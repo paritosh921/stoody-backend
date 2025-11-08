@@ -2115,8 +2115,25 @@ async def get_document_questions(
         # Convert ObjectId to string for JSON serialization and map field names
         serialized_questions = []
         for q in questions:
+            # Auto-clean orphaned images from the question
+            from utils.image_validator import clean_question_images
+            cleaned_q, removed_count = await clean_question_images(q, db)
+
+            # If orphaned images were found and removed, update the database
+            if removed_count > 0:
+                await db.mongo_update_one(
+                    "questions",
+                    {"id": q.get("id")},
+                    {"$set": {
+                        "images": cleaned_q.get("images", []),
+                        "question_figures": cleaned_q.get("question_figures", []),
+                        "auto_cleaned_at": datetime.utcnow()
+                    }}
+                )
+                logger.info(f"Auto-cleaned {removed_count} orphaned images from question {q.get('id')} during retrieval")
+
             question_dict = {}
-            for key, value in q.items():
+            for key, value in cleaned_q.items():
                 if isinstance(value, BsonObjectId):
                     question_dict[key] = str(value)
                 elif isinstance(value, datetime):
@@ -2333,6 +2350,10 @@ async def update_question(
 ):
     """Update a question"""
     try:
+        logger.info(f"📝 Update question request received for question_id={question_id}")
+        logger.info(f"   Update data keys: {list(question_data.keys())}")
+        logger.info(f"   User: {current_user.get('user_id')}")
+
         # Get existing question
         existing_question = await db.mongo_find_one("questions", {"id": question_id})
         if not existing_question:
@@ -2356,7 +2377,30 @@ async def update_question(
         if "document_type" in question_data:
             update_data["document_type"] = question_data["document_type"]
         if "images" in question_data:
-            update_data["images"] = question_data["images"]
+            # Validate images before updating
+            from utils.image_validator import validate_images_list
+            valid_images, invalid_image_ids = await validate_images_list(question_data["images"], db)
+
+            if invalid_image_ids:
+                logger.warning(f"Question {question_id} update attempted with {len(invalid_image_ids)} invalid images. These will be filtered out: {invalid_image_ids}")
+
+            update_data["images"] = valid_images
+
+        # Support question_figures (diagram images) - separate from option images
+        if "question_figures" in question_data:
+            # Validate question figures before updating
+            from utils.image_validator import validate_images_list
+            valid_figures, invalid_figure_ids = await validate_images_list(question_data["question_figures"], db)
+
+            if invalid_figure_ids:
+                logger.warning(f"Question {question_id} update attempted with {len(invalid_figure_ids)} invalid question figures. These will be filtered out: {invalid_figure_ids}")
+
+            update_data["question_figures"] = valid_figures
+
+        # Support enhanced_options (options with images/metadata)
+        if "enhanced_options" in question_data:
+            update_data["enhanced_options"] = question_data["enhanced_options"]
+
         if "points" in question_data:
             update_data["points"] = question_data["points"]
         if "penalty" in question_data:
@@ -2418,12 +2462,18 @@ async def update_question(
 
         # If points were updated, recalculate document's total_points
         if "points" in update_data:
-            document_id = existing_question.get("pdf_source")
+            # Use document_id consistently (not pdf_source)
+            document_id = existing_question.get("document_id") or existing_question.get("pdf_source")
             if document_id:
                 document = await db.mongo_find_one("documents", {"document_id": document_id})
                 if document and document.get("document_type") == "Test Series":
-                    # Get all questions for this document
-                    all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
+                    # Get all questions for this document using document_id
+                    all_questions = await db.mongo_find("questions", {"document_id": document_id})
+
+                    # Fallback to pdf_source if document_id didn't find any
+                    if not all_questions:
+                        all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
+
                     total_points = sum(q.get("points", 1.0) for q in all_questions)
 
                     # Update document's total_points
@@ -2541,11 +2591,17 @@ async def delete_question(
 async def get_document_images(
     request: Request,
     document_id: str,
+    include_orphaned: bool = Query(False, description="Include images that don't exist on disk"),
     current_user: Dict[str, Any] = Depends(require_admin),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Get all images extracted from a specific document"""
+    """
+    Get all images extracted from a specific document.
+    By default, filters out orphaned images (missing from filesystem).
+    """
     try:
+        from utils.image_validator import validate_image_exists
+
         # Verify document exists
         document = await db.mongo_find_one("documents", {"document_id": document_id})
         if not document:
@@ -2557,9 +2613,21 @@ async def get_document_images(
         # Get images for this document
         images = await db.mongo_find("images", {"source_pdf": document["filename"]})
 
-        # Convert ObjectId to string for JSON serialization
+        # Convert ObjectId to string and optionally filter orphaned images
         serialized_images = []
+        orphaned_count = 0
+
         for img in images:
+            image_id = str(img.get("_id", ""))
+
+            # Check if image exists (unless include_orphaned is True)
+            if not include_orphaned:
+                exists = await validate_image_exists(image_id, db)
+                if not exists:
+                    orphaned_count += 1
+                    logger.debug(f"Skipping orphaned image {image_id}")
+                    continue
+
             image_dict = {}
             for key, value in img.items():
                 if isinstance(value, BsonObjectId):
@@ -2574,6 +2642,8 @@ async def get_document_images(
             "document_id": document_id,
             "document_title": document["title"],
             "images_count": len(serialized_images),
+            "total_in_db": len(images),
+            "orphaned_count": orphaned_count,
             "images": serialized_images
         }
 
@@ -2584,6 +2654,209 @@ async def get_document_images(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve document images"
+        )
+
+@router.post("/documents/{document_id}/clean-orphaned-images")
+@limiter.limit("10/minute")
+async def clean_document_orphaned_images(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Clean orphaned image references from all questions in a document.
+    Removes image references that don't exist in database or filesystem.
+    """
+    try:
+        from utils.image_validator import get_orphaned_images_in_document, clean_question_images
+
+        # Verify document exists
+        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        # Find all orphaned images first
+        orphaned_by_question = await get_orphaned_images_in_document(document_id, db)
+
+        if not orphaned_by_question:
+            return {
+                "message": "No orphaned images found",
+                "document_id": document_id,
+                "questions_cleaned": 0,
+                "total_images_removed": 0,
+                "details": []
+            }
+
+        # Clean each affected question
+        questions_cleaned = 0
+        total_images_removed = 0
+        details = []
+
+        for question_id, orphaned_ids in orphaned_by_question.items():
+            # Get question
+            question = await db.mongo_find_one("questions", {"id": question_id})
+            if not question:
+                continue
+
+            # Clean orphaned references
+            cleaned_question, removed_count = await clean_question_images(question, db)
+
+            if removed_count > 0:
+                # Update question in database
+                await db.mongo_update_one(
+                    "questions",
+                    {"id": question_id},
+                    {"$set": {
+                        "images": cleaned_question.get("images", []),
+                        "question_figures": cleaned_question.get("question_figures", []),
+                        "cleaned_at": datetime.utcnow(),
+                        "cleaned_by": current_user.get("user_id")
+                    }}
+                )
+
+                questions_cleaned += 1
+                total_images_removed += removed_count
+
+                details.append({
+                    "question_id": question_id,
+                    "removed_images": orphaned_ids,
+                    "removed_count": removed_count
+                })
+
+                logger.info(f"Cleaned {removed_count} orphaned images from question {question_id}")
+
+        return {
+            "message": f"Successfully cleaned {total_images_removed} orphaned image references",
+            "document_id": document_id,
+            "questions_cleaned": questions_cleaned,
+            "total_images_removed": total_images_removed,
+            "details": details
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Clean orphaned images error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clean orphaned images: {str(e)}"
+        )
+
+@router.post("/questions/{question_id}/clean-orphaned-images")
+@limiter.limit("20/minute")
+async def clean_question_orphaned_images(
+    request: Request,
+    question_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Clean orphaned image references from a specific question.
+    Removes image references that don't exist in database or filesystem.
+    """
+    try:
+        from utils.image_validator import clean_question_images, get_orphaned_images_in_question
+
+        # Get question
+        question = await db.mongo_find_one("questions", {"id": question_id})
+        if not question:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Question {question_id} not found"
+            )
+
+        # Get orphaned images first
+        orphaned_ids = await get_orphaned_images_in_question(question_id, db)
+
+        if not orphaned_ids:
+            return {
+                "message": "No orphaned images found",
+                "question_id": question_id,
+                "removed_count": 0,
+                "orphaned_images": []
+            }
+
+        # Clean orphaned references
+        cleaned_question, removed_count = await clean_question_images(question, db)
+
+        if removed_count > 0:
+            # Update question in database
+            await db.mongo_update_one(
+                "questions",
+                {"id": question_id},
+                {"$set": {
+                    "images": cleaned_question.get("images", []),
+                    "question_figures": cleaned_question.get("question_figures", []),
+                    "cleaned_at": datetime.utcnow(),
+                    "cleaned_by": current_user.get("user_id")
+                }}
+            )
+
+            logger.info(f"Cleaned {removed_count} orphaned images from question {question_id}")
+
+        return {
+            "message": f"Successfully removed {removed_count} orphaned image references",
+            "question_id": question_id,
+            "removed_count": removed_count,
+            "orphaned_images": orphaned_ids
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Clean question orphaned images error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clean orphaned images: {str(e)}"
+        )
+
+@router.get("/documents/{document_id}/orphaned-images")
+@limiter.limit("30/minute")
+async def get_document_orphaned_images(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get all orphaned image references in a document without cleaning them.
+    Useful for inspection before cleanup.
+    """
+    try:
+        from utils.image_validator import get_orphaned_images_in_document
+
+        # Verify document exists
+        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        # Find all orphaned images
+        orphaned_by_question = await get_orphaned_images_in_document(document_id, db)
+
+        total_orphaned = sum(len(ids) for ids in orphaned_by_question.values())
+
+        return {
+            "document_id": document_id,
+            "document_title": document.get("title", ""),
+            "total_orphaned_images": total_orphaned,
+            "affected_questions": len(orphaned_by_question),
+            "orphaned_by_question": orphaned_by_question
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get orphaned images error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get orphaned images: {str(e)}"
         )
 
 @router.delete("/documents/{document_id}")
