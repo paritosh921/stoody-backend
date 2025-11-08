@@ -1,0 +1,2037 @@
+{
+  "lastUpdated": "2025-08-06T17:55:16.635Z",
+  "totalChapters": 73,
+  "chapters": [
+    {
+      "id": "11_chemistry_01",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 1,
+      "chapterName": "Some Basic Concepts of Chemistry",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech101.pdf",
+      "exercises": [],
+      "topics": [
+        "salt",
+        "compound",
+        "base",
+        "element",
+        "acid"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "11_chemistry_02",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 2,
+      "chapterName": "Structure of Atom",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech102.pdf",
+      "exercises": [],
+      "topics": [
+        "hydrogen",
+        "atom"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "11_chemistry_03",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 3,
+      "chapterName": "Classification of Elements and Periodicity in Properties",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech103.pdf",
+      "exercises": [],
+      "topics": [
+        "atom",
+        "metallic",
+        "element",
+        "inorganic",
+        "ionic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "11_chemistry_04",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 4,
+      "chapterName": "Chemical Bonding and Molecular Structure",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech104.pdf",
+      "exercises": [],
+      "topics": [
+        "atom",
+        "compound",
+        "bond",
+        "element",
+        "covalent"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "11_chemistry_05",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 5,
+      "chapterName": "States of Matter",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech105.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "equilibrium"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "11_chemistry_06",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 6,
+      "chapterName": "Thermodynamics",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech106.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "salt",
+        "base",
+        "equilibrium",
+        "acid"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "11_chemistry_07",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 7,
+      "chapterName": "Equilibrium",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech201.pdf",
+      "exercises": [],
+      "topics": [
+        "redox",
+        "reaction",
+        "atom",
+        "oxidation",
+        "metallic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "11_chemistry_08",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 8,
+      "chapterName": "Redox Reactions",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech202.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "compound",
+        "bond",
+        "element"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "11_chemistry_09",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 9,
+      "chapterName": "Hydrogen",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech203.pdf",
+      "exercises": [],
+      "topics": [
+        "atom",
+        "hydrocarbon",
+        "bond",
+        "hydrogen",
+        "organic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "11_mathematics_01",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 1,
+      "chapterName": "Sets",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh101.pdf",
+      "exercises": [],
+      "topics": [
+        "probability",
+        "series",
+        "equation"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.384Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_02",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 2,
+      "chapterName": "Relations and Functions",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh102.pdf",
+      "exercises": [],
+      "topics": [
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_03",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 3,
+      "chapterName": "Trigonometric Functions",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh103.pdf",
+      "exercises": [],
+      "topics": [
+        "tangent",
+        "angle",
+        "trigonometry"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_04",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 4,
+      "chapterName": "Principle of Mathematical Induction",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh104.pdf",
+      "exercises": [],
+      "topics": [
+        "equation"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_05",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 5,
+      "chapterName": "Complex Numbers and Quadratic Equations",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh105.pdf",
+      "exercises": [],
+      "topics": [
+        "graph",
+        "statistics",
+        "equation"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_06",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 6,
+      "chapterName": "Linear Inequalities",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh106.pdf",
+      "exercises": [],
+      "topics": [
+        "permutation",
+        "sequence"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_07",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 7,
+      "chapterName": "Permutations and Combinations",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh107.pdf",
+      "exercises": [],
+      "topics": [
+        "integral"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_08",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 8,
+      "chapterName": "Binomial Theorem",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh108.pdf",
+      "exercises": [],
+      "topics": [
+        "sequence",
+        "series",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_09",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 9,
+      "chapterName": "Sequences and Series",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh109.pdf",
+      "exercises": [],
+      "topics": [
+        "tangent",
+        "equation",
+        "angle",
+        "combination",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_10",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 10,
+      "chapterName": "Straight Lines",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh110.pdf",
+      "exercises": [],
+      "topics": [
+        "equation",
+        "angle"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 11,
+      "chapterName": "Conic Sections",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh111.pdf",
+      "exercises": [],
+      "topics": [
+        "coordinate",
+        "angle"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_12",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 12,
+      "chapterName": "Introduction to Three Dimensional Geometry",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh112.pdf",
+      "exercises": [],
+      "topics": [
+        "tangent",
+        "limit",
+        "derivative",
+        "function",
+        "graph"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_13",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 13,
+      "chapterName": "Limits and Derivatives",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh113.pdf",
+      "exercises": [],
+      "topics": [
+        "statistics",
+        "series"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_mathematics_14",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 14,
+      "chapterName": "Mathematical Reasoning",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh114.pdf",
+      "exercises": [],
+      "topics": [
+        "probability"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_01",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 1,
+      "chapterName": "Physical World",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph101.pdf",
+      "exercises": [],
+      "topics": [
+        "light",
+        "oscillation",
+        "electric",
+        "temperature",
+        "current"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_02",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 2,
+      "chapterName": "Units and Measurements",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph102.pdf",
+      "exercises": [],
+      "topics": [
+        "motion",
+        "velocity",
+        "acceleration"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_03",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 3,
+      "chapterName": "Motion in a Straight Line",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph103.pdf",
+      "exercises": [],
+      "topics": [
+        "light",
+        "motion",
+        "force",
+        "temperature",
+        "velocity"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_04",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 4,
+      "chapterName": "Motion in a Plane",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph104.pdf",
+      "exercises": [],
+      "topics": [
+        "light",
+        "motion",
+        "magnetic",
+        "wave",
+        "electric"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.385Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_05",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 5,
+      "chapterName": "Laws of Motion",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph105.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "motion",
+        "force",
+        "energy",
+        "velocity"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_06",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 6,
+      "chapterName": "Work, Energy and Power",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph106.pdf",
+      "exercises": [],
+      "topics": [
+        "motion",
+        "velocity",
+        "momentum",
+        "oscillation"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_07",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 7,
+      "chapterName": "System of Particles and Rotational Motion",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph107.pdf",
+      "exercises": [],
+      "topics": [
+        "motion",
+        "energy",
+        "force",
+        "momentum",
+        "velocity"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_08",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 8,
+      "chapterName": "Gravitation",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph201.pdf",
+      "exercises": [],
+      "topics": [
+        "motion",
+        "light",
+        "force"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_09",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 9,
+      "chapterName": "Mechanical Properties of Solids",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph202.pdf",
+      "exercises": [],
+      "topics": [
+        "acceleration",
+        "light",
+        "force",
+        "temperature"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_10",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 10,
+      "chapterName": "Mechanical Properties of Fluids",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph203.pdf",
+      "exercises": [],
+      "topics": [
+        "heat",
+        "energy",
+        "temperature"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 11,
+      "chapterName": "Thermal Properties of Matter",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph204.pdf",
+      "exercises": [],
+      "topics": [
+        "heat",
+        "entropy",
+        "temperature",
+        "motion",
+        "thermodynamics"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_12",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 12,
+      "chapterName": "Thermodynamics",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph205.pdf",
+      "exercises": [],
+      "topics": [
+        "motion",
+        "heat",
+        "energy",
+        "temperature"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_13",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 13,
+      "chapterName": "Kinetic Theory",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph206.pdf",
+      "exercises": [],
+      "topics": [
+        "frequency",
+        "light",
+        "temperature",
+        "voltage",
+        "oscillation"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "11_physics_14",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 14,
+      "chapterName": "Oscillations",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph207.pdf",
+      "exercises": [],
+      "topics": [
+        "reflection",
+        "light",
+        "oscillation",
+        "motion",
+        "magnetic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard",
+      "lastUpdated": "2025-08-06T17:11:58.386Z",
+      "nameFixed": true
+    },
+    {
+      "id": "12_chemistry_01",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 1,
+      "chapterName": "Solutions",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech101.pdf",
+      "exercises": [],
+      "topics": [
+        "hydrogen",
+        "ionic",
+        "acid"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_chemistry_02",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 2,
+      "chapterName": "Electrochemistry",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech102.pdf",
+      "exercises": [],
+      "topics": [
+        "redox",
+        "reaction",
+        "oxidation",
+        "metallic",
+        "salt"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_chemistry_03",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 3,
+      "chapterName": "Chemical Kinetics",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech103.pdf",
+      "exercises": [],
+      "topics": [
+        "equilibrium",
+        "reaction",
+        "ionic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_chemistry_04",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 4,
+      "chapterName": "The d- and f- Block Elements",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech104.pdf",
+      "exercises": [],
+      "topics": [
+        "oxidation",
+        "atom",
+        "metallic",
+        "element",
+        "ionic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_chemistry_05",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 5,
+      "chapterName": "Coordination Compounds",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech105.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "oxidation",
+        "salt",
+        "bond"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_chemistry_06",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 6,
+      "chapterName": "The p-Block Elements",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech201.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "metallic",
+        "hydrocarbon",
+        "bond"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_chemistry_07",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 7,
+      "chapterName": "Aldehydes, Ketones and Carboxylic Acids",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech202.pdf",
+      "exercises": [],
+      "topics": [
+        "atom",
+        "hydrocarbon",
+        "compound",
+        "bond",
+        "hydrogen"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_chemistry_08",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 8,
+      "chapterName": "Amines",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech203.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "oxidation",
+        "bond",
+        "base"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_chemistry_09",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 9,
+      "chapterName": "Biomolecules",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech204.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "salt",
+        "compound",
+        "bond"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_chemistry_10",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 10,
+      "chapterName": "Polymers",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech205.pdf",
+      "exercises": [],
+      "topics": [
+        "reaction",
+        "atom",
+        "oxidation",
+        "compound",
+        "acid"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_mathematics_01",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 1,
+      "chapterName": "Relations and Functions",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh101.pdf",
+      "exercises": [],
+      "topics": [
+        "Concepts",
+        "Methods",
+        "Applications",
+        "Problem Solving"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_mathematics_02",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 2,
+      "chapterName": "Inverse Trigonometric Functions",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh102.pdf",
+      "exercises": [],
+      "topics": [
+        "cosine",
+        "tangent",
+        "integral",
+        "sine",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_mathematics_03",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 3,
+      "chapterName": "Matrices",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh103.pdf",
+      "exercises": [],
+      "topics": [
+        "matrix"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_mathematics_04",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 4,
+      "chapterName": "Determinants",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh104.pdf",
+      "exercises": [],
+      "topics": [
+        "matrix",
+        "determinant",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_mathematics_05",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 5,
+      "chapterName": "Continuity and Differentiability",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh105.pdf",
+      "exercises": [],
+      "topics": [
+        "graph",
+        "continuity",
+        "limit",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_mathematics_06",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 6,
+      "chapterName": "Application of Derivatives",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh106.pdf",
+      "exercises": [],
+      "topics": [
+        "tangent",
+        "derivative",
+        "function",
+        "coordinate",
+        "graph"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_mathematics_08",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 8,
+      "chapterName": "Application of Integrals",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh201.pdf",
+      "exercises": [],
+      "topics": [
+        "probability",
+        "tangent",
+        "integral",
+        "derivative",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_mathematics_09",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 9,
+      "chapterName": "Differential Equations",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh202.pdf",
+      "exercises": [],
+      "topics": [
+        "limit",
+        "integral"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_mathematics_10",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 10,
+      "chapterName": "Vector Algebra",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh203.pdf",
+      "exercises": [],
+      "topics": [
+        "derivative",
+        "equation",
+        "integral",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_mathematics_11",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 11,
+      "chapterName": "Three Dimensional Geometry",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh204.pdf",
+      "exercises": [],
+      "topics": [
+        "coordinate",
+        "vector",
+        "cosine"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_mathematics_12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 12,
+      "chapterName": "Linear Programming",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh205.pdf",
+      "exercises": [],
+      "topics": [
+        "vector",
+        "cosine",
+        "equation",
+        "angle",
+        "coordinate"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_mathematics_13",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 13,
+      "chapterName": "Probability",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh206.pdf",
+      "exercises": [],
+      "topics": [
+        "graph",
+        "combination",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_mathematics_14",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 14,
+      "chapterName": "Statistics",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh207.pdf",
+      "exercises": [],
+      "topics": [
+        "probability",
+        "function"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_physics_01",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 1,
+      "chapterName": "Electric Charges and Fields",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph101.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "electric",
+        "force",
+        "current"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_physics_02",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 2,
+      "chapterName": "Electrostatic Potential and Capacitance",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph102.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "electric",
+        "force",
+        "energy",
+        "acceleration"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_physics_03",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 3,
+      "chapterName": "Current Electricity",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph103.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "heat",
+        "voltage",
+        "motion",
+        "magnetic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "id": "12_physics_04",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 4,
+      "chapterName": "Moving Charges and Magnetism",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph104.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "current",
+        "magnetic",
+        "electric"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_physics_05",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 5,
+      "chapterName": "Magnetism and Matter",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph105.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "magnetic",
+        "electric",
+        "energy",
+        "force"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_physics_06",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 6,
+      "chapterName": "Electromagnetic Induction",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph106.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "motion",
+        "magnetic",
+        "electric"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_physics_07",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 7,
+      "chapterName": "Alternating Current",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph107.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "voltage",
+        "magnetic",
+        "electric"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_physics_08",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 8,
+      "chapterName": "Electromagnetic Waves",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph108.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "oscillation",
+        "motion",
+        "magnetic"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "id": "12_physics_09",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 9,
+      "chapterName": "Ray Optics and Optical Instruments",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph202.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "reflection",
+        "light",
+        "interference",
+        "refraction"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_physics_10",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 10,
+      "chapterName": "Wave Optics",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph203.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "voltage",
+        "magnetic",
+        "electric"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_physics_11",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 11,
+      "chapterName": "Dual Nature of Radiation and Matter",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph204.pdf",
+      "exercises": [],
+      "topics": [
+        "field",
+        "light",
+        "motion",
+        "electric",
+        "energy"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_physics_12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 12,
+      "chapterName": "Atoms",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph205.pdf",
+      "exercises": [],
+      "topics": [
+        "light",
+        "force",
+        "energy",
+        "momentum",
+        "velocity"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    },
+    {
+      "id": "12_physics_13",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 13,
+      "chapterName": "Nuclei",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph206.pdf",
+      "exercises": [],
+      "topics": [
+        "heat",
+        "light",
+        "voltage",
+        "motion",
+        "energy"
+      ],
+      "estimatedDuration": 3,
+      "pageRange": {
+        "start": 1,
+        "end": 50
+      },
+      "concepts": [
+        "Fundamental Principles",
+        "Key Definitions",
+        "Important Formulas",
+        "Practical Applications"
+      ],
+      "difficulty": "hard"
+    }
+  ],
+  "fixInfo": {
+    "chaptersFixed": 0,
+    "fixDate": "2025-08-06T17:55:16.635Z",
+    "version": "1.1.0"
+  }
+}

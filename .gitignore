@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+*.env
+
+# Runtime data & uploads
+uploads/
+chromadb_data/
+images/
+data/tmp/
+logs/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

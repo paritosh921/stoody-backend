@@ -1,0 +1,3860 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2025-08-06T17:55:16.808Z",
+  "totalBooks": 6,
+  "totalChapters": 73,
+  "subjects": {
+    "chemistry": 19,
+    "mathematics": 27,
+    "physics": 27
+  },
+  "classes": {
+    "11": 37,
+    "12": 36
+  },
+  "bookToChapterMapping": {
+    "class_11_chemistry": {
+      "title": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "Some Basic Concepts of Chemistry",
+          "chapterId": "11_chemistry_01",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech101.pdf",
+          "topics": [
+            "salt",
+            "compound",
+            "base",
+            "element",
+            "acid"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "Structure of Atom",
+          "chapterId": "11_chemistry_02",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech102.pdf",
+          "topics": [
+            "hydrogen",
+            "atom"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "Classification of Elements and Periodicity in Properties",
+          "chapterId": "11_chemistry_03",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech103.pdf",
+          "topics": [
+            "atom",
+            "metallic",
+            "element",
+            "inorganic",
+            "ionic"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "Chemical Bonding and Molecular Structure",
+          "chapterId": "11_chemistry_04",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech104.pdf",
+          "topics": [
+            "atom",
+            "compound",
+            "bond",
+            "element",
+            "covalent"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "States of Matter",
+          "chapterId": "11_chemistry_05",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech105.pdf",
+          "topics": [
+            "reaction",
+            "equilibrium"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "Thermodynamics",
+          "chapterId": "11_chemistry_06",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech106.pdf",
+          "topics": [
+            "reaction",
+            "salt",
+            "base",
+            "equilibrium",
+            "acid"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 7,
+          "chapterName": "Equilibrium",
+          "chapterId": "11_chemistry_07",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech201.pdf",
+          "topics": [
+            "redox",
+            "reaction",
+            "atom",
+            "oxidation",
+            "metallic"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Redox Reactions",
+          "chapterId": "11_chemistry_08",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech202.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "compound",
+            "bond",
+            "element"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Hydrogen",
+          "chapterId": "11_chemistry_09",
+          "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech203.pdf",
+          "topics": [
+            "atom",
+            "hydrocarbon",
+            "bond",
+            "hydrogen",
+            "organic"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 9,
+      "difficulty": "mixed",
+      "description": "Complete NCERT chemistry textbook for Class 11"
+    },
+    "class_11_mathematics": {
+      "title": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "Sets",
+          "chapterId": "11_mathematics_01",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh101.pdf",
+          "topics": [
+            "probability",
+            "series",
+            "equation"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "Relations and Functions",
+          "chapterId": "11_mathematics_02",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh102.pdf",
+          "topics": [
+            "function"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "Trigonometric Functions",
+          "chapterId": "11_mathematics_03",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh103.pdf",
+          "topics": [
+            "tangent",
+            "angle",
+            "trigonometry"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "Principle of Mathematical Induction",
+          "chapterId": "11_mathematics_04",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh104.pdf",
+          "topics": [
+            "equation"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "Complex Numbers and Quadratic Equations",
+          "chapterId": "11_mathematics_05",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh105.pdf",
+          "topics": [
+            "graph",
+            "statistics",
+            "equation"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "Linear Inequalities",
+          "chapterId": "11_mathematics_06",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh106.pdf",
+          "topics": [
+            "permutation",
+            "sequence"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 7,
+          "chapterName": "Permutations and Combinations",
+          "chapterId": "11_mathematics_07",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh107.pdf",
+          "topics": [
+            "integral"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Binomial Theorem",
+          "chapterId": "11_mathematics_08",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh108.pdf",
+          "topics": [
+            "sequence",
+            "series",
+            "function"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Sequences and Series",
+          "chapterId": "11_mathematics_09",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh109.pdf",
+          "topics": [
+            "tangent",
+            "equation",
+            "angle",
+            "combination",
+            "function"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 10,
+          "chapterName": "Straight Lines",
+          "chapterId": "11_mathematics_10",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh110.pdf",
+          "topics": [
+            "equation",
+            "angle"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 11,
+          "chapterName": "Conic Sections",
+          "chapterId": "11_mathematics_11",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh111.pdf",
+          "topics": [
+            "coordinate",
+            "angle"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 12,
+          "chapterName": "Introduction to Three Dimensional Geometry",
+          "chapterId": "11_mathematics_12",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh112.pdf",
+          "topics": [
+            "tangent",
+            "limit",
+            "derivative",
+            "function",
+            "graph"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 13,
+          "chapterName": "Limits and Derivatives",
+          "chapterId": "11_mathematics_13",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh113.pdf",
+          "topics": [
+            "statistics",
+            "series"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 14,
+          "chapterName": "Mathematical Reasoning",
+          "chapterId": "11_mathematics_14",
+          "pdfPath": "course_database/ncert/class_11_mathematics/kemh114.pdf",
+          "topics": [
+            "probability"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 14,
+      "difficulty": "mixed",
+      "description": "Complete NCERT mathematics textbook for Class 11"
+    },
+    "class_11_physics": {
+      "title": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "Physical World",
+          "chapterId": "11_physics_01",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph101.pdf",
+          "topics": [
+            "light",
+            "oscillation",
+            "electric",
+            "temperature",
+            "current"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "Units and Measurements",
+          "chapterId": "11_physics_02",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph102.pdf",
+          "topics": [
+            "motion",
+            "velocity",
+            "acceleration"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "Motion in a Straight Line",
+          "chapterId": "11_physics_03",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph103.pdf",
+          "topics": [
+            "light",
+            "motion",
+            "force",
+            "temperature",
+            "velocity"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "Motion in a Plane",
+          "chapterId": "11_physics_04",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph104.pdf",
+          "topics": [
+            "light",
+            "motion",
+            "magnetic",
+            "wave",
+            "electric"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "Laws of Motion",
+          "chapterId": "11_physics_05",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph105.pdf",
+          "topics": [
+            "field",
+            "motion",
+            "force",
+            "energy",
+            "velocity"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "Work, Energy and Power",
+          "chapterId": "11_physics_06",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph106.pdf",
+          "topics": [
+            "motion",
+            "velocity",
+            "momentum",
+            "oscillation"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 7,
+          "chapterName": "System of Particles and Rotational Motion",
+          "chapterId": "11_physics_07",
+          "pdfPath": "course_database/ncert/class_11_physics_part1/keph107.pdf",
+          "topics": [
+            "motion",
+            "energy",
+            "force",
+            "momentum",
+            "velocity"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Gravitation",
+          "chapterId": "11_physics_08",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph201.pdf",
+          "topics": [
+            "motion",
+            "light",
+            "force"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Mechanical Properties of Solids",
+          "chapterId": "11_physics_09",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph202.pdf",
+          "topics": [
+            "acceleration",
+            "light",
+            "force",
+            "temperature"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 10,
+          "chapterName": "Mechanical Properties of Fluids",
+          "chapterId": "11_physics_10",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph203.pdf",
+          "topics": [
+            "heat",
+            "energy",
+            "temperature"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 11,
+          "chapterName": "Thermal Properties of Matter",
+          "chapterId": "11_physics_11",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph204.pdf",
+          "topics": [
+            "heat",
+            "entropy",
+            "temperature",
+            "motion",
+            "thermodynamics"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 12,
+          "chapterName": "Thermodynamics",
+          "chapterId": "11_physics_12",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph205.pdf",
+          "topics": [
+            "motion",
+            "heat",
+            "energy",
+            "temperature"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 13,
+          "chapterName": "Kinetic Theory",
+          "chapterId": "11_physics_13",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph206.pdf",
+          "topics": [
+            "frequency",
+            "light",
+            "temperature",
+            "voltage",
+            "oscillation"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 14,
+          "chapterName": "Oscillations",
+          "chapterId": "11_physics_14",
+          "pdfPath": "course_database/ncert/class_11_physics_part2/keph207.pdf",
+          "topics": [
+            "reflection",
+            "light",
+            "oscillation",
+            "motion",
+            "magnetic"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 14,
+      "difficulty": "mixed",
+      "description": "Complete NCERT physics textbook for Class 11"
+    },
+    "class_12_chemistry": {
+      "title": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "Solutions",
+          "chapterId": "12_chemistry_01",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech101.pdf",
+          "topics": [
+            "hydrogen",
+            "ionic",
+            "acid"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "Electrochemistry",
+          "chapterId": "12_chemistry_02",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech102.pdf",
+          "topics": [
+            "redox",
+            "reaction",
+            "oxidation",
+            "metallic",
+            "salt"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "Chemical Kinetics",
+          "chapterId": "12_chemistry_03",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech103.pdf",
+          "topics": [
+            "equilibrium",
+            "reaction",
+            "ionic"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "The d- and f- Block Elements",
+          "chapterId": "12_chemistry_04",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech104.pdf",
+          "topics": [
+            "oxidation",
+            "atom",
+            "metallic",
+            "element",
+            "ionic"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "Coordination Compounds",
+          "chapterId": "12_chemistry_05",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech105.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "oxidation",
+            "salt",
+            "bond"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "The p-Block Elements",
+          "chapterId": "12_chemistry_06",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech201.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "metallic",
+            "hydrocarbon",
+            "bond"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 7,
+          "chapterName": "Aldehydes, Ketones and Carboxylic Acids",
+          "chapterId": "12_chemistry_07",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech202.pdf",
+          "topics": [
+            "atom",
+            "hydrocarbon",
+            "compound",
+            "bond",
+            "hydrogen"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Amines",
+          "chapterId": "12_chemistry_08",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech203.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "oxidation",
+            "bond",
+            "base"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Biomolecules",
+          "chapterId": "12_chemistry_09",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech204.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "salt",
+            "compound",
+            "bond"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 10,
+          "chapterName": "Polymers",
+          "chapterId": "12_chemistry_10",
+          "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech205.pdf",
+          "topics": [
+            "reaction",
+            "atom",
+            "oxidation",
+            "compound",
+            "acid"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 10,
+      "difficulty": "mixed",
+      "description": "Complete NCERT chemistry textbook for Class 12"
+    },
+    "class_12_mathematics": {
+      "title": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "RELA TIONS AND FUNCTIONS Lejeune Dirichlet (1 8",
+          "chapterId": "12_mathematics_01",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh101.pdf",
+          "topics": [
+            "Concepts",
+            "Methods",
+            "Applications",
+            "Problem Solving"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "Chapter 2",
+          "chapterId": "12_mathematics_02",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh102.pdf",
+          "topics": [
+            "cosine",
+            "tangent",
+            "integral",
+            "sine",
+            "function"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "MATRICES Reprint 2 0 2 5-2 6 MATRI",
+          "chapterId": "12_mathematics_03",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh103.pdf",
+          "topics": [
+            "matrix"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "Determinants P",
+          "chapterId": "12_mathematics_04",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh104.pdf",
+          "topics": [
+            "matrix",
+            "determinant",
+            "function"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "CONTINUITY AND DIFFERENTIABILITY Sir Issac Newton (1 6",
+          "chapterId": "12_mathematics_05",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh105.pdf",
+          "topics": [
+            "graph",
+            "continuity",
+            "limit",
+            "function"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "Chapter 6",
+          "chapterId": "12_mathematics_06",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh106.pdf",
+          "topics": [
+            "tangent",
+            "derivative",
+            "function",
+            "coordinate",
+            "graph"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Chapter 8",
+          "chapterId": "12_mathematics_08",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh201.pdf",
+          "topics": [
+            "probability",
+            "tangent",
+            "integral",
+            "derivative",
+            "function"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Chapter 9",
+          "chapterId": "12_mathematics_09",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh202.pdf",
+          "topics": [
+            "limit",
+            "integral"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 10,
+          "chapterName": "Chapter 10",
+          "chapterId": "12_mathematics_10",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh203.pdf",
+          "topics": [
+            "derivative",
+            "equation",
+            "integral",
+            "function"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 11,
+          "chapterName": "Chapter 11",
+          "chapterId": "12_mathematics_11",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh204.pdf",
+          "topics": [
+            "coordinate",
+            "vector",
+            "cosine"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 12,
+          "chapterName": "Chapter 12",
+          "chapterId": "12_mathematics_12",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh205.pdf",
+          "topics": [
+            "vector",
+            "cosine",
+            "equation",
+            "angle",
+            "coordinate"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 13,
+          "chapterName": "Chapter 13",
+          "chapterId": "12_mathematics_13",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh206.pdf",
+          "topics": [
+            "graph",
+            "combination",
+            "function"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 14,
+          "chapterName": "Chapter 14",
+          "chapterId": "12_mathematics_14",
+          "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh207.pdf",
+          "topics": [
+            "probability",
+            "function"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 13,
+      "difficulty": "mixed",
+      "description": "Complete NCERT mathematics textbook for Class 12"
+    },
+    "class_12_physics": {
+      "title": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapters": [
+        {
+          "chapterNumber": 1,
+          "chapterName": "Electric Charges And Fields 1",
+          "chapterId": "12_physics_01",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph101.pdf",
+          "topics": [
+            "field",
+            "light",
+            "electric",
+            "force",
+            "current"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 2,
+          "chapterName": "ELECTROSTATIC POTENTIAL AND CAPACITANCE Reprint 2 0 2",
+          "chapterId": "12_physics_02",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph102.pdf",
+          "topics": [
+            "field",
+            "electric",
+            "force",
+            "energy",
+            "acceleration"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 3,
+          "chapterName": "CURRENT ELECTRICITY Reprint 2 0 2 5-2 6",
+          "chapterId": "12_physics_03",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph103.pdf",
+          "topics": [
+            "field",
+            "heat",
+            "voltage",
+            "motion",
+            "magnetic"
+          ],
+          "difficulty": "easy",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 4,
+          "chapterName": "MOVING CHARGES AND MAGNETISM Reprint 2 0 2",
+          "chapterId": "12_physics_04",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph104.pdf",
+          "topics": [
+            "field",
+            "light",
+            "current",
+            "magnetic",
+            "electric"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 5,
+          "chapterName": "MAGNETISM AND MATTER Reprint 2 0 2 5-2",
+          "chapterId": "12_physics_05",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph105.pdf",
+          "topics": [
+            "field",
+            "magnetic",
+            "electric",
+            "energy",
+            "force"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 6,
+          "chapterName": "ELECTROMAGNETIC INDUCTION Reprint 2 0 2 5-2 6",
+          "chapterId": "12_physics_06",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph106.pdf",
+          "topics": [
+            "field",
+            "light",
+            "motion",
+            "magnetic",
+            "electric"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 7,
+          "chapterName": "ALTERNATING CURRENT *The phrases ac voltage and ac",
+          "chapterId": "12_physics_07",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph107.pdf",
+          "topics": [
+            "field",
+            "light",
+            "voltage",
+            "magnetic",
+            "electric"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 8,
+          "chapterName": "Electromagnetic Waves 8",
+          "chapterId": "12_physics_08",
+          "pdfPath": "course_database/ncert/class_12_physics_part1/leph108.pdf",
+          "topics": [
+            "field",
+            "light",
+            "oscillation",
+            "motion",
+            "magnetic"
+          ],
+          "difficulty": "medium",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 9,
+          "chapterName": "Chapter 9",
+          "chapterId": "12_physics_09",
+          "pdfPath": "course_database/ncert/class_12_physics_part2/leph202.pdf",
+          "topics": [
+            "field",
+            "reflection",
+            "light",
+            "interference",
+            "refraction"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 10,
+          "chapterName": "Chapter 10",
+          "chapterId": "12_physics_10",
+          "pdfPath": "course_database/ncert/class_12_physics_part2/leph203.pdf",
+          "topics": [
+            "field",
+            "light",
+            "voltage",
+            "magnetic",
+            "electric"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 11,
+          "chapterName": "Chapter 11",
+          "chapterId": "12_physics_11",
+          "pdfPath": "course_database/ncert/class_12_physics_part2/leph204.pdf",
+          "topics": [
+            "field",
+            "light",
+            "motion",
+            "electric",
+            "energy"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 12,
+          "chapterName": "Chapter 12",
+          "chapterId": "12_physics_12",
+          "pdfPath": "course_database/ncert/class_12_physics_part2/leph205.pdf",
+          "topics": [
+            "light",
+            "force",
+            "energy",
+            "momentum",
+            "velocity"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        },
+        {
+          "chapterNumber": 13,
+          "chapterName": "Chapter 13",
+          "chapterId": "12_physics_13",
+          "pdfPath": "course_database/ncert/class_12_physics_part2/leph206.pdf",
+          "topics": [
+            "heat",
+            "light",
+            "voltage",
+            "motion",
+            "energy"
+          ],
+          "difficulty": "hard",
+          "estimatedDuration": 3
+        }
+      ],
+      "totalChapters": 13,
+      "difficulty": "mixed",
+      "description": "Complete NCERT physics textbook for Class 12"
+    }
+  },
+  "chapterToBookMapping": {
+    "11_chemistry_01": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 1,
+      "chapterName": "Some Basic Concepts of Chemistry",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech101.pdf"
+    },
+    "11_chemistry_02": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 2,
+      "chapterName": "Structure of Atom",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech102.pdf"
+    },
+    "11_chemistry_03": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 3,
+      "chapterName": "Classification of Elements and Periodicity in Properties",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech103.pdf"
+    },
+    "11_chemistry_04": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 4,
+      "chapterName": "Chemical Bonding and Molecular Structure",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech104.pdf"
+    },
+    "11_chemistry_05": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 5,
+      "chapterName": "States of Matter",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech105.pdf"
+    },
+    "11_chemistry_06": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 6,
+      "chapterName": "Thermodynamics",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part1/kech106.pdf"
+    },
+    "11_chemistry_07": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 7,
+      "chapterName": "Equilibrium",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech201.pdf"
+    },
+    "11_chemistry_08": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 8,
+      "chapterName": "Redox Reactions",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech202.pdf"
+    },
+    "11_chemistry_09": {
+      "bookKey": "class_11_chemistry",
+      "bookTitle": "NCERT Chemistry Class 11",
+      "class": "11",
+      "subject": "chemistry",
+      "chapterNumber": 9,
+      "chapterName": "Hydrogen",
+      "pdfPath": "course_database/ncert/class_11_chemistry_part2/kech203.pdf"
+    },
+    "11_mathematics_01": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 1,
+      "chapterName": "Sets",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh101.pdf"
+    },
+    "11_mathematics_02": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 2,
+      "chapterName": "Relations and Functions",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh102.pdf"
+    },
+    "11_mathematics_03": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 3,
+      "chapterName": "Trigonometric Functions",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh103.pdf"
+    },
+    "11_mathematics_04": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 4,
+      "chapterName": "Principle of Mathematical Induction",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh104.pdf"
+    },
+    "11_mathematics_05": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 5,
+      "chapterName": "Complex Numbers and Quadratic Equations",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh105.pdf"
+    },
+    "11_mathematics_06": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 6,
+      "chapterName": "Linear Inequalities",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh106.pdf"
+    },
+    "11_mathematics_07": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 7,
+      "chapterName": "Permutations and Combinations",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh107.pdf"
+    },
+    "11_mathematics_08": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 8,
+      "chapterName": "Binomial Theorem",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh108.pdf"
+    },
+    "11_mathematics_09": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 9,
+      "chapterName": "Sequences and Series",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh109.pdf"
+    },
+    "11_mathematics_10": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 10,
+      "chapterName": "Straight Lines",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh110.pdf"
+    },
+    "11_mathematics_11": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 11,
+      "chapterName": "Conic Sections",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh111.pdf"
+    },
+    "11_mathematics_12": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 12,
+      "chapterName": "Introduction to Three Dimensional Geometry",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh112.pdf"
+    },
+    "11_mathematics_13": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 13,
+      "chapterName": "Limits and Derivatives",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh113.pdf"
+    },
+    "11_mathematics_14": {
+      "bookKey": "class_11_mathematics",
+      "bookTitle": "NCERT Mathematics Class 11",
+      "class": "11",
+      "subject": "mathematics",
+      "chapterNumber": 14,
+      "chapterName": "Mathematical Reasoning",
+      "pdfPath": "course_database/ncert/class_11_mathematics/kemh114.pdf"
+    },
+    "11_physics_01": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 1,
+      "chapterName": "Physical World",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph101.pdf"
+    },
+    "11_physics_02": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 2,
+      "chapterName": "Units and Measurements",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph102.pdf"
+    },
+    "11_physics_03": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 3,
+      "chapterName": "Motion in a Straight Line",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph103.pdf"
+    },
+    "11_physics_04": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 4,
+      "chapterName": "Motion in a Plane",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph104.pdf"
+    },
+    "11_physics_05": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 5,
+      "chapterName": "Laws of Motion",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph105.pdf"
+    },
+    "11_physics_06": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 6,
+      "chapterName": "Work, Energy and Power",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph106.pdf"
+    },
+    "11_physics_07": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 7,
+      "chapterName": "System of Particles and Rotational Motion",
+      "pdfPath": "course_database/ncert/class_11_physics_part1/keph107.pdf"
+    },
+    "11_physics_08": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 8,
+      "chapterName": "Gravitation",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph201.pdf"
+    },
+    "11_physics_09": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 9,
+      "chapterName": "Mechanical Properties of Solids",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph202.pdf"
+    },
+    "11_physics_10": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 10,
+      "chapterName": "Mechanical Properties of Fluids",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph203.pdf"
+    },
+    "11_physics_11": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 11,
+      "chapterName": "Thermal Properties of Matter",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph204.pdf"
+    },
+    "11_physics_12": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 12,
+      "chapterName": "Thermodynamics",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph205.pdf"
+    },
+    "11_physics_13": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 13,
+      "chapterName": "Kinetic Theory",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph206.pdf"
+    },
+    "11_physics_14": {
+      "bookKey": "class_11_physics",
+      "bookTitle": "NCERT Physics Class 11",
+      "class": "11",
+      "subject": "physics",
+      "chapterNumber": 14,
+      "chapterName": "Oscillations",
+      "pdfPath": "course_database/ncert/class_11_physics_part2/keph207.pdf"
+    },
+    "12_chemistry_01": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 1,
+      "chapterName": "Solutions",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech101.pdf"
+    },
+    "12_chemistry_02": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 2,
+      "chapterName": "Electrochemistry",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech102.pdf"
+    },
+    "12_chemistry_03": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 3,
+      "chapterName": "Chemical Kinetics",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech103.pdf"
+    },
+    "12_chemistry_04": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 4,
+      "chapterName": "The d- and f- Block Elements",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech104.pdf"
+    },
+    "12_chemistry_05": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 5,
+      "chapterName": "Coordination Compounds",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part1/lech105.pdf"
+    },
+    "12_chemistry_06": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 6,
+      "chapterName": "The p-Block Elements",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech201.pdf"
+    },
+    "12_chemistry_07": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 7,
+      "chapterName": "Aldehydes, Ketones and Carboxylic Acids",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech202.pdf"
+    },
+    "12_chemistry_08": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 8,
+      "chapterName": "Amines",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech203.pdf"
+    },
+    "12_chemistry_09": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 9,
+      "chapterName": "Biomolecules",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech204.pdf"
+    },
+    "12_chemistry_10": {
+      "bookKey": "class_12_chemistry",
+      "bookTitle": "NCERT Chemistry Class 12",
+      "class": "12",
+      "subject": "chemistry",
+      "chapterNumber": 10,
+      "chapterName": "Polymers",
+      "pdfPath": "course_database/ncert/class_12_chemistry_part2/lech205.pdf"
+    },
+    "12_mathematics_01": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 1,
+      "chapterName": "RELA TIONS AND FUNCTIONS Lejeune Dirichlet (1 8",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh101.pdf"
+    },
+    "12_mathematics_02": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 2,
+      "chapterName": "Chapter 2",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh102.pdf"
+    },
+    "12_mathematics_03": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 3,
+      "chapterName": "MATRICES Reprint 2 0 2 5-2 6 MATRI",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh103.pdf"
+    },
+    "12_mathematics_04": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 4,
+      "chapterName": "Determinants P",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh104.pdf"
+    },
+    "12_mathematics_05": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 5,
+      "chapterName": "CONTINUITY AND DIFFERENTIABILITY Sir Issac Newton (1 6",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh105.pdf"
+    },
+    "12_mathematics_06": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 6,
+      "chapterName": "Chapter 6",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part1/lemh106.pdf"
+    },
+    "12_mathematics_08": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 8,
+      "chapterName": "Chapter 8",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh201.pdf"
+    },
+    "12_mathematics_09": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 9,
+      "chapterName": "Chapter 9",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh202.pdf"
+    },
+    "12_mathematics_10": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 10,
+      "chapterName": "Chapter 10",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh203.pdf"
+    },
+    "12_mathematics_11": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 11,
+      "chapterName": "Chapter 11",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh204.pdf"
+    },
+    "12_mathematics_12": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 12,
+      "chapterName": "Chapter 12",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh205.pdf"
+    },
+    "12_mathematics_13": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 13,
+      "chapterName": "Chapter 13",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh206.pdf"
+    },
+    "12_mathematics_14": {
+      "bookKey": "class_12_mathematics",
+      "bookTitle": "NCERT Mathematics Class 12",
+      "class": "12",
+      "subject": "mathematics",
+      "chapterNumber": 14,
+      "chapterName": "Chapter 14",
+      "pdfPath": "course_database/ncert/class_12_mathematics_part2/lemh207.pdf"
+    },
+    "12_physics_01": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 1,
+      "chapterName": "Electric Charges And Fields 1",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph101.pdf"
+    },
+    "12_physics_02": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 2,
+      "chapterName": "ELECTROSTATIC POTENTIAL AND CAPACITANCE Reprint 2 0 2",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph102.pdf"
+    },
+    "12_physics_03": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 3,
+      "chapterName": "CURRENT ELECTRICITY Reprint 2 0 2 5-2 6",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph103.pdf"
+    },
+    "12_physics_04": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 4,
+      "chapterName": "MOVING CHARGES AND MAGNETISM Reprint 2 0 2",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph104.pdf"
+    },
+    "12_physics_05": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 5,
+      "chapterName": "MAGNETISM AND MATTER Reprint 2 0 2 5-2",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph105.pdf"
+    },
+    "12_physics_06": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 6,
+      "chapterName": "ELECTROMAGNETIC INDUCTION Reprint 2 0 2 5-2 6",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph106.pdf"
+    },
+    "12_physics_07": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 7,
+      "chapterName": "ALTERNATING CURRENT *The phrases ac voltage and ac",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph107.pdf"
+    },
+    "12_physics_08": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 8,
+      "chapterName": "Electromagnetic Waves 8",
+      "pdfPath": "course_database/ncert/class_12_physics_part1/leph108.pdf"
+    },
+    "12_physics_09": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 9,
+      "chapterName": "Chapter 9",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph202.pdf"
+    },
+    "12_physics_10": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 10,
+      "chapterName": "Chapter 10",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph203.pdf"
+    },
+    "12_physics_11": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 11,
+      "chapterName": "Chapter 11",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph204.pdf"
+    },
+    "12_physics_12": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 12,
+      "chapterName": "Chapter 12",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph205.pdf"
+    },
+    "12_physics_13": {
+      "bookKey": "class_12_physics",
+      "bookTitle": "NCERT Physics Class 12",
+      "class": "12",
+      "subject": "physics",
+      "chapterNumber": 13,
+      "chapterName": "Chapter 13",
+      "pdfPath": "course_database/ncert/class_12_physics_part2/leph206.pdf"
+    }
+  },
+  "searchIndex": {
+    "11_chemistry_01": {
+      "terms": [
+        "some basic concepts of chemistry",
+        "chemistry",
+        "chapter 1",
+        "class 11",
+        "salt",
+        "compound",
+        "base",
+        "element",
+        "acid"
+      ],
+      "fullText": "Some Basic Concepts of Chemistry chemistry Class 11 Chapter 1",
+      "keywords": "salt, compound, base, element, acid"
+    },
+    "11_chemistry_02": {
+      "terms": [
+        "structure of atom",
+        "chemistry",
+        "chapter 2",
+        "class 11",
+        "hydrogen",
+        "atom"
+      ],
+      "fullText": "Structure of Atom chemistry Class 11 Chapter 2",
+      "keywords": "hydrogen, atom"
+    },
+    "11_chemistry_03": {
+      "terms": [
+        "classification of elements and periodicity in properties",
+        "chemistry",
+        "chapter 3",
+        "class 11",
+        "atom",
+        "metallic",
+        "element",
+        "inorganic",
+        "ionic"
+      ],
+      "fullText": "Classification of Elements and Periodicity in Properties chemistry Class 11 Chapter 3",
+      "keywords": "atom, metallic, element, inorganic, ionic"
+    },
+    "11_chemistry_04": {
+      "terms": [
+        "chemical bonding and molecular structure",
+        "chemistry",
+        "chapter 4",
+        "class 11",
+        "atom",
+        "compound",
+        "bond",
+        "element",
+        "covalent"
+      ],
+      "fullText": "Chemical Bonding and Molecular Structure chemistry Class 11 Chapter 4",
+      "keywords": "atom, compound, bond, element, covalent"
+    },
+    "11_chemistry_05": {
+      "terms": [
+        "states of matter",
+        "chemistry",
+        "chapter 5",
+        "class 11",
+        "reaction",
+        "equilibrium"
+      ],
+      "fullText": "States of Matter chemistry Class 11 Chapter 5",
+      "keywords": "reaction, equilibrium"
+    },
+    "11_chemistry_06": {
+      "terms": [
+        "thermodynamics",
+        "chemistry",
+        "chapter 6",
+        "class 11",
+        "reaction",
+        "salt",
+        "base",
+        "equilibrium",
+        "acid"
+      ],
+      "fullText": "Thermodynamics chemistry Class 11 Chapter 6",
+      "keywords": "reaction, salt, base, equilibrium, acid"
+    },
+    "11_chemistry_07": {
+      "terms": [
+        "equilibrium",
+        "chemistry",
+        "chapter 7",
+        "class 11",
+        "redox",
+        "reaction",
+        "atom",
+        "oxidation",
+        "metallic"
+      ],
+      "fullText": "Equilibrium chemistry Class 11 Chapter 7",
+      "keywords": "redox, reaction, atom, oxidation, metallic"
+    },
+    "11_chemistry_08": {
+      "terms": [
+        "redox reactions",
+        "chemistry",
+        "chapter 8",
+        "class 11",
+        "reaction",
+        "atom",
+        "compound",
+        "bond",
+        "element"
+      ],
+      "fullText": "Redox Reactions chemistry Class 11 Chapter 8",
+      "keywords": "reaction, atom, compound, bond, element"
+    },
+    "11_chemistry_09": {
+      "terms": [
+        "hydrogen",
+        "chemistry",
+        "chapter 9",
+        "class 11",
+        "atom",
+        "hydrocarbon",
+        "bond",
+        "hydrogen",
+        "organic"
+      ],
+      "fullText": "Hydrogen chemistry Class 11 Chapter 9",
+      "keywords": "atom, hydrocarbon, bond, hydrogen, organic"
+    },
+    "11_mathematics_01": {
+      "terms": [
+        "sets",
+        "mathematics",
+        "chapter 1",
+        "class 11",
+        "probability",
+        "series",
+        "equation"
+      ],
+      "fullText": "Sets mathematics Class 11 Chapter 1",
+      "keywords": "probability, series, equation"
+    },
+    "11_mathematics_02": {
+      "terms": [
+        "relations and functions",
+        "mathematics",
+        "chapter 2",
+        "class 11",
+        "function"
+      ],
+      "fullText": "Relations and Functions mathematics Class 11 Chapter 2",
+      "keywords": "function"
+    },
+    "11_mathematics_03": {
+      "terms": [
+        "trigonometric functions",
+        "mathematics",
+        "chapter 3",
+        "class 11",
+        "tangent",
+        "angle",
+        "trigonometry"
+      ],
+      "fullText": "Trigonometric Functions mathematics Class 11 Chapter 3",
+      "keywords": "tangent, angle, trigonometry"
+    },
+    "11_mathematics_04": {
+      "terms": [
+        "principle of mathematical induction",
+        "mathematics",
+        "chapter 4",
+        "class 11",
+        "equation"
+      ],
+      "fullText": "Principle of Mathematical Induction mathematics Class 11 Chapter 4",
+      "keywords": "equation"
+    },
+    "11_mathematics_05": {
+      "terms": [
+        "complex numbers and quadratic equations",
+        "mathematics",
+        "chapter 5",
+        "class 11",
+        "graph",
+        "statistics",
+        "equation"
+      ],
+      "fullText": "Complex Numbers and Quadratic Equations mathematics Class 11 Chapter 5",
+      "keywords": "graph, statistics, equation"
+    },
+    "11_mathematics_06": {
+      "terms": [
+        "linear inequalities",
+        "mathematics",
+        "chapter 6",
+        "class 11",
+        "permutation",
+        "sequence"
+      ],
+      "fullText": "Linear Inequalities mathematics Class 11 Chapter 6",
+      "keywords": "permutation, sequence"
+    },
+    "11_mathematics_07": {
+      "terms": [
+        "permutations and combinations",
+        "mathematics",
+        "chapter 7",
+        "class 11",
+        "integral"
+      ],
+      "fullText": "Permutations and Combinations mathematics Class 11 Chapter 7",
+      "keywords": "integral"
+    },
+    "11_mathematics_08": {
+      "terms": [
+        "binomial theorem",
+        "mathematics",
+        "chapter 8",
+        "class 11",
+        "sequence",
+        "series",
+        "function"
+      ],
+      "fullText": "Binomial Theorem mathematics Class 11 Chapter 8",
+      "keywords": "sequence, series, function"
+    },
+    "11_mathematics_09": {
+      "terms": [
+        "sequences and series",
+        "mathematics",
+        "chapter 9",
+        "class 11",
+        "tangent",
+        "equation",
+        "angle",
+        "combination",
+        "function"
+      ],
+      "fullText": "Sequences and Series mathematics Class 11 Chapter 9",
+      "keywords": "tangent, equation, angle, combination, function"
+    },
+    "11_mathematics_10": {
+      "terms": [
+        "straight lines",
+        "mathematics",
+        "chapter 10",
+        "class 11",
+        "equation",
+        "angle"
+      ],
+      "fullText": "Straight Lines mathematics Class 11 Chapter 10",
+      "keywords": "equation, angle"
+    },
+    "11_mathematics_11": {
+      "terms": [
+        "conic sections",
+        "mathematics",
+        "chapter 11",
+        "class 11",
+        "coordinate",
+        "angle"
+      ],
+      "fullText": "Conic Sections mathematics Class 11 Chapter 11",
+      "keywords": "coordinate, angle"
+    },
+    "11_mathematics_12": {
+      "terms": [
+        "introduction to three dimensional geometry",
+        "mathematics",
+        "chapter 12",
+        "class 11",
+        "tangent",
+        "limit",
+        "derivative",
+        "function",
+        "graph"
+      ],
+      "fullText": "Introduction to Three Dimensional Geometry mathematics Class 11 Chapter 12",
+      "keywords": "tangent, limit, derivative, function, graph"
+    },
+    "11_mathematics_13": {
+      "terms": [
+        "limits and derivatives",
+        "mathematics",
+        "chapter 13",
+        "class 11",
+        "statistics",
+        "series"
+      ],
+      "fullText": "Limits and Derivatives mathematics Class 11 Chapter 13",
+      "keywords": "statistics, series"
+    },
+    "11_mathematics_14": {
+      "terms": [
+        "mathematical reasoning",
+        "mathematics",
+        "chapter 14",
+        "class 11",
+        "probability"
+      ],
+      "fullText": "Mathematical Reasoning mathematics Class 11 Chapter 14",
+      "keywords": "probability"
+    },
+    "11_physics_01": {
+      "terms": [
+        "physical world",
+        "physics",
+        "chapter 1",
+        "class 11",
+        "light",
+        "oscillation",
+        "electric",
+        "temperature",
+        "current"
+      ],
+      "fullText": "Physical World physics Class 11 Chapter 1",
+      "keywords": "light, oscillation, electric, temperature, current"
+    },
+    "11_physics_02": {
+      "terms": [
+        "units and measurements",
+        "physics",
+        "chapter 2",
+        "class 11",
+        "motion",
+        "velocity",
+        "acceleration"
+      ],
+      "fullText": "Units and Measurements physics Class 11 Chapter 2",
+      "keywords": "motion, velocity, acceleration"
+    },
+    "11_physics_03": {
+      "terms": [
+        "motion in a straight line",
+        "physics",
+        "chapter 3",
+        "class 11",
+        "light",
+        "motion",
+        "force",
+        "temperature",
+        "velocity"
+      ],
+      "fullText": "Motion in a Straight Line physics Class 11 Chapter 3",
+      "keywords": "light, motion, force, temperature, velocity"
+    },
+    "11_physics_04": {
+      "terms": [
+        "motion in a plane",
+        "physics",
+        "chapter 4",
+        "class 11",
+        "light",
+        "motion",
+        "magnetic",
+        "wave",
+        "electric"
+      ],
+      "fullText": "Motion in a Plane physics Class 11 Chapter 4",
+      "keywords": "light, motion, magnetic, wave, electric"
+    },
+    "11_physics_05": {
+      "terms": [
+        "laws of motion",
+        "physics",
+        "chapter 5",
+        "class 11",
+        "field",
+        "motion",
+        "force",
+        "energy",
+        "velocity"
+      ],
+      "fullText": "Laws of Motion physics Class 11 Chapter 5",
+      "keywords": "field, motion, force, energy, velocity"
+    },
+    "11_physics_06": {
+      "terms": [
+        "work, energy and power",
+        "physics",
+        "chapter 6",
+        "class 11",
+        "motion",
+        "velocity",
+        "momentum",
+        "oscillation"
+      ],
+      "fullText": "Work, Energy and Power physics Class 11 Chapter 6",
+      "keywords": "motion, velocity, momentum, oscillation"
+    },
+    "11_physics_07": {
+      "terms": [
+        "system of particles and rotational motion",
+        "physics",
+        "chapter 7",
+        "class 11",
+        "motion",
+        "energy",
+        "force",
+        "momentum",
+        "velocity"
+      ],
+      "fullText": "System of Particles and Rotational Motion physics Class 11 Chapter 7",
+      "keywords": "motion, energy, force, momentum, velocity"
+    },
+    "11_physics_08": {
+      "terms": [
+        "gravitation",
+        "physics",
+        "chapter 8",
+        "class 11",
+        "motion",
+        "light",
+        "force"
+      ],
+      "fullText": "Gravitation physics Class 11 Chapter 8",
+      "keywords": "motion, light, force"
+    },
+    "11_physics_09": {
+      "terms": [
+        "mechanical properties of solids",
+        "physics",
+        "chapter 9",
+        "class 11",
+        "acceleration",
+        "light",
+        "force",
+        "temperature"
+      ],
+      "fullText": "Mechanical Properties of Solids physics Class 11 Chapter 9",
+      "keywords": "acceleration, light, force, temperature"
+    },
+    "11_physics_10": {
+      "terms": [
+        "mechanical properties of fluids",
+        "physics",
+        "chapter 10",
+        "class 11",
+        "heat",
+        "energy",
+        "temperature"
+      ],
+      "fullText": "Mechanical Properties of Fluids physics Class 11 Chapter 10",
+      "keywords": "heat, energy, temperature"
+    },
+    "11_physics_11": {
+      "terms": [
+        "thermal properties of matter",
+        "physics",
+        "chapter 11",
+        "class 11",
+        "heat",
+        "entropy",
+        "temperature",
+        "motion",
+        "thermodynamics"
+      ],
+      "fullText": "Thermal Properties of Matter physics Class 11 Chapter 11",
+      "keywords": "heat, entropy, temperature, motion, thermodynamics"
+    },
+    "11_physics_12": {
+      "terms": [
+        "thermodynamics",
+        "physics",
+        "chapter 12",
+        "class 11",
+        "motion",
+        "heat",
+        "energy",
+        "temperature"
+      ],
+      "fullText": "Thermodynamics physics Class 11 Chapter 12",
+      "keywords": "motion, heat, energy, temperature"
+    },
+    "11_physics_13": {
+      "terms": [
+        "kinetic theory",
+        "physics",
+        "chapter 13",
+        "class 11",
+        "frequency",
+        "light",
+        "temperature",
+        "voltage",
+        "oscillation"
+      ],
+      "fullText": "Kinetic Theory physics Class 11 Chapter 13",
+      "keywords": "frequency, light, temperature, voltage, oscillation"
+    },
+    "11_physics_14": {
+      "terms": [
+        "oscillations",
+        "physics",
+        "chapter 14",
+        "class 11",
+        "reflection",
+        "light",
+        "oscillation",
+        "motion",
+        "magnetic"
+      ],
+      "fullText": "Oscillations physics Class 11 Chapter 14",
+      "keywords": "reflection, light, oscillation, motion, magnetic"
+    },
+    "12_chemistry_01": {
+      "terms": [
+        "solutions",
+        "chemistry",
+        "chapter 1",
+        "class 12",
+        "hydrogen",
+        "ionic",
+        "acid"
+      ],
+      "fullText": "Solutions chemistry Class 12 Chapter 1",
+      "keywords": "hydrogen, ionic, acid"
+    },
+    "12_chemistry_02": {
+      "terms": [
+        "electrochemistry",
+        "chemistry",
+        "chapter 2",
+        "class 12",
+        "redox",
+        "reaction",
+        "oxidation",
+        "metallic",
+        "salt"
+      ],
+      "fullText": "Electrochemistry chemistry Class 12 Chapter 2",
+      "keywords": "redox, reaction, oxidation, metallic, salt"
+    },
+    "12_chemistry_03": {
+      "terms": [
+        "chemical kinetics",
+        "chemistry",
+        "chapter 3",
+        "class 12",
+        "equilibrium",
+        "reaction",
+        "ionic"
+      ],
+      "fullText": "Chemical Kinetics chemistry Class 12 Chapter 3",
+      "keywords": "equilibrium, reaction, ionic"
+    },
+    "12_chemistry_04": {
+      "terms": [
+        "the d- and f- block elements",
+        "chemistry",
+        "chapter 4",
+        "class 12",
+        "oxidation",
+        "atom",
+        "metallic",
+        "element",
+        "ionic"
+      ],
+      "fullText": "The d- and f- Block Elements chemistry Class 12 Chapter 4",
+      "keywords": "oxidation, atom, metallic, element, ionic"
+    },
+    "12_chemistry_05": {
+      "terms": [
+        "coordination compounds",
+        "chemistry",
+        "chapter 5",
+        "class 12",
+        "reaction",
+        "atom",
+        "oxidation",
+        "salt",
+        "bond"
+      ],
+      "fullText": "Coordination Compounds chemistry Class 12 Chapter 5",
+      "keywords": "reaction, atom, oxidation, salt, bond"
+    },
+    "12_chemistry_06": {
+      "terms": [
+        "the p-block elements",
+        "chemistry",
+        "chapter 6",
+        "class 12",
+        "reaction",
+        "atom",
+        "metallic",
+        "hydrocarbon",
+        "bond"
+      ],
+      "fullText": "The p-Block Elements chemistry Class 12 Chapter 6",
+      "keywords": "reaction, atom, metallic, hydrocarbon, bond"
+    },
+    "12_chemistry_07": {
+      "terms": [
+        "aldehydes, ketones and carboxylic acids",
+        "chemistry",
+        "chapter 7",
+        "class 12",
+        "atom",
+        "hydrocarbon",
+        "compound",
+        "bond",
+        "hydrogen"
+      ],
+      "fullText": "Aldehydes, Ketones and Carboxylic Acids chemistry Class 12 Chapter 7",
+      "keywords": "atom, hydrocarbon, compound, bond, hydrogen"
+    },
+    "12_chemistry_08": {
+      "terms": [
+        "amines",
+        "chemistry",
+        "chapter 8",
+        "class 12",
+        "reaction",
+        "atom",
+        "oxidation",
+        "bond",
+        "base"
+      ],
+      "fullText": "Amines chemistry Class 12 Chapter 8",
+      "keywords": "reaction, atom, oxidation, bond, base"
+    },
+    "12_chemistry_09": {
+      "terms": [
+        "biomolecules",
+        "chemistry",
+        "chapter 9",
+        "class 12",
+        "reaction",
+        "atom",
+        "salt",
+        "compound",
+        "bond"
+      ],
+      "fullText": "Biomolecules chemistry Class 12 Chapter 9",
+      "keywords": "reaction, atom, salt, compound, bond"
+    },
+    "12_chemistry_10": {
+      "terms": [
+        "polymers",
+        "chemistry",
+        "chapter 10",
+        "class 12",
+        "reaction",
+        "atom",
+        "oxidation",
+        "compound",
+        "acid"
+      ],
+      "fullText": "Polymers chemistry Class 12 Chapter 10",
+      "keywords": "reaction, atom, oxidation, compound, acid"
+    },
+    "12_mathematics_01": {
+      "terms": [
+        "rela tions and functions lejeune dirichlet (1 8",
+        "mathematics",
+        "chapter 1",
+        "class 12",
+        "concepts",
+        "methods",
+        "applications",
+        "problem solving"
+      ],
+      "fullText": "RELA TIONS AND FUNCTIONS Lejeune Dirichlet (1 8 mathematics Class 12 Chapter 1",
+      "keywords": "Concepts, Methods, Applications, Problem Solving"
+    },
+    "12_mathematics_02": {
+      "terms": [
+        "chapter 2",
+        "mathematics",
+        "chapter 2",
+        "class 12",
+        "cosine",
+        "tangent",
+        "integral",
+        "sine",
+        "function"
+      ],
+      "fullText": "Chapter 2 mathematics Class 12 Chapter 2",
+      "keywords": "cosine, tangent, integral, sine, function"
+    },
+    "12_mathematics_03": {
+      "terms": [
+        "matrices reprint 2 0 2 5-2 6 matri",
+        "mathematics",
+        "chapter 3",
+        "class 12",
+        "matrix"
+      ],
+      "fullText": "MATRICES Reprint 2 0 2 5-2 6 MATRI mathematics Class 12 Chapter 3",
+      "keywords": "matrix"
+    },
+    "12_mathematics_04": {
+      "terms": [
+        "determinants p",
+        "mathematics",
+        "chapter 4",
+        "class 12",
+        "matrix",
+        "determinant",
+        "function"
+      ],
+      "fullText": "Determinants P mathematics Class 12 Chapter 4",
+      "keywords": "matrix, determinant, function"
+    },
+    "12_mathematics_05": {
+      "terms": [
+        "continuity and differentiability sir issac newton (1 6",
+        "mathematics",
+        "chapter 5",
+        "class 12",
+        "graph",
+        "continuity",
+        "limit",
+        "function"
+      ],
+      "fullText": "CONTINUITY AND DIFFERENTIABILITY Sir Issac Newton (1 6 mathematics Class 12 Chapter 5",
+      "keywords": "graph, continuity, limit, function"
+    },
+    "12_mathematics_06": {
+      "terms": [
+        "chapter 6",
+        "mathematics",
+        "chapter 6",
+        "class 12",
+        "tangent",
+        "derivative",
+        "function",
+        "coordinate",
+        "graph"
+      ],
+      "fullText": "Chapter 6 mathematics Class 12 Chapter 6",
+      "keywords": "tangent, derivative, function, coordinate, graph"
+    },
+    "12_mathematics_08": {
+      "terms": [
+        "chapter 8",
+        "mathematics",
+        "chapter 8",
+        "class 12",
+        "probability",
+        "tangent",
+        "integral",
+        "derivative",
+        "function"
+      ],
+      "fullText": "Chapter 8 mathematics Class 12 Chapter 8",
+      "keywords": "probability, tangent, integral, derivative, function"
+    },
+    "12_mathematics_09": {
+      "terms": [
+        "chapter 9",
+        "mathematics",
+        "chapter 9",
+        "class 12",
+        "limit",
+        "integral"
+      ],
+      "fullText": "Chapter 9 mathematics Class 12 Chapter 9",
+      "keywords": "limit, integral"
+    },
+    "12_mathematics_10": {
+      "terms": [
+        "chapter 10",
+        "mathematics",
+        "chapter 10",
+        "class 12",
+        "derivative",
+        "equation",
+        "integral",
+        "function"
+      ],
+      "fullText": "Chapter 10 mathematics Class 12 Chapter 10",
+      "keywords": "derivative, equation, integral, function"
+    },
+    "12_mathematics_11": {
+      "terms": [
+        "chapter 11",
+        "mathematics",
+        "chapter 11",
+        "class 12",
+        "coordinate",
+        "vector",
+        "cosine"
+      ],
+      "fullText": "Chapter 11 mathematics Class 12 Chapter 11",
+      "keywords": "coordinate, vector, cosine"
+    },
+    "12_mathematics_12": {
+      "terms": [
+        "chapter 12",
+        "mathematics",
+        "chapter 12",
+        "class 12",
+        "vector",
+        "cosine",
+        "equation",
+        "angle",
+        "coordinate"
+      ],
+      "fullText": "Chapter 12 mathematics Class 12 Chapter 12",
+      "keywords": "vector, cosine, equation, angle, coordinate"
+    },
+    "12_mathematics_13": {
+      "terms": [
+        "chapter 13",
+        "mathematics",
+        "chapter 13",
+        "class 12",
+        "graph",
+        "combination",
+        "function"
+      ],
+      "fullText": "Chapter 13 mathematics Class 12 Chapter 13",
+      "keywords": "graph, combination, function"
+    },
+    "12_mathematics_14": {
+      "terms": [
+        "chapter 14",
+        "mathematics",
+        "chapter 14",
+        "class 12",
+        "probability",
+        "function"
+      ],
+      "fullText": "Chapter 14 mathematics Class 12 Chapter 14",
+      "keywords": "probability, function"
+    },
+    "12_physics_01": {
+      "terms": [
+        "electric charges and fields 1",
+        "physics",
+        "chapter 1",
+        "class 12",
+        "field",
+        "light",
+        "electric",
+        "force",
+        "current"
+      ],
+      "fullText": "Electric Charges And Fields 1 physics Class 12 Chapter 1",
+      "keywords": "field, light, electric, force, current"
+    },
+    "12_physics_02": {
+      "terms": [
+        "electrostatic potential and capacitance reprint 2 0 2",
+        "physics",
+        "chapter 2",
+        "class 12",
+        "field",
+        "electric",
+        "force",
+        "energy",
+        "acceleration"
+      ],
+      "fullText": "ELECTROSTATIC POTENTIAL AND CAPACITANCE Reprint 2 0 2 physics Class 12 Chapter 2",
+      "keywords": "field, electric, force, energy, acceleration"
+    },
+    "12_physics_03": {
+      "terms": [
+        "current electricity reprint 2 0 2 5-2 6",
+        "physics",
+        "chapter 3",
+        "class 12",
+        "field",
+        "heat",
+        "voltage",
+        "motion",
+        "magnetic"
+      ],
+      "fullText": "CURRENT ELECTRICITY Reprint 2 0 2 5-2 6 physics Class 12 Chapter 3",
+      "keywords": "field, heat, voltage, motion, magnetic"
+    },
+    "12_physics_04": {
+      "terms": [
+        "moving charges and magnetism reprint 2 0 2",
+        "physics",
+        "chapter 4",
+        "class 12",
+        "field",
+        "light",
+        "current",
+        "magnetic",
+        "electric"
+      ],
+      "fullText": "MOVING CHARGES AND MAGNETISM Reprint 2 0 2 physics Class 12 Chapter 4",
+      "keywords": "field, light, current, magnetic, electric"
+    },
+    "12_physics_05": {
+      "terms": [
+        "magnetism and matter reprint 2 0 2 5-2",
+        "physics",
+        "chapter 5",
+        "class 12",
+        "field",
+        "magnetic",
+        "electric",
+        "energy",
+        "force"
+      ],
+      "fullText": "MAGNETISM AND MATTER Reprint 2 0 2 5-2 physics Class 12 Chapter 5",
+      "keywords": "field, magnetic, electric, energy, force"
+    },
+    "12_physics_06": {
+      "terms": [
+        "electromagnetic induction reprint 2 0 2 5-2 6",
+        "physics",
+        "chapter 6",
+        "class 12",
+        "field",
+        "light",
+        "motion",
+        "magnetic",
+        "electric"
+      ],
+      "fullText": "ELECTROMAGNETIC INDUCTION Reprint 2 0 2 5-2 6 physics Class 12 Chapter 6",
+      "keywords": "field, light, motion, magnetic, electric"
+    },
+    "12_physics_07": {
+      "terms": [
+        "alternating current *the phrases ac voltage and ac",
+        "physics",
+        "chapter 7",
+        "class 12",
+        "field",
+        "light",
+        "voltage",
+        "magnetic",
+        "electric"
+      ],
+      "fullText": "ALTERNATING CURRENT *The phrases ac voltage and ac physics Class 12 Chapter 7",
+      "keywords": "field, light, voltage, magnetic, electric"
+    },
+    "12_physics_08": {
+      "terms": [
+        "electromagnetic waves 8",
+        "physics",
+        "chapter 8",
+        "class 12",
+        "field",
+        "light",
+        "oscillation",
+        "motion",
+        "magnetic"
+      ],
+      "fullText": "Electromagnetic Waves 8 physics Class 12 Chapter 8",
+      "keywords": "field, light, oscillation, motion, magnetic"
+    },
+    "12_physics_09": {
+      "terms": [
+        "chapter 9",
+        "physics",
+        "chapter 9",
+        "class 12",
+        "field",
+        "reflection",
+        "light",
+        "interference",
+        "refraction"
+      ],
+      "fullText": "Chapter 9 physics Class 12 Chapter 9",
+      "keywords": "field, reflection, light, interference, refraction"
+    },
+    "12_physics_10": {
+      "terms": [
+        "chapter 10",
+        "physics",
+        "chapter 10",
+        "class 12",
+        "field",
+        "light",
+        "voltage",
+        "magnetic",
+        "electric"
+      ],
+      "fullText": "Chapter 10 physics Class 12 Chapter 10",
+      "keywords": "field, light, voltage, magnetic, electric"
+    },
+    "12_physics_11": {
+      "terms": [
+        "chapter 11",
+        "physics",
+        "chapter 11",
+        "class 12",
+        "field",
+        "light",
+        "motion",
+        "electric",
+        "energy"
+      ],
+      "fullText": "Chapter 11 physics Class 12 Chapter 11",
+      "keywords": "field, light, motion, electric, energy"
+    },
+    "12_physics_12": {
+      "terms": [
+        "chapter 12",
+        "physics",
+        "chapter 12",
+        "class 12",
+        "light",
+        "force",
+        "energy",
+        "momentum",
+        "velocity"
+      ],
+      "fullText": "Chapter 12 physics Class 12 Chapter 12",
+      "keywords": "light, force, energy, momentum, velocity"
+    },
+    "12_physics_13": {
+      "terms": [
+        "chapter 13",
+        "physics",
+        "chapter 13",
+        "class 12",
+        "heat",
+        "light",
+        "voltage",
+        "motion",
+        "energy"
+      ],
+      "fullText": "Chapter 13 physics Class 12 Chapter 13",
+      "keywords": "heat, light, voltage, motion, energy"
+    }
+  },
+  "practiceMode": {
+    "chapterSelection": {
+      "11_chemistry": {
+        "subject": "chemistry",
+        "class": "11",
+        "displayName": "Class 11 Chemistry",
+        "chapters": [
+          {
+            "id": "11_chemistry_01",
+            "number": 1,
+            "name": "Some Basic Concepts of Chemistry",
+            "difficulty": "easy",
+            "topics": [
+              "salt",
+              "compound",
+              "base",
+              "element",
+              "acid"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_02",
+            "number": 2,
+            "name": "Structure of Atom",
+            "difficulty": "easy",
+            "topics": [
+              "hydrogen",
+              "atom"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_03",
+            "number": 3,
+            "name": "Classification of Elements and Periodicity in Properties",
+            "difficulty": "medium",
+            "topics": [
+              "atom",
+              "metallic",
+              "element",
+              "inorganic",
+              "ionic"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_04",
+            "number": 4,
+            "name": "Chemical Bonding and Molecular Structure",
+            "difficulty": "medium",
+            "topics": [
+              "atom",
+              "compound",
+              "bond",
+              "element",
+              "covalent"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_05",
+            "number": 5,
+            "name": "States of Matter",
+            "difficulty": "medium",
+            "topics": [
+              "reaction",
+              "equilibrium"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_06",
+            "number": 6,
+            "name": "Thermodynamics",
+            "difficulty": "medium",
+            "topics": [
+              "reaction",
+              "salt",
+              "base",
+              "equilibrium",
+              "acid"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_07",
+            "number": 7,
+            "name": "Equilibrium",
+            "difficulty": "hard",
+            "topics": [
+              "redox",
+              "reaction",
+              "atom",
+              "oxidation",
+              "metallic"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_08",
+            "number": 8,
+            "name": "Redox Reactions",
+            "difficulty": "hard",
+            "topics": [
+              "reaction",
+              "atom",
+              "compound",
+              "bond",
+              "element"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_chemistry_09",
+            "number": 9,
+            "name": "Hydrogen",
+            "difficulty": "hard",
+            "topics": [
+              "atom",
+              "hydrocarbon",
+              "bond",
+              "hydrogen",
+              "organic"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 9
+      },
+      "11_mathematics": {
+        "subject": "mathematics",
+        "class": "11",
+        "displayName": "Class 11 Mathematics",
+        "chapters": [
+          {
+            "id": "11_mathematics_01",
+            "number": 1,
+            "name": "Sets",
+            "difficulty": "easy",
+            "topics": [
+              "probability",
+              "series",
+              "equation"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_02",
+            "number": 2,
+            "name": "Relations and Functions",
+            "difficulty": "easy",
+            "topics": [
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_03",
+            "number": 3,
+            "name": "Trigonometric Functions",
+            "difficulty": "easy",
+            "topics": [
+              "tangent",
+              "angle",
+              "trigonometry"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_04",
+            "number": 4,
+            "name": "Principle of Mathematical Induction",
+            "difficulty": "easy",
+            "topics": [
+              "equation"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_05",
+            "number": 5,
+            "name": "Complex Numbers and Quadratic Equations",
+            "difficulty": "medium",
+            "topics": [
+              "graph",
+              "statistics",
+              "equation"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_06",
+            "number": 6,
+            "name": "Linear Inequalities",
+            "difficulty": "medium",
+            "topics": [
+              "permutation",
+              "sequence"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_07",
+            "number": 7,
+            "name": "Permutations and Combinations",
+            "difficulty": "medium",
+            "topics": [
+              "integral"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_08",
+            "number": 8,
+            "name": "Binomial Theorem",
+            "difficulty": "medium",
+            "topics": [
+              "sequence",
+              "series",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_09",
+            "number": 9,
+            "name": "Sequences and Series",
+            "difficulty": "medium",
+            "topics": [
+              "tangent",
+              "equation",
+              "angle",
+              "combination",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_10",
+            "number": 10,
+            "name": "Straight Lines",
+            "difficulty": "medium",
+            "topics": [
+              "equation",
+              "angle"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_11",
+            "number": 11,
+            "name": "Conic Sections",
+            "difficulty": "hard",
+            "topics": [
+              "coordinate",
+              "angle"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_12",
+            "number": 12,
+            "name": "Introduction to Three Dimensional Geometry",
+            "difficulty": "hard",
+            "topics": [
+              "tangent",
+              "limit",
+              "derivative",
+              "function",
+              "graph"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_13",
+            "number": 13,
+            "name": "Limits and Derivatives",
+            "difficulty": "hard",
+            "topics": [
+              "statistics",
+              "series"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_mathematics_14",
+            "number": 14,
+            "name": "Mathematical Reasoning",
+            "difficulty": "hard",
+            "topics": [
+              "probability"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 14
+      },
+      "11_physics": {
+        "subject": "physics",
+        "class": "11",
+        "displayName": "Class 11 Physics",
+        "chapters": [
+          {
+            "id": "11_physics_01",
+            "number": 1,
+            "name": "Physical World",
+            "difficulty": "easy",
+            "topics": [
+              "light",
+              "oscillation",
+              "electric",
+              "temperature",
+              "current"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_02",
+            "number": 2,
+            "name": "Units and Measurements",
+            "difficulty": "easy",
+            "topics": [
+              "motion",
+              "velocity",
+              "acceleration"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_03",
+            "number": 3,
+            "name": "Motion in a Straight Line",
+            "difficulty": "easy",
+            "topics": [
+              "light",
+              "motion",
+              "force",
+              "temperature",
+              "velocity"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_04",
+            "number": 4,
+            "name": "Motion in a Plane",
+            "difficulty": "medium",
+            "topics": [
+              "light",
+              "motion",
+              "magnetic",
+              "wave",
+              "electric"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_05",
+            "number": 5,
+            "name": "Laws of Motion",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "motion",
+              "force",
+              "energy",
+              "velocity"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_06",
+            "number": 6,
+            "name": "Work, Energy and Power",
+            "difficulty": "medium",
+            "topics": [
+              "motion",
+              "velocity",
+              "momentum",
+              "oscillation"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_07",
+            "number": 7,
+            "name": "System of Particles and Rotational Motion",
+            "difficulty": "medium",
+            "topics": [
+              "motion",
+              "energy",
+              "force",
+              "momentum",
+              "velocity"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_08",
+            "number": 8,
+            "name": "Gravitation",
+            "difficulty": "medium",
+            "topics": [
+              "motion",
+              "light",
+              "force"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_09",
+            "number": 9,
+            "name": "Mechanical Properties of Solids",
+            "difficulty": "hard",
+            "topics": [
+              "acceleration",
+              "light",
+              "force",
+              "temperature"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_10",
+            "number": 10,
+            "name": "Mechanical Properties of Fluids",
+            "difficulty": "hard",
+            "topics": [
+              "heat",
+              "energy",
+              "temperature"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_11",
+            "number": 11,
+            "name": "Thermal Properties of Matter",
+            "difficulty": "hard",
+            "topics": [
+              "heat",
+              "entropy",
+              "temperature",
+              "motion",
+              "thermodynamics"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_12",
+            "number": 12,
+            "name": "Thermodynamics",
+            "difficulty": "hard",
+            "topics": [
+              "motion",
+              "heat",
+              "energy",
+              "temperature"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_13",
+            "number": 13,
+            "name": "Kinetic Theory",
+            "difficulty": "hard",
+            "topics": [
+              "frequency",
+              "light",
+              "temperature",
+              "voltage",
+              "oscillation"
+            ],
+            "available": true
+          },
+          {
+            "id": "11_physics_14",
+            "number": 14,
+            "name": "Oscillations",
+            "difficulty": "hard",
+            "topics": [
+              "reflection",
+              "light",
+              "oscillation",
+              "motion",
+              "magnetic"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 14
+      },
+      "12_chemistry": {
+        "subject": "chemistry",
+        "class": "12",
+        "displayName": "Class 12 Chemistry",
+        "chapters": [
+          {
+            "id": "12_chemistry_01",
+            "number": 1,
+            "name": "Solutions",
+            "difficulty": "easy",
+            "topics": [
+              "hydrogen",
+              "ionic",
+              "acid"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_02",
+            "number": 2,
+            "name": "Electrochemistry",
+            "difficulty": "easy",
+            "topics": [
+              "redox",
+              "reaction",
+              "oxidation",
+              "metallic",
+              "salt"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_03",
+            "number": 3,
+            "name": "Chemical Kinetics",
+            "difficulty": "medium",
+            "topics": [
+              "equilibrium",
+              "reaction",
+              "ionic"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_04",
+            "number": 4,
+            "name": "The d- and f- Block Elements",
+            "difficulty": "medium",
+            "topics": [
+              "oxidation",
+              "atom",
+              "metallic",
+              "element",
+              "ionic"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_05",
+            "number": 5,
+            "name": "Coordination Compounds",
+            "difficulty": "medium",
+            "topics": [
+              "reaction",
+              "atom",
+              "oxidation",
+              "salt",
+              "bond"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_06",
+            "number": 6,
+            "name": "The p-Block Elements",
+            "difficulty": "hard",
+            "topics": [
+              "reaction",
+              "atom",
+              "metallic",
+              "hydrocarbon",
+              "bond"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_07",
+            "number": 7,
+            "name": "Aldehydes, Ketones and Carboxylic Acids",
+            "difficulty": "hard",
+            "topics": [
+              "atom",
+              "hydrocarbon",
+              "compound",
+              "bond",
+              "hydrogen"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_08",
+            "number": 8,
+            "name": "Amines",
+            "difficulty": "hard",
+            "topics": [
+              "reaction",
+              "atom",
+              "oxidation",
+              "bond",
+              "base"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_09",
+            "number": 9,
+            "name": "Biomolecules",
+            "difficulty": "hard",
+            "topics": [
+              "reaction",
+              "atom",
+              "salt",
+              "compound",
+              "bond"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_chemistry_10",
+            "number": 10,
+            "name": "Polymers",
+            "difficulty": "hard",
+            "topics": [
+              "reaction",
+              "atom",
+              "oxidation",
+              "compound",
+              "acid"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 10
+      },
+      "12_mathematics": {
+        "subject": "mathematics",
+        "class": "12",
+        "displayName": "Class 12 Mathematics",
+        "chapters": [
+          {
+            "id": "12_mathematics_01",
+            "number": 1,
+            "name": "RELA TIONS AND FUNCTIONS Lejeune Dirichlet (1 8",
+            "difficulty": "easy",
+            "topics": [
+              "Concepts",
+              "Methods",
+              "Applications",
+              "Problem Solving"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_02",
+            "number": 2,
+            "name": "Chapter 2",
+            "difficulty": "easy",
+            "topics": [
+              "cosine",
+              "tangent",
+              "integral",
+              "sine",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_03",
+            "number": 3,
+            "name": "MATRICES Reprint 2 0 2 5-2 6 MATRI",
+            "difficulty": "easy",
+            "topics": [
+              "matrix"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_04",
+            "number": 4,
+            "name": "Determinants P",
+            "difficulty": "easy",
+            "topics": [
+              "matrix",
+              "determinant",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_05",
+            "number": 5,
+            "name": "CONTINUITY AND DIFFERENTIABILITY Sir Issac Newton (1 6",
+            "difficulty": "medium",
+            "topics": [
+              "graph",
+              "continuity",
+              "limit",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_06",
+            "number": 6,
+            "name": "Chapter 6",
+            "difficulty": "medium",
+            "topics": [
+              "tangent",
+              "derivative",
+              "function",
+              "coordinate",
+              "graph"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_08",
+            "number": 8,
+            "name": "Chapter 8",
+            "difficulty": "medium",
+            "topics": [
+              "probability",
+              "tangent",
+              "integral",
+              "derivative",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_09",
+            "number": 9,
+            "name": "Chapter 9",
+            "difficulty": "medium",
+            "topics": [
+              "limit",
+              "integral"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_10",
+            "number": 10,
+            "name": "Chapter 10",
+            "difficulty": "medium",
+            "topics": [
+              "derivative",
+              "equation",
+              "integral",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_11",
+            "number": 11,
+            "name": "Chapter 11",
+            "difficulty": "hard",
+            "topics": [
+              "coordinate",
+              "vector",
+              "cosine"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_12",
+            "number": 12,
+            "name": "Chapter 12",
+            "difficulty": "hard",
+            "topics": [
+              "vector",
+              "cosine",
+              "equation",
+              "angle",
+              "coordinate"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_13",
+            "number": 13,
+            "name": "Chapter 13",
+            "difficulty": "hard",
+            "topics": [
+              "graph",
+              "combination",
+              "function"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_mathematics_14",
+            "number": 14,
+            "name": "Chapter 14",
+            "difficulty": "hard",
+            "topics": [
+              "probability",
+              "function"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 13
+      },
+      "12_physics": {
+        "subject": "physics",
+        "class": "12",
+        "displayName": "Class 12 Physics",
+        "chapters": [
+          {
+            "id": "12_physics_01",
+            "number": 1,
+            "name": "Electric Charges And Fields 1",
+            "difficulty": "easy",
+            "topics": [
+              "field",
+              "light",
+              "electric",
+              "force",
+              "current"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_02",
+            "number": 2,
+            "name": "ELECTROSTATIC POTENTIAL AND CAPACITANCE Reprint 2 0 2",
+            "difficulty": "easy",
+            "topics": [
+              "field",
+              "electric",
+              "force",
+              "energy",
+              "acceleration"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_03",
+            "number": 3,
+            "name": "CURRENT ELECTRICITY Reprint 2 0 2 5-2 6",
+            "difficulty": "easy",
+            "topics": [
+              "field",
+              "heat",
+              "voltage",
+              "motion",
+              "magnetic"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_04",
+            "number": 4,
+            "name": "MOVING CHARGES AND MAGNETISM Reprint 2 0 2",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "light",
+              "current",
+              "magnetic",
+              "electric"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_05",
+            "number": 5,
+            "name": "MAGNETISM AND MATTER Reprint 2 0 2 5-2",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "magnetic",
+              "electric",
+              "energy",
+              "force"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_06",
+            "number": 6,
+            "name": "ELECTROMAGNETIC INDUCTION Reprint 2 0 2 5-2 6",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "light",
+              "motion",
+              "magnetic",
+              "electric"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_07",
+            "number": 7,
+            "name": "ALTERNATING CURRENT *The phrases ac voltage and ac",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "light",
+              "voltage",
+              "magnetic",
+              "electric"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_08",
+            "number": 8,
+            "name": "Electromagnetic Waves 8",
+            "difficulty": "medium",
+            "topics": [
+              "field",
+              "light",
+              "oscillation",
+              "motion",
+              "magnetic"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_09",
+            "number": 9,
+            "name": "Chapter 9",
+            "difficulty": "hard",
+            "topics": [
+              "field",
+              "reflection",
+              "light",
+              "interference",
+              "refraction"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_10",
+            "number": 10,
+            "name": "Chapter 10",
+            "difficulty": "hard",
+            "topics": [
+              "field",
+              "light",
+              "voltage",
+              "magnetic",
+              "electric"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_11",
+            "number": 11,
+            "name": "Chapter 11",
+            "difficulty": "hard",
+            "topics": [
+              "field",
+              "light",
+              "motion",
+              "electric",
+              "energy"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_12",
+            "number": 12,
+            "name": "Chapter 12",
+            "difficulty": "hard",
+            "topics": [
+              "light",
+              "force",
+              "energy",
+              "momentum",
+              "velocity"
+            ],
+            "available": true
+          },
+          {
+            "id": "12_physics_13",
+            "number": 13,
+            "name": "Chapter 13",
+            "difficulty": "hard",
+            "topics": [
+              "heat",
+              "light",
+              "voltage",
+              "motion",
+              "energy"
+            ],
+            "available": true
+          }
+        ],
+        "totalChapters": 13
+      }
+    },
+    "subjectOverview": {
+      "chemistry": {
+        "name": "Chemistry",
+        "totalChapters": 19,
+        "classes": [
+          "11",
+          "12"
+        ],
+        "difficulty": {
+          "easy": 4,
+          "medium": 7,
+          "hard": 8
+        },
+        "topics": [
+          "salt",
+          "compound",
+          "base",
+          "element",
+          "acid",
+          "hydrogen",
+          "atom",
+          "metallic",
+          "inorganic",
+          "ionic"
+        ],
+        "description": "Chemical principles, reactions, bonding, and molecular structures"
+      },
+      "mathematics": {
+        "name": "Mathematics",
+        "totalChapters": 27,
+        "classes": [
+          "11",
+          "12"
+        ],
+        "difficulty": {
+          "easy": 8,
+          "medium": 11,
+          "hard": 8
+        },
+        "topics": [
+          "probability",
+          "series",
+          "equation",
+          "function",
+          "tangent",
+          "angle",
+          "trigonometry",
+          "graph",
+          "statistics",
+          "permutation"
+        ],
+        "description": "Pure and applied mathematics covering algebra, geometry, calculus, and statistics"
+      },
+      "physics": {
+        "name": "Physics",
+        "totalChapters": 27,
+        "classes": [
+          "11",
+          "12"
+        ],
+        "difficulty": {
+          "easy": 6,
+          "medium": 10,
+          "hard": 11
+        },
+        "topics": [
+          "light",
+          "oscillation",
+          "electric",
+          "temperature",
+          "current",
+          "motion",
+          "velocity",
+          "acceleration",
+          "force",
+          "magnetic"
+        ],
+        "description": "Fundamental principles of mechanics, thermodynamics, waves, and modern physics"
+      }
+    }
+  }
+}
