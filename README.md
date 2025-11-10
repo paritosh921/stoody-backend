@@ -12,14 +12,27 @@ Flask backend server for the SkillBot learning platform with ChromaDB integratio
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Use Python 3.11
+
+This backend must run on **Python 3.11**. Python 3.12 on Windows is known to trigger intermittent TLS handshake errors with MongoDB Atlas. Install Python 3.11 (alongside your existing interpreter if needed), then recreate the virtual environment with that interpreter:
+
+```bash
+# From the project root
+cd backend
+py -3.11 -m venv venv
+venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 2. Install Dependencies
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
 
-### 2. Start the Server
+### 3. Start the Server
 
 ```bash
 # Basic start
@@ -32,7 +45,7 @@ python run.py --debug
 python run.py --port 5001
 ```
 
-### 3. Test the API
+### 4. Test the API
 
 ```bash
 # Health check
