@@ -3,11 +3,17 @@
 
 Write-Host "Starting Stoody Backend Server..." -ForegroundColor Cyan
 
+# Get the directory where this script is located
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Change to the backend directory (where the script is located)
+Set-Location $ScriptDir
+
 # Check if we're in the backend directory
 if (Test-Path "main_async.py") {
     Write-Host "✓ Found main_async.py" -ForegroundColor Green
 } else {
-    Write-Host "✗ Error: main_async.py not found. Please run from backend directory." -ForegroundColor Red
+    Write-Host "✗ Error: main_async.py not found in backend directory." -ForegroundColor Red
     exit 1
 }
 

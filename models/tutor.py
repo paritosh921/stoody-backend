@@ -9,7 +9,7 @@ import random
 import string
 from bson import ObjectId
 from marshmallow import Schema, fields, validate, post_load
-from .mongodb_client import get_collection
+# from .mongodb_client import get_collection
 
 class Tutor:
     """Tutor user model for authentication and student management"""

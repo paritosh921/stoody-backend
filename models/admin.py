@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 import bcrypt
 from bson import ObjectId
 from marshmallow import Schema, fields, validate, post_load
-from .mongodb_client import get_collection
+# from .mongodb_client import get_collection
 
 class Admin:
     """Admin user model for authentication and management"""

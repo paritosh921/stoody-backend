@@ -11,6 +11,7 @@ from chromadb.config import Settings as ChromaSettings
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import ServerSelectionTimeoutError, OperationFailure
 import time
+import certifi
 
 from config_async import (
     CHROMADB_PATH,
@@ -123,8 +124,8 @@ class DatabaseManager:
                     connectTimeoutMS=5000,  # Reduced from 15s to 5s
                     socketTimeoutMS=10000,  # Reduced from 45s to 10s
                     waitQueueTimeoutMS=5000,  # Reduced from 20s to 5s
-                    # Allow TLS handshake in dev environments behind proxies if needed
-                    tlsAllowInvalidCertificates=settings.DEBUG_MODE,
+                    tls=True,
+                    tlsCAFile=certifi.where(),
                 )
 
                 # Get database instance

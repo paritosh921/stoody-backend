@@ -1,6 +1,0 @@
-@echo off
-echo Killing all Python processes...
-taskkill /F /IM python3.12.exe /T
-timeout /t 2
-echo Starting server...
-python main_async.py

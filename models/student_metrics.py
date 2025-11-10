@@ -6,7 +6,7 @@ Provides aggregated metrics and analytics for admin monitoring
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from bson import ObjectId
-from .mongodb_client import get_collection
+# from .mongodb_client import get_collection
 from .student import Student
 from .student_session import StudentSession
 from .student_activity import StudentActivity

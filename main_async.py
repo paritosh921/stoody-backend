@@ -51,7 +51,7 @@ from api.v1.questions_async import router as questions_router
 from api.v1.images_async import router as images_router
 from api.v1.practice_async import router as practice_router
 from api.v1.mcq_async import router as mcq_router
-from api.v1.tutot_async import router as tutor_router
+from api.v1.tutor_async import router as tutor_router
 
 from api.v1.learning_async import router as learning_router
 
