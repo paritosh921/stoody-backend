@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-from pymongo.errors import ServerSelectionTimeoutError, OperationFailure
+from pymongo.errors import ServerSelectionTimeoutError, OperationFailure, ConfigurationError
 import time
 import certifi
 
@@ -142,8 +142,8 @@ class DatabaseManager:
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to ensure indexes: {str(e)}")
 
-            except ServerSelectionTimeoutError:
-                logger.warning("⚠️ MongoDB connection failed - continuing without MongoDB")
+            except (ServerSelectionTimeoutError, ConfigurationError) as e:
+                logger.warning(f"⚠️ MongoDB connection failed ({type(e).__name__}) - continuing without MongoDB")
                 self.mongo_client = None
                 self.mongo_db = None
             except Exception as e:
