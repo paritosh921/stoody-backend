@@ -1587,15 +1587,38 @@ async def get_student_practice_sets(
 
             # Format response
             practice_sets_list = []
+            user_id = current_user["user_id"]
+
             for doc in practice_sets:
+                doc_id = doc["document_id"]
+
+                # Check if admin has attempted/completed this practice set
+                # For practice sets, we check practice_sessions collection by document_id
+                sessions = await db.mongo_find(
+                    "practice_sessions",
+                    {
+                        "student_id": user_id,
+                        "document_id": doc_id
+                    },
+                    sort=[("started_at", -1)],
+                    limit=10
+                )
+
+                # Consider completed if any session for THIS specific practice set is completed
+                has_attempted = len(sessions) > 0
+                completed = any(s.get("is_completed", False) for s in sessions)
+
                 practice_sets_list.append({
-                    "document_id": doc["document_id"],
+                    "document_id": doc_id,
                     "title": doc["title"],
                     "subject": doc["subject"],
                     "difficulty": doc["difficulty"],
                     "course_plan": doc.get("course_plan"),
                     "standard": doc.get("standard"),
-                    "extracted_questions_count": doc.get("extracted_questions_count", 0)
+                    "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                    "completed": completed,
+                    "attempted": has_attempted,
+                    "session_count": len(sessions)
                 })
 
             return {
@@ -1704,15 +1727,55 @@ async def get_student_practice_sets(
 
         # Format response - only include necessary fields for security
         practice_sets_list = []
+        user_id = current_user["user_id"]
+
         for doc in practice_sets:
+            doc_id = doc["document_id"]
+
+            # Check if student has attempted/completed this practice set
+            # For practice sets, we check practice_sessions collection by document_id
+            sessions = await db.mongo_find(
+                "practice_sessions",
+                {
+                    "student_id": user_id,
+                    "document_id": doc_id
+                },
+                sort=[("started_at", -1)],
+                limit=10
+            )
+
+            # Consider completed if any session for THIS specific practice set is completed
+            has_attempted = len(sessions) > 0
+            completed = any(s.get("is_completed", False) for s in sessions)
+
+            # Get latest session stats if available
+            latest_session = None
+            if sessions:
+                latest = sessions[0]
+                accuracy_rate = 0.0
+                if latest.get("questions_attempted", 0) > 0:
+                    accuracy_rate = (latest.get("correct_answers", 0) / latest["questions_attempted"]) * 100
+
+                latest_session = {
+                    "questions_attempted": latest.get("questions_attempted", 0),
+                    "correct_answers": latest.get("correct_answers", 0),
+                    "accuracy_rate": round(accuracy_rate, 1),
+                    "started_at": latest.get("started_at").isoformat() if latest.get("started_at") else None,
+                    "is_completed": latest.get("is_completed", False)
+                }
+
             practice_sets_list.append({
-                "document_id": doc["document_id"],
+                "document_id": doc_id,
                 "title": doc["title"],
                 "subject": doc["subject"],
                 "difficulty": doc["difficulty"],
                 "course_plan": doc.get("course_plan"),
                 "standard": doc.get("standard"),
-                "extracted_questions_count": doc.get("extracted_questions_count", 0)
+                "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                "completed": completed,
+                "attempted": has_attempted,
+                "session_count": len(sessions),
+                "latest_session": latest_session
             })
 
         return {

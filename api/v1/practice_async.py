@@ -56,6 +56,7 @@ class StartSessionRequest(BaseModel):
     subject: Optional[str] = None
     difficulty: Optional[str] = None
     time_limit: Optional[int] = Field(None, ge=1)  # in minutes
+    document_id: Optional[str] = None  # Practice set document ID
 
 class SessionResponse(BaseModel):
     id: str
@@ -874,6 +875,7 @@ async def start_practice_session(
             "subject": session_data.subject,
             "difficulty": session_data.difficulty,
             "time_limit": session_data.time_limit,
+            "document_id": session_data.document_id,  # Track which practice set
             "questions_attempted": 0,
             "correct_answers": 0,
             "total_time_spent": 0,

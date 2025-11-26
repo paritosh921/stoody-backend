@@ -439,19 +439,51 @@ async def get_test_series_list(
 
         documents = await db.mongo_find("documents", filter_query, sort=[("title", 1)])
         if documents:
-            test_series_list = [{
-                "document_id": doc.get("document_id"),
-                "title": doc.get("title"),
-                "subject": doc.get("subject"),
-                "standard": doc.get("standard"),
-                "course_plan": doc.get("course_plan"),
-                "difficulty": doc.get("difficulty"),
-                "questions_count": doc.get("extracted_questions_count", 0),
-                "total_points": doc.get("total_points", 0),
-                "total_minutes": doc.get("total_minutes", 0),
-                "is_validated": doc.get("is_validated", False),
-                "file_exists": True  # assume available if listed
-            } for doc in documents]
+            test_series_list = []
+            user_id = current_user["user_id"]
+
+            for doc in documents:
+                doc_id = doc.get("document_id")
+
+                # Check if student has attempted this test
+                attempts = await db.mongo_find(
+                    "student_test_attempts",
+                    {
+                        "student_id": user_id,
+                        "document_id": doc_id
+                    },
+                    sort=[("submitted_at", -1)]
+                )
+
+                has_attempted = len(attempts) > 0
+                attempt_count = len(attempts)
+                latest_attempt = None
+
+                if has_attempted:
+                    latest_attempt = {
+                        "attempt_id": str(attempts[0]["_id"]),
+                        "score": attempts[0].get("score", 0),
+                        "total_points": attempts[0].get("total_points", 0),
+                        "percentage": attempts[0].get("percentage", 0),
+                        "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
+                    }
+
+                test_series_list.append({
+                    "document_id": doc_id,
+                    "title": doc.get("title"),
+                    "subject": doc.get("subject"),
+                    "standard": doc.get("standard"),
+                    "course_plan": doc.get("course_plan"),
+                    "difficulty": doc.get("difficulty"),
+                    "questions_count": doc.get("extracted_questions_count", 0),
+                    "total_points": doc.get("total_points", 0),
+                    "total_minutes": doc.get("total_minutes", 0),
+                    "is_validated": doc.get("is_validated", False),
+                    "file_exists": True,  # assume available if listed
+                    "attempted": has_attempted,
+                    "attempt_count": attempt_count,
+                    "latest_attempt": latest_attempt
+                })
 
             return {
                 "success": True,
@@ -496,9 +528,38 @@ async def get_test_series_list(
                     "total_points": 0,
                     "total_minutes": 0,
                     "is_validated": False,
-                    "file_exists": False
+                    "file_exists": False,
+                    "attempted": False,
+                    "attempt_count": 0,
+                    "latest_attempt": None
                 }
             unique_docs[doc_id]["questions_count"] += 1
+
+        # Check attempt status for each test (ChromaDB fallback)
+        user_id = current_user["user_id"]
+        for doc_id in unique_docs.keys():
+            attempts = await db.mongo_find(
+                "student_test_attempts",
+                {
+                    "student_id": user_id,
+                    "document_id": doc_id
+                },
+                sort=[("submitted_at", -1)]
+            )
+
+            has_attempted = len(attempts) > 0
+            attempt_count = len(attempts)
+
+            if has_attempted:
+                unique_docs[doc_id]["attempted"] = True
+                unique_docs[doc_id]["attempt_count"] = attempt_count
+                unique_docs[doc_id]["latest_attempt"] = {
+                    "attempt_id": str(attempts[0]["_id"]),
+                    "score": attempts[0].get("score", 0),
+                    "total_points": attempts[0].get("total_points", 0),
+                    "percentage": attempts[0].get("percentage", 0),
+                    "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
+                }
 
         test_series_list = list(unique_docs.values())
         if not test_series_list or (len(test_series_list) == 1 and test_series_list[0].get("document_id") in (None, "", "unknown")):
@@ -513,7 +574,10 @@ async def get_test_series_list(
                 "total_points": 0,
                 "total_minutes": 0,
                 "is_validated": False,
-                "file_exists": False
+                "file_exists": False,
+                "attempted": False,
+                "attempt_count": 0,
+                "latest_attempt": None
             }]
 
         return {
@@ -1568,7 +1632,7 @@ async def check_test_attempt(
         if has_attempted:
             # Check if admin has enabled re-attempt for this student
             latest_attempt = attempts[0]
-            can_attempt = latest_attempt.get("can_reattempt", False)
+            can_attempt = True  # Always allow attempts on learning platform
 
         return {
             "success": True,
@@ -1720,7 +1784,7 @@ async def submit_test_series(
             "total_minutes": document.get("total_minutes", 0),
             "answers": student_answers,
             "question_results": question_results,
-            "can_reattempt": False,  # Admin can enable this later
+            "can_reattempt": True,  # Allow unlimited practice
             "submitted_at": datetime.utcnow()
         }
 
