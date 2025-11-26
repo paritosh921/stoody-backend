@@ -83,6 +83,10 @@ async def get_course_structure(
         # Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
+        try:
+            admin_id = ObjectId(admin_id)
+        except Exception:
+            pass
 
         user_type = current_user.get("user_type", "student")
 
@@ -136,6 +140,9 @@ async def get_course_structure(
         # Organize by standard and subject
         standards_set = set()
         subjects_by_standard: Dict[str, set] = {}
+        
+        # Organize by subject for dashboard
+        dashboard_stats: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
         for doc in documents:
             std = doc.get("standard")
@@ -146,6 +153,18 @@ async def get_course_structure(
                 if std not in subjects_by_standard:
                     subjects_by_standard[std] = set()
                 subjects_by_standard[std].add(subj)
+            
+            # Add to dashboard stats
+            if subj:
+                if subj not in dashboard_stats:
+                    dashboard_stats[subj] = {"chapters": []}
+                
+                dashboard_stats[subj]["chapters"].append({
+                    "id": str(doc["_id"]),
+                    "title": doc.get("title"),
+                    "subject": subj,
+                    "standard": std
+                })
 
         # Convert sets to sorted lists
         standards = sorted(list(standards_set))
@@ -158,7 +177,8 @@ async def get_course_structure(
             "success": True,
             "data": {
                 "standards": standards,
-                "subjects": subjects_dict
+                "subjects": subjects_dict,
+                "dashboard_stats": dashboard_stats
             }
         }
 
@@ -195,6 +215,10 @@ async def get_chapters(
         # Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
+        try:
+            admin_id = ObjectId(admin_id)
+        except Exception:
+            pass
 
         user_type = current_user.get("user_type", "student")
 
@@ -308,6 +332,10 @@ async def get_document_metadata(
         # Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
+        try:
+            admin_id = ObjectId(admin_id)
+        except Exception:
+            pass
 
         # Get document from database (document_id is MongoDB's _id as string, filtered by admin_id)
         document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
@@ -415,6 +443,10 @@ async def get_chapter_pdf(
         # Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
+        try:
+            admin_id = ObjectId(admin_id)
+        except Exception:
+            pass
 
         # Get document from database (document_id is MongoDB's _id as string, filtered by admin_id)
         document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
