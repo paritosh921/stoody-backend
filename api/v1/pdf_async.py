@@ -66,8 +66,8 @@ class ExtractedQuestion(BaseModel):
     correct_answer: Optional[str] = None
     images: List[Dict[str, Any]] = []
     metadata: Dict[str, Any] = {}
-    points: Optional[float] = 1.0  # Default 1 point for Test Series
-    penalty: Optional[float] = 0.0  # Default 0 penalty
+    points: Optional[float] = 4.0  # Default 4 points for Test Series (JEE style)
+    penalty: Optional[float] = 1.0  # Default 1 penalty (JEE style)
 
 class PDFProcessingResult(BaseModel):
     job_id: str
@@ -101,8 +101,8 @@ class Question(BaseModel):
     options: List[str] = []
     correct_answer: Optional[str] = None
     metadata: Dict[str, Any] = {}
-    points: Optional[float] = 1.0
-    penalty: Optional[float] = 0.0
+    points: Optional[float] = 4.0
+    penalty: Optional[float] = 1.0
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Dependency to require admin access"""

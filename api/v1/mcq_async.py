@@ -1714,7 +1714,12 @@ async def submit_test_series(
         incorrect_count = 0
         unanswered_count = 0
         score = 0
+        
+        # Calculate total_points from document, or sum from questions if not set
         total_points = document.get("total_points", 0)
+        if total_points == 0:
+            # Calculate from actual questions
+            total_points = sum(q.get("points", 4) for q in questions)
 
         question_results = []
 
@@ -1726,8 +1731,8 @@ async def submit_test_series(
             else:
                 correct_answer = ""
             student_answer = student_answers.get(question_id, "").strip()
-            question_points = question.get("points", 1)
-            penalty_marks = question.get("penalty_marks", 0)  # Get penalty from question
+            question_points = question.get("points", 4)
+            penalty_marks = question.get("penalty", question.get("penalty_marks", 1))  # Get penalty from question, default to 1
 
             is_correct = False
             is_attempted = bool(student_answer)
