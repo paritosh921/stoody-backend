@@ -557,96 +557,96 @@ async def evaluate_submission(
         reasoning = ""
         raw_canvas_response = ""
 
+        # Initialize AI service and support images
+        from services.async_openai_service import AsyncOpenAIService
+        ai = AsyncOpenAIService()
+        support_images: list[str] = []
+
+        # Load support images (question figures and option images)
+        # First, try to get question_figures with their base64Data
+        for fig_ref in (question_doc.get("question_figures", []) or []):
+            if len(support_images) >= 4:  # Increased limit to 4
+                break
+            try:
+                base64_data = None
+                if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
+                    base64_data = fig_ref["base64Data"]
+                    logger.info(f"Using embedded base64Data from question_figures (length: {len(base64_data)})")
+                else:
+                    fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
+                    img_doc = await db.mongo_find_one("images", {"_id": fig_id})
+                    if img_doc:
+                        if img_doc.get("base64Data"):
+                            base64_data = img_doc["base64Data"]
+                            logger.info(f"Using stored base64Data for eval figure {fig_id}")
+                        elif img_doc.get("file_path"):
+                            import os
+                            import base64
+                            file_path = img_doc["file_path"]
+                            if os.path.exists(file_path):
+                                try:
+                                    with open(file_path, "rb") as f:
+                                        image_bytes = f.read()
+                                        base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
+                                        content_type = img_doc.get("content_type", "image/jpeg")
+                                        if not content_type.startswith("image/"):
+                                            content_type = "image/jpeg"
+                                        base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                        logger.info(f"✅ Loaded eval figure {fig_id} from file: {len(base64_data)} bytes")
+                                except Exception as file_err:
+                                    logger.error(f"❌ Failed to read eval figure file {file_path}: {file_err}")
+
+                if base64_data:
+                    if not base64_data.startswith("data:image"):
+                        base64_data = f"data:image/png;base64,{base64_data}"
+                    support_images.append(base64_data)
+                    logger.info(f"Added question figure to support images (total: {len(support_images)})")
+            except Exception as fig_err:
+                logger.warning(f"Failed to load question figure: {fig_err}")
+
+        # Then try regular option images if we still need context
+        for img_ref in (question_doc.get("images", []) or []):
+            if len(support_images) >= 4:
+                break
+            try:
+                img_id = img_ref.get("id") if isinstance(img_ref, dict) else img_ref
+                if not img_id:
+                    continue
+                img_doc = await db.mongo_find_one("images", {"_id": img_id})
+                if img_doc:
+                    base64_data = None
+                    if img_doc.get("base64Data"):
+                        base64_data = img_doc["base64Data"]
+                        logger.info(f"Using stored base64Data for eval option image {img_id}")
+                    elif img_doc.get("file_path"):
+                        import os
+                        import base64
+                        file_path = img_doc["file_path"]
+                        if os.path.exists(file_path):
+                            try:
+                                with open(file_path, "rb") as f:
+                                    image_bytes = f.read()
+                                    base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
+                                    content_type = img_doc.get("content_type", "image/jpeg")
+                                    if not content_type.startswith("image/"):
+                                        content_type = "image/jpeg"
+                                    base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    logger.info(f"✅ Loaded eval option image {img_id} from file: {len(base64_data)} bytes")
+                            except Exception as file_err:
+                                logger.error(f"❌ Failed to read eval option image file {file_path}: {file_err}")
+
+                    if base64_data:
+                        if not base64_data.startswith("data:image"):
+                            base64_data = f"data:image/png;base64,{base64_data}"
+                        support_images.append(base64_data)
+                        logger.info(f"Added option image to support images (total: {len(support_images)})")
+            except Exception as img_err:
+                logger.warning(f"Failed to load option image {img_id}: {img_err}")
+
         # Try to extract an answer from canvas (multi-page aware)
         extracted_from_canvas: Optional[str] = None
         if (canvas_data and canvas_data.startswith("data:image")) or (payload.canvasPages and len(payload.canvasPages) > 0):
             try:
-                from services.async_openai_service import AsyncOpenAIService
-                ai = AsyncOpenAIService()
-
-                # Build context prompt including question text and available images
-                support_images: list[str] = []
-
-                # First, try to get question_figures with their base64Data
-                for fig_ref in (question_doc.get("question_figures", []) or []):
-                    if len(support_images) >= 2:
-                        break
-                    try:
-                        base64_data = None
-                        if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
-                            base64_data = fig_ref["base64Data"]
-                            logger.info(f"Using embedded base64Data from question_figures (length: {len(base64_data)})")
-                        else:
-                            fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
-                            img_doc = await db.mongo_find_one("images", {"_id": fig_id})
-                            if img_doc:
-                                if img_doc.get("base64Data"):
-                                    base64_data = img_doc["base64Data"]
-                                    logger.info(f"Using stored base64Data for eval figure {fig_id}")
-                                elif img_doc.get("file_path"):
-                                    import os
-                                    import base64
-                                    file_path = img_doc["file_path"]
-                                    if os.path.exists(file_path):
-                                        try:
-                                            with open(file_path, "rb") as f:
-                                                image_bytes = f.read()
-                                                base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
-                                                content_type = img_doc.get("content_type", "image/jpeg")
-                                                if not content_type.startswith("image/"):
-                                                    content_type = "image/jpeg"
-                                                base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                                logger.info(f"✅ Loaded eval figure {fig_id} from file: {len(base64_data)} bytes")
-                                        except Exception as file_err:
-                                            logger.error(f"❌ Failed to read eval figure file {file_path}: {file_err}")
-
-                        if base64_data:
-                            if not base64_data.startswith("data:image"):
-                                base64_data = f"data:image/png;base64,{base64_data}"
-                            support_images.append(base64_data)
-                            logger.info(f"Added question figure to support images (total: {len(support_images)})")
-                    except Exception as fig_err:
-                        logger.warning(f"Failed to load question figure: {fig_err}")
-
-                # Then try regular option images if we still need context
-                for img_ref in (question_doc.get("images", []) or []):
-                    if len(support_images) >= 2:
-                        break
-                    try:
-                        img_id = img_ref.get("id") if isinstance(img_ref, dict) else img_ref
-                        if not img_id:
-                            continue
-                        img_doc = await db.mongo_find_one("images", {"_id": img_id})
-                        if img_doc:
-                            base64_data = None
-                            if img_doc.get("base64Data"):
-                                base64_data = img_doc["base64Data"]
-                                logger.info(f"Using stored base64Data for eval option image {img_id}")
-                            elif img_doc.get("file_path"):
-                                import os
-                                import base64
-                                file_path = img_doc["file_path"]
-                                if os.path.exists(file_path):
-                                    try:
-                                        with open(file_path, "rb") as f:
-                                            image_bytes = f.read()
-                                            base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
-                                            content_type = img_doc.get("content_type", "image/jpeg")
-                                            if not content_type.startswith("image/"):
-                                                content_type = "image/jpeg"
-                                            base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                            logger.info(f"✅ Loaded eval option image {img_id} from file: {len(base64_data)} bytes")
-                                    except Exception as file_err:
-                                        logger.error(f"❌ Failed to read eval option image file {file_path}: {file_err}")
-
-                            if base64_data:
-                                if not base64_data.startswith("data:image"):
-                                    base64_data = f"data:image/png;base64,{base64_data}"
-                                support_images.append(base64_data)
-                                logger.info(f"Added option image to support images (total: {len(support_images)})")
-                    except Exception as img_err:
-                        logger.warning(f"Failed to load option image {img_id}: {img_err}")
-
                 logger.info(f"Total support images for canvas evaluation: {len(support_images)}")
 
                 images_payload = (payload.canvasPages or ([canvas_data] if canvas_data else [])) + support_images[:2]
@@ -861,13 +861,23 @@ async def evaluate_submission(
                                 "where X is the correct option letter (A, B, C, or D)"
                             )
                             
-                            solve_response = await ai.chat_completion_async(
-                                messages=[
-                                    {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
-                                    {"role": "user", "content": solve_prompt}
-                                ],
-                                max_tokens=500
-                            )
+                            # Use vision model if images are available
+                            if support_images:
+                                logger.info(f"🧠 Using vision model with {len(support_images)} images to solve question")
+                                solve_response = await ai.analyze_images_and_text_async(
+                                    support_images,
+                                    solve_prompt,
+                                    max_tokens=500,
+                                    system_prompt="You are an expert teacher who solves math and science problems accurately. Always return valid JSON."
+                                )
+                            else:
+                                solve_response = await ai.chat_completion_async(
+                                    messages=[
+                                        {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
+                                        {"role": "user", "content": solve_prompt}
+                                    ],
+                                    max_tokens=500
+                                )
                             
                             llm_answer = (solve_response.get("response") or "").strip()
                             logger.info(f"🧠 LLM solution response: {llm_answer[:200]}...")
@@ -986,13 +996,23 @@ async def evaluate_submission(
                                 '{"answer": "your_answer", "solution": "step by step solution", "explanation": "why this is correct"}\n'
                             )
                             
-                            solve_response = await ai.chat_completion_async(
-                                messages=[
-                                    {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
-                                    {"role": "user", "content": solve_prompt}
-                                ],
-                                max_tokens=500
-                            )
+                            # Use vision model if images are available
+                            if support_images:
+                                logger.info(f"🧠 Using vision model with {len(support_images)} images to solve numeric question")
+                                solve_response = await ai.analyze_images_and_text_async(
+                                    support_images,
+                                    solve_prompt,
+                                    max_tokens=500,
+                                    system_prompt="You are an expert teacher who solves math and science problems accurately. Always return valid JSON."
+                                )
+                            else:
+                                solve_response = await ai.chat_completion_async(
+                                    messages=[
+                                        {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
+                                        {"role": "user", "content": solve_prompt}
+                                    ],
+                                    max_tokens=500
+                                )
                             
                             llm_answer = (solve_response.get("response") or "").strip()
                             logger.info(f"🧠 LLM solution response: {llm_answer[:200]}...")
