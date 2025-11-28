@@ -1735,9 +1735,11 @@ async def submit_test_series(
             penalty_marks = question.get("penalty", question.get("penalty_marks", 1))  # Get penalty from question, default to 1
 
             is_correct = False
-            is_attempted = bool(student_answer)
+            # Check if question was skipped or not attempted
+            is_attempted = bool(student_answer) and student_answer.upper() != "SKIPPED"
 
-            if not is_attempted:
+            # Skipped questions get 0 points (no penalty, no positive marks)
+            if not is_attempted or student_answer.upper() == "SKIPPED":
                 unanswered_count += 1
                 points_earned = 0
             elif student_answer == correct_answer:
