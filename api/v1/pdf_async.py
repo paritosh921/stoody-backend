@@ -2439,7 +2439,51 @@ async def update_question(
             update_data["difficulty"] = question_data["difficulty"]
         if "document_type" in question_data:
             update_data["document_type"] = question_data["document_type"]
+        # Helper to process and save new images
+        async def process_new_images(images_list, id_prefix):
+            processed_images = []
+            for i, img in enumerate(images_list):
+                # Check if this is a new image upload (has base64Data)
+                if img.get("base64Data"):
+                    try:
+                        logger.info(f"Processing new image upload for question {question_id}")
+                        # Generate a unique ID if the current one is temporary or missing
+                        img_id = img.get("id")
+                        if not img_id or img_id.startswith("img_") or "temp" in img_id:
+                            img_id = f"{question_id}_{id_prefix}_{i}_{int(datetime.utcnow().timestamp())}"
+                        
+                        # Save to disk
+                        saved_results = await save_image_to_disk(
+                            image_base64=img["base64Data"],
+                            image_id=img_id,
+                            pdf_filename=existing_question.get("document_id") or existing_question.get("pdf_source") or question_id,
+                            db=db,
+                            user_id=current_user.get("user_id"),
+                            split_composite=False # Don't split manual uploads
+                        )
+                        
+                        # Add saved images to the list
+                        for saved_img in saved_results:
+                            # Preserve description and type from the frontend object
+                            saved_img["description"] = img.get("description", "")
+                            saved_img["type"] = img.get("type", "diagram")
+                            # IMPORTANT: Include base64Data so frontend can display it
+                            saved_img["base64Data"] = img["base64Data"]
+                            processed_images.append(saved_img)
+                            
+                    except Exception as e:
+                        logger.error(f"Failed to save new image: {str(e)}")
+                        # If save fails, we might want to skip it or let validation fail
+                        # For now, we'll skip adding it to processed_images
+                else:
+                    # Existing image (no base64Data), keep as is
+                    processed_images.append(img)
+            return processed_images
+
         if "images" in question_data:
+            # Process any new images first
+            question_data["images"] = await process_new_images(question_data["images"], "opt")
+
             # Validate images before updating
             from utils.image_validator import validate_images_list
             valid_images, invalid_image_ids = await validate_images_list(question_data["images"], db)
@@ -2451,6 +2495,9 @@ async def update_question(
 
         # Support question_figures (diagram images) - separate from option images
         if "question_figures" in question_data:
+            # Process any new images first
+            question_data["question_figures"] = await process_new_images(question_data["question_figures"], "fig")
+
             # Validate question figures before updating
             from utils.image_validator import validate_images_list
             valid_figures, invalid_figure_ids = await validate_images_list(question_data["question_figures"], db)

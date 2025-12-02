@@ -49,7 +49,7 @@ def hash_password(password: str) -> str:
 
 # Pydantic models
 class CreateStudentRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=50)
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
     full_name: str = Field(..., min_length=2, max_length=100)
     password: Optional[str] = Field(None, min_length=6)  # Optional - will auto-generate if not provided
     email: Optional[EmailStr] = None
@@ -468,14 +468,31 @@ async def create_student(
 
         # Check if username already exists GLOBALLY (not just within admin's tenant)
         # This ensures globally unique usernames across entire platform
-        existing_student = await db.mongo_find_one("students", {
-            "username": student_data.username
-        })
-        if existing_student:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already exists. Please choose a different username."
-            )
+        if student_data.username:
+            existing_student = await db.mongo_find_one("students", {
+                "username": student_data.username
+            })
+            if existing_student:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Username already exists. Please choose a different username."
+                )
+        else:
+            # Auto-generate username from full_name
+            base_name = "".join(c for c in student_data.full_name.lower() if c.isalnum() or c == ' ').strip().replace(' ', '.')
+            if not base_name:
+                base_name = "student"
+            
+            # Find a unique username
+            username = base_name
+            counter = 1
+            while True:
+                existing = await db.mongo_find_one("students", {"username": username})
+                if not existing:
+                    student_data.username = username
+                    break
+                username = f"{base_name}{counter}"
+                counter += 1
 
         # Check if email already exists within this admin's tenant
         # Email can be duplicated across different admins, but not within same admin
