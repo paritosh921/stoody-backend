@@ -508,7 +508,7 @@ async def evaluate_submission(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Evaluate student's submission (canvas image and/or text) for a question.
+    """Evaluate student's submission (canvas image and/or text) for a question with AI tutor feedback.
 
     Returns: { success, evaluation: { correct, score, extractedAnswer, feedback, reasoning } }
     """
@@ -516,586 +516,151 @@ async def evaluate_submission(
         qid = payload.questionId
         answer_text = (payload.answerText or "").strip()
         canvas_data = payload.canvasData
-
+        
         # Normalize canvas data header if client sent raw base64
         if canvas_data and not canvas_data.startswith("data:image"):
             canvas_data = f"data:image/png;base64,{canvas_data}"
 
         # Fetch question from Chroma (fullData) first; fallback to MongoDB
-        question_doc: Dict[str, Any] = {}
-        try:
-            chroma_one = await db.chroma_get(ids=[qid])
-            metas = chroma_one.get("metadatas") or []
-            if metas and metas[0].get("fullData"):
-                import json as _json
-                question_doc = _json.loads(metas[0]["fullData"]) or {}
-        except Exception as _e:
-            logger.warning(f"Chroma fullData fetch failed for {qid}: {_e}")
-
-        if not question_doc:
-            question_doc = await db.mongo_find_one("questions", {"id": qid}) or {}
+        question_doc = await _load_question_doc(db, qid)
         if not question_doc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
 
-        # Pull correct answer from multiple possible fields; avoid str(None) -> 'None'
+        # Pull correct answer
         ca_primary = question_doc.get("correctAnswer")
         ca_alt = question_doc.get("correct_answer")
         correct_answer = str((ca_primary if ca_primary is not None else (ca_alt if ca_alt is not None else ""))).strip()
 
-        # Determine question context up front
-        has_options = bool(question_doc.get("options")) or bool(question_doc.get("enhancedOptions"))
-        is_expected_mcq = len(correct_answer) == 1 and correct_answer.isalpha()
-        is_choice_target = is_expected_mcq or has_options
-        
-        # Extract question text for use in evaluation
+        # Extract question text and options
         question_text = str(question_doc.get("text", ""))
+        options_text = _options_text_from_question(question_doc)
 
-        # Default evaluation fields
-        correct = False
-        score = 0.0
-        feedback = ""
-        reasoning = ""
-        raw_canvas_response = ""
-
-        # Initialize AI service and support images
+        # Initialize AI service
         from services.async_openai_service import AsyncOpenAIService
         ai = AsyncOpenAIService()
-        support_images: list[str] = []
 
-        # Load support images (question figures and option images)
-        # First, try to get question_figures with their base64Data
-        for fig_ref in (question_doc.get("question_figures", []) or []):
-            if len(support_images) >= 4:  # Increased limit to 4
-                break
-            try:
-                base64_data = None
-                if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
-                    base64_data = fig_ref["base64Data"]
-                    logger.info(f"Using embedded base64Data from question_figures (length: {len(base64_data)})")
-                else:
-                    fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
-                    img_doc = await db.mongo_find_one("images", {"_id": fig_id})
-                    if img_doc:
-                        if img_doc.get("base64Data"):
-                            base64_data = img_doc["base64Data"]
-                            logger.info(f"Using stored base64Data for eval figure {fig_id}")
-                        elif img_doc.get("file_path"):
-                            import os
-                            import base64
-                            file_path = img_doc["file_path"]
-                            if os.path.exists(file_path):
-                                try:
-                                    with open(file_path, "rb") as f:
-                                        image_bytes = f.read()
-                                        base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
-                                        content_type = img_doc.get("content_type", "image/jpeg")
-                                        if not content_type.startswith("image/"):
-                                            content_type = "image/jpeg"
-                                        base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                        logger.info(f"✅ Loaded eval figure {fig_id} from file: {len(base64_data)} bytes")
-                                except Exception as file_err:
-                                    logger.error(f"❌ Failed to read eval figure file {file_path}: {file_err}")
-
-                if base64_data:
-                    if not base64_data.startswith("data:image"):
-                        base64_data = f"data:image/png;base64,{base64_data}"
-                    support_images.append(base64_data)
-                    logger.info(f"Added question figure to support images (total: {len(support_images)})")
-            except Exception as fig_err:
-                logger.warning(f"Failed to load question figure: {fig_err}")
-
-        # Then try regular option images if we still need context
-        for img_ref in (question_doc.get("images", []) or []):
-            if len(support_images) >= 4:
-                break
-            try:
-                img_id = img_ref.get("id") if isinstance(img_ref, dict) else img_ref
-                if not img_id:
-                    continue
-                img_doc = await db.mongo_find_one("images", {"_id": img_id})
-                if img_doc:
-                    base64_data = None
-                    if img_doc.get("base64Data"):
-                        base64_data = img_doc["base64Data"]
-                        logger.info(f"Using stored base64Data for eval option image {img_id}")
-                    elif img_doc.get("file_path"):
-                        import os
-                        import base64
-                        file_path = img_doc["file_path"]
-                        if os.path.exists(file_path):
-                            try:
-                                with open(file_path, "rb") as f:
-                                    image_bytes = f.read()
-                                    base64_encoded = base64.b64encode(image_bytes).decode("utf-8")
-                                    content_type = img_doc.get("content_type", "image/jpeg")
-                                    if not content_type.startswith("image/"):
-                                        content_type = "image/jpeg"
-                                    base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                    logger.info(f"✅ Loaded eval option image {img_id} from file: {len(base64_data)} bytes")
-                            except Exception as file_err:
-                                logger.error(f"❌ Failed to read eval option image file {file_path}: {file_err}")
-
-                    if base64_data:
-                        if not base64_data.startswith("data:image"):
-                            base64_data = f"data:image/png;base64,{base64_data}"
-                        support_images.append(base64_data)
-                        logger.info(f"Added option image to support images (total: {len(support_images)})")
-            except Exception as img_err:
-                logger.warning(f"Failed to load option image {img_id}: {img_err}")
-
-        # Try to extract an answer from canvas (multi-page aware)
-        extracted_from_canvas: Optional[str] = None
-        if (canvas_data and canvas_data.startswith("data:image")) or (payload.canvasPages and len(payload.canvasPages) > 0):
-            try:
-                logger.info(f"Total support images for canvas evaluation: {len(support_images)}")
-
-                images_payload = (payload.canvasPages or ([canvas_data] if canvas_data else [])) + support_images[:2]
-
-                if is_choice_target:
-                    options_list = _options_text_from_question(question_doc)
-                    prompt = (
-                        "TASK: Analyze the student's handwritten solution and determine their final answer.\n\n"
-                        "You are evaluating a student's handwritten work on a digital canvas for a multiple-choice question.\n\n"
-                        f"QUESTION:\n{question_text}\n\n"
-                        f"OPTIONS:\n{options_list}\n\n"
-                        "IMAGES PROVIDED:\n"
-                        "1. Student's canvas showing their handwritten work (may include reasoning, calculations, and answer)\n"
-                        f"{'2. Question diagram/figure (for context)' if len(support_images) > 0 else ''}\n\n"
-                        "INSTRUCTIONS:\n"
-                        "1. Read ALL the handwritten content on the canvas carefully\n"
-                        "2. Look for:\n"
-                        "   - The student's reasoning and thought process\n"
-                        "   - Any calculations or working shown\n"
-                        "   - Their final answer (may be stated as 'Answer is C', 'C = 35', just 'C', etc.)\n"
-                        "3. Identify which option letter (A, B, C, D) they chose as their final answer\n"
-                        "4. If they wrote explanations like 'I think C because...' or 'C = 35', extract C as their answer\n\n"
-                        "Return JSON format: {\"letter\":\"X\", \"reasoning\":\"brief description of what student wrote\"}\n"
-                        "If you cannot determine their answer, return: {\"letter\":\"Unclear\", \"reasoning\":\"description of what you see\"}\n"
-                    )
-                    mcq_system_prompt = (
-                        "You are an expert at reading handwritten student work. Analyze the ENTIRE canvas image carefully. "
-                        "Students may write their reasoning, show their work, and indicate their answer in various ways "
-                        "(e.g., 'Answer is C', 'C = value', circled letter, underlined answer, etc.). "
-                        "Extract the option letter they chose as their final answer. "
-                        "Return JSON: {\"letter\":\"X\", \"reasoning\":\"what you read\"}."
-                    )
-                    logger.info(f"📤 Sending {len(images_payload)} images to LLM for comprehensive MCQ analysis")
-                    res = await ai.analyze_images_and_text_async(
-                        images_payload,
-                        prompt,
-                        max_tokens=300,
-                        system_prompt=mcq_system_prompt
-                    )
-                    raw = (res.get("response") or "").strip()
-                    raw_canvas_response = raw
-                    logger.info(f"LLM canvas analysis response: {raw}")
-
-                    import json as _json, re as _re
-                    val = ""
-                    student_reasoning = ""
-                    
-                    # Try to parse JSON response
-                    m = _re.search(r"\{[^}]+\}", raw, _re.DOTALL)
-                    if m:
-                        try:
-                            obj = _json.loads(m.group(0))
-                            val = str(obj.get("letter", "")).strip().upper()
-                            student_reasoning = str(obj.get("reasoning", "")).strip()
-                            logger.info(f"Parsed from JSON - letter: {val}, reasoning: {student_reasoning[:100]}...")
-                        except Exception as parse_err:
-                            logger.warning(f"JSON parse error: {parse_err}")
-                            val = ""
-
-                    # Fallback: look for letter patterns in response
-                    if not val or val == "UNCLEAR":
-                        # Look for patterns like "answer is C", "chose C", "option C", "C ="
-                        answer_patterns = [
-                            r"answer\s*(?:is|:)?\s*([A-D])",
-                            r"chose\s+(?:option\s+)?([A-D])",
-                            r"option\s+([A-D])\s+(?:is|=|because)",
-                            r"([A-D])\s*=\s*\d+",  # Matches "C = 35"
-                            r"final\s+answer\s*(?:is|:)?\s*([A-D])",
-                            r"\b([A-D])\b\s+is\s+(?:correct|right|the\s+answer)",
-                        ]
-                        for pattern in answer_patterns:
-                            m2 = _re.search(pattern, raw, _re.IGNORECASE)
-                            if m2:
-                                val = m2.group(1).upper()
-                                logger.info(f"Extracted letter '{val}' using pattern: {pattern}")
-                                break
-                        
-                        # Last resort: find any standalone letter A-D
-                        if not val or val == "UNCLEAR":
-                            m3 = _re.search(r"\b([A-D])\b", raw.upper())
-                            if m3:
-                                val = m3.group(1)
-                                logger.info(f"Extracted letter '{val}' as fallback from response")
-
-                    if val and val.upper() == "UNCLEAR":
-                        val = ""
-
-                    if val and len(val) == 1 and val.isalpha() and val in "ABCD":
-                        extracted_from_canvas = val
-                        if student_reasoning:
-                            raw_canvas_response = f"Student wrote: {student_reasoning}. Extracted answer: {val}"
-                        logger.info(f"✅ Successfully extracted letter from canvas: {val}")
-                    else:
-                        logger.warning(f"Could not parse MCQ letter from canvas response: {raw}")
-                else:
-                    prompt = (
-                        "You see a short-answer or numerical question. Read the question below, then look at the student's canvas image. "
-                        "Extract ONLY the student's FINAL answer. If numeric, normalize to plain number with '.' as decimal. "
-                        "Respond strictly as JSON: {\"answer\":\"...\"}.\n\n"
-                        f"Question: {question_text}"
-                    )
-                    answer_system_prompt = (
-                        "You extract students' handwritten final answers. Respond with compact JSON exactly like "
-                        "{\"answer\":\"42\"}. Do not include commentary or additional text. If uncertain, respond with "
-                        "{\"answer\":\"Unclear\"}."
-                    )
-                    logger.info(f"Sending {len(images_payload)} images to LLM for text/numeric canvas extraction")
-                    res = await ai.analyze_images_and_text_async(
-                        images_payload,
-                        prompt,
-                        max_tokens=80,
-                        system_prompt=answer_system_prompt
-                    )
-                    raw = (res.get("response") or "").strip()
-                    raw_canvas_response = raw
-                    logger.info(f"LLM canvas extraction response: {raw}")
-
-                    import json as _json, re as _re
-                    val = ""
-                    m = _re.search(r"\{.*\}", raw)
-                    if m:
-                        try:
-                            obj = _json.loads(m.group(0))
-                            val = str(obj.get("answer", "")).strip()
-                        except Exception:
-                            val = ""
-
-                    if val and val.lower() == "unclear":
-                        val = ""
-
-                    if val:
-                        extracted_from_canvas = val
-                        logger.info(f"✅ Successfully extracted answer from canvas: {val}")
-                    else:
-                        logger.warning(f"Could not parse answer JSON from canvas response: {raw}")
-            except Exception as canvas_err:
-                raw_canvas_response = f"Canvas extraction failed: {canvas_err}"
-                logger.warning(raw_canvas_response)
-
-        # Decide which answer to evaluate (prefer canvas extraction, fallback to typed text)
-        typed_answer_clean = answer_text.strip() if answer_text else ""
-        canvas_answer_clean = (extracted_from_canvas or "").strip()
-        candidate_answer = canvas_answer_clean or typed_answer_clean
-        answer_source = "canvas" if canvas_answer_clean else ("typed" if typed_answer_clean else "none")
-
-        if is_choice_target:
-            expected_letter = correct_answer[:1].upper() if correct_answer else ""
-            if candidate_answer:
-                # Smart extraction of MCQ letter from typed text
-                import re as _re
-                normalized_letter = None
-                
-                # If answer is a single letter, use it directly
-                if len(candidate_answer) == 1 and candidate_answer.upper() in "ABCD":
-                    normalized_letter = candidate_answer.upper()
-                else:
-                    # Try to extract answer from patterns like "answer is C", "option C", "C = value", etc.
-                    answer_patterns = [
-                        r"(?:answer|ans)\s*(?:is|:)?\s*([A-Da-d])\b",  # "answer is C", "ans: C"
-                        r"\b(?:option|choice)\s*([A-Da-d])\b",  # "option C"
-                        r"\bmy\s+(?:answer|choice)\s+(?:is\s+)?([A-Da-d])\b",  # "my answer is C"
-                        r"\b([A-Da-d])\s*(?:is\s+)?(?:correct|right)\b",  # "C is correct"
-                        r"\bi\s+(?:think|believe|choose|chose|picked|pick)\s+(?:it(?:'s|\s+is)\s+)?([A-Da-d])\b",  # "I think C"
-                        r"\b([A-Da-d])\s*=\s*\d+",  # "C = 35"
-                        r"^\s*([A-Da-d])\s*[:\.\)]",  # "C:", "C.", "C)"
-                        r"^\s*\(?([A-Da-d])\)?\s*$",  # Just "(C)" or "C"
-                    ]
-                    for pattern in answer_patterns:
-                        m = _re.search(pattern, candidate_answer, _re.IGNORECASE)
-                        if m:
-                            normalized_letter = m.group(1).upper()
-                            logger.info(f"Extracted letter '{normalized_letter}' from typed text using pattern: {pattern}")
-                            break
-                    
-                    # Fallback: look for any standalone letter A-D in the text
-                    if not normalized_letter:
-                        # Find all occurrences of A-D as standalone letters
-                        matches = _re.findall(r"\b([A-Da-d])\b", candidate_answer)
-                        if matches:
-                            # Prefer later matches as they're more likely to be the final answer
-                            normalized_letter = matches[-1].upper()
-                            logger.info(f"Extracted letter '{normalized_letter}' as fallback from typed text")
-                
-                if normalized_letter and normalized_letter in "ABCD":
-                    if expected_letter:
-                        correct = normalized_letter == expected_letter
-                        score = 1.0 if correct else 0.0
-                        feedback = (
-                            f"Great job! Option {expected_letter} is correct."
-                            if correct
-                            else f"Not quite. You chose option {normalized_letter}, but the correct answer is {expected_letter}."
-                        )
-                        reasoning = f"Detected option '{normalized_letter}' from {answer_source} submission."
-                    else:
-                        # No answer key - use LLM to solve the question
-                        logger.info(f"🧠 No answer key found, using LLM to solve the question...")
-                        try:
-                            from services.async_openai_service import AsyncOpenAIService
-                            ai = AsyncOpenAIService()
-                            
-                            options_list = _options_text_from_question(question_doc)
-                            solve_prompt = (
-                                "You are a math/science expert. Solve the following multiple-choice question step by step.\n\n"
-                                f"QUESTION:\n{question_text}\n\n"
-                                f"OPTIONS:\n{options_list}\n\n"
-                                "INSTRUCTIONS:\n"
-                                "1. Solve the problem step by step\n"
-                                "2. Show your working\n"
-                                "3. Determine the correct answer\n"
-                                "4. Return your response in this JSON format:\n"
-                                '{"correct_letter": "X", "solution": "step by step solution", "explanation": "why this is correct"}\n'
-                                "where X is the correct option letter (A, B, C, or D)"
-                            )
-                            
-                            # Use vision model if images are available
-                            if support_images:
-                                logger.info(f"🧠 Using vision model with {len(support_images)} images to solve question")
-                                solve_response = await ai.analyze_images_and_text_async(
-                                    support_images,
-                                    solve_prompt,
-                                    max_tokens=500,
-                                    system_prompt="You are an expert teacher who solves math and science problems accurately. Always return valid JSON."
-                                )
-                            else:
-                                solve_response = await ai.chat_completion_async(
-                                    messages=[
-                                        {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
-                                        {"role": "user", "content": solve_prompt}
-                                    ],
-                                    max_tokens=500
-                                )
-                            
-                            llm_answer = (solve_response.get("response") or "").strip()
-                            logger.info(f"🧠 LLM solution response: {llm_answer[:200]}...")
-                            
-                            # Extract the correct letter from LLM response
-                            import json as _json
-                            llm_correct_letter = ""
-                            llm_solution = ""
-                            llm_explanation = ""
-                            
-                            # Try to parse JSON from response
-                            m = _re.search(r"\{[^}]+\}", llm_answer, _re.DOTALL)
-                            if m:
-                                try:
-                                    obj = _json.loads(m.group(0))
-                                    llm_correct_letter = str(obj.get("correct_letter", "")).strip().upper()
-                                    llm_solution = str(obj.get("solution", "")).strip()
-                                    llm_explanation = str(obj.get("explanation", "")).strip()
-                                except Exception:
-                                    pass
-                            
-                            # Fallback: find letter patterns
-                            if not llm_correct_letter or llm_correct_letter not in "ABCD":
-                                letter_patterns = [
-                                    r"correct\s+(?:answer|option)\s*(?:is|:)?\s*([A-D])",
-                                    r"answer\s*(?:is|:)?\s*([A-D])",
-                                    r"\b([A-D])\s+is\s+(?:correct|right)",
-                                ]
-                                for pattern in letter_patterns:
-                                    m2 = _re.search(pattern, llm_answer, _re.IGNORECASE)
-                                    if m2:
-                                        llm_correct_letter = m2.group(1).upper()
-                                        break
-                            
-                            if llm_correct_letter and llm_correct_letter in "ABCD":
-                                correct = normalized_letter == llm_correct_letter
-                                score = 1.0 if correct else 0.0
-                                
-                                if correct:
-                                    feedback = f"✅ Correct! Option {llm_correct_letter} is the right answer."
-                                    if llm_explanation:
-                                        feedback += f"\n\n**Explanation:** {llm_explanation}"
-                                else:
-                                    feedback = f"❌ Not quite. You chose option {normalized_letter}, but the correct answer is {llm_correct_letter}."
-                                    if llm_solution:
-                                        feedback += f"\n\n**Solution:** {llm_solution}"
-                                    if llm_explanation:
-                                        feedback += f"\n\n**Why:** {llm_explanation}"
-                                
-                                reasoning = f"Detected option '{normalized_letter}' from {answer_source} submission. LLM solved and determined correct answer is {llm_correct_letter}."
-                                logger.info(f"✅ LLM solved question: correct={llm_correct_letter}, student={normalized_letter}, match={correct}")
-                            else:
-                                # LLM couldn't solve it properly
-                                feedback = f"Your answer is {normalized_letter}. I attempted to verify but couldn't determine the correct answer automatically."
-                                reasoning = f"Detected option '{normalized_letter}' from {answer_source} submission. LLM verification inconclusive."
-                                logger.warning(f"LLM could not solve question properly: {llm_answer[:100]}")
-                        except Exception as solve_err:
-                            logger.error(f"Error using LLM to solve question: {solve_err}")
-                            feedback = f"Your answer is {normalized_letter}. Could not verify automatically."
-                            reasoning = f"Detected option '{normalized_letter}' from {answer_source} submission."
-                else:
-                    feedback = "I couldn't read a clear option letter from your work. Try writing the letter clearly or type it in."
-                    reasoning = raw_canvas_response or f"Detected text: {candidate_answer}"
-            else:
-                feedback = "I couldn't detect which option you selected. Please write the option letter clearly or type it in."
-                reasoning = raw_canvas_response or "No answer detected on the canvas."
-        else:
-            candidate = candidate_answer
-            if candidate:
-                student_num_txt = _normalize_numeric_text(candidate)
-                correct_num_txt = _normalize_numeric_text(correct_answer)
-
-                def _try_float(x: str) -> Optional[float]:
-                    try:
-                        return float(x)
-                    except Exception:
-                        return None
-
-                s_val = _try_float(student_num_txt)
-                c_val = _try_float(correct_num_txt)
-
-                if s_val is not None and c_val is not None and correct_answer:
-                    tol = max(1e-3, abs(c_val) * 1e-3)
-                    correct = abs(s_val - c_val) <= tol
-                    score = 1.0 if correct else 0.0
-                    feedback = "Correct!" if correct else f"Not quite. Expected {c_val}, but I interpreted {s_val}."
-                    reasoning = f"Extracted numeric answer '{student_num_txt}' from {answer_source} submission."
-                else:
-                    if correct_answer:
-                        normalized_student = candidate.strip().lower()
-                        normalized_correct = correct_answer.strip().lower()
-                        correct = normalized_student == normalized_correct and bool(correct_answer)
-                        score = 1.0 if correct else 0.0
-                        if correct:
-                            feedback = "Correct!"
-                        else:
-                            feedback = f"Expected '{correct_answer}', but I saw '{candidate}'."
-                        reasoning = f"Detected answer '{candidate}' from {answer_source} submission."
-                    else:
-                        # No answer key - use LLM to solve numeric/short-answer question
-                        logger.info(f"🧠 No answer key for numeric question, using LLM to solve...")
-                        try:
-                            from services.async_openai_service import AsyncOpenAIService
-                            import re as _re
-                            import json as _json
-                            
-                            ai = AsyncOpenAIService()
-                            
-                            solve_prompt = (
-                                "You are a math/science expert. Solve the following problem step by step.\n\n"
-                                f"QUESTION:\n{question_text}\n\n"
-                                "INSTRUCTIONS:\n"
-                                "1. Solve the problem step by step\n"
-                                "2. Calculate the final numerical answer\n"
-                                "3. Return your response in this JSON format:\n"
-                                '{"answer": "your_answer", "solution": "step by step solution", "explanation": "why this is correct"}\n'
-                            )
-                            
-                            # Use vision model if images are available
-                            if support_images:
-                                logger.info(f"🧠 Using vision model with {len(support_images)} images to solve numeric question")
-                                solve_response = await ai.analyze_images_and_text_async(
-                                    support_images,
-                                    solve_prompt,
-                                    max_tokens=500,
-                                    system_prompt="You are an expert teacher who solves math and science problems accurately. Always return valid JSON."
-                                )
-                            else:
-                                solve_response = await ai.chat_completion_async(
-                                    messages=[
-                                        {"role": "system", "content": "You are an expert teacher who solves math and science problems accurately. Always return valid JSON."},
-                                        {"role": "user", "content": solve_prompt}
-                                    ],
-                                    max_tokens=500
-                                )
-                            
-                            llm_answer = (solve_response.get("response") or "").strip()
-                            logger.info(f"🧠 LLM solution response: {llm_answer[:200]}...")
-                            
-                            llm_correct_answer = ""
-                            llm_solution = ""
-                            llm_explanation = ""
-                            
-                            m = _re.search(r"\{[^}]+\}", llm_answer, _re.DOTALL)
-                            if m:
-                                try:
-                                    obj = _json.loads(m.group(0))
-                                    llm_correct_answer = str(obj.get("answer", "")).strip()
-                                    llm_solution = str(obj.get("solution", "")).strip()
-                                    llm_explanation = str(obj.get("explanation", "")).strip()
-                                except Exception:
-                                    pass
-                            
-                            if llm_correct_answer:
-                                # Compare student answer with LLM answer
-                                llm_num = _normalize_numeric_text(llm_correct_answer)
-                                student_num = _normalize_numeric_text(candidate)
-                                
-                                try:
-                                    llm_val = float(llm_num)
-                                    student_val = float(student_num)
-                                    tol = max(1e-3, abs(llm_val) * 0.01)  # 1% tolerance
-                                    correct = abs(student_val - llm_val) <= tol
-                                except Exception:
-                                    correct = llm_correct_answer.lower().strip() == candidate.lower().strip()
-                                
-                                score = 1.0 if correct else 0.0
-                                
-                                if correct:
-                                    feedback = f"✅ Correct! The answer is {llm_correct_answer}."
-                                    if llm_explanation:
-                                        feedback += f"\n\n**Explanation:** {llm_explanation}"
-                                else:
-                                    feedback = f"❌ Not quite. You answered {candidate}, but the correct answer is {llm_correct_answer}."
-                                    if llm_solution:
-                                        feedback += f"\n\n**Solution:** {llm_solution}"
-                                
-                                reasoning = f"Detected answer '{candidate}' from {answer_source} submission. LLM solved: {llm_correct_answer}."
-                                logger.info(f"✅ LLM solved numeric question: correct={llm_correct_answer}, student={candidate}, match={correct}")
-                            else:
-                                feedback = f"Your answer is {candidate}. Could not verify automatically."
-                                reasoning = f"Detected answer '{candidate}' from {answer_source} submission."
-                        except Exception as solve_err:
-                            logger.error(f"Error using LLM to solve numeric question: {solve_err}")
-                            feedback = f"Your answer is {candidate}. Could not verify automatically."
-                            reasoning = f"Detected answer '{candidate}' from {answer_source} submission."
-            else:
-                if raw_canvas_response:
-                    reasoning = raw_canvas_response
-                feedback = "I couldn't read your answer. Please try writing it more clearly or type it in."
-
-        if not feedback:
-            feedback = "Evaluation complete." if correct else "I could not extract a clear final answer. Try typing it in the box."
-
-        if not reasoning and candidate_answer:
-            reasoning = f"Evaluated answer '{candidate_answer}' from {answer_source} submission."
-
-        evaluation = {
-            "correct": bool(correct),
-            "score": float(score),
-            "extractedAnswer": candidate_answer or "Not found",
-            "feedback": feedback,
-            "reasoning": reasoning or "",
-            "answerSource": answer_source,
-        }
-
-        if canvas_answer_clean:
-            evaluation["canvasExtractedAnswer"] = canvas_answer_clean
-        if typed_answer_clean:
-            evaluation["typedAnswer"] = typed_answer_clean
-        if raw_canvas_response:
-            evaluation["rawCanvasResponse"] = raw_canvas_response[:500]
-
-        logger.info(
-            f"Evaluation summary for {qid}: source={answer_source}, extracted='{candidate_answer}', correct={correct}, score={score}"
+        # Prepare images: Question Figures + Student Canvas
+        # 1. Question Figures
+        question_images = _figure_images_base64(question_doc)
+        
+        # 2. Student Canvas Images
+        student_images = []
+        if payload.canvasPages and len(payload.canvasPages) > 0:
+            student_images = payload.canvasPages
+        elif canvas_data:
+            student_images = [canvas_data]
+            
+        # Combine all images for the LLM
+        all_images = question_images + student_images
+        num_q_images = len(question_images)
+        
+        # Construct the Prompt
+        prompt = (
+            "You are an expert personal tutor. You are evaluating a student's answer to a question.\n\n"
+            f"QUESTION:\n{question_text}\n\n"
         )
+        
+        if options_text:
+            prompt += f"OPTIONS:\n{options_text}\n\n"
+            
+        if correct_answer:
+            prompt += f"CORRECT ANSWER: {correct_answer}\n\n"
+        else:
+            prompt += "CORRECT ANSWER: (Not provided, please solve it yourself to verify)\n\n"
+            
+        prompt += "STUDENT INPUT:\n"
+        if answer_text:
+            prompt += f"Typed Answer: {answer_text}\n"
+        else:
+            prompt += "Typed Answer: (None)\n"
+            
+        if student_images:
+            prompt += f"Canvas Work: The student has submitted {len(student_images)} pages of handwritten work (images attached).\n"
+            if num_q_images > 0:
+                prompt += f"Note: The first {num_q_images} images are diagrams belonging to the question. The remaining images are the student's work.\n"
+        else:
+            prompt += "Canvas Work: (None)\n"
+            
+        prompt += (
+            "\nTASK:\n"
+            "1. Analyze the student's input (typed text and/or handwritten work).\n"
+            "2. Determine their final answer.\n"
+            "3. Compare it with the CORRECT ANSWER.\n"
+            "4. Provide high-quality, encouraging, and subject-specific feedback.\n"
+            "   - If correct: Confirm it and briefly explain why it's correct (reinforce the concept).\n"
+            "   - If incorrect: Point out the mistake kindly, explain the correct concept/method, and guide them to the right answer. Do NOT just say 'Wrong'. Be a tutor.\n"
+            "   - If the student's work is unclear, ask them to clarify.\n"
+            "5. Return a JSON object with the following fields:\n"
+            "   - 'extracted_answer': The answer you extracted from the student's work.\n"
+            "   - 'is_correct': boolean (true/false).\n"
+            "   - 'feedback': The message to show to the student.\n"
+            "   - 'reasoning': Internal reasoning for your evaluation.\n"
+        )
+        
+        logger.info(f"📤 Sending evaluation request to LLM for Q:{qid}. Images: {len(all_images)} ({len(question_images)} Q + {len(student_images)} S)")
+        
+        # Call LLM
+        system_prompt = "You are a helpful, encouraging, and highly knowledgeable tutor. You always output valid JSON."
+        
+        if all_images:
+            response = await ai.analyze_images_and_text_async(
+                all_images,
+                prompt,
+                max_tokens=1000,
+                system_prompt=system_prompt
+            )
+        else:
+            response = await ai.chat_completion_async(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000
+            )
+            
+        raw_response = (response.get("response") or "").strip()
+        logger.info(f"LLM Evaluation Response: {raw_response[:200]}...")
+        
+        # Parse JSON Response
+        import json as _json
+        import re as _re
+        
+        evaluation_data = {
+            "correct": False,
+            "score": 0.0,
+            "extractedAnswer": "",
+            "feedback": "",
+            "reasoning": "",
+            "answerSource": "ai_eval"
+        }
+        
+        try:
+            # Extract JSON block
+            m = _re.search(r"\{.*\}", raw_response, _re.DOTALL)
+            if m:
+                json_str = m.group(0)
+                parsed = _json.loads(json_str)
+                
+                evaluation_data["correct"] = bool(parsed.get("is_correct", False))
+                evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
+                evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
+                evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
+                evaluation_data["reasoning"] = str(parsed.get("reasoning", "")).strip()
+            else:
+                # Fallback if no JSON found
+                evaluation_data["feedback"] = raw_response
+                evaluation_data["reasoning"] = "Could not parse JSON from LLM response."
+                
+        except Exception as parse_err:
+            logger.error(f"Failed to parse LLM evaluation JSON: {parse_err}")
+            evaluation_data["feedback"] = raw_response
+            evaluation_data["reasoning"] = f"JSON parse error: {parse_err}"
 
-        return EvaluateResponse(success=True, evaluation=evaluation)
+        # If feedback is empty (parsing failed completely), use raw response
+        if not evaluation_data["feedback"]:
+             evaluation_data["feedback"] = raw_response
+
+        return EvaluateResponse(success=True, evaluation=evaluation_data)
 
     except HTTPException:
         raise
