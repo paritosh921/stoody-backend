@@ -600,7 +600,7 @@ async def evaluate_submission(
         logger.info(f"📤 Sending evaluation request to LLM for Q:{qid}. Images: {len(all_images)} ({len(question_images)} Q + {len(student_images)} S)")
         
         # Call LLM
-        system_prompt = "You are a helpful, encouraging, and highly knowledgeable tutor. You always output valid JSON."
+        system_prompt = "You are a helpful, encouraging, and highly knowledgeable tutor. You always output valid JSON. Do not use markdown formatting."
         
         if all_images:
             response = await ai.analyze_images_and_text_async(
@@ -624,6 +624,7 @@ async def evaluate_submission(
         # Parse JSON Response
         import json as _json
         import re as _re
+        import ast as _ast
         
         evaluation_data = {
             "correct": False,
@@ -635,12 +636,28 @@ async def evaluate_submission(
         }
         
         try:
-            # Extract JSON block
-            m = _re.search(r"\{.*\}", raw_response, _re.DOTALL)
-            if m:
-                json_str = m.group(0)
-                parsed = _json.loads(json_str)
+            parsed = None
+            # Attempt 1: Direct JSON parse
+            try:
+                parsed = _json.loads(raw_response)
+            except Exception:
+                pass
                 
+            # Attempt 2: Regex extraction + JSON parse
+            if not parsed:
+                m = _re.search(r"\{.*\}", raw_response, _re.DOTALL)
+                if m:
+                    json_str = m.group(0)
+                    try:
+                        parsed = _json.loads(json_str)
+                    except Exception:
+                        # Attempt 3: ast.literal_eval (handles single quotes, etc.)
+                        try:
+                            parsed = _ast.literal_eval(json_str)
+                        except Exception:
+                            pass
+            
+            if parsed and isinstance(parsed, dict):
                 evaluation_data["correct"] = bool(parsed.get("is_correct", False))
                 evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
                 evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
