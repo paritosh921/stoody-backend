@@ -54,6 +54,7 @@ from api.v1.mcq_async import router as mcq_router
 from api.v1.tutor_async import router as tutor_router
 
 from api.v1.learning_async import router as learning_router
+from api.v1.strokes_async import router as strokes_router
 
 # Optional debugger routes (require LangChain stack). Gate import to avoid hard dependency.
 try:
@@ -384,6 +385,13 @@ app.include_router(
     learning_router,
     prefix=f"{API_V1_PREFIX}/learning",
     tags=["Learning"]
+)
+
+# Strokes from Stoody BLE agent (shared Mongo)
+app.include_router(
+    strokes_router,
+    prefix=f"{API_V1_PREFIX}",
+    tags=["Strokes"]
 )
 
 # Also include learning routes at /api/learning for frontend compatibility
