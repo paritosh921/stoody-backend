@@ -64,6 +64,7 @@ except Exception:
     _debugger_available = False
 
 from api.v1.pdf_async import router as pdf_router
+from api.v1.language_async import router as language_router
 
 
 # Configure logging
@@ -398,6 +399,13 @@ app.include_router(
     mcq_router,
     prefix="/api/mcq",
     tags=["MCQ (Legacy)"]
+)
+
+# Language Lab SSO routes
+app.include_router(
+    language_router,
+    prefix=f"{API_V1_PREFIX}/language",
+    tags=["Language Lab"]
 )
 
 # Static file serving

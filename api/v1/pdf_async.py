@@ -1027,6 +1027,7 @@ class DocumentMetadata(BaseModel):
     extracted_images_count: int = 0
     total_points: Optional[float] = None  # Total points for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
+    is_active: bool = True  # Whether the document is enabled for students
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -1170,7 +1171,8 @@ async def upload_pdf(
             "extracted_images_count": 0,
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
-            "is_validated": False
+            "is_validated": False,
+            "is_active": True  # Default to enabled
         }
 
         # Save to MongoDB
@@ -1536,7 +1538,9 @@ async def get_documents(
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
-                extracted_images_count=doc.get("extracted_images_count", 0)
+
+                extracted_images_count=doc.get("extracted_images_count", 0),
+                is_active=doc.get("is_active", True)
             ))
 
         return DocumentListResponse(
@@ -1647,7 +1651,8 @@ async def get_student_practice_sets(
         # Build filter for practice sets - only check if OCR is completed
         filter_query = {
             "document_type": "Practice Sets",
-            "ocr_status": "completed"  # Only show practice sets that have been processed with OCR
+            "ocr_status": "completed",  # Only show practice sets that have been processed with OCR
+            "is_active": True  # Only show enabled documents
         }
 
         # Get admin_id from student for filtering admin-specific content
@@ -1814,7 +1819,7 @@ async def get_student_available_options(
         except Exception:
             admin_filter = admin_id
 
-        filter_query = {"admin_id": admin_filter}
+        filter_query = {"admin_id": admin_filter, "is_active": True}
         if document_type:
             filter_query["document_type"] = document_type
 
@@ -2068,6 +2073,9 @@ async def update_document_metadata(
                     detail="Total minutes must be greater than 0"
                 )
             update_data["total_minutes"] = total_minutes
+        
+        if "is_active" in metadata:
+            update_data["is_active"] = bool(metadata["is_active"])
 
         if not update_data:
             raise HTTPException(
