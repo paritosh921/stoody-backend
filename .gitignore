@@ -8,6 +8,9 @@ venv/
 .venv/
 env/
 
+# Node.js
+node_modules/
+
 # Environment / secrets
 .env
 *.env
@@ -15,6 +18,7 @@ env/
 # Runtime data & uploads
 uploads/
 chromadb_data/
+data/chromadb_chat/
 images/
 data/tmp/
 logs/
