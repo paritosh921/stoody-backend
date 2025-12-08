@@ -1652,7 +1652,8 @@ async def get_student_practice_sets(
         filter_query = {
             "document_type": "Practice Sets",
             "ocr_status": "completed",  # Only show practice sets that have been processed with OCR
-            "is_active": True  # Only show enabled documents
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            "is_active": {"$ne": False}
         }
 
         # Get admin_id from student for filtering admin-specific content
@@ -1819,7 +1820,8 @@ async def get_student_available_options(
         except Exception:
             admin_filter = admin_id
 
-        filter_query = {"admin_id": admin_filter, "is_active": True}
+        # is_active: {$ne: False} matches True, None, or missing field (default active)
+        filter_query = {"admin_id": admin_filter, "is_active": {"$ne": False}}
         if document_type:
             filter_query["document_type"] = document_type
 
