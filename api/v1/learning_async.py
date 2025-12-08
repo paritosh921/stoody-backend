@@ -127,7 +127,9 @@ async def get_course_structure(
                 "document_type": "Chapter Notes",
                 "admin_id": admin_id,  # Only show documents from student's admin
                 "standard": student_grade,
-                "subject": {"$in": student_subjects}
+                "subject": {"$in": student_subjects},
+                # is_active: {$ne: False} matches True, None, or missing field (default active)
+                "is_active": {"$ne": False}
             }
 
             # If student has plan_types, filter by those as well
@@ -264,7 +266,9 @@ async def get_chapters(
                 "document_type": "Chapter Notes",
                 "admin_id": admin_id,  # Only show documents from student's admin
                 "standard": standard,
-                "subject": subject
+                "subject": subject,
+                # is_active: {$ne: False} matches True, None, or missing field (default active)
+                "is_active": {"$ne": False}
             }
 
             # If course_plan is provided in the request, use it (must be in student's plan_types)

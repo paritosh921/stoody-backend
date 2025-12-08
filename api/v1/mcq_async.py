@@ -433,9 +433,11 @@ async def get_test_series_list(
         if standard:
             filter_query["standard"] = standard
 
-        # If user is a student, only show completed OCR documents
+        # If user is a student, only show completed OCR documents that are active
         if current_user.get("user_type") == "student":
             filter_query["ocr_status"] = "completed"
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            filter_query["is_active"] = {"$ne": False}
 
         documents = await db.mongo_find("documents", filter_query, sort=[("title", 1)])
         if documents:
@@ -622,9 +624,11 @@ async def get_mcq_available_options(
             "admin_id": admin_filter
         }
 
-        # If user is a student, only show completed OCR documents
+        # If user is a student, only show completed OCR documents that are active
         if current_user.get("user_type") == "student":
             filter_query["ocr_status"] = "completed"
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            filter_query["is_active"] = {"$ne": False}
 
         # Get all test series documents for this admin
         documents = await db.mongo_find("documents", filter_query)
@@ -688,6 +692,13 @@ async def get_test_series_questions(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="This document is not a Test Series"
+                )
+
+            # For students, verify document is active (None/missing = active by default)
+            if current_user.get("user_type") == "student" and document.get("is_active") == False:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This test series is not currently available"
                 )
 
             # 1) Preferred: read directly from Mongo 'questions' by document_id (populated during OCR)
