@@ -44,6 +44,12 @@ limiter = Limiter(key_func=get_remote_address)
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 
+# IMPORTANT: Grade/Standard matching uses EXACT string matching
+# Both student.grade and document.standard should come from the same admin settings
+# (configured in School Settings), so they will match exactly
+# For example: student.grade="12th Pass" matches document.standard="12th Pass"
+# No normalization or fuzzy matching is needed or desired
+
 # Pydantic models
 class MistralOCRImage(BaseModel):
     id: str
@@ -1683,12 +1689,13 @@ async def get_student_practice_sets(
             filter_query["subject"] = {"$in": student_subjects}
         # If student has no subjects assigned, show all subjects from their admin
 
-        # Filter by student's grade if available
-        if student_grade:
-            filter_query["standard"] = student_grade
-
         # Build $and conditions array for section and teacher_ids filtering
         and_conditions = []
+
+        # Filter by student's grade if available - EXACT match
+        # Both student.grade and document.standard come from admin settings, so they match exactly
+        if student_grade:
+            filter_query["standard"] = student_grade
 
         # Filter by student's section if available (only show docs for their section or docs without section restriction)
         if student_section:
