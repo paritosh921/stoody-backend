@@ -433,11 +433,32 @@ async def get_test_series_list(
         if standard:
             filter_query["standard"] = standard
 
-        # If user is a student, only show completed OCR documents that are active
+        # If user is a student, apply profile-based filtering
         if current_user.get("user_type") == "student":
             filter_query["ocr_status"] = "completed"
             # is_active: {$ne: False} matches True, None, or missing field (default active)
             filter_query["is_active"] = {"$ne": False}
+            
+            # Get student profile for filtering
+            student_profile = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
+            
+            if student_profile:
+                student_grade = student_profile.get("grade")
+                student_subjects = student_profile.get("subjects", [])
+                student_plan_types = student_profile.get("plan_types", [])
+                
+                # Filter by student's grade if available - EXACT match
+                # Both student.grade and document.standard come from admin settings, so they match exactly
+                if student_grade and not standard:  # Only if not already filtered by query param
+                    filter_query["standard"] = student_grade
+                
+                # Filter by student's subjects if available
+                if student_subjects and not subject:  # Only if not already filtered by query param
+                    filter_query["subject"] = {"$in": student_subjects}
+                
+                # Filter by student's plan types if available
+                if student_plan_types and not course_plan:  # Only if not already filtered by query param
+                    filter_query["course_plan"] = {"$in": student_plan_types}
 
         documents = await db.mongo_find("documents", filter_query, sort=[("title", 1)])
         if documents:

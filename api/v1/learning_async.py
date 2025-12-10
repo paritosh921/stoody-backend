@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# IMPORTANT: Grade/Standard matching is EXACT
+# Both student.grade and document.standard should come from the same admin settings
+# so they will match exactly (e.g., "12th Pass" == "12th Pass")
+# No normalization or fuzzy matching is needed or desired
+
 
 class LearningDocument(BaseModel):
     """Document information for learning mode"""
@@ -77,7 +82,7 @@ async def get_course_structure(
 
     Behavior:
     - Admin users (viewing as student): Returns ALL Chapter Notes documents
-    - Student users: Returns only documents matching their profile
+    - Student users: Returns only documents matching their profile (exact match)
     """
     try:
         # Get admin_id for data isolation
@@ -93,13 +98,12 @@ async def get_course_structure(
         # Build query based on user type - always filter by admin_id
         if user_type == "admin":
             # Admin viewing student panel - show Chapter Notes from their organization
-            # Note: Chapter Notes don't require OCR processing
             query = {
                 "document_type": "Chapter Notes",
                 "admin_id": admin_id
             }
         else:
-            # Actual student login - filter by profile
+            # Actual student login - filter by profile using EXACT match
             student = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
 
             if not student:
@@ -108,10 +112,9 @@ async def get_course_structure(
                     detail="Student profile not found"
                 )
 
-            # Get student's access parameters
-            # Note: Student model uses 'grade' (e.g., "12") and 'plan_types' (e.g., ["JEE", "CBSE"])
-            student_grade = student.get("grade")  # Maps to "standard" in documents
-            student_plan_types = student.get("plan_types", [])  # Maps to "course_plan" in documents
+            # Get student's access parameters - these come from admin settings
+            student_grade = student.get("grade")  # Exact value from settings (e.g., "12th Pass")
+            student_plan_types = student.get("plan_types", [])
             student_subjects = student.get("subjects", [])
 
             if not student_grade or not student_subjects:
@@ -120,15 +123,13 @@ async def get_course_structure(
                     detail="Student profile incomplete. Please contact admin to set grade and subjects."
                 )
 
-            # Query documents with access control
-            # Match documents where standard=grade AND course_plan is in student's plan_types
-            # Note: Chapter Notes don't require OCR processing, so we don't filter by ocr_status
+            # Query documents with EXACT match on standard
+            # Both student.grade and document.standard come from admin settings, so they match exactly
             query = {
                 "document_type": "Chapter Notes",
-                "admin_id": admin_id,  # Only show documents from student's admin
-                "standard": student_grade,
+                "admin_id": admin_id,
+                "standard": student_grade,  # EXACT match - no normalization
                 "subject": {"$in": student_subjects},
-                # is_active: {$ne: False} matches True, None, or missing field (default active)
                 "is_active": {"$ne": False}
             }
 
@@ -244,12 +245,13 @@ async def get_chapters(
                 )
 
             # Verify student has access to this standard and subject
-            # Use 'grade' field instead of 'standard'
+            # Use 'grade' field instead of 'standard' - with flexible matching
             student_grade = student.get("grade")
             student_plan_types = student.get("plan_types", [])
             student_subjects = student.get("subjects", [])
 
-            if student_grade != standard:
+            # Use flexible grade matching
+            if not grades_match(student_grade, standard):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied. You are enrolled in grade {student_grade}, not {standard}."
@@ -379,8 +381,8 @@ async def get_document_metadata(
             doc_course_plan = document.get("course_plan")
             doc_subject = document.get("subject")
 
-            # Check if student's grade matches document standard
-            if doc_standard != student_grade:
+            # Check if student's grade matches document standard (using flexible matching)
+            if not grades_match(student_grade, doc_standard):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Access denied. This document is not for your grade level."
@@ -492,8 +494,8 @@ async def get_chapter_pdf(
             doc_course_plan = document.get("course_plan")
             doc_subject = document.get("subject")
 
-            # Check if student's grade matches document standard
-            if doc_standard != student_grade:
+            # Check if student's grade matches document standard (using flexible matching)
+            if not grades_match(student_grade, doc_standard):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Access denied. This document is not for your grade level."

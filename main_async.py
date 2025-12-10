@@ -66,6 +66,7 @@ except Exception:
 
 from api.v1.pdf_async import router as pdf_router
 from api.v1.language_async import router as language_router
+from api.v1.settings_async import router as settings_router
 
 
 # Configure logging
@@ -414,6 +415,13 @@ app.include_router(
     language_router,
     prefix=f"{API_V1_PREFIX}/language",
     tags=["Language Lab"]
+)
+
+# School Settings routes
+app.include_router(
+    settings_router,
+    prefix=f"{API_V1_PREFIX}/admin",
+    tags=["School Settings"]
 )
 
 # Static file serving
