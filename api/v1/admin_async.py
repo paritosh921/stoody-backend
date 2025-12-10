@@ -842,6 +842,373 @@ async def get_dashboard_stats(
             detail="Failed to get dashboard statistics"
         )
 
+
+@router.get("/dashboard/school-stats")
+@limiter.limit("30/minute")
+async def get_school_dashboard_stats(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Get school-level dashboard statistics with:
+    1. Class/Division level breakdown
+    2. Teacher summary (teachers per subject per class, documents uploaded)
+    """
+    try:
+        # Get admin_id for data isolation
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+
+        # Check cache first
+        cache_key = f"school_dashboard_stats_{admin_id}"
+        cached_stats = await cache.get(cache_key, "admin")
+        if cached_stats:
+            return cached_stats
+
+        # Get all students for this admin
+        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+
+        # Get all tutors for this admin
+        admin_tutors = await db.mongo_find("tutors", {"created_by": str(admin_id)})
+
+        # Get all documents for this admin
+        admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+
+        # ===== CLASS/DIVISION LEVEL BREAKDOWN =====
+        class_division_stats = {}
+        for student in admin_students:
+            grade = student.get("grade", "Unknown")
+            section = student.get("section", "Unknown")
+            is_active = student.get("is_active", True)
+            has_logged_in = student.get("last_login") is not None
+
+            key = f"{grade}"
+            if key not in class_division_stats:
+                class_division_stats[key] = {
+                    "grade": grade,
+                    "sections": {},
+                    "total_students": 0,
+                    "active_students": 0,
+                    "logged_in_students": 0
+                }
+
+            class_division_stats[key]["total_students"] += 1
+            if is_active:
+                class_division_stats[key]["active_students"] += 1
+            if has_logged_in:
+                class_division_stats[key]["logged_in_students"] += 1
+
+            # Section-level stats
+            if section not in class_division_stats[key]["sections"]:
+                class_division_stats[key]["sections"][section] = {
+                    "section": section,
+                    "total_students": 0,
+                    "active_students": 0,
+                    "logged_in_students": 0,
+                    "subjects": {}
+                }
+
+            class_division_stats[key]["sections"][section]["total_students"] += 1
+            if is_active:
+                class_division_stats[key]["sections"][section]["active_students"] += 1
+            if has_logged_in:
+                class_division_stats[key]["sections"][section]["logged_in_students"] += 1
+
+            # Track subjects per section
+            student_subjects = student.get("subjects", []) or []
+            for subj in student_subjects:
+                if subj not in class_division_stats[key]["sections"][section]["subjects"]:
+                    class_division_stats[key]["sections"][section]["subjects"][subj] = 0
+                class_division_stats[key]["sections"][section]["subjects"][subj] += 1
+
+        # Convert to list format for frontend
+        class_division_list = []
+        for grade_key, grade_data in class_division_stats.items():
+            sections_list = []
+            for section_key, section_data in grade_data["sections"].items():
+                sections_list.append({
+                    "section": section_data["section"],
+                    "total_students": section_data["total_students"],
+                    "active_students": section_data["active_students"],
+                    "logged_in_students": section_data["logged_in_students"],
+                    "subjects": section_data["subjects"]
+                })
+            # Sort sections alphabetically
+            sections_list.sort(key=lambda x: x["section"])
+            class_division_list.append({
+                "grade": grade_data["grade"],
+                "total_students": grade_data["total_students"],
+                "active_students": grade_data["active_students"],
+                "logged_in_students": grade_data["logged_in_students"],
+                "sections": sections_list
+            })
+        # Sort by grade
+        class_division_list.sort(key=lambda x: str(x["grade"]))
+
+        # ===== TEACHER SUMMARY =====
+        teacher_summary = []
+        for tutor in admin_tutors:
+            tutor_id = tutor.get("tutor_id")
+            tutor_name = tutor.get("name", tutor.get("username", "Unknown"))
+            tutor_subjects = tutor.get("subjects", []) or []
+            tutor_standards = tutor.get("standards", []) or []
+            tutor_sections = tutor.get("sections", []) or []
+
+            # Count documents uploaded by this teacher
+            tutor_docs = [d for d in admin_documents if tutor_id in (d.get("teacher_ids", []) or [])]
+            notes_count = len([d for d in tutor_docs if d.get("document_type") == "Chapter Notes"])
+            tests_count = len([d for d in tutor_docs if d.get("document_type") == "Test Series"])
+            practice_count = len([d for d in tutor_docs if d.get("document_type") == "Practice Sets"])
+
+            # Count assigned students
+            assigned_ids = tutor.get("assigned_student_ids", []) or []
+
+            teacher_summary.append({
+                "tutor_id": tutor_id,
+                "name": tutor_name,
+                "email": tutor.get("email"),
+                "subjects": tutor_subjects,
+                "standards": tutor_standards,
+                "sections": tutor_sections,
+                "is_active": tutor.get("is_active", True),
+                "assigned_students_count": len(assigned_ids),
+                "documents_uploaded": {
+                    "notes": notes_count,
+                    "tests": tests_count,
+                    "practice": practice_count,
+                    "total": notes_count + tests_count + practice_count
+                }
+            })
+
+        # Sort teachers by name
+        teacher_summary.sort(key=lambda x: x["name"].lower())
+
+        # ===== DOCUMENT STATS BY CLASS =====
+        docs_by_class = {}
+        for doc in admin_documents:
+            standard = doc.get("standard", "Unknown")
+            doc_type = doc.get("document_type", "Unknown")
+
+            if standard not in docs_by_class:
+                docs_by_class[standard] = {
+                    "grade": standard,
+                    "Chapter Notes": 0,
+                    "Test Series": 0,
+                    "Practice Sets": 0
+                }
+            if doc_type in docs_by_class[standard]:
+                docs_by_class[standard][doc_type] += 1
+
+        docs_by_class_list = list(docs_by_class.values())
+        docs_by_class_list.sort(key=lambda x: str(x["grade"]))
+
+        result = {
+            "success": True,
+            "class_division_stats": class_division_list,
+            "teacher_summary": teacher_summary,
+            "documents_by_class": docs_by_class_list,
+            "totals": {
+                "total_classes": len(class_division_list),
+                "total_teachers": len(teacher_summary),
+                "total_students": len(admin_students),
+                "total_documents": len(admin_documents)
+            }
+        }
+
+        # Cache for 5 minutes
+        await cache.set(cache_key, result, 300, "admin")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"School dashboard stats error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get school dashboard statistics"
+        )
+
+
+@router.get("/monitoring/class-section-stats")
+@limiter.limit("30/minute")
+async def get_class_section_monitoring_stats(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Get class-section level monitoring statistics:
+    - Number of students active
+    - Notes/Assignments/Tests uploaded per class-section
+    - Average usage in minutes
+    - Average % completion
+    - Average Score
+    """
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+
+        # Check cache first
+        cache_key = f"class_section_monitoring_{admin_id}"
+        cached_stats = await cache.get(cache_key, "admin")
+        if cached_stats:
+            return cached_stats
+
+        # Get all students for this admin
+        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+
+        # Get all documents for this admin
+        admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+
+        # Get all question attempts for students of this admin
+        student_ids = [s["_id"] for s in admin_students]
+        all_attempts = await db.mongo_find(
+            "question_attempts",
+            {"student_id": {"$in": student_ids}}
+        ) if student_ids else []
+
+        # Get all chat sessions for students of this admin
+        all_sessions = await db.mongo_find(
+            "chat_sessions",
+            {"student_id": {"$in": student_ids}}
+        ) if student_ids else []
+
+        # Build class-section level stats
+        class_section_stats = {}
+
+        for student in admin_students:
+            grade = student.get("grade", "Unknown")
+            section = student.get("section", "Unknown")
+            key = f"{grade}_{section}"
+
+            if key not in class_section_stats:
+                class_section_stats[key] = {
+                    "grade": grade,
+                    "section": section,
+                    "total_students": 0,
+                    "active_students": 0,  # has logged in
+                    "online_students": 0,  # currently online
+                    "documents": {
+                        "notes": 0,
+                        "tests": 0,
+                        "practice": 0
+                    },
+                    "total_time_minutes": 0,
+                    "total_problems_attempted": 0,
+                    "total_correct": 0,
+                    "total_score_sum": 0,
+                    "score_count": 0,
+                    "students_with_activity": 0
+                }
+
+            class_section_stats[key]["total_students"] += 1
+
+            # Active = has logged in at least once
+            if student.get("last_login") is not None:
+                class_section_stats[key]["active_students"] += 1
+
+            # Online = currently online
+            if student.get("is_online", False):
+                class_section_stats[key]["online_students"] += 1
+
+            # Calculate student-specific metrics
+            student_id = student["_id"]
+
+            # Sessions and time
+            student_sessions = [s for s in all_sessions if s.get("student_id") == student_id]
+            student_time = sum(s.get("duration", 0) for s in student_sessions) / 60  # convert to minutes
+            class_section_stats[key]["total_time_minutes"] += student_time
+
+            # Attempts and scores
+            student_attempts = [a for a in all_attempts if a.get("student_id") == student_id]
+            if student_attempts:
+                class_section_stats[key]["students_with_activity"] += 1
+                class_section_stats[key]["total_problems_attempted"] += len(student_attempts)
+                class_section_stats[key]["total_correct"] += sum(1 for a in student_attempts if a.get("is_correct", False))
+
+                scores = [a.get("score", 0) for a in student_attempts if "score" in a]
+                if scores:
+                    class_section_stats[key]["total_score_sum"] += sum(scores)
+                    class_section_stats[key]["score_count"] += len(scores)
+
+        # Add document counts per class-section
+        for doc in admin_documents:
+            standard = doc.get("standard", "Unknown")
+            section = doc.get("section", "Unknown")
+            doc_type = doc.get("document_type", "")
+            key = f"{standard}_{section}"
+
+            if key in class_section_stats:
+                if doc_type == "Chapter Notes":
+                    class_section_stats[key]["documents"]["notes"] += 1
+                elif doc_type == "Test Series":
+                    class_section_stats[key]["documents"]["tests"] += 1
+                elif doc_type == "Practice Sets":
+                    class_section_stats[key]["documents"]["practice"] += 1
+
+        # Convert to list and calculate averages
+        result_list = []
+        for key, stats in class_section_stats.items():
+            total = stats["total_students"]
+            with_activity = stats["students_with_activity"]
+            score_count = stats["score_count"]
+
+            avg_time = round(stats["total_time_minutes"] / total, 1) if total > 0 else 0
+            avg_problems = round(stats["total_problems_attempted"] / total, 1) if total > 0 else 0
+
+            # Completion % = (students with activity / total students) * 100
+            completion_pct = round((with_activity / total) * 100, 1) if total > 0 else 0
+
+            # Average score from all attempts
+            avg_score = round(stats["total_score_sum"] / score_count, 1) if score_count > 0 else 0
+
+            # Accuracy = correct / attempted
+            accuracy = round(
+                (stats["total_correct"] / stats["total_problems_attempted"]) * 100, 1
+            ) if stats["total_problems_attempted"] > 0 else 0
+
+            result_list.append({
+                "grade": stats["grade"],
+                "section": stats["section"],
+                "total_students": stats["total_students"],
+                "active_students": stats["active_students"],
+                "online_students": stats["online_students"],
+                "documents": stats["documents"],
+                "avg_usage_minutes": avg_time,
+                "avg_problems_per_student": avg_problems,
+                "avg_completion_pct": completion_pct,
+                "avg_score": avg_score,
+                "avg_accuracy": accuracy
+            })
+
+        # Sort by grade, then section
+        result_list.sort(key=lambda x: (str(x["grade"]), x["section"]))
+
+        result = {
+            "success": True,
+            "class_section_stats": result_list,
+            "totals": {
+                "total_classes": len(set(s["grade"] for s in result_list)),
+                "total_sections": len(result_list),
+                "total_students": sum(s["total_students"] for s in result_list),
+                "total_active": sum(s["active_students"] for s in result_list),
+                "total_documents": len(admin_documents)
+            }
+        }
+
+        # Cache for 5 minutes
+        await cache.set(cache_key, result, 300, "admin")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Class section monitoring stats error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get class section monitoring statistics"
+        )
+
+
 @router.get("/monitoring/student-progress")
 @limiter.limit("30/minute")
 async def get_student_progress(
@@ -970,6 +1337,8 @@ async def get_student_progress(
                 "student_id": str(student_oid),
                 "student_name": student.get("full_name", student.get("name", "Unknown")),
                 "email": student.get("email", ""),
+                "grade": student.get("grade", "Unknown"),
+                "section": student.get("section", "Unknown"),
                 "total_sessions": len(sessions),
                 "total_time_spent": int(total_time),
                 "problems_solved": problems_solved,
