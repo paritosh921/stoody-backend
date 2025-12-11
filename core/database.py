@@ -411,6 +411,19 @@ class DatabaseManager:
             logger.error(f"MongoDB update_one failed: {str(e)}")
             return False
 
+    async def mongo_update_many(self, collection_name: str, filter_dict: Dict[str, Any],
+                               update_dict: Dict[str, Any]) -> int:
+        """Update multiple documents in MongoDB"""
+        try:
+            collection = await self.get_mongo_collection(collection_name)
+            if collection is None:
+                return 0
+            result = await collection.update_many(filter_dict, update_dict)
+            return result.modified_count
+        except Exception as e:
+            logger.error(f"MongoDB update_many failed: {str(e)}")
+            return 0
+
     async def mongo_delete_one(self, collection_name: str, filter_dict: Dict[str, Any]) -> bool:
         """Delete one document from MongoDB"""
         try:
