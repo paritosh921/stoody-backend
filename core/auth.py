@@ -148,6 +148,13 @@ class AuthManager:
             "admin_id": user_data.get("admin_id"),
             "subdomain": user_data.get("subdomain"),
             "tutor_id": user_data.get("tutor_id"),
+            # Content scoping fields (mainly for tutors)
+            "standards": user_data.get("standards"),
+            "sections": user_data.get("sections"),
+            "subjects": user_data.get("subjects"),
+            "plan_types": user_data.get("plan_types"),
+            "teaching_assignments": user_data.get("teaching_assignments"),
+            "can_edit_students": user_data.get("can_edit_students"),
             "created_at": time.time()
         }
 
@@ -401,6 +408,13 @@ class AuthManager:
                 "user_type": "tutor",
                 # Store admin context for multi-tenant filtering
                 "admin_id": str(tutor_data.get("created_by")) if tutor_data.get("created_by") else None,
+                # Content scoping fields
+                "standards": tutor_data.get("standards", []),
+                "sections": tutor_data.get("sections", []),
+                "subjects": tutor_data.get("subjects", []),
+                "plan_types": tutor_data.get("plan_types", []),
+                "teaching_assignments": tutor_data.get("teaching_assignments", []),
+                "can_edit_students": tutor_data.get("can_edit_students", False),
             }
 
         except HTTPException:
