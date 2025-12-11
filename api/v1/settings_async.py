@@ -50,7 +50,8 @@ class SchoolSettingsRequest(BaseModel):
     """Request model for updating school settings"""
     school_info: Optional[SchoolInfo] = None
     classes: Optional[List[str]] = Field(None, description="List of class/grade names")
-    sections: Optional[List[str]] = Field(None, description="List of section names")
+    sections: Optional[List[str]] = Field(None, description="List of section names (master list)")
+    class_sections: Optional[Dict[str, List[str]]] = Field(None, description="Class to sections mapping - which sections are enabled for each class")
     subjects: Optional[List[str]] = Field(None, description="List of subject names")
     plan_types: Optional[List[str]] = Field(None, description="List of plan types (e.g., CBSE, JEE)")
     streams: Optional[List[str]] = Field(None, description="List of streams (e.g., Science, Arts)")
@@ -61,7 +62,8 @@ class SchoolSettingsResponse(BaseModel):
     admin_id: str
     school_info: SchoolInfo
     classes: List[str]
-    sections: List[str]
+    sections: List[str]  # Master list of all sections
+    class_sections: Optional[Dict[str, List[str]]] = None  # Class to sections mapping
     subjects: List[str]
     plan_types: List[str]
     streams: List[str]
@@ -81,6 +83,12 @@ DEFAULT_SETTINGS = {
     },
     "classes": ["9", "10", "11", "12"],
     "sections": ["A", "B", "C", "D", "E", "F"],
+    "class_sections": {
+        "9": ["A", "B", "C", "D", "E", "F"],
+        "10": ["A", "B", "C", "D", "E", "F"],
+        "11": ["A", "B", "C", "D", "E", "F"],
+        "12": ["A", "B", "C", "D", "E", "F"]
+    },
     "subjects": ["Physics", "Chemistry", "Mathematics", "Biology", "English", "Hindi"],
     "plan_types": ["CBSE", "JEE", "NEET", "CUET"],
     "streams": ["Science", "Commerce", "Arts", "Other"]
@@ -142,6 +150,7 @@ async def get_school_settings(
             "school_info": SchoolInfo(**settings_doc.get("school_info", DEFAULT_SETTINGS["school_info"])).dict(),
             "classes": settings_doc.get("classes", DEFAULT_SETTINGS["classes"]),
             "sections": settings_doc.get("sections", DEFAULT_SETTINGS["sections"]),
+            "class_sections": settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
             "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
             "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
             "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"]),
@@ -204,8 +213,28 @@ async def update_school_settings(
             update_doc["school_info"] = existing_settings.get("school_info", DEFAULT_SETTINGS["school_info"]) if existing_settings else DEFAULT_SETTINGS["school_info"]
         
         # Update lists if provided
+        # Update lists if provided
         update_doc["classes"] = settings_data.classes if settings_data.classes is not None else (existing_settings.get("classes", DEFAULT_SETTINGS["classes"]) if existing_settings else DEFAULT_SETTINGS["classes"])
-        update_doc["sections"] = settings_data.sections if settings_data.sections is not None else (existing_settings.get("sections", DEFAULT_SETTINGS["sections"]) if existing_settings else DEFAULT_SETTINGS["sections"])
+        
+        # Get master sections list
+        master_sections = settings_data.sections if settings_data.sections is not None else (existing_settings.get("sections", DEFAULT_SETTINGS["sections"]) if existing_settings else DEFAULT_SETTINGS["sections"])
+        update_doc["sections"] = master_sections
+        
+        # Get class sections and sanitize against master list
+        raw_class_sections = settings_data.class_sections if settings_data.class_sections is not None else (existing_settings.get("class_sections", DEFAULT_SETTINGS["class_sections"]) if existing_settings else DEFAULT_SETTINGS["class_sections"])
+        
+        # Sanitize class_sections: Ensure all sections in the matrix actually exist in the master sections list
+        sanitized_class_sections = {}
+        if raw_class_sections:
+            for cls, sections in raw_class_sections.items():
+                if sections:
+                    # Only keep sections that are in the master list
+                    valid_sections = [s for s in sections if s in master_sections]
+                    sanitized_class_sections[cls] = valid_sections
+                else:
+                    sanitized_class_sections[cls] = []
+        
+        update_doc["class_sections"] = sanitized_class_sections
         update_doc["subjects"] = settings_data.subjects if settings_data.subjects is not None else (existing_settings.get("subjects", DEFAULT_SETTINGS["subjects"]) if existing_settings else DEFAULT_SETTINGS["subjects"])
         update_doc["plan_types"] = settings_data.plan_types if settings_data.plan_types is not None else (existing_settings.get("plan_types", DEFAULT_SETTINGS["plan_types"]) if existing_settings else DEFAULT_SETTINGS["plan_types"])
         update_doc["streams"] = settings_data.streams if settings_data.streams is not None else (existing_settings.get("streams", DEFAULT_SETTINGS["streams"]) if existing_settings else DEFAULT_SETTINGS["streams"])
@@ -229,6 +258,7 @@ async def update_school_settings(
             "school_info": SchoolInfo(**update_doc["school_info"]).dict(),
             "classes": update_doc["classes"],
             "sections": update_doc["sections"],
+            "class_sections": update_doc["class_sections"],
             "subjects": update_doc["subjects"],
             "plan_types": update_doc["plan_types"],
             "streams": update_doc["streams"],
@@ -390,6 +420,7 @@ async def get_public_school_settings(
                 "school_logo": "",
                 "classes": DEFAULT_SETTINGS["classes"],
                 "sections": DEFAULT_SETTINGS["sections"],
+                "class_sections": DEFAULT_SETTINGS["class_sections"],
                 "subjects": DEFAULT_SETTINGS["subjects"],
                 "plan_types": DEFAULT_SETTINGS["plan_types"],
                 "streams": DEFAULT_SETTINGS["streams"]
@@ -401,6 +432,7 @@ async def get_public_school_settings(
                 "school_logo": school_info.get("school_logo", ""),
                 "classes": settings_doc.get("classes", DEFAULT_SETTINGS["classes"]),
                 "sections": settings_doc.get("sections", DEFAULT_SETTINGS["sections"]),
+                "class_sections": settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
                 "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
                 "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
                 "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"])
