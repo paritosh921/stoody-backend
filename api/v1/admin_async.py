@@ -66,7 +66,54 @@ class CreateStudentRequest(BaseModel):
 class UpdateStudentRequest(BaseModel):
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
     email: Optional[EmailStr] = None
+    grade: Optional[str] = Field(None, description="New grade/class for the student")
+    section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
+
+
+class SessionPromotionRequest(BaseModel):
+    """Request model for promoting students to next session"""
+    new_session: str = Field(..., description="New academic session e.g., '2025-26'")
+    grade_mappings: Dict[str, str] = Field(
+        ..., 
+        description="Mapping of current grade to new grade e.g., {'10': '11', '11': '12'}"
+    )
+    # Filters to select which students to promote
+    grade_filter: Optional[List[str]] = Field(
+        None,
+        description="Only promote students from these grades. If empty/None, apply to all grades in mappings"
+    )
+    section_filter: Optional[List[str]] = Field(
+        None,
+        description="Only promote students from these sections. If empty/None, apply to all sections"
+    )
+    student_ids: Optional[List[str]] = Field(
+        None,
+        description="Specific student IDs to promote. If provided, only these students are promoted (overrides grade/section filters)"
+    )
+    section_updates: Optional[Dict[str, str]] = Field(
+        None,
+        description="Optional section updates for specific students. Key is student_id, value is new section"
+    )
+    deactivate_old_content: bool = Field(
+        True,
+        description="Whether to mark old notes, assignments, tests as inactive"
+    )
+    preview_only: bool = Field(
+        False,
+        description="If true, only return preview without making changes"
+    )
+
+
+class SessionPromotionResponse(BaseModel):
+    """Response model for session promotion"""
+    success: bool
+    message: str
+    new_session: str
+    students_promoted: int
+    students_skipped: int
+    content_deactivated: int
+    details: Optional[List[Dict[str, Any]]] = None
 
 class StudentResponse(BaseModel):
     id: str
@@ -351,6 +398,10 @@ async def update_student(
             update_fields["name"] = update.full_name
         if update.email is not None:
             update_fields["email"] = update.email
+        if update.grade is not None:
+            update_fields["grade"] = update.grade
+        if update.section is not None:
+            update_fields["section"] = update.section
         if update.is_active is not None:
             update_fields["is_active"] = update.is_active
 
@@ -675,6 +726,10 @@ async def update_student(
             update_dict["full_name"] = update_data.full_name
         if update_data.email is not None:
             update_dict["email"] = update_data.email
+        if update_data.grade is not None:
+            update_dict["grade"] = update_data.grade
+        if update_data.section is not None:
+            update_dict["section"] = update_data.section
         if update_data.is_active is not None:
             update_dict["is_active"] = update_data.is_active
 
@@ -1771,4 +1826,231 @@ async def toggle_reattempt(
         raise
     except Exception as e:
         logger.error(f"Failed to toggle re-attempt: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/session/promote", response_model=SessionPromotionResponse)
+@limiter.limit("5/minute")
+async def promote_session(
+    request: Request,
+    promotion_data: SessionPromotionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Promote all students to the next academic session.
+    
+    This endpoint:
+    1. Updates all students' grades based on grade_mappings
+    2. Optionally updates sections for specific students
+    3. Optionally deactivates old content (notes, assignments, tests)
+    4. Stores the session history for reference
+    
+    Use preview_only=True to see changes without actually applying them.
+    """
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        
+        # Get all active students for this admin
+        students = await db.mongo_find(
+            "students",
+            {"admin_id": admin_id, "is_active": True}
+        )
+        
+        if not students:
+            return SessionPromotionResponse(
+                success=True,
+                message="No active students found to promote",
+                new_session=promotion_data.new_session,
+                students_promoted=0,
+                students_skipped=0,
+                content_deactivated=0,
+                details=[]
+            )
+        
+        promoted_count = 0
+        skipped_count = 0
+        content_deactivated = 0
+        details = []
+        
+        for student in students:
+            student_id = str(student.get("_id"))
+            current_grade = student.get("grade", "")
+            current_section = student.get("section", "")
+            student_name = student.get("full_name") or student.get("name") or student.get("username", "Unknown")
+            business_id = student.get("student_id", student_id)
+            
+            # Apply filters
+            # 1. If specific student_ids are provided, only those students are considered
+            if promotion_data.student_ids:
+                if business_id not in promotion_data.student_ids and student_id not in promotion_data.student_ids:
+                    # This student is not in the selected list, skip without adding to details
+                    continue
+            else:
+                # 2. Apply grade filter if specified
+                if promotion_data.grade_filter and current_grade not in promotion_data.grade_filter:
+                    continue
+                
+                # 3. Apply section filter if specified
+                if promotion_data.section_filter and current_section not in promotion_data.section_filter:
+                    continue
+            
+            # Check if grade is in the mapping
+            if current_grade in promotion_data.grade_mappings:
+                new_grade = promotion_data.grade_mappings[current_grade]
+                
+                # Check for section update
+                new_section = current_section
+                if promotion_data.section_updates and business_id in promotion_data.section_updates:
+                    new_section = promotion_data.section_updates[business_id]
+                
+                detail = {
+                    "student_id": business_id,
+                    "student_name": student_name,
+                    "old_grade": current_grade,
+                    "new_grade": new_grade,
+                    "old_section": current_section,
+                    "new_section": new_section,
+                    "status": "promoted"
+                }
+                
+                # Only update if not preview mode
+                if not promotion_data.preview_only:
+                    update_fields = {
+                        "grade": new_grade,
+                        "section": new_section,
+                        "last_session": f"{current_grade}-{current_section}",
+                        "current_session": promotion_data.new_session,
+                        "promoted_at": datetime.utcnow(),
+                        "promoted_by": str(admin_id)
+                    }
+                    
+                    await db.mongo_update_one(
+                        "students",
+                        {"_id": student["_id"]},
+                        {"$set": update_fields}
+                    )
+                
+                details.append(detail)
+                promoted_count += 1
+            else:
+                # Grade not in mapping - skip
+                details.append({
+                    "student_id": business_id,
+                    "student_name": student_name,
+                    "old_grade": current_grade,
+                    "new_grade": current_grade,
+                    "old_section": current_section,
+                    "new_section": current_section,
+                    "status": "skipped",
+                    "reason": "Grade not in mapping"
+                })
+                skipped_count += 1
+        
+        # Deactivate old content if requested
+        if promotion_data.deactivate_old_content and not promotion_data.preview_only:
+            # Deactivate documents (notes, tests, practice sets) for the old session
+            result = await db.mongo_update_many(
+                "documents",
+                {
+                    "admin_id": admin_id,
+                    "is_active": True,
+                    "session": {"$ne": promotion_data.new_session}
+                },
+                {
+                    "$set": {
+                        "is_active": False,
+                        "deactivated_at": datetime.utcnow(),
+                        "deactivated_reason": f"Session promotion to {promotion_data.new_session}"
+                    }
+                }
+            )
+            content_deactivated = result if isinstance(result, int) else 0
+        
+        # Store session promotion history if not preview
+        if not promotion_data.preview_only:
+            await db.mongo_insert_one(
+                "session_promotions",
+                {
+                    "admin_id": admin_id,
+                    "new_session": promotion_data.new_session,
+                    "grade_mappings": promotion_data.grade_mappings,
+                    "students_promoted": promoted_count,
+                    "students_skipped": skipped_count,
+                    "content_deactivated": content_deactivated,
+                    "promoted_at": datetime.utcnow(),
+                    "promoted_by": str(admin_id)
+                }
+            )
+            
+            # Invalidate caches
+            try:
+                await cache.clear_pattern("students:*", "admin")
+                await cache.delete("dashboard_stats", "admin")
+            except Exception:
+                pass
+        
+        message = f"Preview: {promoted_count} students would be promoted" if promotion_data.preview_only else f"Successfully promoted {promoted_count} students to session {promotion_data.new_session}"
+        
+        logger.info(f"Session promotion {'preview' if promotion_data.preview_only else 'completed'} for admin {admin_id}: {promoted_count} promoted, {skipped_count} skipped")
+        
+        return SessionPromotionResponse(
+            success=True,
+            message=message,
+            new_session=promotion_data.new_session,
+            students_promoted=promoted_count,
+            students_skipped=skipped_count,
+            content_deactivated=content_deactivated,
+            details=details
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session promotion error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to promote session: {str(e)}"
+        )
+
+
+@router.get("/session/promotions")
+@limiter.limit("30/minute")
+async def get_session_promotions(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Get history of session promotions for this admin"""
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        
+        promotions = await db.mongo_find(
+            "session_promotions",
+            {"admin_id": admin_id},
+            sort=[("promoted_at", -1)],
+            limit=20
+        )
+        
+        # Format for response
+        formatted_promotions = []
+        for promo in promotions:
+            formatted_promotions.append({
+                "id": str(promo.get("_id")),
+                "new_session": promo.get("new_session"),
+                "grade_mappings": promo.get("grade_mappings"),
+                "students_promoted": promo.get("students_promoted", 0),
+                "students_skipped": promo.get("students_skipped", 0),
+                "content_deactivated": promo.get("content_deactivated", 0),
+                "promoted_at": promo.get("promoted_at").isoformat() if promo.get("promoted_at") else None
+            })
+        
+        return {
+            "success": True,
+            "promotions": formatted_promotions
+        }
+        
+    except Exception as e:
+        logger.error(f"Get session promotions error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

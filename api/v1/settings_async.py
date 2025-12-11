@@ -220,8 +220,19 @@ async def update_school_settings(
         master_sections = settings_data.sections if settings_data.sections is not None else (existing_settings.get("sections", DEFAULT_SETTINGS["sections"]) if existing_settings else DEFAULT_SETTINGS["sections"])
         update_doc["sections"] = master_sections
         
-        # Get class sections and sanitize against master list
-        raw_class_sections = settings_data.class_sections if settings_data.class_sections is not None else (existing_settings.get("class_sections", DEFAULT_SETTINGS["class_sections"]) if existing_settings else DEFAULT_SETTINGS["class_sections"])
+        # Get class sections: Start with existing (or defaults) to preserve untouched classes
+        raw_class_sections = existing_settings.get("class_sections", DEFAULT_SETTINGS["class_sections"]) if existing_settings else DEFAULT_SETTINGS["class_sections"]
+        
+        # Update with new data if provided
+        if settings_data.class_sections is not None:
+            # We merge the new settings into the existing dictionary
+            # This ensures that if the frontend only sends changed classes (or misses some), we don't lose the others
+            if raw_class_sections is None:
+                raw_class_sections = {}
+            
+            # Create a copy to modify
+            raw_class_sections = dict(raw_class_sections)
+            raw_class_sections.update(settings_data.class_sections)
         
         # Sanitize class_sections: Ensure all sections in the matrix actually exist in the master sections list
         sanitized_class_sections = {}
