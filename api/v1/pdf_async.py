@@ -1031,7 +1031,9 @@ class DocumentMetadata(BaseModel):
     ocr_job_id: Optional[str] = None
     extracted_questions_count: int = 0
     extracted_images_count: int = 0
+    pages_count: int = 0  # Number of pages in the PDF (for Notes display)
     total_points: Optional[float] = None  # Total points for Test Series documents
+    total_minutes: Optional[int] = None  # Total minutes for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
     is_active: bool = True  # Whether the document is enabled for students
 
@@ -1058,7 +1060,8 @@ async def upload_pdf(
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
     current_user: Dict[str, Any] = Depends(require_admin),
-    db: DatabaseManager = Depends(get_database)
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
 ):
     """
     Upload PDF file and save metadata (without OCR processing)
@@ -1109,6 +1112,17 @@ async def upload_pdf(
         # Read file content
         file_content = await file.read()
         file_size = len(file_content)
+        
+        # Count PDF pages using pypdf (already in requirements.txt)
+        pages_count = 0
+        try:
+            import io
+            from pypdf import PdfReader
+            pdf_reader = PdfReader(io.BytesIO(file_content))
+            pages_count = len(pdf_reader.pages)
+            logger.info(f"PDF {document_id} has {pages_count} pages")
+        except Exception as pdf_err:
+            logger.warning(f"Failed to count PDF pages for {document_id}: {pdf_err}")
 
         logger.info(f"Uploading document: {document_id}, Title: {title}, Type: {document_type}, Size: {file_size} bytes")
 
@@ -1175,6 +1189,7 @@ async def upload_pdf(
             "ocr_job_id": None,
             "extracted_questions_count": 0,
             "extracted_images_count": 0,
+            "pages_count": pages_count,  # Store page count for Notes display
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
@@ -1185,12 +1200,90 @@ async def upload_pdf(
         await db.mongo_insert_one("documents", document_metadata)
 
         logger.info(f"Document {document_id} uploaded successfully")
+        
+        # Auto-trigger OCR for Test Series and Practice Sets
+        should_auto_ocr = document_type in ["Test Series", "Practice Sets"]
+        ocr_status = "not_processed"
+        ocr_job_id = None
+        
+        if should_auto_ocr:
+            try:
+                # Import required modules for background OCR
+                job_id = str(uuid.uuid4())
+                ocr_job_id = job_id
+                
+                # Update status to processing
+                await db.mongo_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+                )
+                ocr_status = "processing"
+                
+                # Encode PDF for OCR
+                pdf_base64 = base64.b64encode(file_content).decode('utf-8')
+                
+                # Create processing result for cache
+                processing_result = {
+                    "job_id": job_id,
+                    "status": "processing",
+                    "progress": 20,
+                    "extracted_questions": 0,
+                    "extracted_images": 0,
+                    "output_folder": f"extracted_{document_id}_{int(datetime.utcnow().timestamp())}",
+                    "timestamp": datetime.utcnow()
+                }
+                
+                # Use the cache passed as dependency (not get_cache())
+                await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
+                
+                # Run OCR in background task
+                async def background_ocr():
+                    try:
+                        await run_document_ocr_pipeline(
+                            document=document_metadata,
+                            pdf_base64=pdf_base64,
+                            job_id=job_id,
+                            processing_result=processing_result,
+                            current_user=current_user,
+                            db=db,
+                            cache=cache
+                        )
+                        logger.info(f"Auto-OCR completed successfully for {document_id}")
+                    except Exception as ocr_exc:
+                        logger.error(f"Auto-OCR failed for {document_id}: {ocr_exc}")
+                        # Update document status to error so UI doesn't show infinite processing
+                        try:
+                            await db.mongo_update_one(
+                                "documents",
+                                {"document_id": document_id},
+                                {"$set": {"ocr_status": "error"}}
+                            )
+                        except Exception:
+                            pass
+                
+                asyncio.create_task(background_ocr())
+                logger.info(f"Auto-OCR triggered for {document_type}: {document_id}")
+                
+            except Exception as auto_ocr_err:
+                logger.warning(f"Failed to auto-trigger OCR for {document_id}: {auto_ocr_err}")
+                # Reset status since auto-OCR failed - allow manual retry
+                try:
+                    await db.mongo_update_one(
+                        "documents",
+                        {"document_id": document_id},
+                        {"$set": {"ocr_status": "not_processed", "ocr_job_id": None}}
+                    )
+                except Exception:
+                    pass
 
         return {
-            "message": "Document uploaded successfully",
+            "message": "Document uploaded successfully" + (" - OCR processing started automatically" if should_auto_ocr else ""),
             "document_id": document_id,
             "file_path": relative_path,
-            "ocr_status": "not_processed"
+            "ocr_status": ocr_status,
+            "ocr_job_id": ocr_job_id,
+            "pages_count": pages_count
         }
 
     except HTTPException:
@@ -1544,8 +1637,10 @@ async def get_documents(
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
-
                 extracted_images_count=doc.get("extracted_images_count", 0),
+                pages_count=doc.get("pages_count", 0),
+                total_points=doc.get("total_points"),
+                total_minutes=doc.get("total_minutes"),
                 is_active=doc.get("is_active", True)
             ))
 
