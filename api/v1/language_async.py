@@ -119,7 +119,6 @@ def generate_youngminds_login_url(email: str = None) -> str:
     
     try:
         # Use the Node.js script to generate the token to ensure 100% CryptoJS compatibility
-        # This avoids any subtle differences between Python's implementation and the official JS library
         import subprocess
         from config_async import BASE_DIR
         
@@ -143,9 +142,34 @@ def generate_youngminds_login_url(email: str = None) -> str:
         return redirect_url
         
     except Exception as e:
-        logger.error(f"Error generating URL via Node bridge: {str(e)}")
-        # In case of absolute failure, return something safe or raise
-        raise HTTPException(status_code=500, detail="Failed to generate secure link")
+        logger.warning(f"Error generating URL via Node bridge: {str(e)}. Falling back to pure Python implementation.")
+        
+        try:
+            # Python fallback implementation
+            # 60 seconds expiry to match Node script logic
+            expiry = int(time.time() * 1000) + (60 * 1000)
+            
+            # Use separators to mimic JSON.stringify (no spaces)
+            payload = json.dumps({
+                "email": youngminds_email,
+                "expiry": expiry
+            }, separators=(',', ':'))
+            
+            # Encrypt
+            encrypted = aes_encrypt_cryptojs_compatible(payload, YOUNGMINDS_SECRET_KEY)
+            
+            # Sign
+            signature = hmac_sha256_signature(encrypted, YOUNGMINDS_SECRET_HASH)
+            
+            # Construct URL
+            encoded_token = quote(encrypted, safe='')
+            redirect_url = f"{YOUNGMINDS_BASE_URL}?token={encoded_token}&sig={signature}"
+            
+            return redirect_url
+            
+        except Exception as py_e:
+            logger.error(f"Both Node and Python implementations failed: {str(py_e)}")
+            raise HTTPException(status_code=500, detail="Failed to generate secure link")
 
 
 @router.get("/generate-url", response_model=LanguageURLResponse)
