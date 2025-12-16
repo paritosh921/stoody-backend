@@ -153,8 +153,8 @@ class DashboardStats(BaseModel):
     chapter_notes_count: int
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -162,13 +162,47 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     return current_user
 
 def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Allow both admin and tutor roles"""
-    if current_user.get("user_type") not in ["admin", "tutor"]:
+    """Allow admin, B2C admin, and tutor roles"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin or Tutor access required"
         )
     return current_user
+
+def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
+    """Check if the current user is a B2C admin"""
+    return current_user.get("user_type") == "b2c_admin"
+
+async def db_find_one(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any], **kwargs):
+    """Route find_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_find_one(collection, query, **kwargs)
+    return await db.mongo_find_one(collection, query, **kwargs)
+
+async def db_find(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any], **kwargs):
+    """Route find to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_find(collection, query, **kwargs)
+    return await db.mongo_find(collection, query, **kwargs)
+
+async def db_insert_one(db: DatabaseManager, collection: str, document: dict, current_user: Dict[str, Any]):
+    """Route insert_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_insert_one(collection, document)
+    return await db.mongo_insert_one(collection, document)
+
+async def db_update_one(db: DatabaseManager, collection: str, query: dict, update: dict, current_user: Dict[str, Any], **kwargs):
+    """Route update_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_update_one(collection, query, update, **kwargs)
+    return await db.mongo_update_one(collection, query, update, **kwargs)
+
+async def db_delete_one(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any]):
+    """Route delete_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_delete_one(collection, query)
+    return await db.mongo_delete_one(collection, query)
 
 async def calculate_streak_days(student_id: ObjectId, db: DatabaseManager) -> int:
     """Calculate consecutive login days for a student"""
@@ -279,43 +313,64 @@ async def get_students(
 ):
     """Get paginated list of students"""
     try:
+        # Determine which collection to use based on user type
+        # B2C admin uses 'users' collection in STOODY-b2c database
+        # Regular admin uses 'students' collection in skillbot_db
+        is_b2c = is_b2c_admin(current_user)
+        collection = "users" if is_b2c else "students"
+        
         # Get admin_id from JWT token - filter by tenant
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
 
-        # Build filter
-        filter_dict = {"admin_id": admin_id}  # NEW - Multi-tenancy filter
+        # Build filter - B2C uses different filter (no admin_id for B2C users since they're self-registered)
+        if is_b2c:
+            filter_dict = {}  # B2C admin sees all B2C users
+        else:
+            filter_dict = {"admin_id": admin_id}  # Multi-tenancy filter for regular admin
 
         if search:
             filter_dict["$or"] = [
                 {"student_id": {"$regex": search, "$options": "i"}},
                 {"username": {"$regex": search, "$options": "i"}},
                 {"full_name": {"$regex": search, "$options": "i"}},
+                {"name": {"$regex": search, "$options": "i"}},
                 {"email": {"$regex": search, "$options": "i"}},
                 {"phone": {"$regex": search, "$options": "i"}}
             ]
         if is_active is not None:
             filter_dict["is_active"] = is_active
 
-        # Check cache first (include admin_id for tenant isolation)
-        cache_key = f"students:{str(admin_id)}:{page}:{limit}:{search}:{is_active}"
+        # Check cache first (include admin_id and is_b2c for tenant isolation)
+        cache_key = f"students:{'b2c' if is_b2c else str(admin_id)}:{page}:{limit}:{search}:{is_active}"
         cached_result = await cache.get(cache_key, "admin")
 
         if cached_result:
             return StudentsListResponse(**cached_result)
 
-        # Get total count
-        total_students = len(await db.mongo_find("students", filter_dict))
-
-        # Get paginated results
-        skip = (page - 1) * limit
-        students_data = await db.mongo_find(
-            "students",
-            filter_dict,
-            projection={"password_hash": 0},  # Exclude password
-            sort=[("created_at", -1)],
-            skip=skip,
-            limit=limit
-        )
+        # Get data using appropriate database
+        if is_b2c:
+            all_students = await db.b2c_find(collection, filter_dict)
+            total_students = len(all_students)
+            skip = (page - 1) * limit
+            students_data = await db.b2c_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+                skip=skip,
+                limit=limit
+            )
+        else:
+            total_students = len(await db.mongo_find(collection, filter_dict))
+            skip = (page - 1) * limit
+            students_data = await db.mongo_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+                skip=skip,
+                limit=limit
+            )
 
         students = []
         for student in students_data:
@@ -852,29 +907,48 @@ async def get_dashboard_stats(
 ):
     """Get admin dashboard statistics"""
     try:
+        # Determine if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+        
         # Get admin_id for data isolation
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
 
-        # Check cache first (include admin_id for isolation)
-        cache_key = f"dashboard_stats_{admin_id}"
+        # Check cache first (include admin_id and is_b2c for isolation)
+        cache_key = f"dashboard_stats_{'b2c' if is_b2c else str(admin_id)}"
         cached_stats = await cache.get(cache_key, "admin")
         if cached_stats:
             return DashboardStats(**cached_stats)
 
-        # Get statistics filtered by admin_id
-        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
-        total_students = len(admin_students)
+        if is_b2c:
+            # B2C Admin - query STOODY-b2c database 'users' collection
+            all_users = await db.b2c_find("users", {})
+            total_students = len(all_users)
+            
+            # Valid students = students with is_active = true
+            valid_students = len([s for s in all_users if s.get("is_active", True)])
+            
+            # Active students = students who have logged in at least once
+            active_students = len([s for s in all_users if s.get("last_login") is not None])
+            
+            # Get document counts from B2C database
+            practice_sets = await db.b2c_find("documents", {"document_type": "Practice Sets"})
+            test_series = await db.b2c_find("documents", {"document_type": "Test Series"})
+            chapter_notes = await db.b2c_find("documents", {"document_type": "Chapter Notes"})
+        else:
+            # Regular Admin - query skillbot_db
+            admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+            total_students = len(admin_students)
 
-        # Valid students = students with is_active = true
-        valid_students = len([s for s in admin_students if s.get("is_active", True)])
+            # Valid students = students with is_active = true
+            valid_students = len([s for s in admin_students if s.get("is_active", True)])
 
-        # Active students = students who have logged in at least once (have last_login field)
-        active_students = len([s for s in admin_students if s.get("last_login") is not None])
+            # Active students = students who have logged in at least once (have last_login field)
+            active_students = len([s for s in admin_students if s.get("last_login") is not None])
 
-        # Get document counts by type (filtered by admin_id)
-        practice_sets = await db.mongo_find("documents", {"document_type": "Practice Sets", "admin_id": admin_id})
-        test_series = await db.mongo_find("documents", {"document_type": "Test Series", "admin_id": admin_id})
-        chapter_notes = await db.mongo_find("documents", {"document_type": "Chapter Notes", "admin_id": admin_id})
+            # Get document counts by type (filtered by admin_id)
+            practice_sets = await db.mongo_find("documents", {"document_type": "Practice Sets", "admin_id": admin_id})
+            test_series = await db.mongo_find("documents", {"document_type": "Test Series", "admin_id": admin_id})
+            chapter_notes = await db.mongo_find("documents", {"document_type": "Chapter Notes", "admin_id": admin_id})
 
         stats_data = {
             "total_students": total_students,

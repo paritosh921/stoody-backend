@@ -78,8 +78,8 @@ class QuestionStats(BaseModel):
     recent_additions: int
 
 def require_admin_for_write(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access for write operations"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access for write operations (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -87,9 +87,12 @@ def require_admin_for_write(current_user: Dict[str, Any] = Depends(get_current_u
     return current_user
 
 def get_admin_id_from_user(current_user: Dict[str, Any]) -> str:
-    """Extract admin_id from user token (works for admin, tutor, and student users)"""
+    """Extract admin_id from user token (works for admin, tutor, student, b2c_user, and b2c_admin users)"""
     user_type = current_user.get("user_type")
     if user_type == "admin":
+        return current_user.get("user_id")
+    if user_type == "b2c_admin":
+        # B2C Admin uses their own ID for content management
         return current_user.get("user_id")
     if user_type == "tutor":
         admin_id = current_user.get("admin_id")
@@ -107,6 +110,20 @@ def get_admin_id_from_user(current_user: Dict[str, Any]) -> str:
                 detail="Student account not properly configured"
             )
         return admin_id
+    if user_type == "b2c_user":
+        # B2C users get content from the B2C admin
+        # First check if there's an admin_id in the token
+        admin_id = current_user.get("admin_id")
+        if admin_id:
+            return admin_id
+        # Fall back to B2C_ADMIN_ID from environment
+        import os
+        b2c_admin_id = os.getenv("B2C_ADMIN_ID", "")
+        if b2c_admin_id:
+            return b2c_admin_id
+        # If no B2C admin configured, allow access with a placeholder
+        logger.warning("No B2C_ADMIN_ID configured - B2C user will see no content")
+        return "b2c_default_admin"
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Unknown user type"

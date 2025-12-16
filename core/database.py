@@ -18,6 +18,7 @@ from config_async import (
     CHROMADB_COLLECTION_NAME,
     MONGODB_URL,
     MONGODB_DB_NAME,
+    MONGODB_DB_STOODY,
     DISABLE_MONGODB,
     settings
 )
@@ -32,6 +33,7 @@ class DatabaseManager:
         self.chroma_collection = None
         self.mongo_client: Optional[AsyncIOMotorClient] = None
         self.mongo_db: Optional[AsyncIOMotorDatabase] = None
+        self.mongo_db_b2c: Optional[AsyncIOMotorDatabase] = None  # B2C database
         self._chroma_lock = asyncio.Lock()
         self._mongo_lock = asyncio.Lock()
 
@@ -136,6 +138,10 @@ class DatabaseManager:
 
                 logger.info(f"✅ MongoDB initialized - Database: {MONGODB_DB_NAME}")
 
+                # Also initialize B2C database using same client
+                self.mongo_db_b2c = self.mongo_client[MONGODB_DB_STOODY]
+                logger.info(f"✅ B2C MongoDB initialized - Database: {MONGODB_DB_STOODY}")
+
                 # Ensure indexes (unique constraints, performance)
                 try:
                     await self.ensure_indexes()
@@ -163,8 +169,21 @@ class DatabaseManager:
         return self.mongo_db
 
     async def get_mongo_collection(self, collection_name: str):
-        """Get MongoDB collection"""
+        """Get MongoDB collection from main database (skillbot_db)"""
         db = await self.get_mongo_db()
+        if db is None:
+            return None
+        return db[collection_name]
+
+    async def get_b2c_db(self) -> Optional[AsyncIOMotorDatabase]:
+        """Get B2C MongoDB database (stoody-b2c) with lazy initialization"""
+        if self.mongo_db_b2c is None and MONGODB_URL and not DISABLE_MONGODB:
+            await self._init_mongodb()
+        return self.mongo_db_b2c
+
+    async def get_b2c_collection(self, collection_name: str):
+        """Get MongoDB collection from B2C database (stoody-b2c)"""
+        db = await self.get_b2c_db()
         if db is None:
             return None
         return db[collection_name]
@@ -503,3 +522,98 @@ class DatabaseManager:
 
         except Exception as e:
             logger.error(f"Error closing database connections: {str(e)}")
+
+    # ==================== B2C Database Operations ====================
+    # These methods operate on the stoody-b2c database for B2C users
+    # They mirror the main methods but use get_b2c_collection instead
+
+    async def b2c_find_one(self, collection_name: str, filter_dict: Dict[str, Any],
+                           projection: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Find one document in B2C MongoDB database"""
+        try:
+            if self.mongo_client is None or self.mongo_db_b2c is None:
+                logger.warning(f"B2C MongoDB not connected - cannot query {collection_name}")
+                return None
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return None
+            return await collection.find_one(filter_dict, projection)
+        except Exception as e:
+            logger.error(f"B2C MongoDB find_one failed: {str(e)}")
+            return None
+
+    async def b2c_find(self, collection_name: str, filter_dict: Dict[str, Any],
+                       projection: Optional[Dict[str, Any]] = None,
+                       sort: Optional[List[tuple]] = None,
+                       limit: Optional[int] = None,
+                       skip: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Find documents in B2C MongoDB database"""
+        try:
+            if self.mongo_client is None or self.mongo_db_b2c is None:
+                logger.warning(f"B2C MongoDB not connected - cannot query {collection_name}")
+                return []
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return []
+            cursor = collection.find(filter_dict, projection)
+            if sort:
+                cursor = cursor.sort(sort)
+            if skip:
+                cursor = cursor.skip(skip)
+            if limit:
+                cursor = cursor.limit(limit)
+            max_length = limit if limit is not None else 1000
+            return await cursor.to_list(length=max_length)
+        except Exception as e:
+            logger.error(f"B2C MongoDB find failed: {str(e)}")
+            return []
+
+    async def b2c_insert_one(self, collection_name: str, document: Dict[str, Any]) -> Optional[str]:
+        """Insert one document to B2C MongoDB database"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return None
+            result = await collection.insert_one(document)
+            return str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"B2C MongoDB insert_one failed: {str(e)}")
+            return None
+
+    async def b2c_update_one(self, collection_name: str, filter_dict: Dict[str, Any],
+                             update_dict: Dict[str, Any], upsert: bool = False) -> bool:
+        """Update one document in B2C MongoDB database"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return False
+            result = await collection.update_one(filter_dict, update_dict, upsert=upsert)
+            return result.modified_count > 0 or (upsert and result.upserted_id is not None)
+        except Exception as e:
+            logger.error(f"B2C MongoDB update_one failed: {str(e)}")
+            return False
+
+    async def b2c_delete_one(self, collection_name: str, filter_dict: Dict[str, Any]) -> bool:
+        """Delete one document from B2C MongoDB database"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return False
+            result = await collection.delete_one(filter_dict)
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"B2C MongoDB delete_one failed: {str(e)}")
+            return False
+
+    async def b2c_delete_many(self, collection_name: str, filter_dict: Dict[str, Any]) -> bool:
+        """Delete multiple documents from B2C MongoDB database"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return False
+            result = await collection.delete_many(filter_dict)
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"B2C MongoDB delete_many failed: {str(e)}")
+            return False
+

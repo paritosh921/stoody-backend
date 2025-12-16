@@ -96,13 +96,17 @@ DEFAULT_SETTINGS = {
 
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=403,
             detail="Admin access required"
         )
     return current_user
+
+def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
+    """Check if the current user is a B2C admin"""
+    return current_user.get("user_type") == "b2c_admin"
 
 
 @router.get("/settings", response_model=SchoolSettingsResponse)
@@ -119,17 +123,26 @@ async def get_school_settings(
         if not admin_id:
             raise HTTPException(status_code=401, detail="Invalid user session")
         
+        # Determine if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+        
         # Try to get from cache first
-        cache_key = f"school_settings:{admin_id}"
+        cache_key = f"school_settings:{'b2c' if is_b2c else admin_id}"
         cached_settings = await cache.get(cache_key)
         if cached_settings:
             return cached_settings
         
-        # Get settings from database
-        settings_doc = await db.mongo_find_one(
-            "school_settings",
-            {"admin_id": admin_id}
-        )
+        # Get settings from appropriate database
+        if is_b2c:
+            settings_doc = await db.b2c_find_one(
+                "school_settings",
+                {"admin_id": admin_id}
+            )
+        else:
+            settings_doc = await db.mongo_find_one(
+                "school_settings",
+                {"admin_id": admin_id}
+            )
         
         if not settings_doc:
             # Return default settings for new admins

@@ -83,8 +83,9 @@ class MCQStats(BaseModel):
     difficulty_breakdown: Dict[str, Dict[str, int]]  # difficulty -> {total, correct}
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
-    if current_user.get("user_type") not in ["student", "admin"]:
+    """Dependency to require student, B2C user, B2C admin, or admin access"""
+    # b2c_user gets same access as student, b2c_admin gets admin access
+    if current_user.get("user_type") not in ["student", "admin", "b2c_user", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Student or admin access required"
@@ -109,8 +110,8 @@ async def get_current_user_optional(db: DatabaseManager = Depends(get_database))
         return {"user_type": "student", "user_id": "anonymous"}
 
 def require_admin_for_write(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access for write operations"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access for write operations (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -433,8 +434,8 @@ async def get_test_series_list(
         if standard:
             filter_query["standard"] = standard
 
-        # If user is a student, apply profile-based filtering
-        if current_user.get("user_type") == "student":
+        # If user is a student or B2C user, apply profile-based filtering
+        if current_user.get("user_type") in ["student", "b2c_user"]:
             filter_query["ocr_status"] = "completed"
             # is_active: {$ne: False} matches True, None, or missing field (default active)
             filter_query["is_active"] = {"$ne": False}
