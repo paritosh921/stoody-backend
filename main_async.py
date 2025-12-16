@@ -68,6 +68,15 @@ from api.v1.pdf_async import router as pdf_router
 from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
 
+# B2C Authentication routes (Google OAuth for B2C users using stoody-b2c database)
+try:
+    from api.v1.b2c_auth_async import router as b2c_auth_router
+    _b2c_auth_available = True
+except Exception as e:
+    b2c_auth_router = None
+    _b2c_auth_available = False
+    logging.warning(f"B2C auth routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -423,6 +432,23 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}/admin",
     tags=["School Settings"]
 )
+
+# B2C Authentication routes (Google OAuth for B2C users)
+if _b2c_auth_available and b2c_auth_router:
+    app.include_router(
+        b2c_auth_router,
+        prefix=f"{API_V1_PREFIX}/b2c",
+        tags=["B2C Authentication"]
+    )
+    # Also mount at /auth/b2c for frontend convenience
+    app.include_router(
+        b2c_auth_router,
+        prefix="/auth/b2c",
+        tags=["B2C Authentication (Legacy)"]
+    )
+    logger.info("✅ B2C authentication routes enabled")
+else:
+    logger.warning("⚠️ B2C authentication routes disabled (missing dependencies)")
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")

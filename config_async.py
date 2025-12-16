@@ -43,6 +43,12 @@ class AsyncSettings(BaseSettings):
     # Database URLs
     MONGODB_URL: str = os.getenv("MONGODB_URI", "")
     MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "skillbot_db")
+    # B2C Database (Stoody B2C) - Completely separate from skillbot_db
+    # Note: MongoDB is case-sensitive - use exact case of existing database
+    MONGODB_DB_STOODY: str = os.getenv("MONGODB_DB_STOODY", "STOODY-b2c")
+    # Google OAuth Configuration for B2C Users
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
     # Allow disabling MongoDB in dev, but default to enabled if URI is present
     _dev_default = "true" if os.getenv("NODE_ENV", "production") == "development" else "false"
     _default_disable = "false" if os.getenv("MONGODB_URI") else _dev_default
@@ -120,6 +126,9 @@ API_V1_PREFIX = settings.API_V1_PREFIX
 CORS_ORIGINS = settings.CORS_ORIGINS
 MONGODB_URL = settings.MONGODB_URL
 MONGODB_DB_NAME = settings.MONGODB_DB_NAME
+MONGODB_DB_STOODY = settings.MONGODB_DB_STOODY
+GOOGLE_CLIENT_ID = settings.GOOGLE_CLIENT_ID
+GOOGLE_CLIENT_SECRET = settings.GOOGLE_CLIENT_SECRET
 DISABLE_MONGODB = settings.DISABLE_MONGODB
 REDIS_URL = settings.REDIS_URL
 CHROMADB_PATH = settings.CHROMADB_PATH

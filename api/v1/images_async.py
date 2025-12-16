@@ -55,12 +55,13 @@ class ImagesListResponse(BaseModel):
     limit: int
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
+    """Dependency to require student, B2C user, B2C admin, or admin access"""
     user_type = current_user.get("user_type")
     logger.info(f"require_student_or_admin: user_type={user_type}, current_user keys={list(current_user.keys())}")
 
-    if user_type not in ["student", "admin"]:
-        logger.error(f"Access denied: user_type '{user_type}' not in ['student', 'admin']")
+    # b2c_user gets same access as student, b2c_admin gets admin access
+    if user_type not in ["student", "admin", "b2c_user", "b2c_admin"]:
+        logger.error(f"Access denied: user_type '{user_type}' not in ['student', 'admin', 'b2c_user', 'b2c_admin']")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Student or admin access required. Current user_type: {user_type}"
@@ -168,9 +169,9 @@ async def get_images(
         user_id = current_user["user_id"]
         user_type = current_user["user_type"]
 
-        # Build filter - students can only see their own images, admins see all
+        # Build filter - students/b2c_users can only see their own images, admins see all
         filter_dict = {}
-        if user_type == "student":
+        if user_type in ["student", "b2c_user"]:
             filter_dict["uploaded_by"] = user_id
 
         # Get total count
@@ -333,8 +334,8 @@ async def delete_image(
                 detail="Image not found"
             )
 
-        # Check permissions - students can only delete their own images
-        if (current_user["user_type"] == "student" and
+        # Check permissions - students/b2c_users can only delete their own images
+        if (current_user["user_type"] in ["student", "b2c_user"] and
             image_data["uploaded_by"] != current_user["user_id"]):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

@@ -22,8 +22,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 # Helper dependency functions
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=403,
             detail="Admin access required"
@@ -42,8 +42,8 @@ def require_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin OR tutor access"""
-    if current_user.get("user_type") not in ["admin", "tutor"]:
+    """Dependency to require admin, B2C admin, OR tutor access"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
         raise HTTPException(
             status_code=403,
             detail="Admin or Tutor access required"

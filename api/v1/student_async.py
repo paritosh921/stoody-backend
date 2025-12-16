@@ -62,8 +62,9 @@ class StudentDashboardStats(BaseModel):
     recent_activity: int
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
-    if current_user.get("user_type") not in ["student", "admin"]:
+    """Dependency to require student, B2C user, B2C admin, or admin access"""
+    # b2c_user gets same access as student, b2c_admin gets admin access
+    if current_user.get("user_type") not in ["student", "admin", "b2c_user", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Student or admin access required"
@@ -71,8 +72,9 @@ def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_
     return current_user
 
 def require_student(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student access"""
-    if current_user.get("user_type") != "student":
+    """Dependency to require student or B2C user access"""
+    # b2c_user gets same access as student (individual paying students)
+    if current_user.get("user_type") not in ["student", "b2c_user"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Student access required"
