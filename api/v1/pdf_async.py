@@ -1887,6 +1887,124 @@ async def get_student_practice_sets(
     """Get practice sets available for the current student based on their profile"""
     try:
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            # Get B2C user profile from B2C database
+            b2c_user = await db.b2c_find_one("users", {"_id": BsonObjectId(current_user["user_id"])})
+            
+            if not b2c_user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="B2C user profile not found"
+                )
+            
+            # Check if onboarding is complete
+            if not b2c_user.get("onboarding_complete"):
+                return {
+                    "success": True,
+                    "data": {
+                        "practice_sets": [],
+                        "total": 0,
+                        "onboarding_required": True
+                    }
+                }
+            
+            # Get user's plan details
+            user_exam_type = b2c_user.get("exam_type")
+            user_class_level = b2c_user.get("class_level")
+            user_standard = b2c_user.get("standard")
+            user_subjects = b2c_user.get("subjects", [])
+            user_plan_types = b2c_user.get("plan_types", [])
+            
+            # Get B2C admin ID for content filtering
+            b2c_admin = await db.b2c_find_one("admins", {}, {"_id": 1})
+            b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
+            
+            # Build filter for B2C practice sets
+            filter_query = {
+                "document_type": "Practice Sets",
+                "ocr_status": "completed",
+                "is_active": {"$ne": False}
+            }
+            
+            if b2c_admin_id:
+                try:
+                    filter_query["admin_id"] = BsonObjectId(b2c_admin_id)
+                except:
+                    filter_query["admin_id"] = b2c_admin_id
+            
+            # Apply plan type filter
+            if plan_type:
+                filter_query["course_plan"] = plan_type
+            elif user_plan_types:
+                filter_query["course_plan"] = {"$in": user_plan_types}
+            elif user_exam_type:
+                filter_query["course_plan"] = user_exam_type
+            
+            # Apply subject filter
+            if subject:
+                filter_query["subject"] = subject
+            elif user_subjects:
+                filter_query["subject"] = {"$in": user_subjects}
+            
+            # Apply standard filter
+            if user_standard:
+                filter_query["standard"] = user_standard
+            
+            logger.info(f"B2C user {current_user['user_id']} practice sets query: {filter_query}")
+            
+            # Get practice sets from B2C database
+            practice_sets = await db.b2c_find(
+                "documents",
+                filter_query,
+                sort=[("uploaded_at", -1)]
+            )
+            
+            logger.info(f"B2C practice sets found: {len(practice_sets)}")
+            
+            # Format response
+            practice_sets_list = []
+            user_id = current_user["user_id"]
+            
+            for doc in practice_sets:
+                doc_id = doc.get("document_id") or str(doc.get("_id"))
+                
+                # Check if B2C user has attempted/completed this practice set
+                sessions = await db.b2c_find(
+                    "practice_sessions",
+                    {
+                        "student_id": user_id,
+                        "document_id": doc_id
+                    },
+                    sort=[("started_at", -1)],
+                    limit=10
+                )
+                
+                has_attempted = len(sessions) > 0
+                completed = any(s.get("is_completed", False) for s in sessions)
+                
+                practice_sets_list.append({
+                    "document_id": doc_id,
+                    "title": doc.get("title"),
+                    "subject": doc.get("subject"),
+                    "difficulty": doc.get("difficulty"),
+                    "course_plan": doc.get("course_plan"),
+                    "standard": doc.get("standard"),
+                    "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                    "completed": completed,
+                    "attempted": has_attempted,
+                    "session_count": len(sessions)
+                })
+            
+            return {
+                "success": True,
+                "data": {
+                    "practice_sets": practice_sets_list,
+                    "total": len(practice_sets_list)
+                }
+            }
 
         if user_type == "admin":
             # Admin can see all practice sets (including non-validated for testing)
@@ -1950,6 +2068,7 @@ async def get_student_practice_sets(
                     "total": len(practice_sets_list)
                 }
             }
+
 
         # Student - get their profile and filter by access
         student_profile = await db.mongo_find_one("students", {"_id": BsonObjectId(current_user["user_id"])})

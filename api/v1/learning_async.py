@@ -83,6 +83,7 @@ async def get_course_structure(
     Behavior:
     - Admin users (viewing as student): Returns ALL Chapter Notes documents
     - Student users: Returns only documents matching their profile (exact match)
+    - B2C users: Returns documents from B2C database matching their plan (JEE/NEET + class)
     """
     try:
         # Get admin_id for data isolation
@@ -94,16 +95,96 @@ async def get_course_structure(
             pass
 
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
 
-        # Build query based on user type - always filter by admin_id
-        if user_type == "admin":
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            # Get B2C user profile from B2C database
+            b2c_user = await db.b2c_find_one("users", {"_id": ObjectId(current_user["user_id"])})
+            
+            if not b2c_user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="B2C user profile not found"
+                )
+            
+            # Check if onboarding is complete
+            if not b2c_user.get("onboarding_complete"):
+                # Return empty structure for users who haven't completed onboarding
+                return {
+                    "success": True,
+                    "data": {
+                        "standards": [],
+                        "subjects": {},
+                        "dashboard_stats": {},
+                        "onboarding_required": True
+                    }
+                }
+            
+            # Get user's plan details
+            user_exam_type = b2c_user.get("exam_type")  # JEE or NEET
+            user_class_level = b2c_user.get("class_level")  # 9, 10, 11, 12, or Dropper
+            user_standard = b2c_user.get("standard")  # Mapped class (Dropper = 12)
+            user_subjects = b2c_user.get("subjects", [])  # Auto-set based on exam
+            user_plan_types = b2c_user.get("plan_types", [])  # [JEE] or [NEET]
+            
+            # Get B2C admin ID for content filtering
+            b2c_admin = await db.b2c_find_one("admins", {}, {"_id": 1})
+            b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
+            
+            if not b2c_admin_id:
+                logger.warning("No B2C admin found - B2C user will see no content")
+                return {
+                    "success": True,
+                    "data": {
+                        "standards": [],
+                        "subjects": {},
+                        "dashboard_stats": {}
+                    }
+                }
+            
+            # Query B2C documents collection - ONLY Chapter Notes for learning structure
+            query = {
+                "document_type": "Chapter Notes",
+                "is_active": {"$ne": False}
+            }
+
+            
+            # Filter by admin
+            try:
+                query["admin_id"] = ObjectId(b2c_admin_id)
+            except:
+                query["admin_id"] = b2c_admin_id
+            
+            # Filter by course plan (JEE/NEET)
+            if user_plan_types:
+                query["course_plan"] = {"$in": user_plan_types}
+            elif user_exam_type:
+                query["course_plan"] = user_exam_type
+            
+            # Filter by standard (class)
+            if user_standard:
+                query["standard"] = user_standard
+            
+            # Filter by subjects
+            if user_subjects:
+                query["subject"] = {"$in": user_subjects}
+            
+            logger.info(f"B2C user {current_user['user_id']} query: {query}")
+            
+            # Get documents from B2C database
+            documents = await db.b2c_find("documents", query)
+            logger.info(f"B2C documents found: {len(documents)}")
+            
+        elif user_type == "admin":
             # Admin viewing student panel - show Chapter Notes from their organization
             query = {
                 "document_type": "Chapter Notes",
                 "admin_id": admin_id
             }
+            documents = await db.mongo_find("documents", query)
         else:
-            # Actual student login - filter by profile using EXACT match
+            # Regular B2B student login - filter by profile using EXACT match
             student = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
 
             if not student:
@@ -124,21 +205,18 @@ async def get_course_structure(
                 )
 
             # Query documents with EXACT match on standard
-            # Both student.grade and document.standard come from admin settings, so they match exactly
             query = {
                 "document_type": "Chapter Notes",
                 "admin_id": admin_id,
-                "standard": student_grade,  # EXACT match - no normalization
+                "standard": student_grade,
                 "subject": {"$in": student_subjects},
                 "is_active": {"$ne": False}
             }
 
-            # If student has plan_types, filter by those as well
             if student_plan_types:
                 query["course_plan"] = {"$in": student_plan_types}
-
-        # Get all Chapter Notes documents based on query
-        documents = await db.mongo_find("documents", query)
+            
+            documents = await db.mongo_find("documents", query)
 
         # Organize by standard and subject
         standards_set = set()
@@ -166,7 +244,9 @@ async def get_course_structure(
                     "id": str(doc["_id"]),
                     "title": doc.get("title"),
                     "subject": subj,
-                    "standard": std
+                    "standard": std,
+                    "document_type": doc.get("document_type"),
+                    "course_plan": doc.get("course_plan")
                 })
 
         # Convert sets to sorted lists
@@ -193,6 +273,7 @@ async def get_course_structure(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve course structure: {str(e)}"
         )
+
 
 
 @router.get("/chapters/{standard}/{subject}", tags=["Learning"])
@@ -224,6 +305,85 @@ async def get_chapters(
             pass
 
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            logger.info(f"B2C user {current_user['user_id']} fetching chapters for {standard}/{subject}")
+            
+            # Get B2C user profile
+            b2c_user = await db.b2c_find_one("users", {"_id": ObjectId(current_user["user_id"])})
+            if not b2c_user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="B2C user profile not found"
+                )
+            
+            # Get user's standard - either from profile or map from class_level
+            user_standard = b2c_user.get("standard")
+            if not user_standard:
+                # Map class_level like "Class 11" to "11"
+                class_level = b2c_user.get("class_level", "")
+                if "11" in str(class_level):
+                    user_standard = "11"
+                elif "12" in str(class_level):
+                    user_standard = "12"
+            
+            logger.info(f"B2C user standard: {user_standard}, class_level: {b2c_user.get('class_level')}")
+            
+            # Build B2C query with plan-based filtering
+            b2c_query = {
+                "document_type": "Chapter Notes",
+                "is_active": {"$ne": False}
+            }
+            
+            # Use user's standard from profile (not the parameter which might be "Not Set")
+            if user_standard:
+                b2c_query["standard"] = user_standard
+            elif standard and standard != "Not Set":
+                b2c_query["standard"] = standard
+            
+            # Filter by subject
+            if subject:
+                b2c_query["subject"] = subject
+            
+            # Filter by user's plan (exam_type) - documents use 'course_plan' field
+            if b2c_user.get("exam_type"):
+                b2c_query["course_plan"] = {"$in": [b2c_user.get("exam_type")]}
+
+            
+            logger.info(f"B2C chapters query: {b2c_query}")
+            
+            # Get documents from B2C database
+            documents = await db.b2c_find("documents", b2c_query, sort=[("title", 1)])
+            logger.info(f"B2C chapters found: {len(documents)} for standard={user_standard}, subject={subject}")
+
+            
+            # Convert to response format
+            documents_list = []
+            for doc in documents:
+                documents_list.append({
+                    "document_id": doc.get("document_id") or str(doc["_id"]),
+                    "title": doc.get("title"),
+                    "subject": doc.get("subject"),
+                    "standard": doc.get("standard"),
+                    "course_plan": doc.get("course_plan"),
+                    "document_type": doc.get("document_type"),
+                    "difficulty": doc.get("difficulty"),
+                    "file_path": doc.get("file_path"),
+                    "ocr_status": doc.get("ocr_status"),
+                    "created_at": doc.get("created_at")
+                })
+            
+            return {
+                "success": True,
+                "data": {
+                    "standard": standard,
+                    "subject": subject,
+                    "documents": documents_list,
+                    "total": len(documents_list)
+                }
+            }
 
         # Build query based on user type - always filter by admin_id
         if user_type == "admin":
@@ -287,6 +447,7 @@ async def get_chapters(
 
         # Get Chapter Notes documents based on query
         documents = await db.mongo_find("documents", query, sort=[("title", 1)])
+
 
         # Convert MongoDB documents to response format
         documents_list = []
@@ -454,67 +615,92 @@ async def get_chapter_pdf(
         except Exception:
             pass
 
-        # Get document from database (document_id is MongoDB's _id as string, filtered by admin_id)
-        document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
-
-        if not document:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Document not found: {document_id}"
-            )
-
-        # Verify document type is Chapter Notes
-        if document.get("document_type") != "Chapter Notes":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This document is not a Chapter Notes document"
-            )
-
-        # Note: Chapter Notes don't require OCR processing, so we skip the OCR status check
-
-        # Access control based on user type
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        logger.info(f"PDF request: document_id={document_id}, user_type={user_type}, is_b2c={is_b2c}")
 
-        if user_type == "student":
-            # For actual student login, verify access permissions
-            student = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
-
-            if not student:
+        # B2C users - query from B2C database
+        if is_b2c:
+            # Try to find document by _id first, then by document_id
+            try:
+                document = await db.b2c_find_one("documents", {"_id": ObjectId(document_id)})
+            except:
+                document = None
+            
+            if not document:
+                document = await db.b2c_find_one("documents", {"document_id": document_id})
+            
+            if not document:
+                logger.error(f"B2C document not found: {document_id}")
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Student profile not found"
+                    detail=f"Document not found: {document_id}"
                 )
+            
+            logger.info(f"B2C document found: {document.get('title')}, file_path: {document.get('file_path')}")
+            
+            # B2C users have access to all documents in their database
+            # No additional access control needed - documents are already filtered by admin
+        else:
+            # Regular B2B flow - query main database
+            document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
 
-            # Verify student has access to this document
-            student_grade = student.get("grade")
-            student_plan_types = student.get("plan_types", [])
-            student_subjects = student.get("subjects", [])
-
-            doc_standard = document.get("standard")
-            doc_course_plan = document.get("course_plan")
-            doc_subject = document.get("subject")
-
-            # Check if student's grade matches document standard (using flexible matching)
-            if not grades_match(student_grade, doc_standard):
+            if not document:
                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied. This document is not for your grade level."
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Document not found: {document_id}"
                 )
 
-            # Check if student is enrolled in this subject
-            if doc_subject not in student_subjects:
+            # Verify document type is Chapter Notes
+            if document.get("document_type") != "Chapter Notes":
                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied. You are not enrolled in this subject."
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This document is not a Chapter Notes document"
                 )
 
-            # Check if document's course plan matches student's plan types (if student has plan types)
-            if student_plan_types and doc_course_plan not in student_plan_types:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Access denied. This document is for {doc_course_plan} plan."
-                )
-        # else: Admin users can access all documents
+            # Access control for B2B students
+            if user_type == "student":
+                # For actual student login, verify access permissions
+                student = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
+
+                if not student:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Student profile not found"
+                    )
+
+                # Verify student has access to this document
+                student_grade = student.get("grade")
+                student_plan_types = student.get("plan_types", [])
+                student_subjects = student.get("subjects", [])
+
+                doc_standard = document.get("standard")
+                doc_course_plan = document.get("course_plan")
+                doc_subject = document.get("subject")
+
+                # Check if student's grade matches document standard (using flexible matching)
+                if not grades_match(student_grade, doc_standard):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied. This document is not for your grade level."
+                    )
+
+                # Check if student is enrolled in this subject
+                if doc_subject not in student_subjects:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Access denied. You are not enrolled in this subject."
+                    )
+
+                # Check if document's course plan matches student's plan types (if student has plan types)
+                if student_plan_types and doc_course_plan not in student_plan_types:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Access denied. This document is for {doc_course_plan} plan."
+                    )
+            # else: Admin users can access all documents
+
 
         # Get PDF path
         pdf_path = Path(document.get("file_path", ""))
