@@ -2,204 +2,189 @@
 
 ## Overview
 
-This document describes the B2C (Business-to-Consumer) user support added to the Stoody platform. B2C users are individual users who sign in using Google OAuth, separate from the existing school/institution-based users.
+The B2C flow allows individual students to purchase and use the Stoody platform directly without going through an institute (B2B/CRM-based) system.
 
-## Architecture
+## B2C vs B2B Comparison
 
-### Database Separation
+| Feature | B2B (CRM) | B2C (Direct) |
+|---------|-----------|--------------|
+| Account Creation | Admin creates student accounts | Self-registration via Google OAuth |
+| Database | `skillbot_db` | `STOODY-b2c` |
+| Authentication | Username/Password (assigned by admin) | Google OAuth |
+| Plan Selection | Assigned by admin | Student selects during onboarding |
+| Content Management | Institute admin | B2C Admin |
 
-The system now supports two completely isolated databases:
+## B2C User Flow
 
-| Database | Purpose | Users |
-|----------|---------|-------|
-| `skillbot_db` | Original database | Admins, Teachers, Students (school-based) |
-| `stoody-b2c` | B2C database | Individual B2C users (Google OAuth) |
+### 1. Sign Up / Login
+- Students visit the login page and click "Sign in with Google"
+- After Google OAuth, they are redirected to the platform
+- First-time users are redirected to onboarding
 
-**Important**: These databases are completely isolated. No data is shared between them.
+### 2. Onboarding (First-time Users)
+- **Step 1: Plan Selection**
+  - Select exam type: JEE or NEET
+  - Select class level: 9, 10, 11, 12, or Dropper
+  
+- **Step 2: Personal Details**
+  - Full name (required)
+  - Phone number (required)
+  - School/College name (optional)
+  - City (optional)
 
-### Authentication Flows
+### 3. Dashboard Access
+- After completing onboarding, students can access:
+  - Dashboard
+  - Learning mode
+  - MCQ practice
+  - All content relevant to their selected plan
 
-#### Existing Users (Unchanged)
-- **Admin**: Email + Password → `skillbot_db.admins`
-- **Teacher**: Username + Password → `skillbot_db.tutors`
-- **Student**: Username + Password → `skillbot_db.students`
+## Available Plans
 
-#### B2C Users (New)
-- **B2C User**: Google Sign-In → `stoody-b2c.users`
+### JEE (Engineering)
+- Classes: 9, 10, 11, 12, Dropper
+- Subjects: Physics, Chemistry, Mathematics
+
+### NEET (Medical)
+- Classes: 9, 10, 11, 12, Dropper
+- Subjects: Physics, Chemistry, Biology
 
 ## API Endpoints
 
-### B2C Authentication Endpoints
+### B2C Authentication (`/api/v1/b2c/`)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/b2c/google/login` | POST | Google OAuth login/signup |
-| `/api/v1/b2c/me` | GET | Get B2C user profile |
-| `/api/v1/b2c/logout` | POST | B2C user logout |
-| `/api/v1/b2c/verify` | GET | Verify B2C JWT token |
+| `/google/login` | POST | Google OAuth login/signup |
+| `/me` | GET | Get current B2C user |
+| `/verify` | GET | Verify JWT token |
+| `/logout` | POST | Logout B2C user |
 
-### Request/Response Examples
+### B2C Profile & Onboarding (`/api/v1/b2c/`)
 
-#### Google Login
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/profile/onboarding` | POST | Complete onboarding with plan selection |
+| `/profile` | GET | Get full B2C user profile |
+| `/profile` | PUT | Update B2C user profile |
+| `/profile/check-onboarding` | GET | Check if onboarding is complete |
 
-**Request:**
-```json
-POST /api/v1/b2c/google/login
+### B2C Admin (`/api/v1/b2c/admin/`)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/login` | POST | B2C Admin login |
+| `/setup` | POST | Initial admin setup |
+| `/me` | GET | Get B2C admin profile |
+| `/dashboard/stats` | GET | Dashboard statistics |
+| `/students` | GET | List B2C students |
+
+## Database Schema
+
+### B2C Users Collection (`STOODY-b2c.users`)
+
+```javascript
 {
-  "credential": "<Google OAuth ID Token>"
+  _id: ObjectId,
+  google_id: String,
+  email: String,
+  full_name: String,
+  given_name: String,
+  family_name: String,
+  picture: String,
+  phone: String,
+  school_name: String,
+  city: String,
+  locale: String,
+  
+  // User status
+  is_active: Boolean,
+  user_type: "b2c_user",
+  
+  // Plan & Learning
+  exam_type: "JEE" | "NEET",
+  class_level: "9" | "10" | "11" | "12" | "Dropper",
+  standard: String,
+  subjects: ["Physics", "Chemistry", "Mathematics"] | ["Physics", "Chemistry", "Biology"],
+  plan_types: ["JEE"] | ["NEET"],
+  is_dropper: Boolean,
+  
+  // Onboarding
+  onboarding_complete: Boolean,
+  onboarding_completed_at: Date,
+  
+  // Timestamps
+  created_at: Date,
+  updated_at: Date,
+  last_login: Date
 }
 ```
 
-**Response:**
-```json
-{
-  "success": true,
-  "data": {
-    "access_token": "<JWT Token>",
-    "user_type": "b2c_user",
-    "user": {
-      "user_id": "...",
-      "email": "user@gmail.com",
-      "full_name": "John Doe",
-      "picture": "https://...",
-      "is_b2c": true
-    }
-  }
-}
-```
+## Environment Variables
 
-## Environment Configuration
-
-### Backend (s-backend/.env)
-
-Add the following environment variables:
+Add to `.env`:
 
 ```env
 # B2C Database
-MONGODB_DB_STOODY=stoody-b2c
+MONGODB_DB_STOODY=STOODY-b2c
 
-# Google OAuth for B2C
-GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
-GOOGLE_CLIENT_SECRET=YOUR_GOOGLE_CLIENT_SECRET
+# Google OAuth (for B2C users)
+GOOGLE_CLIENT_ID=your_google_client_id
+GOOGLE_CLIENT_SECRET=your_google_client_secret
+
+# B2C Admin Setup
+B2C_ADMIN_SETUP_KEY=your_secure_setup_key
 ```
 
-### Frontend (skiller-bot/.env.local)
+## Content Access Logic
 
-```env
-VITE_GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
-```
+B2C students can only see content that:
+1. Is uploaded by the **B2C Admin**
+2. Matches their **exam type** (JEE or NEET)
+3. Matches their **class level** (or is marked for all levels)
 
-## User Types
+Content filtering is done using:
+- `plan_types` field (matches exam_type)
+- `standard` field (matches class_level)
 
-| User Type | Database | Authentication | JWT `user_type` |
-|-----------|----------|----------------|-----------------|
-| Admin | skillbot_db | Email/Password | `admin` |
-| Teacher | skillbot_db | Username/Password | `tutor` |
-| Student | skillbot_db | Username/Password | `student` |
-| B2C User | stoody-b2c | Google OAuth | `b2c_user` |
+## Setting Up B2C Admin
 
-## Frontend Integration
-
-### Google Sign-In Button
-
-The Login page now includes a Google Sign-In button for B2C users:
-
-```tsx
-import { GoogleLogin, CredentialResponse } from '@react-oauth/google';
-
-// In the Login component
-<GoogleLogin
-  onSuccess={handleGoogleSuccess}
-  onError={handleGoogleError}
-  useOneTap
-  theme="outline"
-  size="large"
-/>
-```
-
-### User Detection
-
-To detect if a user is a B2C user:
-
-```tsx
-const { user } = useAuth();
-
-if (user?.isB2C || user?.userType === 'b2c_user') {
-  // B2C user logic
-}
-```
-
-## Database Collections
-
-### stoody-b2c Database Collections
-
-| Collection | Description |
-|------------|-------------|
-| `users` | B2C user profiles |
-| `user_activity_log` | B2C user activity tracking |
-
-### User Document Schema
+1. Ensure the backend is running with the B2C database connected
+2. Make a POST request to `/api/v1/b2c/admin/setup`:
 
 ```json
 {
-  "_id": ObjectId,
-  "google_id": "Google OAuth sub ID",
-  "email": "user@gmail.com",
-  "full_name": "John Doe",
-  "given_name": "John",
-  "family_name": "Doe",
-  "picture": "https://...",
-  "locale": "en",
-  "is_active": true,
-  "user_type": "b2c_user",
-  "created_at": ISODate,
-  "last_login": ISODate,
-  "admin_id": null,
-  "subdomain": null
+  "username": "b2cadmin",
+  "password": "securepassword",
+  "email": "admin@example.com",
+  "full_name": "B2C Administrator",
+  "setup_key": "stoody-b2c-admin-setup-2024"
 }
 ```
 
-## Security Notes
+3. Only one B2C Admin account is allowed
 
-1. **Token Verification**: Google OAuth tokens are verified using the `google-auth` library
-2. **Database Isolation**: B2C users cannot access data from skillbot_db and vice versa
-3. **JWT Security**: Same JWT mechanism is used for all user types
-4. **Rate Limiting**: Standard rate limits apply to B2C endpoints
+## Frontend Routes
 
-## Files Modified/Created
+| Route | Component | Description |
+|-------|-----------|-------------|
+| `/login` | Login | Combined login (includes Google OAuth) |
+| `/onboarding` | B2COnboarding | Plan selection & details |
+| `/profile` | B2CProfile | B2C user profile |
+| `/dashboard` | Dashboard | Student dashboard |
+| `/b2c-admin-login` | B2CAdminLogin | B2C Admin login |
+| `/b2c-admin` | B2CAdminDashboard | B2C Admin panel |
 
-### Backend
-- `config_async.py` - Added B2C database and Google OAuth config
-- `core/database.py` - Added B2C database methods (b2c_find, b2c_insert, etc.)
-- `api/v1/b2c_auth_async.py` - **NEW** - B2C authentication routes
-- `main_async.py` - Added B2C router registration
-- `requirements.txt` - Added google-auth dependency
+## Future Enhancements (Not Implemented)
 
-### Frontend
-- `src/App.tsx` - Added GoogleOAuthProvider wrapper
-- `src/contexts/AuthContext.tsx` - Added loginWithGoogle implementation
-- `src/pages/Login.tsx` - Added Google Sign-In button
-- `.env.example` - Added Google Client ID
-
-## Testing
-
-1. Start the backend: `python main_async.py`
-2. Start the frontend: `npm run dev`
-3. Navigate to `/login`
-4. Click "Sign in with Google" button
-5. Complete Google OAuth flow
-6. User should be redirected to dashboard
-
-## Troubleshooting
-
-### "Google token verification failed"
-- Ensure `GOOGLE_CLIENT_ID` matches in both frontend and backend
-- Check that the Google OAuth app is configured correctly
-
-### "B2C MongoDB not connected"
-- Ensure `MONGODB_URI` is set and accessible
-- Check that the MongoDB user has access to `stoody-b2c` database
-
-### Google Sign-In button not showing
-- Ensure `VITE_GOOGLE_CLIENT_ID` is set in frontend `.env.local`
-- Clear browser cache and restart dev server
+1. **Payment Gateway Integration**
+   - Razorpay/Stripe integration for plan purchases
+   - Subscription management
+   
+2. **Plan-Based Content Locking**
+   - Free vs Premium content
+   - Trial periods
+   
+3. **B2C Analytics**
+   - User engagement tracking
+   - Plan conversion metrics
