@@ -87,8 +87,11 @@ class PracticeStats(BaseModel):
 # ----------------------
 # Helper utilities (local)
 # ----------------------
-async def _load_question_doc(db: DatabaseManager, qid: str) -> Dict[str, Any]:
-    """Fetch question from Chroma (fullData) with Mongo fallback."""
+async def _load_question_doc(db: DatabaseManager, qid: str, is_b2c: bool = False) -> Dict[str, Any]:
+    """Fetch question from Chroma (fullData) with Mongo fallback.
+    
+    For B2C users, falls back to B2C database instead of main database.
+    """
     try:
         chroma = await db.chroma_get(ids=[qid])
         metas = chroma.get("metadatas") or []
@@ -97,7 +100,12 @@ async def _load_question_doc(db: DatabaseManager, qid: str) -> Dict[str, Any]:
             return _json.loads(metas[0]["fullData"]) or {}
     except Exception:
         pass
+    
+    # Fallback to MongoDB - use B2C database for B2C users
+    if is_b2c:
+        return await db.b2c_find_one("questions", {"id": qid}) or {}
     return await db.mongo_find_one("questions", {"id": qid}) or {}
+
 
 def _options_text_from_question(q: Dict[str, Any]) -> str:
     opts = q.get("options", []) or []
@@ -148,11 +156,12 @@ def _normalize_numeric_text(s: str) -> str:
     return t
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
-    if current_user.get("user_type") not in ["student", "admin"]:
+    """Dependency to require student, admin, or B2C user access"""
+    allowed_types = ["student", "admin", "b2c_user", "b2c_admin"]
+    if current_user.get("user_type") not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Student or admin access required"
+            detail="Student, admin, or B2C user access required"
         )
     return current_user
 
@@ -517,12 +526,17 @@ async def evaluate_submission(
         answer_text = (payload.answerText or "").strip()
         canvas_data = payload.canvasData
         
+        # Detect if user is B2C (uses B2C database)
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
         # Normalize canvas data header if client sent raw base64
         if canvas_data and not canvas_data.startswith("data:image"):
             canvas_data = f"data:image/png;base64,{canvas_data}"
 
         # Fetch question from Chroma (fullData) first; fallback to MongoDB
-        question_doc = await _load_question_doc(db, qid)
+        # For B2C users, use B2C database
+        question_doc = await _load_question_doc(db, qid, is_b2c=is_b2c)
         if not question_doc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
 
@@ -699,6 +713,10 @@ async def start_practice_session(
     """Start a new practice session"""
     try:
         user_id = current_user["user_id"]
+        
+        # Detect if user is B2C (uses B2C database)
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
 
         # Create session record
         session_record = {
@@ -716,7 +734,11 @@ async def start_practice_session(
             "questions": []  # Will store question attempts
         }
 
-        session_id = await db.mongo_insert_one("practice_sessions", session_record)
+        # Use B2C database for B2C users
+        if is_b2c:
+            session_id = await db.b2c_insert_one("practice_sessions", session_record)
+        else:
+            session_id = await db.mongo_insert_one("practice_sessions", session_record)
 
         if not session_id:
             raise HTTPException(
