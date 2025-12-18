@@ -746,6 +746,9 @@ async def get_b2c_students(
                 "standard": user.get("standard"),
                 "subjects": user.get("subjects", []),
                 "plan_types": user.get("plan_types", []),
+                # Personal details
+                "school_name": user.get("school_name"),
+                "city": user.get("city"),
                 # Onboarding status
                 "onboarding_complete": user.get("onboarding_complete", False),
                 "onboarding_completed_at": user.get("onboarding_completed_at").isoformat() if user.get("onboarding_completed_at") else None,
