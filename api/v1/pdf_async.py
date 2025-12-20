@@ -2678,6 +2678,104 @@ async def get_document_questions(
             if "text" in question_dict:
                 question_dict["question_text"] = question_dict["text"]
 
+            # === ENHANCED: Load base64 image data for question_figures ===
+            enriched_figures = []
+            for fig_ref in question_dict.get("question_figures", []) or []:
+                try:
+                    fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
+                    base64_data = None
+                    
+                    # First check if base64Data is already embedded in the figure reference
+                    if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
+                        base64_data = fig_ref["base64Data"]
+                    else:
+                        # Try to get base64Data from images collection
+                        if is_b2c:
+                            img_doc = await db.b2c_find_one("images", {"_id": fig_id})
+                        else:
+                            img_doc = await db.mongo_find_one("images", {"_id": fig_id})
+                        
+                        if img_doc:
+                            # Check if base64Data is stored in the document
+                            if img_doc.get("base64Data"):
+                                base64_data = img_doc["base64Data"]
+                            # If not, try to read from file_path and convert to base64
+                            elif img_doc.get("file_path"):
+                                import os
+                                import base64
+                                file_path = img_doc["file_path"]
+                                if os.path.exists(file_path):
+                                    try:
+                                        with open(file_path, "rb") as f:
+                                            image_bytes = f.read()
+                                            base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                                            content_type = img_doc.get("content_type", "image/jpeg")
+                                            if not content_type.startswith("image/"):
+                                                content_type = "image/jpeg"
+                                            base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    except Exception as file_err:
+                                        logger.error(f"Failed to read image file {file_path}: {file_err}")
+                    
+                    enriched_figures.append({
+                        "id": fig_id,
+                        "url": f"/api/v1/images/{fig_id}",
+                        "base64Data": base64_data,
+                        "description": (fig_ref.get("description", "") if isinstance(fig_ref, dict) else ""),
+                        "type": "diagram"
+                    })
+                except Exception as fig_err:
+                    logger.error(f"Error processing figure: {fig_err}")
+            
+            question_dict["question_figures"] = enriched_figures
+            
+            # === ENHANCED: Load base64 image data for option images ===
+            enriched_images = []
+            for img_ref in question_dict.get("images", []) or []:
+                try:
+                    img_id = img_ref.get("id") if isinstance(img_ref, dict) else img_ref
+                    base64_data = None
+                    
+                    # First check if base64Data is already embedded
+                    if isinstance(img_ref, dict) and img_ref.get("base64Data"):
+                        base64_data = img_ref["base64Data"]
+                    else:
+                        # Try to get from images collection
+                        if is_b2c:
+                            img_doc = await db.b2c_find_one("images", {"_id": img_id})
+                        else:
+                            img_doc = await db.mongo_find_one("images", {"_id": img_id})
+                        
+                        if img_doc:
+                            if img_doc.get("base64Data"):
+                                base64_data = img_doc["base64Data"]
+                            elif img_doc.get("file_path"):
+                                import os
+                                import base64
+                                file_path = img_doc["file_path"]
+                                if os.path.exists(file_path):
+                                    try:
+                                        with open(file_path, "rb") as f:
+                                            image_bytes = f.read()
+                                            base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                                            content_type = img_doc.get("content_type", "image/jpeg")
+                                            if not content_type.startswith("image/"):
+                                                content_type = "image/jpeg"
+                                            base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    except Exception as file_err:
+                                        logger.error(f"Failed to read option image file {file_path}: {file_err}")
+                    
+                    enriched_images.append({
+                        "id": img_id,
+                        "url": f"/api/v1/images/{img_id}",
+                        "base64Data": base64_data,
+                        "description": (img_ref.get("description", "") if isinstance(img_ref, dict) else ""),
+                        "type": img_ref.get("type", "option") if isinstance(img_ref, dict) else "option"
+                    })
+                except Exception as img_err:
+                    logger.error(f"Error processing image: {img_err}")
+            
+            question_dict["images"] = enriched_images
+
             serialized_questions.append(question_dict)
 
         return {
