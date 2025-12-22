@@ -21,6 +21,7 @@ import aiofiles.os
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from utils.s3_storage import download_file as s3_download_file
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,42 @@ router = APIRouter()
 # Both student.grade and document.standard should come from the same admin settings
 # so they will match exactly (e.g., "12th Pass" == "12th Pass")
 # No normalization or fuzzy matching is needed or desired
+
+
+def grades_match(student_grade: str, doc_standard: str) -> bool:
+    """
+    Check if student grade matches document standard.
+    Uses flexible matching to handle various grade formats.
+    
+    Args:
+        student_grade: Student's grade from profile (e.g., "12", "12th", "Class 12")
+        doc_standard: Document's standard field (e.g., "12", "12th Pass")
+    
+    Returns:
+        True if grades match, False otherwise
+    """
+    if not student_grade or not doc_standard:
+        return False
+    
+    # Exact match first
+    if student_grade == doc_standard:
+        return True
+    
+    # Normalize both values for comparison
+    def normalize_grade(grade: str) -> str:
+        """Normalize grade to just the number"""
+        if not grade:
+            return ""
+        grade = str(grade).lower().strip()
+        # Remove common suffixes
+        for suffix in ["th", "st", "nd", "rd", " pass", " class", "class "]:
+            grade = grade.replace(suffix, "")
+        return grade.strip()
+    
+    normalized_student = normalize_grade(student_grade)
+    normalized_doc = normalize_grade(doc_standard)
+    
+    return normalized_student == normalized_doc
 
 
 class LearningDocument(BaseModel):
@@ -702,8 +739,96 @@ async def get_chapter_pdf(
             # else: Admin users can access all documents
 
 
-        # Get PDF path
-        pdf_path = Path(document.get("file_path", ""))
+        # Get PDF path - handle S3 vs local storage
+        stored_path = document.get("file_path", "")
+        
+        # Check if this is an S3 path
+        if stored_path.startswith("s3://"):
+            logger.info(f"Fetching PDF from S3: {stored_path}")
+            
+            # Download from S3
+            file_data = await s3_download_file(stored_path)
+            
+            if not file_data:
+                logger.error(f"Failed to download PDF from S3: {stored_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"PDF file not found in S3: {document_id}"
+                )
+            
+            file_size = len(file_data)
+            
+            # Production-ready headers for caching and performance
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "Content-Type": "application/pdf",
+                "Content-Disposition": f'inline; filename="{document.get("title", "chapter")}.pdf"',
+                "X-Content-Type-Options": "nosniff",
+                "Content-Length": str(file_size),
+            }
+            
+            # Check for range request (for seeking in PDF)
+            range_header = request.headers.get("range")
+            
+            if range_header:
+                # Parse range header
+                range_match = range_header.replace("bytes=", "").split("-")
+                start = int(range_match[0]) if range_match[0] else 0
+                end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else file_size - 1
+                
+                if start >= file_size or end >= file_size or start > end:
+                    raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+                
+                chunk_data = file_data[start:end + 1]
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+                headers["Content-Length"] = str(len(chunk_data))
+                
+                from fastapi.responses import Response
+                return Response(
+                    content=chunk_data,
+                    status_code=206,
+                    headers=headers,
+                    media_type="application/pdf"
+                )
+            
+            # Return full file
+            from fastapi.responses import Response
+            
+            # Log viewing activity in background
+            try:
+                await db.mongo_insert_one("student_activity_log", {
+                    "student_id": ObjectId(current_user["user_id"]),
+                    "action": "chapter_viewed",
+                    "timestamp": datetime.utcnow(),
+                    "metadata": {
+                        "document_id": document_id,
+                        "title": document.get("title"),
+                        "subject": document.get("subject"),
+                        "standard": document.get("standard"),
+                        "course_plan": document.get("course_plan")
+                    }
+                })
+            except Exception as log_error:
+                logger.error(f"Failed to log chapter view activity: {str(log_error)}")
+            
+            return Response(
+                content=file_data,
+                headers=headers,
+                media_type="application/pdf"
+            )
+        
+        # Local file handling
+        # Resolve relative paths against backend directory
+        import os
+        backend_dir = Path(os.getcwd())
+        
+        if stored_path.startswith("uploads/") or stored_path.startswith("uploads\\"):
+            pdf_path = backend_dir / stored_path.replace("\\", "/")
+        else:
+            pdf_path = Path(stored_path)
+        
+        logger.info(f"Resolved PDF path: {pdf_path}, exists: {pdf_path.exists()}")
 
         if not pdf_path.exists():
             logger.error(f"PDF file not found: {pdf_path}")
