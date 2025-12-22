@@ -20,6 +20,7 @@ from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
 from utils.path_utils import get_absolute_path
+from utils.s3_storage import download_file as s3_download_file, is_s3_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +224,12 @@ async def get_image(
 ):
     """Get image file by ID"""
     try:
-        # Get image metadata
+        # Get image metadata - try main DB first, then B2C
         image_data = await db.mongo_find_one("images", {"_id": image_id})
+        
+        if not image_data:
+            # Try B2C database
+            image_data = await db.b2c_find_one("images", {"_id": image_id})
 
         if not image_data:
             logger.error(f"Image not found in database: {image_id}")
@@ -245,7 +250,31 @@ async def get_image(
                 detail="Image file path not found in database"
             )
 
-        # Normalize path separators and handle Windows drive prefixes that were stored earlier
+        # Check if this is an S3 path
+        if str(stored_path).startswith("s3://"):
+            logger.info(f"Fetching image from S3: {stored_path}")
+            
+            # Download from S3
+            file_data = await s3_download_file(stored_path)
+            
+            if not file_data:
+                logger.error(f"Failed to download image from S3: {stored_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Image file not found in S3"
+                )
+            
+            # Return as streaming response
+            from fastapi.responses import Response
+            return Response(
+                content=file_data,
+                media_type=image_data.get("content_type", "image/jpeg"),
+                headers={
+                    "Content-Disposition": f"inline; filename=\"{image_data.get('original_filename', image_data.get('filename', 'image'))}\""
+                }
+            )
+
+        # Local file handling (existing logic)
         from pathlib import Path
         stored_path_str = str(stored_path).replace("\\", "/")
 

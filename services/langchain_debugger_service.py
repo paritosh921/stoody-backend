@@ -1,6 +1,6 @@
 """
 LangChain-based Debugger Chat Service with RAG
-Uses ChromaDB for conversation memory and document storage
+Uses MongoDB for conversation memory and document storage (V2 - NO ChromaDB)
 PRODUCTION-READY for 1000+ concurrent users across multiple workers
 Uses Redis for distributed session state
 """
@@ -14,15 +14,14 @@ import hashlib
 
 # LangChain imports (Pydantic v2 compatible)
 from langchain_openai import ChatOpenAI
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Use HuggingFaceEmbeddings for FREE local embeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# Local imports
-from models.chat_chromadb_client import get_chat_chromadb_client
+# Local imports - Using MongoDB client instead of ChromaDB
+from models.chat_mongodb_client import get_chat_mongodb_client, ChatMongoDBClient
 from services.document_processor import get_document_processor
 from services.async_openai_service import AsyncOpenAIService
 from config_async import OPENAI_API_KEY, OPENAI_MODEL, REDIS_URL
@@ -34,7 +33,7 @@ logger = logging.getLogger(__name__)
 class LangChainDebuggerService:
     """
     Production-ready debugger chat service using LangChain
-    - ChromaDB for conversation memory and RAG
+    - MongoDB for conversation memory and RAG (ChromaDB-free)
     - Supports 1000+ concurrent users
     - Clean error handling and logging
     - Document upload support (PDF, Word, Images)
@@ -91,7 +90,8 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
 
     def __init__(self):
         """Initialize LangChain debugger service with Redis for multi-worker support"""
-        self.chroma_client = get_chat_chromadb_client()
+        # MongoDB client for conversation memory (replaces ChromaDB)
+        self.mongo_client: ChatMongoDBClient = None  # Will be initialized async
         self.document_processor = get_document_processor()
         self.openai_service = AsyncOpenAIService()
         
@@ -112,14 +112,26 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
         self._cache_ttl = 300  # 5 minutes local cache
 
         # LangChain embeddings - using FREE open-source Sentence Transformers
-        # Same as ChromaDB default, ensuring consistency across the app
         self.embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",  # Fast, lightweight, free
             model_kwargs={'device': 'cpu'},  # Use CPU for compatibility
             encode_kwargs={'normalize_embeddings': True}  # Better similarity search
         )
 
-        logger.info("🚀 LangChain Debugger Service initialized with FREE Sentence Transformers (multi-worker ready)")
+        logger.info("🚀 LangChain Debugger Service initialized with MongoDB (ChromaDB-free)")
+
+    async def _ensure_mongo_client(self):
+        """Initialize MongoDB chat client if not already done"""
+        if self.mongo_client is None:
+            try:
+                from main_async import app
+                db_manager = app.state.db if hasattr(app, 'state') and hasattr(app.state, 'db') else None
+                self.mongo_client = await get_chat_mongodb_client(db_manager)
+                logger.info("✅ MongoDB chat client initialized")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize MongoDB chat client: {e}")
+                raise
+
 
     async def _ensure_cache_manager(self):
         """Initialize cache manager if not already done"""
@@ -247,6 +259,9 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
             Dict containing response and metadata
         """
         try:
+            # Ensure MongoDB client is initialized
+            await self._ensure_mongo_client()
+            
             # Get or create session
             session = await self._get_or_create_session(session_id)
 
@@ -254,26 +269,22 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
             message_id = f"msg_{int(datetime.now().timestamp() * 1000)}"
             timestamp = datetime.now().isoformat()
 
-            # Save user message to ChromaDB
-            # Convert attachments list to string (ChromaDB doesn't support list metadata)
+            # Save user message to MongoDB
             attachments_str = ",".join(attachments) if attachments else ""
 
             user_metadata = {
                 "timestamp": timestamp,
-                "attachments": attachments_str,  # Store as comma-separated string
+                "attachments": attachments_str,
                 "has_image": "true" if image_data else "false",
-                # Note: We store a flag but not the actual image data in ChromaDB metadata
-                # Image data will be included in context when messages are retrieved
             }
             
             # Store the message content WITH image reference if present
             message_content = message
             if image_data:
-                # Add image marker to content for better retrieval
                 message_content = f"[IMAGE ATTACHED]\n{message}"
                 logger.info(f"💾 Storing message with image marker for session {session_id}")
 
-            self.chroma_client.save_conversation_message(
+            await self.mongo_client.save_conversation_message(
                 session_id=session_id,
                 message_id=message_id,
                 role="user",
@@ -281,8 +292,8 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
                 metadata=user_metadata
             )
 
-            # Get conversation history from ChromaDB - increased to 40 messages (20 exchanges) for better memory
-            history = self.chroma_client.get_conversation_history(session_id, limit=40)
+            # Get conversation history from MongoDB
+            history = await self.mongo_client.get_conversation_history(session_id, limit=40)
 
             # Build conversation context for OpenAI - IMPORTANT: Send full history!
             conversation_messages = []
@@ -297,21 +308,21 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
             # Search for relevant context from previous conversations (for RAG context)
             relevant_context = []
             if len(history) > 3:
-                relevant_context = self.chroma_client.search_conversation_context(
+                relevant_context = await self.mongo_client.search_conversation_context(
                     session_id=session_id,
                     query=message,
                     n_results=3
                 )
 
             # Search documents if any exist
-            session_stats = self.chroma_client.get_session_stats(session_id)
+            session_stats = await self.mongo_client.get_session_stats(session_id)
             document_context = []
             if session_stats.get("has_documents", False):
                 logger.info(f"📚 Session has documents, searching for relevant context...")
-                doc_results = self.chroma_client.search_documents(
+                doc_results = await self.mongo_client.search_documents(
                     session_id=session_id,
                     query=message,
-                    n_results=5  # Increased for better document context
+                    n_results=5
                 )
                 document_context = [doc["content"] for doc in doc_results]
                 logger.info(f"📚 Found {len(document_context)} relevant document chunks")
@@ -370,15 +381,15 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
 
             assistant_content = response["response"]
 
-            # Save assistant response to ChromaDB
+            # Save assistant response to MongoDB
             assistant_message_id = f"msg_{int(datetime.now().timestamp() * 1000)}_ai"
             assistant_metadata = {
                 "timestamp": datetime.now().isoformat(),
                 "model": response.get("model", OPENAI_MODEL),
-                "tokens": response.get("usage", {}).get("total_tokens", 0)
+                "tokens": str(response.get("usage", {}).get("total_tokens", 0))
             }
 
-            self.chroma_client.save_conversation_message(
+            await self.mongo_client.save_conversation_message(
                 session_id=session_id,
                 message_id=assistant_message_id,
                 role="assistant",
@@ -494,6 +505,9 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
             Dict with processing result
         """
         try:
+            # Ensure MongoDB client is initialized
+            await self._ensure_mongo_client()
+            
             # Validate file
             validation = self.document_processor.validate_file(
                 filename=filename,
@@ -614,8 +628,8 @@ Format the output clearly with proper structure."""
 
                 chunk_metadatas.append(metadata)
 
-            # Save to ChromaDB
-            success = self.chroma_client.save_document_chunks(
+            # Save to MongoDB
+            success = await self.mongo_client.save_document_chunks(
                 session_id=session_id,
                 document_id=document_id,
                 chunks=result["chunks"],
@@ -671,11 +685,14 @@ Format the output clearly with proper structure."""
             Dict containing conversation history
         """
         try:
+            # Ensure MongoDB client is initialized
+            await self._ensure_mongo_client()
+            
             # Get session (creates if doesn't exist)
             session = await self._get_or_create_session(session_id)
 
-            # Get messages from ChromaDB
-            messages = self.chroma_client.get_conversation_history(session_id, limit)
+            # Get messages from MongoDB
+            messages = await self.mongo_client.get_conversation_history(session_id, limit)
 
             return {
                 "success": True,
@@ -702,7 +719,7 @@ Format the output clearly with proper structure."""
         """
         Clear conversation history and documents for a session
         
-        CRITICAL: Clears from ChromaDB, Redis, and local cache
+        CRITICAL: Clears from MongoDB, Redis, and local cache
 
         Args:
             session_id: Session identifier
@@ -711,10 +728,11 @@ Format the output clearly with proper structure."""
             Success status
         """
         try:
+            await self._ensure_mongo_client()
             await self._ensure_cache_manager()
             
-            # Clear from ChromaDB
-            success = self.chroma_client.clear_session_data(session_id)
+            # Clear from MongoDB
+            success = await self.mongo_client.clear_session_data(session_id)
 
             # Clear from Redis (for all workers)
             if self.cache_manager:
@@ -759,23 +777,24 @@ Format the output clearly with proper structure."""
 
     async def get_session_stats(self) -> Dict[str, Any]:
         """
-        Get statistics about active sessions from ChromaDB (persistent storage)
+        Get statistics about active sessions from MongoDB (persistent storage)
         
-        PRODUCTION: Gets data from ChromaDB (multi-worker safe)
+        PRODUCTION: Gets data from MongoDB (multi-worker safe)
 
         Returns:
             Dict containing session statistics
         """
         try:
+            await self._ensure_mongo_client()
             await self._ensure_cache_manager()
             
-            # Get all sessions from ChromaDB (the source of truth for messages)
-            chromadb_sessions = self.chroma_client.get_all_sessions()
+            # Get all sessions from MongoDB (the source of truth for messages)
+            mongodb_sessions = await self.mongo_client.get_all_sessions()
             
             # Enrich with Redis session data if available (for has_documents flag)
             sessions_list = []
-            for chroma_session in chromadb_sessions:
-                session_id = chroma_session['session_id']
+            for mongo_session in mongodb_sessions:
+                session_id = mongo_session['session_id']
                 
                 # Try to get additional metadata from Redis
                 has_documents = False
@@ -791,10 +810,10 @@ Format the output clearly with proper structure."""
                 
                 sessions_list.append({
                     "session_id": session_id,
-                    "message_count": chroma_session.get('message_count', 0),
+                    "message_count": mongo_session.get('message_count', 0),
                     "has_documents": has_documents,
-                    "created_at": chroma_session.get('created_at'),
-                    "last_updated": chroma_session.get('last_updated')
+                    "created_at": mongo_session.get('created_at'),
+                    "last_updated": mongo_session.get('last_updated')
                 })
             
             logger.debug(f"📊 Returning {len(sessions_list)} sessions (multi-worker safe)")

@@ -32,6 +32,7 @@ from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
 from utils.path_utils import get_relative_path, get_absolute_path
+from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -349,13 +350,29 @@ async def save_image_to_disk(
         original_image_filename = f"{base_image_id}.{original_detected_ext}"
         original_file_path = os.path.join(upload_dir, original_image_filename)
         
-        async with aiofiles.open(original_file_path, "wb") as f:
-            await f.write(image_data)
-        
-        logger.info(f"Saved original image: {original_image_filename} (detected format: {original_detected_ext})")
+        # Use S3 storage if enabled, otherwise save locally
+        if is_s3_enabled():
+            # Upload to S3
+            success, storage_path = await s3_upload_file(
+                file_data=image_data,
+                local_path=original_file_path,
+                content_type=original_content_type
+            )
+            if success:
+                logger.info(f"✅ Saved image to S3: {storage_path}")
+                original_relative_path = storage_path  # Store S3 path
+            else:
+                logger.warning(f"S3 upload failed, image not saved: {original_image_filename}")
+                original_relative_path = ""
+        else:
+            # Save locally (fallback)
+            os.makedirs(upload_dir, exist_ok=True)
+            async with aiofiles.open(original_file_path, "wb") as f:
+                await f.write(image_data)
+            logger.info(f"Saved original image locally: {original_image_filename}")
+            original_relative_path = get_relative_path(original_file_path)
         
         # Save original to database
-        original_relative_path = get_relative_path(original_file_path)
         original_metadata = {
             "_id": base_image_id,
             "filename": original_image_filename,
@@ -368,7 +385,8 @@ async def save_image_to_disk(
             "file_path": original_relative_path,
             "source_pdf": pdf_filename,
             "tags": ["pdf_extracted", "ocr", "original"],
-            "was_split": was_split
+            "was_split": was_split,
+            "is_s3": is_s3_enabled()  # Track storage type
         }
         
         # Save to database (use update_one with upsert to handle re-processing)
@@ -380,7 +398,7 @@ async def save_image_to_disk(
         saved_images.append({
             "id": base_image_id,
             "filename": original_image_filename,
-            "path": original_file_path,
+            "path": original_relative_path,
             "url": f"/api/v1/images/{base_image_id}",
             "size": len(image_data),
             "is_original": True
@@ -397,14 +415,26 @@ async def save_image_to_disk(
                 image_filename = f"{db_image_id}.{detected_ext}"
                 file_path = os.path.join(upload_dir, image_filename)
 
-                # Save image file
-                async with aiofiles.open(file_path, "wb") as f:
-                    await f.write(img_data)
-
-                logger.info(f"Saved split part {idx+1}/{len(image_parts)}: {image_filename} (detected format: {detected_ext})")
+                # Use S3 storage if enabled, otherwise save locally
+                if is_s3_enabled():
+                    success, storage_path = await s3_upload_file(
+                        file_data=img_data,
+                        local_path=file_path,
+                        content_type=content_type
+                    )
+                    if success:
+                        logger.info(f"✅ Saved split part {idx+1} to S3: {storage_path}")
+                        relative_path = storage_path
+                    else:
+                        logger.warning(f"S3 upload failed for split part: {image_filename}")
+                        relative_path = ""
+                else:
+                    async with aiofiles.open(file_path, "wb") as f:
+                        await f.write(img_data)
+                    logger.info(f"Saved split part {idx+1}/{len(image_parts)} locally: {image_filename}")
+                    relative_path = get_relative_path(file_path)
 
                 # Create image metadata for database
-                relative_path = get_relative_path(file_path)
                 image_metadata = {
                     "_id": db_image_id,
                     "filename": image_filename,
@@ -418,7 +448,8 @@ async def save_image_to_disk(
                     "source_pdf": pdf_filename,
                     "tags": ["pdf_extracted", "ocr", "split_composite"],
                     "parent_image_id": base_image_id,
-                    "split_index": idx
+                    "split_index": idx,
+                    "is_s3": is_s3_enabled()
                 }
 
                 # Save to database
@@ -430,7 +461,7 @@ async def save_image_to_disk(
                 saved_images.append({
                     "id": db_image_id,
                     "filename": image_filename,
-                    "path": file_path,
+                    "path": relative_path,
                     "url": f"/api/v1/images/{db_image_id}",
                     "size": len(img_data),
                     "is_original": False
@@ -1276,15 +1307,36 @@ async def upload_pdf(
         from pathlib import Path
         backend_dir = Path(os.getcwd())
         upload_dir = backend_dir / "uploads" / "documents" / document_type
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save file with document_id as filename
         file_path = upload_dir / f"{document_id}.pdf"
+        
         # Store relative path with forward slashes (universal format)
-        relative_path = f"uploads/documents/{document_type}/{document_id}.pdf"
+        local_relative_path = f"uploads/documents/{document_type}/{document_id}.pdf"
 
-        async with aiofiles.open(str(file_path), "wb") as f:
-            await f.write(file_content)
+        # Use S3 storage if enabled, otherwise save locally
+        if is_s3_enabled():
+            # Upload PDF to S3
+            success, storage_path = await s3_upload_file(
+                file_data=file_content,
+                local_path=str(file_path),
+                content_type="application/pdf"
+            )
+            if success:
+                relative_path = storage_path  # s3://bucket/documents/...
+                logger.info(f"✅ Uploaded PDF to S3: {storage_path}")
+            else:
+                # Fallback to local if S3 fails
+                logger.warning("S3 upload failed, falling back to local storage")
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(str(file_path), "wb") as f:
+                    await f.write(file_content)
+                relative_path = local_relative_path
+        else:
+            # Save file locally
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.open(str(file_path), "wb") as f:
+                await f.write(file_content)
+            relative_path = local_relative_path
+            logger.info(f"Saved PDF locally: {file_path}")
 
         # Validate total_points for Test Series
         if document_type == "Test Series" and total_points is not None:
@@ -1338,7 +1390,8 @@ async def upload_pdf(
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
-            "is_active": True  # Default to enabled
+            "is_active": True,  # Default to enabled
+            "is_s3": is_s3_enabled()  # Track storage location
         }
 
         # Save to appropriate MongoDB database (B2C or regular)
@@ -2364,13 +2417,16 @@ async def get_document_file(
     db: DatabaseManager = Depends(get_database)
 ):
     """Serve PDF file for viewing"""
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
 
     try:
         logger.info(f"Attempting to fetch document with ID: {document_id}")
 
-        # Get document metadata
+        # Get document metadata - try both main and B2C database
         document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not document:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+            
         if not document:
             # Debug: Log what's in the database
             all_docs = await db.mongo_find("documents", {}, limit=10)
@@ -2388,13 +2444,40 @@ async def get_document_file(
             if teacher_ids and tutor_id not in teacher_ids:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tutor not authorized for this document")
 
-        logger.info(f"Document found. File path: {document.get('file_path')}")
+        stored_path = document.get("file_path", "")
+        logger.info(f"Document found. File path: {stored_path}")
 
-        # Get file path - handle both forward and backslashes
+        # Check if this is an S3 path
+        if stored_path.startswith("s3://"):
+            logger.info(f"Fetching PDF from S3: {stored_path}")
+            
+            # Import S3 download function
+            from utils.s3_storage import download_file as s3_download
+            
+            # Download from S3
+            file_data = await s3_download(stored_path)
+            
+            if not file_data:
+                logger.error(f"Failed to download PDF from S3: {stored_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="PDF file not found in S3"
+                )
+            
+            # Return as response
+            return Response(
+                content=file_data,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f"inline; filename=\"{document.get('filename', 'document.pdf')}\""
+                }
+            )
+
+        # Local file handling
         from pathlib import Path
         backend_dir = Path(os.getcwd())
         # Convert stored path to use forward slashes, then to Path
-        stored_path = document["file_path"].replace("\\", "/")
+        stored_path = stored_path.replace("\\", "/")
         file_path = backend_dir / stored_path
         logger.info(f"Full file path: {file_path}")
 

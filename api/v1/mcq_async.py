@@ -267,20 +267,51 @@ async def _get_mcq_questions_with_images(db: DatabaseManager, where_filter: dict
                                 import os
                                 import base64 as b64
                                 file_path = img_doc["file_path"]
-                                if os.path.exists(file_path):
+                                
+                                # Handle S3 paths
+                                if file_path.startswith("s3://"):
                                     try:
-                                        with open(file_path, "rb") as f:
-                                            image_bytes = f.read()
+                                        from utils.s3_storage import download_file as s3_download
+                                        import asyncio
+                                        
+                                        # Check if we're in an async context and download
+                                        loop = asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            # Use create_task for async context
+                                            image_bytes = await s3_download(file_path)
+                                        else:
+                                            image_bytes = loop.run_until_complete(s3_download(file_path))
+                                        
+                                        if image_bytes:
                                             base64_encoded = b64.b64encode(image_bytes).decode('utf-8')
                                             content_type = img_doc.get("content_type", "image/jpeg")
                                             if not content_type.startswith("image/"):
                                                 content_type = "image/jpeg"
                                             base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                            logger.info(f"✅ Loaded MCQ figure {fig_id} from file: {len(base64_data)} bytes")
-                                    except Exception as file_err:
-                                        logger.error(f"❌ Failed to read MCQ figure file {file_path}: {file_err}")
+                                            logger.info(f"✅ Loaded MCQ figure {fig_id} from S3: {len(base64_data)} bytes")
+                                        else:
+                                            logger.warning(f"⚠️ Failed to download MCQ figure from S3: {file_path}")
+                                    except Exception as s3_err:
+                                        logger.error(f"❌ S3 download error for {file_path}: {s3_err}")
                                 else:
-                                    logger.warning(f"⚠️ MCQ figure file not found: {file_path}")
+                                    # Local file handling - resolve relative paths
+                                    if file_path.startswith("uploads/") or file_path.startswith("uploads\\"):
+                                        file_path = os.path.join(os.getcwd(), file_path.replace("\\", "/"))
+                                    
+                                    if os.path.exists(file_path):
+                                        try:
+                                            with open(file_path, "rb") as f:
+                                                image_bytes = f.read()
+                                                base64_encoded = b64.b64encode(image_bytes).decode('utf-8')
+                                                content_type = img_doc.get("content_type", "image/jpeg")
+                                                if not content_type.startswith("image/"):
+                                                    content_type = "image/jpeg"
+                                                base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                                logger.info(f"✅ Loaded MCQ figure {fig_id} from file: {len(base64_data)} bytes")
+                                        except Exception as file_err:
+                                            logger.error(f"❌ Failed to read MCQ figure file {file_path}: {file_err}")
+                                    else:
+                                        logger.warning(f"⚠️ MCQ figure file not found: {file_path}")
                             else:
                                 logger.warning(f"Question {question_id} figure {fig_idx}: Image doc found but no base64Data or file_path")
 

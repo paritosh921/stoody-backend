@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 async def validate_image_exists(image_id: str, db, is_b2c: bool = False) -> bool:
     """
-    Check if an image exists in both database and filesystem
+    Check if an image exists in both database and filesystem/S3
 
     Args:
         image_id: Image ID to validate
@@ -20,7 +20,7 @@ async def validate_image_exists(image_id: str, db, is_b2c: bool = False) -> bool
         is_b2c: If True, check B2C database; otherwise check main database
 
     Returns:
-        True if image exists in database and on disk, False otherwise
+        True if image exists in database and on disk/S3, False otherwise
     """
     try:
         # Check database (B2C or main based on is_b2c flag)
@@ -32,7 +32,7 @@ async def validate_image_exists(image_id: str, db, is_b2c: bool = False) -> bool
             logger.debug(f"Image {image_id} not found in {'B2C' if is_b2c else 'main'} database")
             return False
 
-        # Check filesystem
+        # Check filesystem or S3
         from utils.path_utils import get_absolute_path
 
         stored_path = image_data.get("file_path")
@@ -40,7 +40,13 @@ async def validate_image_exists(image_id: str, db, is_b2c: bool = False) -> bool
             logger.debug(f"Image {image_id} has no file_path in database")
             return False
 
-        # Normalize path separators
+        # Handle S3 paths - assume they exist if the record is in DB
+        # (S3 uploads are verified at upload time)
+        if str(stored_path).startswith("s3://"):
+            logger.debug(f"Image {image_id} is stored in S3: {stored_path}")
+            return True
+
+        # Normalize path separators for local files
         stored_path_str = str(stored_path).replace("\\", "/")
 
         # If the path contains 'uploads/', use that portion
