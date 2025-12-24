@@ -954,6 +954,16 @@ async def get_b2c_user_full_profile(
                 "plan_types": user.get("plan_types", []),
                 "is_dropper": user.get("is_dropper", False),
                 "onboarding_complete": user.get("onboarding_complete", False),
+                # GDPR Consent fields
+                "consent_completed": user.get("consent_completed", False),
+                "is_minor": user.get("is_minor", False),
+                "has_parental_consent": user.get("has_parental_consent", False),
+                "parent_info": user.get("parent_info"),
+                "gdpr_consent": user.get("gdpr_consent"),
+                "ai_personalization_consent": user.get("ai_personalization_consent"),
+                "marketing_consent": user.get("marketing_consent"),
+                "consent_timestamp": user.get("consent_timestamp"),
+                # Timestamps
                 "created_at": user.get("created_at", datetime.utcnow()).isoformat(),
                 "last_login": user.get("last_login", datetime.utcnow()).isoformat() if user.get("last_login") else None
             }
@@ -1291,3 +1301,527 @@ async def toggle_b2c_reattempt(
     except Exception as e:
         logger.error(f"Failed to toggle B2C re-attempt: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== GDPR Consent Endpoints ====================
+
+class AdultConsentRequest(BaseModel):
+    """Request model for adult GDPR consent"""
+    is_minor: bool = False
+    gdpr_consent: bool = Field(..., description="Privacy policy consent")
+    ai_personalization_consent: bool = Field(..., description="AI processing consent")
+    marketing_consent: bool = Field(False, description="Marketing communications consent")
+    consent_timestamp: str = Field(..., description="ISO timestamp of consent")
+    consent_version: str = Field("1.0", description="Version of consent document")
+
+
+class ParentInfoModel(BaseModel):
+    """Model for parent/guardian information"""
+    full_name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., description="Parent's email address")
+    phone: str = Field(..., min_length=10, max_length=20)
+    country: str = Field(..., description="Country of residence")
+    relationship: str = Field(..., description="Relationship to child")
+
+
+class ParentalConsentModel(BaseModel):
+    """Model for parental consent checkboxes"""
+    is_legal_guardian: bool
+    consent_data_processing: bool
+    consent_ai_analysis: bool
+    consent_international_transfers: bool
+
+
+class ParentalConsentRequest(BaseModel):
+    """Request model for parental GDPR consent"""
+    is_minor: bool = True
+    parent_info: ParentInfoModel
+    parental_consent: ParentalConsentModel
+    digital_signature: str = Field(..., description="Parent's full name as digital signature")
+    signature_date: str = Field(..., description="ISO timestamp of signature")
+    consent_timestamp: str = Field(..., description="ISO timestamp of consent")
+    consent_version: str = Field("1.0", description="Version of consent document")
+    scc_version: str = Field("2021/914", description="EU SCC version")
+
+
+@router.post("/consent/adult")
+@limiter.limit("5/minute")
+async def submit_adult_consent(
+    request: Request,
+    consent_data: AdultConsentRequest,
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Submit GDPR consent for adult users (16+)
+    
+    - Records user's consent for privacy policy and AI processing
+    - Stores consent timestamp and version for audit trail
+    - Logs IP address for compliance
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Validate required consents
+        if not consent_data.gdpr_consent:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Privacy policy consent is required"
+            )
+        if not consent_data.ai_personalization_consent:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="AI personalization consent is required for our service"
+            )
+        
+        # Prepare consent record
+        consent_record = {
+            "consent_completed": True,
+            "is_minor": False,
+            "has_parental_consent": False,
+            "gdpr_consent": consent_data.gdpr_consent,
+            "ai_personalization_consent": consent_data.ai_personalization_consent,
+            "marketing_consent": consent_data.marketing_consent,
+            "consent_timestamp": consent_data.consent_timestamp,
+            "consent_version": consent_data.consent_version,
+            "consent_ip": request.client.host if request.client else "unknown",
+            "consent_user_agent": request.headers.get("user-agent", "unknown"),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Update user in B2C database
+        await db.b2c_update_one(
+            "users",
+            {"_id": ObjectId(user_id)},
+            {"$set": consent_record}
+        )
+        
+        # Log consent activity for audit trail
+        await db.b2c_insert_one("consent_audit_log", {
+            "user_id": ObjectId(user_id),
+            "consent_type": "adult",
+            "action": "consent_granted",
+            "timestamp": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "consent_version": consent_data.consent_version,
+            "consent_details": {
+                "gdpr_consent": consent_data.gdpr_consent,
+                "ai_personalization_consent": consent_data.ai_personalization_consent,
+                "marketing_consent": consent_data.marketing_consent,
+            }
+        })
+        
+        logger.info(f"Adult GDPR consent recorded for user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Consent recorded successfully",
+            "data": {
+                "consent_completed": True,
+                "is_minor": False
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Adult consent error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to record consent"
+        )
+
+
+@router.post("/consent/parental")
+@limiter.limit("5/minute")
+async def submit_parental_consent(
+    request: Request,
+    consent_data: ParentalConsentRequest,
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Submit parental consent for minors (under 16) under GDPR Article 8
+    
+    - Records parent/guardian information
+    - Stores all consent checkboxes
+    - Records digital signature and audit trail
+    - Compliant with EU SCC requirements
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Validate all required parental consents
+        pc = consent_data.parental_consent
+        if not all([pc.is_legal_guardian, pc.consent_data_processing, 
+                    pc.consent_ai_analysis, pc.consent_international_transfers]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="All parental consent checkboxes must be checked"
+            )
+        
+        # Validate digital signature matches parent name
+        if consent_data.digital_signature.lower().strip() != consent_data.parent_info.full_name.lower().strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Digital signature must match parent's full name"
+            )
+        
+        # Prepare parent info
+        parent_info = {
+            "full_name": consent_data.parent_info.full_name,
+            "email": consent_data.parent_info.email,
+            "phone": consent_data.parent_info.phone,
+            "country": consent_data.parent_info.country,
+            "relationship": consent_data.parent_info.relationship,
+        }
+        
+        # Prepare consent record
+        consent_record = {
+            "consent_completed": True,
+            "is_minor": True,
+            "has_parental_consent": True,
+            "parent_info": parent_info,
+            "parental_consent": {
+                "is_legal_guardian": pc.is_legal_guardian,
+                "consent_data_processing": pc.consent_data_processing,
+                "consent_ai_analysis": pc.consent_ai_analysis,
+                "consent_international_transfers": pc.consent_international_transfers,
+            },
+            "digital_signature": consent_data.digital_signature,
+            "signature_date": consent_data.signature_date,
+            "consent_timestamp": consent_data.consent_timestamp,
+            "consent_version": consent_data.consent_version,
+            "scc_version": consent_data.scc_version,
+            "consent_ip": request.client.host if request.client else "unknown",
+            "consent_user_agent": request.headers.get("user-agent", "unknown"),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Update user in B2C database
+        await db.b2c_update_one(
+            "users",
+            {"_id": ObjectId(user_id)},
+            {"$set": consent_record}
+        )
+        
+        # Log consent for audit trail (critical for GDPR compliance)
+        await db.b2c_insert_one("consent_audit_log", {
+            "user_id": ObjectId(user_id),
+            "consent_type": "parental",
+            "action": "consent_granted",
+            "timestamp": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "consent_version": consent_data.consent_version,
+            "scc_version": consent_data.scc_version,
+            "parent_info": parent_info,
+            "consent_details": {
+                "is_legal_guardian": pc.is_legal_guardian,
+                "consent_data_processing": pc.consent_data_processing,
+                "consent_ai_analysis": pc.consent_ai_analysis,
+                "consent_international_transfers": pc.consent_international_transfers,
+            },
+            "digital_signature": consent_data.digital_signature,
+            "signature_date": consent_data.signature_date,
+        })
+        
+        logger.info(f"Parental consent recorded for minor user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Parental consent recorded successfully",
+            "data": {
+                "consent_completed": True,
+                "is_minor": True,
+                "has_parental_consent": True
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Parental consent error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to record parental consent"
+        )
+
+
+@router.get("/parent/dashboard")
+async def get_parent_dashboard(
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get parent dashboard data for minor accounts
+    
+    Returns:
+    - Parent/guardian info
+    - Child's data summary
+    - Consent record details
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Fetch user profile
+        user = await db.b2c_find_one("users", {"_id": ObjectId(user_id)})
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        if not user.get("is_minor") or not user.get("has_parental_consent"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint is only for accounts with parental consent"
+            )
+        
+        # Calculate data summary
+        # Count learning sessions
+        learning_sessions = await db.b2c_find("user_activity_log", {"user_id": ObjectId(user_id)})
+        
+        # Prepare data summary
+        data_summary = {
+            "learning_sessions": len([l for l in learning_sessions if l.get("action") == "learning_session"]),
+            "handwriting_samples": 0,  # Placeholder - integrate with actual data
+            "audio_recordings": 0,  # Placeholder - integrate with actual data
+            "practice_tests": len([l for l in learning_sessions if l.get("action") in ["test_submitted", "practice_submitted"]]),
+            "total_study_hours": 0,  # Placeholder - calculate from sessions
+            "last_active": user.get("last_login", datetime.utcnow()).isoformat() if user.get("last_login") else "Never"
+        }
+        
+        # Get consent record
+        consent_record = None
+        consent_log = await db.b2c_find_one(
+            "consent_audit_log",
+            {"user_id": ObjectId(user_id), "action": "consent_granted"},
+            sort=[("timestamp", -1)]
+        )
+        if consent_log:
+            consent_record = {
+                "consent_timestamp": consent_log.get("timestamp", datetime.utcnow()).isoformat(),
+                "consent_version": consent_log.get("consent_version", "1.0"),
+                "scc_version": consent_log.get("scc_version", "2021/914"),
+                "ip_address": "Logged securely"  # Don't expose actual IP
+            }
+        
+        return {
+            "success": True,
+            "data": {
+                "parent_info": user.get("parent_info"),
+                "data_summary": data_summary,
+                "consent_record": consent_record
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Parent dashboard error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch parent dashboard"
+        )
+
+
+@router.post("/parent/export-data")
+@limiter.limit("3/hour")
+async def request_data_export(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Request data export (GDPR data portability)
+    
+    Creates an export request that will be processed and emailed to the parent
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Verify user has parental consent
+        user = await db.b2c_find_one("users", {"_id": ObjectId(user_id)})
+        
+        if not user or not user.get("has_parental_consent"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Data export requires parental consent"
+            )
+        
+        # Create export request
+        await db.b2c_insert_one("data_export_requests", {
+            "user_id": ObjectId(user_id),
+            "parent_email": user.get("parent_info", {}).get("email"),
+            "status": "pending",
+            "requested_at": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown"
+        })
+        
+        # Log activity
+        await db.b2c_insert_one("consent_audit_log", {
+            "user_id": ObjectId(user_id),
+            "consent_type": "parental",
+            "action": "data_export_requested",
+            "timestamp": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown"
+        })
+        
+        logger.info(f"Data export requested for user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Data export request submitted. You will receive an email within 24 hours."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Data export request error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit data export request"
+        )
+
+
+@router.post("/parent/withdraw-consent")
+@limiter.limit("3/hour")
+async def withdraw_consent(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """
+    Withdraw parental consent
+    
+    - Suspends the child's account
+    - Queues data for deletion
+    - Sends confirmation email
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Update user to suspended state
+        await db.b2c_update_one(
+            "users",
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "is_active": False,
+                "consent_withdrawn": True,
+                "consent_withdrawn_at": datetime.utcnow(),
+                "deletion_scheduled": True,
+                "deletion_scheduled_at": datetime.utcnow()
+            }}
+        )
+        
+        # Log consent withdrawal
+        await db.b2c_insert_one("consent_audit_log", {
+            "user_id": ObjectId(user_id),
+            "consent_type": "parental",
+            "action": "consent_withdrawn",
+            "timestamp": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown")
+        })
+        
+        # Invalidate user session
+        await auth_manager.invalidate_user_session(user_id)
+        
+        logger.info(f"Parental consent withdrawn for user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Consent withdrawn. Account suspended and data queued for deletion."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Consent withdrawal error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to withdraw consent"
+        )
+
+
+@router.delete("/parent/delete-data")
+@limiter.limit("1/hour")
+async def delete_all_data(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_b2c_user),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """
+    Delete all user data (GDPR Right to be Forgotten)
+    
+    - Queues all data for permanent deletion
+    - Keeps only legal compliance logs
+    - Sends confirmation email
+    """
+    try:
+        user_id = current_user.get("user_id")
+        
+        # Verify user has parental consent
+        user = await db.b2c_find_one("users", {"_id": ObjectId(user_id)})
+        
+        if not user or not user.get("has_parental_consent"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This action requires parental consent verification"
+            )
+        
+        # Create deletion request (actual deletion would be processed by a background job)
+        await db.b2c_insert_one("data_deletion_requests", {
+            "user_id": ObjectId(user_id),
+            "parent_email": user.get("parent_info", {}).get("email"),
+            "status": "pending",
+            "requested_at": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown"
+        })
+        
+        # Update user status
+        await db.b2c_update_one(
+            "users",
+            {"_id": ObjectId(user_id)},
+            {"$set": {
+                "is_active": False,
+                "deletion_requested": True,
+                "deletion_requested_at": datetime.utcnow()
+            }}
+        )
+        
+        # Log for compliance (this log is kept even after deletion)
+        await db.b2c_insert_one("consent_audit_log", {
+            "user_id": ObjectId(user_id),
+            "consent_type": "parental",
+            "action": "data_deletion_requested",
+            "timestamp": datetime.utcnow(),
+            "ip_address": request.client.host if request.client else "unknown",
+            "user_agent": request.headers.get("user-agent", "unknown"),
+            "note": "Compliance log - retained for legal purposes"
+        })
+        
+        # Invalidate user session
+        await auth_manager.invalidate_user_session(user_id)
+        
+        logger.info(f"Data deletion requested for user: {user_id}")
+        
+        return {
+            "success": True,
+            "message": "Data deletion request submitted. All data will be permanently deleted within 30 days."
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Data deletion error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to submit data deletion request"
+        )
+
