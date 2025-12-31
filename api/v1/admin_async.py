@@ -66,7 +66,54 @@ class CreateStudentRequest(BaseModel):
 class UpdateStudentRequest(BaseModel):
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
     email: Optional[EmailStr] = None
+    grade: Optional[str] = Field(None, description="New grade/class for the student")
+    section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
+
+
+class SessionPromotionRequest(BaseModel):
+    """Request model for promoting students to next session"""
+    new_session: str = Field(..., description="New academic session e.g., '2025-26'")
+    grade_mappings: Dict[str, str] = Field(
+        ..., 
+        description="Mapping of current grade to new grade e.g., {'10': '11', '11': '12'}"
+    )
+    # Filters to select which students to promote
+    grade_filter: Optional[List[str]] = Field(
+        None,
+        description="Only promote students from these grades. If empty/None, apply to all grades in mappings"
+    )
+    section_filter: Optional[List[str]] = Field(
+        None,
+        description="Only promote students from these sections. If empty/None, apply to all sections"
+    )
+    student_ids: Optional[List[str]] = Field(
+        None,
+        description="Specific student IDs to promote. If provided, only these students are promoted (overrides grade/section filters)"
+    )
+    section_updates: Optional[Dict[str, str]] = Field(
+        None,
+        description="Optional section updates for specific students. Key is student_id, value is new section"
+    )
+    deactivate_old_content: bool = Field(
+        True,
+        description="Whether to mark old notes, assignments, tests as inactive"
+    )
+    preview_only: bool = Field(
+        False,
+        description="If true, only return preview without making changes"
+    )
+
+
+class SessionPromotionResponse(BaseModel):
+    """Response model for session promotion"""
+    success: bool
+    message: str
+    new_session: str
+    students_promoted: int
+    students_skipped: int
+    content_deactivated: int
+    details: Optional[List[Dict[str, Any]]] = None
 
 class StudentResponse(BaseModel):
     id: str
@@ -106,8 +153,8 @@ class DashboardStats(BaseModel):
     chapter_notes_count: int
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -115,13 +162,47 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     return current_user
 
 def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Allow both admin and tutor roles"""
-    if current_user.get("user_type") not in ["admin", "tutor"]:
+    """Allow admin, B2C admin, and tutor roles"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin or Tutor access required"
         )
     return current_user
+
+def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
+    """Check if the current user is a B2C admin"""
+    return current_user.get("user_type") == "b2c_admin"
+
+async def db_find_one(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any], **kwargs):
+    """Route find_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_find_one(collection, query, **kwargs)
+    return await db.mongo_find_one(collection, query, **kwargs)
+
+async def db_find(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any], **kwargs):
+    """Route find to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_find(collection, query, **kwargs)
+    return await db.mongo_find(collection, query, **kwargs)
+
+async def db_insert_one(db: DatabaseManager, collection: str, document: dict, current_user: Dict[str, Any]):
+    """Route insert_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_insert_one(collection, document)
+    return await db.mongo_insert_one(collection, document)
+
+async def db_update_one(db: DatabaseManager, collection: str, query: dict, update: dict, current_user: Dict[str, Any], **kwargs):
+    """Route update_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_update_one(collection, query, update, **kwargs)
+    return await db.mongo_update_one(collection, query, update, **kwargs)
+
+async def db_delete_one(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any]):
+    """Route delete_one to B2C or regular database based on user type"""
+    if is_b2c_admin(current_user):
+        return await db.b2c_delete_one(collection, query)
+    return await db.mongo_delete_one(collection, query)
 
 async def calculate_streak_days(student_id: ObjectId, db: DatabaseManager) -> int:
     """Calculate consecutive login days for a student"""
@@ -232,43 +313,64 @@ async def get_students(
 ):
     """Get paginated list of students"""
     try:
+        # Determine which collection to use based on user type
+        # B2C admin uses 'users' collection in STOODY-b2c database
+        # Regular admin uses 'students' collection in skillbot_db
+        is_b2c = is_b2c_admin(current_user)
+        collection = "users" if is_b2c else "students"
+        
         # Get admin_id from JWT token - filter by tenant
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
 
-        # Build filter
-        filter_dict = {"admin_id": admin_id}  # NEW - Multi-tenancy filter
+        # Build filter - B2C uses different filter (no admin_id for B2C users since they're self-registered)
+        if is_b2c:
+            filter_dict = {}  # B2C admin sees all B2C users
+        else:
+            filter_dict = {"admin_id": admin_id}  # Multi-tenancy filter for regular admin
 
         if search:
             filter_dict["$or"] = [
                 {"student_id": {"$regex": search, "$options": "i"}},
                 {"username": {"$regex": search, "$options": "i"}},
                 {"full_name": {"$regex": search, "$options": "i"}},
+                {"name": {"$regex": search, "$options": "i"}},
                 {"email": {"$regex": search, "$options": "i"}},
                 {"phone": {"$regex": search, "$options": "i"}}
             ]
         if is_active is not None:
             filter_dict["is_active"] = is_active
 
-        # Check cache first (include admin_id for tenant isolation)
-        cache_key = f"students:{str(admin_id)}:{page}:{limit}:{search}:{is_active}"
+        # Check cache first (include admin_id and is_b2c for tenant isolation)
+        cache_key = f"students:{'b2c' if is_b2c else str(admin_id)}:{page}:{limit}:{search}:{is_active}"
         cached_result = await cache.get(cache_key, "admin")
 
         if cached_result:
             return StudentsListResponse(**cached_result)
 
-        # Get total count
-        total_students = len(await db.mongo_find("students", filter_dict))
-
-        # Get paginated results
-        skip = (page - 1) * limit
-        students_data = await db.mongo_find(
-            "students",
-            filter_dict,
-            projection={"password_hash": 0},  # Exclude password
-            sort=[("created_at", -1)],
-            skip=skip,
-            limit=limit
-        )
+        # Get data using appropriate database
+        if is_b2c:
+            all_students = await db.b2c_find(collection, filter_dict)
+            total_students = len(all_students)
+            skip = (page - 1) * limit
+            students_data = await db.b2c_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+                skip=skip,
+                limit=limit
+            )
+        else:
+            total_students = len(await db.mongo_find(collection, filter_dict))
+            skip = (page - 1) * limit
+            students_data = await db.mongo_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+                skip=skip,
+                limit=limit
+            )
 
         students = []
         for student in students_data:
@@ -351,6 +453,10 @@ async def update_student(
             update_fields["name"] = update.full_name
         if update.email is not None:
             update_fields["email"] = update.email
+        if update.grade is not None:
+            update_fields["grade"] = update.grade
+        if update.section is not None:
+            update_fields["section"] = update.section
         if update.is_active is not None:
             update_fields["is_active"] = update.is_active
 
@@ -675,6 +781,10 @@ async def update_student(
             update_dict["full_name"] = update_data.full_name
         if update_data.email is not None:
             update_dict["email"] = update_data.email
+        if update_data.grade is not None:
+            update_dict["grade"] = update_data.grade
+        if update_data.section is not None:
+            update_dict["section"] = update_data.section
         if update_data.is_active is not None:
             update_dict["is_active"] = update_data.is_active
 
@@ -797,29 +907,48 @@ async def get_dashboard_stats(
 ):
     """Get admin dashboard statistics"""
     try:
+        # Determine if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+        
         # Get admin_id for data isolation
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
 
-        # Check cache first (include admin_id for isolation)
-        cache_key = f"dashboard_stats_{admin_id}"
+        # Check cache first (include admin_id and is_b2c for isolation)
+        cache_key = f"dashboard_stats_{'b2c' if is_b2c else str(admin_id)}"
         cached_stats = await cache.get(cache_key, "admin")
         if cached_stats:
             return DashboardStats(**cached_stats)
 
-        # Get statistics filtered by admin_id
-        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
-        total_students = len(admin_students)
+        if is_b2c:
+            # B2C Admin - query STOODY-b2c database 'users' collection
+            all_users = await db.b2c_find("users", {})
+            total_students = len(all_users)
+            
+            # Valid students = students with is_active = true
+            valid_students = len([s for s in all_users if s.get("is_active", True)])
+            
+            # Active students = students who have logged in at least once
+            active_students = len([s for s in all_users if s.get("last_login") is not None])
+            
+            # Get document counts from B2C database
+            practice_sets = await db.b2c_find("documents", {"document_type": "Practice Sets"})
+            test_series = await db.b2c_find("documents", {"document_type": "Test Series"})
+            chapter_notes = await db.b2c_find("documents", {"document_type": "Chapter Notes"})
+        else:
+            # Regular Admin - query skillbot_db
+            admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+            total_students = len(admin_students)
 
-        # Valid students = students with is_active = true
-        valid_students = len([s for s in admin_students if s.get("is_active", True)])
+            # Valid students = students with is_active = true
+            valid_students = len([s for s in admin_students if s.get("is_active", True)])
 
-        # Active students = students who have logged in at least once (have last_login field)
-        active_students = len([s for s in admin_students if s.get("last_login") is not None])
+            # Active students = students who have logged in at least once (have last_login field)
+            active_students = len([s for s in admin_students if s.get("last_login") is not None])
 
-        # Get document counts by type (filtered by admin_id)
-        practice_sets = await db.mongo_find("documents", {"document_type": "Practice Sets", "admin_id": admin_id})
-        test_series = await db.mongo_find("documents", {"document_type": "Test Series", "admin_id": admin_id})
-        chapter_notes = await db.mongo_find("documents", {"document_type": "Chapter Notes", "admin_id": admin_id})
+            # Get document counts by type (filtered by admin_id)
+            practice_sets = await db.mongo_find("documents", {"document_type": "Practice Sets", "admin_id": admin_id})
+            test_series = await db.mongo_find("documents", {"document_type": "Test Series", "admin_id": admin_id})
+            chapter_notes = await db.mongo_find("documents", {"document_type": "Chapter Notes", "admin_id": admin_id})
 
         stats_data = {
             "total_students": total_students,
@@ -841,6 +970,373 @@ async def get_dashboard_stats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get dashboard statistics"
         )
+
+
+@router.get("/dashboard/school-stats")
+@limiter.limit("30/minute")
+async def get_school_dashboard_stats(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Get school-level dashboard statistics with:
+    1. Class/Division level breakdown
+    2. Teacher summary (teachers per subject per class, documents uploaded)
+    """
+    try:
+        # Get admin_id for data isolation
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+
+        # Check cache first
+        cache_key = f"school_dashboard_stats_{admin_id}"
+        cached_stats = await cache.get(cache_key, "admin")
+        if cached_stats:
+            return cached_stats
+
+        # Get all students for this admin
+        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+
+        # Get all tutors for this admin
+        admin_tutors = await db.mongo_find("tutors", {"created_by": str(admin_id)})
+
+        # Get all documents for this admin
+        admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+
+        # ===== CLASS/DIVISION LEVEL BREAKDOWN =====
+        class_division_stats = {}
+        for student in admin_students:
+            grade = student.get("grade", "Unknown")
+            section = student.get("section", "Unknown")
+            is_active = student.get("is_active", True)
+            has_logged_in = student.get("last_login") is not None
+
+            key = f"{grade}"
+            if key not in class_division_stats:
+                class_division_stats[key] = {
+                    "grade": grade,
+                    "sections": {},
+                    "total_students": 0,
+                    "active_students": 0,
+                    "logged_in_students": 0
+                }
+
+            class_division_stats[key]["total_students"] += 1
+            if is_active:
+                class_division_stats[key]["active_students"] += 1
+            if has_logged_in:
+                class_division_stats[key]["logged_in_students"] += 1
+
+            # Section-level stats
+            if section not in class_division_stats[key]["sections"]:
+                class_division_stats[key]["sections"][section] = {
+                    "section": section,
+                    "total_students": 0,
+                    "active_students": 0,
+                    "logged_in_students": 0,
+                    "subjects": {}
+                }
+
+            class_division_stats[key]["sections"][section]["total_students"] += 1
+            if is_active:
+                class_division_stats[key]["sections"][section]["active_students"] += 1
+            if has_logged_in:
+                class_division_stats[key]["sections"][section]["logged_in_students"] += 1
+
+            # Track subjects per section
+            student_subjects = student.get("subjects", []) or []
+            for subj in student_subjects:
+                if subj not in class_division_stats[key]["sections"][section]["subjects"]:
+                    class_division_stats[key]["sections"][section]["subjects"][subj] = 0
+                class_division_stats[key]["sections"][section]["subjects"][subj] += 1
+
+        # Convert to list format for frontend
+        class_division_list = []
+        for grade_key, grade_data in class_division_stats.items():
+            sections_list = []
+            for section_key, section_data in grade_data["sections"].items():
+                sections_list.append({
+                    "section": section_data["section"],
+                    "total_students": section_data["total_students"],
+                    "active_students": section_data["active_students"],
+                    "logged_in_students": section_data["logged_in_students"],
+                    "subjects": section_data["subjects"]
+                })
+            # Sort sections alphabetically
+            sections_list.sort(key=lambda x: x["section"])
+            class_division_list.append({
+                "grade": grade_data["grade"],
+                "total_students": grade_data["total_students"],
+                "active_students": grade_data["active_students"],
+                "logged_in_students": grade_data["logged_in_students"],
+                "sections": sections_list
+            })
+        # Sort by grade
+        class_division_list.sort(key=lambda x: str(x["grade"]))
+
+        # ===== TEACHER SUMMARY =====
+        teacher_summary = []
+        for tutor in admin_tutors:
+            tutor_id = tutor.get("tutor_id")
+            tutor_name = tutor.get("name", tutor.get("username", "Unknown"))
+            tutor_subjects = tutor.get("subjects", []) or []
+            tutor_standards = tutor.get("standards", []) or []
+            tutor_sections = tutor.get("sections", []) or []
+
+            # Count documents uploaded by this teacher
+            tutor_docs = [d for d in admin_documents if tutor_id in (d.get("teacher_ids", []) or [])]
+            notes_count = len([d for d in tutor_docs if d.get("document_type") == "Chapter Notes"])
+            tests_count = len([d for d in tutor_docs if d.get("document_type") == "Test Series"])
+            practice_count = len([d for d in tutor_docs if d.get("document_type") == "Practice Sets"])
+
+            # Count assigned students
+            assigned_ids = tutor.get("assigned_student_ids", []) or []
+
+            teacher_summary.append({
+                "tutor_id": tutor_id,
+                "name": tutor_name,
+                "email": tutor.get("email"),
+                "subjects": tutor_subjects,
+                "standards": tutor_standards,
+                "sections": tutor_sections,
+                "is_active": tutor.get("is_active", True),
+                "assigned_students_count": len(assigned_ids),
+                "documents_uploaded": {
+                    "notes": notes_count,
+                    "tests": tests_count,
+                    "practice": practice_count,
+                    "total": notes_count + tests_count + practice_count
+                }
+            })
+
+        # Sort teachers by name
+        teacher_summary.sort(key=lambda x: x["name"].lower())
+
+        # ===== DOCUMENT STATS BY CLASS =====
+        docs_by_class = {}
+        for doc in admin_documents:
+            standard = doc.get("standard", "Unknown")
+            doc_type = doc.get("document_type", "Unknown")
+
+            if standard not in docs_by_class:
+                docs_by_class[standard] = {
+                    "grade": standard,
+                    "Chapter Notes": 0,
+                    "Test Series": 0,
+                    "Practice Sets": 0
+                }
+            if doc_type in docs_by_class[standard]:
+                docs_by_class[standard][doc_type] += 1
+
+        docs_by_class_list = list(docs_by_class.values())
+        docs_by_class_list.sort(key=lambda x: str(x["grade"]))
+
+        result = {
+            "success": True,
+            "class_division_stats": class_division_list,
+            "teacher_summary": teacher_summary,
+            "documents_by_class": docs_by_class_list,
+            "totals": {
+                "total_classes": len(class_division_list),
+                "total_teachers": len(teacher_summary),
+                "total_students": len(admin_students),
+                "total_documents": len(admin_documents)
+            }
+        }
+
+        # Cache for 5 minutes
+        await cache.set(cache_key, result, 300, "admin")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"School dashboard stats error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get school dashboard statistics"
+        )
+
+
+@router.get("/monitoring/class-section-stats")
+@limiter.limit("30/minute")
+async def get_class_section_monitoring_stats(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Get class-section level monitoring statistics:
+    - Number of students active
+    - Notes/Assignments/Tests uploaded per class-section
+    - Average usage in minutes
+    - Average % completion
+    - Average Score
+    """
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+
+        # Check cache first
+        cache_key = f"class_section_monitoring_{admin_id}"
+        cached_stats = await cache.get(cache_key, "admin")
+        if cached_stats:
+            return cached_stats
+
+        # Get all students for this admin
+        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+
+        # Get all documents for this admin
+        admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+
+        # Get all question attempts for students of this admin
+        student_ids = [s["_id"] for s in admin_students]
+        all_attempts = await db.mongo_find(
+            "question_attempts",
+            {"student_id": {"$in": student_ids}}
+        ) if student_ids else []
+
+        # Get all chat sessions for students of this admin
+        all_sessions = await db.mongo_find(
+            "chat_sessions",
+            {"student_id": {"$in": student_ids}}
+        ) if student_ids else []
+
+        # Build class-section level stats
+        class_section_stats = {}
+
+        for student in admin_students:
+            grade = student.get("grade", "Unknown")
+            section = student.get("section", "Unknown")
+            key = f"{grade}_{section}"
+
+            if key not in class_section_stats:
+                class_section_stats[key] = {
+                    "grade": grade,
+                    "section": section,
+                    "total_students": 0,
+                    "active_students": 0,  # has logged in
+                    "online_students": 0,  # currently online
+                    "documents": {
+                        "notes": 0,
+                        "tests": 0,
+                        "practice": 0
+                    },
+                    "total_time_minutes": 0,
+                    "total_problems_attempted": 0,
+                    "total_correct": 0,
+                    "total_score_sum": 0,
+                    "score_count": 0,
+                    "students_with_activity": 0
+                }
+
+            class_section_stats[key]["total_students"] += 1
+
+            # Active = has logged in at least once
+            if student.get("last_login") is not None:
+                class_section_stats[key]["active_students"] += 1
+
+            # Online = currently online
+            if student.get("is_online", False):
+                class_section_stats[key]["online_students"] += 1
+
+            # Calculate student-specific metrics
+            student_id = student["_id"]
+
+            # Sessions and time
+            student_sessions = [s for s in all_sessions if s.get("student_id") == student_id]
+            student_time = sum(s.get("duration", 0) for s in student_sessions) / 60  # convert to minutes
+            class_section_stats[key]["total_time_minutes"] += student_time
+
+            # Attempts and scores
+            student_attempts = [a for a in all_attempts if a.get("student_id") == student_id]
+            if student_attempts:
+                class_section_stats[key]["students_with_activity"] += 1
+                class_section_stats[key]["total_problems_attempted"] += len(student_attempts)
+                class_section_stats[key]["total_correct"] += sum(1 for a in student_attempts if a.get("is_correct", False))
+
+                scores = [a.get("score", 0) for a in student_attempts if "score" in a]
+                if scores:
+                    class_section_stats[key]["total_score_sum"] += sum(scores)
+                    class_section_stats[key]["score_count"] += len(scores)
+
+        # Add document counts per class-section
+        for doc in admin_documents:
+            standard = doc.get("standard", "Unknown")
+            section = doc.get("section", "Unknown")
+            doc_type = doc.get("document_type", "")
+            key = f"{standard}_{section}"
+
+            if key in class_section_stats:
+                if doc_type == "Chapter Notes":
+                    class_section_stats[key]["documents"]["notes"] += 1
+                elif doc_type == "Test Series":
+                    class_section_stats[key]["documents"]["tests"] += 1
+                elif doc_type == "Practice Sets":
+                    class_section_stats[key]["documents"]["practice"] += 1
+
+        # Convert to list and calculate averages
+        result_list = []
+        for key, stats in class_section_stats.items():
+            total = stats["total_students"]
+            with_activity = stats["students_with_activity"]
+            score_count = stats["score_count"]
+
+            avg_time = round(stats["total_time_minutes"] / total, 1) if total > 0 else 0
+            avg_problems = round(stats["total_problems_attempted"] / total, 1) if total > 0 else 0
+
+            # Completion % = (students with activity / total students) * 100
+            completion_pct = round((with_activity / total) * 100, 1) if total > 0 else 0
+
+            # Average score from all attempts
+            avg_score = round(stats["total_score_sum"] / score_count, 1) if score_count > 0 else 0
+
+            # Accuracy = correct / attempted
+            accuracy = round(
+                (stats["total_correct"] / stats["total_problems_attempted"]) * 100, 1
+            ) if stats["total_problems_attempted"] > 0 else 0
+
+            result_list.append({
+                "grade": stats["grade"],
+                "section": stats["section"],
+                "total_students": stats["total_students"],
+                "active_students": stats["active_students"],
+                "online_students": stats["online_students"],
+                "documents": stats["documents"],
+                "avg_usage_minutes": avg_time,
+                "avg_problems_per_student": avg_problems,
+                "avg_completion_pct": completion_pct,
+                "avg_score": avg_score,
+                "avg_accuracy": accuracy
+            })
+
+        # Sort by grade, then section
+        result_list.sort(key=lambda x: (str(x["grade"]), x["section"]))
+
+        result = {
+            "success": True,
+            "class_section_stats": result_list,
+            "totals": {
+                "total_classes": len(set(s["grade"] for s in result_list)),
+                "total_sections": len(result_list),
+                "total_students": sum(s["total_students"] for s in result_list),
+                "total_active": sum(s["active_students"] for s in result_list),
+                "total_documents": len(admin_documents)
+            }
+        }
+
+        # Cache for 5 minutes
+        await cache.set(cache_key, result, 300, "admin")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Class section monitoring stats error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get class section monitoring statistics"
+        )
+
 
 @router.get("/monitoring/student-progress")
 @limiter.limit("30/minute")
@@ -970,6 +1466,8 @@ async def get_student_progress(
                 "student_id": str(student_oid),
                 "student_name": student.get("full_name", student.get("name", "Unknown")),
                 "email": student.get("email", ""),
+                "grade": student.get("grade", "Unknown"),
+                "section": student.get("section", "Unknown"),
                 "total_sessions": len(sessions),
                 "total_time_spent": int(total_time),
                 "problems_solved": problems_solved,
@@ -1402,4 +1900,231 @@ async def toggle_reattempt(
         raise
     except Exception as e:
         logger.error(f"Failed to toggle re-attempt: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/session/promote", response_model=SessionPromotionResponse)
+@limiter.limit("5/minute")
+async def promote_session(
+    request: Request,
+    promotion_data: SessionPromotionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Promote all students to the next academic session.
+    
+    This endpoint:
+    1. Updates all students' grades based on grade_mappings
+    2. Optionally updates sections for specific students
+    3. Optionally deactivates old content (notes, assignments, tests)
+    4. Stores the session history for reference
+    
+    Use preview_only=True to see changes without actually applying them.
+    """
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        
+        # Get all active students for this admin
+        students = await db.mongo_find(
+            "students",
+            {"admin_id": admin_id, "is_active": True}
+        )
+        
+        if not students:
+            return SessionPromotionResponse(
+                success=True,
+                message="No active students found to promote",
+                new_session=promotion_data.new_session,
+                students_promoted=0,
+                students_skipped=0,
+                content_deactivated=0,
+                details=[]
+            )
+        
+        promoted_count = 0
+        skipped_count = 0
+        content_deactivated = 0
+        details = []
+        
+        for student in students:
+            student_id = str(student.get("_id"))
+            current_grade = student.get("grade", "")
+            current_section = student.get("section", "")
+            student_name = student.get("full_name") or student.get("name") or student.get("username", "Unknown")
+            business_id = student.get("student_id", student_id)
+            
+            # Apply filters
+            # 1. If specific student_ids are provided, only those students are considered
+            if promotion_data.student_ids:
+                if business_id not in promotion_data.student_ids and student_id not in promotion_data.student_ids:
+                    # This student is not in the selected list, skip without adding to details
+                    continue
+            else:
+                # 2. Apply grade filter if specified
+                if promotion_data.grade_filter and current_grade not in promotion_data.grade_filter:
+                    continue
+                
+                # 3. Apply section filter if specified
+                if promotion_data.section_filter and current_section not in promotion_data.section_filter:
+                    continue
+            
+            # Check if grade is in the mapping
+            if current_grade in promotion_data.grade_mappings:
+                new_grade = promotion_data.grade_mappings[current_grade]
+                
+                # Check for section update
+                new_section = current_section
+                if promotion_data.section_updates and business_id in promotion_data.section_updates:
+                    new_section = promotion_data.section_updates[business_id]
+                
+                detail = {
+                    "student_id": business_id,
+                    "student_name": student_name,
+                    "old_grade": current_grade,
+                    "new_grade": new_grade,
+                    "old_section": current_section,
+                    "new_section": new_section,
+                    "status": "promoted"
+                }
+                
+                # Only update if not preview mode
+                if not promotion_data.preview_only:
+                    update_fields = {
+                        "grade": new_grade,
+                        "section": new_section,
+                        "last_session": f"{current_grade}-{current_section}",
+                        "current_session": promotion_data.new_session,
+                        "promoted_at": datetime.utcnow(),
+                        "promoted_by": str(admin_id)
+                    }
+                    
+                    await db.mongo_update_one(
+                        "students",
+                        {"_id": student["_id"]},
+                        {"$set": update_fields}
+                    )
+                
+                details.append(detail)
+                promoted_count += 1
+            else:
+                # Grade not in mapping - skip
+                details.append({
+                    "student_id": business_id,
+                    "student_name": student_name,
+                    "old_grade": current_grade,
+                    "new_grade": current_grade,
+                    "old_section": current_section,
+                    "new_section": current_section,
+                    "status": "skipped",
+                    "reason": "Grade not in mapping"
+                })
+                skipped_count += 1
+        
+        # Deactivate old content if requested
+        if promotion_data.deactivate_old_content and not promotion_data.preview_only:
+            # Deactivate documents (notes, tests, practice sets) for the old session
+            result = await db.mongo_update_many(
+                "documents",
+                {
+                    "admin_id": admin_id,
+                    "is_active": True,
+                    "session": {"$ne": promotion_data.new_session}
+                },
+                {
+                    "$set": {
+                        "is_active": False,
+                        "deactivated_at": datetime.utcnow(),
+                        "deactivated_reason": f"Session promotion to {promotion_data.new_session}"
+                    }
+                }
+            )
+            content_deactivated = result if isinstance(result, int) else 0
+        
+        # Store session promotion history if not preview
+        if not promotion_data.preview_only:
+            await db.mongo_insert_one(
+                "session_promotions",
+                {
+                    "admin_id": admin_id,
+                    "new_session": promotion_data.new_session,
+                    "grade_mappings": promotion_data.grade_mappings,
+                    "students_promoted": promoted_count,
+                    "students_skipped": skipped_count,
+                    "content_deactivated": content_deactivated,
+                    "promoted_at": datetime.utcnow(),
+                    "promoted_by": str(admin_id)
+                }
+            )
+            
+            # Invalidate caches
+            try:
+                await cache.clear_pattern("students:*", "admin")
+                await cache.delete("dashboard_stats", "admin")
+            except Exception:
+                pass
+        
+        message = f"Preview: {promoted_count} students would be promoted" if promotion_data.preview_only else f"Successfully promoted {promoted_count} students to session {promotion_data.new_session}"
+        
+        logger.info(f"Session promotion {'preview' if promotion_data.preview_only else 'completed'} for admin {admin_id}: {promoted_count} promoted, {skipped_count} skipped")
+        
+        return SessionPromotionResponse(
+            success=True,
+            message=message,
+            new_session=promotion_data.new_session,
+            students_promoted=promoted_count,
+            students_skipped=skipped_count,
+            content_deactivated=content_deactivated,
+            details=details
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session promotion error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to promote session: {str(e)}"
+        )
+
+
+@router.get("/session/promotions")
+@limiter.limit("30/minute")
+async def get_session_promotions(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Get history of session promotions for this admin"""
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        
+        promotions = await db.mongo_find(
+            "session_promotions",
+            {"admin_id": admin_id},
+            sort=[("promoted_at", -1)],
+            limit=20
+        )
+        
+        # Format for response
+        formatted_promotions = []
+        for promo in promotions:
+            formatted_promotions.append({
+                "id": str(promo.get("_id")),
+                "new_session": promo.get("new_session"),
+                "grade_mappings": promo.get("grade_mappings"),
+                "students_promoted": promo.get("students_promoted", 0),
+                "students_skipped": promo.get("students_skipped", 0),
+                "content_deactivated": promo.get("content_deactivated", 0),
+                "promoted_at": promo.get("promoted_at").isoformat() if promo.get("promoted_at") else None
+            })
+        
+        return {
+            "success": True,
+            "promotions": formatted_promotions
+        }
+        
+    except Exception as e:
+        logger.error(f"Get session promotions error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

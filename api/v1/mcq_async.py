@@ -83,8 +83,9 @@ class MCQStats(BaseModel):
     difficulty_breakdown: Dict[str, Dict[str, int]]  # difficulty -> {total, correct}
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
-    if current_user.get("user_type") not in ["student", "admin"]:
+    """Dependency to require student, B2C user, B2C admin, or admin access"""
+    # b2c_user gets same access as student, b2c_admin gets admin access
+    if current_user.get("user_type") not in ["student", "admin", "b2c_user", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Student or admin access required"
@@ -109,8 +110,8 @@ async def get_current_user_optional(db: DatabaseManager = Depends(get_database))
         return {"user_type": "student", "user_id": "anonymous"}
 
 def require_admin_for_write(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access for write operations"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access for write operations (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -266,20 +267,51 @@ async def _get_mcq_questions_with_images(db: DatabaseManager, where_filter: dict
                                 import os
                                 import base64 as b64
                                 file_path = img_doc["file_path"]
-                                if os.path.exists(file_path):
+                                
+                                # Handle S3 paths
+                                if file_path.startswith("s3://"):
                                     try:
-                                        with open(file_path, "rb") as f:
-                                            image_bytes = f.read()
+                                        from utils.s3_storage import download_file as s3_download
+                                        import asyncio
+                                        
+                                        # Check if we're in an async context and download
+                                        loop = asyncio.get_event_loop()
+                                        if loop.is_running():
+                                            # Use create_task for async context
+                                            image_bytes = await s3_download(file_path)
+                                        else:
+                                            image_bytes = loop.run_until_complete(s3_download(file_path))
+                                        
+                                        if image_bytes:
                                             base64_encoded = b64.b64encode(image_bytes).decode('utf-8')
                                             content_type = img_doc.get("content_type", "image/jpeg")
                                             if not content_type.startswith("image/"):
                                                 content_type = "image/jpeg"
                                             base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                            logger.info(f"✅ Loaded MCQ figure {fig_id} from file: {len(base64_data)} bytes")
-                                    except Exception as file_err:
-                                        logger.error(f"❌ Failed to read MCQ figure file {file_path}: {file_err}")
+                                            logger.info(f"✅ Loaded MCQ figure {fig_id} from S3: {len(base64_data)} bytes")
+                                        else:
+                                            logger.warning(f"⚠️ Failed to download MCQ figure from S3: {file_path}")
+                                    except Exception as s3_err:
+                                        logger.error(f"❌ S3 download error for {file_path}: {s3_err}")
                                 else:
-                                    logger.warning(f"⚠️ MCQ figure file not found: {file_path}")
+                                    # Local file handling - resolve relative paths
+                                    if file_path.startswith("uploads/") or file_path.startswith("uploads\\"):
+                                        file_path = os.path.join(os.getcwd(), file_path.replace("\\", "/"))
+                                    
+                                    if os.path.exists(file_path):
+                                        try:
+                                            with open(file_path, "rb") as f:
+                                                image_bytes = f.read()
+                                                base64_encoded = b64.b64encode(image_bytes).decode('utf-8')
+                                                content_type = img_doc.get("content_type", "image/jpeg")
+                                                if not content_type.startswith("image/"):
+                                                    content_type = "image/jpeg"
+                                                base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                                logger.info(f"✅ Loaded MCQ figure {fig_id} from file: {len(base64_data)} bytes")
+                                        except Exception as file_err:
+                                            logger.error(f"❌ Failed to read MCQ figure file {file_path}: {file_err}")
+                                    else:
+                                        logger.warning(f"⚠️ MCQ figure file not found: {file_path}")
                             else:
                                 logger.warning(f"Question {question_id} figure {fig_idx}: Image doc found but no base64Data or file_path")
 
@@ -413,6 +445,141 @@ async def get_test_series_list(
     Works with ChromaDB data when MongoDB documents are missing
     """
     try:
+        user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            # Get B2C user profile from B2C database
+            b2c_user = await db.b2c_find_one("users", {"_id": ObjectId(current_user["user_id"])})
+            
+            if not b2c_user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="B2C user profile not found"
+                )
+            
+            # Check if onboarding is complete
+            if not b2c_user.get("onboarding_complete"):
+                return {
+                    "success": True,
+                    "data": {
+                        "test_series": [],
+                        "total": 0,
+                        "onboarding_required": True
+                    }
+                }
+            
+            # Get user's plan details
+            user_exam_type = b2c_user.get("exam_type")
+            user_class_level = b2c_user.get("class_level")
+            user_standard = b2c_user.get("standard")
+            user_subjects = b2c_user.get("subjects", [])
+            user_plan_types = b2c_user.get("plan_types", [])
+            
+            # Get B2C admin ID for content filtering
+            b2c_admin = await db.b2c_find_one("admins", {}, {"_id": 1})
+            b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
+            
+            # Build filter for B2C test series
+            filter_query = {
+                "document_type": "Test Series",
+                "ocr_status": "completed",
+                "is_active": {"$ne": False}
+            }
+            
+            if b2c_admin_id:
+                try:
+                    filter_query["admin_id"] = ObjectId(b2c_admin_id)
+                except:
+                    filter_query["admin_id"] = b2c_admin_id
+            
+            # Apply plan type filter
+            if course_plan:
+                filter_query["course_plan"] = course_plan
+            elif user_plan_types:
+                filter_query["course_plan"] = {"$in": user_plan_types}
+            elif user_exam_type:
+                filter_query["course_plan"] = user_exam_type
+            
+            # Apply subject filter
+            if subject:
+                filter_query["subject"] = subject
+            elif user_subjects:
+                filter_query["subject"] = {"$in": user_subjects}
+            
+            # Apply standard filter
+            if standard:
+                filter_query["standard"] = standard
+            elif user_standard:
+                filter_query["standard"] = user_standard
+            
+            logger.info(f"B2C user {current_user['user_id']} test series query: {filter_query}")
+            
+            # Get test series from B2C database
+            documents = await db.b2c_find(
+                "documents",
+                filter_query,
+                sort=[("title", 1)]
+            )
+            
+            logger.info(f"B2C test series found: {len(documents)}")
+            
+            # Format response
+            test_series_list = []
+            user_id = current_user["user_id"]
+            
+            for doc in documents:
+                doc_id = doc.get("document_id") or str(doc.get("_id"))
+                
+                # Check if B2C user has attempted this test
+                attempts = await db.b2c_find(
+                    "student_test_attempts",
+                    {
+                        "student_id": user_id,
+                        "document_id": doc_id
+                    },
+                    sort=[("submitted_at", -1)]
+                )
+                
+                has_attempted = len(attempts) > 0
+                attempt_count = len(attempts)
+                latest_attempt = None
+                
+                if has_attempted:
+                    latest_attempt = {
+                        "attempt_id": str(attempts[0]["_id"]),
+                        "score": attempts[0].get("score", 0),
+                        "total_points": attempts[0].get("total_points", 0),
+                        "percentage": attempts[0].get("percentage", 0),
+                        "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
+                    }
+                
+                test_series_list.append({
+                    "document_id": doc_id,
+                    "title": doc.get("title"),
+                    "subject": doc.get("subject"),
+                    "standard": doc.get("standard"),
+                    "course_plan": doc.get("course_plan"),
+                    "difficulty": doc.get("difficulty"),
+                    "questions_count": doc.get("extracted_questions_count", 0),
+                    "total_points": doc.get("total_points", 0),
+                    "total_minutes": doc.get("total_minutes", 0),
+                    "is_validated": doc.get("is_validated", False),
+                    "file_exists": True,
+                    "attempted": has_attempted,
+                    "attempt_count": attempt_count,
+                    "latest_attempt": latest_attempt
+                })
+            
+            return {
+                "success": True,
+                "data": {
+                    "test_series": test_series_list,
+                    "total": len(test_series_list)
+                }
+            }
+
         # Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
@@ -433,11 +600,35 @@ async def get_test_series_list(
         if standard:
             filter_query["standard"] = standard
 
-        # If user is a student, only show completed OCR documents
+        # If user is a regular student, apply profile-based filtering
         if current_user.get("user_type") == "student":
             filter_query["ocr_status"] = "completed"
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            filter_query["is_active"] = {"$ne": False}
+            
+            # Get student profile for filtering
+            student_profile = await db.mongo_find_one("students", {"_id": ObjectId(current_user["user_id"])})
+            
+            if student_profile:
+                student_grade = student_profile.get("grade")
+                student_subjects = student_profile.get("subjects", [])
+                student_plan_types = student_profile.get("plan_types", [])
+                
+                # Filter by student's grade if available - EXACT match
+                # Both student.grade and document.standard come from admin settings, so they match exactly
+                if student_grade and not standard:  # Only if not already filtered by query param
+                    filter_query["standard"] = student_grade
+                
+                # Filter by student's subjects if available
+                if student_subjects and not subject:  # Only if not already filtered by query param
+                    filter_query["subject"] = {"$in": student_subjects}
+                
+                # Filter by student's plan types if available
+                if student_plan_types and not course_plan:  # Only if not already filtered by query param
+                    filter_query["course_plan"] = {"$in": student_plan_types}
 
         documents = await db.mongo_find("documents", filter_query, sort=[("title", 1)])
+
         if documents:
             test_series_list = []
             user_id = current_user["user_id"]
@@ -622,9 +813,11 @@ async def get_mcq_available_options(
             "admin_id": admin_filter
         }
 
-        # If user is a student, only show completed OCR documents
+        # If user is a student, only show completed OCR documents that are active
         if current_user.get("user_type") == "student":
             filter_query["ocr_status"] = "completed"
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            filter_query["is_active"] = {"$ne": False}
 
         # Get all test series documents for this admin
         documents = await db.mongo_find("documents", filter_query)
@@ -670,7 +863,180 @@ async def get_test_series_questions(
     No authentication required for basic access
     """
     try:
-        # Get admin_id for data isolation
+        user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            logger.info(f"B2C user {current_user['user_id']} fetching test series {document_id}")
+            
+            # Get B2C admin ID for content filtering
+            b2c_admin = await db.b2c_find_one("admins", {}, {"_id": 1})
+            b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
+            
+            # Try to get document from B2C database
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+            
+            if not document:
+                # Also try by _id
+                try:
+                    document = await db.b2c_find_one("documents", {"_id": ObjectId(document_id)})
+                except:
+                    pass
+            
+            if not document:
+                logger.warning(f"B2C document {document_id} not found")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Test series document not found: {document_id}"
+                )
+            
+            # Verify document type
+            if document.get("document_type") != "Test Series":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This document is not a Test Series"
+                )
+            
+            # Check if document is active
+            if document.get("is_active") == False:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This test series is not currently available"
+                )
+            
+            # Get questions from B2C database
+            mongo_questions = await db.b2c_find(
+                "questions",
+                {"document_id": document_id},
+                sort=[("metadata.page", 1)]
+            )
+            
+            # If no questions found by document_id, try by pdf_source (filename)
+            if not mongo_questions:
+                mongo_questions = await db.b2c_find(
+                    "questions",
+                    {"pdf_source": document.get("filename")},
+                    sort=[("metadata.page", 1)]
+                )
+            
+            logger.info(f"B2C test series {document_id}: found {len(mongo_questions)} questions")
+            
+            questions_with_images = []
+            if mongo_questions:
+                from datetime import datetime
+                def to_jsonable(value):
+                    if isinstance(value, datetime):
+                        return value.isoformat()
+                    try:
+                        if isinstance(value, ObjectId):
+                            return str(value)
+                    except Exception:
+                        pass
+                    if isinstance(value, list):
+                        return [to_jsonable(v) for v in value]
+                    if isinstance(value, dict):
+                        return {k: to_jsonable(v) for k, v in value.items()}
+                    return value
+                
+                for q in mongo_questions:
+                    payload = {
+                        "id": str(q.get("id") or q.get("_id")),
+                        "text": q.get("text", q.get("question_text", "")),
+                        "question_text": q.get("question_text", q.get("text", "")),
+                        "subject": q.get("subject", document.get("subject")),
+                        "difficulty": q.get("difficulty", "medium"),
+                        "document_type": "Test Series",
+                        "document_id": document_id,
+                        "pdf_source": q.get("pdf_source", document.get("filename")),
+                        "images": q.get("images", []),
+                        "question_figures": q.get("question_figures", []),
+                        "options": q.get("options", []),
+                        "enhanced_options": q.get("enhanced_options", []),
+                        "correct_answer": q.get("correct_answer"),
+                        "metadata": q.get("metadata", {}),
+                        "points": q.get("points", 1),
+                        "penalty": q.get("penalty", 0),
+                        "created_at": q.get("created_at"),
+                        "extracted_at": q.get("extracted_at"),
+                    }
+                    
+                    # Enrich figures with base64 from B2C database
+                    try:
+                        figures: List[Dict[str, Any]] = []
+                        for fig_ref in (q.get("question_figures", []) or []):
+                            fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
+                            base64_data = None
+                            if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
+                                base64_data = fig_ref["base64Data"]
+                            else:
+                                img_doc = await db.b2c_find_one("images", {"_id": fig_id})
+                                if img_doc:
+                                    if img_doc.get("base64Data"):
+                                        base64_data = img_doc["base64Data"]
+                                    elif img_doc.get("file_path"):
+                                        import os, base64
+                                        fp = img_doc["file_path"]
+                                        if os.path.exists(fp):
+                                            with open(fp, "rb") as f:
+                                                enc = base64.b64encode(f.read()).decode("utf-8")
+                                                ct = img_doc.get("content_type", "image/jpeg")
+                                                if not ct.startswith("image/"):
+                                                    ct = "image/jpeg"
+                                                base64_data = f"data:{ct};base64,{enc}"
+                            figures.append({
+                                "id": fig_id,
+                                "url": f"/api/v1/images/{fig_id}",
+                                "base64Data": base64_data,
+                                "contentType": "image/jpeg",
+                                "filename": (fig_ref.get("filename") if isinstance(fig_ref, dict) else str(fig_id)),
+                                "type": "diagram"
+                            })
+                        payload["questionFigures"] = figures
+                    except Exception:
+                        payload["questionFigures"] = []
+                    
+                    # Inline base64 for image-type enhanced options
+                    try:
+                        eos = payload.get("enhanced_options") or []
+                        for i, opt in enumerate(list(eos)):
+                            if isinstance(opt, dict) and opt.get("type") == "image":
+                                content = opt.get("content")
+                                if isinstance(content, str) and content and not content.startswith("data:image"):
+                                    img_doc = await db.b2c_find_one("images", {"_id": content})
+                                    if img_doc:
+                                        b64 = img_doc.get("base64Data")
+                                        if not b64 and img_doc.get("file_path"):
+                                            import os, base64
+                                            fp = img_doc["file_path"]
+                                            if os.path.exists(fp):
+                                                with open(fp, "rb") as f:
+                                                    enc = base64.b64encode(f.read()).decode("utf-8")
+                                                    ct = img_doc.get("content_type", "image/jpeg")
+                                                    if not ct.startswith("image/"):
+                                                        ct = "image/jpeg"
+                                                    b64 = f"data:{ct};base64,{enc}"
+                                        if b64:
+                                            payload["enhanced_options"][i]["content"] = b64
+                    except Exception:
+                        pass
+                    
+                    questions_with_images.append(to_jsonable(payload))
+            
+            return {
+                "success": True,
+                "data": {
+                    "document_id": document.get("document_id") or str(document.get("_id")),
+                    "title": document.get("title"),
+                    "subject": document.get("subject"),
+                    "total_points": document.get("total_points", 0),
+                    "total_minutes": document.get("total_minutes", 0),
+                    "questions": questions_with_images,
+                    "total": len(questions_with_images)
+                }
+            }
+
+        # Regular B2B flow - Get admin_id for data isolation
         from api.v1.questions_async import get_admin_id_from_user
         admin_id = get_admin_id_from_user(current_user)
         try:
@@ -690,12 +1056,20 @@ async def get_test_series_questions(
                     detail="This document is not a Test Series"
                 )
 
+            # For students, verify document is active (None/missing = active by default)
+            if current_user.get("user_type") == "student" and document.get("is_active") == False:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="This test series is not currently available"
+                )
+
             # 1) Preferred: read directly from Mongo 'questions' by document_id (populated during OCR)
             mongo_questions = await db.mongo_find(
                 "questions",
                 {"document_id": document_id},
                 sort=[("metadata.page", 1)]
             )
+
 
             questions_with_images = []
             if mongo_questions:
@@ -1604,6 +1978,7 @@ async def check_test_attempt(
     try:
         user_id = current_user["user_id"]
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
 
         # Admins can always access
         if user_type == "admin":
@@ -1614,15 +1989,26 @@ async def check_test_attempt(
                 "attempt_count": 0
             }
 
-        # Check for existing attempts
-        attempts = await db.mongo_find(
-            "student_test_attempts",
-            {
-                "student_id": user_id,
-                "document_id": document_id
-            },
-            sort=[("submitted_at", -1)]
-        )
+        # B2C users query B2C database
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "student_test_attempts",
+                {
+                    "student_id": user_id,
+                    "document_id": document_id
+                },
+                sort=[("submitted_at", -1)]
+            )
+        else:
+            # Regular B2B students query main database
+            attempts = await db.mongo_find(
+                "student_test_attempts",
+                {
+                    "student_id": user_id,
+                    "document_id": document_id
+                },
+                sort=[("submitted_at", -1)]
+            )
 
         has_attempted = len(attempts) > 0
         attempt_count = len(attempts)
@@ -1654,6 +2040,7 @@ async def check_test_attempt(
             detail=f"Failed to check test attempt: {str(e)}"
         )
 
+
 @router.post("/test-series/{document_id}/submit")
 @limiter.limit("10/minute")
 async def submit_test_series(
@@ -1671,36 +2058,65 @@ async def submit_test_series(
     try:
         user_id = current_user["user_id"]
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
 
-        # Get document
-        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        logger.info(f"Test submission: user={user_id}, is_b2c={is_b2c}, document={document_id}")
+
+        # Get document from appropriate database
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+            if not document:
+                # Try by _id
+                try:
+                    document = await db.b2c_find_one("documents", {"_id": ObjectId(document_id)})
+                except:
+                    pass
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+        
         if not document:
             raise HTTPException(status_code=404, detail="Test series not found")
 
         if document.get("document_type") != "Test Series":
             raise HTTPException(status_code=400, detail="Document is not a Test Series")
 
-        # For students, check if they can attempt
-        if user_type == "student":
-            # Check existing attempts
-            attempts = await db.mongo_find(
-                "student_test_attempts",
-                {
-                    "student_id": user_id,
-                    "document_id": document_id
-                }
-            )
+        # For students/B2C users, check if they can attempt
+        if user_type in ["student", "b2c_user"]:
+            # Check existing attempts from appropriate database
+            if is_b2c:
+                attempts = await db.b2c_find(
+                    "student_test_attempts",
+                    {
+                        "student_id": user_id,
+                        "document_id": document_id
+                    }
+                )
+            else:
+                attempts = await db.mongo_find(
+                    "student_test_attempts",
+                    {
+                        "student_id": user_id,
+                        "document_id": document_id
+                    }
+                )
 
             if len(attempts) > 0:
                 latest_attempt = attempts[-1]
-                if not latest_attempt.get("can_reattempt", False):
+                if not latest_attempt.get("can_reattempt", True):
                     raise HTTPException(
                         status_code=403,
                         detail="You have already attempted this test. Re-attempt not allowed."
                     )
 
-        # Get questions
-        questions = await db.mongo_find("questions", {"document_id": document_id})
+        # Get questions from appropriate database
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+            if not questions:
+                # Try by pdf_source
+                questions = await db.b2c_find("questions", {"pdf_source": document.get("filename")})
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+        
         if not questions:
             raise HTTPException(status_code=404, detail="No questions found for this test")
 
@@ -1724,15 +2140,15 @@ async def submit_test_series(
         question_results = []
 
         for question in questions:
-            question_id = question.get("id")
+            question_id = question.get("id") or str(question.get("_id"))
             correct_answer = question.get("correct_answer")
             if correct_answer is not None:
-                correct_answer = correct_answer.strip()
+                correct_answer = str(correct_answer).strip()
             else:
                 correct_answer = ""
-            student_answer = student_answers.get(question_id, "").strip()
+            student_answer = str(student_answers.get(question_id, "")).strip()
             question_points = question.get("points", 4)
-            penalty_marks = question.get("penalty", question.get("penalty_marks", 1))  # Get penalty from question, default to 1
+            penalty_marks = question.get("penalty", question.get("penalty_marks", 1))
 
             is_correct = False
             # Check if question was skipped or not attempted
@@ -1767,10 +2183,18 @@ async def submit_test_series(
         # Calculate percentage
         percentage = (score / total_points * 100) if total_points > 0 else 0
 
-        # Get student info
-        student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)}) if user_type == "student" else None
-        student_name = student.get("name", "Admin") if student else "Admin"
-        student_grade = student.get("grade", "") if student else ""
+        # Get student info from appropriate database
+        if is_b2c:
+            student = await db.b2c_find_one("users", {"_id": ObjectId(user_id)})
+            student_name = student.get("full_name", student.get("name", "B2C User")) if student else "B2C User"
+            student_grade = student.get("standard", student.get("class_level", "")) if student else ""
+        elif user_type == "student":
+            student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)})
+            student_name = student.get("name", "Student") if student else "Student"
+            student_grade = student.get("grade", "") if student else ""
+        else:
+            student_name = "Admin"
+            student_grade = ""
 
         # Create attempt record
         attempt_record = {
@@ -1792,13 +2216,17 @@ async def submit_test_series(
             "answers": student_answers,
             "question_results": question_results,
             "can_reattempt": True,  # Allow unlimited practice
-            "submitted_at": datetime.utcnow()
+            "submitted_at": datetime.utcnow(),
+            "is_b2c": is_b2c  # Mark as B2C attempt for analytics
         }
 
-        # Insert into database
-        attempt_id = await db.mongo_insert_one("student_test_attempts", attempt_record)
+        # Insert into appropriate database
+        if is_b2c:
+            attempt_id = await db.b2c_insert_one("student_test_attempts", attempt_record)
+        else:
+            attempt_id = await db.mongo_insert_one("student_test_attempts", attempt_record)
 
-        logger.info(f"Test series submitted: {document_id} by {student_name} - Score: {score}/{total_points}")
+        logger.info(f"Test series submitted: {document_id} by {student_name} (B2C={is_b2c}) - Score: {score}/{total_points}")
 
         return {
             "success": True,
@@ -1827,3 +2255,4 @@ async def submit_test_series(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to submit test: {str(e)}"
         )
+

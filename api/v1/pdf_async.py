@@ -32,6 +32,7 @@ from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
 from utils.path_utils import get_relative_path, get_absolute_path
+from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,12 @@ limiter = Limiter(key_func=get_remote_address)
 # Mistral OCR API configuration
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
+
+# IMPORTANT: Grade/Standard matching uses EXACT string matching
+# Both student.grade and document.standard should come from the same admin settings
+# (configured in School Settings), so they will match exactly
+# For example: student.grade="12th Pass" matches document.standard="12th Pass"
+# No normalization or fuzzy matching is needed or desired
 
 # Pydantic models
 class MistralOCRImage(BaseModel):
@@ -105,8 +112,8 @@ class Question(BaseModel):
     penalty: Optional[float] = 1.0
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
@@ -114,13 +121,17 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     return current_user
 
 def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Allow both admin and tutor roles"""
-    if current_user.get("user_type") not in ["admin", "tutor"]:
+    """Allow admin, B2C admin, and tutor roles"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin or Tutor access required"
         )
     return current_user
+
+def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
+    """Check if the current user is a B2C admin"""
+    return current_user.get("user_type") == "b2c_admin"
 
 async def call_mistral_ocr(pdf_base64: str) -> Dict[str, Any]:
     """Call Mistral OCR API with base64 PDF data"""
@@ -280,7 +291,8 @@ async def save_image_to_disk(
     pdf_filename: str,
     db: DatabaseManager,
     user_id: str,
-    split_composite: bool = True
+    split_composite: bool = True,
+    is_b2c: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Save extracted image to disk and return metadata.
@@ -320,6 +332,7 @@ async def save_image_to_disk(
 
         # Split composite image if enabled
         image_parts = split_composite_image(image_data, image_id) if split_composite else [image_data]
+        was_split = len(image_parts) > 1
 
         # Create uploads directory structure
         upload_dir = os.path.join(os.getcwd(), "uploads", "pdf_images", pdf_filename.replace('.pdf', ''))
@@ -329,55 +342,130 @@ async def save_image_to_disk(
         # Strip any existing extension from image_id
         base_image_id = image_id.split('.')[0] if '.' in image_id else image_id
 
-        # Save each part (or just the original if not split)
         saved_images = []
-        for idx, img_data in enumerate(image_parts):
-            # Detect format for this part
-            detected_ext, content_type = detect_image_format(img_data)
-
-            # Create unique ID for each split part
-            if len(image_parts) > 1:
+        
+        # ALWAYS save the original unsplit image first with base_image_id
+        # This ensures question figures have access to the complete image
+        original_detected_ext, original_content_type = detect_image_format(image_data)
+        original_image_filename = f"{base_image_id}.{original_detected_ext}"
+        original_file_path = os.path.join(upload_dir, original_image_filename)
+        
+        # Use S3 storage if enabled, otherwise save locally
+        if is_s3_enabled():
+            # Upload to S3
+            success, storage_path = await s3_upload_file(
+                file_data=image_data,
+                local_path=original_file_path,
+                content_type=original_content_type
+            )
+            if success:
+                logger.info(f"✅ Saved image to S3: {storage_path}")
+                original_relative_path = storage_path  # Store S3 path
+            else:
+                logger.warning(f"S3 upload failed, image not saved: {original_image_filename}")
+                original_relative_path = ""
+        else:
+            # Save locally (fallback)
+            os.makedirs(upload_dir, exist_ok=True)
+            async with aiofiles.open(original_file_path, "wb") as f:
+                await f.write(image_data)
+            logger.info(f"Saved original image locally: {original_image_filename}")
+            original_relative_path = get_relative_path(original_file_path)
+        
+        # Save original to database
+        original_metadata = {
+            "_id": base_image_id,
+            "filename": original_image_filename,
+            "original_filename": original_image_filename,
+            "size": len(image_data),
+            "content_type": original_content_type,
+            "uploaded_by": user_id,
+            "uploaded_at": datetime.utcnow(),
+            "is_processed": True,
+            "file_path": original_relative_path,
+            "source_pdf": pdf_filename,
+            "tags": ["pdf_extracted", "ocr", "original"],
+            "was_split": was_split,
+            "is_s3": is_s3_enabled()  # Track storage type
+        }
+        
+        # Save to database (use update_one with upsert to handle re-processing)
+        if is_b2c:
+            await db.b2c_update_one("images", {"_id": base_image_id}, {"$set": original_metadata}, upsert=True)
+        else:
+            await db.mongo_update_one("images", {"_id": base_image_id}, {"$set": original_metadata}, upsert=True)
+        
+        saved_images.append({
+            "id": base_image_id,
+            "filename": original_image_filename,
+            "path": original_relative_path,
+            "url": f"/api/v1/images/{base_image_id}",
+            "size": len(image_data),
+            "is_original": True
+        })
+        
+        # If the image was split, also save split parts with -A, -B, etc. suffixes
+        if was_split:
+            for idx, img_data in enumerate(image_parts):
+                # Detect format for this part
+                detected_ext, content_type = detect_image_format(img_data)
+                
+                # Create unique ID for each split part
                 db_image_id = f"{base_image_id}-{chr(65+idx)}"  # img-9-A, img-9-B, img-9-C, img-9-D
                 image_filename = f"{db_image_id}.{detected_ext}"
-            else:
-                db_image_id = base_image_id
-                image_filename = f"{base_image_id}.{detected_ext}"
+                file_path = os.path.join(upload_dir, image_filename)
 
-            file_path = os.path.join(upload_dir, image_filename)
+                # Use S3 storage if enabled, otherwise save locally
+                if is_s3_enabled():
+                    success, storage_path = await s3_upload_file(
+                        file_data=img_data,
+                        local_path=file_path,
+                        content_type=content_type
+                    )
+                    if success:
+                        logger.info(f"✅ Saved split part {idx+1} to S3: {storage_path}")
+                        relative_path = storage_path
+                    else:
+                        logger.warning(f"S3 upload failed for split part: {image_filename}")
+                        relative_path = ""
+                else:
+                    async with aiofiles.open(file_path, "wb") as f:
+                        await f.write(img_data)
+                    logger.info(f"Saved split part {idx+1}/{len(image_parts)} locally: {image_filename}")
+                    relative_path = get_relative_path(file_path)
 
-            # Save image file
-            async with aiofiles.open(file_path, "wb") as f:
-                await f.write(img_data)
+                # Create image metadata for database
+                image_metadata = {
+                    "_id": db_image_id,
+                    "filename": image_filename,
+                    "original_filename": original_image_filename,
+                    "size": len(img_data),
+                    "content_type": content_type,
+                    "uploaded_by": user_id,
+                    "uploaded_at": datetime.utcnow(),
+                    "is_processed": True,
+                    "file_path": relative_path,
+                    "source_pdf": pdf_filename,
+                    "tags": ["pdf_extracted", "ocr", "split_composite"],
+                    "parent_image_id": base_image_id,
+                    "split_index": idx,
+                    "is_s3": is_s3_enabled()
+                }
 
-            logger.info(f"Saved image part {idx+1}/{len(image_parts)}: {image_filename} (detected format: {detected_ext})")
+                # Save to database
+                if is_b2c:
+                    await db.b2c_update_one("images", {"_id": db_image_id}, {"$set": image_metadata}, upsert=True)
+                else:
+                    await db.mongo_update_one("images", {"_id": db_image_id}, {"$set": image_metadata}, upsert=True)
 
-            # Create image metadata for database
-            # IMPORTANT: Store relative path for cross-platform compatibility
-            relative_path = get_relative_path(file_path)
-            image_metadata = {
-                "_id": db_image_id,
-                "filename": image_filename,
-                "original_filename": image_filename if len(image_parts) == 1 else f"{base_image_id}.{detected_ext}",
-                "size": len(img_data),
-                "content_type": content_type,
-                "uploaded_by": user_id,
-                "uploaded_at": datetime.utcnow(),
-                "is_processed": True,
-                "file_path": relative_path,
-                "source_pdf": pdf_filename,
-                "tags": ["pdf_extracted", "ocr"] + (["split_composite"] if len(image_parts) > 1 else [])
-            }
-
-            # Save to database
-            await db.mongo_insert_one("images", image_metadata)
-
-            saved_images.append({
-                "id": db_image_id,
-                "filename": image_filename,
-                "path": file_path,
-                "url": f"/api/v1/images/{db_image_id}",
-                "size": len(img_data)
-            })
+                saved_images.append({
+                    "id": db_image_id,
+                    "filename": image_filename,
+                    "path": relative_path,
+                    "url": f"/api/v1/images/{db_image_id}",
+                    "size": len(img_data),
+                    "is_original": False
+                })
 
         return saved_images
 
@@ -486,8 +574,19 @@ def extract_questions_from_ocr(
             if line_num < 10:
                 logger.debug(f"Line {line_num}: {line_stripped[:100]}")
 
-            # Extract image references from the line (format: ![img-X.jpeg] or similar)
-            image_refs = re.findall(r'!\[([^\]]*(?:img-\d+[^\]]*)?)\]', line)
+            # Extract image references from the line (format: ![alt](url) or ![alt])
+            # Updated regex to capture both alt text and URL to handle cases like ![](img-0.jpeg)
+            image_refs_raw = re.findall(r'!\[([^\]]*)\](?:\(([^)]+)\))?', line)
+            # Build image_refs list: prefer alt text if not empty, otherwise use URL
+            image_refs = []
+            for alt_text, url_text in image_refs_raw:
+                img_ref = alt_text.strip() if alt_text.strip() else url_text.strip()
+                if img_ref:
+                    image_refs.append(img_ref)
+            
+            # Log image extraction for debugging
+            if image_refs:
+                logger.info(f"📸 Line {line_num}: Extracted {len(image_refs)} image refs: {image_refs}")
 
             # NEW LOGIC: Classify images based on previous line
             if image_refs and not current_question:
@@ -735,6 +834,9 @@ async def run_document_ocr_pipeline(
         all_images: List[Dict[str, Any]] = []
         image_base64_map: Dict[str, Dict[str, Any]] = {}
 
+        # Determine if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+
         for page in ocr_result.get("pages", []):
             for img in page.get("images", []):
                 if img.get("image_base64"):
@@ -744,7 +846,8 @@ async def run_document_ocr_pipeline(
                         document["filename"],
                         db,
                         current_user.get("user_id"),
-                        split_composite=True
+                        split_composite=True,
+                        is_b2c=is_b2c
                     )
                     if saved_images:
                         all_images.extend(saved_images)
@@ -801,13 +904,16 @@ async def run_document_ocr_pipeline(
 
                                 logger.info(f"Including {mistral_img_id} - referenced in question")
 
-                                saved_img = next(
-                                    (img for img in all_images if img['id'] == base_img_id),
-                                    None
-                                )
+                                # Find saved images - check for both exact match and split variants
+                                # If image was split, the IDs become img-X-A, img-X-B, etc.
+                                matching_saved_images = [
+                                    img for img in all_images 
+                                    if img['id'] == base_img_id or img['id'].startswith(f"{base_img_id}-")
+                                ]
+                                
                                 img_base64_data = image_base64_map.get(mistral_img_id) or image_base64_map.get(base_img_id, {})
 
-                                if saved_img and img_base64_data:
+                                if matching_saved_images and img_base64_data:
                                     is_question_figure = any(
                                         base_img_id in ref or mistral_img_id in ref
                                         for ref in question_image_refs
@@ -817,31 +923,75 @@ async def run_document_ocr_pipeline(
                                     if is_image_based_mcq and not is_question_figure:
                                         is_question_figure = False
                                         logger.info(f"Treating {mistral_img_id} as option image for image-based MCQ")
-
-                                    image_obj = {
-                                        'id': saved_img['id'],
-                                        'filename': saved_img['filename'],
-                                        'path': saved_img['path'],
-                                        'base64Data': img_base64_data.get('image_base64', ''),
-                                        'description': '',
-                                        'type': 'diagram',
-                                        'bbox': {
-                                            'top_left_x': img_base64_data.get('top_left_x', 0),
-                                            'top_left_y': img_base64_data.get('top_left_y', 0),
-                                            'bottom_right_x': img_base64_data.get('bottom_right_x', 0),
-                                            'bottom_right_y': img_base64_data.get('bottom_right_y', 0)
-                                        },
-                                        'metadata': {
-                                            'source': 'mistral_ocr',
-                                            'page': page_index,
-                                            'extractedAt': datetime.utcnow().isoformat()
-                                        }
-                                    }
-
+                                    
+                                    # For question figures, use the first image (or unsplit original)
+                                    # For option images (image-based MCQ), include all split parts
                                     if is_question_figure:
+                                        # For question diagrams, prefer the original (unsplit) image
+                                        saved_img = next(
+                                            (img for img in matching_saved_images if img.get('is_original', False)),
+                                            next(
+                                                (img for img in matching_saved_images if img['id'] == base_img_id),
+                                                matching_saved_images[0]  # Fall back to first part
+                                            )
+                                        )
+                                        image_obj = {
+                                            'id': saved_img['id'],
+                                            'filename': saved_img['filename'],
+                                            'path': saved_img['path'],
+                                            'base64Data': img_base64_data.get('image_base64', ''),
+                                            'description': '',
+                                            'type': 'diagram',
+                                            'bbox': {
+                                                'top_left_x': img_base64_data.get('top_left_x', 0),
+                                                'top_left_y': img_base64_data.get('top_left_y', 0),
+                                                'bottom_right_x': img_base64_data.get('bottom_right_x', 0),
+                                                'bottom_right_y': img_base64_data.get('bottom_right_y', 0)
+                                            },
+                                            'metadata': {
+                                                'source': 'mistral_ocr',
+                                                'page': page_index,
+                                                'extractedAt': datetime.utcnow().isoformat()
+                                            }
+                                        }
                                         question_figures.append(image_obj)
+                                        logger.info(f"✅ Added question figure: {saved_img['id']}")
                                     else:
-                                        page_images.append(image_obj)
+                                        # For option images, prefer split parts over original
+                                        # Filter to only use split parts if available
+                                        split_images = [img for img in matching_saved_images if not img.get('is_original', True)]
+                                        images_to_use = split_images if split_images else matching_saved_images
+                                        
+                                        for saved_img in images_to_use:
+                                            # Get base64 data for this specific split part if available
+                                            split_base64_data = image_base64_map.get(saved_img['id'], img_base64_data)
+                                            image_obj = {
+                                                'id': saved_img['id'],
+                                                'filename': saved_img['filename'],
+                                                'path': saved_img['path'],
+                                                'base64Data': split_base64_data.get('image_base64', ''),
+                                                'description': '',
+                                                'type': 'diagram',
+                                                'bbox': {
+                                                    'top_left_x': split_base64_data.get('top_left_x', 0),
+                                                    'top_left_y': split_base64_data.get('top_left_y', 0),
+                                                    'bottom_right_x': split_base64_data.get('bottom_right_x', 0),
+                                                    'bottom_right_y': split_base64_data.get('bottom_right_y', 0)
+                                                },
+                                                'metadata': {
+                                                    'source': 'mistral_ocr',
+                                                    'page': page_index,
+                                                    'extractedAt': datetime.utcnow().isoformat()
+                                                }
+                                            }
+                                            page_images.append(image_obj)
+                                        logger.info(f"✅ Added {len(images_to_use)} option images from {base_img_id}")
+                                else:
+                                    # Log why the image wasn't matched
+                                    if not matching_saved_images:
+                                        logger.warning(f"⚠️ Image {base_img_id} not found in all_images (available: {[img['id'] for img in all_images[:10]]}...)")
+                                    if not img_base64_data:
+                                        logger.warning(f"⚠️ Image {mistral_img_id} not found in image_base64_map (keys: {list(image_base64_map.keys())[:10]}...)")
 
                 logger.info(
                     f"Associated {len(question_figures)} question figures and "
@@ -934,7 +1084,11 @@ async def run_document_ocr_pipeline(
                     "created_at": datetime.utcnow()
                 }
 
-            await db.mongo_insert_one("questions", question_doc)
+            # Save question to appropriate database (B2C or regular)
+            if is_b2c:
+                await db.b2c_insert_one("questions", question_doc)
+            else:
+                await db.mongo_insert_one("questions", question_doc)
 
             # Store richer metadata so other services can reconstruct the question fully
             import json as _json_for_full
@@ -957,7 +1111,13 @@ async def run_document_ocr_pipeline(
                 [chromadb_metadata]
             )
 
-        document_fresh = await db.mongo_find_one("documents", {"document_id": document_id})
+        # Check if B2C admin for database routing
+        is_b2c = is_b2c_admin(current_user)
+        
+        if is_b2c:
+            document_fresh = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document_fresh = await db.mongo_find_one("documents", {"document_id": document_id})
         total_calculated_points = sum(
             q.points if hasattr(q, 'points') and q.points else 1.0
             for q in extracted_questions
@@ -976,11 +1136,18 @@ async def run_document_ocr_pipeline(
                 update_data["total_points"] = total_calculated_points
                 logger.info(f"Auto-calculated total_points for {document_id}: {total_calculated_points}")
 
-        await db.mongo_update_one(
-            "documents",
-            {"document_id": document_id},
-            {"$set": update_data}
-        )
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data}
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data}
+            )
 
         processing_result["status"] = "completed"
         processing_result["progress"] = 100
@@ -991,11 +1158,20 @@ async def run_document_ocr_pipeline(
         return PDFProcessingResult(**processing_result)
     except Exception as exc:
         logger.error(f"OCR pipeline failed for document {document_id}: {exc}", exc_info=True)
-        await db.mongo_update_one(
-            "documents",
-            {"document_id": document_id},
-            {"$set": {"ocr_status": "error"}}
-        )
+        # Check if B2C admin for error update
+        is_b2c = is_b2c_admin(current_user)
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "error"}}
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "error"}}
+            )
 
         error_result = {
             "job_id": job_id,
@@ -1025,8 +1201,11 @@ class DocumentMetadata(BaseModel):
     ocr_job_id: Optional[str] = None
     extracted_questions_count: int = 0
     extracted_images_count: int = 0
+    pages_count: int = 0  # Number of pages in the PDF (for Notes display)
     total_points: Optional[float] = None  # Total points for Test Series documents
+    total_minutes: Optional[int] = None  # Total minutes for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
+    is_active: bool = True  # Whether the document is enabled for students
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -1051,7 +1230,8 @@ async def upload_pdf(
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
     current_user: Dict[str, Any] = Depends(require_admin),
-    db: DatabaseManager = Depends(get_database)
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
 ):
     """
     Upload PDF file and save metadata (without OCR processing)
@@ -1076,8 +1256,14 @@ async def upload_pdf(
                 detail="Document ID must be alphanumeric only (no spaces or special characters)"
             )
 
-        # Check for duplicate document_id
-        existing_doc = await db.mongo_find_one("documents", {"document_id": document_id})
+        # Check if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+        
+        # Check for duplicate document_id in appropriate database
+        if is_b2c:
+            existing_doc = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            existing_doc = await db.mongo_find_one("documents", {"document_id": document_id})
         if existing_doc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1102,6 +1288,17 @@ async def upload_pdf(
         # Read file content
         file_content = await file.read()
         file_size = len(file_content)
+        
+        # Count PDF pages using pypdf (already in requirements.txt)
+        pages_count = 0
+        try:
+            import io
+            from pypdf import PdfReader
+            pdf_reader = PdfReader(io.BytesIO(file_content))
+            pages_count = len(pdf_reader.pages)
+            logger.info(f"PDF {document_id} has {pages_count} pages")
+        except Exception as pdf_err:
+            logger.warning(f"Failed to count PDF pages for {document_id}: {pdf_err}")
 
         logger.info(f"Uploading document: {document_id}, Title: {title}, Type: {document_type}, Size: {file_size} bytes")
 
@@ -1110,15 +1307,36 @@ async def upload_pdf(
         from pathlib import Path
         backend_dir = Path(os.getcwd())
         upload_dir = backend_dir / "uploads" / "documents" / document_type
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        # Save file with document_id as filename
         file_path = upload_dir / f"{document_id}.pdf"
+        
         # Store relative path with forward slashes (universal format)
-        relative_path = f"uploads/documents/{document_type}/{document_id}.pdf"
+        local_relative_path = f"uploads/documents/{document_type}/{document_id}.pdf"
 
-        async with aiofiles.open(str(file_path), "wb") as f:
-            await f.write(file_content)
+        # Use S3 storage if enabled, otherwise save locally
+        if is_s3_enabled():
+            # Upload PDF to S3
+            success, storage_path = await s3_upload_file(
+                file_data=file_content,
+                local_path=str(file_path),
+                content_type="application/pdf"
+            )
+            if success:
+                relative_path = storage_path  # s3://bucket/documents/...
+                logger.info(f"✅ Uploaded PDF to S3: {storage_path}")
+            else:
+                # Fallback to local if S3 fails
+                logger.warning("S3 upload failed, falling back to local storage")
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(str(file_path), "wb") as f:
+                    await f.write(file_content)
+                relative_path = local_relative_path
+        else:
+            # Save file locally
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            async with aiofiles.open(str(file_path), "wb") as f:
+                await f.write(file_content)
+            relative_path = local_relative_path
+            logger.info(f"Saved PDF locally: {file_path}")
 
         # Validate total_points for Test Series
         if document_type == "Test Series" and total_points is not None:
@@ -1168,21 +1386,126 @@ async def upload_pdf(
             "ocr_job_id": None,
             "extracted_questions_count": 0,
             "extracted_images_count": 0,
+            "pages_count": pages_count,  # Store page count for Notes display
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
-            "is_validated": False
+            "is_validated": False,
+            "is_active": True,  # Default to enabled
+            "is_s3": is_s3_enabled()  # Track storage location
         }
 
-        # Save to MongoDB
-        await db.mongo_insert_one("documents", document_metadata)
+        # Save to appropriate MongoDB database (B2C or regular)
+        if is_b2c:
+            await db.b2c_insert_one("documents", document_metadata)
+        else:
+            await db.mongo_insert_one("documents", document_metadata)
 
-        logger.info(f"Document {document_id} uploaded successfully")
+        logger.info(f"Document {document_id} uploaded successfully to {'B2C' if is_b2c else 'regular'} database")
+        
+        # Auto-trigger OCR for Test Series and Practice Sets
+        should_auto_ocr = document_type in ["Test Series", "Practice Sets"]
+        ocr_status = "not_processed"
+        ocr_job_id = None
+        
+        if should_auto_ocr:
+            try:
+                # Import required modules for background OCR
+                job_id = str(uuid.uuid4())
+                ocr_job_id = job_id
+                
+                # Update status to processing in appropriate database
+                if is_b2c:
+                    await db.b2c_update_one(
+                        "documents",
+                        {"document_id": document_id},
+                        {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+                    )
+                else:
+                    await db.mongo_update_one(
+                        "documents",
+                        {"document_id": document_id},
+                        {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+                    )
+                ocr_status = "processing"
+                
+                # Encode PDF for OCR
+                pdf_base64 = base64.b64encode(file_content).decode('utf-8')
+                
+                # Create processing result for cache
+                processing_result = {
+                    "job_id": job_id,
+                    "status": "processing",
+                    "progress": 20,
+                    "extracted_questions": 0,
+                    "extracted_images": 0,
+                    "output_folder": f"extracted_{document_id}_{int(datetime.utcnow().timestamp())}",
+                    "timestamp": datetime.utcnow()
+                }
+                
+                # Use the cache passed as dependency (not get_cache())
+                await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
+                
+                # Run OCR in background task
+                async def background_ocr():
+                    try:
+                        await run_document_ocr_pipeline(
+                            document=document_metadata,
+                            pdf_base64=pdf_base64,
+                            job_id=job_id,
+                            processing_result=processing_result,
+                            current_user=current_user,
+                            db=db,
+                            cache=cache
+                        )
+                        logger.info(f"Auto-OCR completed successfully for {document_id}")
+                    except Exception as ocr_exc:
+                        logger.error(f"Auto-OCR failed for {document_id}: {ocr_exc}")
+                        # Update document status to error so UI doesn't show infinite processing
+                        try:
+                            if is_b2c:
+                                await db.b2c_update_one(
+                                    "documents",
+                                    {"document_id": document_id},
+                                    {"$set": {"ocr_status": "error"}}
+                                )
+                            else:
+                                await db.mongo_update_one(
+                                    "documents",
+                                    {"document_id": document_id},
+                                    {"$set": {"ocr_status": "error"}}
+                                )
+                        except Exception:
+                            pass
+                
+                asyncio.create_task(background_ocr())
+                logger.info(f"Auto-OCR triggered for {document_type}: {document_id}")
+                
+            except Exception as auto_ocr_err:
+                logger.warning(f"Failed to auto-trigger OCR for {document_id}: {auto_ocr_err}")
+                # Reset status since auto-OCR failed - allow manual retry
+                try:
+                    if is_b2c:
+                        await db.b2c_update_one(
+                            "documents",
+                            {"document_id": document_id},
+                            {"$set": {"ocr_status": "not_processed", "ocr_job_id": None}}
+                        )
+                    else:
+                        await db.mongo_update_one(
+                            "documents",
+                            {"document_id": document_id},
+                            {"$set": {"ocr_status": "not_processed", "ocr_job_id": None}}
+                        )
+                except Exception:
+                    pass
 
         return {
-            "message": "Document uploaded successfully",
+            "message": "Document uploaded successfully" + (" - OCR processing started automatically" if should_auto_ocr else ""),
             "document_id": document_id,
             "file_path": relative_path,
-            "ocr_status": "not_processed"
+            "ocr_status": ocr_status,
+            "ocr_job_id": ocr_job_id,
+            "pages_count": pages_count
         }
 
     except HTTPException:
@@ -1206,7 +1529,15 @@ async def process_document_ocr(
 ):
     """Trigger OCR processing on an existing uploaded document."""
     try:
-        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        # Check if B2C admin or B2C user
+        user_type = current_user.get("user_type")
+        is_b2c = user_type in ["b2c_admin", "b2c_user"]
+
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+
         if not document:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1222,10 +1553,22 @@ async def process_document_ocr(
         if document.get("ocr_status") == "completed":
             logger.info(f"Reprocessing document {document_id} - cleaning up old data")
 
-            questions_deleted = await db.mongo_delete_many("questions", {"document_id": document_id})
-            logger.info(f"Deleted {questions_deleted} questions for document {document_id}")
+            if is_b2c:
+                questions_deleted_result = await db.b2c_delete_many("questions", {"document_id": document_id})
+                # delete_many returns bool in our implementation, not count directly unless we change it. 
+                # Checking database.py implementation: returns bool (deleted_count > 0).
+                # Actually, standard mongo driver returns DeleteResult.
+                # Our wrapper b2c_delete_many returns bool.
+                logger.info(f"Deleted questions for document {document_id} from B2C DB")
+            else:
+                questions_deleted = await db.mongo_delete_many("questions", {"document_id": document_id})
+                logger.info(f"Deleted {questions_deleted} questions for document {document_id}")
 
-            images_result = await db.mongo_find("images", {"source_pdf": document["filename"]})
+            if is_b2c:
+                images_result = await db.b2c_find("images", {"source_pdf": document["filename"]})
+            else:
+                images_result = await db.mongo_find("images", {"source_pdf": document["filename"]})
+
             for img in images_result:
                 file_path = img.get("file_path")
                 if file_path and os.path.exists(file_path):
@@ -1235,7 +1578,10 @@ async def process_document_ocr(
                     except Exception as exc:
                         logger.error(f"Failed to delete image file {file_path}: {exc}")
 
-            await db.mongo_delete_many("images", {"source_pdf": document["filename"]})
+            if is_b2c:
+                await db.b2c_delete_many("images", {"source_pdf": document["filename"]})
+            else:
+                await db.mongo_delete_many("images", {"source_pdf": document["filename"]})
 
         from pathlib import Path as _Path
         backend_dir = _Path(os.getcwd())
@@ -1290,11 +1636,18 @@ async def process_document_ocr(
         pdf_base64 = base64.b64encode(file_content).decode('utf-8')
         job_id = str(uuid.uuid4())
 
-        await db.mongo_update_one(
-            "documents",
-            {"document_id": document_id},
-            {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
-        )
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+            )
 
         processing_result = {
             "job_id": job_id,
@@ -1466,10 +1819,17 @@ async def get_documents(
 ):
     """Get list of uploaded documents with pagination"""
     try:
+        # Check if B2C admin
+        is_b2c = is_b2c_admin(current_user)
+        
         # Build base filter scoped by tenant (admin) and role
         user_type = current_user.get("user_type")
         filter_query: Dict[str, Any] = {}
-        if user_type == "admin":
+        
+        if is_b2c:
+            # B2C admin sees all documents in B2C database (no admin_id filter)
+            pass
+        elif user_type == "admin":
             try:
                 filter_query["admin_id"] = BsonObjectId(current_user.get("admin_id", current_user["user_id"]))
             except Exception:
@@ -1500,18 +1860,29 @@ async def get_documents(
                 ]
             }
 
-        # Get total count (bounded by the query)
-        total = len(await db.mongo_find("documents", filter_query))
-
-        # Get paginated documents
-        skip = (page - 1) * limit
-        documents = await db.mongo_find(
-            "documents",
-            filter_query,
-            skip=skip,
-            limit=limit,
-            sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
-        )
+        # Get data from appropriate database
+        if is_b2c:
+            # B2C admin - query STOODY-b2c database
+            total = len(await db.b2c_find("documents", filter_query))
+            skip = (page - 1) * limit
+            documents = await db.b2c_find(
+                "documents",
+                filter_query,
+                skip=skip,
+                limit=limit,
+                sort=[("uploaded_at", -1)]
+            )
+        else:
+            # Regular admin/tutor - query skillbot_db
+            total = len(await db.mongo_find("documents", filter_query))
+            skip = (page - 1) * limit
+            documents = await db.mongo_find(
+                "documents",
+                filter_query,
+                skip=skip,
+                limit=limit,
+                sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
+            )
 
         # Format response and check file existence
         from pathlib import Path
@@ -1536,7 +1907,11 @@ async def get_documents(
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
-                extracted_images_count=doc.get("extracted_images_count", 0)
+                extracted_images_count=doc.get("extracted_images_count", 0),
+                pages_count=doc.get("pages_count", 0),
+                total_points=doc.get("total_points"),
+                total_minutes=doc.get("total_minutes"),
+                is_active=doc.get("is_active", True)
             ))
 
         return DocumentListResponse(
@@ -1565,6 +1940,124 @@ async def get_student_practice_sets(
     """Get practice sets available for the current student based on their profile"""
     try:
         user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        # Handle B2C users - query from B2C database
+        if is_b2c:
+            # Get B2C user profile from B2C database
+            b2c_user = await db.b2c_find_one("users", {"_id": BsonObjectId(current_user["user_id"])})
+            
+            if not b2c_user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="B2C user profile not found"
+                )
+            
+            # Check if onboarding is complete
+            if not b2c_user.get("onboarding_complete"):
+                return {
+                    "success": True,
+                    "data": {
+                        "practice_sets": [],
+                        "total": 0,
+                        "onboarding_required": True
+                    }
+                }
+            
+            # Get user's plan details
+            user_exam_type = b2c_user.get("exam_type")
+            user_class_level = b2c_user.get("class_level")
+            user_standard = b2c_user.get("standard")
+            user_subjects = b2c_user.get("subjects", [])
+            user_plan_types = b2c_user.get("plan_types", [])
+            
+            # Get B2C admin ID for content filtering
+            b2c_admin = await db.b2c_find_one("admins", {}, {"_id": 1})
+            b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
+            
+            # Build filter for B2C practice sets
+            filter_query = {
+                "document_type": "Practice Sets",
+                "ocr_status": "completed",
+                "is_active": {"$ne": False}
+            }
+            
+            if b2c_admin_id:
+                try:
+                    filter_query["admin_id"] = BsonObjectId(b2c_admin_id)
+                except:
+                    filter_query["admin_id"] = b2c_admin_id
+            
+            # Apply plan type filter
+            if plan_type:
+                filter_query["course_plan"] = plan_type
+            elif user_plan_types:
+                filter_query["course_plan"] = {"$in": user_plan_types}
+            elif user_exam_type:
+                filter_query["course_plan"] = user_exam_type
+            
+            # Apply subject filter
+            if subject:
+                filter_query["subject"] = subject
+            elif user_subjects:
+                filter_query["subject"] = {"$in": user_subjects}
+            
+            # Apply standard filter
+            if user_standard:
+                filter_query["standard"] = user_standard
+            
+            logger.info(f"B2C user {current_user['user_id']} practice sets query: {filter_query}")
+            
+            # Get practice sets from B2C database
+            practice_sets = await db.b2c_find(
+                "documents",
+                filter_query,
+                sort=[("uploaded_at", -1)]
+            )
+            
+            logger.info(f"B2C practice sets found: {len(practice_sets)}")
+            
+            # Format response
+            practice_sets_list = []
+            user_id = current_user["user_id"]
+            
+            for doc in practice_sets:
+                doc_id = doc.get("document_id") or str(doc.get("_id"))
+                
+                # Check if B2C user has attempted/completed this practice set
+                sessions = await db.b2c_find(
+                    "practice_sessions",
+                    {
+                        "student_id": user_id,
+                        "document_id": doc_id
+                    },
+                    sort=[("started_at", -1)],
+                    limit=10
+                )
+                
+                has_attempted = len(sessions) > 0
+                completed = any(s.get("is_completed", False) for s in sessions)
+                
+                practice_sets_list.append({
+                    "document_id": doc_id,
+                    "title": doc.get("title"),
+                    "subject": doc.get("subject"),
+                    "difficulty": doc.get("difficulty"),
+                    "course_plan": doc.get("course_plan"),
+                    "standard": doc.get("standard"),
+                    "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                    "completed": completed,
+                    "attempted": has_attempted,
+                    "session_count": len(sessions)
+                })
+            
+            return {
+                "success": True,
+                "data": {
+                    "practice_sets": practice_sets_list,
+                    "total": len(practice_sets_list)
+                }
+            }
 
         if user_type == "admin":
             # Admin can see all practice sets (including non-validated for testing)
@@ -1629,6 +2122,7 @@ async def get_student_practice_sets(
                 }
             }
 
+
         # Student - get their profile and filter by access
         student_profile = await db.mongo_find_one("students", {"_id": BsonObjectId(current_user["user_id"])})
 
@@ -1647,7 +2141,9 @@ async def get_student_practice_sets(
         # Build filter for practice sets - only check if OCR is completed
         filter_query = {
             "document_type": "Practice Sets",
-            "ocr_status": "completed"  # Only show practice sets that have been processed with OCR
+            "ocr_status": "completed",  # Only show practice sets that have been processed with OCR
+            # is_active: {$ne: False} matches True, None, or missing field (default active)
+            "is_active": {"$ne": False}
         }
 
         # Get admin_id from student for filtering admin-specific content
@@ -1677,12 +2173,13 @@ async def get_student_practice_sets(
             filter_query["subject"] = {"$in": student_subjects}
         # If student has no subjects assigned, show all subjects from their admin
 
-        # Filter by student's grade if available
-        if student_grade:
-            filter_query["standard"] = student_grade
-
         # Build $and conditions array for section and teacher_ids filtering
         and_conditions = []
+
+        # Filter by student's grade if available - EXACT match
+        # Both student.grade and document.standard come from admin settings, so they match exactly
+        if student_grade:
+            filter_query["standard"] = student_grade
 
         # Filter by student's section if available (only show docs for their section or docs without section restriction)
         if student_section:
@@ -1814,7 +2311,8 @@ async def get_student_available_options(
         except Exception:
             admin_filter = admin_id
 
-        filter_query = {"admin_id": admin_filter}
+        # is_active: {$ne: False} matches True, None, or missing field (default active)
+        filter_query = {"admin_id": admin_filter, "is_active": {"$ne": False}}
         if document_type:
             filter_query["document_type"] = document_type
 
@@ -1919,13 +2417,16 @@ async def get_document_file(
     db: DatabaseManager = Depends(get_database)
 ):
     """Serve PDF file for viewing"""
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
 
     try:
         logger.info(f"Attempting to fetch document with ID: {document_id}")
 
-        # Get document metadata
+        # Get document metadata - try both main and B2C database
         document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not document:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+            
         if not document:
             # Debug: Log what's in the database
             all_docs = await db.mongo_find("documents", {}, limit=10)
@@ -1943,13 +2444,40 @@ async def get_document_file(
             if teacher_ids and tutor_id not in teacher_ids:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tutor not authorized for this document")
 
-        logger.info(f"Document found. File path: {document.get('file_path')}")
+        stored_path = document.get("file_path", "")
+        logger.info(f"Document found. File path: {stored_path}")
 
-        # Get file path - handle both forward and backslashes
+        # Check if this is an S3 path
+        if stored_path.startswith("s3://"):
+            logger.info(f"Fetching PDF from S3: {stored_path}")
+            
+            # Import S3 download function
+            from utils.s3_storage import download_file as s3_download
+            
+            # Download from S3
+            file_data = await s3_download(stored_path)
+            
+            if not file_data:
+                logger.error(f"Failed to download PDF from S3: {stored_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="PDF file not found in S3"
+                )
+            
+            # Return as response
+            return Response(
+                content=file_data,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f"inline; filename=\"{document.get('filename', 'document.pdf')}\""
+                }
+            )
+
+        # Local file handling
         from pathlib import Path
         backend_dir = Path(os.getcwd())
         # Convert stored path to use forward slashes, then to Path
-        stored_path = document["file_path"].replace("\\", "/")
+        stored_path = stored_path.replace("\\", "/")
         file_path = backend_dir / stored_path
         logger.info(f"Full file path: {file_path}")
 
@@ -2068,6 +2596,9 @@ async def update_document_metadata(
                     detail="Total minutes must be greater than 0"
                 )
             update_data["total_minutes"] = total_minutes
+        
+        if "is_active" in metadata:
+            update_data["is_active"] = bool(metadata["is_active"])
 
         if not update_data:
             raise HTTPException(
@@ -2113,8 +2644,15 @@ async def get_document_questions(
 ):
     """Get all questions extracted from a specific document"""
     try:
-        # Verify document exists
-        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        # Check if B2C admin or B2C user
+        user_type = current_user.get("user_type")
+        is_b2c = user_type in ["b2c_admin", "b2c_user"]
+        
+        # Verify document exists in appropriate database
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
         if not document:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2154,8 +2692,8 @@ async def get_document_questions(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="This document is not yet available"
                     )
-        else:
-            # For admins, verify they own the document (type-safe)
+        elif user_type not in ["b2c_admin", "b2c_user"]:
+            # For regular admins, verify they own the document (type-safe)
             admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
             document_admin_id = document.get("admin_id")
             document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
@@ -2171,28 +2709,43 @@ async def get_document_questions(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="You don't have access to this document"
                     )
+        # B2C admins can access all B2C documents (no admin_id check needed)
 
-        # Get questions for this document
-        questions = await db.mongo_find("questions", {"document_id": document_id})
+        # Get questions for this document from appropriate database
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
 
         # Convert ObjectId to string for JSON serialization and map field names
         serialized_questions = []
         for q in questions:
             # Auto-clean orphaned images from the question
             from utils.image_validator import clean_question_images
-            cleaned_q, removed_count = await clean_question_images(q, db)
+            cleaned_q, removed_count = await clean_question_images(q, db, is_b2c)
 
             # If orphaned images were found and removed, update the database
             if removed_count > 0:
-                await db.mongo_update_one(
-                    "questions",
-                    {"id": q.get("id")},
-                    {"$set": {
-                        "images": cleaned_q.get("images", []),
-                        "question_figures": cleaned_q.get("question_figures", []),
-                        "auto_cleaned_at": datetime.utcnow()
-                    }}
-                )
+                if is_b2c:
+                    await db.b2c_update_one(
+                        "questions",
+                        {"id": q.get("id")},
+                        {"$set": {
+                            "images": cleaned_q.get("images", []),
+                            "question_figures": cleaned_q.get("question_figures", []),
+                            "auto_cleaned_at": datetime.utcnow()
+                        }}
+                    )
+                else:
+                    await db.mongo_update_one(
+                        "questions",
+                        {"id": q.get("id")},
+                        {"$set": {
+                            "images": cleaned_q.get("images", []),
+                            "question_figures": cleaned_q.get("question_figures", []),
+                            "auto_cleaned_at": datetime.utcnow()
+                        }}
+                    )
                 logger.info(f"Auto-cleaned {removed_count} orphaned images from question {q.get('id')} during retrieval")
 
             question_dict = {}
@@ -2207,6 +2760,104 @@ async def get_document_questions(
             # Map backend field names to frontend expected names
             if "text" in question_dict:
                 question_dict["question_text"] = question_dict["text"]
+
+            # === ENHANCED: Load base64 image data for question_figures ===
+            enriched_figures = []
+            for fig_ref in question_dict.get("question_figures", []) or []:
+                try:
+                    fig_id = fig_ref.get("id") if isinstance(fig_ref, dict) else fig_ref
+                    base64_data = None
+                    
+                    # First check if base64Data is already embedded in the figure reference
+                    if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
+                        base64_data = fig_ref["base64Data"]
+                    else:
+                        # Try to get base64Data from images collection
+                        if is_b2c:
+                            img_doc = await db.b2c_find_one("images", {"_id": fig_id})
+                        else:
+                            img_doc = await db.mongo_find_one("images", {"_id": fig_id})
+                        
+                        if img_doc:
+                            # Check if base64Data is stored in the document
+                            if img_doc.get("base64Data"):
+                                base64_data = img_doc["base64Data"]
+                            # If not, try to read from file_path and convert to base64
+                            elif img_doc.get("file_path"):
+                                import os
+                                import base64
+                                file_path = img_doc["file_path"]
+                                if os.path.exists(file_path):
+                                    try:
+                                        with open(file_path, "rb") as f:
+                                            image_bytes = f.read()
+                                            base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                                            content_type = img_doc.get("content_type", "image/jpeg")
+                                            if not content_type.startswith("image/"):
+                                                content_type = "image/jpeg"
+                                            base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    except Exception as file_err:
+                                        logger.error(f"Failed to read image file {file_path}: {file_err}")
+                    
+                    enriched_figures.append({
+                        "id": fig_id,
+                        "url": f"/api/v1/images/{fig_id}",
+                        "base64Data": base64_data,
+                        "description": (fig_ref.get("description", "") if isinstance(fig_ref, dict) else ""),
+                        "type": "diagram"
+                    })
+                except Exception as fig_err:
+                    logger.error(f"Error processing figure: {fig_err}")
+            
+            question_dict["question_figures"] = enriched_figures
+            
+            # === ENHANCED: Load base64 image data for option images ===
+            enriched_images = []
+            for img_ref in question_dict.get("images", []) or []:
+                try:
+                    img_id = img_ref.get("id") if isinstance(img_ref, dict) else img_ref
+                    base64_data = None
+                    
+                    # First check if base64Data is already embedded
+                    if isinstance(img_ref, dict) and img_ref.get("base64Data"):
+                        base64_data = img_ref["base64Data"]
+                    else:
+                        # Try to get from images collection
+                        if is_b2c:
+                            img_doc = await db.b2c_find_one("images", {"_id": img_id})
+                        else:
+                            img_doc = await db.mongo_find_one("images", {"_id": img_id})
+                        
+                        if img_doc:
+                            if img_doc.get("base64Data"):
+                                base64_data = img_doc["base64Data"]
+                            elif img_doc.get("file_path"):
+                                import os
+                                import base64
+                                file_path = img_doc["file_path"]
+                                if os.path.exists(file_path):
+                                    try:
+                                        with open(file_path, "rb") as f:
+                                            image_bytes = f.read()
+                                            base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                                            content_type = img_doc.get("content_type", "image/jpeg")
+                                            if not content_type.startswith("image/"):
+                                                content_type = "image/jpeg"
+                                            base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    except Exception as file_err:
+                                        logger.error(f"Failed to read option image file {file_path}: {file_err}")
+                    
+                    enriched_images.append({
+                        "id": img_id,
+                        "url": f"/api/v1/images/{img_id}",
+                        "base64Data": base64_data,
+                        "description": (img_ref.get("description", "") if isinstance(img_ref, dict) else ""),
+                        "type": img_ref.get("type", "option") if isinstance(img_ref, dict) else "option"
+                    })
+                except Exception as img_err:
+                    logger.error(f"Error processing image: {img_err}")
+            
+            question_dict["images"] = enriched_images
 
             serialized_questions.append(question_dict)
 
@@ -2224,6 +2875,97 @@ async def get_document_questions(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve document questions"
+        )
+
+
+@router.get("/documents/{document_id}/images")
+@limiter.limit("60/minute")
+async def get_document_images(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_student_or_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Get all images extracted from a specific document"""
+    try:
+        # Check if B2C admin or B2C user
+        user_type = current_user.get("user_type")
+        is_b2c = user_type in ["b2c_admin", "b2c_user"]
+
+        # Verify document exists in appropriate database
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+            
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        # Access control
+        if user_type == "student":
+            student_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
+            document_admin_id = document.get("admin_id")
+            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+
+            from config_async import DEBUG_MODE as _DEBUG_MODE
+            if student_admin_id != document_admin_id_str and not _DEBUG_MODE:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You don't have access to this document"
+                )
+        elif not is_b2c:
+            # Regular admin
+            admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
+            document_admin_id = document.get("admin_id")
+            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+
+            from config_async import DEBUG_MODE as _DEBUG_MODE
+            if admin_id != document_admin_id_str and not _DEBUG_MODE:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You don't have access to this document"
+                )
+
+        # Get images for this document
+        if is_b2c:
+            images = await db.b2c_find("images", {"source_pdf": document["filename"]})
+        else:
+            images = await db.mongo_find("images", {"source_pdf": document["filename"]})
+
+        serialized_images = []
+        for img in images:
+            img_dict = {}
+            for key, value in img.items():
+                if isinstance(value, BsonObjectId):
+                    img_dict[key] = str(value)
+                elif isinstance(value, datetime):
+                    img_dict[key] = value.isoformat()
+                else:
+                    img_dict[key] = value
+            
+            # Ensure url is present
+            if "url" not in img_dict and "_id" in img_dict:
+                img_dict["url"] = f"/api/v1/images/{img_dict['_id']}"
+                
+            serialized_images.append(img_dict)
+
+        return {
+            "document_id": document_id,
+            "document_title": document["title"],
+            "images_count": len(serialized_images),
+            "images": serialized_images
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get document images error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get document images: {str(e)}"
         )
 
 @router.post("/questions")
@@ -2417,8 +3159,15 @@ async def update_question(
         logger.info(f"   Update data keys: {list(question_data.keys())}")
         logger.info(f"   User: {current_user.get('user_id')}")
 
-        # Get existing question
-        existing_question = await db.mongo_find_one("questions", {"id": question_id})
+        # Check if B2C admin
+        user_type = current_user.get("user_type")
+        is_b2c = user_type == "b2c_admin"
+
+        # Get existing question from appropriate database
+        if is_b2c:
+            existing_question = await db.b2c_find_one("questions", {"id": question_id})
+        else:
+            existing_question = await db.mongo_find_one("questions", {"id": question_id})
         if not existing_question:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2459,7 +3208,8 @@ async def update_question(
                             pdf_filename=existing_question.get("document_id") or existing_question.get("pdf_source") or question_id,
                             db=db,
                             user_id=current_user.get("user_id"),
-                            split_composite=False # Don't split manual uploads
+                            split_composite=False, # Don't split manual uploads
+                            is_b2c=is_b2c
                         )
                         
                         # Add saved images to the list
@@ -2486,7 +3236,7 @@ async def update_question(
 
             # Validate images before updating
             from utils.image_validator import validate_images_list
-            valid_images, invalid_image_ids = await validate_images_list(question_data["images"], db)
+            valid_images, invalid_image_ids = await validate_images_list(question_data["images"], db, is_b2c)
 
             if invalid_image_ids:
                 logger.warning(f"Question {question_id} update attempted with {len(invalid_image_ids)} invalid images. These will be filtered out: {invalid_image_ids}")
@@ -2500,7 +3250,7 @@ async def update_question(
 
             # Validate question figures before updating
             from utils.image_validator import validate_images_list
-            valid_figures, invalid_figure_ids = await validate_images_list(question_data["question_figures"], db)
+            valid_figures, invalid_figure_ids = await validate_images_list(question_data["question_figures"], db, is_b2c)
 
             if invalid_figure_ids:
                 logger.warning(f"Question {question_id} update attempted with {len(invalid_figure_ids)} invalid question figures. These will be filtered out: {invalid_figure_ids}")
@@ -2527,12 +3277,19 @@ async def update_question(
         update_data["updated_at"] = datetime.utcnow()
         update_data["updated_by"] = current_user.get("user_id")
 
-        # Update in MongoDB
-        success = await db.mongo_update_one(
-            "questions",
-            {"id": question_id},
-            {"$set": update_data}
-        )
+        # Update in MongoDB (use appropriate database based on user type)
+        if is_b2c:
+            success = await db.b2c_update_one(
+                "questions",
+                {"id": question_id},
+                {"$set": update_data}
+            )
+        else:
+            success = await db.mongo_update_one(
+                "questions",
+                {"id": question_id},
+                {"$set": update_data}
+            )
 
         if not success:
             raise HTTPException(
@@ -2542,8 +3299,11 @@ async def update_question(
 
         # Update in ChromaDB with proper metadata (CRITICAL for categorization)
         try:
-            # Get updated question data from MongoDB
-            updated_question = await db.mongo_find_one("questions", {"id": question_id})
+            # Get updated question data from appropriate database
+            if is_b2c:
+                updated_question = await db.b2c_find_one("questions", {"id": question_id})
+            else:
+                updated_question = await db.mongo_find_one("questions", {"id": question_id})
 
             # Build updated ChromaDB metadata with all fields
             chromadb_metadata = {
@@ -2575,23 +3335,39 @@ async def update_question(
             # Use document_id consistently (not pdf_source)
             document_id = existing_question.get("document_id") or existing_question.get("pdf_source")
             if document_id:
-                document = await db.mongo_find_one("documents", {"document_id": document_id})
+                if is_b2c:
+                    document = await db.b2c_find_one("documents", {"document_id": document_id})
+                else:
+                    document = await db.mongo_find_one("documents", {"document_id": document_id})
                 if document and document.get("document_type") == "Test Series":
                     # Get all questions for this document using document_id
-                    all_questions = await db.mongo_find("questions", {"document_id": document_id})
+                    if is_b2c:
+                        all_questions = await db.b2c_find("questions", {"document_id": document_id})
+                    else:
+                        all_questions = await db.mongo_find("questions", {"document_id": document_id})
 
                     # Fallback to pdf_source if document_id didn't find any
                     if not all_questions:
-                        all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
+                        if is_b2c:
+                            all_questions = await db.b2c_find("questions", {"pdf_source": document_id})
+                        else:
+                            all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
 
                     total_points = sum(q.get("points", 1.0) for q in all_questions)
 
                     # Update document's total_points
-                    await db.mongo_update_one(
-                        "documents",
-                        {"document_id": document_id},
-                        {"$set": {"total_points": total_points}}
-                    )
+                    if is_b2c:
+                        await db.b2c_update_one(
+                            "documents",
+                            {"document_id": document_id},
+                            {"$set": {"total_points": total_points}}
+                        )
+                    else:
+                        await db.mongo_update_one(
+                            "documents",
+                            {"document_id": document_id},
+                            {"$set": {"total_points": total_points}}
+                        )
                     logger.info(f"Updated document {document_id} total_points to {total_points}")
 
         return {
@@ -2618,8 +3394,16 @@ async def delete_question(
 ):
     """Delete a question and all its associated images and metadata"""
     try:
+        # Check if B2C admin or B2C user
+        user_type = current_user.get("user_type")
+        is_b2c = user_type in ["b2c_admin", "b2c_user"]
+
         # Get the question first
-        question = await db.mongo_find_one("questions", {"id": question_id})
+        if is_b2c:
+            question = await db.b2c_find_one("questions", {"id": question_id})
+        else:
+            question = await db.mongo_find_one("questions", {"id": question_id})
+
         if not question:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2633,7 +3417,11 @@ async def delete_question(
                 image_id = image.get("id")
                 if image_id:
                     # Delete from database
-                    result = await db.mongo_delete_one("images", {"_id": image_id})
+                    if is_b2c:
+                        result = await db.b2c_delete_one("images", {"_id": image_id})
+                    else:
+                        result = await db.mongo_delete_one("images", {"_id": image_id})
+                    
                     if result:
                         deleted_images_count += 1
 
@@ -2651,7 +3439,11 @@ async def delete_question(
                 figure_id = figure.get("id")
                 if figure_id:
                     # Delete from database
-                    result = await db.mongo_delete_one("images", {"_id": figure_id})
+                    if is_b2c:
+                        result = await db.b2c_delete_one("images", {"_id": figure_id})
+                    else:
+                        result = await db.mongo_delete_one("images", {"_id": figure_id})
+                    
                     if result:
                         deleted_images_count += 1
 
@@ -2664,7 +3456,10 @@ async def delete_question(
                         logger.warning(f"Failed to delete figure file {figure_id}: {str(e)}")
 
         # Delete the question from MongoDB
-        result = await db.mongo_delete_one("questions", {"id": question_id})
+        if is_b2c:
+            result = await db.b2c_delete_one("questions", {"id": question_id})
+        else:
+            result = await db.mongo_delete_one("questions", {"id": question_id})
 
         if not result:
             raise HTTPException(
@@ -2979,8 +3774,16 @@ async def delete_document(
 ):
     """Delete document and all associated data (cascading delete)"""
     try:
+        # Check if B2C admin or B2C user
+        user_type = current_user.get("user_type")
+        is_b2c = user_type in ["b2c_admin", "b2c_user"]
+
         # Get document metadata
-        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+
         if not document:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2997,7 +3800,11 @@ async def delete_document(
             logger.info(f"Deleted PDF file: {file_path}")
 
         # Delete all questions associated with this document
-        questions = await db.mongo_find("questions", {"document_id": document_id})
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+
         logger.info(f"Found {len(questions)} questions to delete for document {document_id}")
 
         for question in questions:
@@ -3010,14 +3817,21 @@ async def delete_document(
 
         # Delete questions from MongoDB
         try:
-            q_result = await db.mongo_delete_many("questions", {"document_id": document_id})
+            if is_b2c:
+                q_result = await db.b2c_delete_many("questions", {"document_id": document_id})
+            else:
+                q_result = await db.mongo_delete_many("questions", {"document_id": document_id})
             logger.info(f"Deleted {len(questions)} questions from MongoDB for document {document_id}")
         except Exception as e:
             logger.error(f"Failed to delete questions from MongoDB: {str(e)}")
             raise
 
         # Delete all images associated with this document
-        images = await db.mongo_find("images", {"source_pdf": document["filename"]})
+        if is_b2c:
+            images = await db.b2c_find("images", {"source_pdf": document["filename"]})
+        else:
+            images = await db.mongo_find("images", {"source_pdf": document["filename"]})
+
         logger.info(f"Found {len(images)} images to delete for document {document_id}")
 
         for image in images:
@@ -3031,7 +3845,10 @@ async def delete_document(
 
         # Delete images from MongoDB
         try:
-            img_result = await db.mongo_delete_many("images", {"source_pdf": document["filename"]})
+            if is_b2c:
+                img_result = await db.b2c_delete_many("images", {"source_pdf": document["filename"]})
+            else:
+                img_result = await db.mongo_delete_many("images", {"source_pdf": document["filename"]})
             logger.info(f"Deleted {len(images)} images from MongoDB for document {document_id}")
         except Exception as e:
             logger.error(f"Failed to delete images from MongoDB: {str(e)}")
@@ -3039,7 +3856,10 @@ async def delete_document(
 
         # Delete document metadata
         try:
-            doc_result = await db.mongo_delete_one("documents", {"document_id": document_id})
+            if is_b2c:
+                doc_result = await db.b2c_delete_one("documents", {"document_id": document_id})
+            else:
+                doc_result = await db.mongo_delete_one("documents", {"document_id": document_id})
             logger.info(f"Deleted document {document_id} from MongoDB")
         except Exception as e:
             logger.error(f"Failed to delete document from MongoDB: {str(e)}")
