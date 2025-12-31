@@ -1084,6 +1084,7 @@ async def get_b2c_user_full_profile(
                 "plan_types": user.get("plan_types", []),
                 "is_dropper": user.get("is_dropper", False),
                 "onboarding_complete": user.get("onboarding_complete", False),
+
                 # GDPR Consent fields
                 "consent_completed": user.get("consent_completed", False),
                 "is_minor": user.get("is_minor", False),
