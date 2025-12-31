@@ -5,6 +5,7 @@ Uses stoody-b2c database (completely separate from skillbot_db)
 """
 
 import logging
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 from bson import ObjectId
