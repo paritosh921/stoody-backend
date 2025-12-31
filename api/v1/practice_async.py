@@ -87,8 +87,11 @@ class PracticeStats(BaseModel):
 # ----------------------
 # Helper utilities (local)
 # ----------------------
-async def _load_question_doc(db: DatabaseManager, qid: str) -> Dict[str, Any]:
-    """Fetch question from Chroma (fullData) with Mongo fallback."""
+async def _load_question_doc(db: DatabaseManager, qid: str, is_b2c: bool = False) -> Dict[str, Any]:
+    """Fetch question from Chroma (fullData) with Mongo fallback.
+    
+    For B2C users, falls back to B2C database instead of main database.
+    """
     try:
         chroma = await db.chroma_get(ids=[qid])
         metas = chroma.get("metadatas") or []
@@ -97,7 +100,12 @@ async def _load_question_doc(db: DatabaseManager, qid: str) -> Dict[str, Any]:
             return _json.loads(metas[0]["fullData"]) or {}
     except Exception:
         pass
+    
+    # Fallback to MongoDB - use B2C database for B2C users
+    if is_b2c:
+        return await db.b2c_find_one("questions", {"id": qid}) or {}
     return await db.mongo_find_one("questions", {"id": qid}) or {}
+
 
 def _options_text_from_question(q: Dict[str, Any]) -> str:
     opts = q.get("options", []) or []
@@ -119,19 +127,113 @@ def _options_text_from_question(q: Dict[str, Any]) -> str:
         return "\n".join(parts)
     return ""
 
-def _figure_images_base64(q: Dict[str, Any]) -> List[str]:
+async def _figure_images_base64(q: Dict[str, Any], db: DatabaseManager = None, is_b2c: bool = False) -> List[str]:
+    """Extract base64 image data for question figures.
+    
+    ENHANCED: Now loads images from disk/database if base64Data is not embedded.
+    This ensures question diagram images are always available for LLM evaluation.
+    
+    Args:
+        q: Question document
+        db: Database manager for loading images from disk (optional)
+        is_b2c: Whether this is a B2C user (uses B2C database)
+        
+    Returns:
+        List of base64 data URLs for question figures
+    """
+    import os
+    import base64 as base64_module
+    
     imgs: List[str] = []
+    
     for fig_ref in (q.get("question_figures", []) or []):
         try:
             b64 = None
-            if isinstance(fig_ref, dict) and fig_ref.get("base64Data"):
-                b64 = fig_ref["base64Data"]
-            if b64 and not b64.startswith("data:image"):
-                b64 = f"data:image/png;base64,{b64}"
+            fig_id = None
+            
+            # First try to get base64Data directly from the figure reference
+            if isinstance(fig_ref, dict):
+                b64 = fig_ref.get("base64Data")
+                fig_id = fig_ref.get("id")
+            elif isinstance(fig_ref, str):
+                fig_id = fig_ref
+            
+            # If no embedded base64 and we have a database connection, try to load from database/disk
+            if not b64 and fig_id and db:
+                try:
+                    # Try to get from images collection
+                    if is_b2c:
+                        img_doc = await db.b2c_find_one("images", {"_id": fig_id})
+                    else:
+                        img_doc = await db.mongo_find_one("images", {"_id": fig_id})
+                    
+                    if img_doc:
+                        # First check if base64Data is stored in the document
+                        if img_doc.get("base64Data"):
+                            b64 = img_doc["base64Data"]
+                            logger.info(f"Loaded base64Data from database for figure {fig_id}")
+                        # If not, try to read from file_path
+                        elif img_doc.get("file_path"):
+                            file_path = img_doc["file_path"]
+                            if os.path.exists(file_path):
+                                with open(file_path, "rb") as f:
+                                    image_bytes = f.read()
+                                    base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                                    content_type = img_doc.get("content_type", "image/jpeg")
+                                    if not content_type.startswith("image/"):
+                                        content_type = "image/jpeg"
+                                    b64 = f"data:{content_type};base64,{base64_encoded}"
+                                    logger.info(f"Loaded and encoded image from disk for figure {fig_id}: {len(b64)} bytes")
+                            else:
+                                logger.warning(f"Image file not found: {file_path}")
+                except Exception as load_err:
+                    logger.error(f"Failed to load image {fig_id} from database/disk: {load_err}")
+            
+            # Normalize format and add to list
             if b64:
+                if not b64.startswith("data:image"):
+                    b64 = f"data:image/png;base64,{b64}"
                 imgs.append(b64)
+                
+        except Exception as e:
+            logger.warning(f"Error processing figure: {e}")
+    
+    # Also check for images in the 'images' array that might be diagrams
+    for img_ref in (q.get("images", []) or []):
+        try:
+            if isinstance(img_ref, dict) and img_ref.get("type") == "diagram":
+                b64 = img_ref.get("base64Data")
+                img_id = img_ref.get("id")
+                
+                if not b64 and img_id and db:
+                    try:
+                        if is_b2c:
+                            img_doc = await db.b2c_find_one("images", {"_id": img_id})
+                        else:
+                            img_doc = await db.mongo_find_one("images", {"_id": img_id})
+                        
+                        if img_doc:
+                            if img_doc.get("base64Data"):
+                                b64 = img_doc["base64Data"]
+                            elif img_doc.get("file_path"):
+                                file_path = img_doc["file_path"]
+                                if os.path.exists(file_path):
+                                    with open(file_path, "rb") as f:
+                                        image_bytes = f.read()
+                                        base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                                        content_type = img_doc.get("content_type", "image/jpeg")
+                                        b64 = f"data:{content_type};base64,{base64_encoded}"
+                    except Exception:
+                        pass
+                
+                if b64:
+                    if not b64.startswith("data:image"):
+                        b64 = f"data:image/png;base64,{b64}"
+                    imgs.append(b64)
         except Exception:
             pass
+    
+    logger.info(f"Extracted {len(imgs)} question figure images for LLM evaluation")
     return imgs
 
 def _normalize_choice_text(s: str) -> str:
@@ -148,11 +250,12 @@ def _normalize_numeric_text(s: str) -> str:
     return t
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
-    if current_user.get("user_type") not in ["student", "admin"]:
+    """Dependency to require student, admin, or B2C user access"""
+    allowed_types = ["student", "admin", "b2c_user", "b2c_admin"]
+    if current_user.get("user_type") not in allowed_types:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Student or admin access required"
+            detail="Student, admin, or B2C user access required"
         )
     return current_user
 
@@ -509,20 +612,37 @@ async def evaluate_submission(
     db: DatabaseManager = Depends(get_database)
 ):
     """Evaluate student's submission (canvas image and/or text) for a question with AI tutor feedback.
+    
+    ENHANCED VERSION: Uses multi-stage OCR pipeline for reliable handwriting recognition:
+    1. Image enhancement (upscaling, contrast, stroke thickening)
+    2. Dedicated OCR extraction with confidence scoring
+    3. Fallback strategies for low-confidence results
+    4. Improved prompting for handwriting analysis
 
-    Returns: { success, evaluation: { correct, score, extractedAnswer, feedback, reasoning } }
+    Returns: { success, evaluation: { correct, score, extractedAnswer, feedback, reasoning, ocrConfidence } }
     """
     try:
+        import json as _json
+        import re as _re
+        import ast as _ast
+        
         qid = payload.questionId
         answer_text = (payload.answerText or "").strip()
         canvas_data = payload.canvasData
+        
+        # Detect if user is B2C (uses B2C database)
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        logger.info(f"📝 Evaluating submission for Q:{qid}, user_type:{user_type}, is_b2c:{is_b2c}")
         
         # Normalize canvas data header if client sent raw base64
         if canvas_data and not canvas_data.startswith("data:image"):
             canvas_data = f"data:image/png;base64,{canvas_data}"
 
         # Fetch question from Chroma (fullData) first; fallback to MongoDB
-        question_doc = await _load_question_doc(db, qid)
+        # For B2C users, use B2C database
+        question_doc = await _load_question_doc(db, qid, is_b2c=is_b2c)
         if not question_doc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
 
@@ -534,6 +654,9 @@ async def evaluate_submission(
         # Extract question text and options
         question_text = str(question_doc.get("text", ""))
         options_text = _options_text_from_question(question_doc)
+        
+        # Determine if this is MCQ (has options)
+        is_mcq = bool(options_text)
 
         # Initialize AI service
         from services.async_openai_service import AsyncOpenAIService
@@ -541,22 +664,74 @@ async def evaluate_submission(
 
         # Prepare images: Question Figures + Student Canvas
         # 1. Question Figures
-        question_images = _figure_images_base64(question_doc)
+        question_images = await _figure_images_base64(question_doc, db, is_b2c)
         
-        # 2. Student Canvas Images
-        student_images = []
+        # 2. Student Canvas Images - ENHANCED PROCESSING
+        student_images_raw = []
         if payload.canvasPages and len(payload.canvasPages) > 0:
-            student_images = payload.canvasPages
+            student_images_raw = payload.canvasPages
         elif canvas_data:
-            student_images = [canvas_data]
-            
+            student_images_raw = [canvas_data]
+        
+        # === STAGE 1: CANVAS OCR EXTRACTION (New Enhanced Pipeline) ===
+        ocr_extracted_text = ""
+        ocr_confidence = 0.0
+        
+        if student_images_raw:
+            try:
+                from services.canvas_ocr_service import get_canvas_ocr_service
+                from utils.image_processor import (
+                    enhance_canvas_images_batch,
+                    merge_canvas_pages_vertical,
+                    is_canvas_empty
+                )
+                
+                # Enhance canvas images for better OCR
+                logger.info(f"🖼️ Enhancing {len(student_images_raw)} canvas images...")
+                enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
+                
+                # Run dedicated OCR extraction
+                ocr_service = get_canvas_ocr_service()
+                ocr_result = await ocr_service.extract_text_from_canvas(
+                    canvas_pages=enhanced_student_images,
+                    question_context=question_text,
+                    options_context=options_text if is_mcq else None,
+                    is_mcq=is_mcq
+                )
+                
+                ocr_extracted_text = ocr_result.extracted_text
+                ocr_confidence = ocr_result.confidence
+                
+                logger.info(f"📖 OCR Extraction: '{ocr_extracted_text}' (confidence: {ocr_confidence:.2f}, method: {ocr_result.method})")
+                
+                # Use enhanced images for subsequent LLM evaluation
+                student_images = enhanced_student_images
+                
+            except ImportError as ie:
+                logger.warning(f"Canvas OCR service not available: {ie}. Using raw images.")
+                student_images = student_images_raw
+            except Exception as ocr_err:
+                logger.error(f"OCR extraction failed: {ocr_err}. Continuing with raw images.")
+                student_images = student_images_raw
+        else:
+            student_images = []
+        
+        # === STAGE 2: COMBINED EVALUATION WITH ENHANCED PROMPT ===
+        # Combine typed answer with OCR-extracted text
+        combined_answer = answer_text
+        if ocr_extracted_text and ocr_confidence > 0.3:
+            if answer_text:
+                combined_answer = f"{answer_text} (Canvas OCR: {ocr_extracted_text})"
+            else:
+                combined_answer = ocr_extracted_text
+        
         # Combine all images for the LLM
         all_images = question_images + student_images
         num_q_images = len(question_images)
         
-        # Construct the Prompt
+        # Construct ENHANCED Prompt with better handwriting instructions
         prompt = (
-            "You are an expert personal tutor. You are evaluating a student's answer to a question.\n\n"
+            "You are an expert personal tutor evaluating a student's handwritten/typed answer.\n\n"
             f"QUESTION:\n{question_text}\n\n"
         )
         
@@ -569,44 +744,63 @@ async def evaluate_submission(
             prompt += "CORRECT ANSWER: (Not provided, please solve it yourself to verify)\n\n"
             
         prompt += "STUDENT INPUT:\n"
+        
+        # Include both typed and OCR-extracted answer
         if answer_text:
             prompt += f"Typed Answer: {answer_text}\n"
-        else:
+        if ocr_extracted_text and ocr_confidence > 0.3:
+            prompt += f"Canvas OCR Extraction (confidence {ocr_confidence:.0%}): {ocr_extracted_text}\n"
+        elif ocr_extracted_text:
+            prompt += f"Canvas OCR Extraction (LOW confidence): {ocr_extracted_text}\n"
+        if not answer_text and not ocr_extracted_text:
             prompt += "Typed Answer: (None)\n"
             
         if student_images:
-            prompt += f"Canvas Work: The student has submitted {len(student_images)} pages of handwritten work (images attached).\n"
+            prompt += f"\nCanvas Work: The student has submitted {len(student_images)} page(s) of handwritten work.\n"
+            prompt += "IMPORTANT: Carefully examine the handwritten content in the canvas images.\n"
+            prompt += "Look for: letters, numbers, equations, diagrams, circled answers, or any marks.\n"
             if num_q_images > 0:
-                prompt += f"Note: The first {num_q_images} images are diagrams belonging to the question. The remaining images are the student's work.\n"
-        else:
-            prompt += "Canvas Work: (None)\n"
+                prompt += f"Note: The first {num_q_images} image(s) are question diagrams. The remaining are student work.\n"
+        
+        if is_mcq:
+            prompt += "\nThis is a MULTIPLE CHOICE question. The student's answer should be a letter (A, B, C, D, etc.)\n"
+            prompt += "Even if the writing is messy, try to identify which letter they wrote.\n"
             
         prompt += (
-            "\nTASK:\n"
-            "1. Analyze the student's input (typed text and/or handwritten work).\n"
-            "2. Determine their final answer.\n"
-            "3. Compare it with the CORRECT ANSWER.\n"
-            "4. Provide high-quality, encouraging, and subject-specific feedback.\n"
-            "   - If correct: Confirm it and briefly explain why it's correct (reinforce the concept).\n"
-            "   - If incorrect: Point out the mistake kindly, explain the correct concept/method, and guide them to the right answer. Do NOT just say 'Wrong'. Be a tutor.\n"
-            "   - If the student's work is unclear, ask them to clarify.\n"
-            "5. Return a JSON object with the following fields:\n"
-            "   - 'extracted_answer': The answer you extracted from the student's work.\n"
-            "   - 'is_correct': boolean (true/false).\n"
-            "   - 'feedback': The message to show to the student.\n"
-            "   - 'reasoning': Internal reasoning for your evaluation.\n"
+            "\nEVALUATION TASK:\n"
+            "1. FIRST: Carefully transcribe what the student wrote on the canvas (if any).\n"
+            "2. Combine this with any typed answer they provided.\n"
+            "3. Determine their FINAL answer.\n"
+            "4. Compare with the CORRECT ANSWER.\n"
+            "5. Provide encouraging, educational feedback:\n"
+            "   - If CORRECT: Reinforce why it's right.\n"
+            "   - If INCORRECT: Kindly explain the correct approach. Be a tutor, not a judge.\n"
+            "   - If UNCLEAR: Tell them what you could see and ask for clarification.\n"
+            "\nRETURN a JSON object with these EXACT fields:\n"
+            "{\n"
+            '  "extracted_answer": "What you read from the student\'s work",\n'
+            '  "is_correct": true or false,\n'
+            '  "feedback": "Your tutoring feedback message",\n'
+            '  "reasoning": "Your evaluation reasoning"\n'
+            "}\n"
         )
         
-        logger.info(f"📤 Sending evaluation request to LLM for Q:{qid}. Images: {len(all_images)} ({len(question_images)} Q + {len(student_images)} S)")
+        logger.info(f"📤 Sending evaluation request to LLM for Q:{qid}. Images: {len(all_images)} ({num_q_images} Q + {len(student_images)} S). Pre-extracted: '{ocr_extracted_text}'")
         
-        # Call LLM
-        system_prompt = "You are a helpful, encouraging, and highly knowledgeable tutor. You always output valid JSON. Do not use markdown formatting."
+        # Call LLM with enhanced system prompt
+        system_prompt = (
+            "You are a helpful, encouraging, and highly knowledgeable tutor. "
+            "You are expert at reading handwritten student work, including messy handwriting. "
+            "You always output valid JSON without markdown formatting. "
+            "For MCQ questions, focus on identifying the letter (A, B, C, D) the student selected. "
+            "Even partial or unclear answers should be interpreted with best effort before marking unclear."
+        )
         
         if all_images:
             response = await ai.analyze_images_and_text_async(
                 all_images,
                 prompt,
-                max_tokens=1000,
+                max_tokens=1200,
                 system_prompt=system_prompt
             )
         else:
@@ -619,20 +813,18 @@ async def evaluate_submission(
             )
             
         raw_response = (response.get("response") or "").strip()
-        logger.info(f"LLM Evaluation Response: {raw_response[:200]}...")
+        logger.info(f"LLM Evaluation Response: {raw_response[:300]}...")
         
         # Parse JSON Response
-        import json as _json
-        import re as _re
-        import ast as _ast
-        
         evaluation_data = {
             "correct": False,
             "score": 0.0,
             "extractedAnswer": "",
             "feedback": "",
             "reasoning": "",
-            "answerSource": "ai_eval"
+            "answerSource": "ai_eval",
+            "ocrConfidence": ocr_confidence,
+            "ocrExtractedText": ocr_extracted_text
         }
         
         try:
@@ -645,7 +837,7 @@ async def evaluate_submission(
                 
             # Attempt 2: Regex extraction + JSON parse
             if not parsed:
-                m = _re.search(r"\{.*\}", raw_response, _re.DOTALL)
+                m = _re.search(r"\{[^{}]*\}", raw_response, _re.DOTALL)
                 if m:
                     json_str = m.group(0)
                     try:
@@ -663,26 +855,41 @@ async def evaluate_submission(
                 evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
                 evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
                 evaluation_data["reasoning"] = str(parsed.get("reasoning", "")).strip()
+                
+                # If LLM didn't extract an answer but OCR did, use OCR result
+                if not evaluation_data["extractedAnswer"] and ocr_extracted_text:
+                    evaluation_data["extractedAnswer"] = ocr_extracted_text
+                    evaluation_data["answerSource"] = "ocr_extraction"
+                    
             else:
                 # Fallback if no JSON found
                 evaluation_data["feedback"] = raw_response
                 evaluation_data["reasoning"] = "Could not parse JSON from LLM response."
+                # Still use OCR extraction if available
+                if ocr_extracted_text:
+                    evaluation_data["extractedAnswer"] = ocr_extracted_text
+                    evaluation_data["answerSource"] = "ocr_fallback"
                 
         except Exception as parse_err:
             logger.error(f"Failed to parse LLM evaluation JSON: {parse_err}")
             evaluation_data["feedback"] = raw_response
             evaluation_data["reasoning"] = f"JSON parse error: {parse_err}"
+            if ocr_extracted_text:
+                evaluation_data["extractedAnswer"] = ocr_extracted_text
+                evaluation_data["answerSource"] = "ocr_fallback"
 
         # If feedback is empty (parsing failed completely), use raw response
         if not evaluation_data["feedback"]:
              evaluation_data["feedback"] = raw_response
+
+        logger.info(f"✅ Evaluation complete for Q:{qid}. Correct: {evaluation_data['correct']}, Extracted: '{evaluation_data['extractedAnswer']}', Source: {evaluation_data['answerSource']}")
 
         return EvaluateResponse(success=True, evaluation=evaluation_data)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to evaluate submission: {str(e)}")
+        logger.error(f"Failed to evaluate submission: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to evaluate submission"
@@ -699,6 +906,10 @@ async def start_practice_session(
     """Start a new practice session"""
     try:
         user_id = current_user["user_id"]
+        
+        # Detect if user is B2C (uses B2C database)
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
 
         # Create session record
         session_record = {
@@ -716,7 +927,11 @@ async def start_practice_session(
             "questions": []  # Will store question attempts
         }
 
-        session_id = await db.mongo_insert_one("practice_sessions", session_record)
+        # Use B2C database for B2C users
+        if is_b2c:
+            session_id = await db.b2c_insert_one("practice_sessions", session_record)
+        else:
+            session_id = await db.mongo_insert_one("practice_sessions", session_record)
 
         if not session_id:
             raise HTTPException(
@@ -1267,7 +1482,7 @@ Return ONLY the JSON line. No other text."""
 
         # Collect images for context (question figures first, then all student pages)
         images_for_eval: list[str] = []
-        figures = _figure_images_base64(q)
+        figures = await _figure_images_base64(q, db)
         for fig in figures[:2]:
             if fig:
                 images_for_eval.append(fig)

@@ -10,25 +10,29 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-async def validate_image_exists(image_id: str, db) -> bool:
+async def validate_image_exists(image_id: str, db, is_b2c: bool = False) -> bool:
     """
-    Check if an image exists in both database and filesystem
+    Check if an image exists in both database and filesystem/S3
 
     Args:
         image_id: Image ID to validate
         db: DatabaseManager instance
+        is_b2c: If True, check B2C database; otherwise check main database
 
     Returns:
-        True if image exists in database and on disk, False otherwise
+        True if image exists in database and on disk/S3, False otherwise
     """
     try:
-        # Check database
-        image_data = await db.mongo_find_one("images", {"_id": image_id})
+        # Check database (B2C or main based on is_b2c flag)
+        if is_b2c:
+            image_data = await db.b2c_find_one("images", {"_id": image_id})
+        else:
+            image_data = await db.mongo_find_one("images", {"_id": image_id})
         if not image_data:
-            logger.debug(f"Image {image_id} not found in database")
+            logger.debug(f"Image {image_id} not found in {'B2C' if is_b2c else 'main'} database")
             return False
 
-        # Check filesystem
+        # Check filesystem or S3
         from utils.path_utils import get_absolute_path
 
         stored_path = image_data.get("file_path")
@@ -36,7 +40,13 @@ async def validate_image_exists(image_id: str, db) -> bool:
             logger.debug(f"Image {image_id} has no file_path in database")
             return False
 
-        # Normalize path separators
+        # Handle S3 paths - assume they exist if the record is in DB
+        # (S3 uploads are verified at upload time)
+        if str(stored_path).startswith("s3://"):
+            logger.debug(f"Image {image_id} is stored in S3: {stored_path}")
+            return True
+
+        # Normalize path separators for local files
         stored_path_str = str(stored_path).replace("\\", "/")
 
         # If the path contains 'uploads/', use that portion
@@ -61,13 +71,14 @@ async def validate_image_exists(image_id: str, db) -> bool:
         return False
 
 
-async def validate_images_list(image_refs: List[Dict[str, Any]], db) -> Tuple[List[Dict[str, Any]], List[str]]:
+async def validate_images_list(image_refs: List[Dict[str, Any]], db, is_b2c: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Validate a list of image references and separate valid from invalid
 
     Args:
         image_refs: List of image reference dictionaries with 'id' field
         db: DatabaseManager instance
+        is_b2c: If True, check B2C database; otherwise check main database
 
     Returns:
         Tuple of (valid_images, invalid_image_ids)
@@ -81,7 +92,7 @@ async def validate_images_list(image_refs: List[Dict[str, Any]], db) -> Tuple[Li
             logger.warning(f"Image reference missing 'id' field: {img_ref}")
             continue
 
-        if await validate_image_exists(image_id, db):
+        if await validate_image_exists(image_id, db, is_b2c):
             valid_images.append(img_ref)
         else:
             invalid_image_ids.append(image_id)
@@ -90,13 +101,14 @@ async def validate_images_list(image_refs: List[Dict[str, Any]], db) -> Tuple[Li
     return valid_images, invalid_image_ids
 
 
-async def clean_question_images(question: Dict[str, Any], db) -> Tuple[Dict[str, Any], int]:
+async def clean_question_images(question: Dict[str, Any], db, is_b2c: bool = False) -> Tuple[Dict[str, Any], int]:
     """
     Clean orphaned image references from a question
 
     Args:
         question: Question document from database
         db: DatabaseManager instance
+        is_b2c: If True, check B2C database; otherwise check main database
 
     Returns:
         Tuple of (cleaned_question, removed_count)
@@ -105,7 +117,7 @@ async def clean_question_images(question: Dict[str, Any], db) -> Tuple[Dict[str,
 
     # Clean 'images' field
     if question.get("images"):
-        valid_images, invalid_ids = await validate_images_list(question["images"], db)
+        valid_images, invalid_ids = await validate_images_list(question["images"], db, is_b2c)
         removed_count += len(invalid_ids)
         question["images"] = valid_images
 
@@ -114,7 +126,7 @@ async def clean_question_images(question: Dict[str, Any], db) -> Tuple[Dict[str,
 
     # Clean 'question_figures' field
     if question.get("question_figures"):
-        valid_figures, invalid_ids = await validate_images_list(question["question_figures"], db)
+        valid_figures, invalid_ids = await validate_images_list(question["question_figures"], db, is_b2c)
         removed_count += len(invalid_ids)
         question["question_figures"] = valid_figures
 

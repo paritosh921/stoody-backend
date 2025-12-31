@@ -22,6 +22,7 @@ class Tutor:
                  assigned_student_ids: List[str] = None,
                  requires_password_change: bool = True,
                  password_reset_requested: bool = False,
+                 teaching_assignments: List[Dict[str, Any]] = None,
                  created_by: str = None, created_at: datetime = None,
                  last_login: datetime = None, _id: ObjectId = None):
         self._id = _id
@@ -40,6 +41,8 @@ class Tutor:
         self.assigned_student_ids = assigned_student_ids or []  # Students assigned to this tutor
         self.requires_password_change = requires_password_change
         self.password_reset_requested = password_reset_requested
+        # Detailed mappings of what is taught where (e.g. class, subject, sections)
+        self.teaching_assignments = teaching_assignments or []
         self.created_by = created_by  # Admin ID who created this tutor
         self.created_at = created_at or datetime.utcnow()
         self.last_login = last_login
@@ -75,6 +78,7 @@ class Tutor:
             "assigned_student_ids": self.assigned_student_ids,
             "requires_password_change": self.requires_password_change,
             "password_reset_requested": self.password_reset_requested,
+            "teaching_assignments": self.teaching_assignments,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "last_login": self.last_login.isoformat() if self.last_login else None,
@@ -99,6 +103,7 @@ class Tutor:
             assigned_student_ids=data.get('assigned_student_ids', []),
             requires_password_change=data.get('requires_password_change', True),
             password_reset_requested=data.get('password_reset_requested', False),
+            teaching_assignments=data.get('teaching_assignments', []),
             created_by=data.get('created_by'),
             created_at=data.get('created_at'),
             last_login=data.get('last_login'),
@@ -124,6 +129,7 @@ class Tutor:
             "assigned_student_ids": self.assigned_student_ids,
             "requires_password_change": self.requires_password_change,
             "password_reset_requested": self.password_reset_requested,
+            "teaching_assignments": self.teaching_assignments,
             "created_by": self.created_by,
             "created_at": self.created_at,
             "last_login": self.last_login,
@@ -235,6 +241,12 @@ class Tutor:
 
 
 # Marshmallow Schema for validation
+class TeachingAssignmentSchema(Schema):
+    standard = fields.Str(required=True)
+    subject = fields.Str(required=True)
+    sections = fields.List(fields.Str(), allow_none=True)
+
+
 class TutorSchema(Schema):
     tutor_id = fields.Str(required=True)
     name = fields.Str(required=True, validate=validate.Length(min=2, max=100))
@@ -250,6 +262,7 @@ class TutorSchema(Schema):
     assigned_student_ids = fields.List(fields.Str(), allow_none=True)
     requires_password_change = fields.Bool(missing=True)
     password_reset_requested = fields.Bool(missing=False)
+    teaching_assignments = fields.List(fields.Nested(TeachingAssignmentSchema), allow_none=True)
 
     @post_load
     def make_tutor(self, data, **kwargs):
@@ -266,6 +279,7 @@ class TutorUpdateSchema(Schema):
     plan_types = fields.List(fields.Str(), allow_none=True)
     can_edit_students = fields.Bool()
     is_active = fields.Bool()
+    teaching_assignments = fields.List(fields.Nested(TeachingAssignmentSchema), allow_none=True)
 
 
 class TutorPasswordChangeSchema(Schema):

@@ -20,6 +20,7 @@ from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
 from utils.path_utils import get_absolute_path
+from utils.s3_storage import download_file as s3_download_file, is_s3_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +56,13 @@ class ImagesListResponse(BaseModel):
     limit: int
 
 def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require student or admin access"""
+    """Dependency to require student, B2C user, B2C admin, or admin access"""
     user_type = current_user.get("user_type")
     logger.info(f"require_student_or_admin: user_type={user_type}, current_user keys={list(current_user.keys())}")
 
-    if user_type not in ["student", "admin"]:
-        logger.error(f"Access denied: user_type '{user_type}' not in ['student', 'admin']")
+    # b2c_user gets same access as student, b2c_admin gets admin access
+    if user_type not in ["student", "admin", "b2c_user", "b2c_admin"]:
+        logger.error(f"Access denied: user_type '{user_type}' not in ['student', 'admin', 'b2c_user', 'b2c_admin']")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Student or admin access required. Current user_type: {user_type}"
@@ -168,9 +170,9 @@ async def get_images(
         user_id = current_user["user_id"]
         user_type = current_user["user_type"]
 
-        # Build filter - students can only see their own images, admins see all
+        # Build filter - students/b2c_users can only see their own images, admins see all
         filter_dict = {}
-        if user_type == "student":
+        if user_type in ["student", "b2c_user"]:
             filter_dict["uploaded_by"] = user_id
 
         # Get total count
@@ -222,8 +224,12 @@ async def get_image(
 ):
     """Get image file by ID"""
     try:
-        # Get image metadata
+        # Get image metadata - try main DB first, then B2C
         image_data = await db.mongo_find_one("images", {"_id": image_id})
+        
+        if not image_data:
+            # Try B2C database
+            image_data = await db.b2c_find_one("images", {"_id": image_id})
 
         if not image_data:
             logger.error(f"Image not found in database: {image_id}")
@@ -244,7 +250,31 @@ async def get_image(
                 detail="Image file path not found in database"
             )
 
-        # Normalize path separators and handle Windows drive prefixes that were stored earlier
+        # Check if this is an S3 path
+        if str(stored_path).startswith("s3://"):
+            logger.info(f"Fetching image from S3: {stored_path}")
+            
+            # Download from S3
+            file_data = await s3_download_file(stored_path)
+            
+            if not file_data:
+                logger.error(f"Failed to download image from S3: {stored_path}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Image file not found in S3"
+                )
+            
+            # Return as streaming response
+            from fastapi.responses import Response
+            return Response(
+                content=file_data,
+                media_type=image_data.get("content_type", "image/jpeg"),
+                headers={
+                    "Content-Disposition": f"inline; filename=\"{image_data.get('original_filename', image_data.get('filename', 'image'))}\""
+                }
+            )
+
+        # Local file handling (existing logic)
         from pathlib import Path
         stored_path_str = str(stored_path).replace("\\", "/")
 
@@ -333,8 +363,8 @@ async def delete_image(
                 detail="Image not found"
             )
 
-        # Check permissions - students can only delete their own images
-        if (current_user["user_type"] == "student" and
+        # Check permissions - students/b2c_users can only delete their own images
+        if (current_user["user_type"] in ["student", "b2c_user"] and
             image_data["uploaded_by"] != current_user["user_id"]):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

@@ -6,7 +6,7 @@ Handles tutor CRUD operations, authentication, and student assignments
 from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, ValidationError
 import bcrypt
 
 from models.tutor import Tutor, TutorSchema, TutorUpdateSchema, TutorPasswordChangeSchema
@@ -22,8 +22,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 # Helper dependency functions
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin access"""
-    if current_user.get("user_type") != "admin":
+    """Dependency to require admin access (regular or B2C)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=403,
             detail="Admin access required"
@@ -42,13 +42,19 @@ def require_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 
 def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dependency to require admin OR tutor access"""
-    if current_user.get("user_type") not in ["admin", "tutor"]:
+    """Dependency to require admin, B2C admin, OR tutor access"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
         raise HTTPException(
             status_code=403,
             detail="Admin or Tutor access required"
         )
     return current_user
+
+
+class TeachingAssignment(BaseModel):
+    standard: str = Field(..., description="Class/grade for the assignment")
+    subject: str = Field(..., description="Subject taught in the class")
+    sections: List[str] = Field(default_factory=list, description="Sections within the class")
 
 
 # Pydantic Models for Request/Response
@@ -62,6 +68,7 @@ class CreateTutorRequest(BaseModel):
     subjects: Optional[List[str]] = None  # Multiple subjects
     plan_types: Optional[List[str]] = None  # Multiple plan types
     can_edit_students: bool = False  # Permission to add/edit students
+    teaching_assignments: Optional[List[TeachingAssignment]] = None  # Class / subject / section mapping
 
 
 class TutorResponse(BaseModel):
@@ -84,6 +91,29 @@ class TutorResponse(BaseModel):
     created_at: datetime
     last_login: Optional[datetime] = None
     generated_password: Optional[str] = None  # Only included on creation
+    teaching_assignments: Optional[List[TeachingAssignment]] = None
+
+
+def derive_assignment_meta(assignments: Optional[List[TeachingAssignment]]):
+    """
+    Normalize teaching assignments and derive aggregate standards/sections/subjects.
+    """
+    normalized: List[Dict[str, Any]] = []
+    standards: set[str] = set()
+    sections: set[str] = set()
+    subjects: set[str] = set()
+
+    for assignment in assignments or []:
+        normalized.append(assignment.dict())
+        if assignment.standard:
+            standards.add(assignment.standard)
+        if assignment.subject:
+            subjects.add(assignment.subject)
+        for sec in assignment.sections or []:
+            if sec:
+                sections.add(sec)
+
+    return normalized, sorted(standards), sorted(sections), sorted(subjects)
 
 
 class AssignStudentRequest(BaseModel):
@@ -125,6 +155,14 @@ async def create_tutor(
     # Get admin ID
     admin_id = current_user.get("user_id")
 
+    # Normalize teaching assignments and derive aggregate fields
+    normalized_assignments, assignment_standards, assignment_sections, assignment_subjects = derive_assignment_meta(
+        tutor_data.teaching_assignments
+    )
+    standards = sorted(set((tutor_data.standards or []) + assignment_standards))
+    sections = sorted(set((tutor_data.sections or []) + assignment_sections))
+    subjects = sorted(set((tutor_data.subjects or []) + assignment_subjects))
+
     # Create tutor document
     new_tutor = {
         "tutor_id": auto_tutor_id,
@@ -133,15 +171,16 @@ async def create_tutor(
         "password_hash": password_hash,
         "email": tutor_data.email,
         "phone": tutor_data.phone,
-        "standards": tutor_data.standards or [],
-        "sections": tutor_data.sections or [],
-        "subjects": tutor_data.subjects or [],
+        "standards": standards,
+        "sections": sections,
+        "subjects": subjects,
         "plan_types": tutor_data.plan_types or [],
         "can_edit_students": tutor_data.can_edit_students,
         "is_active": True,
         "assigned_student_ids": [],
         "requires_password_change": True,  # Must change on first login
         "password_reset_requested": False,
+        "teaching_assignments": normalized_assignments,
         "created_by": admin_id,
         "created_at": datetime.utcnow(),
         "last_login": None,
@@ -160,9 +199,9 @@ async def create_tutor(
         name=tutor_data.full_name,
         email=tutor_data.email,
         phone=tutor_data.phone,
-        standards=tutor_data.standards or [],
-        sections=tutor_data.sections or [],
-        subjects=tutor_data.subjects or [],
+        standards=standards,
+        sections=sections,
+        subjects=subjects,
         plan_types=tutor_data.plan_types or [],
         can_edit_students=tutor_data.can_edit_students,
         is_active=True,
@@ -171,7 +210,8 @@ async def create_tutor(
         password_reset_requested=False,
         created_at=new_tutor["created_at"],
         last_login=None,
-        generated_password=generated_password  # Only shown on creation
+        generated_password=generated_password,  # Only shown on creation
+        teaching_assignments=normalized_assignments
     )
 
 
@@ -208,7 +248,8 @@ async def get_tutors(
             requires_password_change=tutor.get("requires_password_change"),
             password_reset_requested=tutor.get("password_reset_requested"),
             created_at=tutor.get("created_at"),
-            last_login=tutor.get("last_login")
+            last_login=tutor.get("last_login"),
+            teaching_assignments=tutor.get("teaching_assignments", [])
         )
         for tutor in tutors
     ]
@@ -246,7 +287,8 @@ async def get_tutor(
         requires_password_change=tutor.get("requires_password_change"),
         password_reset_requested=tutor.get("password_reset_requested"),
         created_at=tutor.get("created_at"),
-        last_login=tutor.get("last_login")
+        last_login=tutor.get("last_login"),
+        teaching_assignments=tutor.get("teaching_assignments", [])
     )
 
 
@@ -265,6 +307,48 @@ async def update_tutor(
     tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
     if not tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
+
+    # Normalize teaching assignments if provided and derive aggregate fields
+    if "teaching_assignments" in updates:
+        assignments_payload = updates.get("teaching_assignments") or []
+        validated_assignments = []
+        assignment_standards: set[str] = set()
+        assignment_sections: set[str] = set()
+        assignment_subjects: set[str] = set()
+
+        for item in assignments_payload:
+            try:
+                assignment = TeachingAssignment(**item)
+            except ValidationError:
+                # Skip invalid assignment entries instead of failing the whole request
+                continue
+
+            validated_assignments.append(assignment.dict())
+            if assignment.standard:
+                assignment_standards.add(assignment.standard)
+            if assignment.subject:
+                assignment_subjects.add(assignment.subject)
+            for sec in assignment.sections or []:
+                if sec:
+                    assignment_sections.add(sec)
+
+        updates["teaching_assignments"] = validated_assignments
+
+        # Ensure lists before merging
+        standards_from_updates = updates.get("standards", []) or []
+        sections_from_updates = updates.get("sections", []) or []
+        subjects_from_updates = updates.get("subjects", []) or []
+
+        if not isinstance(standards_from_updates, list):
+            standards_from_updates = [standards_from_updates]
+        if not isinstance(sections_from_updates, list):
+            sections_from_updates = [sections_from_updates]
+        if not isinstance(subjects_from_updates, list):
+            subjects_from_updates = [subjects_from_updates]
+
+        updates["standards"] = sorted(set(standards_from_updates + list(assignment_standards)))
+        updates["sections"] = sorted(set(sections_from_updates + list(assignment_sections)))
+        updates["subjects"] = sorted(set(subjects_from_updates + list(assignment_subjects)))
 
     # Update tutor
     await db.mongo_update_one(
