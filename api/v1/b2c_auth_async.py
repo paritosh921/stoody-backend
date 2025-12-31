@@ -409,7 +409,11 @@ async def b2c_google_callback(
         
     except Exception as e:
         logger.error(f"Google Callback Error: {e}")
-        return RedirectResponse(f"{agent_callback}?error=login_failed")
+        # Return error detail to help debugging (in production be careful exposing internal errors, 
+        # but for now we need to know why it failed)
+        import urllib.parse
+        error_msg = urllib.parse.quote(str(e))
+        return RedirectResponse(f"{agent_callback}?error=login_failed&detail={error_msg}")
 
 
 @router.get("/me", response_model=B2CUserResponse)
