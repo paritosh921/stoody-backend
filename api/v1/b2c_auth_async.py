@@ -272,14 +272,144 @@ async def b2c_google_login(
             }
         )
 
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"B2C Google login error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Login failed"
         )
+
+
+# ==================== Desktop Agent Redirect Flow ====================
+
+@router.get("/google/authorize")
+async def b2c_google_authorize(redirect_uri: str):
+    """
+    Initiates Google OAuth flow for Desktop Agent
+    Redirects user to Google's consent page
+    """
+    from fastapi.responses import RedirectResponse
+    import urllib.parse
+    
+    # Base Google Auth URL
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+    
+    # Use the production API URL (https://api.stoody.in is the deployed backend)
+    import os
+    api_base = os.getenv("PUBLIC_API_URL", "https://api.stoody.in/api/v1")
+    callback_url = f"{api_base}/b2c/google/callback"
+    
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        # Pass the agent's local callback as state so we know where to send the token
+        "state": redirect_uri
+    }
+    
+    url = f"{auth_url}?{urllib.parse.urlencode(params)}"
+    return RedirectResponse(url)
+
+
+@router.get("/google/callback")
+async def b2c_google_callback(
+    code: str, 
+    state: str, 
+    request: Request,
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """
+    Handles callback from Google, exchanges code for token,
+    and redirects back to the Desktop Agent
+    """
+    from fastapi.responses import RedirectResponse
+    import httpx
+    
+    agent_callback = state  # e.g., http://localhost:8001/api/v1/auth/callback
+    
+    try:
+        # Exchange code for tokens
+        token_url = "https://oauth2.googleapis.com/token"
+        data = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            # Use same production URL as authorize endpoint
+            "redirect_uri": f"{os.getenv('PUBLIC_API_URL', 'https://api.stoody.in/api/v1')}/b2c/google/callback"
+        }
+        
+        async with httpx.AsyncClient() as client:
+            token_resp = await client.post(token_url, data=data)
+            token_resp.raise_for_status()
+            tokens = token_resp.json()
+            
+        id_token_str = tokens.get("id_token")
+        
+        # Verify token and get user info
+        google_user = await verify_google_token(id_token_str)
+        if not google_user:
+             return RedirectResponse(f"{agent_callback}?error=invalid_token")
+
+        google_id = google_user['google_id']
+        email = google_user['email']
+        
+        # --- Database Logic (Same as b2c_google_login) ---
+        existing_user = await db.b2c_find_one("users", {"google_id": google_id})
+        
+        if existing_user:
+            await db.b2c_update_one(
+                "users",
+                {"_id": existing_user["_id"]},
+                {
+                    "$set": {
+                        "last_login": datetime.utcnow(),
+                        "picture": google_user.get('picture', existing_user.get('picture'))
+                    }
+                }
+            )
+            user_id = str(existing_user["_id"])
+            full_name = existing_user.get("full_name", google_user['full_name'])
+        else:
+            new_user = {
+                "google_id": google_id,
+                "email": email,
+                "full_name": google_user['full_name'],
+                "given_name": google_user.get('given_name', ''),
+                "family_name": google_user.get('family_name', ''),
+                "picture": google_user.get('picture', ''),
+                "locale": google_user.get('locale', 'en'),
+                "is_active": True,
+                "user_type": "b2c_user",
+                "created_at": datetime.utcnow(),
+                "last_login": datetime.utcnow(),
+                "admin_id": None,
+                "subdomain": None
+            }
+            user_id = await db.b2c_insert_one("users", new_user)
+            full_name = google_user['full_name']
+
+        # Create JWT session
+        user_data = {
+            "user_id": user_id,
+            "user_type": "b2c_user",
+            "email": email,
+            "full_name": full_name,
+            "google_id": google_id,
+            "is_b2c": True
+        }
+        session_data = await auth_manager.create_user_session(user_data)
+        access_token = session_data["access_token"]
+        
+        # Redirect back to Agent with token
+        return RedirectResponse(f"{agent_callback}?token={access_token}&user_id={user_id}&email={email}")
+        
+    except Exception as e:
+        logger.error(f"Google Callback Error: {e}")
+        return RedirectResponse(f"{agent_callback}?error=login_failed")
 
 
 @router.get("/me", response_model=B2CUserResponse)
