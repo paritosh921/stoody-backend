@@ -405,8 +405,11 @@ async def b2c_google_callback(
         session_data = await auth_manager.create_user_session(user_data)
         access_token = session_data["access_token"]
         
-        # Redirect back to Agent with token
-        return RedirectResponse(f"{agent_callback}?token={access_token}&user_id={user_id}&email={email}")
+        # Redirect back to Agent with token (URL-encode to handle special chars)
+        import urllib.parse
+        encoded_token = urllib.parse.quote(access_token, safe='')
+        encoded_email = urllib.parse.quote(email, safe='')
+        return RedirectResponse(f"{agent_callback}?token={encoded_token}&user_id={user_id}&email={encoded_email}")
         
     except Exception as e:
         logger.error(f"Google Callback Error: {e}")
