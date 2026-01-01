@@ -734,6 +734,9 @@ async def evaluate_submission(
         # Log question details for debugging
         logger.info(f"📝 Question {qid} details: text_len={len(question_text)}, correct_answer='{correct_answer}', is_mcq={is_mcq}, options_len={len(options_text)}")
         
+        # Determine if we need the LLM to solve the question itself
+        has_correct_answer = bool(correct_answer and correct_answer.strip())
+        
         # Construct IMPROVED Prompt with clearer structure and explicit instructions
         prompt = (
             "You are an expert tutor evaluating a student's handwritten answer. "
@@ -761,15 +764,26 @@ async def evaluate_submission(
             prompt += "📋 OPTIONS:\n"
             prompt += f"{options_text}\n\n"
         
-        # Correct answer - CRITICAL for evaluation
+        # Correct answer section - CRITICAL for evaluation
         prompt += "═══════════════════════════════════════\n"
         prompt += "✅ CORRECT ANSWER:\n"
         prompt += "═══════════════════════════════════════\n"
-        if correct_answer:
+        
+        if has_correct_answer:
             prompt += f"{correct_answer}\n\n"
         else:
-            prompt += "(Not explicitly provided - you must solve the question yourself to determine correctness)\n\n"
-            logger.warning(f"⚠️ Question {qid} has no correct_answer stored! LLM must infer correctness.")
+            # IMPORTANT: When no answer is provided, LLM must solve it
+            prompt += "⚠️ NO CORRECT ANSWER PROVIDED BY ADMIN\n\n"
+            prompt += "🧠 YOU MUST SOLVE THIS QUESTION YOURSELF:\n"
+            if is_mcq:
+                prompt += "1. Read the question carefully and analyze each option.\n"
+                prompt += "2. Determine which option (A, B, C, or D) is correct.\n"
+                prompt += "3. Use this as your reference to evaluate the student's answer.\n\n"
+            else:
+                prompt += "1. Read the question carefully.\n"
+                prompt += "2. Solve it step-by-step to find the correct answer.\n"
+                prompt += "3. Use your solution as the reference to evaluate the student's answer.\n\n"
+            logger.warning(f"⚠️ Question {qid} has no correct_answer stored! LLM must solve it.")
         
         # Student's input section
         prompt += "═══════════════════════════════════════\n"
@@ -787,45 +801,68 @@ async def evaluate_submission(
             prompt += "(No answer submitted)\n"
         prompt += "\n"
         
-        # Specific evaluation instructions based on question type
+        # Specific evaluation instructions based on question type AND whether answer is provided
         if is_mcq:
             prompt += "🎯 EVALUATION RULES (Multiple Choice Question):\n"
             prompt += "1. Look for a LETTER (A, B, C, D, etc.) in the student's handwriting.\n"
             prompt += "2. Common handwriting variations: curved lines may be 'C' or 'D', bumpy lines may be 'B'.\n"
-            prompt += "3. The student is CORRECT if their letter matches the correct answer letter.\n"
+            if has_correct_answer:
+                prompt += f"3. The student is CORRECT if their letter matches '{correct_answer}'.\n"
+            else:
+                prompt += "3. Compare the student's letter to YOUR solved answer.\n"
             prompt += "4. Ignore any scratch work - focus on their FINAL circled or clearly written letter.\n\n"
         else:
             prompt += "🎯 EVALUATION RULES (Subjective Question):\n"
             prompt += "1. Transcribe all text, numbers, and equations from the student's handwriting.\n"
-            prompt += "2. Compare their answer/solution to the correct answer.\n"
+            if has_correct_answer:
+                prompt += f"2. Compare their answer/solution to the correct answer: '{correct_answer[:100]}{'...' if len(correct_answer) > 100 else ''}'.\n"
+            else:
+                prompt += "2. Compare their answer/solution to YOUR solved answer.\n"
             prompt += "3. They are CORRECT if the answer matches or the solution approach is correct.\n"
             prompt += "4. Partial credit: if they're on the right track but made a small error.\n\n"
         
-        prompt += (
-            "═══════════════════════════════════════\n"
-            "📊 RETURN THIS JSON EXACTLY:\n"
-            "═══════════════════════════════════════\n"
-            "{\n"
-            '  "extracted_answer": "EXACTLY what the student wrote (letter for MCQ, full text for others)",\n'
-            '  "is_correct": true or false,\n'
-            '  "feedback": "Encouraging feedback explaining why correct/incorrect",\n'
-            '  "reasoning": "Your step-by-step evaluation logic"\n'
-            "}\n\n"
-            "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
-        )
+        # JSON output instructions - include solved_answer for no-answer cases
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "📊 RETURN THIS JSON EXACTLY:\n"
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "{\n"
+        prompt += '  "extracted_answer": "EXACTLY what the student wrote (letter for MCQ, full text for others)",\n'
+        prompt += '  "is_correct": true or false,\n'
+        if not has_correct_answer:
+            prompt += '  "solved_answer": "The correct answer YOU calculated (REQUIRED since no answer was provided)",\n'
+        prompt += '  "feedback": "Encouraging feedback explaining why correct/incorrect",\n'
+        prompt += '  "reasoning": "Your step-by-step evaluation logic"\n'
+        prompt += "}\n\n"
+        prompt += "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
+        if not has_correct_answer:
+            prompt += "CRITICAL: You MUST solve the question first and include 'solved_answer' in your response!\n"
         
         logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
         
-        # Call LLM with enhanced system prompt
-        system_prompt = (
-            "You are an expert answer evaluator specializing in reading handwritten student work. "
-            "CRITICAL: Your ONLY job is to determine if the student's answer is CORRECT or INCORRECT. "
-            "You MUST compare the student's answer to the CORRECT ANSWER provided. "
-            "For MCQ, a single letter (A/B/C/D) is the answer - focus on identifying that letter. "
-            "For subjective questions, compare the content/value of their answer. "
-            "Always output ONLY valid JSON without markdown code blocks. "
-            "Be generous in interpreting messy handwriting but strict in evaluating correctness."
-        )
+        # Call LLM with enhanced system prompt - varies based on whether we have a correct answer
+        if has_correct_answer:
+            system_prompt = (
+                "You are an expert answer evaluator specializing in reading handwritten student work. "
+                "CRITICAL: Your ONLY job is to determine if the student's answer is CORRECT or INCORRECT. "
+                "You MUST compare the student's answer to the CORRECT ANSWER provided. "
+                "For MCQ, a single letter (A/B/C/D) is the answer - focus on identifying that letter. "
+                "For subjective questions, compare the content/value of their answer. "
+                "Always output ONLY valid JSON without markdown code blocks. "
+                "Be generous in interpreting messy handwriting but strict in evaluating correctness."
+            )
+        else:
+            system_prompt = (
+                "You are an expert tutor who can both SOLVE questions AND evaluate student answers. "
+                "CRITICAL: Since NO CORRECT ANSWER was provided, you MUST first SOLVE the question yourself. "
+                "1. First, solve the question to determine the correct answer. "
+                "2. Then, read and interpret the student's handwritten work. "
+                "3. Compare the student's answer to YOUR solution. "
+                "4. Include your 'solved_answer' in the JSON response. "
+                "For MCQ, determine which letter (A/B/C/D) is correct, then check if the student wrote that letter. "
+                "For subjective questions, solve it step-by-step, then compare to the student's work. "
+                "Always output ONLY valid JSON without markdown code blocks. "
+                "Be generous in interpreting messy handwriting but strict in evaluating correctness."
+            )
         
         if all_images:
             response = await ai.analyze_images_and_text_async(
@@ -914,6 +951,13 @@ async def evaluate_submission(
                 evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
                 evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
                 evaluation_data["reasoning"] = str(parsed.get("reasoning", "")).strip()
+                
+                # Handle solved_answer - when admin didn't provide a correct answer, LLM solved it
+                solved_answer = parsed.get("solved_answer", "")
+                if solved_answer and not has_correct_answer:
+                    evaluation_data["correctAnswer"] = str(solved_answer).strip()
+                    evaluation_data["answerSource"] = "llm_solved"
+                    logger.info(f"🧠 LLM solved the question. Correct answer: '{solved_answer}'")
                 
                 # If LLM didn't extract an answer but OCR did, use OCR result
                 if not evaluation_data["extractedAnswer"] and ocr_extracted_text:
