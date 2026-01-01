@@ -56,6 +56,7 @@ class ChatRequest(BaseModel):
     useAssistants: Optional[bool] = False
     context: Optional[Any] = None
     fileIds: Optional[List[str]] = None
+    systemPrompt: Optional[str] = None  # Custom system prompt for hints, practice mode, etc.
 
     class Config:
         extra = "allow"  # Allow any extra fields from frontend
@@ -358,9 +359,18 @@ async def _prepare_messages(chat_request: ChatRequest, openai_service: AsyncOpen
     """Prepare messages for OpenAI API"""
     messages = []
 
-    # Get system prompt
-    system_prompts = await openai_service.get_system_prompts_async()
-    system_prompt = system_prompts.get(chat_request.mode, system_prompts['general'])
+    # Get system prompt - use custom systemPrompt if provided, otherwise use mode-based prompt
+    if chat_request.systemPrompt:
+        system_prompt = chat_request.systemPrompt
+    else:
+        system_prompts = await openai_service.get_system_prompts_async()
+        system_prompt = system_prompts.get(chat_request.mode, system_prompts['general'])
+
+    # Add system prompt as first message
+    messages.append({
+        'role': 'system',
+        'content': system_prompt
+    })
 
     # Add conversation history (limit to last 10 messages)
     if chat_request.conversationHistory:

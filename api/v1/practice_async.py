@@ -725,75 +725,106 @@ async def evaluate_submission(
             else:
                 combined_answer = ocr_extracted_text
         
-        # Combine all images for the LLM
-        all_images = question_images + student_images
+        # Combine all images for the LLM - STUDENT IMAGES FIRST, then question images
+        # This ensures the LLM focuses on the student's work first
+        all_images = student_images + question_images
         num_q_images = len(question_images)
+        num_s_images = len(student_images)
         
-        # Construct ENHANCED Prompt with better handwriting instructions
+        # Log question details for debugging
+        logger.info(f"📝 Question {qid} details: text_len={len(question_text)}, correct_answer='{correct_answer}', is_mcq={is_mcq}, options_len={len(options_text)}")
+        
+        # Construct IMPROVED Prompt with clearer structure and explicit instructions
         prompt = (
-            "You are an expert personal tutor evaluating a student's handwritten/typed answer.\n\n"
-            f"QUESTION:\n{question_text}\n\n"
+            "You are an expert tutor evaluating a student's handwritten answer. "
+            "Your task is to determine if their answer is CORRECT or INCORRECT.\n\n"
         )
         
-        if options_text:
-            prompt += f"OPTIONS:\n{options_text}\n\n"
-            
-        if correct_answer:
-            prompt += f"CORRECT ANSWER: {correct_answer}\n\n"
-        else:
-            prompt += "CORRECT ANSWER: (Not provided, please solve it yourself to verify)\n\n"
-            
-        prompt += "STUDENT INPUT:\n"
+        # Add clear image labeling
+        if num_s_images > 0 and num_q_images > 0:
+            prompt += f"📷 IMAGE GUIDE: You will see {num_s_images + num_q_images} images.\n"
+            prompt += f"  - Images 1 to {num_s_images}: STUDENT'S HANDWRITTEN WORK (analyze these carefully)\n"
+            prompt += f"  - Images {num_s_images + 1} to {num_s_images + num_q_images}: QUESTION DIAGRAMS (for reference)\n\n"
+        elif num_s_images > 0:
+            prompt += f"📷 IMAGE GUIDE: You will see {num_s_images} image(s) of the STUDENT'S HANDWRITTEN WORK.\n\n"
+        elif num_q_images > 0:
+            prompt += f"📷 IMAGE GUIDE: You will see {num_q_images} image(s) of QUESTION DIAGRAMS.\n\n"
         
-        # Include both typed and OCR-extracted answer
+        # Question section
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "📚 QUESTION:\n"
+        prompt += "═══════════════════════════════════════\n"
+        prompt += f"{question_text}\n\n"
+        
+        # Options if MCQ
+        if options_text:
+            prompt += "📋 OPTIONS:\n"
+            prompt += f"{options_text}\n\n"
+        
+        # Correct answer - CRITICAL for evaluation
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "✅ CORRECT ANSWER:\n"
+        prompt += "═══════════════════════════════════════\n"
+        if correct_answer:
+            prompt += f"{correct_answer}\n\n"
+        else:
+            prompt += "(Not explicitly provided - you must solve the question yourself to determine correctness)\n\n"
+            logger.warning(f"⚠️ Question {qid} has no correct_answer stored! LLM must infer correctness.")
+        
+        # Student's input section
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "✍️ STUDENT'S SUBMISSION:\n"
+        prompt += "═══════════════════════════════════════\n"
+        
         if answer_text:
             prompt += f"Typed Answer: {answer_text}\n"
-        if ocr_extracted_text and ocr_confidence > 0.3:
-            prompt += f"Canvas OCR Extraction (confidence {ocr_confidence:.0%}): {ocr_extracted_text}\n"
-        elif ocr_extracted_text:
-            prompt += f"Canvas OCR Extraction (LOW confidence): {ocr_extracted_text}\n"
-        if not answer_text and not ocr_extracted_text:
-            prompt += "Typed Answer: (None)\n"
-            
-        if student_images:
-            prompt += f"\nCanvas Work: The student has submitted {len(student_images)} page(s) of handwritten work.\n"
-            prompt += "IMPORTANT: Carefully examine the handwritten content in the canvas images.\n"
-            prompt += "Look for: letters, numbers, equations, diagrams, circled answers, or any marks.\n"
-            if num_q_images > 0:
-                prompt += f"Note: The first {num_q_images} image(s) are question diagrams. The remaining are student work.\n"
+        if ocr_extracted_text:
+            conf_label = "HIGH" if ocr_confidence > 0.7 else ("MEDIUM" if ocr_confidence > 0.4 else "LOW")
+            prompt += f"OCR Detected Text ({conf_label} confidence): {ocr_extracted_text}\n"
+        if num_s_images > 0:
+            prompt += f"Handwritten Canvas: {num_s_images} page(s) submitted - EXAMINE CAREFULLY.\n"
+        if not answer_text and not ocr_extracted_text and num_s_images == 0:
+            prompt += "(No answer submitted)\n"
+        prompt += "\n"
         
+        # Specific evaluation instructions based on question type
         if is_mcq:
-            prompt += "\nThis is a MULTIPLE CHOICE question. The student's answer should be a letter (A, B, C, D, etc.)\n"
-            prompt += "Even if the writing is messy, try to identify which letter they wrote.\n"
-            
+            prompt += "🎯 EVALUATION RULES (Multiple Choice Question):\n"
+            prompt += "1. Look for a LETTER (A, B, C, D, etc.) in the student's handwriting.\n"
+            prompt += "2. Common handwriting variations: curved lines may be 'C' or 'D', bumpy lines may be 'B'.\n"
+            prompt += "3. The student is CORRECT if their letter matches the correct answer letter.\n"
+            prompt += "4. Ignore any scratch work - focus on their FINAL circled or clearly written letter.\n\n"
+        else:
+            prompt += "🎯 EVALUATION RULES (Subjective Question):\n"
+            prompt += "1. Transcribe all text, numbers, and equations from the student's handwriting.\n"
+            prompt += "2. Compare their answer/solution to the correct answer.\n"
+            prompt += "3. They are CORRECT if the answer matches or the solution approach is correct.\n"
+            prompt += "4. Partial credit: if they're on the right track but made a small error.\n\n"
+        
         prompt += (
-            "\nEVALUATION TASK:\n"
-            "1. FIRST: Carefully transcribe what the student wrote on the canvas (if any).\n"
-            "2. Combine this with any typed answer they provided.\n"
-            "3. Determine their FINAL answer.\n"
-            "4. Compare with the CORRECT ANSWER.\n"
-            "5. Provide encouraging, educational feedback:\n"
-            "   - If CORRECT: Reinforce why it's right.\n"
-            "   - If INCORRECT: Kindly explain the correct approach. Be a tutor, not a judge.\n"
-            "   - If UNCLEAR: Tell them what you could see and ask for clarification.\n"
-            "\nRETURN a JSON object with these EXACT fields:\n"
+            "═══════════════════════════════════════\n"
+            "📊 RETURN THIS JSON EXACTLY:\n"
+            "═══════════════════════════════════════\n"
             "{\n"
-            '  "extracted_answer": "What you read from the student\'s work",\n'
+            '  "extracted_answer": "EXACTLY what the student wrote (letter for MCQ, full text for others)",\n'
             '  "is_correct": true or false,\n'
-            '  "feedback": "Your tutoring feedback message",\n'
-            '  "reasoning": "Your evaluation reasoning"\n'
-            "}\n"
+            '  "feedback": "Encouraging feedback explaining why correct/incorrect",\n'
+            '  "reasoning": "Your step-by-step evaluation logic"\n'
+            "}\n\n"
+            "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
         )
         
-        logger.info(f"📤 Sending evaluation request to LLM for Q:{qid}. Images: {len(all_images)} ({num_q_images} Q + {len(student_images)} S). Pre-extracted: '{ocr_extracted_text}'")
+        logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
         
         # Call LLM with enhanced system prompt
         system_prompt = (
-            "You are a helpful, encouraging, and highly knowledgeable tutor. "
-            "You are expert at reading handwritten student work, including messy handwriting. "
-            "You always output valid JSON without markdown formatting. "
-            "For MCQ questions, focus on identifying the letter (A, B, C, D) the student selected. "
-            "Even partial or unclear answers should be interpreted with best effort before marking unclear."
+            "You are an expert answer evaluator specializing in reading handwritten student work. "
+            "CRITICAL: Your ONLY job is to determine if the student's answer is CORRECT or INCORRECT. "
+            "You MUST compare the student's answer to the CORRECT ANSWER provided. "
+            "For MCQ, a single letter (A/B/C/D) is the answer - focus on identifying that letter. "
+            "For subjective questions, compare the content/value of their answer. "
+            "Always output ONLY valid JSON without markdown code blocks. "
+            "Be generous in interpreting messy handwriting but strict in evaluating correctness."
         )
         
         if all_images:
@@ -813,7 +844,7 @@ async def evaluate_submission(
             )
             
         raw_response = (response.get("response") or "").strip()
-        logger.info(f"LLM Evaluation Response: {raw_response[:300]}...")
+        logger.info(f"📥 LLM Raw Response (first 500 chars): {raw_response[:500]}")
         
         # Parse JSON Response
         evaluation_data = {
@@ -824,20 +855,31 @@ async def evaluate_submission(
             "reasoning": "",
             "answerSource": "ai_eval",
             "ocrConfidence": ocr_confidence,
-            "ocrExtractedText": ocr_extracted_text
+            "ocrExtractedText": ocr_extracted_text,
+            "correctAnswer": correct_answer  # Include for frontend display
         }
         
         try:
             parsed = None
+            
+            # Pre-process: Remove markdown code blocks if present
+            clean_response = raw_response
+            if "```json" in raw_response:
+                clean_response = _re.sub(r"```json\s*", "", raw_response)
+                clean_response = _re.sub(r"```\s*", "", clean_response).strip()
+            elif "```" in raw_response:
+                clean_response = _re.sub(r"```\s*", "", raw_response).strip()
+            
             # Attempt 1: Direct JSON parse
             try:
-                parsed = _json.loads(raw_response)
+                parsed = _json.loads(clean_response)
             except Exception:
                 pass
                 
-            # Attempt 2: Regex extraction + JSON parse
+            # Attempt 2: Regex extraction + JSON parse (handles nested braces)
             if not parsed:
-                m = _re.search(r"\{[^{}]*\}", raw_response, _re.DOTALL)
+                # Try to find JSON object with a more robust regex
+                m = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', clean_response, _re.DOTALL)
                 if m:
                     json_str = m.group(0)
                     try:
@@ -849,8 +891,25 @@ async def evaluate_submission(
                         except Exception:
                             pass
             
+            # Attempt 4: Simple brace extraction
+            if not parsed:
+                m = _re.search(r"\{[^{}]*\}", clean_response, _re.DOTALL)
+                if m:
+                    try:
+                        parsed = _json.loads(m.group(0))
+                    except Exception:
+                        pass
+            
             if parsed and isinstance(parsed, dict):
-                evaluation_data["correct"] = bool(parsed.get("is_correct", False))
+                # Parse is_correct - handle various representations
+                is_correct_val = parsed.get("is_correct", parsed.get("correct", False))
+                if isinstance(is_correct_val, bool):
+                    evaluation_data["correct"] = is_correct_val
+                elif isinstance(is_correct_val, str):
+                    evaluation_data["correct"] = is_correct_val.lower() in ("true", "yes", "correct", "1")
+                else:
+                    evaluation_data["correct"] = bool(is_correct_val)
+                
                 evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
                 evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
                 evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
@@ -860,9 +919,12 @@ async def evaluate_submission(
                 if not evaluation_data["extractedAnswer"] and ocr_extracted_text:
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
                     evaluation_data["answerSource"] = "ocr_extraction"
+                
+                logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}'")
                     
             else:
                 # Fallback if no JSON found
+                logger.warning(f"⚠️ Could not parse JSON from LLM response. Raw: {raw_response[:200]}")
                 evaluation_data["feedback"] = raw_response
                 evaluation_data["reasoning"] = "Could not parse JSON from LLM response."
                 # Still use OCR extraction if available
@@ -871,7 +933,7 @@ async def evaluate_submission(
                     evaluation_data["answerSource"] = "ocr_fallback"
                 
         except Exception as parse_err:
-            logger.error(f"Failed to parse LLM evaluation JSON: {parse_err}")
+            logger.error(f"❌ Failed to parse LLM evaluation JSON: {parse_err}")
             evaluation_data["feedback"] = raw_response
             evaluation_data["reasoning"] = f"JSON parse error: {parse_err}"
             if ocr_extracted_text:
@@ -882,7 +944,7 @@ async def evaluate_submission(
         if not evaluation_data["feedback"]:
              evaluation_data["feedback"] = raw_response
 
-        logger.info(f"✅ Evaluation complete for Q:{qid}. Correct: {evaluation_data['correct']}, Extracted: '{evaluation_data['extractedAnswer']}', Source: {evaluation_data['answerSource']}")
+        logger.info(f"🎯 Evaluation complete for Q:{qid}. Correct: {evaluation_data['correct']}, Extracted: '{evaluation_data['extractedAnswer']}', Expected: '{correct_answer[:30] if correct_answer else 'N/A'}', Source: {evaluation_data['answerSource']}")
 
         return EvaluateResponse(success=True, evaluation=evaluation_data)
 
