@@ -84,6 +84,16 @@ async def get_current_user(
     """Get current authenticated user"""
     try:
         token = credentials.credentials
+        
+        # CRITICAL: Check if token is revoked (for portal auto-logout)
+        from core.token_blacklist import token_blacklist
+        if token_blacklist.is_revoked(token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
         user_data = await auth_manager.verify_token_and_get_user(token)
 
         if not user_data:
@@ -623,14 +633,31 @@ async def register_admin(
 
 @router.post("/logout")
 async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
-    """Logout user and invalidate session"""
+    """
+    Logout user and invalidate session.
+    
+    This endpoint:
+    1. Revokes the JWT token (adds to blacklist)
+    2. Invalidates the session cache  
+    3. Tracks student logout activity
+    
+    This ensures portal sessions are automatically logged out when desktop client logs out.
+    """
     try:
         user_id = current_user.get("user_id")
         user_type = current_user.get("user_type")
+        
+        # CRITICAL: Revoke JWT token to force portal logout
+        # This is called by desktop client when user logs out
+        from core.token_blacklist import token_blacklist
+        token = credentials.credentials
+        token_blacklist.revoke(token, expiry_seconds=86400)  # Keep in blacklist for 24 hours
+        logger.info(f"Token revoked for user {user_id}")
 
         # For students, track session end
         if user_type == "student":
