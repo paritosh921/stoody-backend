@@ -146,95 +146,186 @@ async def _figure_images_base64(q: Dict[str, Any], db: DatabaseManager = None, i
     
     imgs: List[str] = []
     
+    # Helper function to load image from database/disk
+    async def load_image_by_id(img_id: str) -> Optional[str]:
+        if not img_id or not db:
+            return None
+        try:
+            if is_b2c:
+                img_doc = await db.b2c_find_one("images", {"_id": img_id})
+            else:
+                img_doc = await db.mongo_find_one("images", {"_id": img_id})
+            
+            if img_doc:
+                if img_doc.get("base64Data"):
+                    b64 = img_doc["base64Data"]
+                    logger.info(f"Loaded base64Data from database for image {img_id}")
+                    return b64
+                elif img_doc.get("file_path"):
+                    file_path = img_doc["file_path"]
+                    if os.path.exists(file_path):
+                        with open(file_path, "rb") as f:
+                            image_bytes = f.read()
+                            base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                            content_type = img_doc.get("content_type", "image/jpeg")
+                            if not content_type.startswith("image/"):
+                                content_type = "image/jpeg"
+                            b64 = f"data:{content_type};base64,{base64_encoded}"
+                            logger.info(f"Loaded image from disk for {img_id}: {len(b64)} bytes")
+                            return b64
+        except Exception as e:
+            logger.error(f"Failed to load image {img_id}: {e}")
+        return None
+    
+    # Helper to normalize base64 format
+    def normalize_b64(b64: str) -> str:
+        if b64 and not b64.startswith("data:image"):
+            return f"data:image/png;base64,{b64}"
+        return b64
+    
+    # 1. Extract from question_figures array
     for fig_ref in (q.get("question_figures", []) or []):
         try:
             b64 = None
             fig_id = None
             
-            # First try to get base64Data directly from the figure reference
             if isinstance(fig_ref, dict):
                 b64 = fig_ref.get("base64Data")
                 fig_id = fig_ref.get("id")
             elif isinstance(fig_ref, str):
                 fig_id = fig_ref
             
-            # If no embedded base64 and we have a database connection, try to load from database/disk
-            if not b64 and fig_id and db:
-                try:
-                    # Try to get from images collection
-                    if is_b2c:
-                        img_doc = await db.b2c_find_one("images", {"_id": fig_id})
-                    else:
-                        img_doc = await db.mongo_find_one("images", {"_id": fig_id})
-                    
-                    if img_doc:
-                        # First check if base64Data is stored in the document
-                        if img_doc.get("base64Data"):
-                            b64 = img_doc["base64Data"]
-                            logger.info(f"Loaded base64Data from database for figure {fig_id}")
-                        # If not, try to read from file_path
-                        elif img_doc.get("file_path"):
-                            file_path = img_doc["file_path"]
-                            if os.path.exists(file_path):
-                                with open(file_path, "rb") as f:
-                                    image_bytes = f.read()
-                                    base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
-                                    content_type = img_doc.get("content_type", "image/jpeg")
-                                    if not content_type.startswith("image/"):
-                                        content_type = "image/jpeg"
-                                    b64 = f"data:{content_type};base64,{base64_encoded}"
-                                    logger.info(f"Loaded and encoded image from disk for figure {fig_id}: {len(b64)} bytes")
-                            else:
-                                logger.warning(f"Image file not found: {file_path}")
-                except Exception as load_err:
-                    logger.error(f"Failed to load image {fig_id} from database/disk: {load_err}")
+            if not b64 and fig_id:
+                b64 = await load_image_by_id(fig_id)
             
-            # Normalize format and add to list
             if b64:
-                if not b64.startswith("data:image"):
-                    b64 = f"data:image/png;base64,{b64}"
-                imgs.append(b64)
+                imgs.append(normalize_b64(b64))
                 
         except Exception as e:
             logger.warning(f"Error processing figure: {e}")
     
-    # Also check for images in the 'images' array that might be diagrams
+    # 2. Extract from images array (diagrams and other embedded images)
     for img_ref in (q.get("images", []) or []):
         try:
-            if isinstance(img_ref, dict) and img_ref.get("type") == "diagram":
+            b64 = None
+            img_id = None
+            
+            if isinstance(img_ref, dict):
+                # Include ALL image types, not just diagrams
                 b64 = img_ref.get("base64Data")
                 img_id = img_ref.get("id")
-                
-                if not b64 and img_id and db:
-                    try:
-                        if is_b2c:
-                            img_doc = await db.b2c_find_one("images", {"_id": img_id})
-                        else:
-                            img_doc = await db.mongo_find_one("images", {"_id": img_id})
-                        
-                        if img_doc:
-                            if img_doc.get("base64Data"):
-                                b64 = img_doc["base64Data"]
-                            elif img_doc.get("file_path"):
-                                file_path = img_doc["file_path"]
-                                if os.path.exists(file_path):
-                                    with open(file_path, "rb") as f:
-                                        image_bytes = f.read()
-                                        base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
-                                        content_type = img_doc.get("content_type", "image/jpeg")
-                                        b64 = f"data:{content_type};base64,{base64_encoded}"
-                    except Exception:
-                        pass
-                
-                if b64:
-                    if not b64.startswith("data:image"):
-                        b64 = f"data:image/png;base64,{b64}"
-                    imgs.append(b64)
+            elif isinstance(img_ref, str):
+                img_id = img_ref
+            
+            if not b64 and img_id:
+                b64 = await load_image_by_id(img_id)
+            
+            if b64:
+                imgs.append(normalize_b64(b64))
         except Exception:
             pass
     
-    logger.info(f"Extracted {len(imgs)} question figure images for LLM evaluation")
+    # 3. Check for inline figure in the question text (base64 embedded)
+    if q.get("figure") and isinstance(q.get("figure"), str):
+        fig = q["figure"]
+        if fig.startswith("data:image") or len(fig) > 100:  # Likely base64
+            imgs.append(normalize_b64(fig))
+    
+    # 4. Check for questionImage field
+    if q.get("questionImage"):
+        qimg = q["questionImage"]
+        if isinstance(qimg, str):
+            if qimg.startswith("data:image") or len(qimg) > 100:
+                imgs.append(normalize_b64(qimg))
+            else:
+                # It might be an ID
+                loaded = await load_image_by_id(qimg)
+                if loaded:
+                    imgs.append(normalize_b64(loaded))
+        elif isinstance(qimg, dict):
+            b64 = qimg.get("base64Data")
+            if not b64:
+                b64 = await load_image_by_id(qimg.get("id"))
+            if b64:
+                imgs.append(normalize_b64(b64))
+    
+    logger.info(f"📷 Extracted {len(imgs)} question figure/diagram images for LLM evaluation")
     return imgs
+
+
+async def _option_images_base64(q: Dict[str, Any], db: DatabaseManager = None, is_b2c: bool = False) -> List[Dict[str, str]]:
+    """Extract images from MCQ options.
+    
+    Returns list of dicts with 'option' (A, B, C, D) and 'image' (base64 data URL)
+    """
+    import os
+    import base64 as base64_module
+    
+    option_images: List[Dict[str, str]] = []
+    
+    # Helper to load image by ID
+    async def load_image_by_id(img_id: str) -> Optional[str]:
+        if not img_id or not db:
+            return None
+        try:
+            if is_b2c:
+                img_doc = await db.b2c_find_one("images", {"_id": img_id})
+            else:
+                img_doc = await db.mongo_find_one("images", {"_id": img_id})
+            
+            if img_doc:
+                if img_doc.get("base64Data"):
+                    return img_doc["base64Data"]
+                elif img_doc.get("file_path"):
+                    file_path = img_doc["file_path"]
+                    if os.path.exists(file_path):
+                        with open(file_path, "rb") as f:
+                            image_bytes = f.read()
+                            base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                            content_type = img_doc.get("content_type", "image/jpeg")
+                            return f"data:{content_type};base64,{base64_encoded}"
+        except Exception as e:
+            logger.error(f"Failed to load option image {img_id}: {e}")
+        return None
+    
+    def normalize_b64(b64: str) -> str:
+        if b64 and not b64.startswith("data:image"):
+            return f"data:image/png;base64,{b64}"
+        return b64
+    
+    # Check enhancedOptions for image options
+    enh = q.get("enhancedOptions") or []
+    for i, opt in enumerate(enh):
+        label = chr(65 + i)  # A, B, C, D...
+        if isinstance(opt, dict) and opt.get("type") == "image":
+            b64 = opt.get("base64Data")
+            if not b64:
+                b64 = await load_image_by_id(opt.get("id"))
+            if b64:
+                option_images.append({
+                    "option": label,
+                    "image": normalize_b64(b64)
+                })
+    
+    # Also check regular options array for image objects
+    opts = q.get("options") or []
+    for i, opt in enumerate(opts):
+        label = chr(65 + i)
+        if isinstance(opt, dict):
+            if opt.get("type") == "image" or opt.get("image"):
+                b64 = opt.get("base64Data") or opt.get("image")
+                if not b64:
+                    b64 = await load_image_by_id(opt.get("id"))
+                if b64:
+                    option_images.append({
+                        "option": label,
+                        "image": normalize_b64(b64)
+                    })
+    
+    if option_images:
+        logger.info(f"📷 Extracted {len(option_images)} option images: {[o['option'] for o in option_images]}")
+    
+    return option_images
 
 def _normalize_choice_text(s: str) -> str:
     import re as _re
@@ -662,9 +753,18 @@ async def evaluate_submission(
         from services.async_openai_service import AsyncOpenAIService
         ai = AsyncOpenAIService()
 
-        # Prepare images: Question Figures + Student Canvas
-        # 1. Question Figures
+        # Prepare images: Question Figures + Option Images + Student Canvas
+        # 1. Question Figures (diagrams, inline images)
         question_images = await _figure_images_base64(question_doc, db, is_b2c)
+        
+        # 2. Option Images (for MCQs where options are images)
+        option_images_data = await _option_images_base64(question_doc, db, is_b2c)
+        option_images = [oi["image"] for oi in option_images_data]
+        
+        # Combine all question-related images
+        all_question_images = question_images + option_images
+        
+        logger.info(f"📷 Total question images: {len(all_question_images)} (figures: {len(question_images)}, option images: {len(option_images)})")
         
         # 2. Student Canvas Images - ENHANCED PROCESSING
         student_images_raw = []
@@ -727,12 +827,14 @@ async def evaluate_submission(
         
         # Combine all images for the LLM - STUDENT IMAGES FIRST, then question images
         # This ensures the LLM focuses on the student's work first
-        all_images = student_images + question_images
-        num_q_images = len(question_images)
+        all_images = student_images + all_question_images
+        num_q_images = len(all_question_images)
+        num_fig_images = len(question_images)
+        num_opt_images = len(option_images)
         num_s_images = len(student_images)
         
         # Log question details for debugging
-        logger.info(f"📝 Question {qid} details: text_len={len(question_text)}, correct_answer='{correct_answer}', is_mcq={is_mcq}, options_len={len(options_text)}")
+        logger.info(f"📝 Question {qid}: text_len={len(question_text)}, correct='{correct_answer}', is_mcq={is_mcq}, images: {num_s_images} student + {num_fig_images} fig + {num_opt_images} opt")
         
         # Determine if we need the LLM to solve the question itself
         has_correct_answer = bool(correct_answer and correct_answer.strip())
@@ -743,11 +845,17 @@ async def evaluate_submission(
             "Your task is to determine if their answer is CORRECT or INCORRECT.\n\n"
         )
         
-        # Add clear image labeling
+        # Add clear image labeling with detailed breakdown
         if num_s_images > 0 and num_q_images > 0:
-            prompt += f"📷 IMAGE GUIDE: You will see {num_s_images + num_q_images} images.\n"
+            prompt += f"📷 IMAGE GUIDE: You will see {num_s_images + num_q_images} images total.\n"
             prompt += f"  - Images 1 to {num_s_images}: STUDENT'S HANDWRITTEN WORK (analyze these carefully)\n"
-            prompt += f"  - Images {num_s_images + 1} to {num_s_images + num_q_images}: QUESTION DIAGRAMS (for reference)\n\n"
+            img_offset = num_s_images + 1
+            if num_fig_images > 0:
+                prompt += f"  - Images {img_offset} to {img_offset + num_fig_images - 1}: QUESTION DIAGRAMS/FIGURES (essential for understanding the question)\n"
+                img_offset += num_fig_images
+            if num_opt_images > 0:
+                prompt += f"  - Images {img_offset} to {img_offset + num_opt_images - 1}: MCQ OPTION IMAGES (these are the answer choices A, B, C, D as images)\n"
+            prompt += "\n⚠️ IMPORTANT: You MUST examine the QUESTION DIAGRAMS to understand the problem correctly!\n\n"
         elif num_s_images > 0:
             prompt += f"📷 IMAGE GUIDE: You will see {num_s_images} image(s) of the STUDENT'S HANDWRITTEN WORK.\n\n"
         elif num_q_images > 0:
