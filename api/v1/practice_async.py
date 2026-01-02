@@ -833,8 +833,16 @@ async def evaluate_submission(
         num_opt_images = len(option_images)
         num_s_images = len(student_images)
         
-        # Log question details for debugging
-        logger.info(f"📝 Question {qid}: text_len={len(question_text)}, correct='{correct_answer}', is_mcq={is_mcq}, images: {num_s_images} student + {num_fig_images} fig + {num_opt_images} opt")
+        # Log question details for debugging - DETAILED IMAGE LOGGING
+        logger.info(f"📝 Question {qid}: text_len={len(question_text)}, correct='{correct_answer}', is_mcq={is_mcq}")
+        logger.info(f"📷 Image breakdown for Q:{qid}:")
+        logger.info(f"   - Student canvas images: {num_s_images} (lengths: {[len(img) if img else 0 for img in student_images[:3]]}...)")
+        logger.info(f"   - Question figures: {num_fig_images} (from question_figures + images arrays)")
+        logger.info(f"   - Option images: {num_opt_images} (from enhancedOptions with type=image)")
+        if question_images:
+            logger.info(f"   - Question image samples: {[img[:50]+'...' if img else 'None' for img in question_images[:2]]}")
+        if not all_question_images and not student_images:
+            logger.warning(f"⚠️ No images at all for Q:{qid} evaluation! This may cause issues.")
         
         # Determine if we need the LLM to solve the question itself
         has_correct_answer = bool(correct_answer and correct_answer.strip())
@@ -912,38 +920,51 @@ async def evaluate_submission(
         # Specific evaluation instructions based on question type AND whether answer is provided
         if is_mcq:
             prompt += "🎯 EVALUATION RULES (Multiple Choice Question):\n"
-            prompt += "1. Look for a LETTER (A, B, C, D, etc.) in the student's handwriting.\n"
-            prompt += "2. Common handwriting variations: curved lines may be 'C' or 'D', bumpy lines may be 'B'.\n"
+            prompt += "1. Look for a LETTER (A, B, C, D, etc.) in the student's handwriting - this is their FINAL answer.\n"
+            prompt += "2. IMPORTANT: Students often show their WORK (calculations, equations, diagrams) before writing their final letter.\n"
+            prompt += "3. If you see calculations/work but NO final letter, evaluate if their work leads to the correct answer.\n"
+            prompt += "4. Common handwriting variations: curved lines may be 'C' or 'D', bumpy lines may be 'B'.\n"
             if has_correct_answer:
-                prompt += f"3. The student is CORRECT if their letter matches '{correct_answer}'.\n"
+                prompt += f"5. The student is CORRECT if:\n"
+                prompt += f"   - Their final letter matches '{correct_answer}', OR\n"
+                prompt += f"   - Their calculations/work correctly lead to option '{correct_answer}' (even if letter is missing)\n"
             else:
-                prompt += "3. Compare the student's letter to YOUR solved answer.\n"
-            prompt += "4. Ignore any scratch work - focus on their FINAL circled or clearly written letter.\n\n"
+                prompt += "5. Compare the student's letter/work to YOUR solved answer.\n"
+            prompt += "6. For numerical MCQs: Check if their calculated value matches one of the options.\n\n"
         else:
             prompt += "🎯 EVALUATION RULES (Subjective Question):\n"
             prompt += "1. Transcribe all text, numbers, and equations from the student's handwriting.\n"
+            prompt += "2. Look for their FINAL answer (often boxed, circled, or underlined).\n"
             if has_correct_answer:
-                prompt += f"2. Compare their answer/solution to the correct answer: '{correct_answer[:100]}{'...' if len(correct_answer) > 100 else ''}'.\n"
+                prompt += f"3. Compare their answer/solution to the correct answer: '{correct_answer[:100]}{'...' if len(correct_answer) > 100 else ''}'.\n"
             else:
-                prompt += "2. Compare their answer/solution to YOUR solved answer.\n"
-            prompt += "3. They are CORRECT if the answer matches or the solution approach is correct.\n"
-            prompt += "4. Partial credit: if they're on the right track but made a small error.\n\n"
+                prompt += "3. Compare their answer/solution to YOUR solved answer.\n"
+            prompt += "4. They are CORRECT if the answer matches or the solution approach is correct.\n"
+            prompt += "5. Partial credit (score 0.5): if they're on the right track but made a small error.\n\n"
+        
         
         # JSON output instructions - include solved_answer for no-answer cases
         prompt += "═══════════════════════════════════════\n"
         prompt += "📊 RETURN THIS JSON EXACTLY:\n"
         prompt += "═══════════════════════════════════════\n"
         prompt += "{\n"
-        prompt += '  "extracted_answer": "EXACTLY what the student wrote (letter for MCQ, full text for others)",\n'
+        prompt += '  "extracted_answer": "The student\'s FINAL answer (the letter for MCQ, or the final numerical/text answer)",\n'
+        prompt += '  "work_shown": "Summary of any calculations or work the student showed",\n'
         prompt += '  "is_correct": true or false,\n'
+        prompt += '  "score": 0.0 to 1.0 (1.0 = fully correct, 0.5 = partially correct approach, 0.0 = wrong),\n'
         if not has_correct_answer:
-            prompt += '  "solved_answer": "The correct answer YOU calculated (REQUIRED since no answer was provided)",\n'
-        prompt += '  "feedback": "Encouraging feedback explaining why correct/incorrect",\n'
+            prompt += '  "solved_answer": "The correct answer YOU calculated",\n'
+        prompt += '  "what_went_wrong": "If incorrect: EXPLAIN specifically what mistake the student made (e.g., wrong formula, calculation error, misread question). If correct: leave empty or say \'Nothing - great work!\'",\n'
+        prompt += '  "correct_solution": "If incorrect: Provide the COMPLETE step-by-step solution showing how to solve this problem correctly. Include all formulas, substitutions, and calculations. If correct: Brief confirmation of their approach",\n'
+        prompt += '  "feedback": "Encouraging, educational feedback for the student",\n'
         prompt += '  "reasoning": "Your step-by-step evaluation logic"\n'
         prompt += "}\n\n"
         prompt += "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
+        prompt += "CRITICAL FOR WRONG ANSWERS: You MUST provide:\n"
+        prompt += "  1. 'what_went_wrong' - Specific explanation of the student's mistake\n"
+        prompt += "  2. 'correct_solution' - Complete step-by-step solution with all calculations\n"
         if not has_correct_answer:
-            prompt += "CRITICAL: You MUST solve the question first and include 'solved_answer' in your response!\n"
+            prompt += "  3. 'solved_answer' - The correct answer you calculated\n"
         
         logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
         
@@ -1055,10 +1076,34 @@ async def evaluate_submission(
                 else:
                     evaluation_data["correct"] = bool(is_correct_val)
                 
-                evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
+                # Parse score - use LLM-provided score if available, else default based on correctness
+                llm_score = parsed.get("score")
+                if llm_score is not None:
+                    try:
+                        evaluation_data["score"] = float(llm_score)
+                    except (ValueError, TypeError):
+                        evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
+                else:
+                    evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
+                
                 evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
                 evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
                 evaluation_data["reasoning"] = str(parsed.get("reasoning", "")).strip()
+                
+                # Extract work_shown for display
+                work_shown = parsed.get("work_shown", "")
+                if work_shown:
+                    evaluation_data["workShown"] = str(work_shown).strip()
+                
+                # Extract what_went_wrong - explanation of student's mistake
+                what_went_wrong = parsed.get("what_went_wrong", "")
+                if what_went_wrong:
+                    evaluation_data["whatWentWrong"] = str(what_went_wrong).strip()
+                
+                # Extract correct_solution - step-by-step solution
+                correct_solution = parsed.get("correct_solution", "")
+                if correct_solution:
+                    evaluation_data["correctSolution"] = str(correct_solution).strip()
                 
                 # Handle solved_answer - when admin didn't provide a correct answer, LLM solved it
                 solved_answer = parsed.get("solved_answer", "")
@@ -1072,7 +1117,7 @@ async def evaluate_submission(
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
                     evaluation_data["answerSource"] = "ocr_extraction"
                 
-                logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}'")
+                logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, score={evaluation_data['score']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}', has_solution={bool(correct_solution)}")
                     
             else:
                 # Fallback if no JSON found
