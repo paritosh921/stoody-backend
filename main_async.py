@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from pyinstrument import Profiler
 
 # Import configuration
 from config_async import (
@@ -268,6 +269,28 @@ app.add_middleware(
 
 # Subdomain extraction middleware (MUST be before other middlewares)
 app.middleware("http")(subdomain_middleware)
+
+@app.middleware("http")
+async def profile_request(request: Request, call_next):
+    """Profiler middleware"""
+    if request.query_params.get("profile", "false").lower() == "true":
+        profiler = Profiler(interval=0.001, async_mode="enabled")
+        profiler.start()
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            profiler.stop()
+            output_dir = "logs/profiles"
+            os.makedirs(output_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            html_path = f"{output_dir}/profile_{timestamp}.html"
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(profiler.output_html())
+            logger.info(f"Profiler saved to {html_path}")
+            logger.info("\n" + profiler.output_text(unicode=True, color=True, show_all=True))
+    else:
+        return await call_next(request)
 
 # Request timing middleware
 @app.middleware("http")
