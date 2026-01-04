@@ -20,7 +20,7 @@ from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
 from utils.path_utils import get_absolute_path
-from utils.s3_storage import download_file as s3_download_file, is_s3_enabled
+from utils.s3_storage import download_file as s3_download_file, upload_file as s3_upload_file, delete_file as s3_delete_file, is_s3_enabled, get_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -112,15 +112,38 @@ async def upload_image(
         file_id = str(uuid.uuid4())
         unique_filename = f"{file_id}{file_ext}"
 
-        # Create uploads directory if it doesn't exist
-        upload_dir = os.path.join(os.getcwd(), "uploads", "images")
-        os.makedirs(upload_dir, exist_ok=True)
+        # Define the local path (used for S3 key generation)
+        local_path = os.path.join(os.getcwd(), "uploads", "images", unique_filename)
 
-        file_path = os.path.join(upload_dir, unique_filename)
+        # Detect content type
+        content_type = file.content_type or "application/octet-stream"
 
-        # Save file
-        async with aiofiles.open(file_path, "wb") as f:
-            await f.write(file_content)
+        # Use S3 storage if enabled, otherwise save locally
+        if is_s3_enabled():
+            # Upload to S3
+            success, storage_path = await s3_upload_file(
+                file_data=file_content,
+                local_path=local_path,
+                content_type=content_type
+            )
+            if success:
+                logger.info(f"✅ Uploaded image to S3: {storage_path}")
+            else:
+                # Fallback to local if S3 fails
+                logger.warning("S3 upload failed, falling back to local storage")
+                upload_dir = os.path.join(os.getcwd(), "uploads", "images")
+                os.makedirs(upload_dir, exist_ok=True)
+                async with aiofiles.open(local_path, "wb") as f:
+                    await f.write(file_content)
+                storage_path = local_path
+        else:
+            # Save file locally
+            upload_dir = os.path.join(os.getcwd(), "uploads", "images")
+            os.makedirs(upload_dir, exist_ok=True)
+            async with aiofiles.open(local_path, "wb") as f:
+                await f.write(file_content)
+            storage_path = local_path
+            logger.info(f"Saved image locally: {local_path}")
 
         # Save metadata to database
         image_metadata = {
@@ -128,11 +151,12 @@ async def upload_image(
             "filename": unique_filename,
             "original_filename": file.filename,
             "size": file_size,
-            "content_type": file.content_type or "application/octet-stream",
+            "content_type": content_type,
             "uploaded_by": current_user["user_id"],
             "uploaded_at": datetime.utcnow(),
             "is_processed": False,
-            "file_path": file_path,
+            "file_path": storage_path,
+            "is_s3": is_s3_enabled(),  # Track storage location
             "tags": []
         }
 
@@ -143,7 +167,7 @@ async def upload_image(
             filename=unique_filename,
             url=f"/api/v1/images/{file_id}",
             size=file_size,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=content_type,
             uploaded_at=image_metadata["uploaded_at"]
         )
 
@@ -371,22 +395,31 @@ async def delete_image(
                 detail="Access denied"
             )
 
-        # Delete file from filesystem
+        # Delete file from storage (S3 or local filesystem)
         stored_path = image_data.get("file_path")
         if stored_path:
-            # Convert to absolute path (handles both old absolute and new relative paths)
-            from pathlib import Path
-            if Path(stored_path).is_absolute():
-                file_path = Path(stored_path)
+            # Check if stored in S3
+            if str(stored_path).startswith("s3://"):
+                # Delete from S3
+                deleted = await s3_delete_file(stored_path)
+                if deleted:
+                    logger.info(f"✅ Deleted file from S3: {stored_path}")
+                else:
+                    logger.warning(f"Failed to delete file from S3: {stored_path}")
             else:
-                file_path = get_absolute_path(stored_path)
+                # Delete from local filesystem
+                from pathlib import Path
+                if Path(stored_path).is_absolute():
+                    file_path = Path(stored_path)
+                else:
+                    file_path = get_absolute_path(stored_path)
 
-            if file_path.exists():
-                try:
-                    file_path.unlink()
-                    logger.info(f"Deleted file: {file_path}")
-                except OSError as e:
-                    logger.warning(f"Could not delete file {file_path}: {e}")
+                if file_path.exists():
+                    try:
+                        file_path.unlink()
+                        logger.info(f"Deleted file: {file_path}")
+                    except OSError as e:
+                        logger.warning(f"Could not delete file {file_path}: {e}")
 
         # Delete from database
         result = await db.mongo_delete_one("images", {"_id": image_id})
