@@ -480,6 +480,18 @@ async def health_check(request: Request):
         except Exception as _chroma_err:
             logger.warning(f"ChromaDB health probe failed: {str(_chroma_err)}")
 
+        # Check S3 storage status
+        try:
+            from utils.s3_storage import is_s3_enabled, S3_BUCKET_NAME, USE_S3_STORAGE
+            s3_enabled = is_s3_enabled()
+            s3_status = {
+                "enabled": s3_enabled,
+                "use_s3_storage_env": USE_S3_STORAGE,
+                "bucket": S3_BUCKET_NAME if s3_enabled else None
+            }
+        except Exception as _s3_err:
+            s3_status = {"enabled": False, "error": str(_s3_err)}
+
         # Treat cache as optional in all environments; report overall service as running
         # even if one or more dependencies are degraded. Frontend uses this flag to
         # detect whether the backend is reachable.
@@ -501,7 +513,8 @@ async def health_check(request: Request):
                     "connected": chroma_healthy,
                     "status": "online" if chroma_healthy else "offline",
                     "questions_count": chroma_count
-                }
+                },
+                "s3_storage": s3_status
             },
             "chromaConnected": chroma_healthy,
             "chromadb": {
@@ -509,6 +522,7 @@ async def health_check(request: Request):
                 "status": "online" if chroma_healthy else "offline",
                 "questions_count": chroma_count
             },
+            "s3_storage": s3_status,
             "version": "2.0.0",
             "mode": "development" if DEBUG_MODE else "production"
         }
