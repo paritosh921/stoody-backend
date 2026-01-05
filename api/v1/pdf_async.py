@@ -334,9 +334,8 @@ async def save_image_to_disk(
         image_parts = split_composite_image(image_data, image_id) if split_composite else [image_data]
         was_split = len(image_parts) > 1
 
-        # Create uploads directory structure
+        # Define uploads directory structure (only create if NOT using S3)
         upload_dir = os.path.join(os.getcwd(), "uploads", "pdf_images", pdf_filename.replace('.pdf', ''))
-        os.makedirs(upload_dir, exist_ok=True)
 
         # Generate filename with correct extension based on actual format
         # Strip any existing extension from image_id
@@ -429,6 +428,7 @@ async def save_image_to_disk(
                         logger.warning(f"S3 upload failed for split part: {image_filename}")
                         relative_path = ""
                 else:
+                    os.makedirs(upload_dir, exist_ok=True)
                     async with aiofiles.open(file_path, "wb") as f:
                         await f.write(img_data)
                     logger.info(f"Saved split part {idx+1}/{len(image_parts)} locally: {image_filename}")
