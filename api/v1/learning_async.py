@@ -930,3 +930,448 @@ async def get_chapter_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to serve PDF file: {str(e)}"
         )
+
+
+# ============================================================================
+# ANNOTATION ENDPOINTS - For saving student highlights, notes, bookmarks
+# ============================================================================
+
+class AnnotationPosition(BaseModel):
+    """Position for annotation on page"""
+    x: float
+    y: float
+    width: Optional[float] = None
+    height: Optional[float] = None
+
+
+class HighlightData(BaseModel):
+    """Highlight annotation data"""
+    id: str
+    pageNumber: int
+    position: AnnotationPosition
+    color: str
+    text: Optional[str] = None
+    createdAt: str
+
+
+class NoteData(BaseModel):
+    """Note annotation data"""
+    id: str
+    pageNumber: int
+    position: AnnotationPosition
+    content: str
+    color: str
+    createdAt: str
+    updatedAt: str
+
+
+class BookmarkData(BaseModel):
+    """Bookmark data"""
+    id: str
+    pageNumber: int
+    title: str
+    createdAt: str
+
+
+class AnnotationsPayload(BaseModel):
+    """Full annotations payload for saving"""
+    documentId: str
+    highlights: Optional[List[HighlightData]] = []
+    notes: Optional[List[NoteData]] = []
+    bookmarks: Optional[List[BookmarkData]] = []
+    lastViewedPage: Optional[int] = 1
+    lastViewedAt: Optional[str] = None
+    totalReadingTime: Optional[int] = 0
+
+
+@router.get("/annotations/{document_id}", tags=["Learning", "Annotations"])
+async def get_annotations(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get all annotations for a document by the current user
+    Returns highlights, notes, bookmarks, and reading progress
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        logger.info(f"Getting annotations for document {document_id} by user {user_id}")
+        
+        # Query the appropriate database
+        query = {
+            "document_id": document_id,
+            "user_id": user_id
+        }
+        
+        if is_b2c:
+            annotation = await db.b2c_find_one("document_annotations", query)
+        else:
+            annotation = await db.mongo_find_one("document_annotations", query)
+        
+        if not annotation:
+            # Return empty annotation structure
+            return {
+                "success": True,
+                "data": {
+                    "documentId": document_id,
+                    "userId": user_id,
+                    "highlights": [],
+                    "notes": [],
+                    "bookmarks": [],
+                    "lastViewedPage": 1,
+                    "lastViewedAt": None,
+                    "totalReadingTime": 0
+                }
+            }
+        
+        # Convert MongoDB document to response format
+        return {
+            "success": True,
+            "data": {
+                "documentId": annotation.get("document_id"),
+                "userId": annotation.get("user_id"),
+                "highlights": annotation.get("highlights", []),
+                "notes": annotation.get("notes", []),
+                "bookmarks": annotation.get("bookmarks", []),
+                "lastViewedPage": annotation.get("last_viewed_page", 1),
+                "lastViewedAt": annotation.get("last_viewed_at"),
+                "totalReadingTime": annotation.get("total_reading_time", 0)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get annotations: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve annotations: {str(e)}"
+        )
+
+
+@router.post("/annotations/{document_id}", tags=["Learning", "Annotations"])
+async def save_annotations(
+    document_id: str,
+    payload: AnnotationsPayload,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Save annotations for a document by the current user
+    Creates or updates highlights, notes, bookmarks, and reading progress
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        logger.info(f"Saving annotations for document {document_id} by user {user_id}")
+        
+        # Prepare the annotation document
+        annotation_doc = {
+            "document_id": document_id,
+            "user_id": user_id,
+            "highlights": [h.dict() if hasattr(h, 'dict') else h for h in (payload.highlights or [])],
+            "notes": [n.dict() if hasattr(n, 'dict') else n for n in (payload.notes or [])],
+            "bookmarks": [b.dict() if hasattr(b, 'dict') else b for b in (payload.bookmarks or [])],
+            "last_viewed_page": payload.lastViewedPage or 1,
+            "last_viewed_at": payload.lastViewedAt or datetime.utcnow().isoformat(),
+            "total_reading_time": payload.totalReadingTime or 0,
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Query filter
+        query = {
+            "document_id": document_id,
+            "user_id": user_id
+        }
+        
+        # Upsert the annotation
+        if is_b2c:
+            existing = await db.b2c_find_one("document_annotations", query)
+            if existing:
+                await db.b2c_update_one("document_annotations", query, {"$set": annotation_doc})
+            else:
+                annotation_doc["created_at"] = datetime.utcnow()
+                await db.b2c_insert_one("document_annotations", annotation_doc)
+        else:
+            existing = await db.mongo_find_one("document_annotations", query)
+            if existing:
+                await db.mongo_update_one("document_annotations", query, {"$set": annotation_doc})
+            else:
+                annotation_doc["created_at"] = datetime.utcnow()
+                await db.mongo_insert_one("document_annotations", annotation_doc)
+        
+        return {
+            "success": True,
+            "message": "Annotations saved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to save annotations: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save annotations: {str(e)}"
+        )
+
+
+@router.post("/reading-time/{document_id}", tags=["Learning", "Annotations"])
+async def update_reading_time(
+    document_id: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Update reading time for a document
+    Adds additional reading time to the total
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        # Parse request body
+        body = await request.json()
+        additional_time = body.get("additionalTime", 0)
+        
+        if additional_time <= 0:
+            return {"success": True, "message": "No time to add"}
+        
+        logger.info(f"Adding {additional_time}s reading time for document {document_id} by user {user_id}")
+        
+        query = {
+            "document_id": document_id,
+            "user_id": user_id
+        }
+        
+        update = {
+            "$inc": {"total_reading_time": additional_time},
+            "$set": {
+                "last_viewed_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow()
+            }
+        }
+        
+        if is_b2c:
+            existing = await db.b2c_find_one("document_annotations", query)
+            if existing:
+                await db.b2c_update_one("document_annotations", query, update)
+            else:
+                # Create new annotation document with just reading time
+                await db.b2c_insert_one("document_annotations", {
+                    "document_id": document_id,
+                    "user_id": user_id,
+                    "highlights": [],
+                    "notes": [],
+                    "bookmarks": [],
+                    "last_viewed_page": 1,
+                    "last_viewed_at": datetime.utcnow().isoformat(),
+                    "total_reading_time": additional_time,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                })
+        else:
+            existing = await db.mongo_find_one("document_annotations", query)
+            if existing:
+                await db.mongo_update_one("document_annotations", query, update)
+            else:
+                # Create new annotation document with just reading time
+                await db.mongo_insert_one("document_annotations", {
+                    "document_id": document_id,
+                    "user_id": user_id,
+                    "highlights": [],
+                    "notes": [],
+                    "bookmarks": [],
+                    "last_viewed_page": 1,
+                    "last_viewed_at": datetime.utcnow().isoformat(),
+                    "total_reading_time": additional_time,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                })
+        
+        # Also log to activity log
+        try:
+            activity_log = {
+                "student_id": ObjectId(user_id) if not is_b2c else user_id,
+                "action": "reading_session",
+                "timestamp": datetime.utcnow(),
+                "metadata": {
+                    "document_id": document_id,
+                    "reading_time_seconds": additional_time
+                }
+            }
+            
+            if is_b2c:
+                await db.b2c_insert_one("user_activity_log", activity_log)
+            else:
+                await db.mongo_insert_one("student_activity_log", activity_log)
+        except Exception as log_error:
+            logger.error(f"Failed to log reading activity: {str(log_error)}")
+        
+        return {
+            "success": True,
+            "message": f"Added {additional_time}s reading time"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to update reading time: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update reading time: {str(e)}"
+        )
+
+
+@router.get("/my-notes", tags=["Learning", "Annotations"])
+async def get_all_user_notes(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get all notes across all documents for the current user
+    Returns a summary of all notes with document info
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        query = {"user_id": user_id}
+        
+        if is_b2c:
+            annotations = await db.b2c_find("document_annotations", query)
+        else:
+            annotations = await db.mongo_find("document_annotations", query)
+        
+        all_notes = []
+        for annotation in annotations:
+            doc_id = annotation.get("document_id")
+            notes = annotation.get("notes", [])
+            
+            for note in notes:
+                all_notes.append({
+                    "documentId": doc_id,
+                    "note": note,
+                    "lastViewedAt": annotation.get("last_viewed_at")
+                })
+        
+        # Sort by most recent
+        all_notes.sort(key=lambda x: x.get("note", {}).get("updatedAt", ""), reverse=True)
+        
+        return {
+            "success": True,
+            "data": {
+                "notes": all_notes,
+                "total": len(all_notes)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get user notes: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve notes: {str(e)}"
+        )
+
+
+@router.get("/my-bookmarks", tags=["Learning", "Annotations"])
+async def get_all_user_bookmarks(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get all bookmarks across all documents for the current user
+    Returns a summary of all bookmarks with document info
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        query = {"user_id": user_id}
+        
+        if is_b2c:
+            annotations = await db.b2c_find("document_annotations", query)
+        else:
+            annotations = await db.mongo_find("document_annotations", query)
+        
+        all_bookmarks = []
+        for annotation in annotations:
+            doc_id = annotation.get("document_id")
+            bookmarks = annotation.get("bookmarks", [])
+            
+            for bookmark in bookmarks:
+                all_bookmarks.append({
+                    "documentId": doc_id,
+                    "bookmark": bookmark,
+                    "lastViewedAt": annotation.get("last_viewed_at")
+                })
+        
+        # Sort by page number
+        all_bookmarks.sort(key=lambda x: x.get("bookmark", {}).get("pageNumber", 0))
+        
+        return {
+            "success": True,
+            "data": {
+                "bookmarks": all_bookmarks,
+                "total": len(all_bookmarks)
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get user bookmarks: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve bookmarks: {str(e)}"
+        )
+
+
+@router.get("/reading-stats", tags=["Learning", "Annotations"])
+async def get_reading_stats(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get reading statistics for the current user
+    Returns total reading time, documents read, notes count, etc.
+    """
+    try:
+        user_id = current_user.get("user_id")
+        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+        
+        query = {"user_id": user_id}
+        
+        if is_b2c:
+            annotations = await db.b2c_find("document_annotations", query)
+        else:
+            annotations = await db.mongo_find("document_annotations", query)
+        
+        total_reading_time = 0
+        total_notes = 0
+        total_bookmarks = 0
+        total_highlights = 0
+        documents_read = 0
+        
+        for annotation in annotations:
+            total_reading_time += annotation.get("total_reading_time", 0)
+            total_notes += len(annotation.get("notes", []))
+            total_bookmarks += len(annotation.get("bookmarks", []))
+            total_highlights += len(annotation.get("highlights", []))
+            if annotation.get("total_reading_time", 0) > 0:
+                documents_read += 1
+        
+        return {
+            "success": True,
+            "data": {
+                "totalReadingTime": total_reading_time,
+                "totalReadingTimeFormatted": f"{total_reading_time // 3600}h {(total_reading_time % 3600) // 60}m",
+                "documentsRead": documents_read,
+                "totalNotes": total_notes,
+                "totalBookmarks": total_bookmarks,
+                "totalHighlights": total_highlights
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get reading stats: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve reading stats: {str(e)}"
+        )
