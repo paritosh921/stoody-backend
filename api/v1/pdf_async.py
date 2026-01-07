@@ -32,7 +32,7 @@ from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
 from utils.path_utils import get_relative_path, get_absolute_path
-from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url
+from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url, download_file
 
 logger = logging.getLogger(__name__)
 
@@ -476,9 +476,19 @@ async def save_image_to_disk(
 def extract_questions_from_ocr(
     ocr_result: Dict[str, Any],
     subject: str,
-    difficulty: str
+    difficulty: str,
+    skip_option_extraction: bool = False  # When True, keep options in question text (for Practice Sets)
 ) -> List[ExtractedQuestion]:
-    """Extract questions from Mistral OCR result"""
+    """Extract questions from Mistral OCR result.
+    
+    Args:
+        ocr_result: The raw OCR result from Mistral
+        subject: Subject of the document
+        difficulty: Difficulty level
+        skip_option_extraction: If True, don't extract options separately - keep them in question text.
+                               This is used for Practice Sets where we want the full question with options
+                               to be displayed inline.
+    """
     questions = []
     
     # ------------------------------
@@ -564,6 +574,9 @@ def extract_questions_from_ocr(
         # Compile regex patterns for option label detection
         option_label_pattern = re.compile(r'^\s*\(([A-Da-d]|[ivxIVX]+)\)\s*$')  # (A), (B), (i), (ii), etc.
 
+        # Buffer for images detected before the corresponding question text starts
+        pending_images: List[str] = []
+
         for line_num, line in enumerate(lines):
             line_stripped = line.strip()
             if not line_stripped:
@@ -590,8 +603,11 @@ def extract_questions_from_ocr(
 
             # NEW LOGIC: Classify images based on previous line
             if image_refs and not current_question:
-                # Images before any question - skip them
-                pass
+                # Buffer images appearing before question starts
+                for img_ref in image_refs:
+                    if img_ref not in pending_images:
+                        pending_images.append(img_ref)
+                logger.info(f"Buffered {len(image_refs)} images appearing before question start")
             elif image_refs and current_question:
                 # Check if previous line was an option label
                 is_option_image = option_label_pattern.match(previous_line)
@@ -673,19 +689,44 @@ def extract_questions_from_ocr(
                         logger.info(f"📝 Text-based question: {len(current_options)} text options, {num_question_figures} question figures")
 
                     logger.info(f"Extracted question: {len(final_options)} options, {len(final_question_images)} question figures, {total_images} total images")
-                    questions.append(ExtractedQuestion(
-                        id=str(uuid.uuid4()),
-                        text=current_question_text,
-                        options=final_options,
-                        metadata={
-                            "subject": subject,
-                            "difficulty": difficulty,
-                            "page": page.get("index", 0),
-                            "image_refs": current_image_refs,  # All images (question + option)
-                            "question_image_refs": final_question_images,  # Only question figures
-                            "is_image_based_mcq": is_image_based_mcq
-                        }
-                    ))
+                    
+                    # If skip_option_extraction is True, include options in the question text
+                    if skip_option_extraction and final_options:
+                        # Build question text with options inline
+                        inline_question_text = current_question_text + "\n\n"
+                        for idx, opt in enumerate(final_options):
+                            label = chr(65 + idx)  # A, B, C, D...
+                            inline_question_text += f"({label}) {opt}\n"
+                        
+                        questions.append(ExtractedQuestion(
+                            id=str(uuid.uuid4()),
+                            text=inline_question_text.strip(),
+                            options=[],  # Empty options - they're now in the text
+                            metadata={
+                                "subject": subject,
+                                "difficulty": difficulty,
+                                "page": page.get("index", 0),
+                                "image_refs": current_image_refs,
+                                "question_image_refs": final_question_images,
+                                "is_image_based_mcq": is_image_based_mcq,
+                                "options_inline": True  # Flag to indicate options are in text
+                            }
+                        ))
+                        logger.info(f"📝 Practice mode: Included {len(final_options)} options inline with question text")
+                    else:
+                        questions.append(ExtractedQuestion(
+                            id=str(uuid.uuid4()),
+                            text=current_question_text,
+                            options=final_options,
+                            metadata={
+                                "subject": subject,
+                                "difficulty": difficulty,
+                                "page": page.get("index", 0),
+                                "image_refs": current_image_refs,  # All images (question + option)
+                                "question_image_refs": final_question_images,  # Only question figures
+                                "is_image_based_mcq": is_image_based_mcq
+                            }
+                        ))
 
                 # Use the line without heading markers for question text
                 current_question = line_without_heading
@@ -694,13 +735,25 @@ def extract_questions_from_ocr(
                 current_image_refs = []
                 current_question_images = []
                 current_option_images = []
+                
+                # Ingest pending images (found before this question started)
+                if pending_images:
+                    logger.info(f"Attaching {len(pending_images)} pending images to new question")
+                    current_image_refs.extend(pending_images)
+                    # Assume pending images are question figures
+                    for img in pending_images:
+                        if img not in current_question_images:
+                            current_question_images.append(img)
+                    pending_images = []
+
                 accumulating_option_idx = None
 
             # Detect text options - ONLY accept lines that start with option label
             # This is consistent with image option detection logic
             elif current_question and not image_refs:
-                # Check if this line starts with an option marker (A. / (A) / A) etc.)
-                option_match = re.match(r'^\s*(?:\(|\[)?([A-Fa-f])[\.|\)]\s*(.*)', line_stripped)
+                # Check if this line starts with an option marker (A. / (A) / A) / (1) / (i) etc.)
+                # Updated regex to be more inclusive of formats like (a), (1), (i), etc.
+                option_match = re.match(r'^\s*(?:\(|\[)?([A-Za-z]|[0-9]{1,2}|[ivxIVX]+)[\.|\)]\s*(.*)', line_stripped)
                 if option_match:
                     option_label = option_match.group(1).upper()
                     option_text = option_match.group(2).strip()
@@ -786,19 +839,44 @@ def extract_questions_from_ocr(
                 f"Extracted last question: {len(final_options)} options, "
                 f"{len(final_question_images)} question figures, {total_images} total images"
             )
-            questions.append(ExtractedQuestion(
-                id=str(uuid.uuid4()),
-                text=current_question_text,
-                options=final_options,
-                metadata={
-                    "subject": subject,
-                    "difficulty": difficulty,
-                    "page": page.get("index", 0),
-                    "image_refs": current_image_refs,
-                    "question_image_refs": final_question_images,  # Only question figures
-                    "is_image_based_mcq": is_image_based_mcq
-                }
-            ))
+            
+            # If skip_option_extraction is True, include options in the question text
+            if skip_option_extraction and final_options:
+                # Build question text with options inline
+                inline_question_text = current_question_text + "\n\n"
+                for idx, opt in enumerate(final_options):
+                    label = chr(65 + idx)  # A, B, C, D...
+                    inline_question_text += f"({label}) {opt}\n"
+                
+                questions.append(ExtractedQuestion(
+                    id=str(uuid.uuid4()),
+                    text=inline_question_text.strip(),
+                    options=[],  # Empty options - they're now in the text
+                    metadata={
+                        "subject": subject,
+                        "difficulty": difficulty,
+                        "page": page.get("index", 0),
+                        "image_refs": current_image_refs,
+                        "question_image_refs": final_question_images,
+                        "is_image_based_mcq": is_image_based_mcq,
+                        "options_inline": True
+                    }
+                ))
+                logger.info(f"📝 Practice mode (last): Included {len(final_options)} options inline with question text")
+            else:
+                questions.append(ExtractedQuestion(
+                    id=str(uuid.uuid4()),
+                    text=current_question_text,
+                    options=final_options,
+                    metadata={
+                        "subject": subject,
+                        "difficulty": difficulty,
+                        "page": page.get("index", 0),
+                        "image_refs": current_image_refs,
+                        "question_image_refs": final_question_images,  # Only question figures
+                        "is_image_based_mcq": is_image_based_mcq
+                    }
+                ))
 
     return questions
 
@@ -821,14 +899,22 @@ async def run_document_ocr_pipeline(
         processing_result["progress"] = 60
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
-        logger.info(f"Extracting questions from OCR result for job {job_id}")
+        document_type = document.get("document_type", "Chapter Notes")
+        logger.info(f"Extracting questions from OCR result for job {job_id}, document_type: {document_type}")
+        
+        # For Practice Sets, don't extract options separately - keep them in question text
+        skip_option_extraction = document_type == "Practice Sets"
+        
         extracted_questions = extract_questions_from_ocr(
             ocr_result,
             document.get("subject", "General"),
-            document.get("difficulty", "medium")
+            document.get("difficulty", "medium"),
+            skip_option_extraction=skip_option_extraction
         )
+        
+        if skip_option_extraction:
+            logger.info(f"📝 Practice Sets mode: Options kept inline with question text")
 
-        document_type = document.get("document_type", "Chapter Notes")
         logger.info(f"Processing extracted images for job {job_id}, document type: {document_type}")
 
         all_images: List[Dict[str, Any]] = []
@@ -1402,110 +1488,25 @@ async def upload_pdf(
 
         logger.info(f"Document {document_id} uploaded successfully to {'B2C' if is_b2c else 'regular'} database")
         
-        # Auto-trigger OCR for Test Series and Practice Sets
-        should_auto_ocr = document_type in ["Test Series", "Practice Sets"]
+        # NOTE: Auto-OCR has been disabled to allow manual question segmentation
+        # The admin can now:
+        # 1. Preview the PDF and draw bounding boxes around each question
+        # 2. Use the "Segment" button to manually define question regions
+        # 3. Then trigger OCR which will process each region individually
+        # This gives better control over question extraction, especially for complex PDFs
+        
+        # Document starts with 'not_processed' status - admin must manually trigger OCR
         ocr_status = "not_processed"
         ocr_job_id = None
-        
-        if should_auto_ocr:
-            try:
-                # Import required modules for background OCR
-                job_id = str(uuid.uuid4())
-                ocr_job_id = job_id
-                
-                # Update status to processing in appropriate database
-                if is_b2c:
-                    await db.b2c_update_one(
-                        "documents",
-                        {"document_id": document_id},
-                        {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
-                    )
-                else:
-                    await db.mongo_update_one(
-                        "documents",
-                        {"document_id": document_id},
-                        {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
-                    )
-                ocr_status = "processing"
-                
-                # Encode PDF for OCR
-                pdf_base64 = base64.b64encode(file_content).decode('utf-8')
-                
-                # Create processing result for cache
-                processing_result = {
-                    "job_id": job_id,
-                    "status": "processing",
-                    "progress": 20,
-                    "extracted_questions": 0,
-                    "extracted_images": 0,
-                    "output_folder": f"extracted_{document_id}_{int(datetime.utcnow().timestamp())}",
-                    "timestamp": datetime.utcnow()
-                }
-                
-                # Use the cache passed as dependency (not get_cache())
-                await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
-                
-                # Run OCR in background task
-                async def background_ocr():
-                    try:
-                        await run_document_ocr_pipeline(
-                            document=document_metadata,
-                            pdf_base64=pdf_base64,
-                            job_id=job_id,
-                            processing_result=processing_result,
-                            current_user=current_user,
-                            db=db,
-                            cache=cache
-                        )
-                        logger.info(f"Auto-OCR completed successfully for {document_id}")
-                    except Exception as ocr_exc:
-                        logger.error(f"Auto-OCR failed for {document_id}: {ocr_exc}")
-                        # Update document status to error so UI doesn't show infinite processing
-                        try:
-                            if is_b2c:
-                                await db.b2c_update_one(
-                                    "documents",
-                                    {"document_id": document_id},
-                                    {"$set": {"ocr_status": "error"}}
-                                )
-                            else:
-                                await db.mongo_update_one(
-                                    "documents",
-                                    {"document_id": document_id},
-                                    {"$set": {"ocr_status": "error"}}
-                                )
-                        except Exception:
-                            pass
-                
-                asyncio.create_task(background_ocr())
-                logger.info(f"Auto-OCR triggered for {document_type}: {document_id}")
-                
-            except Exception as auto_ocr_err:
-                logger.warning(f"Failed to auto-trigger OCR for {document_id}: {auto_ocr_err}")
-                # Reset status since auto-OCR failed - allow manual retry
-                try:
-                    if is_b2c:
-                        await db.b2c_update_one(
-                            "documents",
-                            {"document_id": document_id},
-                            {"$set": {"ocr_status": "not_processed", "ocr_job_id": None}}
-                        )
-                    else:
-                        await db.mongo_update_one(
-                            "documents",
-                            {"document_id": document_id},
-                            {"$set": {"ocr_status": "not_processed", "ocr_job_id": None}}
-                        )
-                except Exception:
-                    pass
 
         return {
-            "message": "Document uploaded successfully" + (" - OCR processing started automatically" if should_auto_ocr else ""),
+            "message": "Document uploaded successfully. Use 'Segment' to define question regions before processing OCR.",
             "document_id": document_id,
             "file_path": relative_path,
             "ocr_status": ocr_status,
             "ocr_job_id": ocr_job_id,
-            "pages_count": pages_count
+            "pages_count": pages_count,
+            "requires_segmentation": False # Auto-OCR/Direct OCR enabled for all types
         }
 
     except HTTPException:
@@ -1586,52 +1587,62 @@ async def process_document_ocr(
         from pathlib import Path as _Path
         backend_dir = _Path(os.getcwd())
         stored_path_raw = str(document.get("file_path", "")).replace("\\", "/")
+        file_content = None
 
-        # Build a set of candidate locations to handle legacy absolute Windows paths
-        candidates: list[_Path] = []
+        if stored_path_raw.startswith("s3://"):
+            logger.info(f"Downloading document from S3: {stored_path_raw}")
+            file_content = await download_file(stored_path_raw)
+            if not file_content:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Failed to download file from S3: {stored_path_raw}"
+                )
+        else:
+            # Build a set of candidate locations to handle legacy absolute Windows paths
+            candidates: list[_Path] = []
 
-        if stored_path_raw:
-            sp = _Path(stored_path_raw)
-            # 1) Use as absolute if it is absolute
-            if sp.is_absolute():
-                candidates.append(sp)
-            # 2) Treat as repo-relative (current behavior)
-            candidates.append(backend_dir / stored_path_raw)
+            if stored_path_raw:
+                sp = _Path(stored_path_raw)
+                # 1) Use as absolute if it is absolute
+                if sp.is_absolute():
+                    candidates.append(sp)
+                # 2) Treat as repo-relative (current behavior)
+                candidates.append(backend_dir / stored_path_raw)
 
-            # 3) If path contains an embedded Windows drive with an 'uploads' segment, strip until '/uploads/...'
-            if "uploads/" in stored_path_raw:
+                # 3) If path contains an embedded Windows drive with an 'uploads' segment, strip until '/uploads/...'
+                if "uploads/" in stored_path_raw:
+                    try:
+                        uploads_index = stored_path_raw.index("uploads/")
+                        rel_after_uploads = stored_path_raw[uploads_index:]
+                        candidates.append(backend_dir / rel_after_uploads)
+                    except ValueError:
+                        pass
+
+            # 4) Final fallback to canonical expected location
+            canonical_fallback = backend_dir / f"uploads/documents/{document.get('document_type','')}/{document_id}.pdf"
+            candidates.append(canonical_fallback)
+
+            file_path: _Path | None = None
+            for p in candidates:
                 try:
-                    uploads_index = stored_path_raw.index("uploads/")
-                    rel_after_uploads = stored_path_raw[uploads_index:]
-                    candidates.append(backend_dir / rel_after_uploads)
-                except ValueError:
-                    pass
+                    if p.exists():
+                        file_path = p
+                        break
+                except Exception:
+                    continue
 
-        # 4) Final fallback to canonical expected location
-        canonical_fallback = backend_dir / f"uploads/documents/{document.get('document_type','')}/{document_id}.pdf"
-        candidates.append(canonical_fallback)
+            if not file_path:
+                logger.error(
+                    f"PDF file not found for document {document_id}. Checked: " + 
+                    ", ".join(str(c) for c in candidates)
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="PDF file not found on server. Please re-upload this document from the Admin panel."
+                )
 
-        file_path: _Path | None = None
-        for p in candidates:
-            try:
-                if p.exists():
-                    file_path = p
-                    break
-            except Exception:
-                continue
-
-        if not file_path:
-            logger.error(
-                f"PDF file not found for document {document_id}. Checked: " + 
-                ", ".join(str(c) for c in candidates)
-            )
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="PDF file not found on server. Please re-upload this document from the Admin panel."
-            )
-
-        async with aiofiles.open(str(file_path), "rb") as f:
-            file_content = await f.read()
+            async with aiofiles.open(str(file_path), "rb") as f:
+                file_content = await f.read()
 
         pdf_base64 = base64.b64encode(file_content).decode('utf-8')
         job_id = str(uuid.uuid4())
@@ -3877,4 +3888,680 @@ async def delete_document(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete document: {str(e)}"
+        )
+
+
+# =============================================================================
+# REGION-BASED OCR ENDPOINTS
+# Manual question segmentation and region-based OCR processing
+# =============================================================================
+
+class QuestionRegion(BaseModel):
+    """Represents a bounding box for a question region on a PDF page"""
+    id: str
+    pageNumber: int
+    x: float  # Percentage (0-100)
+    y: float  # Percentage (0-100)
+    width: float  # Percentage (0-100)
+    height: float  # Percentage (0-100)
+    order: int
+    label: str
+    hasSubQuestions: bool = False
+    notes: Optional[str] = None
+    ocrStatus: Optional[str] = None  # pending, processing, completed, error
+    extractedText: Optional[str] = None
+    createdAt: str
+    updatedAt: str
+
+class DocumentRegionsRequest(BaseModel):
+    """Request body for saving document regions"""
+    regions: List[QuestionRegion]
+
+class DocumentRegionsResponse(BaseModel):
+    """Response for document regions"""
+    documentId: str
+    regions: List[QuestionRegion]
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+    createdBy: Optional[str] = None
+
+class RegionOCRRequest(BaseModel):
+    """Request for processing specific regions with OCR"""
+    regionIds: Optional[List[str]] = None  # If None, process all regions
+
+class RegionOCRResult(BaseModel):
+    """Result of OCR processing for a single region"""
+    regionId: str
+    success: bool
+    extractedText: Optional[str] = None
+    extractedOptions: Optional[List[str]] = None
+    extractedImages: Optional[List[Dict[str, Any]]] = None
+    error: Optional[str] = None
+
+class RegionOCRResponse(BaseModel):
+    """Response for region-based OCR processing"""
+    success: bool
+    documentId: str
+    processedRegions: int
+    successfulRegions: int
+    failedRegions: int
+    results: List[RegionOCRResult]
+
+
+@router.get("/documents/{document_id}/regions")
+async def get_document_regions(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get all saved question regions for a document.
+    
+    Returns the list of bounding box regions that have been manually drawn
+    on the PDF pages for question segmentation.
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        
+        # Verify document exists
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+        
+        # Get regions for this document
+        if is_b2c:
+            regions_doc = await db.b2c_find_one("document_regions", {"document_id": document_id})
+        else:
+            regions_doc = await db.mongo_find_one("document_regions", {"document_id": document_id})
+        
+        if not regions_doc:
+            return {
+                "documentId": document_id,
+                "regions": [],
+                "createdAt": None,
+                "updatedAt": None,
+                "createdBy": None
+            }
+        
+        return {
+            "documentId": document_id,
+            "regions": regions_doc.get("regions", []),
+            "createdAt": regions_doc.get("created_at"),
+            "updatedAt": regions_doc.get("updated_at"),
+            "createdBy": regions_doc.get("created_by")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting document regions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get document regions: {str(e)}"
+        )
+
+
+@router.post("/documents/{document_id}/regions")
+async def save_document_regions(
+    document_id: str,
+    request: DocumentRegionsRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Save question regions for a document.
+    
+    Stores the bounding box regions that have been manually drawn on the PDF pages.
+    This replaces any existing regions for the document.
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        
+        # Verify document exists
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+        
+        now = datetime.utcnow().isoformat()
+        
+        # Convert regions to dict format
+        regions_data = [region.dict() for region in request.regions]
+        
+        # Prepare regions document
+        regions_doc = {
+            "document_id": document_id,
+            "regions": regions_data,
+            "created_by": current_user.get("user_id"),
+            "updated_at": now
+        }
+        
+        # Upsert regions document
+        if is_b2c:
+            existing = await db.b2c_find_one("document_regions", {"document_id": document_id})
+            if existing:
+                await db.b2c_update_one(
+                    "document_regions",
+                    {"document_id": document_id},
+                    {"$set": regions_doc}
+                )
+            else:
+                regions_doc["created_at"] = now
+                await db.b2c_insert_one("document_regions", regions_doc)
+        else:
+            existing = await db.mongo_find_one("document_regions", {"document_id": document_id})
+            if existing:
+                await db.mongo_update_one(
+                    "document_regions",
+                    {"document_id": document_id},
+                    {"$set": regions_doc}
+                )
+            else:
+                regions_doc["created_at"] = now
+                await db.mongo_insert_one("document_regions", regions_doc)
+        
+        logger.info(f"Saved {len(request.regions)} regions for document {document_id}")
+        
+        return {
+            "success": True,
+            "message": f"Saved {len(request.regions)} regions",
+            "documentId": document_id,
+            "regionsCount": len(request.regions)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error saving document regions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save document regions: {str(e)}"
+        )
+
+
+@router.delete("/documents/{document_id}/regions")
+async def delete_document_regions(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Delete all regions for a document.
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        
+        if is_b2c:
+            result = await db.b2c_delete_one("document_regions", {"document_id": document_id})
+        else:
+            result = await db.mongo_delete_one("document_regions", {"document_id": document_id})
+        
+        return {
+            "success": True,
+            "message": f"Deleted regions for document {document_id}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error deleting document regions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete document regions: {str(e)}"
+        )
+
+
+async def extract_region_from_pdf(
+    pdf_content: bytes,
+    page_number: int,
+    bbox: Dict[str, float],
+    region_id: str
+) -> Dict[str, Any]:
+    """
+    Extract a specific region from a PDF page and process it with OCR.
+    
+    Args:
+        pdf_content: Raw PDF bytes
+        page_number: Page number (1-indexed)
+        bbox: Bounding box as percentages {x, y, width, height}
+        region_id: ID of the region being processed
+    
+    Returns:
+        Dict with extracted text and images
+    """
+    try:
+        from PIL import Image
+        import fitz  # PyMuPDF
+        import io
+        
+        # Open PDF
+        doc = fitz.open(stream=pdf_content, filetype="pdf")
+        
+        if page_number < 1 or page_number > len(doc):
+            return {
+                "success": False,
+                "error": f"Invalid page number {page_number}"
+            }
+        
+        page = doc[page_number - 1]  # 0-indexed
+        page_rect = page.rect
+        
+        # Convert percentage coordinates to actual coordinates
+        x0 = page_rect.width * (bbox['x'] / 100)
+        y0 = page_rect.height * (bbox['y'] / 100)
+        x1 = x0 + page_rect.width * (bbox['width'] / 100)
+        y1 = y0 + page_rect.height * (bbox['height'] / 100)
+        
+        clip_rect = fitz.Rect(x0, y0, x1, y1)
+        
+        # Render the clipped region at high resolution
+        mat = fitz.Matrix(3.0, 3.0)  # 3x zoom for better OCR quality
+        pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+        
+        # Convert to PNG bytes
+        img_bytes = pix.tobytes("png")
+        
+        # Encode as base64 for Mistral OCR
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        
+        # Close document
+        doc.close()
+        
+        # Send to Mistral OCR as an image
+        import aiohttp
+        
+        if not MISTRAL_API_KEY:
+            return {
+                "success": False,
+                "error": "Mistral API key not configured"
+            }
+        
+        headers = {
+            "Authorization": f"Bearer {MISTRAL_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Use Pixtral model for image-based OCR
+        payload = {
+            "model": "pixtral-12b-2409",  # Pixtral model for image understanding
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Extract all text from this question image. This is a question from an exam or practice paper.
+
+Please extract:
+1. The complete question text
+2. All options (if this is an MCQ, label them as A), B), C), D))
+3. Any mathematical formulas or equations (use LaTeX notation)
+4. Descriptions of any diagrams or figures
+
+Format the output as:
+QUESTION: [question text]
+OPTIONS:
+A) [option A text]
+B) [option B text]
+C) [option C text]
+D) [option D text]
+FIGURES: [description of any images/diagrams if present]
+
+If this is not an MCQ, just provide the question text and any figure descriptions."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.1
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Mistral API error for region {region_id}: {error_text}")
+                    return {
+                        "success": False,
+                        "error": f"OCR API error: {response.status}"
+                    }
+                
+                result = await response.json()
+                extracted_text = result['choices'][0]['message']['content'].strip()
+                
+                logger.info(f"Successfully extracted text for region {region_id}: {len(extracted_text)} chars")
+                
+                return {
+                    "success": True,
+                    "extractedText": extracted_text,
+                    "imageBase64": img_base64  # Keep for reference
+                }
+                
+    except ImportError as e:
+        logger.error(f"Missing dependency for region extraction: {e}")
+        return {
+            "success": False,
+            "error": f"Missing dependency: {e}. Install PyMuPDF with 'pip install pymupdf'"
+        }
+    except Exception as e:
+        logger.error(f"Error extracting region {region_id}: {str(e)}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@router.post("/documents/{document_id}/regions/process-ocr")
+@limiter.limit("5/minute")
+async def process_regions_ocr(
+    request: Request,
+    document_id: str,
+    ocr_request: RegionOCRRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Process OCR on specific regions of a document.
+    
+    This endpoint:
+    1. Retrieves saved regions for the document
+    2. For each region, extracts that portion of the PDF page
+    3. Sends each region to Mistral OCR
+    4. Parses the OCR result and creates questions
+    5. Returns the results
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        
+        # Get document
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+        
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+        
+        # Get regions
+        if is_b2c:
+            regions_doc = await db.b2c_find_one("document_regions", {"document_id": document_id})
+        else:
+            regions_doc = await db.mongo_find_one("document_regions", {"document_id": document_id})
+        
+        if not regions_doc or not regions_doc.get("regions"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No regions defined for this document. Please draw question regions first."
+            )
+        
+        all_regions = regions_doc.get("regions", [])
+        
+        # Filter regions if specific IDs provided
+        if ocr_request.regionIds:
+            regions_to_process = [r for r in all_regions if r['id'] in ocr_request.regionIds]
+        else:
+            regions_to_process = all_regions
+        
+        if not regions_to_process:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No matching regions found to process"
+            )
+        
+        # Load PDF content
+        from pathlib import Path as _Path
+        backend_dir = _Path(os.getcwd())
+        file_path = document.get("file_path", "")
+        
+        pdf_content = None
+        
+        # Check if S3 storage
+        if file_path.startswith("s3://"):
+            try:
+                from utils.s3_storage import download_file as s3_download_file
+                pdf_content = await s3_download_file(file_path)
+            except Exception as s3_err:
+                logger.error(f"Failed to download PDF from S3: {s3_err}")
+        else:
+            # Try local file
+            local_path = backend_dir / file_path if not _Path(file_path).is_absolute() else _Path(file_path)
+            if local_path.exists():
+                async with aiofiles.open(str(local_path), "rb") as f:
+                    pdf_content = await f.read()
+        
+        if not pdf_content:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="PDF file not found"
+            )
+        
+        # Update document status to processing
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "processing"}}
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {"ocr_status": "processing"}}
+            )
+        
+        # Process each region
+        results = []
+        successful = 0
+        failed = 0
+        
+        for region in regions_to_process:
+            region_id = region['id']
+            
+            logger.info(f"Processing region {region_id} on page {region['pageNumber']}")
+            
+            # Update region status
+            region['ocrStatus'] = 'processing'
+            
+            # Extract and OCR the region
+            extraction_result = await extract_region_from_pdf(
+                pdf_content=pdf_content,
+                page_number=region['pageNumber'],
+                bbox={
+                    'x': region['x'],
+                    'y': region['y'],
+                    'width': region['width'],
+                    'height': region['height']
+                },
+                region_id=region_id
+            )
+            
+            if extraction_result['success']:
+                successful += 1
+                region['ocrStatus'] = 'completed'
+                region['extractedText'] = extraction_result.get('extractedText', '')
+                
+                # Parse extracted text to extract options if present
+                extracted_text = extraction_result.get('extractedText', '')
+                options = []
+                
+                # Check if this is Practice Sets - skip option extraction
+                document_type = document.get("document_type", "Chapter Notes")
+                skip_option_extraction = document_type == "Practice Sets"
+                
+                # Simple parsing for MCQ options (only if not Practice Sets)
+                import re
+                if not skip_option_extraction:
+                    option_pattern = re.compile(r'^([A-D])\)\s*(.+)$', re.MULTILINE)
+                    for match in option_pattern.finditer(extracted_text):
+                        options.append(match.group(2).strip())
+                
+                results.append({
+                    "regionId": region_id,
+                    "success": True,
+                    "extractedText": extracted_text,
+                    "extractedOptions": options if options else None,
+                    "error": None
+                })
+                
+                # Create question in database
+                question_text = extracted_text
+                
+                # Only parse question structure if not Practice Sets
+                if not skip_option_extraction:
+                    question_match = re.search(r'QUESTION:\s*(.+?)(?:OPTIONS:|FIGURES:|$)', extracted_text, re.DOTALL)
+                    if question_match:
+                        question_text = question_match.group(1).strip()
+                
+                question_doc = {
+                    "id": region_id,
+                    "text": question_text,  # For Practice Sets, this includes the full text with options
+                    "subject": document.get("subject", "General"),
+                    "difficulty": document.get("difficulty", "medium"),
+                    "document_type": document.get("document_type", "Practice Sets"),
+                    "extracted_at": datetime.utcnow(),
+                    "pdf_source": document.get("filename", ""),
+                    "document_id": document_id,
+                    "options": options,  # Will be empty for Practice Sets
+                    "enhanced_options": [
+                        {
+                            "id": f"{region_id}_opt_{i}",
+                            "type": "text",
+                            "content": opt,
+                            "label": chr(65 + i)
+                        }
+                        for i, opt in enumerate(options)
+                    ] if options else [],  # Empty for Practice Sets
+                    "correct_answer": None,
+                    "is_region_based": True,
+                    "options_inline": skip_option_extraction,  # Flag indicating options are in text
+                    "region_metadata": {
+                        "page": region['pageNumber'],
+                        "x": region['x'],
+                        "y": region['y'],
+                        "width": region['width'],
+                        "height": region['height']
+                    },
+                    "points": 1.0,
+                    "penalty": 0.0,
+                    "created_by": current_user.get("user_id"),
+                    "created_at": datetime.utcnow()
+                }
+                
+                if is_b2c:
+                    await db.b2c_insert_one("questions", question_doc)
+                else:
+                    await db.mongo_insert_one("questions", question_doc)
+                
+            else:
+                failed += 1
+                region['ocrStatus'] = 'error'
+                results.append({
+                    "regionId": region_id,
+                    "success": False,
+                    "extractedText": None,
+                    "extractedOptions": None,
+                    "error": extraction_result.get('error', 'Unknown error')
+                })
+        
+        # Update regions with OCR status
+        if is_b2c:
+            await db.b2c_update_one(
+                "document_regions",
+                {"document_id": document_id},
+                {"$set": {"regions": all_regions, "updated_at": datetime.utcnow().isoformat()}}
+            )
+        else:
+            await db.mongo_update_one(
+                "document_regions",
+                {"document_id": document_id},
+                {"$set": {"regions": all_regions, "updated_at": datetime.utcnow().isoformat()}}
+            )
+        
+        # Update document status
+        final_status = "completed" if failed == 0 else ("error" if successful == 0 else "completed")
+        
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {
+                    "ocr_status": final_status,
+                    "extracted_questions_count": successful,
+                    "ocr_completed_at": datetime.utcnow()
+                }}
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": {
+                    "ocr_status": final_status,
+                    "extracted_questions_count": successful,
+                    "ocr_completed_at": datetime.utcnow()
+                }}
+            )
+        
+        logger.info(f"Region OCR completed for {document_id}: {successful} successful, {failed} failed")
+        
+        return {
+            "success": True,
+            "documentId": document_id,
+            "processedRegions": len(regions_to_process),
+            "successfulRegions": successful,
+            "failedRegions": failed,
+            "results": results
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Region OCR processing error: {str(e)}", exc_info=True)
+        
+        # Reset status on error
+        try:
+            is_b2c = is_b2c_admin(current_user)
+            if is_b2c:
+                await db.b2c_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": {"ocr_status": "error"}}
+                )
+            else:
+                await db.mongo_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": {"ocr_status": "error"}}
+                )
+        except:
+            pass
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process OCR: {str(e)}"
         )
