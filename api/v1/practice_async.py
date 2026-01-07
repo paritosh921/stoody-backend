@@ -959,6 +959,16 @@ async def evaluate_submission(
         prompt += '  "feedback": "Encouraging, educational feedback for the student",\n'
         prompt += '  "reasoning": "Your step-by-step evaluation logic"\n'
         prompt += "}\n\n"
+
+        # Language Instruction
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "🗣️ LANGUAGE INSTRUCTION:\n"
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "1. Analyze the language of the 'Question Text' and the 'Student's Handwritten Work'.\n"
+        prompt += "2. If the question is in Hindi OR the student answered in Hindi, you MUST provide the 'feedback', 'reasoning', 'what_went_wrong', 'correct_solution', and 'work_shown' fields in HINDI.\n"
+        prompt += "3. Otherwise, provide them in English.\n"
+        prompt += "4. Do NOT translate the technical terms if they are commonly used in English (like 'Equation', 'Matrix'), but keep the explanation in Hindi.\n\n"
+
         prompt += "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
         prompt += "CRITICAL FOR WRONG ANSWERS: You MUST provide:\n"
         prompt += "  1. 'what_went_wrong' - Specific explanation of the student's mistake\n"
