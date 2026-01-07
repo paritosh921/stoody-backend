@@ -2165,13 +2165,12 @@ async def get_student_practice_sets(
             filter_query["course_plan"] = {"$in": student_plan_types}
         # If student has no plan types assigned, show all plan types from their admin
 
-        # Filter by subject if specified in query
+        # Filter by subject if specified in query (explicit filter from frontend dropdown)
         if subject:
             filter_query["subject"] = subject
-        elif student_subjects and len(student_subjects) > 0:
-            # If student has specific subjects assigned, filter by them
-            filter_query["subject"] = {"$in": student_subjects}
-        # If student has no subjects assigned, show all subjects from their admin
+        # NOTE: We intentionally do NOT filter by student_subjects here - students should
+        # see ALL content uploaded by their admin. The assigned subjects are for 
+        # personalization/recommendations, not for restricting access to content.
 
         # Build $and conditions array for section and teacher_ids filtering
         and_conditions = []
