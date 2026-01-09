@@ -228,7 +228,7 @@ Focus on being supportive while helping students improve their work and understa
             }
 
             # Use max_completion_tokens for newer models, max_tokens for older ones
-            if any(m in used_model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in used_model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = max_tokens
             else:
                 completion_params['max_tokens'] = max_tokens
@@ -323,7 +323,7 @@ Focus on being supportive while helping students improve their work and understa
             }
 
             # Use max_completion_tokens for newer models
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = max_tokens
             else:
                 completion_params['max_tokens'] = max_tokens
@@ -386,7 +386,7 @@ Focus on being supportive while helping students improve their work and understa
                 "temperature": 0.3
             }
 
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = max_tokens
             else:
                 completion_params['max_tokens'] = max_tokens
@@ -497,7 +497,7 @@ Requirements:
             }
 
             # Use max_completion_tokens for newer models
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = 2000
             else:
                 completion_params['max_tokens'] = 2000
@@ -563,7 +563,7 @@ Be constructive and educational in your feedback."""
             }
 
             # Use max_completion_tokens for newer models
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = 1000
             else:
                 completion_params['max_tokens'] = 1000
@@ -601,7 +601,7 @@ Be constructive and educational in your feedback."""
             }
 
             # Use max_completion_tokens for newer models
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = 10
             else:
                 completion_params['max_tokens'] = 10
