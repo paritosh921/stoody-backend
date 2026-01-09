@@ -20,6 +20,56 @@ from config_async import settings
 
 logger = logging.getLogger(__name__)
 
+# Language detection utility for multilingual support
+def detect_language(text: str) -> str:
+    """
+    Detect the primary language of the given text.
+    
+    Returns:
+        'hindi' if the text contains significant Hindi (Devanagari) characters
+        'english' otherwise (default)
+    
+    This is used to ensure LLM responses match the question/input language.
+    """
+    if not text:
+        return 'english'
+    
+    # Count Devanagari characters (Hindi script range: U+0900 to U+097F)
+    devanagari_count = sum(1 for char in text if '\u0900' <= char <= '\u097F')
+    total_alpha_count = sum(1 for char in text if char.isalpha())
+    
+    if total_alpha_count == 0:
+        return 'english'
+    
+    # If more than 20% of alphabetic characters are Devanagari, consider it Hindi
+    hindi_ratio = devanagari_count / total_alpha_count
+    
+    if hindi_ratio > 0.2:
+        return 'hindi'
+    
+    return 'english'
+
+
+def get_language_instruction(detected_language: str) -> str:
+    """
+    Get the language instruction for LLM prompts based on detected language.
+    
+    This ensures the LLM responds in the same language as the question/input.
+    """
+    if detected_language == 'hindi':
+        return (
+            "\n\n🌐 भाषा निर्देश (LANGUAGE INSTRUCTION):\n"
+            "यह प्रश्न हिंदी में है। कृपया अपना पूरा उत्तर केवल हिंदी में दें।\n"
+            "The question is in Hindi. You MUST respond ENTIRELY in Hindi.\n"
+            "All feedback, explanations, and solutions should be in Hindi only.\n"
+        )
+    else:
+        return (
+            "\n\n🌐 LANGUAGE INSTRUCTION:\n"
+            "The question is in English. Respond entirely in English.\n"
+        )
+
+
 router = APIRouter()
 
 # Rate limiter
@@ -847,11 +897,20 @@ async def evaluate_submission(
         # Determine if we need the LLM to solve the question itself
         has_correct_answer = bool(correct_answer and correct_answer.strip())
         
+        # === LANGUAGE DETECTION FOR MULTILINGUAL SUPPORT ===
+        # Detect question language to ensure LLM responds in the same language
+        detected_language = detect_language(question_text)
+        language_instruction = get_language_instruction(detected_language)
+        logger.info(f"🌐 Language detection: question='{detected_language}' for Q:{qid}")
+        
         # Construct IMPROVED Prompt with clearer structure and explicit instructions
         prompt = (
             "You are an expert tutor evaluating a student's handwritten answer. "
             "Your task is to determine if their answer is CORRECT or INCORRECT.\n\n"
         )
+        
+        # Add LANGUAGE INSTRUCTION at the very beginning of the prompt
+        prompt += language_instruction
         
         # Add clear image labeling with detailed breakdown
         if num_s_images > 0 and num_q_images > 0:
@@ -959,28 +1018,45 @@ async def evaluate_submission(
         prompt += '  "feedback": "Encouraging, educational feedback for the student",\n'
         prompt += '  "reasoning": "Your step-by-step evaluation logic"\n'
         prompt += "}\n\n"
-
-        # Language Instruction
-        prompt += "═══════════════════════════════════════\n"
-        prompt += "🗣️ LANGUAGE INSTRUCTION:\n"
-        prompt += "═══════════════════════════════════════\n"
-        prompt += "1. Analyze the language of the 'Question Text' and the 'Student's Handwritten Work'.\n"
-        prompt += "2. If the question is in Hindi OR the student answered in Hindi, you MUST provide the 'feedback', 'reasoning', 'what_went_wrong', 'correct_solution', and 'work_shown' fields in HINDI.\n"
-        prompt += "3. Otherwise, provide them in English.\n"
-        prompt += "4. Do NOT translate the technical terms if they are commonly used in English (like 'Equation', 'Matrix'), but keep the explanation in Hindi.\n\n"
-
+        
+        # CRITICAL: LaTeX formatting instructions
+        prompt += "⚠️ MATH FORMATTING REQUIREMENTS:\n"
+        prompt += "For ALL mathematical expressions, equations, and formulas, you MUST use LaTeX notation:\n"
+        prompt += "- Use \\\\( and \\\\) for inline math. Example: \\\\(\\\\tau = F \\\\times R\\\\)\n"
+        prompt += "- Use \\\\[ and \\\\] for display/block math. Example: \\\\[E = mc^2\\\\]\n"
+        prompt += "- Use LaTeX commands: \\\\frac{a}{b}, \\\\sqrt{x}, \\\\alpha, \\\\beta, \\\\tau, \\\\omega, etc.\n"
+        prompt += "- DO NOT use plain Unicode symbols like τ, α, ×, ⇒. ALWAYS use LaTeX equivalents.\n"
+        prompt += "- Example of CORRECT format: \\\\(\\\\tau = I\\\\alpha\\\\) where \\\\(I = mR^2\\\\)\n"
+        prompt += "- Example of WRONG format: τ = Iα where I = mR²\n\n"
+        
         prompt += "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
         prompt += "CRITICAL FOR WRONG ANSWERS: You MUST provide:\n"
         prompt += "  1. 'what_went_wrong' - Specific explanation of the student's mistake\n"
-        prompt += "  2. 'correct_solution' - Complete step-by-step solution with all calculations\n"
+        prompt += "  2. 'correct_solution' - Complete step-by-step solution with all calculations (use LaTeX!)\n"
         if not has_correct_answer:
             prompt += "  3. 'solved_answer' - The correct answer you calculated\n"
         
         logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
         
         # Call LLM with enhanced system prompt - varies based on whether we have a correct answer
+        # Include language instruction in system prompt for stronger enforcement
+        language_system_instruction = (
+            "CRITICAL LANGUAGE RULE: If the question is in Hindi (Devanagari script), "
+            "you MUST respond ENTIRELY in Hindi. If the question is in English, respond in English. "
+            "Match the language of the question exactly. "
+        ) if detected_language == 'hindi' else ""
+        
+        # LaTeX formatting instruction for both system prompts
+        latex_instruction = (
+            "MATH FORMATTING: For ALL math expressions, use LaTeX notation with \\( \\) delimiters. "
+            "Example: \\(\\tau = I\\alpha\\), \\(F = ma\\), \\(\\frac{a}{b}\\). "
+            "NEVER use plain Unicode symbols (τ, α, ×). ALWAYS use LaTeX (\\tau, \\alpha, \\times). "
+        )
+        
         if has_correct_answer:
             system_prompt = (
+                f"{language_system_instruction}"
+                f"{latex_instruction}"
                 "You are an expert answer evaluator specializing in reading handwritten student work. "
                 "CRITICAL: Your ONLY job is to determine if the student's answer is CORRECT or INCORRECT. "
                 "You MUST compare the student's answer to the CORRECT ANSWER provided. "
@@ -991,6 +1067,8 @@ async def evaluate_submission(
             )
         else:
             system_prompt = (
+                f"{language_system_instruction}"
+                f"{latex_instruction}"
                 "You are an expert tutor who can both SOLVE questions AND evaluate student answers. "
                 "CRITICAL: Since NO CORRECT ANSWER was provided, you MUST first SOLVE the question yourself. "
                 "1. First, solve the question to determine the correct answer. "

@@ -26,6 +26,50 @@ from config_async import settings
 
 logger = logging.getLogger(__name__)
 
+# Language detection utility for multilingual support
+def detect_language(text: str) -> str:
+    """
+    Detect the primary language of the given text.
+    
+    Returns:
+        'hindi' if the text contains significant Hindi (Devanagari) characters
+        'english' otherwise (default)
+    
+    This is used to ensure chat responses match the question/input language.
+    """
+    if not text:
+        return 'english'
+    
+    # Count Devanagari characters (Hindi script range: U+0900 to U+097F)
+    devanagari_count = sum(1 for char in text if '\u0900' <= char <= '\u097F')
+    total_alpha_count = sum(1 for char in text if char.isalpha())
+    
+    if total_alpha_count == 0:
+        return 'english'
+    
+    # If more than 20% of alphabetic characters are Devanagari, consider it Hindi
+    hindi_ratio = devanagari_count / total_alpha_count
+    
+    if hindi_ratio > 0.2:
+        return 'hindi'
+    
+    return 'english'
+
+
+def get_language_instruction_for_chat(detected_language: str) -> str:
+    """
+    Get the language instruction for chat/hint prompts based on detected language.
+    """
+    if detected_language == 'hindi':
+        return (
+            "\n\n🌐 भाषा निर्देश (LANGUAGE INSTRUCTION):\n"
+            "यह प्रश्न हिंदी में है। कृपया अपना पूरा उत्तर केवल हिंदी में दें।\n"
+            "The content is in Hindi. Respond ENTIRELY in Hindi.\n"
+        )
+    else:
+        return ""  # Default to English, no special instruction needed
+
+
 router = APIRouter()
 
 # Rate limiter
@@ -230,14 +274,20 @@ async def chat_endpoint(
     try:
         logger.info(f"Chat request - User: {chat_request.userId}, Session: {chat_request.sessionId}, Mode: {chat_request.mode}")
 
-        # Create cache key for the request
+        # Detect language for cache key (prevents serving Hindi cached response to English requests)
+        detected_lang_for_cache = detect_language(chat_request.systemPrompt or "") 
+        if detected_lang_for_cache == 'english':
+            detected_lang_for_cache = detect_language(chat_request.message)
+
+        # Create cache key for the request - includes language to prevent cross-language cache hits
         cache_key_data = {
             "message": chat_request.message,
             "mode": chat_request.mode,
             "subject": chat_request.subject,
             "has_canvas": bool(chat_request.canvasData or chat_request.canvasPages),
             "pages_len": len(chat_request.canvasPages) if chat_request.canvasPages else (1 if chat_request.canvasData else 0),
-            "history_length": len(chat_request.conversationHistory)
+            "history_length": len(chat_request.conversationHistory),
+            "language": detected_lang_for_cache  # CRITICAL: Include language in cache key
         }
         cache_key = cache.hash_query(cache_key_data)
 
@@ -356,7 +406,7 @@ async def chat_endpoint(
         )
 
 async def _prepare_messages(chat_request: ChatRequest, openai_service: AsyncOpenAIService) -> List[Dict[str, Any]]:
-    """Prepare messages for OpenAI API"""
+    """Prepare messages for OpenAI API with language detection for multilingual support"""
     messages = []
 
     # Get system prompt - use custom systemPrompt if provided, otherwise use mode-based prompt
@@ -365,6 +415,19 @@ async def _prepare_messages(chat_request: ChatRequest, openai_service: AsyncOpen
     else:
         system_prompts = await openai_service.get_system_prompts_async()
         system_prompt = system_prompts.get(chat_request.mode, system_prompts['general'])
+
+    # === LANGUAGE DETECTION FOR MULTILINGUAL SUPPORT ===
+    # Detect language from the system prompt (which often contains the question) or the user message
+    detected_language = detect_language(system_prompt) if system_prompt else 'english'
+    if detected_language == 'english':
+        # Also check the user's message for Hindi content
+        detected_language = detect_language(chat_request.message)
+    
+    # Add language instruction to system prompt for Hindi content
+    language_instruction = get_language_instruction_for_chat(detected_language)
+    if language_instruction:
+        system_prompt = system_prompt + language_instruction
+        logger.info(f"🌐 Language detection: detected='{detected_language}', added language instruction to chat")
 
     # Add system prompt as first message
     messages.append({
@@ -410,7 +473,14 @@ async def _prepare_messages(chat_request: ChatRequest, openai_service: AsyncOpen
     return messages
 
 async def _create_enhanced_message_with_canvas(message: str, canvas_data: str) -> str:
-    """Create enhanced message for canvas analysis"""
+    """Create enhanced message for canvas analysis with language detection"""
+    
+    # Detect language from the user message
+    detected_language = detect_language(message)
+    language_instruction = ""
+    if detected_language == 'hindi':
+        language_instruction = "\n\n🌐 **भाषा निर्देश**: यह प्रश्न हिंदी में है। कृपया अपना पूरा उत्तर केवल हिंदी में दें।\n**LANGUAGE**: Respond in Hindi."
+    
     return f"""{message}
 
 🔍 **COMPREHENSIVE ACADEMIC ANALYSIS SYSTEM**
@@ -435,7 +505,7 @@ Please analyze the provided image using a systematic multi-pass approach:
 - **Error Detection**: Identify any mistakes or areas for improvement
 
 **FORMATTING**: Use LaTeX for math (\\[ \\] for display, \\( \\) for inline), proper units, and clear structure.
-**GOAL**: Provide complete, accurate educational analysis that helps students understand the material."""
+**GOAL**: Provide complete, accurate educational analysis that helps students understand the material.{language_instruction}"""
 
 @router.get("/health", response_model=ChatHealthResponse)
 @limiter.limit("120/minute")
