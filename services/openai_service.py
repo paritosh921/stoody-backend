@@ -73,7 +73,7 @@ class OpenAIService:
             }
 
             # Use max_completion_tokens for newer models, max_tokens for older ones
-            if any(m in self.model.lower() for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
+            if any(m in self.model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
                 completion_params['max_completion_tokens'] = max_tokens
             else:
                 completion_params['max_tokens'] = max_tokens
