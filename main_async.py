@@ -68,6 +68,7 @@ except Exception:
 from api.v1.pdf_async import router as pdf_router
 from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
+from api.v1.video_async import router as video_router
 
 # B2C Authentication routes (Google OAuth for B2C users using stoody-b2c database)
 try:
@@ -397,6 +398,12 @@ app.include_router(
     pdf_router,
     prefix=f"{API_V1_PREFIX}/pdf",
     tags=["PDF Processing"]
+)
+
+app.include_router(
+    video_router,
+    prefix=f"{API_V1_PREFIX}/video",
+    tags=["Video Content"]
 )
 
 if _debugger_available and debugger_router:
