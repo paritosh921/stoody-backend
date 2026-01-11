@@ -34,6 +34,8 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-dotenv==1.0.0
 google-auth>=2.23.0  # For B2C Google OAuth verification
+pyotp>=2.9.0  # TOTP for Google Authenticator 2FA
+itsdangerous>=2.1.0  # Secure tokens for 2FA flow
 
 # ===============================
 # HTTP clients & utils
@@ -82,6 +84,8 @@ pytesseract==0.3.10
 pdf2image==1.16.3
 pypdfium2>=4.20.0
 unstructured>=0.11.0
+PyMuPDF
+
 
 # ===============================
 # Rate limiting
