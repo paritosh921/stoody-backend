@@ -78,6 +78,15 @@ except Exception as e:
     _b2c_auth_available = False
     logging.warning(f"B2C auth routes disabled: {str(e)}")
 
+# Online Class routes (WebSocket for remote teaching)
+try:
+    from api.v1.online_class_async import router as online_class_router
+    _online_class_available = True
+except Exception as e:
+    online_class_router = None
+    _online_class_available = False
+    logging.warning(f"Online class routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -472,6 +481,17 @@ if _b2c_auth_available and b2c_auth_router:
     logger.info("✅ B2C authentication routes enabled")
 else:
     logger.warning("⚠️ B2C authentication routes disabled (missing dependencies)")
+
+# Online Class routes (WebSocket for remote teaching)
+if _online_class_available and online_class_router:
+    app.include_router(
+        online_class_router,
+        prefix=f"{API_V1_PREFIX}/online-class",
+        tags=["Online Class"]
+    )
+    logger.info("✅ Online class routes enabled")
+else:
+    logger.warning("⚠️ Online class routes disabled")
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")
