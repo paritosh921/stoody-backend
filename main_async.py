@@ -46,15 +46,15 @@ from middleware.subdomain import subdomain_middleware
 from api.v1.chat_async import router as chat_router
 from api.v1.auth_async import router as auth_router
 from api.v1.auth_bypass import router as auth_bypass_router
-from api.v1.admin_async import router as admin_router
+from api.v1.admin import admin_router as admin_router
 from api.v1.student_async import router as student_router
 from api.v1.questions_async import router as questions_router
 from api.v1.images_async import router as images_router
 from api.v1.practice_async import router as practice_router
-from api.v1.mcq_async import router as mcq_router
+from api.v1.mcq_test_series import mcq_test_series_router as mcq_router
 from api.v1.tutor_async import router as tutor_router
 
-from api.v1.learning_async import router as learning_router
+from api.v1.learning import learning_router as learning_router
 from api.v1.strokes_async import router as strokes_router
 
 # Optional debugger routes (require LangChain stack). Gate import to avoid hard dependency.
@@ -87,6 +87,24 @@ except Exception as e:
     _online_class_available = False
     logging.warning(f"Online class routes disabled: {str(e)}")
 
+# Classroom Management routes (Online Class with Meet links)
+try:
+    from api.v1.classroom_async import router as classroom_router
+    _classroom_available = True
+except Exception as e:
+    classroom_router = None
+    _classroom_available = False
+    logging.warning(f"Classroom routes disabled: {str(e)}")
+
+# SmartBoard routes (real-time pen monitoring for teaching)
+try:
+    from api.v1.smartboard_async import router as smartboard_router
+    _smartboard_available = True
+except Exception as e:
+    smartboard_router = None
+    _smartboard_available = False
+    logging.warning(f"SmartBoard routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -100,6 +118,69 @@ db_manager = None
 cache_manager = None
 auth_manager = None
 session_timeout_task = None
+
+async def ensure_classroom_indexes(db: DatabaseManager):
+    """
+    Automatically ensure classroom-related indexes exist on startup.
+    No manual migration script needed - this runs every time the app starts.
+    """
+    try:
+        # Get the raw MongoDB database
+        mongo_db = db.mongo_db
+
+        # Index for student class mappings (for finding students in a class)
+        try:
+            await mongo_db.students.create_index(
+                [("class_mappings.standard", 1), ("class_mappings.section", 1), ("class_mappings.subject", 1)],
+                name="class_mappings_lookup",
+                sparse=True,
+                background=True
+            )
+        except Exception:
+            pass  # Index may already exist
+
+        # Indexes for online_classes collection
+        try:
+            await mongo_db.online_classes.create_index(
+                [("tutor_id", 1), ("status", 1)],
+                name="tutor_status",
+                background=True
+            )
+            await mongo_db.online_classes.create_index(
+                [("meet_code", 1)],
+                name="meet_code_unique",
+                unique=True,
+                sparse=True,
+                background=True
+            )
+            await mongo_db.online_classes.create_index(
+                [("standard", 1), ("section", 1), ("subject", 1)],
+                name="class_filter",
+                background=True
+            )
+        except Exception:
+            pass  # Indexes may already exist
+
+        # Indexes for smartboard_sessions collection
+        try:
+            await mongo_db.smartboard_sessions.create_index(
+                [("session_id", 1)],
+                name="session_id_unique",
+                unique=True,
+                background=True
+            )
+            await mongo_db.smartboard_sessions.create_index(
+                [("tutor_id", 1), ("status", 1)],
+                name="tutor_session_status",
+                background=True
+            )
+        except Exception:
+            pass  # Indexes may already exist
+
+        logger.info("✅ Classroom indexes verified")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not verify classroom indexes: {e}")
+
 
 async def check_inactive_sessions():
     """Background task to mark students offline if inactive for >5 minutes"""
@@ -165,6 +246,9 @@ async def lifespan(app: FastAPI):
         # Initialize database connections
         db_manager = DatabaseManager()
         await db_manager.initialize()
+
+        # Ensure classroom indexes exist (auto-setup, no migration needed)
+        await ensure_classroom_indexes(db_manager)
 
         # Initialize cache (optional - continue without it if unavailable)
         cache_manager = CacheManager(REDIS_URL)
@@ -492,6 +576,28 @@ if _online_class_available and online_class_router:
     logger.info("✅ Online class routes enabled")
 else:
     logger.warning("⚠️ Online class routes disabled")
+
+# Classroom Management routes (Online Class with Meet links, student eligibility)
+if _classroom_available and classroom_router:
+    app.include_router(
+        classroom_router,
+        prefix=f"{API_V1_PREFIX}/classroom",
+        tags=["Classroom"]
+    )
+    logger.info("✅ Classroom routes enabled")
+else:
+    logger.warning("⚠️ Classroom routes disabled")
+
+# SmartBoard routes (real-time pen monitoring, question attempts)
+if _smartboard_available and smartboard_router:
+    app.include_router(
+        smartboard_router,
+        prefix=f"{API_V1_PREFIX}/smartboard",
+        tags=["SmartBoard"]
+    )
+    logger.info("✅ SmartBoard routes enabled")
+else:
+    logger.warning("⚠️ SmartBoard routes disabled")
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")
