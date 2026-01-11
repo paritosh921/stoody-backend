@@ -184,6 +184,13 @@ async def create_tutor(
         "created_by": admin_id,
         "created_at": datetime.utcnow(),
         "last_login": None,
+        # 2FA: Required for all new tutors
+        "two_fa": {
+            "enabled": False,
+            "required": True,  # Force 2FA setup on first login
+            "secret_enc": None,
+            "verified_at": None
+        }
     }
 
     # Insert into database

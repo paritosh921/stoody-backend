@@ -116,7 +116,7 @@ NODE_ENV=development
 # AI Provider
 AI_PROVIDER=openai
 OPENAI_API_KEY=your-api-key
-OPENAI_MODEL=gpt-4o
+OPENAI_MODEL=gpt-5.1
 
 # Database
 MONGODB_URI=your-mongodb-uri

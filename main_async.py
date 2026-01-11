@@ -68,6 +68,7 @@ except Exception:
 from api.v1.pdf_async import router as pdf_router
 from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
+from api.v1.totp_2fa import router as totp_2fa_router
 
 # B2C Authentication routes (Google OAuth for B2C users using stoody-b2c database)
 try:
@@ -482,16 +483,19 @@ if _b2c_auth_available and b2c_auth_router:
 else:
     logger.warning("⚠️ B2C authentication routes disabled (missing dependencies)")
 
-# Online Class routes (WebSocket for remote teaching)
-if _online_class_available and online_class_router:
-    app.include_router(
-        online_class_router,
-        prefix=f"{API_V1_PREFIX}/online-class",
-        tags=["Online Class"]
-    )
-    logger.info("✅ Online class routes enabled")
-else:
-    logger.warning("⚠️ Online class routes disabled")
+# TOTP 2FA routes (Google Authenticator for admins and tutors)
+app.include_router(
+    totp_2fa_router,
+    prefix=f"{API_V1_PREFIX}/auth/2fa",
+    tags=["Two-Factor Authentication"]
+)
+# Also mount at /auth/2fa for frontend convenience
+app.include_router(
+    totp_2fa_router,
+    prefix="/auth/2fa",
+    tags=["Two-Factor Authentication (Legacy)"]
+)
+logger.info("✅ TOTP 2FA authentication routes enabled")
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")

@@ -587,7 +587,14 @@ async def register_admin(
             "role": "admin",
             "is_active": True,
             "created_at": datetime.utcnow(),
-            "google_id": None
+            "google_id": None,
+            # 2FA: Required for all new admins
+            "two_fa": {
+                "enabled": False,
+                "required": True,  # Force 2FA setup on first login
+                "secret_enc": None,
+                "verified_at": None
+            }
         }
 
         # Insert admin
