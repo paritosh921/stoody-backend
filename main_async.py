@@ -79,6 +79,15 @@ except Exception as e:
     _b2c_auth_available = False
     logging.warning(f"B2C auth routes disabled: {str(e)}")
 
+# Online Class routes (WebSocket for remote teaching)
+try:
+    from api.v1.online_class_async import router as online_class_router
+    _online_class_available = True
+except Exception as e:
+    online_class_router = None
+    _online_class_available = False
+    logging.warning(f"Online class routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
