@@ -1162,7 +1162,7 @@ async def get_school_dashboard_stats(
 @limiter.limit("30/minute")
 async def get_class_section_monitoring_stats(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -1173,23 +1173,99 @@ async def get_class_section_monitoring_stats(
     - Average usage in minutes
     - Average % completion
     - Average Score
+
+    Admins see all students under them.
+    Tutors see only students assigned/mapped to them.
     """
     try:
-        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        user_type = current_user.get("user_type")
+        admin_id = None
 
-        # Check cache first
-        cache_key = f"class_section_monitoring_{admin_id}"
-        cached_stats = await cache.get(cache_key, "admin")
-        if cached_stats:
-            return cached_stats
+        # Determine which students to include based on user type
+        if user_type == "admin":
+            admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+            cache_key = f"class_section_monitoring_admin_{admin_id}"
+            cached_stats = await cache.get(cache_key, "admin")
+            if cached_stats:
+                return cached_stats
+            admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+        else:
+            # Tutor scoping: same logic as get_student_progress
+            tutor_id = current_user.get("tutor_id")
+            admin_id_str = current_user.get("admin_id")
+            try:
+                admin_id = ObjectId(admin_id_str) if admin_id_str else None
+            except Exception:
+                admin_id = None
 
-        # Get all students for this admin
-        admin_students = await db.mongo_find("students", {"admin_id": admin_id})
+            cache_key = f"class_section_monitoring_tutor_{tutor_id}"
+            cached_stats = await cache.get(cache_key, "admin")
+            if cached_stats:
+                return cached_stats
 
-        # Get all documents for this admin
-        admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+            # 1) Students explicitly mapped via teacher_ids
+            mapped = await db.mongo_find(
+                "students",
+                {"teacher_ids": {"$in": [tutor_id]}},
+                projection={"password_hash": 0}
+            )
 
-        # Get all question attempts for students of this admin
+            # 2) Students listed in tutor.assigned_student_ids
+            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            assigned = []
+            if tutor_doc and tutor_doc.get("assigned_student_ids"):
+                assigned_ids = tutor_doc.get("assigned_student_ids", [])
+                if assigned_ids:
+                    assigned = await db.mongo_find(
+                        "students",
+                        {"student_id": {"$in": assigned_ids}},
+                        projection={"password_hash": 0}
+                    )
+
+            # 3) Criteria-based: same admin with matching standards/sections/subjects
+            criteria_matches = []
+            if tutor_doc and admin_id is not None:
+                base = {"admin_id": admin_id}
+                or_filters = []
+                standards = tutor_doc.get("standards") or []
+                if standards:
+                    or_filters.append({"grade": {"$in": standards}})
+                sections = tutor_doc.get("sections") or []
+                if sections:
+                    or_filters.append({"section": {"$in": sections}})
+                subjects = tutor_doc.get("subjects") or []
+                if subjects:
+                    or_filters.append({"subjects": {"$in": subjects}})
+                plans = tutor_doc.get("plan_types") or []
+                if plans:
+                    or_filters.append({"plan_types": {"$in": plans}})
+
+                if not or_filters:
+                    criteria_matches = await db.mongo_find(
+                        "students", base, projection={"password_hash": 0}
+                    )
+                else:
+                    criteria_matches = await db.mongo_find(
+                        "students",
+                        {"$and": [base, {"$or": or_filters}]},
+                        projection={"password_hash": 0}
+                    )
+
+            # Deduplicate by _id
+            seen = set()
+            admin_students = []
+            for s in mapped + assigned + criteria_matches:
+                sid = str(s.get("_id"))
+                if sid not in seen:
+                    seen.add(sid)
+                    admin_students.append(s)
+
+        # Get all documents for this admin (tutors see documents for their admin)
+        admin_documents = []
+        if admin_id:
+            admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+
+        # Get all question attempts for scoped students
         student_ids = [s["_id"] for s in admin_students]
         all_attempts = await db.mongo_find(
             "question_attempts",
