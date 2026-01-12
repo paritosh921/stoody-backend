@@ -97,6 +97,15 @@ except Exception as e:
     _classroom_available = False
     logging.warning(f"Classroom routes disabled: {str(e)}")
 
+# Meeting Management routes (Google Meet integration)
+try:
+    from api.v1.meeting_async import router as meeting_router
+    _meeting_available = True
+except Exception as e:
+    meeting_router = None
+    _meeting_available = False
+    logging.warning(f"Meeting routes disabled: {str(e)}")
+
 # SmartBoard routes (real-time pen monitoring for teaching)
 try:
     from api.v1.smartboard_async import router as smartboard_router
@@ -105,6 +114,51 @@ except Exception as e:
     smartboard_router = None
     _smartboard_available = False
     logging.warning(f"SmartBoard routes disabled: {str(e)}")
+
+# Dashboard routes (pen monitoring from stoody-pen-multi)
+try:
+    from api.v1.dashboard import router as dashboard_router
+    _dashboard_available = True
+except Exception as e:
+    dashboard_router = None
+    _dashboard_available = False
+    logging.warning(f"Dashboard routes disabled: {str(e)}")
+
+# Hub routes (BLE hub registration)
+try:
+    from api.v1.hub import router as hub_router
+    _hub_available = True
+except Exception as e:
+    hub_router = None
+    _hub_available = False
+    logging.warning(f"Hub routes disabled: {str(e)}")
+
+# Notes routes (teacher canvas notes)
+try:
+    from api.v1.notes import router as notes_router
+    _notes_available = True
+except Exception as e:
+    notes_router = None
+    _notes_available = False
+    logging.warning(f"Notes routes disabled: {str(e)}")
+
+# OCR routes (handwriting recognition)
+try:
+    from api.v1.ocr import router as ocr_router
+    _ocr_available = True
+except Exception as e:
+    ocr_router = None
+    _ocr_available = False
+    logging.warning(f"OCR routes disabled: {str(e)}")
+
+# Question Attempts routes (question locking and evaluation)
+try:
+    from api.v1.question_attempts import router as question_attempts_router
+    _question_attempts_available = True
+except Exception as e:
+    question_attempts_router = None
+    _question_attempts_available = False
+    logging.warning(f"Question Attempts routes disabled: {str(e)}")
 
 
 # Configure logging
@@ -526,6 +580,17 @@ if _classroom_available and classroom_router:
 else:
     logger.warning("⚠️ Classroom routes disabled")
 
+# Meeting Management routes (Google Meet integration for online classes)
+if _meeting_available and meeting_router:
+    app.include_router(
+        meeting_router,
+        prefix=f"{API_V1_PREFIX}/meeting",
+        tags=["Meeting"]
+    )
+    logger.info("✅ Meeting routes enabled")
+else:
+    logger.warning("⚠️ Meeting routes disabled")
+
 # SmartBoard routes (real-time pen monitoring, question attempts)
 if _smartboard_available and smartboard_router:
     app.include_router(
@@ -536,6 +601,57 @@ if _smartboard_available and smartboard_router:
     logger.info("✅ SmartBoard routes enabled")
 else:
     logger.warning("⚠️ SmartBoard routes disabled")
+
+# Dashboard routes (pen monitoring from stoody-pen-multi)
+if _dashboard_available and dashboard_router:
+    app.include_router(
+        dashboard_router,
+        tags=["Dashboard"]
+    )
+    logger.info("✅ Dashboard routes enabled")
+else:
+    logger.warning("⚠️ Dashboard routes disabled")
+
+# Hub routes (BLE hub registration)
+if _hub_available and hub_router:
+    app.include_router(
+        hub_router,
+        tags=["Hub"]
+    )
+    logger.info("✅ Hub routes enabled")
+else:
+    logger.warning("⚠️ Hub routes disabled")
+
+# Notes routes (teacher canvas notes)
+if _notes_available and notes_router:
+    app.include_router(
+        notes_router,
+        tags=["Notes"]
+    )
+    logger.info("✅ Notes routes enabled")
+else:
+    logger.warning("⚠️ Notes routes disabled")
+
+# OCR routes (handwriting recognition)
+if _ocr_available and ocr_router:
+    app.include_router(
+        ocr_router,
+        tags=["OCR"]
+    )
+    logger.info("✅ OCR routes enabled")
+else:
+    logger.warning("⚠️ OCR routes disabled")
+
+# Question Attempts routes (question locking and evaluation)
+if _question_attempts_available and question_attempts_router:
+    app.include_router(
+        question_attempts_router,
+        tags=["Question Attempts"]
+    )
+    logger.info("✅ Question Attempts routes enabled")
+else:
+    logger.warning("⚠️ Question Attempts routes disabled")
+
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")
