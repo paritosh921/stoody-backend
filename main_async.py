@@ -177,6 +177,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress httpx/httpcore logging to prevent token leakage in URLs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Global managers
 db_manager = None
 cache_manager = None
