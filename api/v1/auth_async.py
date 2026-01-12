@@ -384,6 +384,77 @@ async def student_change_password(
             detail="Failed to change password"
         )
 
+
+@router.post("/tutor/change-password")
+async def tutor_change_password(
+    request: Request,
+    password_data: StudentChangePasswordRequest,  # Reuse same schema (current_password, new_password)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """Tutor changes their password (must be logged in)"""
+    try:
+        # Ensure user is a tutor
+        if current_user.get("user_type") != "tutor":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only tutors can use this endpoint"
+            )
+
+        tutor_id = ObjectId(current_user["user_id"])
+
+        # Get tutor
+        tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+        if not tutor:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Tutor not found"
+            )
+
+        # Verify current password
+        if not auth_manager.verify_password(
+            password_data.current_password,
+            tutor.get("password_hash", "")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect"
+            )
+
+        # Hash new password
+        new_password_hash = auth_manager.get_password_hash(password_data.new_password)
+
+        # Update password and clear requires_password_change flag
+        await db.mongo_update_one(
+            "tutors",
+            {"_id": tutor_id},
+            {
+                "$set": {
+                    "password_hash": new_password_hash,
+                    "requires_password_change": False,
+                    "password_changed_at": datetime.utcnow()
+                }
+            }
+        )
+
+        logger.info(f"Tutor {tutor.get('username')} changed their password")
+
+        return {
+            "success": True,
+            "message": "Password changed successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Tutor change password error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password"
+        )
+
+
 @router.post("/student/forgot-password")
 @limiter.limit("3/hour")
 async def student_forgot_password(
