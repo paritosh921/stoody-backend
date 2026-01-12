@@ -742,37 +742,37 @@ async def disable_2fa(
         # Verify token
         token = credentials.credentials
         user_data = await auth_manager.verify_token_and_get_user(token)
-        
+
         if not user_data:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication"
             )
-        
+
         # Only allow admins to disable 2FA
         if user_data.get("user_type") != "admin":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only admins can disable 2FA"
             )
-        
+
         user_id = user_data.get("user_id")
         user_type = user_data.get("user_type")
-        
+
         await update_user_2fa(db, user_id, user_type, {
             "two_fa.enabled": False,
             "two_fa.required": False,
             "two_fa.secret_enc": None,
             "two_fa.disabled_at": datetime.utcnow()
         })
-        
+
         logger.info(f"2FA disabled for {user_type} {user_id}")
-        
+
         return {
             "success": True,
             "message": "2FA has been disabled for your account"
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -780,4 +780,101 @@ async def disable_2fa(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to disable 2FA"
+        )
+
+
+class ResetSelfRequest(BaseModel):
+    """Request to reset own 2FA with OTP verification"""
+    otp: str = Field(..., min_length=6, max_length=6)
+
+
+@router.post("/reset-self")
+@limiter.limit("3/minute")  # Strict rate limit for security
+async def reset_own_2fa(
+    request: Request,
+    data: ResetSelfRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """
+    Reset own 2FA after verifying current OTP.
+
+    This allows users to reconfigure their authenticator app by:
+    1. Verifying their current OTP code (proves they have access to authenticator)
+    2. Clearing the existing 2FA secret
+    3. User will be prompted to set up 2FA again on next login
+
+    Security: Requires valid current OTP to prevent unauthorized resets.
+    """
+    try:
+        # Verify token
+        token = credentials.credentials
+        user_data = await auth_manager.verify_token_and_get_user(token)
+
+        if not user_data:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication"
+            )
+
+        user_id = user_data.get("user_id")
+        user_type = user_data.get("user_type")
+
+        user = await get_user_by_id(db, user_id, user_type)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+
+        # Check if 2FA is enabled
+        two_fa = user.get("two_fa", {})
+        if not two_fa.get("enabled"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="2FA is not enabled for this account"
+            )
+
+        # Get current secret and verify OTP
+        secret_enc = two_fa.get("secret_enc")
+        if not secret_enc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="2FA configuration error"
+            )
+
+        secret = decrypt_secret(secret_enc)
+        totp = pyotp.TOTP(secret)
+
+        if not totp.verify(data.otp.strip(), valid_window=1):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid verification code. Please enter your current authenticator code."
+            )
+
+        # OTP verified - reset 2FA so user can set up again
+        await update_user_2fa(db, user_id, user_type, {
+            "two_fa.enabled": False,
+            "two_fa.secret_enc": None,
+            "two_fa.temp_secret_enc": None,
+            "two_fa.required": True,  # Still require 2FA on next login
+            "two_fa.reset_at": datetime.utcnow(),
+            "two_fa.reset_reason": "self_reset"
+        })
+
+        logger.info(f"2FA self-reset by {user_type} {user_id}")
+
+        return {
+            "success": True,
+            "message": "2FA has been reset. You will need to set up 2FA again on your next login."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Self-reset 2FA error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reset 2FA"
         )
