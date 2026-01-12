@@ -386,7 +386,7 @@ async def login_with_2fa(
         )
 
 
-@router.post("/2fa/setup/start", response_model=SetupStartResponse)
+@router.post("/setup/start", response_model=SetupStartResponse)
 @limiter.limit("10/minute")
 async def start_2fa_setup(
     request: Request,
@@ -438,7 +438,7 @@ async def start_2fa_setup(
         )
 
 
-@router.post("/2fa/setup/verify", response_model=SetupVerifyResponse)
+@router.post("/setup/verify", response_model=SetupVerifyResponse)
 @limiter.limit("5/minute")  # Rate limit to prevent brute force
 async def verify_2fa_setup(
     request: Request,
@@ -531,7 +531,7 @@ async def verify_2fa_setup(
         )
 
 
-@router.post("/2fa/verify-otp", response_model=OTPVerifyResponse)
+@router.post("/verify-otp", response_model=OTPVerifyResponse)
 @limiter.limit("5/minute")  # Rate limit to prevent brute force
 async def verify_otp(
     request: Request,
@@ -620,7 +620,7 @@ async def verify_otp(
         )
 
 
-@router.get("/2fa/status", response_model=TwoFAStatusResponse)
+@router.get("/status", response_model=TwoFAStatusResponse)
 async def get_2fa_status(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -670,7 +670,7 @@ async def get_2fa_status(
         )
 
 
-@router.post("/2fa/admin/reset/{target_user_id}")
+@router.post("/admin/reset/{target_user_id}")
 async def admin_reset_2fa(
     request: Request,
     target_user_id: str,
@@ -727,7 +727,7 @@ async def admin_reset_2fa(
         )
 
 
-@router.post("/2fa/disable")
+@router.post("/disable")
 async def disable_2fa(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
