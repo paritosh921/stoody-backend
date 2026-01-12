@@ -4131,6 +4131,9 @@ async def extract_region_from_pdf(
     """
     Extract a specific region from a PDF page and process it with OCR.
     
+    Uses Mistral OCR API (mistral-ocr-latest) to extract text AND images from the region,
+    just like the direct OCR pipeline does for full documents.
+    
     Args:
         pdf_content: Raw PDF bytes
         page_number: Page number (1-indexed)
@@ -4138,7 +4141,7 @@ async def extract_region_from_pdf(
         region_id: ID of the region being processed
     
     Returns:
-        Dict with extracted text and images
+        Dict with extracted text, images list, and region screenshot
     """
     try:
         from PIL import Image
@@ -4165,20 +4168,39 @@ async def extract_region_from_pdf(
         
         clip_rect = fitz.Rect(x0, y0, x1, y1)
         
-        # Render the clipped region at high resolution
-        mat = fitz.Matrix(3.0, 3.0)  # 3x zoom for better OCR quality
+        # Create a new single-page PDF with just the region
+        # This allows us to use Mistral OCR API which expects a PDF
+        region_doc = fitz.open()  # Create new empty PDF
+        
+        # Create a new page with the region dimensions
+        region_width = x1 - x0
+        region_height = y1 - y0
+        new_page = region_doc.new_page(width=region_width, height=region_height)
+        
+        # Copy the content from the original region to the new page
+        # Use show_pdf_page to copy a portion of the original page
+        new_page.show_pdf_page(
+            fitz.Rect(0, 0, region_width, region_height),  # Target rect on new page
+            doc,  # Source document
+            page_number - 1,  # Source page (0-indexed)
+            clip=clip_rect  # Clip to the region
+        )
+        
+        # Get the region PDF as bytes
+        region_pdf_bytes = region_doc.tobytes()
+        region_doc.close()
+        
+        # Also render the region as an image for fallback/reference
+        mat = fitz.Matrix(3.0, 3.0)  # 3x zoom for better quality
         pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+        region_img_bytes = pix.tobytes("png")
+        region_img_base64 = base64.b64encode(region_img_bytes).decode('utf-8')
         
-        # Convert to PNG bytes
-        img_bytes = pix.tobytes("png")
-        
-        # Encode as base64 for Mistral OCR
-        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-        
-        # Close document
         doc.close()
         
-        # Send to Mistral OCR as an image
+        # Encode region PDF as base64 for Mistral OCR API
+        region_pdf_base64 = base64.b64encode(region_pdf_bytes).decode('utf-8')
+        
         import aiohttp
         
         if not MISTRAL_API_KEY:
@@ -4192,16 +4214,103 @@ async def extract_region_from_pdf(
             "Content-Type": "application/json"
         }
         
-        # Use Pixtral model for image-based OCR
+        # Use Mistral OCR API (same as direct OCR) to extract both text AND images
         payload = {
-            "model": "pixtral-12b-2409",  # Pixtral model for image understanding
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": """Extract all text from this question image. This is a question from an exam or practice paper.
+            "model": "mistral-ocr-latest",
+            "document": {
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{region_pdf_base64}"
+            },
+            "include_image_base64": True  # Important: This extracts individual figures
+        }
+        
+        logger.info(f"Calling Mistral OCR API for region {region_id} (PDF size: {len(region_pdf_base64)} chars)")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                MISTRAL_OCR_URL,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"Mistral OCR API error for region {region_id}: {error_text}")
+                    
+                    # Fall back to Pixtral for text extraction if OCR fails
+                    logger.info(f"Falling back to Pixtral for region {region_id}")
+                    return await _extract_region_with_pixtral(region_img_base64, region_id)
+                
+                ocr_result = await response.json()
+                
+                # Extract text from OCR result
+                extracted_text = ""
+                extracted_images = []
+                
+                for page_data in ocr_result.get("pages", []):
+                    # Get markdown text
+                    page_markdown = page_data.get("markdown", "")
+                    extracted_text += page_markdown + "\n"
+                    
+                    # Get extracted images (these are the cropped figures!)
+                    for img in page_data.get("images", []):
+                        if img.get("image_base64"):
+                            extracted_images.append({
+                                "id": img.get("id", f"img-{len(extracted_images)}"),
+                                "base64": img.get("image_base64"),
+                                "top_left_x": img.get("top_left_x", 0),
+                                "top_left_y": img.get("top_left_y", 0),
+                                "bottom_right_x": img.get("bottom_right_x", 0),
+                                "bottom_right_y": img.get("bottom_right_y", 0)
+                            })
+                
+                extracted_text = extracted_text.strip()
+                
+                logger.info(f"Successfully extracted from region {region_id}: {len(extracted_text)} chars, {len(extracted_images)} images")
+                
+                return {
+                    "success": True,
+                    "extractedText": extracted_text,
+                    "extractedImages": extracted_images,  # Individual cropped figures
+                    "regionImageBase64": region_img_base64,  # Region screenshot (for fallback)
+                    "ocrResult": ocr_result  # Full OCR result for advanced processing
+                }
+                
+    except ImportError as e:
+        logger.error(f"Missing dependency for region extraction: {e}")
+        return {
+            "success": False,
+            "error": f"Missing dependency: {e}. Install PyMuPDF with 'pip install pymupdf'"
+        }
+    except Exception as e:
+        logger.error(f"Error extracting region {region_id}: {str(e)}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+async def _extract_region_with_pixtral(img_base64: str, region_id: str) -> Dict[str, Any]:
+    """
+    Fallback: Extract text from region image using Pixtral chat API.
+    This is used when OCR API fails or doesn't return images.
+    """
+    import aiohttp
+    
+    headers = {
+        "Authorization": f"Bearer {MISTRAL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "pixtral-12b-2409",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """Extract all text from this question image. This is a question from an exam or practice paper.
 
 Please extract:
 1. The complete question text
@@ -4219,20 +4328,21 @@ D) [option D text]
 FIGURES: [description of any images/diagrams if present]
 
 If this is not an MCQ, just provide the question text and any figure descriptions."""
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{img_base64}"
-                            }
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_base64}"
                         }
-                    ]
-                }
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.1
-        }
-        
+                    }
+                ]
+            }
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.1
+    }
+    
+    try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.mistral.ai/v1/chat/completions",
@@ -4242,31 +4352,25 @@ If this is not an MCQ, just provide the question text and any figure description
             ) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.error(f"Mistral API error for region {region_id}: {error_text}")
+                    logger.error(f"Pixtral API error for region {region_id}: {error_text}")
                     return {
                         "success": False,
-                        "error": f"OCR API error: {response.status}"
+                        "error": f"Pixtral API error: {response.status}"
                     }
                 
                 result = await response.json()
                 extracted_text = result['choices'][0]['message']['content'].strip()
                 
-                logger.info(f"Successfully extracted text for region {region_id}: {len(extracted_text)} chars")
+                logger.info(f"Pixtral fallback extracted text for region {region_id}: {len(extracted_text)} chars")
                 
                 return {
                     "success": True,
                     "extractedText": extracted_text,
-                    "imageBase64": img_base64  # Keep for reference
+                    "extractedImages": [],  # Pixtral doesn't extract images
+                    "regionImageBase64": img_base64
                 }
-                
-    except ImportError as e:
-        logger.error(f"Missing dependency for region extraction: {e}")
-        return {
-            "success": False,
-            "error": f"Missing dependency: {e}. Install PyMuPDF with 'pip install pymupdf'"
-        }
     except Exception as e:
-        logger.error(f"Error extracting region {region_id}: {str(e)}")
+        logger.error(f"Pixtral fallback error for region {region_id}: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -4379,6 +4483,7 @@ async def process_regions_ocr(
         results = []
         successful = 0
         failed = 0
+        total_images_saved = 0  # Track total images saved
         
         for region in regions_to_process:
             region_id = region['id']
@@ -4421,11 +4526,119 @@ async def process_regions_ocr(
                     for match in option_pattern.finditer(extracted_text):
                         options.append(match.group(2).strip())
                 
+                # ============================================
+                # SAVE THE EXTRACTED IMAGES (CROPPED FIGURES)
+                # These are individually cropped diagrams from Mistral OCR
+                # ============================================
+                question_figures = []
+                page_images = []
+                
+                # Get the extracted images from OCR result (these are cropped figures like direct OCR)
+                extracted_images = extraction_result.get('extractedImages', [])
+                region_image_base64 = extraction_result.get('regionImageBase64', '')
+                
+                if extracted_images:
+                    # We have cropped figures from Mistral OCR - save each one
+                    logger.info(f"📸 Region {region_id} has {len(extracted_images)} extracted images from OCR")
+                    
+                    for idx, img_data in enumerate(extracted_images):
+                        img_base64 = img_data.get('base64', '')
+                        img_id = img_data.get('id', f'img-{idx}')
+                        
+                        if img_base64:
+                            try:
+                                # Save each cropped figure using the same function as regular OCR
+                                saved_images = await save_image_to_disk(
+                                    image_base64=img_base64,
+                                    image_id=f"region-{region_id}-{img_id}",
+                                    pdf_filename=document.get("filename", "unknown.pdf"),
+                                    db=db,
+                                    user_id=current_user.get("user_id"),
+                                    split_composite=True,  # Split if it's a composite image with multiple options
+                                    is_b2c=is_b2c
+                                )
+                                
+                                if saved_images:
+                                    logger.info(f"✅ Saved cropped figure {img_id} for region {region_id}")
+                                    total_images_saved += len(saved_images)
+                                    
+                                    # Add to question_figures (these are the actual diagrams)
+                                    for saved_img in saved_images:
+                                        image_obj = {
+                                            'id': saved_img['id'],
+                                            'filename': saved_img['filename'],
+                                            'path': saved_img['path'],
+                                            'base64Data': img_base64,
+                                            'description': '',
+                                            'type': 'diagram',
+                                            'bbox': {
+                                                'top_left_x': img_data.get('top_left_x', 0),
+                                                'top_left_y': img_data.get('top_left_y', 0),
+                                                'bottom_right_x': img_data.get('bottom_right_x', 0),
+                                                'bottom_right_y': img_data.get('bottom_right_y', 0)
+                                            },
+                                            'metadata': {
+                                                'source': 'manual_segmentation_ocr',
+                                                'page': region['pageNumber'],
+                                                'extractedAt': datetime.utcnow().isoformat()
+                                            }
+                                        }
+                                        question_figures.append(image_obj)
+                            except Exception as img_err:
+                                logger.error(f"Failed to save cropped figure {img_id} for region {region_id}: {img_err}")
+                
+                elif region_image_base64:
+                    # Fallback: No extracted figures, use the region screenshot
+                    # This happens when Pixtral fallback was used or OCR didn't find any images
+                    logger.warning(f"⚠️ No cropped figures for region {region_id}, using region screenshot as fallback")
+                    
+                    try:
+                        saved_images = await save_image_to_disk(
+                            image_base64=region_image_base64,
+                            image_id=f"region-{region_id}-full",
+                            pdf_filename=document.get("filename", "unknown.pdf"),
+                            db=db,
+                            user_id=current_user.get("user_id"),
+                            split_composite=False,
+                            is_b2c=is_b2c
+                        )
+                        
+                        if saved_images:
+                            logger.info(f"📸 Saved region screenshot as fallback for {region_id}")
+                            total_images_saved += len(saved_images)
+                            
+                            for saved_img in saved_images:
+                                image_obj = {
+                                    'id': saved_img['id'],
+                                    'filename': saved_img['filename'],
+                                    'path': saved_img['path'],
+                                    'base64Data': region_image_base64,
+                                    'description': '',
+                                    'type': 'region_screenshot',
+                                    'bbox': {
+                                        'x': region['x'],
+                                        'y': region['y'],
+                                        'width': region['width'],
+                                        'height': region['height']
+                                    },
+                                    'metadata': {
+                                        'source': 'manual_segmentation_fallback',
+                                        'page': region['pageNumber'],
+                                        'extractedAt': datetime.utcnow().isoformat()
+                                    }
+                                }
+                                question_figures.append(image_obj)
+                    except Exception as img_err:
+                        logger.error(f"Failed to save region screenshot for {region_id}: {img_err}")
+                else:
+                    logger.warning(f"No images available for region {region_id}")
+                
                 results.append({
                     "regionId": region_id,
                     "success": True,
                     "extractedText": extracted_text,
                     "extractedOptions": options if options else None,
+                    "extractedImages": [{"id": img['id'], "path": img['path']} for img in question_figures],
                     "error": None
                 })
                 
@@ -4447,6 +4660,8 @@ async def process_regions_ocr(
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document.get("filename", ""),
                     "document_id": document_id,
+                    "images": page_images,  # Option images (empty for manual segmentation)
+                    "question_figures": question_figures,  # The region image as the question figure
                     "options": options,  # Will be empty for Practice Sets
                     "enhanced_options": [
                         {
@@ -4486,6 +4701,7 @@ async def process_regions_ocr(
                     "success": False,
                     "extractedText": None,
                     "extractedOptions": None,
+                    "extractedImages": None,
                     "error": extraction_result.get('error', 'Unknown error')
                 })
         
@@ -4513,6 +4729,7 @@ async def process_regions_ocr(
                 {"$set": {
                     "ocr_status": final_status,
                     "extracted_questions_count": successful,
+                    "extracted_images_count": total_images_saved,
                     "ocr_completed_at": datetime.utcnow()
                 }}
             )
@@ -4523,11 +4740,12 @@ async def process_regions_ocr(
                 {"$set": {
                     "ocr_status": final_status,
                     "extracted_questions_count": successful,
+                    "extracted_images_count": total_images_saved,
                     "ocr_completed_at": datetime.utcnow()
                 }}
             )
         
-        logger.info(f"Region OCR completed for {document_id}: {successful} successful, {failed} failed")
+        logger.info(f"Region OCR completed for {document_id}: {successful} questions, {total_images_saved} images, {failed} failed")
         
         return {
             "success": True,

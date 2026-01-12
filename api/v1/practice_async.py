@@ -70,6 +70,147 @@ def get_language_instruction(detected_language: str) -> str:
         )
 
 
+def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
+    """
+    Robustly parse JSON from LLM response, handling:
+    - Markdown code blocks
+    - LaTeX content with escaped backslashes
+    - Incomplete/truncated JSON
+    - Extra text before/after JSON
+    
+    Returns parsed dict or None if parsing fails.
+    """
+    import json
+    import re
+    import ast
+    
+    if not raw_response:
+        return None
+    
+    # Step 1: Remove markdown code blocks
+    clean = raw_response.strip()
+    
+    # Remove ```json ... ``` blocks
+    if "```json" in clean:
+        match = re.search(r'```json\s*([\s\S]*?)\s*```', clean)
+        if match:
+            clean = match.group(1).strip()
+        else:
+            clean = re.sub(r'```json\s*', '', clean)
+            clean = re.sub(r'\s*```', '', clean)
+    elif "```" in clean:
+        match = re.search(r'```\s*([\s\S]*?)\s*```', clean)
+        if match:
+            clean = match.group(1).strip()
+        else:
+            clean = re.sub(r'```\s*', '', clean)
+    
+    # Step 2: Try direct JSON parse
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+    
+    # Step 3: Find JSON object boundaries (handle nested braces)
+    json_str = None
+    
+    # Find the first { and try to match balanced braces
+    start_idx = clean.find('{')
+    if start_idx != -1:
+        brace_count = 0
+        end_idx = start_idx
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(clean)):
+            char = clean[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+            
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i
+                        break
+        
+        if brace_count == 0 and end_idx > start_idx:
+            json_str = clean[start_idx:end_idx + 1]
+    
+    if json_str:
+        # Try parsing the extracted JSON
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+        
+        # Step 4: Fix common JSON issues
+        fixed = json_str
+        
+        # Fix unescaped control characters
+        fixed = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', fixed)
+        
+        # Try again after fixing
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+        
+        # Step 5: Try ast.literal_eval (handles single quotes)
+        try:
+            result = ast.literal_eval(fixed)
+            if isinstance(result, dict):
+                return result
+        except (ValueError, SyntaxError):
+            pass
+    
+    # Step 6: Last resort - regex extraction for key fields
+    # Try to extract individual fields if full parse fails
+    try:
+        extracted = {}
+        
+        # Extract is_correct (boolean)
+        is_correct_match = re.search(r'"is_correct"\s*:\s*(true|false)', clean, re.IGNORECASE)
+        if is_correct_match:
+            extracted["is_correct"] = is_correct_match.group(1).lower() == "true"
+        
+        # Extract score (number)
+        score_match = re.search(r'"score"\s*:\s*([0-9.]+)', clean)
+        if score_match:
+            extracted["score"] = float(score_match.group(1))
+        
+        # Extract extracted_answer (string - be careful with quotes)
+        answer_match = re.search(r'"extracted_answer"\s*:\s*"([^"]*(?:\\"[^"]*)*)"', clean)
+        if answer_match:
+            extracted["extracted_answer"] = answer_match.group(1).replace('\\"', '"')
+        
+        # Extract solved_answer if present
+        solved_match = re.search(r'"solved_answer"\s*:\s*"([^"]*(?:\\"[^"]*)*)"', clean)
+        if solved_match:
+            extracted["solved_answer"] = solved_match.group(1).replace('\\"', '"')
+        
+        # If we got at least is_correct, use the extracted data
+        if "is_correct" in extracted:
+            logger.info(f"📊 Partial JSON extraction succeeded: {extracted}")
+            return extracted
+            
+    except Exception as e:
+        logger.warning(f"Partial extraction failed: {e}")
+    
+    return None
+
+
 router = APIRouter()
 
 # Rate limiter
@@ -1002,39 +1143,46 @@ async def evaluate_submission(
             prompt += "5. Partial credit (score 0.5): if they're on the right track but made a small error.\n\n"
         
         
-        # JSON output instructions - include solved_answer for no-answer cases
+        # JSON output instructions - simplified and clearer
         prompt += "═══════════════════════════════════════\n"
-        prompt += "📊 RETURN THIS JSON EXACTLY:\n"
+        prompt += "📊 OUTPUT FORMAT - RETURN VALID JSON ONLY:\n"
         prompt += "═══════════════════════════════════════\n"
+        prompt += "```json\n"
         prompt += "{\n"
-        prompt += '  "extracted_answer": "The student\'s FINAL answer (the letter for MCQ, or the final numerical/text answer)",\n'
-        prompt += '  "work_shown": "Summary of any calculations or work the student showed",\n'
-        prompt += '  "is_correct": true or false,\n'
-        prompt += '  "score": 0.0 to 1.0 (1.0 = fully correct, 0.5 = partially correct approach, 0.0 = wrong),\n'
+        prompt += '  "extracted_answer": "B",\n'  # Simple example
+        prompt += '  "work_shown": "Brief summary of student work",\n'
+        prompt += '  "is_correct": false,\n'
+        prompt += '  "score": 0.0,\n'
         if not has_correct_answer:
-            prompt += '  "solved_answer": "The correct answer YOU calculated",\n'
-        prompt += '  "what_went_wrong": "If incorrect: EXPLAIN specifically what mistake the student made (e.g., wrong formula, calculation error, misread question). If correct: leave empty or say \'Nothing - great work!\'",\n'
-        prompt += '  "correct_solution": "If incorrect: Provide the COMPLETE step-by-step solution showing how to solve this problem correctly. Include all formulas, substitutions, and calculations. If correct: Brief confirmation of their approach",\n'
-        prompt += '  "feedback": "Encouraging, educational feedback for the student",\n'
-        prompt += '  "reasoning": "Your step-by-step evaluation logic"\n'
-        prompt += "}\n\n"
+            prompt += '  "solved_answer": "B",\n'
+        prompt += '  "what_went_wrong": "Explanation if wrong",\n'
+        prompt += '  "correct_solution": "Step by step solution",\n'
+        prompt += '  "feedback": "Encouraging feedback",\n'
+        prompt += '  "reasoning": "Your evaluation logic"\n'
+        prompt += "}\n"
+        prompt += "```\n\n"
         
-        # CRITICAL: LaTeX formatting instructions
-        prompt += "⚠️ MATH FORMATTING REQUIREMENTS:\n"
-        prompt += "For ALL mathematical expressions, equations, and formulas, you MUST use LaTeX notation:\n"
-        prompt += "- Use \\\\( and \\\\) for inline math. Example: \\\\(\\\\tau = F \\\\times R\\\\)\n"
-        prompt += "- Use \\\\[ and \\\\] for display/block math. Example: \\\\[E = mc^2\\\\]\n"
-        prompt += "- Use LaTeX commands: \\\\frac{a}{b}, \\\\sqrt{x}, \\\\alpha, \\\\beta, \\\\tau, \\\\omega, etc.\n"
-        prompt += "- DO NOT use plain Unicode symbols like τ, α, ×, ⇒. ALWAYS use LaTeX equivalents.\n"
-        prompt += "- Example of CORRECT format: \\\\(\\\\tau = I\\\\alpha\\\\) where \\\\(I = mR^2\\\\)\n"
-        prompt += "- Example of WRONG format: τ = Iα where I = mR²\n\n"
-        
-        prompt += "IMPORTANT: Output ONLY the JSON, no markdown formatting or explanation.\n"
-        prompt += "CRITICAL FOR WRONG ANSWERS: You MUST provide:\n"
-        prompt += "  1. 'what_went_wrong' - Specific explanation of the student's mistake\n"
-        prompt += "  2. 'correct_solution' - Complete step-by-step solution with all calculations (use LaTeX!)\n"
+        prompt += "📝 FIELD GUIDELINES:\n"
+        prompt += "- extracted_answer: For MCQ, just the LETTER (A, B, C, or D). For numerical, the number.\n"
+        prompt += "- is_correct: Must be true or false (boolean, not string)\n"
+        prompt += "- score: 0.0 (wrong), 0.5 (partial), 1.0 (correct)\n"
         if not has_correct_answer:
-            prompt += "  3. 'solved_answer' - The correct answer you calculated\n"
+            prompt += "- solved_answer: The correct answer YOU determined (REQUIRED since no admin answer)\n"
+        prompt += "\n"
+        
+        # Math formatting (simplified)
+        prompt += "⚠️ MATH IN JSON STRINGS:\n"
+        prompt += "Use LaTeX with properly escaped backslashes in JSON strings:\n"
+        prompt += '- Write \\\\frac{a}{b} not \\frac{a}{b}\n'
+        prompt += '- Write \\\\sqrt{x} not \\sqrt{x}\n'
+        prompt += '- Write \\\\alpha, \\\\beta, \\\\tau (not α, β, τ Unicode)\n'
+        prompt += "Example: \"The answer is \\\\\\\\(mv^2\\\\\\\\)\"\n\n"
+        
+        prompt += "⚠️ CRITICAL RULES:\n"
+        prompt += "1. Output ONLY valid JSON - no text before or after\n"
+        prompt += "2. Use double quotes for strings, not single quotes\n"
+        prompt += "3. Boolean values are true/false (lowercase, no quotes)\n"
+        prompt += "4. Escape special characters in strings: \\\" for quotes, \\\\ for backslash\n\n"
         
         logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
         
@@ -1114,45 +1262,37 @@ async def evaluate_submission(
         }
         
         try:
-            parsed = None
+            # Use the robust JSON parser that handles LaTeX, nested braces, and edge cases
+            parsed = robust_json_parse(raw_response)
             
-            # Pre-process: Remove markdown code blocks if present
-            clean_response = raw_response
-            if "```json" in raw_response:
-                clean_response = _re.sub(r"```json\s*", "", raw_response)
-                clean_response = _re.sub(r"```\s*", "", clean_response).strip()
-            elif "```" in raw_response:
-                clean_response = _re.sub(r"```\s*", "", raw_response).strip()
-            
-            # Attempt 1: Direct JSON parse
-            try:
-                parsed = _json.loads(clean_response)
-            except Exception:
-                pass
+            if not parsed:
+                logger.warning(f"⚠️ Initial JSON parse failed, attempting retry request...")
                 
-            # Attempt 2: Regex extraction + JSON parse (handles nested braces)
-            if not parsed:
-                # Try to find JSON object with a more robust regex
-                m = _re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', clean_response, _re.DOTALL)
-                if m:
-                    json_str = m.group(0)
-                    try:
-                        parsed = _json.loads(json_str)
-                    except Exception:
-                        # Attempt 3: ast.literal_eval (handles single quotes, etc.)
-                        try:
-                            parsed = _ast.literal_eval(json_str)
-                        except Exception:
-                            pass
-            
-            # Attempt 4: Simple brace extraction
-            if not parsed:
-                m = _re.search(r"\{[^{}]*\}", clean_response, _re.DOTALL)
-                if m:
-                    try:
-                        parsed = _json.loads(m.group(0))
-                    except Exception:
-                        pass
+                # Retry with a simpler prompt to get just the essential data
+                retry_prompt = (
+                    f"Based on the student's work shown earlier, provide ONLY this JSON (no explanation):\n"
+                    f'{{"is_correct": true/false, "score": 0.0-1.0, "extracted_answer": "student answer"}}'
+                )
+                
+                if all_images:
+                    retry_response = await ai.analyze_images_and_text_async(
+                        all_images,
+                        retry_prompt,
+                        max_tokens=200,
+                        system_prompt="You are a JSON generator. Output ONLY valid JSON, nothing else."
+                    )
+                else:
+                    retry_response = await ai.chat_completion_async(
+                        messages=[
+                            {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON."},
+                            {"role": "user", "content": retry_prompt}
+                        ],
+                        max_tokens=200
+                    )
+                
+                retry_raw = (retry_response.get("response") or "").strip()
+                logger.info(f"📥 Retry response: {retry_raw[:200]}")
+                parsed = robust_json_parse(retry_raw)
             
             if parsed and isinstance(parsed, dict):
                 # Parse is_correct - handle various representations
@@ -1193,19 +1333,45 @@ async def evaluate_submission(
                 if correct_solution:
                     evaluation_data["correctSolution"] = str(correct_solution).strip()
                 
-                # Handle solved_answer - when admin didn't provide a correct answer, LLM solved it
+                # Handle correct answer - either from admin or LLM
                 solved_answer = parsed.get("solved_answer", "")
-                if solved_answer and not has_correct_answer:
+                if has_correct_answer:
+                    # Admin provided answer - use that as the source of truth
+                    evaluation_data["correctAnswer"] = correct_answer
+                    evaluation_data["answerSource"] = "admin_provided"
+                    
+                    # Validate: If LLM solved it differently, log a warning
+                    if solved_answer and solved_answer.strip().upper() != correct_answer.strip().upper():
+                        logger.warning(f"⚠️ LLM's solved_answer '{solved_answer}' differs from admin's '{correct_answer}'")
+                elif solved_answer:
+                    # LLM solved the question - use its answer
                     evaluation_data["correctAnswer"] = str(solved_answer).strip()
                     evaluation_data["answerSource"] = "llm_solved"
                     logger.info(f"🧠 LLM solved the question. Correct answer: '{solved_answer}'")
+                else:
+                    # No answer available - keep empty
+                    evaluation_data["correctAnswer"] = ""
+                    evaluation_data["answerSource"] = "unknown"
+                    logger.warning(f"⚠️ No correct answer available for Q:{qid}")
                 
                 # If LLM didn't extract an answer but OCR did, use OCR result
                 if not evaluation_data["extractedAnswer"] and ocr_extracted_text:
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
                     evaluation_data["answerSource"] = "ocr_extraction"
                 
-                logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, score={evaluation_data['score']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}', has_solution={bool(correct_solution)}")
+                # Validation: Check for contradictions in the analysis
+                extracted = evaluation_data["extractedAnswer"].strip().upper() if evaluation_data["extractedAnswer"] else ""
+                expected = evaluation_data["correctAnswer"].strip().upper() if evaluation_data["correctAnswer"] else ""
+                
+                # For MCQ, simple letter comparison
+                if is_mcq and extracted and expected and len(extracted) == 1 and len(expected) == 1:
+                    letter_match = extracted == expected
+                    if letter_match != evaluation_data["correct"]:
+                        logger.warning(f"⚠️ Contradiction detected! Extracted='{extracted}', Expected='{expected}', is_correct={evaluation_data['correct']}. Overriding to match={letter_match}")
+                        evaluation_data["correct"] = letter_match
+                        evaluation_data["score"] = 1.0 if letter_match else 0.0
+                
+                logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, score={evaluation_data['score']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}', correctAnswer='{evaluation_data['correctAnswer'][:50] if evaluation_data['correctAnswer'] else 'EMPTY'}', has_solution={bool(correct_solution)}")
                     
             else:
                 # Fallback if no JSON found
