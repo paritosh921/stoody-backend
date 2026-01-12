@@ -115,6 +115,15 @@ except Exception as e:
     _smartboard_available = False
     logging.warning(f"SmartBoard routes disabled: {str(e)}")
 
+# SmartBoard Token routes (secure JWT token issuance for SmartBoard access)
+try:
+    from api.v1.smartboard_token import router as smartboard_token_router
+    _smartboard_token_available = True
+except Exception as e:
+    smartboard_token_router = None
+    _smartboard_token_available = False
+    logging.warning(f"SmartBoard Token routes disabled: {str(e)}")
+
 # Dashboard routes (pen monitoring from stoody-pen-multi)
 try:
     from api.v1.dashboard import router as dashboard_router
@@ -601,6 +610,17 @@ if _smartboard_available and smartboard_router:
     logger.info("✅ SmartBoard routes enabled")
 else:
     logger.warning("⚠️ SmartBoard routes disabled")
+
+# SmartBoard Token routes (secure JWT token issuance)
+if _smartboard_token_available and smartboard_token_router:
+    app.include_router(
+        smartboard_token_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["SmartBoard Auth"]
+    )
+    logger.info("✅ SmartBoard Token routes enabled")
+else:
+    logger.warning("⚠️ SmartBoard Token routes disabled")
 
 # Dashboard routes (pen monitoring from stoody-pen-multi)
 if _dashboard_available and dashboard_router:
