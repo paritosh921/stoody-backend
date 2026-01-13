@@ -43,6 +43,7 @@ class AsyncSettings(BaseSettings):
     # Database URLs
     MONGODB_URL: str = os.getenv("MONGODB_URI", "")
     MONGODB_DB_NAME: str = os.getenv("MONGODB_DB_NAME", "skillbot_db")
+    MONGODB_DB_MASTER: str = os.getenv("MONGODB_DB_MASTER", "skb_master")
     # B2C Database (Stoody B2C) - Completely separate from skillbot_db
     # Note: MongoDB is case-sensitive - use exact case of existing database
     MONGODB_DB_STOODY: str = os.getenv("MONGODB_DB_STOODY", "STOODY-b2c")
@@ -126,6 +127,7 @@ API_V1_PREFIX = settings.API_V1_PREFIX
 CORS_ORIGINS = settings.CORS_ORIGINS
 MONGODB_URL = settings.MONGODB_URL
 MONGODB_DB_NAME = settings.MONGODB_DB_NAME
+MONGODB_DB_MASTER = settings.MONGODB_DB_MASTER
 MONGODB_DB_STOODY = settings.MONGODB_DB_STOODY
 GOOGLE_CLIENT_ID = settings.GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET = settings.GOOGLE_CLIENT_SECRET

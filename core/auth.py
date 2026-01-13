@@ -134,6 +134,11 @@ class AuthManager:
             "admin_id": user_data.get("admin_id"),
             "subdomain": user_data.get("subdomain"),
             "tutor_id": user_data.get("tutor_id"),
+            "tenant_id": user_data.get("tenant_id"),
+            "db_name": user_data.get("db_name"),
+            "institution_id": user_data.get("institution_id"),
+            "admin_role": user_data.get("admin_role"),
+            "permissions": user_data.get("permissions"),
         }
 
         access_token = self.create_access_token(token_data)
@@ -148,6 +153,11 @@ class AuthManager:
             "admin_id": user_data.get("admin_id"),
             "subdomain": user_data.get("subdomain"),
             "tutor_id": user_data.get("tutor_id"),
+            "tenant_id": user_data.get("tenant_id"),
+            "db_name": user_data.get("db_name"),
+            "institution_id": user_data.get("institution_id"),
+            "admin_role": user_data.get("admin_role"),
+            "permissions": user_data.get("permissions"),
             # Content scoping fields (mainly for tutors)
             "standards": user_data.get("standards"),
             "sections": user_data.get("sections"),
@@ -211,6 +221,11 @@ class AuthManager:
                 "admin_id": payload.get("admin_id"),
                 "subdomain": payload.get("subdomain"),
                 "tutor_id": payload.get("tutor_id"),
+                "tenant_id": payload.get("tenant_id"),
+                "db_name": payload.get("db_name"),
+                "institution_id": payload.get("institution_id"),
+                "admin_role": payload.get("admin_role"),
+                "permissions": payload.get("permissions"),
             }
 
         except Exception as e:
@@ -275,7 +290,7 @@ class AuthManager:
 
     # Utility methods for different user types
     async def authenticate_admin(self, email: str, password: str,
-                               db_manager) -> Optional[Dict[str, Any]]:
+                               db_manager, db_override=None) -> Optional[Dict[str, Any]]:
         """Authenticate admin user"""
         try:
             # Check rate limit
@@ -287,10 +302,15 @@ class AuthManager:
                 )
 
             # Find admin user in database
-            admin_data = await db_manager.mongo_find_one(
-                "admins",
-                {"email": email, "is_active": True}
-            )
+            if db_override is not None:
+                admin_data = await db_override["admins"].find_one(
+                    {"email": email, "is_active": True}
+                )
+            else:
+                admin_data = await db_manager.mongo_find_one(
+                    "admins",
+                    {"email": email, "is_active": True}
+                )
 
             if not admin_data:
                 return None
@@ -300,11 +320,17 @@ class AuthManager:
                 return None
 
             # Update last login
-            await db_manager.mongo_update_one(
-                "admins",
-                {"_id": admin_data["_id"]},
-                {"$set": {"last_login": datetime.utcnow()}}
-            )
+            if db_override is not None:
+                await db_override["admins"].update_one(
+                    {"_id": admin_data["_id"]},
+                    {"$set": {"last_login": datetime.utcnow()}}
+                )
+            else:
+                await db_manager.mongo_update_one(
+                    "admins",
+                    {"_id": admin_data["_id"]},
+                    {"$set": {"last_login": datetime.utcnow()}}
+                )
 
             return {
                 "user_id": str(admin_data["_id"]),
@@ -368,7 +394,7 @@ class AuthManager:
             return None
 
     async def authenticate_tutor(self, username: str, password: str,
-                                 db_manager) -> Optional[Dict[str, Any]]:
+                                 db_manager, db_override=None) -> Optional[Dict[str, Any]]:
         """Authenticate tutor user"""
         try:
             # Check rate limit
@@ -380,10 +406,15 @@ class AuthManager:
                 )
 
             # Find tutor in database
-            tutor_data = await db_manager.mongo_find_one(
-                "tutors",
-                {"username": username, "is_active": True}
-            )
+            if db_override is not None:
+                tutor_data = await db_override["tutors"].find_one(
+                    {"username": username, "is_active": True}
+                )
+            else:
+                tutor_data = await db_manager.mongo_find_one(
+                    "tutors",
+                    {"username": username, "is_active": True}
+                )
 
             if not tutor_data:
                 return None
@@ -393,11 +424,17 @@ class AuthManager:
                 return None
 
             # Update last login
-            await db_manager.mongo_update_one(
-                "tutors",
-                {"_id": tutor_data["_id"]},
-                {"$set": {"last_login": datetime.utcnow()}}
-            )
+            if db_override is not None:
+                await db_override["tutors"].update_one(
+                    {"_id": tutor_data["_id"]},
+                    {"$set": {"last_login": datetime.utcnow()}}
+                )
+            else:
+                await db_manager.mongo_update_one(
+                    "tutors",
+                    {"_id": tutor_data["_id"]},
+                    {"$set": {"last_login": datetime.utcnow()}}
+                )
 
             return {
                 "user_id": str(tutor_data["_id"]),

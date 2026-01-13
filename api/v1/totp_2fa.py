@@ -33,6 +33,11 @@ from bson import ObjectId
 
 from core.database import DatabaseManager
 from core.auth import AuthManager
+from core.tenant_registry import (
+    get_tenant_by_subdomain,
+    get_tenant_by_institution_id,
+    normalize_institution_id,
+)
 from config_async import settings
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,8 @@ TEMP_TOKEN_MAX_AGE_SECONDS = 600  # 10 minutes
 
 # TOTP issuer name (appears in Google Authenticator)
 TOTP_ISSUER = "Stoody"
+
+INSTITUTION_ID_PATTERN = r'^[A-Za-z0-9]{5}-[A-Za-z0-9]{3}-[A-Za-z0-9]{2}$'
 
 # Legacy accounts exempt from 2FA (old system compatibility)
 # These accounts will use regular login without 2FA requirement
@@ -114,7 +121,14 @@ def _get_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(APP_SECRET_KEY)
 
 
-def create_temp_token(user_id: str, user_type: str, purpose: str) -> str:
+def create_temp_token(
+    user_id: str,
+    user_type: str,
+    purpose: str,
+    tenant_id: Optional[str] = None,
+    db_name: Optional[str] = None,
+    institution_id: Optional[str] = None,
+) -> str:
     """
     Create a short-lived temp token for 2FA flow.
     Purpose can be 'SETUP' or 'OTP'
@@ -122,7 +136,10 @@ def create_temp_token(user_id: str, user_type: str, purpose: str) -> str:
     return _get_serializer().dumps({
         "uid": user_id,
         "user_type": user_type,
-        "purpose": purpose
+        "purpose": purpose,
+        "tenant_id": tenant_id,
+        "db_name": db_name,
+        "institution_id": institution_id
     })
 
 
@@ -160,6 +177,7 @@ class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, description="Username or email")
     password: str = Field(..., min_length=1)
     user_type: str = Field(default="admin", description="'admin' or 'tutor'")
+    institution_id: Optional[str] = Field(None, pattern=INSTITUTION_ID_PATTERN)
 
 
 class TempTokenRequest(BaseModel):
@@ -227,27 +245,67 @@ async def get_auth_manager(request: Request) -> AuthManager:
 # Helper Functions
 # ============================================================================
 
-async def get_user_by_id(db: DatabaseManager, user_id: str, user_type: str) -> Optional[Dict]:
-    """Get user by ID and type"""
+def _get_request_subdomain(request: Request) -> Optional[str]:
+    return getattr(request.state, "subdomain", None)
+
+async def _resolve_tenant_for_auth(
+    db: DatabaseManager,
+    request: Request,
+    institution_id: Optional[str],
+    require_active: bool = True,
+) -> Dict[str, Any]:
+    subdomain = _get_request_subdomain(request)
+    tenant = None
+    if subdomain:
+        tenant = await get_tenant_by_subdomain(db, subdomain, include_inactive=not require_active)
+    if not tenant and institution_id:
+        tenant = await get_tenant_by_institution_id(
+            db,
+            institution_id,
+            include_inactive=not require_active
+        )
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant not found for this request"
+        )
+    if require_active and tenant.get("status") != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant is not active"
+        )
+    return tenant
+
+async def _get_tenant_db_or_503(db: DatabaseManager, tenant: Dict[str, Any]):
+    db_name = tenant.get("db_name")
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant database not available"
+        )
+    return tenant_db
+
+async def get_user_by_id(tenant_db, user_id: str, user_type: str) -> Optional[Dict]:
+    """Get user by ID and type from tenant DB"""
     collection = "admins" if user_type == "admin" else "tutors"
     try:
-        return await db.mongo_find_one(collection, {"_id": ObjectId(user_id)})
+        return await tenant_db[collection].find_one({"_id": ObjectId(user_id)})
     except Exception as e:
         logger.error(f"Error fetching user: {e}")
         return None
 
 
-async def update_user_2fa(db: DatabaseManager, user_id: str, user_type: str, 
+async def update_user_2fa(tenant_db, user_id: str, user_type: str,
                           update_data: Dict[str, Any]) -> bool:
-    """Update user's 2FA fields"""
+    """Update user's 2FA fields in tenant DB"""
     collection = "admins" if user_type == "admin" else "tutors"
     try:
-        result = await db.mongo_update_one(
-            collection,
+        result = await tenant_db[collection].update_one(
             {"_id": ObjectId(user_id)},
             {"$set": update_data}
         )
-        return result
+        return result.modified_count > 0
     except Exception as e:
         logger.error(f"Error updating user 2FA: {e}")
         return False
@@ -263,6 +321,11 @@ def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any])
         "admin_id": user_data.get("admin_id"),
         "subdomain": user_data.get("subdomain"),
         "tutor_id": user_data.get("tutor_id"),
+        "tenant_id": user_data.get("tenant_id"),
+        "db_name": user_data.get("db_name"),
+        "institution_id": user_data.get("institution_id"),
+        "admin_role": user_data.get("admin_role"),
+        "permissions": user_data.get("permissions"),
     }
     return auth_manager.create_access_token(
         token_data, 
@@ -292,29 +355,32 @@ async def login_with_2fa(
     """
     try:
         user_type = login_data.user_type.lower()
+        institution_id = normalize_institution_id(login_data.institution_id) if login_data.institution_id else None
+        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_db = await _get_tenant_db_or_503(db, tenant)
         
         if user_type == "admin":
             # Authenticate admin
             admin_data = await auth_manager.authenticate_admin(
-                login_data.username, login_data.password, db
+                login_data.username, login_data.password, db, tenant_db
             )
             if not admin_data:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid email or password"
                 )
-            user = await db.mongo_find_one("admins", {"email": login_data.username})
+            user = await tenant_db["admins"].find_one({"email": login_data.username})
         elif user_type == "tutor":
             # Authenticate tutor
             tutor_data = await auth_manager.authenticate_tutor(
-                login_data.username, login_data.password, db
+                login_data.username, login_data.password, db, tenant_db
             )
             if not tutor_data:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid username or password"
                 )
-            user = await db.mongo_find_one("tutors", {"username": login_data.username})
+            user = await tenant_db["tutors"].find_one({"username": login_data.username})
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -340,7 +406,14 @@ async def login_with_2fa(
         
         if two_fa_required and not two_fa_enabled:
             # User needs to set up 2FA
-            temp_token = create_temp_token(user_id, user_type, "SETUP")
+            temp_token = create_temp_token(
+                user_id,
+                user_type,
+                "SETUP",
+                tenant_id=tenant.get("tenant_id"),
+                db_name=tenant.get("db_name"),
+                institution_id=tenant.get("institution_id")
+            )
             return LoginResponse(
                 success=True,
                 next="SETUP_2FA",
@@ -349,7 +422,14 @@ async def login_with_2fa(
         
         if two_fa_enabled and not is_exempt:
             # User needs to enter OTP
-            temp_token = create_temp_token(user_id, user_type, "OTP")
+            temp_token = create_temp_token(
+                user_id,
+                user_type,
+                "OTP",
+                tenant_id=tenant.get("tenant_id"),
+                db_name=tenant.get("db_name"),
+                institution_id=tenant.get("institution_id")
+            )
             return LoginResponse(
                 success=True,
                 next="OTP",
@@ -365,6 +445,11 @@ async def login_with_2fa(
             "full_name": user.get("name") or user.get("full_name"),
             "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
             "subdomain": user.get("subdomain"),
+            "tenant_id": tenant.get("tenant_id"),
+            "db_name": tenant.get("db_name"),
+            "institution_id": tenant.get("institution_id"),
+            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
+            "permissions": user.get("permissions") or [],
         }
         
         session_data = await auth_manager.create_user_session(user_data)
@@ -401,8 +486,20 @@ async def start_2fa_setup(
         payload = verify_temp_token(data.temp_token, "SETUP")
         user_id = payload["uid"]
         user_type = payload["user_type"]
-        
-        user = await get_user_by_id(db, user_id, user_type)
+
+        tenant_db = None
+        if payload.get("db_name"):
+            tenant_db = await db.get_tenant_db(payload.get("db_name"))
+        if tenant_db is None:
+            tenant = await _resolve_tenant_for_auth(
+                db,
+                request,
+                payload.get("institution_id"),
+                require_active=False
+            )
+            tenant_db = await _get_tenant_db_or_503(db, tenant)
+
+        user = await get_user_by_id(tenant_db, user_id, user_type)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -418,7 +515,7 @@ async def start_2fa_setup(
         otpauth_url = totp.provisioning_uri(name=label, issuer_name=TOTP_ISSUER)
         
         # Store temp secret (encrypted)
-        await update_user_2fa(db, user_id, user_type, {
+        await update_user_2fa(tenant_db, user_id, user_type, {
             "two_fa.temp_secret_enc": encrypt_secret(secret),
             "two_fa.setup_started_at": datetime.utcnow()
         })
@@ -454,8 +551,20 @@ async def verify_2fa_setup(
         payload = verify_temp_token(data.temp_token, "SETUP")
         user_id = payload["uid"]
         user_type = payload["user_type"]
-        
-        user = await get_user_by_id(db, user_id, user_type)
+
+        tenant_db = None
+        if payload.get("db_name"):
+            tenant_db = await db.get_tenant_db(payload.get("db_name"))
+        if tenant_db is None:
+            tenant = await _resolve_tenant_for_auth(
+                db,
+                request,
+                payload.get("institution_id"),
+                require_active=False
+            )
+            tenant_db = await _get_tenant_db_or_503(db, tenant)
+
+        user = await get_user_by_id(tenant_db, user_id, user_type)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -481,7 +590,7 @@ async def verify_2fa_setup(
             )
         
         # Enable 2FA
-        await update_user_2fa(db, user_id, user_type, {
+        await update_user_2fa(tenant_db, user_id, user_type, {
             "two_fa.enabled": True,
             "two_fa.required": True,
             "two_fa.secret_enc": encrypt_secret(secret),
@@ -499,6 +608,11 @@ async def verify_2fa_setup(
             "full_name": user.get("name") or user.get("full_name"),
             "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
             "subdomain": user.get("subdomain"),
+            "tenant_id": payload.get("tenant_id"),
+            "db_name": payload.get("db_name"),
+            "institution_id": payload.get("institution_id"),
+            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
+            "permissions": user.get("permissions") or [],
         }
         
         access_token = create_6h_access_token(auth_manager, user_data)
@@ -511,6 +625,11 @@ async def verify_2fa_setup(
             "username": user.get("username"),
             "full_name": user.get("name") or user.get("full_name"),
             "subdomain": user.get("subdomain"),
+            "tenant_id": payload.get("tenant_id"),
+            "db_name": payload.get("db_name"),
+            "institution_id": payload.get("institution_id"),
+            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
+            "permissions": user.get("permissions") or [],
         }
         
         logger.info(f"2FA enabled for {user_type} {user_id}")
@@ -547,8 +666,20 @@ async def verify_otp(
         payload = verify_temp_token(data.temp_token, "OTP")
         user_id = payload["uid"]
         user_type = payload["user_type"]
-        
-        user = await get_user_by_id(db, user_id, user_type)
+
+        tenant_db = None
+        if payload.get("db_name"):
+            tenant_db = await db.get_tenant_db(payload.get("db_name"))
+        if tenant_db is None:
+            tenant = await _resolve_tenant_for_auth(
+                db,
+                request,
+                payload.get("institution_id"),
+                require_active=False
+            )
+            tenant_db = await _get_tenant_db_or_503(db, tenant)
+
+        user = await get_user_by_id(tenant_db, user_id, user_type)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -575,8 +706,7 @@ async def verify_otp(
         
         # Update last login
         collection = "admins" if user_type == "admin" else "tutors"
-        await db.mongo_update_one(
-            collection,
+        await tenant_db[collection].update_one(
             {"_id": ObjectId(user_id)},
             {"$set": {"last_login": datetime.utcnow(), "two_fa.last_verified_at": datetime.utcnow()}}
         )
@@ -590,6 +720,11 @@ async def verify_otp(
             "full_name": user.get("name") or user.get("full_name"),
             "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
             "subdomain": user.get("subdomain"),
+            "tenant_id": payload.get("tenant_id"),
+            "db_name": payload.get("db_name"),
+            "institution_id": payload.get("institution_id"),
+            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
+            "permissions": user.get("permissions") or [],
         }
         
         access_token = create_6h_access_token(auth_manager, user_data)
@@ -602,6 +737,11 @@ async def verify_otp(
             "username": user.get("username"),
             "full_name": user.get("name") or user.get("full_name"),
             "subdomain": user.get("subdomain"),
+            "tenant_id": payload.get("tenant_id"),
+            "db_name": payload.get("db_name"),
+            "institution_id": payload.get("institution_id"),
+            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
+            "permissions": user.get("permissions") or [],
         }
         
         return OTPVerifyResponse(
@@ -644,8 +784,15 @@ async def get_2fa_status(
         
         user_id = user_data.get("user_id")
         user_type = user_data.get("user_type")
-        
-        user = await get_user_by_id(db, user_id, user_type)
+
+        tenant_db = await db.get_tenant_db(user_data.get("db_name"))
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
+        user = await get_user_by_id(tenant_db, user_id, user_type)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -693,9 +840,16 @@ async def admin_reset_2fa(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin access required"
             )
-        
+
+        tenant_db = await db.get_tenant_db(admin_data.get("db_name"))
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
         # Reset target user's 2FA
-        success = await update_user_2fa(db, target_user_id, target_user_type.lower(), {
+        success = await update_user_2fa(tenant_db, target_user_id, target_user_type.lower(), {
             "two_fa.enabled": False,
             "two_fa.secret_enc": None,
             "two_fa.temp_secret_enc": None,
@@ -759,7 +913,14 @@ async def disable_2fa(
         user_id = user_data.get("user_id")
         user_type = user_data.get("user_type")
 
-        await update_user_2fa(db, user_id, user_type, {
+        tenant_db = await db.get_tenant_db(user_data.get("db_name"))
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
+        await update_user_2fa(tenant_db, user_id, user_type, {
             "two_fa.enabled": False,
             "two_fa.required": False,
             "two_fa.secret_enc": None,
@@ -821,7 +982,14 @@ async def reset_own_2fa(
         user_id = user_data.get("user_id")
         user_type = user_data.get("user_type")
 
-        user = await get_user_by_id(db, user_id, user_type)
+        tenant_db = await db.get_tenant_db(user_data.get("db_name"))
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
+        user = await get_user_by_id(tenant_db, user_id, user_type)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -854,7 +1022,7 @@ async def reset_own_2fa(
             )
 
         # OTP verified - reset 2FA so user can set up again
-        await update_user_2fa(db, user_id, user_type, {
+        await update_user_2fa(tenant_db, user_id, user_type, {
             "two_fa.enabled": False,
             "two_fa.secret_enc": None,
             "two_fa.temp_secret_enc": None,

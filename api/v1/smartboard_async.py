@@ -12,7 +12,10 @@ import json
 import asyncio
 import logging
 
+from bson import ObjectId
+
 from core.database import DatabaseManager
+from core.permissions import has_permission
 from api.v1.auth_async import get_current_user
 
 router = APIRouter()
@@ -123,8 +126,11 @@ async def get_database(request: Request) -> DatabaseManager:
 
 def require_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Dependency to require tutor access"""
-    if current_user.get("user_type") not in ["tutor", "admin", "b2c_admin"]:
+    user_type = current_user.get("user_type")
+    if user_type not in ["tutor", "admin", "b2c_admin"]:
         raise HTTPException(status_code=403, detail="Tutor access required")
+    if user_type in ["admin", "b2c_admin"] and not has_permission(current_user, "manage_smartboard"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
     return current_user
 
 
@@ -149,16 +155,24 @@ async def create_session(
     """
     tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
     tutor_name = current_user.get("name") or current_user.get("username")
-    
+
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
     session_id = generate_session_id()
-    
+
     # Create in-memory session
     session = SmartBoardSession(session_id, tutor_id, tutor_name)
     _sessions[session_id] = session
-    
+
     # Persist to database
     session_doc = {
         "session_id": session_id,
+        "admin_id": ObjectId(admin_id),  # Tenant isolation
         "title": session_data.title or f"Session {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
         "tutor_id": tutor_id,
         "tutor_name": tutor_name,
@@ -196,7 +210,17 @@ async def get_session(
     """
     Get session details
     """
-    session_doc = await db.mongo_find_one("smartboard_sessions", {"session_id": session_id})
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
+    session_doc = await db.mongo_find_one(
+        "smartboard_sessions",
+        {"session_id": session_id, "admin_id": ObjectId(admin_id)}
+    )
     if not session_doc:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -231,11 +255,21 @@ async def end_session(
     End a SmartBoard session
     """
     tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
-    
-    session_doc = await db.mongo_find_one("smartboard_sessions", {"session_id": session_id})
+
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
+    session_doc = await db.mongo_find_one(
+        "smartboard_sessions",
+        {"session_id": session_id, "admin_id": ObjectId(admin_id)}
+    )
     if not session_doc:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     if session_doc.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized to end this session")
     
@@ -270,18 +304,29 @@ async def create_question_attempt(
     Lock a question for all students in the session
     """
     tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
-    
-    session_doc = await db.mongo_find_one("smartboard_sessions", {"session_id": session_id})
+
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
+    session_doc = await db.mongo_find_one(
+        "smartboard_sessions",
+        {"session_id": session_id, "admin_id": ObjectId(admin_id)}
+    )
     if not session_doc:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     if session_doc.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
+
     attempt_id = f"QA{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
-    
+
     attempt = {
         "attempt_id": attempt_id,
+        "admin_id": ObjectId(admin_id),  # Tenant isolation
         "session_id": session_id,
         "question_text": question_data.question_text,
         "question_id": question_data.question_id,
@@ -341,7 +386,17 @@ async def end_question_attempt(
     """
     End a question attempt and collect submissions
     """
-    attempt = await db.mongo_find_one("question_attempts", {"attempt_id": attempt_id})
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
+    attempt = await db.mongo_find_one(
+        "question_attempts",
+        {"attempt_id": attempt_id, "admin_id": ObjectId(admin_id)}
+    )
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
     
@@ -375,7 +430,17 @@ async def evaluate_submissions(
     """
     Trigger AI evaluation for all submissions in a question attempt
     """
-    attempt = await db.mongo_find_one("question_attempts", {"attempt_id": eval_data.attempt_id})
+    # Get admin_id for tenant isolation
+    admin_id = current_user.get("admin_id")
+    if current_user.get("user_type") == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+    if not admin_id:
+        raise HTTPException(status_code=403, detail="Tenant context required")
+
+    attempt = await db.mongo_find_one(
+        "question_attempts",
+        {"attempt_id": eval_data.attempt_id, "admin_id": ObjectId(admin_id)}
+    )
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
     

@@ -15,6 +15,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.permissions import has_permission
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
 
@@ -83,6 +84,11 @@ def require_admin_for_write(current_user: Dict[str, Any] = Depends(get_current_u
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
+        )
+    if not has_permission(current_user, "manage_questions"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions"
         )
     return current_user
 

@@ -12,6 +12,7 @@ import bcrypt
 from models.tutor import Tutor, TutorSchema, TutorUpdateSchema, TutorPasswordChangeSchema
 from models.student import Student
 from core.database import DatabaseManager
+from core.permissions import has_permission
 from api.v1.auth_async import get_current_user, get_database
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -27,6 +28,11 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
         raise HTTPException(
             status_code=403,
             detail="Admin access required"
+        )
+    if not has_permission(current_user, "manage_tutors"):
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions"
         )
     return current_user
 
@@ -47,6 +53,11 @@ def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_us
         raise HTTPException(
             status_code=403,
             detail="Admin or Tutor access required"
+        )
+    if current_user.get("user_type") in ["admin", "b2c_admin"] and not has_permission(current_user, "manage_tutors"):
+        raise HTTPException(
+            status_code=403,
+            detail="Insufficient permissions"
         )
     return current_user
 
@@ -484,18 +495,7 @@ async def get_tutor_students(
 
     assigned_student_ids = tutor.get("assigned_student_ids", []) or []
 
-    students_union: List[Dict[str, Any]] = []
-
-    # 1) Students explicitly assigned by id
-    if assigned_student_ids:
-        assigned_students = await db.mongo_find("students", {"student_id": {"$in": assigned_student_ids}})
-        students_union.extend(assigned_students)
-
-    # 2) Students mapped via teacher_ids
-    teacher_mapped = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}})
-    students_union.extend(teacher_mapped)
-
-    # 3) Criteria-based matching within same admin (OR across grade/section/subjects/plan_types)
+    # Get admin_id for data isolation
     admin_id = tutor.get("created_by")
     try:
         from bson import ObjectId
@@ -503,6 +503,21 @@ async def get_tutor_students(
     except Exception:
         admin_oid = None
 
+    students_union: List[Dict[str, Any]] = []
+
+    # 1) Students explicitly assigned by id
+    # IMPORTANT: Must include admin_id filter for data isolation
+    if assigned_student_ids and admin_oid is not None:
+        assigned_students = await db.mongo_find("students", {"student_id": {"$in": assigned_student_ids}, "admin_id": admin_oid})
+        students_union.extend(assigned_students)
+
+    # 2) Students mapped via teacher_ids
+    # IMPORTANT: Must include admin_id filter for data isolation
+    if admin_oid is not None:
+        teacher_mapped = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid})
+        students_union.extend(teacher_mapped)
+
+    # 3) Criteria-based matching within same admin (OR across grade/section/subjects/plan_types)
     criteria = {}
     or_filters = []
     if admin_oid:

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import jwt
 
 from api.v1.auth_async import get_current_user
+from core.permissions import has_permission
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,11 @@ async def get_smartboard_token(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Only tutors and teachers can access SmartBoard. Your role: {user_type}"
+        )
+    if user_type.lower() == "admin" and not has_permission(current_user, "manage_smartboard"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Insufficient permissions"
         )
 
     # Generate token expiration

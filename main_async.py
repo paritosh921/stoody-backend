@@ -41,6 +41,7 @@ from core.auth import AuthManager
 
 # Import middleware
 from middleware.subdomain import subdomain_middleware
+from middleware.tenant_middleware import TenantMiddleware
 
 # Import async route modules
 from api.v1.chat_async import router as chat_router
@@ -364,6 +365,9 @@ app.add_middleware(
 
 # Subdomain extraction middleware (MUST be before other middlewares)
 app.middleware("http")(subdomain_middleware)
+
+# Tenant context middleware - sets admin_id for data isolation
+app.add_middleware(TenantMiddleware)
 
 @app.middleware("http")
 async def profile_request(request: Request, call_next):
@@ -800,11 +804,16 @@ async def verify_token_legacy(request: Request):
     try:
         # Import the auth manager
         from api.v1.auth_async import get_current_user, get_auth_manager
-        from fastapi import Depends
+        from fastapi import Depends, HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
 
         auth_manager = request.app.state.auth
-        # This will raise an exception if not authenticated
-        current_user = await get_current_user(request, auth_manager)
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        token = auth_header.split(" ", 1)[1]
+        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+        current_user = await get_current_user(request, credentials, auth_manager)
 
         return {
             "success": True,

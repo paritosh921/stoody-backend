@@ -56,8 +56,18 @@ async def subdomain_middleware(request: Request, call_next):
 
     # Attach to request state
     request.state.subdomain = subdomain
+    request.state.tenant = None
 
     logger.debug(f"Request host: {host}, extracted subdomain: {subdomain}")
+
+    if subdomain:
+        try:
+            db = getattr(request.app.state, "db", None)
+            if db:
+                from core.tenant_registry import get_tenant_by_subdomain
+                request.state.tenant = await get_tenant_by_subdomain(db, subdomain)
+        except Exception as exc:
+            logger.debug(f"Tenant lookup failed for subdomain {subdomain}: {exc}")
 
     response = await call_next(request)
     return response
