@@ -104,6 +104,17 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
         )
     return current_user
 
+
+def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Allow admin, B2C admin, and tutor roles (read-only for tutors)"""
+    if current_user.get("user_type") not in ["admin", "b2c_admin", "tutor"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin or Tutor access required"
+        )
+    return current_user
+
+
 def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
     return current_user.get("user_type") == "b2c_admin"
@@ -113,13 +124,22 @@ def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
 @limiter.limit("60/minute")
 async def get_school_settings(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
-    """Get school settings for the current admin"""
+    """Get school settings for the current admin or tutor's admin"""
     try:
-        admin_id = current_user.get("user_id") or current_user.get("sub")
+        user_type = current_user.get("user_type")
+
+        # For tutors, get their admin's settings
+        if user_type == "tutor":
+            admin_id = current_user.get("admin_id")
+            if not admin_id:
+                raise HTTPException(status_code=401, detail="Tutor has no associated admin")
+        else:
+            admin_id = current_user.get("user_id") or current_user.get("sub")
+
         if not admin_id:
             raise HTTPException(status_code=401, detail="Invalid user session")
         

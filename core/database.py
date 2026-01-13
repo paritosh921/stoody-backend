@@ -18,6 +18,7 @@ from config_async import (
     CHROMADB_COLLECTION_NAME,
     MONGODB_URL,
     MONGODB_DB_NAME,
+    MONGODB_DB_MASTER,
     MONGODB_DB_STOODY,
     DISABLE_MONGODB,
     settings
@@ -33,6 +34,8 @@ class DatabaseManager:
         self.chroma_collection = None
         self.mongo_client: Optional[AsyncIOMotorClient] = None
         self.mongo_db: Optional[AsyncIOMotorDatabase] = None
+        self.mongo_master_db: Optional[AsyncIOMotorDatabase] = None
+        self.mongo_tenant_dbs: Dict[str, AsyncIOMotorDatabase] = {}
         self.mongo_db_b2c: Optional[AsyncIOMotorDatabase] = None  # B2C database
         self._chroma_lock = asyncio.Lock()
         self._mongo_lock = asyncio.Lock()
@@ -103,6 +106,9 @@ class DatabaseManager:
                     logger.info("MongoDB disabled or not configured; skipping initialization")
                     self.mongo_client = None
                     self.mongo_db = None
+                    self.mongo_master_db = None
+                    self.mongo_db_b2c = None
+                    self.mongo_tenant_dbs.clear()
                     return
                 # Create MongoDB client with async motor
                 # Reduced timeouts to fail fast and not hang the UI
@@ -130,13 +136,15 @@ class DatabaseManager:
                     tlsCAFile=certifi.where(),
                 )
 
-                # Get database instance
+                # Get database instances
+                self.mongo_master_db = self.mongo_client[MONGODB_DB_MASTER]
                 self.mongo_db = self.mongo_client[MONGODB_DB_NAME]
 
                 # Test connection
                 await self.mongo_client.admin.command('ping')
 
-                logger.info(f"✅ MongoDB initialized - Database: {MONGODB_DB_NAME}")
+                logger.info(f"✅ MongoDB initialized - Master DB: {MONGODB_DB_MASTER}")
+                logger.info(f"✅ MongoDB initialized - Default DB: {MONGODB_DB_NAME}")
 
                 # Also initialize B2C database using same client
                 self.mongo_db_b2c = self.mongo_client[MONGODB_DB_STOODY]
@@ -152,6 +160,9 @@ class DatabaseManager:
                 logger.warning(f"⚠️ MongoDB connection failed ({type(e).__name__}) - continuing without MongoDB")
                 self.mongo_client = None
                 self.mongo_db = None
+                self.mongo_master_db = None
+                self.mongo_db_b2c = None
+                self.mongo_tenant_dbs.clear()
             except Exception as e:
                 logger.error(f"❌ MongoDB initialization failed: {str(e)}")
                 raise
@@ -163,14 +174,48 @@ class DatabaseManager:
         return self.chroma_collection
 
     async def get_mongo_db(self) -> Optional[AsyncIOMotorDatabase]:
-        """Get MongoDB database with lazy initialization"""
+        """Get default MongoDB database (legacy/shared) with lazy initialization"""
         if self.mongo_db is None and MONGODB_URL and not DISABLE_MONGODB:
             await self._init_mongodb()
         return self.mongo_db
 
+    async def get_master_db(self) -> Optional[AsyncIOMotorDatabase]:
+        """Get master MongoDB database (tenant registry) with lazy initialization"""
+        if self.mongo_master_db is None and MONGODB_URL and not DISABLE_MONGODB:
+            await self._init_mongodb()
+        return self.mongo_master_db
+
+    async def get_tenant_db(self, db_name: str) -> Optional[AsyncIOMotorDatabase]:
+        """Get tenant MongoDB database by name (cached per process)."""
+        if not db_name:
+            return None
+        if self.mongo_client is None and MONGODB_URL and not DISABLE_MONGODB:
+            await self._init_mongodb()
+        if self.mongo_client is None:
+            return None
+        if db_name in self.mongo_tenant_dbs:
+            return self.mongo_tenant_dbs[db_name]
+        tenant_db = self.mongo_client[db_name]
+        self.mongo_tenant_dbs[db_name] = tenant_db
+        return tenant_db
+
     async def get_mongo_collection(self, collection_name: str):
         """Get MongoDB collection from main database (skillbot_db)"""
         db = await self.get_mongo_db()
+        if db is None:
+            return None
+        return db[collection_name]
+
+    async def get_master_collection(self, collection_name: str):
+        """Get MongoDB collection from master database (skb_master)"""
+        db = await self.get_master_db()
+        if db is None:
+            return None
+        return db[collection_name]
+
+    async def get_tenant_collection(self, db_name: str, collection_name: str):
+        """Get MongoDB collection from tenant database by name."""
+        db = await self.get_tenant_db(db_name)
         if db is None:
             return None
         return db[collection_name]
@@ -466,6 +511,30 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"MongoDB delete_many failed: {str(e)}")
             return 0
+
+    async def mongo_count(self, collection_name: str, filter_dict: Dict[str, Any] = None) -> int:
+        """Count documents in MongoDB collection"""
+        try:
+            collection = await self.get_mongo_collection(collection_name)
+            if collection is None:
+                return 0
+            filter_dict = filter_dict or {}
+            return await collection.count_documents(filter_dict)
+        except Exception as e:
+            logger.error(f"MongoDB count failed: {str(e)}")
+            return 0
+
+    async def mongo_aggregate(self, collection_name: str, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Run aggregation pipeline on MongoDB collection"""
+        try:
+            collection = await self.get_mongo_collection(collection_name)
+            if collection is None:
+                return []
+            cursor = collection.aggregate(pipeline)
+            return await cursor.to_list(length=1000)
+        except Exception as e:
+            logger.error(f"MongoDB aggregate failed: {str(e)}")
+            return []
 
     async def health_check(self) -> bool:
         """Check health of all database connections"""

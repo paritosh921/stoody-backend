@@ -17,6 +17,12 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
+from core.pen_tokens import create_pen_token
+from core.tenant_registry import (
+    get_tenant_by_subdomain,
+    get_tenant_by_institution_id,
+    normalize_institution_id,
+)
 from config_async import settings
 
 logger = logging.getLogger(__name__)
@@ -28,9 +34,12 @@ security = HTTPBearer()
 limiter = Limiter(key_func=get_remote_address)
 
 # Pydantic models
+INSTITUTION_ID_PATTERN = r'^[A-Za-z0-9]{5}-[A-Za-z0-9]{3}-[A-Za-z0-9]{2}$'
+
 class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
+    institution_id: Optional[str] = Field(None, pattern=INSTITUTION_ID_PATTERN)
 
 class AdminRegisterRequest(BaseModel):
     email: EmailStr
@@ -42,10 +51,12 @@ class AdminRegisterRequest(BaseModel):
 class StudentLoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
+    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
 
 class TutorLoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
+    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
 
 class StudentChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=6)
@@ -55,6 +66,7 @@ class StudentForgotPasswordRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     date_of_birth: str  # Format: YYYY-MM-DD
     phone: str
+    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
 
 class TokenResponse(BaseModel):
     success: bool = True
@@ -67,6 +79,11 @@ class UserResponse(BaseModel):
     username: Optional[str] = None
     full_name: Optional[str] = None
 
+class AdminRegistrationResponse(BaseModel):
+    success: bool
+    message: str
+    status: str
+
 # Dependency injection
 async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
@@ -77,7 +94,58 @@ async def get_cache(request: Request) -> CacheManager:
 async def get_auth_manager(request: Request) -> AuthManager:
     return request.app.state.auth
 
+def _get_request_subdomain(request: Request) -> Optional[str]:
+    return getattr(request.state, "subdomain", None)
+
+async def _resolve_tenant_for_auth(
+    db: DatabaseManager,
+    request: Request,
+    institution_id: Optional[str],
+    require_active: bool = True,
+) -> Dict[str, Any]:
+    subdomain = _get_request_subdomain(request)
+    tenant = None
+    if subdomain:
+        tenant = await get_tenant_by_subdomain(db, subdomain, include_inactive=not require_active)
+    if not tenant and institution_id:
+        tenant = await get_tenant_by_institution_id(
+            db,
+            institution_id,
+            include_inactive=not require_active
+        )
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant not found for this request"
+        )
+    if require_active and tenant.get("status") != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant is not active"
+        )
+    return tenant
+
+async def _get_tenant_db_or_503(db: DatabaseManager, tenant: Dict[str, Any]):
+    db_name = tenant.get("db_name")
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant database not available"
+        )
+    return tenant_db
+
+async def _get_tenant_db_from_user(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+) -> Optional[Any]:
+    db_name = current_user.get("db_name")
+    if not db_name:
+        return None
+    return await db.get_tenant_db(db_name)
+
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ) -> Dict[str, Any]:
@@ -103,6 +171,25 @@ async def get_current_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        # Validate tenant claims against request context (if available)
+        subdomain = _get_request_subdomain(request)
+        token_subdomain = user_data.get("subdomain")
+        if subdomain and token_subdomain != subdomain:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Tenant mismatch for this session",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        tenant_ctx = getattr(request.state, "tenant", None)
+        if tenant_ctx:
+            if user_data.get("tenant_id") != tenant_ctx.get("tenant_id"):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Tenant mismatch for this session",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+
         return user_data
 
     except HTTPException:
@@ -125,18 +212,46 @@ async def admin_login(
 ):
     """Admin login endpoint"""
     try:
-        # Authenticate admin
-        admin_data = await auth_manager.authenticate_admin(
-            login_data.email, login_data.password, db
-        )
+        institution_id = normalize_institution_id(login_data.institution_id) if login_data.institution_id else None
+        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_db = await _get_tenant_db_or_503(db, tenant)
 
-        if not admin_data:
+        admin_doc = await tenant_db["admins"].find_one({
+            "email": login_data.email,
+            "is_active": True
+        })
+
+        if not admin_doc:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
 
-        # Create session
+        if not auth_manager.verify_password(login_data.password, admin_doc.get("password_hash", "")):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+
+        await tenant_db["admins"].update_one(
+            {"_id": admin_doc["_id"]},
+            {"$set": {"last_login": datetime.utcnow()}}
+        )
+
+        admin_data = {
+            "user_id": str(admin_doc["_id"]),
+            "admin_id": str(admin_doc["_id"]),
+            "email": admin_doc.get("email"),
+            "full_name": admin_doc.get("full_name") or admin_doc.get("name"),
+            "user_type": "admin",
+            "subdomain": tenant.get("subdomain"),
+            "tenant_id": tenant.get("tenant_id"),
+            "db_name": tenant.get("db_name"),
+            "institution_id": tenant.get("institution_id"),
+            "admin_role": admin_doc.get("role", "master_admin"),
+            "permissions": admin_doc.get("permissions") or []
+        }
+
         session_data = await auth_manager.create_user_session(admin_data)
 
         return TokenResponse(
@@ -166,16 +281,19 @@ async def student_login(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """
-    Student login endpoint with globally unique usernames
+    Student login endpoint with tenant-scoped usernames
 
-    - Username is globally unique across all students
-    - No subdomain dependency
-    - Student automatically mapped to correct admin via admin_id field
+    - Username is unique per institution (institution_id required)
+    - Subdomain is optional for non-web clients
     """
     try:
-        # Find student by globally unique username
-        student = await db.mongo_find_one("students", {
-            "username": login_data.username
+        institution_id = normalize_institution_id(login_data.institution_id)
+        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_db = await _get_tenant_db_or_503(db, tenant)
+
+        student = await tenant_db["students"].find_one({
+            "username": login_data.username,
+            "is_active": True
         })
 
         if not student:
@@ -185,7 +303,6 @@ async def student_login(
                 detail="Invalid username or password"
             )
 
-        # Verify password
         if not auth_manager.verify_password(login_data.password, student.get("password_hash", "")):
             logger.warning(f"Invalid password for student {login_data.username}")
             raise HTTPException(
@@ -193,54 +310,52 @@ async def student_login(
                 detail="Invalid username or password"
             )
 
-        # Get admin info for the student's admin_id
         admin_id = student.get("admin_id")
-        if not admin_id:
-            logger.error(f"Student {login_data.username} has no admin_id")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Student account is not properly configured"
-            )
+        subdomain = tenant.get("subdomain")
 
-        admin = await db.mongo_find_one("admins", {"_id": admin_id})
-        if not admin:
-            logger.error(f"Admin not found for student {login_data.username}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Associated school/organization not found"
-            )
-
-        subdomain = admin.get("subdomain", "demo")
-
-        # Create student_data for session
         student_data = {
             "user_id": str(student["_id"]),
             "user_type": "student",
             "username": student.get("username"),
             "email": student.get("email"),
             "full_name": student.get("full_name", student.get("name")),
-            "admin_id": str(admin_id),  # IMPORTANT: Include admin_id in JWT
-            "subdomain": subdomain
+            "admin_id": str(admin_id) if admin_id else None,
+            "subdomain": subdomain,
+            "tenant_id": tenant.get("tenant_id"),
+            "db_name": tenant.get("db_name"),
+            "institution_id": tenant.get("institution_id"),
         }
 
-        # Create session (JWT token)
         session_data = await auth_manager.create_user_session(student_data)
 
-        # Update student last_login
+        pen_token = None
+        pen_token_expires_at = None
         try:
-            await db.mongo_update_one(
-                "students",
+            pen_token, pen_token_expires_at = create_pen_token(
+                str(student["_id"]),
+                tenant.get("tenant_id"),
+                tenant.get("db_name"),
+                tenant.get("institution_id")
+            )
+            await tenant_db["pen_tokens"].insert_one({
+                "token": pen_token,
+                "student_id": student["_id"],
+                "pen_mac": None,
+                "tenant_id": tenant.get("tenant_id"),
+                "issued_at": datetime.utcnow(),
+                "expires_at": pen_token_expires_at,
+                "active": True
+            })
+        except Exception as e:
+            logger.warning(f"Failed to create pen token: {str(e)}")
+
+        try:
+            await tenant_db["students"].update_one(
                 {"_id": student["_id"]},
-                {
-                    "$set": {
-                        "is_online": True,
-                        "last_login": datetime.utcnow()
-                    }
-                }
+                {"$set": {"is_online": True, "last_login": datetime.utcnow()}}
             )
 
-            # Log login activity
-            await db.mongo_insert_one("student_activity_log", {
+            await tenant_db["student_activity_log"].insert_one({
                 "student_id": student["_id"],
                 "admin_id": admin_id,
                 "action": "login",
@@ -260,7 +375,9 @@ async def student_login(
                 "access_token": session_data["access_token"],
                 "user_type": "student",
                 "user": session_data["user"],
-                "requires_password_change": student.get("requires_password_change", False)
+                "requires_password_change": student.get("requires_password_change", False),
+                "pen_token": pen_token,
+                "pen_token_expires_at": pen_token_expires_at.isoformat() if pen_token_expires_at else None
             }
         )
 
@@ -283,8 +400,12 @@ async def tutor_login(
 ):
     """Tutor login endpoint"""
     try:
+        institution_id = normalize_institution_id(login_data.institution_id)
+        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_db = await _get_tenant_db_or_503(db, tenant)
+
         tutor_data = await auth_manager.authenticate_tutor(
-            login_data.username, login_data.password, db
+            login_data.username, login_data.password, db, tenant_db
         )
 
         if not tutor_data:
@@ -293,7 +414,13 @@ async def tutor_login(
                 detail="Invalid username or password"
             )
 
-        # Create session (JWT token)
+        tutor_data.update({
+            "subdomain": tenant.get("subdomain"),
+            "tenant_id": tenant.get("tenant_id"),
+            "db_name": tenant.get("db_name"),
+            "institution_id": tenant.get("institution_id"),
+        })
+
         session_data = await auth_manager.create_user_session(tutor_data)
 
         # Update tutor last_login is already done; optionally log activity if needed
@@ -333,9 +460,14 @@ async def student_change_password(
             )
 
         student_id = ObjectId(current_user["user_id"])
+        tenant_db = await _get_tenant_db_from_user(db, current_user)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
 
-        # Get student
-        student = await db.mongo_find_one("students", {"_id": student_id})
+        student = await tenant_db["students"].find_one({"_id": student_id})
         if not student:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -356,16 +488,13 @@ async def student_change_password(
         new_password_hash = auth_manager.get_password_hash(password_data.new_password)
 
         # Update password and clear requires_password_change flag
-        await db.mongo_update_one(
-            "students",
+        await tenant_db["students"].update_one(
             {"_id": student_id},
-            {
-                "$set": {
-                    "password_hash": new_password_hash,
-                    "requires_password_change": False,
-                    "password_changed_at": datetime.utcnow()
-                }
-            }
+            {"$set": {
+                "password_hash": new_password_hash,
+                "requires_password_change": False,
+                "password_changed_at": datetime.utcnow()
+            }}
         )
 
         logger.info(f"Student {student.get('username')} changed their password")
@@ -403,9 +532,14 @@ async def tutor_change_password(
             )
 
         tutor_id = ObjectId(current_user["user_id"])
+        tenant_db = await _get_tenant_db_from_user(db, current_user)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
 
-        # Get tutor
-        tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+        tutor = await tenant_db["tutors"].find_one({"_id": tutor_id})
         if not tutor:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -426,16 +560,13 @@ async def tutor_change_password(
         new_password_hash = auth_manager.get_password_hash(password_data.new_password)
 
         # Update password and clear requires_password_change flag
-        await db.mongo_update_one(
-            "tutors",
+        await tenant_db["tutors"].update_one(
             {"_id": tutor_id},
-            {
-                "$set": {
-                    "password_hash": new_password_hash,
-                    "requires_password_change": False,
-                    "password_changed_at": datetime.utcnow()
-                }
-            }
+            {"$set": {
+                "password_hash": new_password_hash,
+                "requires_password_change": False,
+                "password_changed_at": datetime.utcnow()
+            }}
         )
 
         logger.info(f"Tutor {tutor.get('username')} changed their password")
@@ -462,10 +593,13 @@ async def student_forgot_password(
     forgot_data: StudentForgotPasswordRequest,
     db: DatabaseManager = Depends(get_database)
 ):
-    """Student requests password reset using globally unique username"""
+    """Student requests password reset using institution-scoped username"""
     try:
-        # Find student by globally unique username (no subdomain needed)
-        student = await db.mongo_find_one("students", {
+        institution_id = normalize_institution_id(forgot_data.institution_id)
+        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_db = await _get_tenant_db_or_503(db, tenant)
+
+        student = await tenant_db["students"].find_one({
             "username": forgot_data.username
         })
 
@@ -486,15 +620,12 @@ async def student_forgot_password(
             }
 
         # Set password reset request flag
-        await db.mongo_update_one(
-            "students",
+        await tenant_db["students"].update_one(
             {"_id": student["_id"]},
-            {
-                "$set": {
-                    "password_reset_requested": True,
-                    "password_reset_requested_at": datetime.utcnow()
-                }
-            }
+            {"$set": {
+                "password_reset_requested": True,
+                "password_reset_requested_at": datetime.utcnow()
+            }}
         )
 
         logger.info(f"Password reset requested for student: {forgot_data.username}")
@@ -573,8 +704,9 @@ async def check_subdomain_availability(
                 }
             }
 
-        # Check if subdomain already exists
-        existing = await db.mongo_find_one("admins", {"subdomain": subdomain})
+        # Check if subdomain already exists in tenant registry
+        tenants = await db.get_master_collection("tenants")
+        existing = await tenants.find_one({"subdomain": subdomain}) if tenants else None
 
         if existing:
             return {
@@ -600,7 +732,7 @@ async def check_subdomain_availability(
             detail="Failed to check subdomain availability"
         )
 
-@router.post("/admin/register", response_model=TokenResponse)
+@router.post("/admin/register", response_model=AdminRegistrationResponse)
 @limiter.limit("3/hour")
 async def register_admin(
     request: Request,
@@ -610,11 +742,18 @@ async def register_admin(
 ):
     """
     Register a new admin with subdomain
-    Creates admin account and returns JWT token
+    Creates a pending tenant request for super-admin review
     """
     try:
-        # Check if email already exists
-        existing_email = await db.mongo_find_one("admins", {"email": register_data.email})
+        tenants = await db.get_master_collection("tenants")
+        if tenants is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Tenant registry not available"
+            )
+
+        # Check if email already exists in tenant registry
+        existing_email = await tenants.find_one({"admin_email": register_data.email})
         if existing_email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -622,7 +761,7 @@ async def register_admin(
             )
 
         # Check if subdomain already exists
-        existing_subdomain = await db.mongo_find_one("admins", {"subdomain": register_data.subdomain})
+        existing_subdomain = await tenants.find_one({"subdomain": register_data.subdomain})
         if existing_subdomain:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -648,56 +787,44 @@ async def register_admin(
         # Hash password
         password_hash = auth_manager.get_password_hash(register_data.password)
 
-        # Create admin document
-        admin_doc = {
-            "email": register_data.email,
-            "password_hash": password_hash,
-            "name": register_data.full_name,
+        tenant_doc = {
+            "tenant_id": None,
+            "db_name": None,
+            "institution_id": None,
             "subdomain": register_data.subdomain,
             "organization": register_data.organization,
-            "role": "admin",
-            "is_active": True,
-            "created_at": datetime.utcnow(),
-            "google_id": None,
-            # 2FA: Required for all new admins
-            "two_fa": {
-                "enabled": False,
-                "required": True,  # Force 2FA setup on first login
-                "secret_enc": None,
-                "verified_at": None
-            }
+            "status": "pending",
+            "admin_email": register_data.email,
+            "admin_full_name": register_data.full_name,
+            "pending_admin": {
+                "email": register_data.email,
+                "password_hash": password_hash,
+                "full_name": register_data.full_name,
+                "role": "master_admin",
+                "created_at": datetime.utcnow(),
+                "two_fa": {
+                    "enabled": False,
+                    "required": True,
+                    "secret_enc": None,
+                    "verified_at": None
+                }
+            },
+            "created_at": datetime.utcnow()
         }
 
-        # Insert admin
-        admin_id = await db.mongo_insert_one("admins", admin_doc)
-
-        if not admin_id:
+        result = await tenants.insert_one(tenant_doc)
+        if not result.inserted_id:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create admin account"
+                detail="Failed to create tenant request"
             )
 
-        # Create JWT token
-        admin_data = {
-            "user_id": admin_id,
-            "user_type": "admin",
-            "admin_id": admin_id,  # Add admin_id for consistency
-            "email": register_data.email,
-            "full_name": register_data.full_name,
-            "subdomain": register_data.subdomain
-        }
+        logger.info(f"New tenant request: {register_data.email} ({register_data.subdomain})")
 
-        session_data = await auth_manager.create_user_session(admin_data)
-
-        logger.info(f"New admin registered: {register_data.email} with subdomain: {register_data.subdomain}")
-
-        return TokenResponse(
+        return AdminRegistrationResponse(
             success=True,
-            data={
-                "access_token": session_data["access_token"],
-                "user_type": "admin",
-                "user": session_data["user"]
-            }
+            message="Registration submitted. Awaiting institution ID assignment.",
+            status="pending"
         )
 
     except HTTPException:
@@ -729,6 +856,7 @@ async def logout(
     try:
         user_id = current_user.get("user_id")
         user_type = current_user.get("user_type")
+        tenant_db = await _get_tenant_db_from_user(db, current_user)
         
         # CRITICAL: Revoke JWT token to force portal logout
         # This is called by desktop client when user logs out
@@ -741,14 +869,23 @@ async def logout(
         if user_type == "student":
             try:
                 # Set offline status
-                await db.mongo_update_one(
-                    "students",
-                    {"_id": ObjectId(user_id)},
-                    {"$set": {"is_online": False}}
-                )
+                if tenant_db is not None:
+                    await tenant_db["students"].update_one(
+                        {"_id": ObjectId(user_id)},
+                        {"$set": {"is_online": False}}
+                    )
+                else:
+                    await db.mongo_update_one(
+                        "students",
+                        {"_id": ObjectId(user_id)},
+                        {"$set": {"is_online": False}}
+                    )
 
                 # Get last login to calculate session duration
-                student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)})
+                if tenant_db is not None:
+                    student = await tenant_db["students"].find_one({"_id": ObjectId(user_id)})
+                else:
+                    student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)})
                 last_login = student.get("last_login") if student else None
 
                 session_duration = 0
@@ -756,14 +893,18 @@ async def logout(
                     session_duration = (datetime.utcnow() - last_login).total_seconds()
 
                 # Log session end activity
-                await db.mongo_insert_one("student_activity_log", {
+                log_doc = {
                     "student_id": ObjectId(user_id),
                     "action": "session_end",
                     "timestamp": datetime.utcnow(),
                     "metadata": {
                         "session_duration": session_duration
                     }
-                })
+                }
+                if tenant_db is not None:
+                    await tenant_db["student_activity_log"].insert_one(log_doc)
+                else:
+                    await db.mongo_insert_one("student_activity_log", log_doc)
             except Exception as e:
                 logger.warning(f"Failed to track student logout: {str(e)}")
 

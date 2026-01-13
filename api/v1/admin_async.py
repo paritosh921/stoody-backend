@@ -12,11 +12,15 @@ from datetime import datetime, timedelta
 from bson import ObjectId
 
 from fastapi import APIRouter, Request, HTTPException, Depends, status, Query
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, field_validator
+
+# Valid grades for students (class 6 to 12)
+VALID_GRADES = ["6", "7", "8", "9", "10", "11", "12"]
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
+from core.permissions import has_permission, OPERATOR_PERMISSIONS
 from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
@@ -58,24 +62,38 @@ class CreateStudentRequest(BaseModel):
     location: Optional[str] = None
     school: Optional[str] = None
     stream: Optional[str] = None
-    grade: Optional[str] = None
+    grade: Optional[str] = Field(None, description="Student grade/class (6-12)")
     phone: Optional[str] = None
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
 
+    @field_validator('grade')
+    @classmethod
+    def validate_grade(cls, v):
+        if v is not None and v not in VALID_GRADES:
+            raise ValueError(f"Grade must be one of {VALID_GRADES}, got '{v}'")
+        return v
+
 class UpdateStudentRequest(BaseModel):
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
     email: Optional[EmailStr] = None
-    grade: Optional[str] = Field(None, description="New grade/class for the student")
+    grade: Optional[str] = Field(None, description="New grade/class for the student (6-12)")
     section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
+
+    @field_validator('grade')
+    @classmethod
+    def validate_grade(cls, v):
+        if v is not None and v not in VALID_GRADES:
+            raise ValueError(f"Grade must be one of {VALID_GRADES}, got '{v}'")
+        return v
 
 
 class SessionPromotionRequest(BaseModel):
     """Request model for promoting students to next session"""
     new_session: str = Field(..., description="New academic session e.g., '2025-26'")
     grade_mappings: Dict[str, str] = Field(
-        ..., 
+        ...,
         description="Mapping of current grade to new grade e.g., {'10': '11', '11': '12'}"
     )
     # Filters to select which students to promote
@@ -103,6 +121,25 @@ class SessionPromotionRequest(BaseModel):
         False,
         description="If true, only return preview without making changes"
     )
+
+    @field_validator('grade_mappings')
+    @classmethod
+    def validate_grade_mappings(cls, v):
+        for from_grade, to_grade in v.items():
+            if from_grade not in VALID_GRADES:
+                raise ValueError(f"Source grade must be one of {VALID_GRADES}, got '{from_grade}'")
+            if to_grade not in VALID_GRADES:
+                raise ValueError(f"Target grade must be one of {VALID_GRADES}, got '{to_grade}'")
+        return v
+
+    @field_validator('grade_filter')
+    @classmethod
+    def validate_grade_filter(cls, v):
+        if v is not None:
+            for grade in v:
+                if grade not in VALID_GRADES:
+                    raise ValueError(f"Grade filter must only contain values from {VALID_GRADES}, got '{grade}'")
+        return v
 
 
 class SessionPromotionResponse(BaseModel):
@@ -152,12 +189,81 @@ class DashboardStats(BaseModel):
     test_series_count: int
     chapter_notes_count: int
 
+class AdminSummary(BaseModel):
+    id: str
+    email: str
+    full_name: Optional[str] = None
+    role: str
+    permissions: List[str] = []
+    is_active: bool
+    created_at: Optional[datetime] = None
+    created_by: Optional[str] = None
+
+class CreateOperatorAdminRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    full_name: str = Field(..., min_length=2, max_length=100)
+    permissions: List[str] = Field(default_factory=list)
+
+    @field_validator("permissions")
+    @classmethod
+    def validate_permissions(cls, value: List[str]) -> List[str]:
+        invalid = [perm for perm in value if perm not in OPERATOR_PERMISSIONS]
+        if invalid:
+            raise ValueError(f"Invalid permissions: {invalid}")
+        return value
+
+class UpdateOperatorAdminRequest(BaseModel):
+    full_name: Optional[str] = Field(None, min_length=2, max_length=100)
+    email: Optional[EmailStr] = None
+    permissions: Optional[List[str]] = None
+    is_active: Optional[bool] = None
+
+    @field_validator("permissions")
+    @classmethod
+    def validate_permissions(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        invalid = [perm for perm in value if perm not in OPERATOR_PERMISSIONS]
+        if invalid:
+            raise ValueError(f"Invalid permissions: {invalid}")
+        return value
+
+class ResetOperatorPasswordRequest(BaseModel):
+    new_password: str = Field(..., min_length=8)
+
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Dependency to require admin access (regular or B2C)"""
     if current_user.get("user_type") not in ["admin", "b2c_admin"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"
+        )
+    return current_user
+
+def require_admin_permission(permission: str):
+    """Require admin access with a specific permission for operator admins."""
+    def dependency(current_user: Dict[str, Any] = Depends(require_admin)):
+        if not has_permission(current_user, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions"
+            )
+        return current_user
+    return dependency
+
+def require_master_admin(current_user: Dict[str, Any] = Depends(require_admin)):
+    """Require master admin role for tenant admin management."""
+    if current_user.get("user_type") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required"
+        )
+    role = current_user.get("admin_role") or "master_admin"
+    if role != "master_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Master admin access required"
         )
     return current_user
 
@@ -169,6 +275,17 @@ def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_us
             detail="Admin or Tutor access required"
         )
     return current_user
+
+def require_admin_or_tutor_permission(permission: str):
+    """Require admin/tutor access with a specific permission for operator admins."""
+    def dependency(current_user: Dict[str, Any] = Depends(require_admin_or_tutor)):
+        if current_user.get("user_type") in ["admin", "b2c_admin"] and not has_permission(current_user, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions"
+            )
+        return current_user
+    return dependency
 
 def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
@@ -203,6 +320,16 @@ async def db_delete_one(db: DatabaseManager, collection: str, query: dict, curre
     if is_b2c_admin(current_user):
         return await db.b2c_delete_one(collection, query)
     return await db.mongo_delete_one(collection, query)
+
+async def get_tenant_db_or_403(db: DatabaseManager, current_user: Dict[str, Any]):
+    """Resolve tenant DB for the current admin user."""
+    db_name = current_user.get("db_name")
+    if not db_name:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context required")
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Tenant database not available")
+    return tenant_db
 
 async def calculate_streak_days(student_id: ObjectId, db: DatabaseManager) -> int:
     """Calculate consecutive login days for a student"""
@@ -299,6 +426,192 @@ async def calculate_student_level(student_id: ObjectId, db: DatabaseManager) -> 
         logger.error(f"Calculate level error: {str(e)}")
         return 1, 0
 
+# ==================== Operator Admin Management ====================
+
+@router.get("/admins", response_model=List[AdminSummary])
+@limiter.limit("30/minute")
+async def list_admins(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_master_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """List admins within the tenant (master + operator)."""
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+    cursor = tenant_db["admins"].find({}, {"password_hash": 0}).sort("created_at", 1)
+    admins = await cursor.to_list(length=100)
+
+    results: List[AdminSummary] = []
+    for admin in admins:
+        results.append(
+            AdminSummary(
+                id=str(admin.get("_id")),
+                email=admin.get("email", ""),
+                full_name=admin.get("full_name") or admin.get("name"),
+                role=admin.get("role", "master_admin"),
+                permissions=admin.get("permissions") or [],
+                is_active=admin.get("is_active", True),
+                created_at=admin.get("created_at"),
+                created_by=str(admin.get("created_by")) if admin.get("created_by") else None
+            )
+        )
+
+    return results
+
+
+@router.post("/admins/operator", response_model=AdminSummary, status_code=201)
+@limiter.limit("10/minute")
+async def create_operator_admin(
+    request: Request,
+    payload: CreateOperatorAdminRequest,
+    current_user: Dict[str, Any] = Depends(require_master_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Create the operator admin for this tenant (master admin only)."""
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+
+    existing_operator = await tenant_db["admins"].find_one({"role": "operator_admin"})
+    if existing_operator:
+        raise HTTPException(status_code=400, detail="Operator admin already exists for this tenant")
+
+    existing_email = await tenant_db["admins"].find_one({"email": payload.email})
+    if existing_email:
+        raise HTTPException(status_code=400, detail="Email already in use for this tenant")
+
+    admin_doc = {
+        "email": payload.email,
+        "password_hash": hash_password(payload.password),
+        "full_name": payload.full_name,
+        "role": "operator_admin",
+        "permissions": payload.permissions or [],
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+        "created_by": ObjectId(current_user.get("user_id")),
+        "two_fa": {
+            "enabled": False,
+            "required": True,
+            "secret_enc": None,
+            "verified_at": None
+        }
+    }
+
+    result = await tenant_db["admins"].insert_one(admin_doc)
+    admin_doc["_id"] = result.inserted_id
+
+    return AdminSummary(
+        id=str(result.inserted_id),
+        email=admin_doc["email"],
+        full_name=admin_doc.get("full_name"),
+        role=admin_doc["role"],
+        permissions=admin_doc.get("permissions") or [],
+        is_active=admin_doc.get("is_active", True),
+        created_at=admin_doc.get("created_at"),
+        created_by=str(admin_doc.get("created_by"))
+    )
+
+
+@router.put("/admins/operator/{admin_id}", response_model=AdminSummary)
+@limiter.limit("10/minute")
+async def update_operator_admin(
+    request: Request,
+    admin_id: str,
+    payload: UpdateOperatorAdminRequest,
+    current_user: Dict[str, Any] = Depends(require_master_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Update operator admin details and permissions (master admin only)."""
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+
+    try:
+        admin_oid = ObjectId(admin_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid admin_id")
+
+    admin_doc = await tenant_db["admins"].find_one({"_id": admin_oid, "role": "operator_admin"})
+    if not admin_doc:
+        raise HTTPException(status_code=404, detail="Operator admin not found")
+
+    update_fields: Dict[str, Any] = {}
+    if payload.full_name is not None:
+        update_fields["full_name"] = payload.full_name
+    if payload.email is not None and payload.email != admin_doc.get("email"):
+        existing = await tenant_db["admins"].find_one({"email": payload.email, "_id": {"$ne": admin_oid}})
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already in use for this tenant")
+        update_fields["email"] = payload.email
+    if payload.permissions is not None:
+        update_fields["permissions"] = payload.permissions
+    if payload.is_active is not None:
+        update_fields["is_active"] = payload.is_active
+
+    if update_fields:
+        update_fields["updated_at"] = datetime.utcnow()
+        await tenant_db["admins"].update_one({"_id": admin_oid}, {"$set": update_fields})
+
+    refreshed = await tenant_db["admins"].find_one({"_id": admin_oid})
+    return AdminSummary(
+        id=str(refreshed.get("_id")),
+        email=refreshed.get("email", ""),
+        full_name=refreshed.get("full_name") or refreshed.get("name"),
+        role=refreshed.get("role", "operator_admin"),
+        permissions=refreshed.get("permissions") or [],
+        is_active=refreshed.get("is_active", True),
+        created_at=refreshed.get("created_at"),
+        created_by=str(refreshed.get("created_by")) if refreshed.get("created_by") else None
+    )
+
+
+@router.post("/admins/operator/{admin_id}/reset-password")
+@limiter.limit("10/minute")
+async def reset_operator_admin_password(
+    request: Request,
+    admin_id: str,
+    payload: ResetOperatorPasswordRequest,
+    current_user: Dict[str, Any] = Depends(require_master_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Reset operator admin password (master admin only)."""
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+
+    try:
+        admin_oid = ObjectId(admin_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid admin_id")
+
+    admin_doc = await tenant_db["admins"].find_one({"_id": admin_oid, "role": "operator_admin"})
+    if not admin_doc:
+        raise HTTPException(status_code=404, detail="Operator admin not found")
+
+    await tenant_db["admins"].update_one(
+        {"_id": admin_oid},
+        {"$set": {"password_hash": hash_password(payload.new_password), "password_changed_at": datetime.utcnow()}}
+    )
+
+    return {"success": True, "message": "Operator admin password updated"}
+
+
+@router.delete("/admins/operator/{admin_id}")
+@limiter.limit("10/minute")
+async def delete_operator_admin(
+    request: Request,
+    admin_id: str,
+    current_user: Dict[str, Any] = Depends(require_master_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Delete operator admin account (master admin only)."""
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+
+    try:
+        admin_oid = ObjectId(admin_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid admin_id")
+
+    admin_doc = await tenant_db["admins"].find_one({"_id": admin_oid})
+    if not admin_doc or admin_doc.get("role") != "operator_admin":
+        raise HTTPException(status_code=404, detail="Operator admin not found")
+
+    await tenant_db["admins"].delete_one({"_id": admin_oid})
+    return {"success": True, "message": "Operator admin deleted"}
+
 @router.get("/students", response_model=StudentsListResponse)
 @limiter.limit("30/minute")
 async def get_students(
@@ -307,7 +620,7 @@ async def get_students(
     limit: int = Query(20, ge=1, le=100),
     search: Optional[str] = Query(None, max_length=100),
     is_active: Optional[bool] = Query(None),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -427,18 +740,23 @@ async def update_student(
     request: Request,
     student_id: str,
     update: UpdateStudentRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Update student details or status"""
     try:
-        # Find by custom student_id first, then by ObjectId
-        query: Dict[str, Any] = {"student_id": student_id}
+        # Get admin_id for tenant isolation
+        admin_id = current_user.get("admin_id") or current_user.get("user_id")
+        if not admin_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context required")
+
+        # Find by custom student_id first, then by ObjectId - WITH admin_id filter for tenant isolation
+        query: Dict[str, Any] = {"student_id": student_id, "admin_id": ObjectId(admin_id)}
         student = await db.mongo_find_one("students", query)
         if not student:
             try:
                 oid = ObjectId(student_id)
-                query = {"_id": oid}
+                query = {"_id": oid, "admin_id": ObjectId(admin_id)}
                 student = await db.mongo_find_one("students", query)
             except Exception:
                 student = None
@@ -495,7 +813,7 @@ async def reset_student_password(
     request: Request,
     student_id: str,
     payload: ResetPasswordRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Reset student password"""
@@ -553,7 +871,7 @@ async def reset_student_password(
 async def create_student(
     request: Request,
     student_data: CreateStudentRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -712,7 +1030,7 @@ async def create_student(
 async def get_student(
     request: Request,
     student_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Get student by ID"""
@@ -763,18 +1081,23 @@ async def get_student(
             detail="Failed to get student"
         )
 
-@router.put("/students/{student_id}", response_model=StudentResponse)
+@router.put("/students/{student_id}/v2", response_model=StudentResponse)
 @limiter.limit("20/minute")
-async def update_student(
+async def update_student_v2(
     request: Request,
     student_id: str,
     update_data: UpdateStudentRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
-    """Update student by ID"""
+    """Update student by ID (v2 - with cache invalidation)"""
     try:
+        # Get admin_id for tenant isolation
+        admin_id = current_user.get("admin_id") or current_user.get("user_id")
+        if not admin_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context required")
+
         # Build update dict from provided fields only
         update_dict = {}
         if update_data.full_name is not None:
@@ -794,10 +1117,10 @@ async def update_student(
                 detail="No fields to update"
             )
 
-        # Update student by student_id
+        # Update student by student_id WITH admin_id filter for tenant isolation
         updated = await db.mongo_update_one(
             "students",
-            {"student_id": student_id},
+            {"student_id": student_id, "admin_id": ObjectId(admin_id)},
             {"$set": update_dict}
         )
 
@@ -809,7 +1132,7 @@ async def update_student(
             )
 
         # Get updated student
-        student = await db.mongo_find_one("students", {"student_id": student_id})
+        student = await db.mongo_find_one("students", {"student_id": student_id, "admin_id": ObjectId(admin_id)})
 
         # Invalidate cached students lists and dashboard stats
         try:
@@ -853,7 +1176,7 @@ async def update_student(
 async def delete_student(
     request: Request,
     student_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -901,7 +1224,7 @@ async def delete_student(
 @limiter.limit("30/minute")
 async def get_dashboard_stats(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -976,7 +1299,7 @@ async def get_dashboard_stats(
 @limiter.limit("30/minute")
 async def get_school_dashboard_stats(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -1007,8 +1330,9 @@ async def get_school_dashboard_stats(
         # ===== CLASS/DIVISION LEVEL BREAKDOWN =====
         class_division_stats = {}
         for student in admin_students:
-            grade = student.get("grade", "Unknown")
-            section = student.get("section", "Unknown")
+            # Handle None/null values explicitly
+            grade = student.get("grade") or "Unknown"
+            section = student.get("section") or "Unknown"
             is_active = student.get("is_active", True)
             has_logged_in = student.get("last_login") is not None
 
@@ -1162,7 +1486,7 @@ async def get_school_dashboard_stats(
 @limiter.limit("30/minute")
 async def get_class_section_monitoring_stats(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -1204,21 +1528,25 @@ async def get_class_section_monitoring_stats(
                 return cached_stats
 
             # 1) Students explicitly mapped via teacher_ids
-            mapped = await db.mongo_find(
-                "students",
-                {"teacher_ids": {"$in": [tutor_id]}},
-                projection={"password_hash": 0}
-            )
+            # IMPORTANT: Must include admin_id filter for data isolation
+            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            mapped = []
+            if admin_id is not None:
+                mapped = await db.mongo_find(
+                    "students",
+                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_id},
+                    projection={"password_hash": 0}
+                )
 
             # 2) Students listed in tutor.assigned_student_ids
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            # IMPORTANT: Must include admin_id filter for data isolation
             assigned = []
-            if tutor_doc and tutor_doc.get("assigned_student_ids"):
+            if tutor_doc and tutor_doc.get("assigned_student_ids") and admin_id is not None:
                 assigned_ids = tutor_doc.get("assigned_student_ids", [])
                 if assigned_ids:
                     assigned = await db.mongo_find(
                         "students",
-                        {"student_id": {"$in": assigned_ids}},
+                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_id},
                         projection={"password_hash": 0}
                     )
 
@@ -1282,8 +1610,9 @@ async def get_class_section_monitoring_stats(
         class_section_stats = {}
 
         for student in admin_students:
-            grade = student.get("grade", "Unknown")
-            section = student.get("section", "Unknown")
+            # Handle None/null values explicitly (not just missing keys)
+            grade = student.get("grade") or "Unknown"
+            section = student.get("section") or "Unknown"
             key = f"{grade}_{section}"
 
             if key not in class_section_stats:
@@ -1338,9 +1667,9 @@ async def get_class_section_monitoring_stats(
 
         # Add document counts per class-section
         for doc in admin_documents:
-            standard = doc.get("standard", "Unknown")
-            section = doc.get("section", "Unknown")
-            doc_type = doc.get("document_type", "")
+            standard = doc.get("standard") or "Unknown"
+            section = doc.get("section") or "Unknown"
+            doc_type = doc.get("document_type") or ""
             key = f"{standard}_{section}"
 
             if key in class_section_stats:
@@ -1418,7 +1747,7 @@ async def get_class_section_monitoring_stats(
 @limiter.limit("30/minute")
 async def get_student_progress(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Get student progress monitoring data"""
@@ -1443,21 +1772,25 @@ async def get_student_progress(
                 admin_oid = None
 
             # 1) Students explicitly mapped via teacher_ids
-            mapped = await db.mongo_find(
-                "students",
-                {"teacher_ids": {"$in": [tutor_id]}},
-                projection={"password_hash": 0}
-            )
+            # IMPORTANT: Must include admin_id filter for data isolation
+            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            mapped = []
+            if admin_oid is not None:
+                mapped = await db.mongo_find(
+                    "students",
+                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid},
+                    projection={"password_hash": 0}
+                )
 
             # 2) Students listed in tutor.assigned_student_ids (business student_id)
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            # IMPORTANT: Must include admin_id filter for data isolation
             assigned = []
-            if tutor_doc and tutor_doc.get("assigned_student_ids"):
+            if tutor_doc and tutor_doc.get("assigned_student_ids") and admin_oid is not None:
                 assigned_ids = tutor_doc.get("assigned_student_ids", [])
                 if assigned_ids:
                     assigned = await db.mongo_find(
                         "students",
-                        {"student_id": {"$in": assigned_ids}},
+                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_oid},
                         projection={"password_hash": 0}
                     )
 
@@ -1540,10 +1873,10 @@ async def get_student_progress(
 
             progress_data.append({
                 "student_id": str(student_oid),
-                "student_name": student.get("full_name", student.get("name", "Unknown")),
-                "email": student.get("email", ""),
-                "grade": student.get("grade", "Unknown"),
-                "section": student.get("section", "Unknown"),
+                "student_name": student.get("full_name") or student.get("name") or "Unknown",
+                "email": student.get("email") or "",
+                "grade": student.get("grade") or "Unknown",
+                "section": student.get("section") or "Unknown",
                 "total_sessions": len(sessions),
                 "total_time_spent": int(total_time),
                 "problems_solved": problems_solved,
@@ -1572,7 +1905,7 @@ async def get_student_progress(
 async def get_recent_activities(
     request: Request,
     limit: int = Query(10, ge=1, le=100),
-    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Get recent student activities"""
@@ -1594,17 +1927,21 @@ async def get_recent_activities(
                 admin_oid = None
 
             # teacher_ids mapping
-            tutor_students = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}}, projection={"_id": 1})
+            # IMPORTANT: Must include admin_id filter for data isolation
+            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            tutor_students = []
+            if admin_oid is not None:
+                tutor_students = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid}, projection={"_id": 1})
 
             # assigned_student_ids mapping
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+            # IMPORTANT: Must include admin_id filter for data isolation
             assigned = []
-            if tutor_doc and tutor_doc.get("assigned_student_ids"):
+            if tutor_doc and tutor_doc.get("assigned_student_ids") and admin_oid is not None:
                 assigned_ids = tutor_doc.get("assigned_student_ids", [])
                 if assigned_ids:
                     assigned = await db.mongo_find(
                         "students",
-                        {"student_id": {"$in": assigned_ids}},
+                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_oid},
                         projection={"_id": 1}
                     )
 
@@ -1787,7 +2124,7 @@ async def get_database_status(
 async def validate_test_series(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_questions")),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -1866,7 +2203,7 @@ async def validate_test_series(
 @limiter.limit("30/minute")
 async def get_all_test_attempts(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor_permission("view_analytics")),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -1884,7 +2221,16 @@ async def get_all_test_attempts(
             student_ids = [str(s["_id"]) for s in admin_students]
         else:
             tutor_id = current_user.get("tutor_id")
-            tutor_students = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}}, projection={"_id": 1})
+            admin_id_str = current_user.get("admin_id")
+            admin_oid = None
+            try:
+                admin_oid = ObjectId(admin_id_str) if admin_id_str else None
+            except Exception:
+                admin_oid = None
+            # IMPORTANT: Must include admin_id filter for data isolation
+            tutor_students = []
+            if admin_oid is not None:
+                tutor_students = await db.mongo_find("students", {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid}, projection={"_id": 1})
             student_ids = [str(s["_id"]) for s in tutor_students]
 
         attempts = await db.mongo_find(
@@ -1937,7 +2283,7 @@ async def get_all_test_attempts(
 async def toggle_reattempt(
     request: Request,
     attempt_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_questions")),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -1984,7 +2330,7 @@ async def toggle_reattempt(
 async def promote_session(
     request: Request,
     promotion_data: SessionPromotionRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -2169,7 +2515,7 @@ async def promote_session(
 @limiter.limit("30/minute")
 async def get_session_promotions(
     request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database)
 ):
     """Get history of session promotions for this admin"""

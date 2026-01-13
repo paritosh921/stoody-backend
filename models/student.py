@@ -259,6 +259,9 @@ class Student:
 class StudentSchema(Schema):
     """Marshmallow schema for Student validation"""
 
+    # Valid grades for students (class 6 to 12)
+    VALID_GRADES = ['6', '7', '8', '9', '10', '11', '12']
+
     student_id = fields.Str(validate=validate.Length(min=3, max=20))
     name = fields.Str(required=True, validate=validate.Length(min=2, max=255))
     username = fields.Str(required=True, validate=validate.Length(min=3, max=50))
@@ -269,7 +272,7 @@ class StudentSchema(Schema):
     location = fields.Str(validate=validate.Length(max=255), allow_none=True)
     school = fields.Str(validate=validate.Length(max=255), allow_none=True)
     stream = fields.Str(validate=validate.OneOf(['science', 'arts', 'commerce', 'other']), allow_none=True)
-    grade = fields.Str(validate=validate.Length(max=20), allow_none=True)
+    grade = fields.Str(validate=validate.OneOf(['6', '7', '8', '9', '10', '11', '12']), allow_none=True)
     phone = fields.Str(validate=validate.Length(max=20), allow_none=True)
     is_active = fields.Bool(missing=True)
 
@@ -304,7 +307,7 @@ class StudentUpdateSchema(Schema):
     location = fields.Str(validate=validate.Length(max=255), allow_none=True)
     school = fields.Str(validate=validate.Length(max=255), allow_none=True)
     stream = fields.Str(validate=validate.OneOf(['science', 'arts', 'commerce', 'other']), allow_none=True)
-    grade = fields.Str(validate=validate.Length(max=20), allow_none=True)
+    grade = fields.Str(validate=validate.OneOf(['6', '7', '8', '9', '10', '11', '12']), allow_none=True)
     phone = fields.Str(validate=validate.Length(max=20), allow_none=True)
     is_active = fields.Bool()
 
