@@ -206,6 +206,36 @@ class DatabaseManager:
             return None
         return db[collection_name]
 
+    async def _get_context_db(self) -> Optional[AsyncIOMotorDatabase]:
+        """Resolve MongoDB database for the current request context."""
+        if self.mongo_client is None and MONGODB_URL and not DISABLE_MONGODB:
+            await self._init_mongodb()
+        if self.mongo_client is None:
+            return None
+
+        db_name = None
+        try:
+            from core.tenant import TenantContext
+            db_name = TenantContext.get_db_name()
+        except Exception:
+            db_name = None
+
+        if db_name:
+            return await self.get_tenant_db(db_name)
+
+        return self.mongo_db
+
+    async def _get_context_collection(self, collection_name: str):
+        """Get MongoDB collection for the current request context."""
+        db = await self._get_context_db()
+        if db is None:
+            return None
+        return db[collection_name]
+
+    async def get_context_db(self) -> Optional[AsyncIOMotorDatabase]:
+        """Public accessor for the context-resolved MongoDB database."""
+        return await self._get_context_db()
+
     async def get_master_collection(self, collection_name: str):
         """Get MongoDB collection from master database (skb_master)"""
         db = await self.get_master_db()
@@ -394,11 +424,11 @@ class DatabaseManager:
         """Find one document in MongoDB"""
         try:
             # Quick check if MongoDB is available
-            if self.mongo_client is None or self.mongo_db is None:
+            if self.mongo_client is None:
                 logger.warning(f"MongoDB not connected - cannot query {collection_name} collection")
                 return None
 
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return None
             return await collection.find_one(filter_dict, projection)
@@ -414,11 +444,11 @@ class DatabaseManager:
         """Find documents in MongoDB"""
         try:
             # Quick check if MongoDB is available
-            if self.mongo_client is None or self.mongo_db is None:
+            if self.mongo_client is None:
                 logger.warning(f"MongoDB not connected - cannot query {collection_name} collection")
                 return []
 
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return []
 
@@ -441,7 +471,7 @@ class DatabaseManager:
     async def mongo_insert_one(self, collection_name: str, document: Dict[str, Any]) -> Optional[str]:
         """Insert one document to MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return None
             result = await collection.insert_one(document)
@@ -453,7 +483,7 @@ class DatabaseManager:
     async def mongo_insert_many(self, collection_name: str, documents: List[Dict[str, Any]]) -> Optional[List[str]]:
         """Insert many documents to MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return None
             result = await collection.insert_many(documents)
@@ -466,7 +496,7 @@ class DatabaseManager:
                               update_dict: Dict[str, Any], upsert: bool = False) -> bool:
         """Update one document in MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return False
             result = await collection.update_one(filter_dict, update_dict, upsert=upsert)
@@ -479,7 +509,7 @@ class DatabaseManager:
                                update_dict: Dict[str, Any]) -> int:
         """Update multiple documents in MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return 0
             result = await collection.update_many(filter_dict, update_dict)
@@ -491,7 +521,7 @@ class DatabaseManager:
     async def mongo_delete_one(self, collection_name: str, filter_dict: Dict[str, Any]) -> bool:
         """Delete one document from MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return False
             result = await collection.delete_one(filter_dict)
@@ -503,7 +533,7 @@ class DatabaseManager:
     async def mongo_delete_many(self, collection_name: str, filter_dict: Dict[str, Any]) -> int:
         """Delete multiple documents from MongoDB"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return 0
             result = await collection.delete_many(filter_dict)
@@ -515,7 +545,7 @@ class DatabaseManager:
     async def mongo_count(self, collection_name: str, filter_dict: Dict[str, Any] = None) -> int:
         """Count documents in MongoDB collection"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return 0
             filter_dict = filter_dict or {}
@@ -527,7 +557,7 @@ class DatabaseManager:
     async def mongo_aggregate(self, collection_name: str, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Run aggregation pipeline on MongoDB collection"""
         try:
-            collection = await self.get_mongo_collection(collection_name)
+            collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return []
             cursor = collection.aggregate(pipeline)

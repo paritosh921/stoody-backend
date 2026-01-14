@@ -81,6 +81,9 @@ class TenantMiddleware(BaseHTTPMiddleware):
                         user_type=user_data.get("user_type"),
                         user_id=user_data.get("user_id"),
                         tutor_id=user_data.get("tutor_id"),
+                        db_name=user_data.get("db_name"),
+                        tenant_id=user_data.get("tenant_id"),
+                        institution_id=user_data.get("institution_id"),
                     )
                     logger.debug(f"Tenant context set for user {user_data.get('user_id')}, admin_id={admin_id}")
 
@@ -145,6 +148,9 @@ async def get_tenant_db(
         user_type=user_type,
         user_id=current_user.get("user_id"),
         tutor_id=current_user.get("tutor_id"),
+        db_name=current_user.get("db_name"),
+        tenant_id=current_user.get("tenant_id"),
+        institution_id=current_user.get("institution_id"),
     )
 
     # Return tenant-aware database wrapper
@@ -193,4 +199,7 @@ def set_tenant_from_user(current_user: Dict[str, Any]):
         user_type=user_type,
         user_id=current_user.get("user_id"),
         tutor_id=current_user.get("tutor_id"),
+        db_name=current_user.get("db_name"),
+        tenant_id=current_user.get("tenant_id"),
+        institution_id=current_user.get("institution_id"),
     )

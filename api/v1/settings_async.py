@@ -284,13 +284,12 @@ async def update_school_settings(
         update_doc["streams"] = settings_data.streams if settings_data.streams is not None else (existing_settings.get("streams", DEFAULT_SETTINGS["streams"]) if existing_settings else DEFAULT_SETTINGS["streams"])
         
         # Upsert settings
-        collection = await db.get_mongo_collection("school_settings")
-        if collection is not None:
-            await collection.update_one(
-                {"admin_id": admin_id},
-                {"$set": update_doc},
-                upsert=True
-            )
+        await db.mongo_update_one(
+            "school_settings",
+            {"admin_id": admin_id},
+            {"$set": update_doc},
+            upsert=True,
+        )
         
         # Invalidate cache
         cache_key = f"school_settings:{admin_id}"
@@ -351,32 +350,31 @@ async def upload_school_logo(
         base64_logo = f"data:{file.content_type};base64,{base64.b64encode(content).decode('utf-8')}"
         
         # Update settings with new logo
-        collection = await db.get_mongo_collection("school_settings")
-        if collection is not None:
-            await collection.update_one(
-                {"admin_id": admin_id},
-                {
-                    "$set": {
-                        "school_info.school_logo": base64_logo,
-                        "updated_at": datetime.utcnow()
-                    },
-                    "$setOnInsert": {
-                        "admin_id": admin_id,
-                        "created_at": datetime.utcnow(),
-                        "school_info.school_name": "",
-                        "school_info.contact_email": "",
-                        "school_info.contact_phone": "",
-                        "school_info.address": "",
-                        "school_info.website": "",
-                        "classes": DEFAULT_SETTINGS["classes"],
-                        "sections": DEFAULT_SETTINGS["sections"],
-                        "subjects": DEFAULT_SETTINGS["subjects"],
-                        "plan_types": DEFAULT_SETTINGS["plan_types"],
-                        "streams": DEFAULT_SETTINGS["streams"]
-                    }
+        await db.mongo_update_one(
+            "school_settings",
+            {"admin_id": admin_id},
+            {
+                "$set": {
+                    "school_info.school_logo": base64_logo,
+                    "updated_at": datetime.utcnow()
                 },
-                upsert=True
-            )
+                "$setOnInsert": {
+                    "admin_id": admin_id,
+                    "created_at": datetime.utcnow(),
+                    "school_info.school_name": "",
+                    "school_info.contact_email": "",
+                    "school_info.contact_phone": "",
+                    "school_info.address": "",
+                    "school_info.website": "",
+                    "classes": DEFAULT_SETTINGS["classes"],
+                    "sections": DEFAULT_SETTINGS["sections"],
+                    "subjects": DEFAULT_SETTINGS["subjects"],
+                    "plan_types": DEFAULT_SETTINGS["plan_types"],
+                    "streams": DEFAULT_SETTINGS["streams"]
+                }
+            },
+            upsert=True,
+        )
         
         # Invalidate cache
         cache_key = f"school_settings:{admin_id}"
@@ -409,17 +407,16 @@ async def delete_school_logo(
             raise HTTPException(status_code=401, detail="Invalid user session")
         
         # Update settings to remove logo
-        collection = await db.get_mongo_collection("school_settings")
-        if collection is not None:
-            await collection.update_one(
-                {"admin_id": admin_id},
-                {
-                    "$set": {
-                        "school_info.school_logo": "",
-                        "updated_at": datetime.utcnow()
-                    }
+        await db.mongo_update_one(
+            "school_settings",
+            {"admin_id": admin_id},
+            {
+                "$set": {
+                    "school_info.school_logo": "",
+                    "updated_at": datetime.utcnow()
                 }
-            )
+            },
+        )
         
         # Invalidate cache
         cache_key = f"school_settings:{admin_id}"
