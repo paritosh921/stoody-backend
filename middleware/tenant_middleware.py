@@ -24,6 +24,7 @@ from starlette.responses import Response
 from core.tenant import TenantContext, TenantAwareDB, TenantContextError, TenantIsolationError
 from core.database import DatabaseManager
 from api.v1.auth_async import get_database, get_current_user
+from config_async import MONGODB_DB_STOODY
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +73,25 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 if user_data:
                     # Set tenant context
                     admin_id = user_data.get("admin_id")
+                    user_type = user_data.get("user_type")
+                    is_b2c = user_data.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
+                    db_name = user_data.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
+                    if not db_name and not is_b2c:
+                        return Response(
+                            content='{"detail":"Tenant database missing. Please log in again with institution ID."}',
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            media_type="application/json",
+                        )
                     if user_data.get("user_type") == "admin":
                         # For admins, admin_id is their own user_id
                         admin_id = admin_id or user_data.get("user_id")
 
                     TenantContext.set(
                         admin_id=admin_id,
-                        user_type=user_data.get("user_type"),
+                        user_type=user_type,
                         user_id=user_data.get("user_id"),
                         tutor_id=user_data.get("tutor_id"),
-                        db_name=user_data.get("db_name"),
+                        db_name=db_name,
                         tenant_id=user_data.get("tenant_id"),
                         institution_id=user_data.get("institution_id"),
                     )
@@ -132,6 +142,13 @@ async def get_tenant_db(
     """
     # Extract admin_id based on user type
     user_type = current_user.get("user_type")
+    is_b2c = current_user.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
+    db_name = current_user.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
+    if not db_name and not is_b2c:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant database missing. Please log in again with institution ID.",
+        )
 
     if user_type == "admin":
         admin_id = current_user.get("admin_id") or current_user.get("user_id")
@@ -148,7 +165,7 @@ async def get_tenant_db(
         user_type=user_type,
         user_id=current_user.get("user_id"),
         tutor_id=current_user.get("tutor_id"),
-        db_name=current_user.get("db_name"),
+        db_name=db_name,
         tenant_id=current_user.get("tenant_id"),
         institution_id=current_user.get("institution_id"),
     )
