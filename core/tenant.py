@@ -77,18 +77,34 @@ class TenantContext:
     """
 
     @staticmethod
-    def set(admin_id: Optional[str], user_type: str = "admin", user_id: Optional[str] = None,
-            tutor_id: Optional[str] = None, **extra):
+    def set(
+        admin_id: Optional[str],
+        user_type: str = "admin",
+        user_id: Optional[str] = None,
+        tutor_id: Optional[str] = None,
+        db_name: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        institution_id: Optional[str] = None,
+        **extra,
+    ):
         """Set tenant context for current async context"""
         ctx = {
             "admin_id": admin_id,
             "user_type": user_type,
             "user_id": user_id,
             "tutor_id": tutor_id,
+            "db_name": db_name,
+            "tenant_id": tenant_id,
+            "institution_id": institution_id,
             **extra
         }
         _tenant_context.set(ctx)
-        logger.debug(f"Tenant context set: admin_id={admin_id}, user_type={user_type}")
+        logger.debug(
+            "Tenant context set: admin_id=%s user_type=%s db_name=%s",
+            admin_id,
+            user_type,
+            db_name,
+        )
 
     @staticmethod
     def get() -> Optional[Dict[str, Any]]:
@@ -111,6 +127,12 @@ class TenantContext:
             except Exception:
                 return None
         return None
+
+    @staticmethod
+    def get_db_name() -> Optional[str]:
+        """Get current tenant database name from context"""
+        ctx = _tenant_context.get()
+        return ctx.get("db_name") if ctx else None
 
     @staticmethod
     def clear():

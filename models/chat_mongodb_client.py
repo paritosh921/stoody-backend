@@ -103,14 +103,21 @@ class ChatMongoDBClient:
         
         self._initialized = True
         logger.info("✅ Chat MongoDB Client initialized")
+
+    async def _get_db(self):
+        """Resolve the context-aware MongoDB database."""
+        if self._db_manager is None:
+            return None
+        return await self._db_manager.get_context_db()
+
     
     async def _ensure_indexes(self):
         """Create necessary indexes for efficient querying"""
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return
-            
+        
         try:
-            db = self._db_manager.mongo_db
             
             # Conversations collection indexes
             conv_collection = db[self.CONVERSATIONS_COLLECTION]
@@ -165,7 +172,8 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             logger.warning("MongoDB not available for saving conversation")
             return False
             
@@ -190,7 +198,7 @@ class ChatMongoDBClient:
                 **(metadata or {})
             }
             
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             
             # Use upsert to handle duplicates
             await collection.update_one(
@@ -223,12 +231,13 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             logger.warning("MongoDB not available for getting conversation history")
             return []
             
         try:
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             
             cursor = collection.find(
                 {"session_id": session_id},
@@ -281,7 +290,8 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return []
         
         if self._embeddings_model is None:
@@ -294,7 +304,7 @@ class ChatMongoDBClient:
             if query_embedding is None:
                 return await self._simple_text_search(session_id, query, n_results)
             
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             
             # Get all messages with embeddings for this session
             cursor = collection.find(
@@ -334,7 +344,7 @@ class ChatMongoDBClient:
     ) -> List[Dict[str, Any]]:
         """Simple text-based search fallback when embeddings are not available"""
         try:
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             
             # Use MongoDB text search or simple regex
             cursor = collection.find({
@@ -367,11 +377,12 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return []
             
         try:
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             
             # Aggregate to get session statistics
             pipeline = [
@@ -414,11 +425,12 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return False
             
         try:
-            collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
+            collection = db[self.CONVERSATIONS_COLLECTION]
             result = await collection.delete_many({"session_id": session_id})
             
             logger.info(f"🗑️ Cleared {result.deleted_count} messages for session {session_id}")
@@ -451,13 +463,14 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             logger.warning("MongoDB not available for saving document chunks")
             return False
             
         try:
             user_id = self._extract_user_id_from_session(session_id)
-            collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            collection = db[self.DOCUMENTS_COLLECTION]
             
             documents = []
             for i, (chunk, metadata) in enumerate(zip(chunks, metadatas)):
@@ -519,7 +532,8 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return []
         
         if self._embeddings_model is None:
@@ -531,7 +545,7 @@ class ChatMongoDBClient:
             if query_embedding is None:
                 return await self._simple_document_search(session_id, query, n_results)
             
-            collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            collection = db[self.DOCUMENTS_COLLECTION]
             
             # Get all chunks with embeddings for this session
             cursor = collection.find(
@@ -571,7 +585,10 @@ class ChatMongoDBClient:
     ) -> List[Dict[str, Any]]:
         """Simple text-based document search fallback"""
         try:
-            collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            db = await self._get_db()
+            if db is None:
+                return []
+            collection = db[self.DOCUMENTS_COLLECTION]
             
             cursor = collection.find({
                 "session_id": session_id,
@@ -607,11 +624,12 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return False
             
         try:
-            collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            collection = db[self.DOCUMENTS_COLLECTION]
             result = await collection.delete_many({
                 "session_id": session_id,
                 "document_id": document_id
@@ -638,12 +656,13 @@ class ChatMongoDBClient:
         """
         await self._ensure_initialized()
         
-        if self._db_manager is None or self._db_manager.mongo_db is None:
+        db = await self._get_db()
+        if db is None:
             return {}
             
         try:
-            conv_collection = self._db_manager.mongo_db[self.CONVERSATIONS_COLLECTION]
-            doc_collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            conv_collection = db[self.CONVERSATIONS_COLLECTION]
+            doc_collection = db[self.DOCUMENTS_COLLECTION]
             
             message_count = await conv_collection.count_documents({"session_id": session_id})
             chunk_count = await doc_collection.count_documents({"session_id": session_id})
@@ -676,8 +695,9 @@ class ChatMongoDBClient:
             conv_success = await self.clear_conversation(session_id)
             
             # Clear documents
-            if self._db_manager and self._db_manager.mongo_db:
-                doc_collection = self._db_manager.mongo_db[self.DOCUMENTS_COLLECTION]
+            db = await self._get_db()
+            if db:
+                doc_collection = db[self.DOCUMENTS_COLLECTION]
                 await doc_collection.delete_many({"session_id": session_id})
             
             logger.info(f"🧹 Cleared all data for session {session_id}")

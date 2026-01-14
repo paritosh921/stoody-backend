@@ -195,45 +195,60 @@ async def check_inactive_sessions():
             if db_manager:
                 # Find students who are online but haven't had activity in 5 minutes
                 timeout_threshold = datetime.utcnow() - timedelta(minutes=5)
+                master_db = await db_manager.get_master_db()
+                if master_db is None:
+                    await asyncio.sleep(120)
+                    continue
 
-                # Get all online students
-                online_students = await db_manager.mongo_find(
-                    "students",
-                    {"is_online": True}
-                )
+                tenants = await master_db["tenants"].find(
+                    {"status": "active"},
+                    {"db_name": 1},
+                ).to_list(length=None)
 
-                for student in online_students:
-                    student_id = student["_id"]
+                for tenant in tenants:
+                    db_name = tenant.get("db_name")
+                    if not db_name:
+                        continue
+                    tenant_db = await db_manager.get_tenant_db(db_name)
+                    if tenant_db is None:
+                        continue
 
-                    # Check last activity (get most recent)
-                    activities = await db_manager.mongo_find(
-                        "student_activity_log",
-                        {"student_id": student_id},
-                        sort=[("timestamp", -1)],
-                        limit=1
-                    )
-                    last_activity = activities[0] if activities else None
+                    online_students = await tenant_db["students"].find(
+                        {"is_online": True}
+                    ).to_list(length=10000)
 
-                    # If last activity was more than 5 minutes ago, mark offline
-                    if last_activity:
-                        last_time = last_activity.get("timestamp")
-                        if last_time and last_time < timeout_threshold:
-                            await db_manager.mongo_update_one(
-                                "students",
-                                {"_id": student_id},
-                                {"$set": {"is_online": False}}
-                            )
+                    for student in online_students:
+                        student_id = student["_id"]
 
-                            # Log auto-logout
-                            await db_manager.mongo_insert_one("student_activity_log", {
-                                "student_id": student_id,
-                                "action": "auto_logout",
-                                "timestamp": datetime.utcnow(),
-                                "metadata": {
-                                    "reason": "inactivity_timeout"
-                                }
-                            })
-                            logger.info(f"Auto-logged out student {student_id} due to inactivity")
+                        # Check last activity (get most recent)
+                        activities = await tenant_db["student_activity_log"].find(
+                            {"student_id": student_id}
+                        ).sort("timestamp", -1).limit(1).to_list(length=1)
+                        last_activity = activities[0] if activities else None
+
+                        # If last activity was more than 5 minutes ago, mark offline
+                        if last_activity:
+                            last_time = last_activity.get("timestamp")
+                            if last_time and last_time < timeout_threshold:
+                                await tenant_db["students"].update_one(
+                                    {"_id": student_id},
+                                    {"$set": {"is_online": False}},
+                                )
+
+                                # Log auto-logout
+                                await tenant_db["student_activity_log"].insert_one({
+                                    "student_id": student_id,
+                                    "action": "auto_logout",
+                                    "timestamp": datetime.utcnow(),
+                                    "metadata": {
+                                        "reason": "inactivity_timeout"
+                                    }
+                                })
+                                logger.info(
+                                    "Auto-logged out student %s due to inactivity (tenant=%s)",
+                                    student_id,
+                                    db_name,
+                                )
 
         except Exception as e:
             logger.error(f"Session timeout check error: {str(e)}")
