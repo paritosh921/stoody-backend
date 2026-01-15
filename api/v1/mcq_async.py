@@ -946,9 +946,13 @@ async def get_test_series_questions(
                         "pdf_source": q.get("pdf_source", document.get("filename")),
                         "images": q.get("images", []),
                         "question_figures": q.get("question_figures", []),
+                        "questionFigures": q.get("question_figures", []),  # CamelCase for frontend
                         "options": q.get("options", []),
                         "enhanced_options": q.get("enhanced_options", []),
+                        "enhancedOptions": q.get("enhanced_options", []),  # CamelCase for frontend
                         "correct_answer": q.get("correct_answer"),
+                        "questionType": q.get("question_type", "mcq"),  # Critical for integer input display
+                        "question_type": q.get("question_type", "mcq"),
                         "metadata": q.get("metadata", {}),
                         "points": q.get("points", 1),
                         "penalty": q.get("penalty", 0),
@@ -1096,9 +1100,13 @@ async def get_test_series_questions(
                         "pdf_source": q.get("pdf_source", document.get("filename")),
                         "images": q.get("images", []),
                         "question_figures": q.get("question_figures", []),
+                        "questionFigures": q.get("question_figures", []),  # CamelCase for frontend
                         "options": q.get("options", []),
                         "enhanced_options": q.get("enhanced_options", []),
+                        "enhancedOptions": q.get("enhanced_options", []),  # CamelCase for frontend
                         "correct_answer": q.get("correct_answer"),
+                        "questionType": q.get("question_type", "mcq"),  # Critical for frontend to show correct input type
+                        "question_type": q.get("question_type", "mcq"),  # Also include snake_case version
                         "metadata": q.get("metadata", {}),
                         "points": q.get("points", 1),
                         "penalty": q.get("penalty", 0),
@@ -2149,20 +2157,51 @@ async def submit_test_series(
             # Check if question was skipped or not attempted
             is_attempted = bool(student_answer) and student_answer.upper() != "SKIPPED"
 
+            # Determine question type for proper comparison
+            question_type = str(question.get("question_type", "")).lower() or "mcq"
+            
+            # Heuristic: treat as integer if no options and correct_answer looks numeric
+            def _is_numeric_string(val: str) -> bool:
+                try:
+                    float(val)
+                    return True
+                except (ValueError, TypeError):
+                    return False
+            
+            is_integer_type = (
+                question_type == "integer" or 
+                (not question.get("options") and _is_numeric_string(correct_answer) 
+                 and correct_answer.upper() not in ["A", "B", "C", "D", "E", "F"])
+            )
+
             # Skipped questions get 0 points (no penalty, no positive marks)
             if not is_attempted or student_answer.upper() == "SKIPPED":
                 unanswered_count += 1
                 points_earned = 0
-            elif student_answer == correct_answer:
-                is_correct = True
-                correct_count += 1
-                points_earned = question_points
-                score += question_points
             else:
-                incorrect_count += 1
-                # Use penalty_marks from the question itself
-                points_earned = -penalty_marks
-                score -= penalty_marks
+                # For integer-type questions, use numerical comparison
+                if is_integer_type:
+                    try:
+                        # Normalize and compare numerically
+                        student_num = float(student_answer.strip().replace("+", ""))
+                        correct_num = float(correct_answer.strip().replace("+", ""))
+                        is_correct = abs(student_num - correct_num) < 1e-9  # Near-exact match
+                    except (ValueError, TypeError):
+                        # Fallback to string comparison
+                        is_correct = student_answer.lower() == correct_answer.lower()
+                else:
+                    # For MCQ, compare case-insensitively
+                    is_correct = student_answer.upper() == correct_answer.upper()
+                
+                if is_correct:
+                    correct_count += 1
+                    points_earned = question_points
+                    score += question_points
+                else:
+                    incorrect_count += 1
+                    # Use penalty_marks from the question itself
+                    points_earned = -penalty_marks
+                    score -= penalty_marks
 
             question_results.append({
                 "question_id": question_id,

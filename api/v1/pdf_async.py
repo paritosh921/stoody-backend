@@ -3282,6 +3282,13 @@ async def update_question(
                     detail="Penalty cannot exceed 50 points"
                 )
             update_data["penalty"] = penalty
+        
+        # Support question_type (mcq or integer) - accept both snake_case and camelCase
+        question_type = question_data.get("question_type") or question_data.get("questionType")
+        if question_type:
+            if question_type not in ["mcq", "integer"]:
+                question_type = "mcq"  # Default to MCQ
+            update_data["question_type"] = question_type
 
         # Add updated timestamp
         update_data["updated_at"] = datetime.utcnow()
