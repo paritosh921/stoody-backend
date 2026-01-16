@@ -47,22 +47,42 @@ DEFAULT_INSTANCE = "001"
 
 TENANT_COLLECTIONS = [
     "admins",
+    "canvas_history",
+    "chat_analytics",
+    "chat_conversations",
+    "chat_documents",
+    "chat_sessions",
+    "devices",
+    "document_annotations",
+    "document_regions",
     "students",
+    "student_activities",
+    "student_activity_log",
+    "student_sessions",
+    "student_test_attempts",
     "tutors",
+    "tutor_activity_log",
     "documents",
+    "images",
+    "mcq_solutions",
+    "online_classes",
+    "pen_calibrations",
+    "pens",
+    "practice_sessions",
     "questions",
     "question_attempts",
-    "student_activity_log",
-    "chat_sessions",
-    "student_test_attempts",
+    "school_settings",
+    "session_promotions",
+    "sessions",
+    "smartboard_sessions",
+    "strokes",
+    "video_views",
+    "videos",
+    "pen_tokens",
     "assignments",
     "meetings",
     "notifications",
     "class_schedules",
-    "smartboard_sessions",
-    "strokes",
-    "pen_tokens",
-    "session_promotions",
 ]
 
 EXCLUDED_COLLECTIONS = {
@@ -117,15 +137,33 @@ def build_admin_conditions(admin_oid: ObjectId) -> List[Dict[str, Any]]:
     ]
 
 
+def _build_in_filter(field: str, values: List[Any]) -> Dict[str, Any]:
+    if not values:
+        return {"_id": None}
+    return {field: {"$in": values}}
+
+
+def _build_or(filters: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [f for f in filters if f]
+    if not valid:
+        return {"_id": None}
+    if len(valid) == 1:
+        return valid[0]
+    return {"$or": valid}
+
+
 class TenantMigrator:
     def __init__(self, mongo_uri: str, source_db: str, master_db: str, dry_run: bool = False,
-                 bootstrap_from_admins: bool = False, apply_indexes_flag: bool = False):
+                 bootstrap_from_admins: bool = False, apply_indexes_flag: bool = False,
+                 delete_source: bool = False, collections: Optional[Set[str]] = None):
         self.mongo_uri = mongo_uri
         self.source_db_name = source_db
         self.master_db_name = master_db
         self.dry_run = dry_run
         self.bootstrap_from_admins = bootstrap_from_admins
         self.apply_indexes_flag = apply_indexes_flag
+        self.delete_source = delete_source
+        self.collections = collections
         self.client: Optional[AsyncIOMotorClient] = None
         self.source_db = None
         self.master_db = None
@@ -265,6 +303,12 @@ class TenantMigrator:
 
         return total
 
+    async def maybe_delete_source(self, source_collection, filter_dict: Dict[str, Any]) -> int:
+        if self.dry_run or not self.delete_source:
+            return 0
+        result = await source_collection.delete_many(filter_dict)
+        return result.deleted_count
+
     async def write_batch(self, collection, docs: List[Dict[str, Any]]) -> int:
         if not docs:
             return 0
@@ -301,13 +345,68 @@ class TenantMigrator:
         tenant_db = self.client[db_name]
         logger.info("Migrating tenant %s -> %s", tenant.get("subdomain") or tenant.get("tenant_id"), db_name)
 
-        student_cursor = self.source_db["students"].find({"admin_id": admin_oid}, {"_id": 1})
+        student_cursor = self.source_db["students"].find({"admin_id": admin_oid}, {"_id": 1, "username": 1})
         student_ids: List[ObjectId] = []
+        student_usernames: List[str] = []
         async for student in student_cursor:
             student_ids.append(student["_id"])
-        student_id_values = student_ids + [str(sid) for sid in student_ids]
+            username = student.get("username")
+            if username:
+                student_usernames.append(username)
+        student_id_values = list({*student_ids, *[str(sid) for sid in student_ids]})
+        user_id_values = list({*student_id_values, *student_usernames})
 
+        tutor_cursor = self.source_db["tutors"].find(
+            {"admin_id": admin_oid},
+            {"_id": 1, "username": 1, "tutor_id": 1},
+        )
+        tutor_ids: List[ObjectId] = []
+        tutor_usernames: List[str] = []
+        tutor_custom_ids: List[str] = []
+        async for tutor in tutor_cursor:
+            tutor_ids.append(tutor["_id"])
+            tname = tutor.get("username")
+            if tname:
+                tutor_usernames.append(tname)
+            tid = tutor.get("tutor_id")
+            if tid:
+                tutor_custom_ids.append(str(tid))
+        tutor_id_values = list({*tutor_ids, *[str(tid) for tid in tutor_ids], *tutor_usernames, *tutor_custom_ids})
+
+        document_cursor = self.source_db["documents"].find(
+            {"admin_id": admin_oid},
+            {"_id": 1, "document_id": 1, "filename": 1},
+        )
+        document_ids: List[ObjectId] = []
+        document_custom_ids: List[str] = []
+        document_filenames: List[str] = []
+        async for doc in document_cursor:
+            document_ids.append(doc["_id"])
+            doc_id = doc.get("document_id")
+            if doc_id:
+                document_custom_ids.append(str(doc_id))
+            filename = doc.get("filename")
+            if filename:
+                document_filenames.append(str(filename))
+        document_id_values = list({*document_ids, *[str(did) for did in document_ids], *document_custom_ids})
+
+        question_cursor = self.source_db["questions"].find(
+            {"$or": admin_conditions},
+            {"_id": 1, "id": 1, "question_id": 1},
+        )
+        question_ids: List[ObjectId] = []
+        question_custom_ids: List[str] = []
+        async for q in question_cursor:
+            question_ids.append(q["_id"])
+            qid = q.get("id") or q.get("question_id")
+            if qid:
+                question_custom_ids.append(str(qid))
+        question_id_values = list({*question_ids, *[str(qid) for qid in question_ids], *question_custom_ids})
+
+        collections_to_migrate = self.collections or set(TENANT_COLLECTIONS)
         for collection_name in TENANT_COLLECTIONS:
+            if collection_name not in collections_to_migrate:
+                continue
             source_collection = self.source_db[collection_name]
             target_collection = tenant_db[collection_name]
 
@@ -322,13 +421,61 @@ class TenantMigrator:
                     return updated
 
                 count = await self.migrate_collection(source_collection, target_collection, filter_dict, transform_admin)
-            elif collection_name == "strokes":
-                filter_dict = {"user_id": {"$in": student_id_values}} if student_id_values else {"user_id": None}
+            elif collection_name in {"strokes", "sessions", "pens", "devices", "pen_calibrations"}:
+                filter_dict = _build_in_filter("user_id", user_id_values)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"student_activities", "student_sessions", "practice_sessions", "video_views"}:
+                filter_dict = _build_or([
+                    _build_in_filter("student_id", student_id_values),
+                    _build_in_filter("user_id", user_id_values),
+                    _build_in_filter("username", student_usernames),
+                ])
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"tutor_activity_log"}:
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("tutor_id", tutor_id_values))
+                conditions.append(_build_in_filter("username", tutor_usernames))
+                filter_dict = _build_or(conditions)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"online_classes", "videos"}:
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("tutor_id", tutor_id_values))
+                filter_dict = _build_or(conditions)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"documents", "school_settings"}:
+                filter_dict = _build_or(list(admin_conditions))
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"document_annotations", "document_regions", "images", "chat_documents"}:
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("document_id", document_id_values))
+                conditions.append(_build_in_filter("doc_id", document_id_values))
+                conditions.append(_build_in_filter("source_pdf", document_filenames))
+                filter_dict = _build_or(conditions)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"questions", "question_attempts", "mcq_solutions"}:
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("question_id", question_id_values))
+                conditions.append(_build_in_filter("id", question_id_values))
+                conditions.append(_build_in_filter("student_id", student_id_values))
+                filter_dict = _build_or(conditions)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name in {"chat_sessions", "chat_conversations", "chat_analytics"}:
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("student_id", student_id_values))
+                conditions.append(_build_in_filter("user_id", user_id_values))
+                conditions.append(_build_in_filter("tutor_id", tutor_id_values))
+                filter_dict = _build_or(conditions)
+                count = await self.migrate_collection(source_collection, target_collection, filter_dict)
+            elif collection_name == "canvas_history":
+                conditions = list(admin_conditions)
+                conditions.append(_build_in_filter("user_id", user_id_values))
+                conditions.append(_build_in_filter("student_id", student_id_values))
+                filter_dict = _build_or(conditions)
                 count = await self.migrate_collection(source_collection, target_collection, filter_dict)
             elif collection_name == "pen_tokens":
                 filter_dict = {"student_id": {"$in": student_ids}} if student_ids else {"student_id": None}
                 count = await self.migrate_collection(source_collection, target_collection, filter_dict)
-            elif collection_name in {"student_activity_log", "chat_sessions", "student_test_attempts"}:
+            elif collection_name in {"student_activity_log", "student_test_attempts"}:
                 conditions = list(admin_conditions)
                 if student_id_values:
                     conditions.append({"student_id": {"$in": student_id_values}})
@@ -339,6 +486,9 @@ class TenantMigrator:
                 count = await self.migrate_collection(source_collection, target_collection, filter_dict)
 
             logger.info("  %s: %s documents", collection_name, count)
+            deleted = await self.maybe_delete_source(source_collection, filter_dict)
+            if deleted:
+                logger.info("  %s: deleted %s legacy documents", collection_name, deleted)
 
         if self.apply_indexes_flag:
             await apply_indexes(tenant_db, dry_run=self.dry_run)
@@ -366,10 +516,23 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Log changes without writing data")
     parser.add_argument("--bootstrap-from-admins", action="store_true", help="Create tenant registry from admins")
     parser.add_argument("--apply-indexes", action="store_true", help="Apply tenant index template after copy")
+    parser.add_argument("--delete-source", action="store_true", help="Delete migrated docs from source DB")
+    parser.add_argument(
+        "--collections",
+        default=None,
+        help="Comma-separated list of collections to migrate (default: all tenant collections)",
+    )
     parser.add_argument("--mongo-uri", default=None, help="MongoDB URI (default: from env)")
     parser.add_argument("--source-db", default=None, help="Source DB name (default: from env)")
     parser.add_argument("--master-db", default=None, help="Master DB name (default: from env)")
     args = parser.parse_args()
+
+    collections: Optional[Set[str]] = None
+    if args.collections:
+        collections = {c.strip() for c in args.collections.split(",") if c.strip()}
+        unknown = collections - set(TENANT_COLLECTIONS)
+        if unknown:
+            logger.warning("Unknown collections requested: %s", ", ".join(sorted(unknown)))
 
     mongo_uri = args.mongo_uri or os.getenv("MONGODB_URI", "mongodb://localhost:27017")
     source_db = args.source_db or os.getenv("MONGODB_DB_NAME", "skillbot_db")
@@ -386,6 +549,8 @@ def main() -> None:
         dry_run=args.dry_run,
         bootstrap_from_admins=args.bootstrap_from_admins,
         apply_indexes_flag=args.apply_indexes,
+        delete_source=args.delete_source,
+        collections=collections,
     )
 
     asyncio.run(migrator.run())
