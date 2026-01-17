@@ -20,6 +20,13 @@ def normalize_institution_id(institution_id: str) -> str:
     return institution_id.strip().upper()
 
 
+def normalize_tenant_id(tenant_id: str) -> str:
+    """Normalize tenant login IDs for lookup (upper-case, trimmed)."""
+    if not tenant_id:
+        return ""
+    return tenant_id.strip().upper()
+
+
 async def _find_tenant(
     db: DatabaseManager,
     filter_dict: Dict[str, Any],
@@ -59,6 +66,7 @@ async def get_tenant_by_tenant_id(
     tenant_id: str,
     include_inactive: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    if not tenant_id:
+    normalized = normalize_tenant_id(tenant_id)
+    if not normalized:
         return None
-    return await _find_tenant(db, {"tenant_id": tenant_id}, include_inactive)
+    return await _find_tenant(db, {"tenant_id": normalized}, include_inactive)

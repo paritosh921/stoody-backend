@@ -35,8 +35,8 @@ from core.database import DatabaseManager
 from core.auth import AuthManager
 from core.tenant_registry import (
     get_tenant_by_subdomain,
-    get_tenant_by_institution_id,
-    normalize_institution_id,
+    get_tenant_by_tenant_id,
+    normalize_tenant_id,
 )
 from config_async import settings
 
@@ -64,7 +64,7 @@ TEMP_TOKEN_MAX_AGE_SECONDS = 600  # 10 minutes
 # TOTP issuer name (appears in Google Authenticator)
 TOTP_ISSUER = "Stoody"
 
-INSTITUTION_ID_PATTERN = r'^[A-Za-z0-9]{5}-[A-Za-z0-9]{3}-[A-Za-z0-9]{2}$'
+TENANT_ID_PATTERN = r'^[A-Za-z]{4}[0-9]{4}$'
 
 # Legacy accounts exempt from 2FA (old system compatibility)
 # These accounts will use regular login without 2FA requirement
@@ -177,7 +177,7 @@ class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, description="Username or email")
     password: str = Field(..., min_length=1)
     user_type: str = Field(default="admin", description="'admin' or 'tutor'")
-    institution_id: Optional[str] = Field(None, pattern=INSTITUTION_ID_PATTERN)
+    tenant_id: Optional[str] = Field(None, pattern=TENANT_ID_PATTERN)
 
 
 class TempTokenRequest(BaseModel):
@@ -251,17 +251,17 @@ def _get_request_subdomain(request: Request) -> Optional[str]:
 async def _resolve_tenant_for_auth(
     db: DatabaseManager,
     request: Request,
-    institution_id: Optional[str],
+    tenant_id: Optional[str],
     require_active: bool = True,
 ) -> Dict[str, Any]:
     subdomain = _get_request_subdomain(request)
     tenant = None
     if subdomain:
         tenant = await get_tenant_by_subdomain(db, subdomain, include_inactive=not require_active)
-    if not tenant and institution_id:
-        tenant = await get_tenant_by_institution_id(
+    if not tenant and tenant_id:
+        tenant = await get_tenant_by_tenant_id(
             db,
-            institution_id,
+            tenant_id,
             include_inactive=not require_active
         )
     if not tenant:
@@ -355,8 +355,8 @@ async def login_with_2fa(
     """
     try:
         user_type = login_data.user_type.lower()
-        institution_id = normalize_institution_id(login_data.institution_id) if login_data.institution_id else None
-        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
+        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
         
         if user_type == "admin":
@@ -494,7 +494,7 @@ async def start_2fa_setup(
             tenant = await _resolve_tenant_for_auth(
                 db,
                 request,
-                payload.get("institution_id"),
+                payload.get("tenant_id"),
                 require_active=False
             )
             tenant_db = await _get_tenant_db_or_503(db, tenant)
@@ -559,7 +559,7 @@ async def verify_2fa_setup(
             tenant = await _resolve_tenant_for_auth(
                 db,
                 request,
-                payload.get("institution_id"),
+                payload.get("tenant_id"),
                 require_active=False
             )
             tenant_db = await _get_tenant_db_or_503(db, tenant)
@@ -674,7 +674,7 @@ async def verify_otp(
             tenant = await _resolve_tenant_for_auth(
                 db,
                 request,
-                payload.get("institution_id"),
+                payload.get("tenant_id"),
                 require_active=False
             )
             tenant_db = await _get_tenant_db_or_503(db, tenant)
