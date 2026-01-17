@@ -104,6 +104,19 @@ async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
 
 
+def convert_objectids(obj):
+    """Recursively convert ObjectId fields to strings"""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_objectids(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectids(item) for item in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
+
 def generate_tenant_id() -> str:
     """Generate a unique tenant ID like TNTXYZ123AB"""
     timestamp = hex(int(datetime.utcnow().timestamp()))[2:].upper()[:6]
@@ -315,14 +328,16 @@ async def get_tenants(
 
     tenants = await master_db["tenants"].find(query).sort("created_at", -1).to_list(length=1000)
 
-    # Convert ObjectIds to strings
+    # Convert all ObjectIds and dates to JSON-serializable format
+    result = []
     for tenant in tenants:
-        tenant["_id"] = str(tenant["_id"])
+        tenant = convert_objectids(tenant)
         if "pending_admin" in tenant and tenant["pending_admin"]:
             # Remove password hash from response
             tenant["pending_admin"].pop("password_hash", None)
+        result.append(tenant)
 
-    return tenants
+    return result
 
 
 @router.get("/tenants/{tenant_id}")
@@ -342,7 +357,7 @@ async def get_tenant_by_id(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    tenant["_id"] = str(tenant["_id"])
+    tenant = convert_objectids(tenant)
     if "pending_admin" in tenant and tenant["pending_admin"]:
         tenant["pending_admin"].pop("password_hash", None)
 
@@ -365,11 +380,7 @@ async def get_tenant_files(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid tenant ID")
 
-    for file in files:
-        file["_id"] = str(file["_id"])
-        file["tenant_request_id"] = str(file["tenant_request_id"])
-
-    return files
+    return [convert_objectids(file) for file in files]
 
 
 @router.post("/tenants/{tenant_id}/approve")
