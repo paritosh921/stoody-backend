@@ -890,17 +890,26 @@ async def create_student(
         # Get admin_id from JWT token
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
 
-        # Check if username already exists GLOBALLY (not just within admin's tenant)
-        # This ensures globally unique usernames across entire platform
+        # Check if username already exists (case-insensitive)
         if student_data.username:
-            existing_student = await db.mongo_find_one("students", {
-                "username": student_data.username
-            })
+            normalized_username = student_data.username.strip()
+            username_lower = normalized_username.lower()
+            existing_student = await db.mongo_find_one(
+                "students",
+                {"username_lower": username_lower}
+            )
+            if not existing_student:
+                existing_student = await db.mongo_find_one(
+                    "students",
+                    {"username": normalized_username},
+                    collation={"locale": "en", "strength": 2}
+                )
             if existing_student:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Username already exists. Please choose a different username."
                 )
+            student_data.username = normalized_username
         else:
             # Auto-generate username from full_name
             base_name = "".join(c for c in student_data.full_name.lower() if c.isalnum() or c == ' ').strip().replace(' ', '.')
@@ -911,7 +920,13 @@ async def create_student(
             username = base_name
             counter = 1
             while True:
-                existing = await db.mongo_find_one("students", {"username": username})
+                existing = await db.mongo_find_one("students", {"username_lower": username.lower()})
+                if not existing:
+                    existing = await db.mongo_find_one(
+                        "students",
+                        {"username": username},
+                        collation={"locale": "en", "strength": 2}
+                    )
                 if not existing:
                     student_data.username = username
                     break
@@ -947,6 +962,7 @@ async def create_student(
             "full_name": student_data.full_name,
             "name": student_data.full_name,  # Keep legacy field for compatibility
             "email": student_data.email,
+            "username_lower": student_data.username.lower(),
             "password_hash": password_hash,
             "date_of_birth": student_data.date_of_birth,  # Store as string YYYY-MM-DD
             "gender": student_data.gender,
