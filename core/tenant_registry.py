@@ -73,4 +73,8 @@ async def get_tenant_by_tenant_id(
     normalized = normalize_tenant_id(tenant_id)
     if not normalized:
         return None
-    return await _find_tenant(db, {"tenant_id": normalized}, include_inactive)
+    compact = normalized.replace("-", "")
+    candidates = [normalized]
+    if compact and compact != normalized:
+        candidates.append(compact)
+    return await _find_tenant(db, {"tenant_id": {"$in": candidates}}, include_inactive)
