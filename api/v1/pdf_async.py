@@ -154,7 +154,7 @@ async def call_mistral_ocr(pdf_base64: str) -> Dict[str, Any]:
         }
 
         payload = {
-            "model": "mistral-ocr-latest",
+            "model": "mistral-ocr-2512",
             "document": {
                 "type": "document_url",
                 "document_url": document_url
@@ -4138,7 +4138,7 @@ async def extract_region_from_pdf(
     """
     Extract a specific region from a PDF page and process it with OCR.
     
-    Uses Mistral OCR API (mistral-ocr-latest) to extract text AND images from the region,
+    Uses Mistral OCR API (mistral-ocr-2512) to extract text AND images from the region,
     just like the direct OCR pipeline does for full documents.
     
     Args:
@@ -4223,7 +4223,7 @@ async def extract_region_from_pdf(
         
         # Use Mistral OCR API (same as direct OCR) to extract both text AND images
         payload = {
-            "model": "mistral-ocr-latest",
+            "model": "mistral-ocr-2512",
             "document": {
                 "type": "document_url",
                 "document_url": f"data:application/pdf;base64,{region_pdf_base64}"
