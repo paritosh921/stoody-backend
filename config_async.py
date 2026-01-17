@@ -83,8 +83,8 @@ class AsyncSettings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
 
     # Super Admin Configuration
-    SUPERADMIN_JWT_SECRET: str = os.getenv("SUPERADMIN_JWT_SECRET", os.getenv("JWT_SECRET_KEY", "superadmin-secret-change-me"))
-    SUPERADMIN_SETUP_KEY: str = os.getenv("SUPERADMIN_SETUP_KEY", "stoody-setup-key-2024")
+    SUPERADMIN_JWT_SECRET: str = os.getenv("SUPERADMIN_JWT_SECRET", os.getenv("JWT_SECRET_KEY", ""))
+    SUPERADMIN_SETUP_KEY: str = os.getenv("SUPERADMIN_SETUP_KEY", "")
 
     # File storage
     IMAGES_DIR: Path = BASE_DIR / "images"
