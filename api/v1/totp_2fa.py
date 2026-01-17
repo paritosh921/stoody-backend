@@ -64,7 +64,7 @@ TEMP_TOKEN_MAX_AGE_SECONDS = 600  # 10 minutes
 # TOTP issuer name (appears in Google Authenticator)
 TOTP_ISSUER = "Stoody"
 
-TENANT_ID_PATTERN = r'^[A-Za-z]{4}[0-9]{4}$'
+TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
 
 # Legacy accounts exempt from 2FA (old system compatibility)
 # These accounts will use regular login without 2FA requirement

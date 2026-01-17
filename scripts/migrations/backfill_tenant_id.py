@@ -1,5 +1,8 @@
 """
-Backfill tenant_id (login code) for existing tenants in the master registry.
+Backfill tenant_id (login code) from institution_id for existing tenants.
+
+Institution ID format: AAAA-BBBB-0000
+Tenant ID derived from institution ID suffix: BBBB-0000
 
 Usage:
     cd backend
@@ -14,12 +17,10 @@ import argparse
 import asyncio
 import logging
 import os
-import random
-import string
 import sys
 import re
 from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -40,18 +41,17 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-TENANT_ID_PATTERN = re.compile(r"^[A-Z]{4}[0-9]{4}$")
+TENANT_ID_PATTERN = re.compile(r"^[A-Z]{4}-[0-9]{4}$")
+INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
 
 
-def _generate_tenant_id(existing: Set[str]) -> str:
-    """Generate a unique tenant ID in AAAA0000 format."""
-    while True:
-        letters = "".join(random.choices(string.ascii_uppercase, k=4))
-        digits = "".join(random.choices(string.digits, k=4))
-        tenant_id = f"{letters}{digits}"
-        if tenant_id not in existing:
-            existing.add(tenant_id)
-            return tenant_id
+def _derive_tenant_id(institution_id: str) -> str:
+    """Derive tenant ID from institution ID suffix."""
+    normalized = institution_id.strip().upper()
+    if not INSTITUTION_ID_PATTERN.match(normalized):
+        raise ValueError("Institution ID must match AAAA-BBBB-0000 format")
+    _, middle, digits = normalized.split("-")
+    return f"{middle}-{digits}"
 
 
 class TenantIdBackfill:
@@ -77,6 +77,7 @@ class TenantIdBackfill:
             "updated": 0,
             "skipped_valid": 0,
             "skipped_invalid": 0,
+            "skipped_missing_institution": 0,
         }
 
     async def connect(self) -> None:
@@ -89,19 +90,9 @@ class TenantIdBackfill:
             self.client.close()
             logger.info("MongoDB connection closed")
 
-    async def _load_existing_ids(self) -> Set[str]:
-        existing: Set[str] = set()
-        cursor = self.master_db["tenants"].find({"tenant_id": {"$exists": True}}, {"tenant_id": 1})
-        async for doc in cursor:
-            tenant_id = (doc.get("tenant_id") or "").strip().upper()
-            if tenant_id and TENANT_ID_PATTERN.match(tenant_id):
-                existing.add(tenant_id)
-        return existing
-
     async def run(self) -> None:
         await self.connect()
         try:
-            existing_ids = await self._load_existing_ids()
             query = {}
             if self.only_active:
                 query["status"] = "active"
@@ -113,23 +104,34 @@ class TenantIdBackfill:
             async for tenant in cursor:
                 self.stats["scanned"] += 1
                 current = (tenant.get("tenant_id") or "").strip().upper()
+                institution_id = (tenant.get("institution_id") or "").strip().upper()
 
-                if current and TENANT_ID_PATTERN.match(current):
+                if not institution_id or not INSTITUTION_ID_PATTERN.match(institution_id):
+                    self.stats["skipped_missing_institution"] += 1
+                    logger.warning(
+                        "Skipping tenant %s due to missing/invalid institution_id: %s",
+                        str(tenant.get("_id")),
+                        tenant.get("institution_id"),
+                    )
+                    continue
+
+                derived_id = _derive_tenant_id(institution_id)
+
+                if current and TENANT_ID_PATTERN.match(current) and current == derived_id:
                     self.stats["skipped_valid"] += 1
                     continue
 
-                if current and not TENANT_ID_PATTERN.match(current) and self.keep_invalid:
+                if current and self.keep_invalid and current != derived_id:
                     self.stats["skipped_invalid"] += 1
                     continue
 
-                new_id = _generate_tenant_id(existing_ids)
                 update = {
-                    "tenant_id": new_id,
+                    "tenant_id": derived_id,
                     "tenant_id_assigned_at": datetime.utcnow(),
                 }
                 logger.info(
                     "Assigning tenant_id=%s to tenant=%s (db=%s, subdomain=%s)",
-                    new_id,
+                    derived_id,
                     str(tenant.get("_id")),
                     tenant.get("db_name"),
                     tenant.get("subdomain"),
@@ -143,11 +145,12 @@ class TenantIdBackfill:
                 self.stats["updated"] += 1
 
             logger.info(
-                "Backfill complete. scanned=%s updated=%s skipped_valid=%s skipped_invalid=%s",
+                "Backfill complete. scanned=%s updated=%s skipped_valid=%s skipped_invalid=%s skipped_missing_institution=%s",
                 self.stats["scanned"],
                 self.stats["updated"],
                 self.stats["skipped_valid"],
                 self.stats["skipped_invalid"],
+                self.stats["skipped_missing_institution"],
             )
         finally:
             await self.close()
