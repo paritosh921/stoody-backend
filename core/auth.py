@@ -351,8 +351,10 @@ class AuthManager:
                                  db_manager) -> Optional[Dict[str, Any]]:
         """Authenticate student user"""
         try:
+            normalized_username = username.strip()
+            username_lower = normalized_username.lower()
             # Check rate limit
-            allowed, remaining = await self.check_auth_rate_limit(username, "login")
+            allowed, remaining = await self.check_auth_rate_limit(username_lower, "login")
             if not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -362,8 +364,14 @@ class AuthManager:
             # Find student user in database
             student_data = await db_manager.mongo_find_one(
                 "students",
-                {"username": username, "is_active": True}
+                {"username_lower": username_lower, "is_active": True}
             )
+            if not student_data:
+                student_data = await db_manager.mongo_find_one(
+                    "students",
+                    {"username": normalized_username, "is_active": True},
+                    collation={"locale": "en", "strength": 2}
+                )
 
             if not student_data:
                 return None
@@ -397,8 +405,10 @@ class AuthManager:
                                  db_manager, db_override=None) -> Optional[Dict[str, Any]]:
         """Authenticate tutor user"""
         try:
+            normalized_username = username.strip()
+            username_lower = normalized_username.lower()
             # Check rate limit
-            allowed, _ = await self.check_auth_rate_limit(username, "login")
+            allowed, _ = await self.check_auth_rate_limit(username_lower, "login")
             if not allowed:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -408,13 +418,24 @@ class AuthManager:
             # Find tutor in database
             if db_override is not None:
                 tutor_data = await db_override["tutors"].find_one(
-                    {"username": username, "is_active": True}
+                    {"username_lower": username_lower, "is_active": True}
                 )
+                if not tutor_data:
+                    tutor_data = await db_override["tutors"].find_one(
+                        {"username": normalized_username, "is_active": True},
+                        collation={"locale": "en", "strength": 2}
+                    )
             else:
                 tutor_data = await db_manager.mongo_find_one(
                     "tutors",
-                    {"username": username, "is_active": True}
+                    {"username_lower": username_lower, "is_active": True}
                 )
+                if not tutor_data:
+                    tutor_data = await db_manager.mongo_find_one(
+                        "tutors",
+                        {"username": normalized_username, "is_active": True},
+                        collation={"locale": "en", "strength": 2}
+                    )
 
             if not tutor_data:
                 return None

@@ -40,10 +40,12 @@ IndexDef = Tuple[List[Tuple[str, int]], Dict[str, object]]
 
 TENANT_INDEXES: Dict[str, List[IndexDef]] = {
     "students": [
+        ([("username_lower", 1)], {"unique": True, "sparse": True, "name": "uniq_students_username_lower"}),
         ([("username", 1)], {"unique": True, "name": "uniq_students_username"}),
         ([("email", 1)], {"sparse": True, "name": "idx_students_email"}),
     ],
     "tutors": [
+        ([("username_lower", 1)], {"unique": True, "sparse": True, "name": "uniq_tutors_username_lower"}),
         ([("username", 1)], {"unique": True, "name": "uniq_tutors_username"}),
         ([("tutor_id", 1)], {"unique": True, "name": "uniq_tutors_tutor_id"}),
     ],

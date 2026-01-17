@@ -153,8 +153,16 @@ async def create_tutor(
     Create a new tutor account (Admin only)
     Auto-generates tutor_id and password
     """
-    # Check if username already exists
-    existing_tutor = await db.mongo_find_one("tutors", {"username": tutor_data.username})
+    normalized_username = tutor_data.username.strip()
+    username_lower = normalized_username.lower()
+    # Check if username already exists (case-insensitive)
+    existing_tutor = await db.mongo_find_one("tutors", {"username_lower": username_lower})
+    if not existing_tutor:
+        existing_tutor = await db.mongo_find_one(
+            "tutors",
+            {"username": normalized_username},
+            collation={"locale": "en", "strength": 2}
+        )
     if existing_tutor:
         raise HTTPException(status_code=400, detail="Username already exists")
 
@@ -178,7 +186,8 @@ async def create_tutor(
     new_tutor = {
         "tutor_id": auto_tutor_id,
         "name": tutor_data.full_name,
-        "username": tutor_data.username,
+        "username": normalized_username,
+        "username_lower": username_lower,
         "password_hash": password_hash,
         "email": tutor_data.email,
         "phone": tutor_data.phone,
@@ -212,7 +221,7 @@ async def create_tutor(
     return TutorResponse(
         id=str(result),
         tutor_id=auto_tutor_id,
-        username=tutor_data.username,
+        username=normalized_username,
         full_name=tutor_data.full_name,
         name=tutor_data.full_name,
         email=tutor_data.email,
