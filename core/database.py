@@ -276,6 +276,13 @@ class DatabaseManager:
                 name="uniq_student_id"
             )
             logger.info("✅ Ensured unique index on students.student_id")
+            await students.create_index(
+                [("username_lower", 1)],
+                unique=True,
+                sparse=True,
+                name="uniq_student_username_lower"
+            )
+            logger.info("✅ Ensured unique index on students.username_lower")
 
             # Tutor indexes
             tutors = self.mongo_db["tutors"]
@@ -283,6 +290,12 @@ class DatabaseManager:
                 [("username", 1)],
                 unique=True,
                 name="uniq_tutor_username"
+            )
+            await tutors.create_index(
+                [("username_lower", 1)],
+                unique=True,
+                sparse=True,
+                name="uniq_tutor_username_lower"
             )
             await tutors.create_index(
                 [("tutor_id", 1)],
@@ -420,7 +433,8 @@ class DatabaseManager:
 
     # MongoDB async operations wrapper
     async def mongo_find_one(self, collection_name: str, filter_dict: Dict[str, Any],
-                            projection: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                            projection: Optional[Dict[str, Any]] = None,
+                            collation: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Find one document in MongoDB"""
         try:
             # Quick check if MongoDB is available
@@ -431,6 +445,8 @@ class DatabaseManager:
             collection = await self._get_context_collection(collection_name)
             if collection is None:
                 return None
+            if collation:
+                return await collection.find_one(filter_dict, projection, collation=collation)
             return await collection.find_one(filter_dict, projection)
         except Exception as e:
             logger.error(f"MongoDB find_one failed: {str(e)}")
@@ -627,7 +643,8 @@ class DatabaseManager:
     # They mirror the main methods but use get_b2c_collection instead
 
     async def b2c_find_one(self, collection_name: str, filter_dict: Dict[str, Any],
-                           projection: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                           projection: Optional[Dict[str, Any]] = None,
+                           collation: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Find one document in B2C MongoDB database"""
         try:
             if self.mongo_client is None or self.mongo_db_b2c is None:
@@ -636,6 +653,8 @@ class DatabaseManager:
             collection = await self.get_b2c_collection(collection_name)
             if collection is None:
                 return None
+            if collation:
+                return await collection.find_one(filter_dict, projection, collation=collation)
             return await collection.find_one(filter_dict, projection)
         except Exception as e:
             logger.error(f"B2C MongoDB find_one failed: {str(e)}")

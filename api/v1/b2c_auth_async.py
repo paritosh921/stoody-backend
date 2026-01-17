@@ -589,11 +589,20 @@ async def b2c_admin_login(
     try:
         import bcrypt
         
-        # Find admin in B2C database
-        admin = await db.b2c_find_one("admins", {"username": login_data.username})
+        normalized_username = login_data.username.strip()
+        username_lower = normalized_username.lower()
+
+        # Find admin in B2C database (case-insensitive)
+        admin = await db.b2c_find_one("admins", {"username_lower": username_lower})
+        if not admin:
+            admin = await db.b2c_find_one(
+                "admins",
+                {"username": normalized_username},
+                collation={"locale": "en", "strength": 2}
+            )
         
         if not admin:
-            logger.warning(f"B2C Admin login attempt with unknown username: {login_data.username}")
+            logger.warning(f"B2C Admin login attempt with unknown username: {normalized_username}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -605,7 +614,7 @@ async def b2c_admin_login(
             login_data.password.encode('utf-8'),
             stored_hash.encode('utf-8') if isinstance(stored_hash, str) else stored_hash
         ):
-            logger.warning(f"B2C Admin login failed - incorrect password: {login_data.username}")
+            logger.warning(f"B2C Admin login failed - incorrect password: {normalized_username}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -654,7 +663,7 @@ async def b2c_admin_login(
         except Exception as e:
             logger.warning(f"Failed to log B2C admin activity: {str(e)}")
         
-        logger.info(f"B2C Admin logged in: {login_data.username}")
+        logger.info(f"B2C Admin logged in: {normalized_username}")
         
         return {
             "success": True,
@@ -725,7 +734,8 @@ async def setup_b2c_admin(
         
         # Create admin document
         admin_doc = {
-            "username": setup_data.username,
+            "username": setup_data.username.strip(),
+            "username_lower": setup_data.username.strip().lower(),
             "password_hash": password_hash,
             "email": setup_data.email,
             "full_name": setup_data.full_name,
@@ -750,7 +760,7 @@ async def setup_b2c_admin(
                 detail="Failed to create admin account"
             )
         
-        logger.info(f"B2C Admin account created: {setup_data.username}")
+        logger.info(f"B2C Admin account created: {setup_data.username.strip()}")
         
         return {
             "success": True,
