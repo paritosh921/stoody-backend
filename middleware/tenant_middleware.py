@@ -78,7 +78,7 @@ class TenantMiddleware(BaseHTTPMiddleware):
                     db_name = user_data.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
                     if not db_name and not is_b2c:
                         return Response(
-                            content='{"detail":"Tenant database missing. Please log in again with institution ID."}',
+                            content='{"detail":"Tenant database missing. Please log in again with tenant ID."}',
                             status_code=status.HTTP_401_UNAUTHORIZED,
                             media_type="application/json",
                         )
@@ -147,7 +147,7 @@ async def get_tenant_db(
     if not db_name and not is_b2c:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Tenant database missing. Please log in again with institution ID.",
+            detail="Tenant database missing. Please log in again with tenant ID.",
         )
 
     if user_type == "admin":
