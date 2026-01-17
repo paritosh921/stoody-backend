@@ -21,12 +21,24 @@ import json
 import logging
 import os
 import re
+import sys
 from typing import Dict, List
 
 from pymongo import MongoClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, backend_dir)
+
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(backend_dir, ".env")
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+except ImportError:
+    pass
 
 INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
 
