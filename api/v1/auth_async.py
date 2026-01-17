@@ -45,7 +45,7 @@ class AdminRegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     full_name: str = Field(..., min_length=2, max_length=100)
-    subdomain: str = Field(..., min_length=3, max_length=50, pattern=r'^[a-z0-9\-]+$')
+    subdomain: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-z0-9\-]+$')
     organization: str = Field(..., min_length=2, max_length=100)
 
 class StudentLoginRequest(BaseModel):
@@ -741,7 +741,7 @@ async def register_admin(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """
-    Register a new admin with subdomain
+    Register a new admin
     Creates a pending tenant request for super-admin review
     """
     try:
@@ -760,29 +760,31 @@ async def register_admin(
                 detail="Email already registered"
             )
 
-        # Check if subdomain already exists
-        existing_subdomain = await tenants.find_one({"subdomain": register_data.subdomain})
-        if existing_subdomain:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Subdomain already taken. Please choose another."
-            )
+        subdomain = register_data.subdomain.lower().strip() if register_data.subdomain else None
+        if subdomain:
+            # Check if subdomain already exists
+            existing_subdomain = await tenants.find_one({"subdomain": subdomain})
+            if existing_subdomain:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Subdomain already taken. Please choose another."
+                )
 
-        # Validate subdomain format again
-        import re
-        if not re.match(r'^[a-z0-9\-]+$', register_data.subdomain):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Subdomain can only contain lowercase letters, numbers, and hyphens"
-            )
+            # Validate subdomain format again
+            import re
+            if not re.match(r'^[a-z0-9\-]+$', subdomain):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Subdomain can only contain lowercase letters, numbers, and hyphens"
+                )
 
-        # Check reserved subdomains
-        reserved = ['www', 'app', 'admin', 'api', 'demo', 'test', 'staging', 'dev', 'mail', 'ftp']
-        if register_data.subdomain in reserved:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This subdomain is reserved"
-            )
+            # Check reserved subdomains
+            reserved = ['www', 'app', 'admin', 'api', 'demo', 'test', 'staging', 'dev', 'mail', 'ftp']
+            if subdomain in reserved:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This subdomain is reserved"
+                )
 
         # Hash password
         password_hash = auth_manager.get_password_hash(register_data.password)
@@ -791,7 +793,7 @@ async def register_admin(
             "tenant_id": None,
             "db_name": None,
             "institution_id": None,
-            "subdomain": register_data.subdomain,
+            "subdomain": subdomain,
             "organization": register_data.organization,
             "status": "pending",
             "admin_email": register_data.email,
@@ -819,7 +821,7 @@ async def register_admin(
                 detail="Failed to create tenant request"
             )
 
-        logger.info(f"New tenant request: {register_data.email} ({register_data.subdomain})")
+        logger.info("New tenant request: %s", register_data.email)
 
         return AdminRegistrationResponse(
             success=True,
