@@ -51,6 +51,11 @@ class TenantMiddleware(BaseHTTPMiddleware):
         "/api/v1/auth/register",
     }
 
+    # Path prefixes that should be exempt (super admin uses different JWT)
+    EXEMPT_PREFIXES = {
+        "/api/v1/superadmin",
+    }
+
     async def dispatch(self, request: Request, call_next) -> Response:
         # Clear any stale tenant context
         TenantContext.clear()
@@ -58,6 +63,10 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # Skip tenant context for exempt paths
         path = request.url.path
         if any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS):
+            return await call_next(request)
+
+        # Skip tenant context for exempt path prefixes (e.g., super admin routes)
+        if any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
         # Try to extract tenant info from authorization header
