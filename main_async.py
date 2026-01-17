@@ -170,6 +170,15 @@ except Exception as e:
     _question_attempts_available = False
     logging.warning(f"Question Attempts routes disabled: {str(e)}")
 
+# Super Admin routes (tenant management for super admins)
+try:
+    from api.v1.superadmin_async import router as superadmin_router
+    _superadmin_available = True
+except Exception as e:
+    superadmin_router = None
+    _superadmin_available = False
+    logging.warning(f"Super Admin routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -694,6 +703,17 @@ if _question_attempts_available and question_attempts_router:
     logger.info("✅ Question Attempts routes enabled")
 else:
     logger.warning("⚠️ Question Attempts routes disabled")
+
+# Super Admin routes (tenant management)
+if _superadmin_available and superadmin_router:
+    app.include_router(
+        superadmin_router,
+        prefix=f"{API_V1_PREFIX}/superadmin",
+        tags=["Super Admin"]
+    )
+    logger.info("✅ Super Admin routes enabled")
+else:
+    logger.warning("⚠️ Super Admin routes disabled")
 
 
 # Static file serving

@@ -835,6 +835,60 @@ async def register_admin(
             detail="Registration failed"
         )
 
+
+@router.get("/admin/registration-status")
+@limiter.limit("30/minute")
+async def get_registration_status(
+    request: Request,
+    email: str,
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Check the status of a tenant registration by admin email.
+    Returns the current status and relevant details for the registration page.
+    """
+    try:
+        tenants = await db.get_master_collection("tenants")
+        if tenants is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service unavailable"
+            )
+
+        tenant = await tenants.find_one({"admin_email": email})
+        if not tenant:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No application found for this email"
+            )
+
+        # Build response based on status
+        response = {
+            "status": tenant.get("status", "pending"),
+            "institution_name": tenant.get("institution_name") or tenant.get("organization"),
+            "created_at": tenant.get("created_at").isoformat() if tenant.get("created_at") else None,
+        }
+
+        # Add status-specific fields
+        if tenant.get("status") == "rejected":
+            response["rejection_reason"] = tenant.get("rejection_reason")
+
+        if tenant.get("status") in ["approved", "active"]:
+            response["approved_at"] = tenant.get("approved_at").isoformat() if tenant.get("approved_at") else None
+            response["tenant_id"] = tenant.get("tenant_id")
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration status check error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to check status"
+        )
+
+
 @router.post("/logout")
 async def logout(
     credentials: HTTPAuthorizationCredentials = Depends(security),
