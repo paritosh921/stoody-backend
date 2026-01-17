@@ -17,6 +17,12 @@ Usage:
 
     # Verbose output:
     python scripts/migrations/backfill_admin_id.py --verbose
+
+    # Run for all tenant DBs in master registry:
+    python scripts/migrations/backfill_admin_id.py --all-tenants
+
+    # Run for a specific tenant (new tenant_id login code):
+    python scripts/migrations/backfill_admin_id.py --tenant-id ABCD1234
 """
 
 import asyncio
@@ -25,6 +31,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Dict, Optional, Tuple, List
 
 # Add parent directory to path for imports
 backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,12 +60,20 @@ logger = logging.getLogger(__name__)
 class AdminIdBackfill:
     """Backfill admin_id for tenant isolation"""
 
-    def __init__(self, mongo_uri: str, db_name: str, dry_run: bool = False, verbose: bool = False):
+    def __init__(
+        self,
+        mongo_uri: str,
+        db_name: str,
+        dry_run: bool = False,
+        verbose: bool = False,
+        client: Optional[AsyncIOMotorClient] = None,
+    ):
         self.mongo_uri = mongo_uri
         self.db_name = db_name
         self.dry_run = dry_run
         self.verbose = verbose
-        self.client = None
+        self.client = client
+        self._external_client = client is not None
         self.db = None
         self.stats = {
             "smartboard_sessions": {"found": 0, "updated": 0, "skipped": 0, "errors": 0},
@@ -67,13 +82,14 @@ class AdminIdBackfill:
 
     async def connect(self):
         """Connect to MongoDB"""
-        logger.info(f"Connecting to MongoDB: {self.db_name}")
-        self.client = AsyncIOMotorClient(self.mongo_uri)
+        if not self.client:
+            logger.info(f"Connecting to MongoDB: {self.db_name}")
+            self.client = AsyncIOMotorClient(self.mongo_uri)
         self.db = self.client[self.db_name]
 
     async def close(self):
         """Close MongoDB connection"""
-        if self.client:
+        if self.client and not self._external_client:
             self.client.close()
             logger.info("MongoDB connection closed")
 
@@ -239,6 +255,24 @@ class AdminIdBackfill:
         finally:
             await self.close()
 
+        return self.stats
+
+
+async def _load_tenants(
+    client: AsyncIOMotorClient,
+    master_db: str,
+    include_inactive: bool = False,
+    tenant_id: Optional[str] = None,
+) -> List[Dict]:
+    db = client[master_db]
+    query: Dict[str, object] = {}
+    if not include_inactive:
+        query["status"] = "active"
+    if tenant_id:
+        query["tenant_id"] = tenant_id.strip().upper()
+    cursor = db["tenants"].find(query, {"db_name": 1, "tenant_id": 1, "subdomain": 1, "status": 1})
+    return await cursor.to_list(length=None)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Backfill admin_id for tenant isolation")
@@ -246,24 +280,67 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--mongo-uri", default=None, help="MongoDB URI (default: from env)")
     parser.add_argument("--db-name", default=None, help="Database name (default: from env)")
+    parser.add_argument("--master-db", default=None, help="Master DB name (default: from env)")
+    parser.add_argument("--all-tenants", action="store_true", help="Run for all tenant DBs in master registry")
+    parser.add_argument("--tenant-id", default=None, help="Run for a specific tenant_id (login code)")
+    parser.add_argument("--include-inactive", action="store_true", help="Include inactive tenants")
 
     args = parser.parse_args()
 
     # Get MongoDB settings from environment or arguments
     mongo_uri = args.mongo_uri or os.getenv("MONGODB_URI", "mongodb://localhost:27017")
     db_name = args.db_name or os.getenv("MONGODB_DB_NAME", "skillbot_local")
+    master_db = args.master_db or os.getenv("MONGODB_DB_MASTER", "skb_master")
 
     logger.info(f"MongoDB URI: {mongo_uri[:50]}...")
-    logger.info(f"Database: {db_name}")
 
-    backfill = AdminIdBackfill(
-        mongo_uri=mongo_uri,
-        db_name=db_name,
-        dry_run=args.dry_run,
-        verbose=args.verbose
-    )
+    async def run_backfill() -> None:
+        if args.tenant_id or args.all_tenants:
+            client = AsyncIOMotorClient(mongo_uri)
+            try:
+                tenants = await _load_tenants(
+                    client,
+                    master_db,
+                    include_inactive=args.include_inactive,
+                    tenant_id=args.tenant_id,
+                )
+                if not tenants:
+                    logger.warning("No tenants found in master registry")
+                    return
+                logger.info("Master DB: %s", master_db)
+                for tenant in tenants:
+                    tenant_db_name = tenant.get("db_name")
+                    if not tenant_db_name:
+                        logger.warning("Skipping tenant without db_name: %s", tenant.get("_id"))
+                        continue
+                    logger.info(
+                        "Running backfill for tenant_id=%s db_name=%s subdomain=%s status=%s",
+                        tenant.get("tenant_id"),
+                        tenant_db_name,
+                        tenant.get("subdomain"),
+                        tenant.get("status"),
+                    )
+                    backfill = AdminIdBackfill(
+                        mongo_uri=mongo_uri,
+                        db_name=tenant_db_name,
+                        dry_run=args.dry_run,
+                        verbose=args.verbose,
+                        client=client,
+                    )
+                    await backfill.run()
+            finally:
+                client.close()
+        else:
+            logger.info(f"Database: {db_name}")
+            backfill = AdminIdBackfill(
+                mongo_uri=mongo_uri,
+                db_name=db_name,
+                dry_run=args.dry_run,
+                verbose=args.verbose,
+            )
+            await backfill.run()
 
-    asyncio.run(backfill.run())
+    asyncio.run(run_backfill())
 
 
 if __name__ == "__main__":
