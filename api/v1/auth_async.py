@@ -20,8 +20,8 @@ from core.auth import AuthManager
 from core.pen_tokens import create_pen_token
 from core.tenant_registry import (
     get_tenant_by_subdomain,
-    get_tenant_by_institution_id,
-    normalize_institution_id,
+    get_tenant_by_tenant_id,
+    normalize_tenant_id,
 )
 from config_async import settings
 
@@ -34,12 +34,12 @@ security = HTTPBearer()
 limiter = Limiter(key_func=get_remote_address)
 
 # Pydantic models
-INSTITUTION_ID_PATTERN = r'^[A-Za-z0-9]{5}-[A-Za-z0-9]{3}-[A-Za-z0-9]{2}$'
+TENANT_ID_PATTERN = r'^[A-Za-z]{4}[0-9]{4}$'
 
 class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
-    institution_id: Optional[str] = Field(None, pattern=INSTITUTION_ID_PATTERN)
+    tenant_id: Optional[str] = Field(None, pattern=TENANT_ID_PATTERN)
 
 class AdminRegisterRequest(BaseModel):
     email: EmailStr
@@ -51,12 +51,12 @@ class AdminRegisterRequest(BaseModel):
 class StudentLoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
-    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
+    tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
 class TutorLoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
-    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
+    tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
 class StudentChangePasswordRequest(BaseModel):
     current_password: str = Field(..., min_length=6)
@@ -66,7 +66,7 @@ class StudentForgotPasswordRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     date_of_birth: str  # Format: YYYY-MM-DD
     phone: str
-    institution_id: str = Field(..., pattern=INSTITUTION_ID_PATTERN)
+    tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
 class TokenResponse(BaseModel):
     success: bool = True
@@ -100,17 +100,17 @@ def _get_request_subdomain(request: Request) -> Optional[str]:
 async def _resolve_tenant_for_auth(
     db: DatabaseManager,
     request: Request,
-    institution_id: Optional[str],
+    tenant_id: Optional[str],
     require_active: bool = True,
 ) -> Dict[str, Any]:
     subdomain = _get_request_subdomain(request)
     tenant = None
     if subdomain:
         tenant = await get_tenant_by_subdomain(db, subdomain, include_inactive=not require_active)
-    if not tenant and institution_id:
-        tenant = await get_tenant_by_institution_id(
+    if not tenant and tenant_id:
+        tenant = await get_tenant_by_tenant_id(
             db,
-            institution_id,
+            tenant_id,
             include_inactive=not require_active
         )
     if not tenant:
@@ -212,8 +212,8 @@ async def admin_login(
 ):
     """Admin login endpoint"""
     try:
-        institution_id = normalize_institution_id(login_data.institution_id) if login_data.institution_id else None
-        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
+        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
         admin_doc = await tenant_db["admins"].find_one({
@@ -283,12 +283,12 @@ async def student_login(
     """
     Student login endpoint with tenant-scoped usernames
 
-    - Username is unique per institution (institution_id required)
+    - Username is unique per tenant (tenant_id required)
     - Subdomain is optional for non-web clients
     """
     try:
-        institution_id = normalize_institution_id(login_data.institution_id)
-        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_id = normalize_tenant_id(login_data.tenant_id)
+        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
         student = await tenant_db["students"].find_one({
@@ -400,8 +400,8 @@ async def tutor_login(
 ):
     """Tutor login endpoint"""
     try:
-        institution_id = normalize_institution_id(login_data.institution_id)
-        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_id = normalize_tenant_id(login_data.tenant_id)
+        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
         tutor_data = await auth_manager.authenticate_tutor(
@@ -593,10 +593,10 @@ async def student_forgot_password(
     forgot_data: StudentForgotPasswordRequest,
     db: DatabaseManager = Depends(get_database)
 ):
-    """Student requests password reset using institution-scoped username"""
+    """Student requests password reset using tenant-scoped username"""
     try:
-        institution_id = normalize_institution_id(forgot_data.institution_id)
-        tenant = await _resolve_tenant_for_auth(db, request, institution_id)
+        tenant_id = normalize_tenant_id(forgot_data.tenant_id)
+        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
         student = await tenant_db["students"].find_one({
@@ -823,7 +823,7 @@ async def register_admin(
 
         return AdminRegistrationResponse(
             success=True,
-            message="Registration submitted. Awaiting institution ID assignment.",
+            message="Registration submitted. Awaiting tenant ID assignment.",
             status="pending"
         )
 
