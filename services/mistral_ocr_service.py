@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class MistralOCRService:
     def __init__(self):
         self.api_key = os.getenv('MISTRAL_API_KEY')
-        self.model = os.getenv('MISTRAL_OCR_MODEL', 'mistral-ocr-latest')
+        self.model = os.getenv('MISTRAL_OCR_MODEL', 'mistral-ocr-2512')
         self.base_url = "https://api.mistral.ai/v1"
 
         if not self.api_key:
