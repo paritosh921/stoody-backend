@@ -6,6 +6,7 @@ Handles tenant management, registration approval, and feature flags
 import logging
 import secrets
 import string
+import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from bson import ObjectId
@@ -64,6 +65,7 @@ class TenantFeatures(BaseModel):
 
 
 class ApproveTenantRequest(BaseModel):
+    institution_id: str = Field(..., min_length=9, max_length=64)
     notes: Optional[str] = None
     features: Optional[TenantFeatures] = None
 
@@ -118,17 +120,67 @@ def convert_objectids(obj):
 
 
 def generate_tenant_id() -> str:
-    """Generate a unique tenant ID like TNTXYZ123AB"""
-    timestamp = hex(int(datetime.utcnow().timestamp()))[2:].upper()[:6]
-    random_part = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    return f"TNT{timestamp}{random_part}"
+    """Generate a unique tenant ID with pattern: 4 letters + 4 digits (e.g., ABCD1234)"""
+    letters = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
+    digits = ''.join(secrets.choice(string.digits) for _ in range(4))
+    return f"{letters}{digits}"
 
 
 def generate_institution_id() -> str:
-    """Generate a unique institution ID like INSTXYZ123AB"""
-    timestamp = hex(int(datetime.utcnow().timestamp()))[2:].upper()[:6]
-    random_part = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4))
-    return f"INST{timestamp}{random_part}"
+    """Generate a unique institution ID with pattern: 4 letters + 4 digits (e.g., INST1234)"""
+    # Use the same format as tenant_id for consistency
+    letters = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
+    digits = ''.join(secrets.choice(string.digits) for _ in range(4))
+    return f"{letters}{digits}"
+
+
+TENANT_ID_SUFFIX_PATTERN = re.compile(r"^[A-Z]{4}[0-9]{4}$")
+INSTITUTION_ID_ALLOWED_PATTERN = re.compile(r"^[A-Z0-9-]+$")
+
+
+def normalize_institution_id(institution_id: str) -> str:
+    return institution_id.strip().upper()
+
+
+def derive_tenant_id(institution_id: str) -> str:
+    normalized = normalize_institution_id(institution_id)
+    if not INSTITUTION_ID_ALLOWED_PATTERN.match(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="Institution ID may only contain letters, digits, and hyphens"
+        )
+    compact = re.sub(r"[^A-Z0-9]", "", normalized)
+    if len(compact) < 9:
+        raise HTTPException(
+            status_code=400,
+            detail="Institution ID must include a prefix and end with an 8-character tenant ID"
+        )
+    tenant_id = compact[-8:]
+    if not TENANT_ID_SUFFIX_PATTERN.match(tenant_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Institution ID must end with 4 letters followed by 4 digits (tenant ID)"
+        )
+    return tenant_id
+
+
+def build_db_name(institution_id: str) -> str:
+    normalized = normalize_institution_id(institution_id)
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized.lower()).strip("_")
+    return f"skb_{slug}"
+
+
+async def ensure_tenant_indexes(tenant_db) -> None:
+    await tenant_db["students"].create_index([("username_lower", 1)], unique=True, sparse=True, name="uniq_students_username_lower")
+    await tenant_db["students"].create_index([("username", 1)], unique=True, name="uniq_students_username")
+    await tenant_db["students"].create_index([("email", 1)], sparse=True, name="idx_students_email")
+    await tenant_db["tutors"].create_index([("username_lower", 1)], unique=True, sparse=True, name="uniq_tutors_username_lower")
+    await tenant_db["tutors"].create_index([("username", 1)], unique=True, name="uniq_tutors_username")
+    await tenant_db["tutors"].create_index([("tutor_id", 1)], unique=True, name="uniq_tutors_tutor_id")
+    await tenant_db["admins"].create_index([("email", 1)], unique=True, name="uniq_admins_email")
+    await tenant_db["strokes"].create_index([("user_id", 1), ("timestamp", -1)], name="idx_strokes_user_ts")
+    await tenant_db["smartboard_sessions"].create_index([("session_id", 1)], unique=True, name="uniq_smartboard_session_id")
+    await tenant_db["smartboard_sessions"].create_index([("tutor_id", 1), ("status", 1)], name="idx_smartboard_tutor_status")
 
 
 def create_superadmin_token(admin_id: str, email: str) -> str:
@@ -404,10 +456,24 @@ async def approve_tenant(
     if tenant["status"] != "pending":
         raise HTTPException(status_code=400, detail="Tenant is not in pending status")
 
-    # Generate IDs
-    new_tenant_id = generate_tenant_id()
-    db_name = f"stoody_{new_tenant_id.lower()}"
-    institution_id = generate_institution_id()
+    normalized_institution_id = normalize_institution_id(request.institution_id)
+    new_tenant_id = derive_tenant_id(normalized_institution_id)
+    db_name = build_db_name(normalized_institution_id)
+
+    # Ensure unique institution_id, tenant_id, and db_name
+    existing = await master_db["tenants"].find_one({
+        "_id": {"$ne": ObjectId(tenant_id)},
+        "$or": [
+            {"institution_id": normalized_institution_id},
+            {"tenant_id": new_tenant_id},
+            {"db_name": db_name},
+        ]
+    })
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Institution ID or tenant ID already in use"
+        )
 
     # Prepare subdomain
     subdomain = tenant.get("subdomain")
@@ -443,6 +509,39 @@ async def approve_tenant(
     }
 
     # Update tenant
+    # Create tenant database + master admin
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Tenant database unavailable")
+
+    pending_admin = tenant.get("pending_admin") or {}
+    pending_password_hash = pending_admin.get("password_hash")
+    if not pending_password_hash:
+        raise HTTPException(status_code=400, detail="Pending admin credentials missing")
+
+    admin_email = tenant.get("admin_email")
+    existing_admin = await tenant_db["admins"].find_one({"email": admin_email})
+    if not existing_admin:
+        admin_doc = {
+            "email": admin_email,
+            "password_hash": pending_password_hash,
+            "full_name": pending_admin.get("full_name") or tenant.get("admin_full_name"),
+            "role": "master_admin",
+            "permissions": [],
+            "is_active": True,
+            "created_at": datetime.utcnow(),
+            "created_by": None,
+            "two_fa": pending_admin.get("two_fa") or {
+                "enabled": False,
+                "required": True,
+                "secret_enc": None,
+                "verified_at": None
+            }
+        }
+        await tenant_db["admins"].insert_one(admin_doc)
+
+    await ensure_tenant_indexes(tenant_db)
+
     update_result = await master_db["tenants"].update_one(
         {"_id": ObjectId(tenant_id)},
         {
@@ -450,7 +549,7 @@ async def approve_tenant(
                 "status": "approved",
                 "tenant_id": new_tenant_id,
                 "db_name": db_name,
-                "institution_id": institution_id,
+                "institution_id": normalized_institution_id,
                 "subdomain": subdomain,
                 "approved_at": datetime.utcnow(),
                 "enabled_features": default_features,
@@ -467,7 +566,7 @@ async def approve_tenant(
     if update_result.modified_count != 1:
         raise HTTPException(status_code=500, detail="Failed to approve tenant")
 
-    return {"success": True, "tenant_id": new_tenant_id}
+    return {"success": True, "tenant_id": new_tenant_id, "institution_id": normalized_institution_id}
 
 
 @router.post("/tenants/{tenant_id}/reject")
@@ -699,7 +798,7 @@ async def reset_tenant_admin_password(
         tenant_db = await db.get_tenant_db(tenant["db_name"])
         if tenant_db:
             # Find master admin in tenant database
-            master_admin = await tenant_db["admins"].find_one({"role": "master"})
+            master_admin = await tenant_db["admins"].find_one({"role": "master_admin"})
             if master_admin:
                 await tenant_db["admins"].update_one(
                     {"_id": master_admin["_id"]},
@@ -726,7 +825,7 @@ async def reset_tenant_admin_password(
 
 
 class UpdateTenantIdRequest(BaseModel):
-    institution_id: str = Field(..., min_length=8, max_length=8, pattern=r'^[A-Z]{4}[0-9]{4}$')
+    institution_id: str = Field(..., min_length=9, max_length=64)
 
 
 class SendMessageRequest(BaseModel):
@@ -757,28 +856,26 @@ async def update_tenant_institution_id(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Validate the ID format (4 letters + 4 digits)
-    new_id = request.institution_id.upper()
-    if not (len(new_id) == 8 and new_id[:4].isalpha() and new_id[4:].isdigit()):
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID must be 4 letters followed by 4 digits (e.g., INST1234)"
-        )
+    new_id = normalize_institution_id(request.institution_id)
+    new_tenant_id = derive_tenant_id(new_id)
 
     # Check if this ID is already in use by another tenant
     existing = await master_db["tenants"].find_one({
-        "institution_id": new_id,
-        "_id": {"$ne": ObjectId(tenant_id)}
+        "_id": {"$ne": ObjectId(tenant_id)},
+        "$or": [
+            {"institution_id": new_id},
+            {"tenant_id": new_tenant_id},
+        ]
     })
     if existing:
         raise HTTPException(
             status_code=400,
-            detail="This institution ID is already in use by another tenant"
+            detail="Institution ID or tenant ID already in use by another tenant"
         )
 
     old_id = tenant.get("institution_id")
 
-    # Update both tenant_id and institution_id (they should be the same in the new format)
+    # Update institution_id + derived tenant_id (db_name unchanged)
     update_action = {
         "action": "id_changed",
         "by": admin["email"],
@@ -787,18 +884,22 @@ async def update_tenant_institution_id(
         "changes": {"old_id": old_id, "new_id": new_id}
     }
 
+    update_fields = {
+        "institution_id": new_id,
+        "tenant_id": new_tenant_id,
+    }
+    if not tenant.get("db_name"):
+        update_fields["db_name"] = build_db_name(new_id)
+
     await master_db["tenants"].update_one(
         {"_id": ObjectId(tenant_id)},
         {
-            "$set": {
-                "institution_id": new_id,
-                "tenant_id": new_id,  # Keep both in sync
-            },
+            "$set": update_fields,
             "$push": {"approval_history": update_action}
         }
     )
 
-    return {"success": True, "institution_id": new_id}
+    return {"success": True, "institution_id": new_id, "tenant_id": new_tenant_id}
 
 
 @router.post("/tenants/{tenant_id}/messages")
