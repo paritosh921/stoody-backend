@@ -35,6 +35,8 @@ class AsyncSettings(BaseSettings):
     CORS_ORIGINS: List[str] = [
         "http://localhost:8080",
         "http://127.0.0.1:8080",
+        "http://localhost:5173",  # Super Admin Electron app (Vite dev server)
+        "http://127.0.0.1:5173",
         os.getenv("FRONTEND_URL", "http://localhost:8080"),
         "https://app.stoody.in",  # Production frontend
         "https://your-frontend-domain.vercel.app"  # Add your Vercel URL
