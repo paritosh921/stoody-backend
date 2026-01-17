@@ -77,6 +77,14 @@ class CreateStudentRequest(BaseModel):
 class UpdateStudentRequest(BaseModel):
     full_name: Optional[str] = Field(None, min_length=2, max_length=100)
     email: Optional[EmailStr] = None
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    location: Optional[str] = None
+    school: Optional[str] = None
+    stream: Optional[str] = None
+    phone: Optional[str] = None
+    plan_types: Optional[List[str]] = None
+    subjects: Optional[List[str]] = None
     grade: Optional[str] = Field(None, description="New grade/class for the student (6-12)")
     section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
@@ -771,6 +779,22 @@ async def update_student(
             update_fields["name"] = update.full_name
         if update.email is not None:
             update_fields["email"] = update.email
+        if update.date_of_birth is not None:
+            update_fields["date_of_birth"] = update.date_of_birth
+        if update.gender is not None:
+            update_fields["gender"] = update.gender
+        if update.location is not None:
+            update_fields["location"] = update.location
+        if update.school is not None:
+            update_fields["school"] = update.school
+        if update.stream is not None:
+            update_fields["stream"] = update.stream
+        if update.phone is not None:
+            update_fields["phone"] = update.phone
+        if update.plan_types is not None:
+            update_fields["plan_types"] = update.plan_types
+        if update.subjects is not None:
+            update_fields["subjects"] = update.subjects
         if update.grade is not None:
             update_fields["grade"] = update.grade
         if update.section is not None:
@@ -793,7 +817,18 @@ async def update_student(
             name=updated.get("name") or updated.get("full_name"),
             student_id=updated.get("student_id") or str(updated.get("_id")),
             email=updated.get("email"),
+            date_of_birth=updated.get("date_of_birth"),
+            gender=updated.get("gender"),
+            location=updated.get("location"),
+            school=updated.get("school"),
+            stream=updated.get("stream"),
+            grade=updated.get("grade"),
+            phone=updated.get("phone"),
+            plan_types=updated.get("plan_types"),
+            subjects=updated.get("subjects"),
             is_active=updated.get("is_active", True),
+            requires_password_change=updated.get("requires_password_change", False),
+            password_reset_requested=updated.get("password_reset_requested", False),
             created_at=updated.get("created_at") or datetime.utcnow(),
             last_login=updated.get("last_login")
         )
