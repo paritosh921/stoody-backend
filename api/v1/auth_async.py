@@ -918,7 +918,12 @@ async def lookup_tenant_name(
 
     return {
         "tenant_id": tenant.get("tenant_id") or normalized,
-        "institution_name": tenant.get("institution_name") or tenant.get("organization"),
+        "institution_name": (
+            tenant.get("institution_name")
+            or tenant.get("organization")
+            or tenant.get("admin_full_name")
+            or tenant.get("admin_email")
+        ),
         "status": tenant.get("status"),
     }
 
