@@ -65,7 +65,7 @@ class TenantFeatures(BaseModel):
 
 
 class ApproveTenantRequest(BaseModel):
-    institution_id: str = Field(..., min_length=9, max_length=64)
+    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
     notes: Optional[str] = None
     features: Optional[TenantFeatures] = None
 
@@ -120,22 +120,21 @@ def convert_objectids(obj):
 
 
 def generate_tenant_id() -> str:
-    """Generate a unique tenant ID with pattern: 4 letters + 4 digits (e.g., ABCD1234)"""
+    """Generate a tenant ID with pattern: AAAA-0000."""
     letters = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
     digits = ''.join(secrets.choice(string.digits) for _ in range(4))
-    return f"{letters}{digits}"
+    return f"{letters}-{digits}"
 
 
 def generate_institution_id() -> str:
-    """Generate a unique institution ID with pattern: 4 letters + 4 digits (e.g., INST1234)"""
-    # Use the same format as tenant_id for consistency
-    letters = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
+    """Generate an institution ID with pattern: AAAA-BBBB-0000."""
+    prefix = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
+    school = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
     digits = ''.join(secrets.choice(string.digits) for _ in range(4))
-    return f"{letters}{digits}"
+    return f"{prefix}-{school}-{digits}"
 
 
-TENANT_ID_SUFFIX_PATTERN = re.compile(r"^[A-Z]{4}[0-9]{4}$")
-INSTITUTION_ID_ALLOWED_PATTERN = re.compile(r"^[A-Z0-9-]+$")
+INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
 
 
 def normalize_institution_id(institution_id: str) -> str:
@@ -144,30 +143,18 @@ def normalize_institution_id(institution_id: str) -> str:
 
 def derive_tenant_id(institution_id: str) -> str:
     normalized = normalize_institution_id(institution_id)
-    if not INSTITUTION_ID_ALLOWED_PATTERN.match(normalized):
+    if not INSTITUTION_ID_PATTERN.match(normalized):
         raise HTTPException(
             status_code=400,
-            detail="Institution ID may only contain letters, digits, and hyphens"
+            detail="Institution ID must match AAAA-BBBB-0000 format"
         )
-    compact = re.sub(r"[^A-Z0-9]", "", normalized)
-    if len(compact) < 9:
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID must include a prefix and end with an 8-character tenant ID"
-        )
-    tenant_id = compact[-8:]
-    if not TENANT_ID_SUFFIX_PATTERN.match(tenant_id):
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID must end with 4 letters followed by 4 digits (tenant ID)"
-        )
-    return tenant_id
+    parts = normalized.split("-")
+    return f"{parts[1]}-{parts[2]}"
 
 
 def build_db_name(institution_id: str) -> str:
     normalized = normalize_institution_id(institution_id)
-    slug = re.sub(r"[^a-z0-9]+", "_", normalized.lower()).strip("_")
-    return f"skb_{slug}"
+    return f"skb_{normalized.lower()}"
 
 
 async def ensure_tenant_indexes(tenant_db) -> None:
@@ -825,7 +812,7 @@ async def reset_tenant_admin_password(
 
 
 class UpdateTenantIdRequest(BaseModel):
-    institution_id: str = Field(..., min_length=9, max_length=64)
+    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
 
 
 class SendMessageRequest(BaseModel):
