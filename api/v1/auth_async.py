@@ -35,7 +35,7 @@ security = HTTPBearer()
 limiter = Limiter(key_func=get_remote_address)
 
 # Pydantic models
-TENANT_ID_PATTERN = r'^[A-Za-z]{4}[0-9]{4}$'
+TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
 
 class AdminLoginRequest(BaseModel):
     email: EmailStr
@@ -77,6 +77,11 @@ class AdminRegistrationResponse(BaseModel):
     success: bool
     message: str
     status: str
+
+class TenantLookupResponse(BaseModel):
+    tenant_id: str
+    institution_name: Optional[str] = None
+    status: Optional[str] = None
 
 # Dependency injection
 async def get_database(request: Request) -> DatabaseManager:
@@ -887,6 +892,35 @@ async def get_registration_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check status"
         )
+
+
+@router.get("/tenant/lookup", response_model=TenantLookupResponse)
+@limiter.limit("60/minute")
+async def lookup_tenant_name(
+    request: Request,
+    tenant_id: str,
+    db: DatabaseManager = Depends(get_database),
+):
+    """Lookup institution name by tenant ID for login assistance."""
+    normalized = normalize_tenant_id(tenant_id)
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID is required"
+        )
+
+    tenant = await get_tenant_by_tenant_id(db, normalized, include_inactive=True)
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tenant not found"
+        )
+
+    return {
+        "tenant_id": tenant.get("tenant_id") or normalized,
+        "institution_name": tenant.get("institution_name") or tenant.get("organization"),
+        "status": tenant.get("status"),
+    }
 
 
 @router.post("/logout")

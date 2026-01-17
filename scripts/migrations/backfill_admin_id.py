@@ -21,8 +21,8 @@ Usage:
     # Run for all tenant DBs in master registry:
     python scripts/migrations/backfill_admin_id.py --all-tenants
 
-    # Run for a specific tenant (new tenant_id login code):
-    python scripts/migrations/backfill_admin_id.py --tenant-id ABCD1234
+    # Run for a specific tenant (login code):
+    python scripts/migrations/backfill_admin_id.py --tenant-id ABCD-1234
 """
 
 import asyncio

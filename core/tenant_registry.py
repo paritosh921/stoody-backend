@@ -24,7 +24,11 @@ def normalize_tenant_id(tenant_id: str) -> str:
     """Normalize tenant login IDs for lookup (upper-case, trimmed)."""
     if not tenant_id:
         return ""
-    return tenant_id.strip().upper()
+    normalized = tenant_id.strip().upper()
+    compact = normalized.replace("-", "")
+    if len(compact) == 8 and compact[:4].isalpha() and compact[4:].isdigit():
+        return f"{compact[:4]}-{compact[4:]}"
+    return normalized
 
 
 async def _find_tenant(
