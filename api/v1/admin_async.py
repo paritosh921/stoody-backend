@@ -2566,3 +2566,130 @@ async def get_session_promotions(
     except Exception as e:
         logger.error(f"Get session promotions error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ SUPER ADMIN MESSAGES ============
+
+@router.get("/superadmin-messages")
+@limiter.limit("30/minute")
+async def get_superadmin_messages(
+    request: Request,
+    unread_only: bool = Query(False, description="Only return unread messages"),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Get messages sent from super admin to this tenant"""
+    try:
+        # Get tenant_id from current user's context
+        tenant_id = current_user.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="Tenant context not found")
+
+        # Query the master database for messages to this tenant
+        master_db = await db.get_master_db()
+
+        # Find tenant by institution_id
+        tenant = await master_db["tenants"].find_one({
+            "$or": [
+                {"institution_id": tenant_id},
+                {"tenant_id": tenant_id}
+            ]
+        })
+
+        if not tenant:
+            return {"success": True, "messages": [], "unread_count": 0}
+
+        # Build query
+        query = {"tenant_id": tenant["_id"]}
+        if unread_only:
+            query["read"] = False
+
+        # Fetch messages
+        messages_cursor = master_db["superadmin_messages"].find(query).sort("created_at", -1)
+        messages = await messages_cursor.to_list(length=50)
+
+        # Count unread
+        unread_count = await master_db["superadmin_messages"].count_documents({
+            "tenant_id": tenant["_id"],
+            "read": False
+        })
+
+        # Format messages
+        formatted_messages = []
+        for msg in messages:
+            formatted_messages.append({
+                "id": str(msg["_id"]),
+                "from_name": msg.get("from_name", "Super Admin"),
+                "from_email": msg.get("from_admin"),
+                "subject": msg.get("subject"),
+                "message": msg.get("message"),
+                "priority": msg.get("priority", "normal"),
+                "created_at": msg.get("created_at").isoformat() if msg.get("created_at") else None,
+                "read": msg.get("read", False),
+                "read_at": msg.get("read_at").isoformat() if msg.get("read_at") else None,
+            })
+
+        return {
+            "success": True,
+            "messages": formatted_messages,
+            "unread_count": unread_count
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get superadmin messages error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/superadmin-messages/{message_id}/read")
+@limiter.limit("30/minute")
+async def mark_superadmin_message_read(
+    message_id: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Mark a super admin message as read"""
+    try:
+        tenant_id = current_user.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="Tenant context not found")
+
+        master_db = await db.get_master_db()
+
+        # Find tenant
+        tenant = await master_db["tenants"].find_one({
+            "$or": [
+                {"institution_id": tenant_id},
+                {"tenant_id": tenant_id}
+            ]
+        })
+
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        # Update message as read (only if it belongs to this tenant)
+        result = await master_db["superadmin_messages"].update_one(
+            {
+                "_id": ObjectId(message_id),
+                "tenant_id": tenant["_id"]
+            },
+            {
+                "$set": {
+                    "read": True,
+                    "read_at": datetime.utcnow()
+                }
+            }
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        return {"success": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Mark message read error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
