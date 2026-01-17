@@ -58,6 +58,15 @@ from api.v1.tutor_async import router as tutor_router
 from api.v1.learning_async import router as learning_router
 from api.v1.strokes_async import router as strokes_router
 
+# Student Copies routes (pen stroke pages and pinned PDFs)
+try:
+    from api.v1.copies_async import router as copies_router
+    _copies_available = True
+except Exception as e:
+    copies_router = None
+    _copies_available = False
+    logging.warning(f"Copies routes disabled: {str(e)}")
+
 # Optional debugger routes (require LangChain stack). Gate import to avoid hard dependency.
 try:
     from api.v1.debugger_async import router as debugger_router  # type: ignore
@@ -550,6 +559,17 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}",
     tags=["Strokes"]
 )
+
+# Student Copies routes (pen stroke pages and pinned PDFs)
+if _copies_available and copies_router:
+    app.include_router(
+        copies_router,
+        prefix=f"{API_V1_PREFIX}/learning",
+        tags=["Student Copies"]
+    )
+    logger.info("✅ Student Copies routes enabled")
+else:
+    logger.warning("⚠️ Student Copies routes disabled")
 
 # Also include learning routes at /api/learning for frontend compatibility
 app.include_router(
