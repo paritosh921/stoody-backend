@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import string
 import sys
 from datetime import datetime
@@ -112,6 +113,10 @@ def normalize_institution_id(institution_id: str) -> str:
     return institution_id.strip().upper()
 
 
+def normalize_tenant_id(tenant_id: str) -> str:
+    return tenant_id.strip().upper()
+
+
 def normalize_instance(instance: Optional[Any]) -> str:
     if instance is None:
         return DEFAULT_INSTANCE
@@ -123,9 +128,20 @@ def normalize_instance(instance: Optional[Any]) -> str:
     return value
 
 
+def _sanitize_db_segment(value: str) -> str:
+    if not value:
+        return ""
+    segment = re.sub(r"[^A-Za-z0-9]+", "_", value.strip())
+    segment = re.sub(r"_+", "_", segment).strip("_")
+    return segment
+
+
 def build_db_name(region: str, institution_id: str, instance: str) -> str:
-    institution_segment = institution_id.replace("-", "_")
-    return f"skb_{region}_{institution_segment}_{instance}"
+    region_segment = _sanitize_db_segment(region)
+    institution_segment = _sanitize_db_segment(institution_id)
+    if region_segment:
+        return f"skb_{region_segment}_{institution_segment}_{instance}"
+    return f"skb_{institution_segment}_{instance}"
 
 
 def build_admin_conditions(admin_oid: ObjectId) -> List[Dict[str, Any]]:
@@ -206,7 +222,7 @@ class TenantMigrator:
             self.existing_db_names.add(db_name)
 
             tenant_doc = {
-                "tenant_id": db_name,
+                "tenant_id": None,
                 "db_name": db_name,
                 "institution_id": inst_id,
                 "region": region,
@@ -244,7 +260,7 @@ class TenantMigrator:
             updates["institution_id"] = inst_id
 
         region = tenant.get("region") or DEFAULT_REGION
-        region = str(region).lower()
+        region = str(region).strip()
         if region != tenant.get("region"):
             updates["region"] = region
 
@@ -269,8 +285,10 @@ class TenantMigrator:
             self.existing_db_names.add(db_name)
 
         tenant_id = tenant.get("tenant_id")
-        if not tenant_id:
-            updates["tenant_id"] = db_name
+        if tenant_id:
+            normalized_tenant_id = normalize_tenant_id(tenant_id)
+            if normalized_tenant_id != tenant_id:
+                updates["tenant_id"] = normalized_tenant_id
 
         admin_id = tenant.get("admin_id")
         if not admin_id and tenant.get("admin_email"):
