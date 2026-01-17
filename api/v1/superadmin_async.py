@@ -723,3 +723,185 @@ async def reset_tenant_admin_password(
                 return {"success": True}
 
     raise HTTPException(status_code=400, detail="Unable to reset password for this tenant")
+
+
+class UpdateTenantIdRequest(BaseModel):
+    institution_id: str = Field(..., min_length=8, max_length=8, pattern=r'^[A-Z]{4}[0-9]{4}$')
+
+
+class SendMessageRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1)
+    priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
+
+
+class DeleteTenantRequest(BaseModel):
+    confirmation: str = Field(..., description="Must match institution name to confirm deletion")
+
+
+@router.put("/tenants/{tenant_id}/institution-id")
+async def update_tenant_institution_id(
+    tenant_id: str,
+    request: UpdateTenantIdRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Update the institution/tenant ID for a tenant"""
+    master_db = await db.get_master_db()
+
+    try:
+        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Validate the ID format (4 letters + 4 digits)
+    new_id = request.institution_id.upper()
+    if not (len(new_id) == 8 and new_id[:4].isalpha() and new_id[4:].isdigit()):
+        raise HTTPException(
+            status_code=400,
+            detail="Institution ID must be 4 letters followed by 4 digits (e.g., INST1234)"
+        )
+
+    # Check if this ID is already in use by another tenant
+    existing = await master_db["tenants"].find_one({
+        "institution_id": new_id,
+        "_id": {"$ne": ObjectId(tenant_id)}
+    })
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="This institution ID is already in use by another tenant"
+        )
+
+    old_id = tenant.get("institution_id")
+
+    # Update both tenant_id and institution_id (they should be the same in the new format)
+    update_action = {
+        "action": "id_changed",
+        "by": admin["email"],
+        "at": datetime.utcnow(),
+        "notes": f"Institution ID changed from {old_id} to {new_id}",
+        "changes": {"old_id": old_id, "new_id": new_id}
+    }
+
+    await master_db["tenants"].update_one(
+        {"_id": ObjectId(tenant_id)},
+        {
+            "$set": {
+                "institution_id": new_id,
+                "tenant_id": new_id,  # Keep both in sync
+            },
+            "$push": {"approval_history": update_action}
+        }
+    )
+
+    return {"success": True, "institution_id": new_id}
+
+
+@router.post("/tenants/{tenant_id}/messages")
+async def send_message_to_tenant(
+    tenant_id: str,
+    request: SendMessageRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Send a message from super admin to tenant master admin"""
+    master_db = await db.get_master_db()
+
+    try:
+        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Create message document
+    message_doc = {
+        "tenant_id": ObjectId(tenant_id),
+        "from_admin": admin["email"],
+        "from_name": admin["name"],
+        "to_email": tenant.get("admin_email"),
+        "subject": request.subject,
+        "message": request.message,
+        "priority": request.priority,
+        "created_at": datetime.utcnow(),
+        "read": False,
+        "read_at": None,
+    }
+
+    result = await master_db["superadmin_messages"].insert_one(message_doc)
+
+    return {
+        "success": True,
+        "message_id": str(result.inserted_id)
+    }
+
+
+@router.get("/tenants/{tenant_id}/messages")
+async def get_tenant_messages(
+    tenant_id: str,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Get all messages sent to a specific tenant"""
+    master_db = await db.get_master_db()
+
+    try:
+        messages = await master_db["superadmin_messages"].find({
+            "tenant_id": ObjectId(tenant_id)
+        }).sort("created_at", -1).to_list(length=100)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    return [convert_objectids(msg) for msg in messages]
+
+
+@router.delete("/tenants/{tenant_id}")
+async def delete_tenant(
+    tenant_id: str,
+    request: DeleteTenantRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Delete a tenant permanently (requires confirmation)"""
+    master_db = await db.get_master_db()
+
+    try:
+        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Verify confirmation matches institution name
+    if request.confirmation.lower() != tenant["institution_name"].lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation text does not match institution name"
+        )
+
+    # Log the deletion before removing
+    logger.warning(
+        f"Super admin {admin['email']} deleting tenant {tenant_id} "
+        f"({tenant['institution_name']})"
+    )
+
+    # Delete associated files
+    await master_db["tenant_application_files"].delete_many({
+        "tenant_request_id": ObjectId(tenant_id)
+    })
+
+    # Delete associated messages
+    await master_db["superadmin_messages"].delete_many({
+        "tenant_id": ObjectId(tenant_id)
+    })
+
+    # Delete the tenant
+    await master_db["tenants"].delete_one({"_id": ObjectId(tenant_id)})
+
+    return {"success": True, "deleted": tenant["institution_name"]}
