@@ -28,10 +28,10 @@ security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # JWT settings for super admin (separate from regular auth)
-SUPERADMIN_JWT_SECRET = getattr(settings, "SUPERADMIN_JWT_SECRET", getattr(settings, "JWT_SECRET_KEY", "superadmin-secret-change-me"))
+SUPERADMIN_JWT_SECRET = getattr(settings, "SUPERADMIN_JWT_SECRET", None) or getattr(settings, "JWT_SECRET_KEY", "")
 SUPERADMIN_JWT_ALGORITHM = "HS256"
 SUPERADMIN_JWT_EXPIRATION_HOURS = 24
-SUPERADMIN_SETUP_KEY = getattr(settings, "SUPERADMIN_SETUP_KEY", "stoody-setup-key-2024")
+SUPERADMIN_SETUP_KEY = getattr(settings, "SUPERADMIN_SETUP_KEY", "")
 
 
 # ============ PYDANTIC MODELS ============
