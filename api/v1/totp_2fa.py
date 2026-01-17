@@ -380,7 +380,14 @@ async def login_with_2fa(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid username or password"
                 )
-            user = await tenant_db["tutors"].find_one({"username": login_data.username})
+            normalized_username = login_data.username.strip()
+            username_lower = normalized_username.lower()
+            user = await tenant_db["tutors"].find_one({"username_lower": username_lower})
+            if not user:
+                user = await tenant_db["tutors"].find_one(
+                    {"username": normalized_username},
+                    collation={"locale": "en", "strength": 2}
+                )
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

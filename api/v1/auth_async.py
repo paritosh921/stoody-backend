@@ -3,12 +3,13 @@ Async Authentication API for SkillBot
 JWT-based authentication with rate limiting and caching
 """
 
+import base64
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 from bson import ObjectId
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status
+from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
 from slowapi import Limiter
@@ -40,13 +41,6 @@ class AdminLoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=6)
     tenant_id: Optional[str] = Field(None, pattern=TENANT_ID_PATTERN)
-
-class AdminRegisterRequest(BaseModel):
-    email: EmailStr
-    password: str = Field(..., min_length=6)
-    full_name: str = Field(..., min_length=2, max_length=100)
-    subdomain: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-z0-9\-]+$')
-    organization: str = Field(..., min_length=2, max_length=100)
 
 class StudentLoginRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -291,20 +285,28 @@ async def student_login(
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
+        normalized_username = login_data.username.strip()
+        username_lower = normalized_username.lower()
+
         student = await tenant_db["students"].find_one({
-            "username": login_data.username,
+            "username_lower": username_lower,
             "is_active": True
         })
+        if not student:
+            student = await tenant_db["students"].find_one(
+                {"username": normalized_username, "is_active": True},
+                collation={"locale": "en", "strength": 2}
+            )
 
         if not student:
-            logger.warning(f"Student {login_data.username} not found")
+            logger.warning(f"Student {normalized_username} not found")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
             )
 
         if not auth_manager.verify_password(login_data.password, student.get("password_hash", "")):
-            logger.warning(f"Invalid password for student {login_data.username}")
+            logger.warning(f"Invalid password for student {normalized_username}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -599,9 +601,16 @@ async def student_forgot_password(
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
 
+        normalized_username = forgot_data.username.strip()
+        username_lower = normalized_username.lower()
         student = await tenant_db["students"].find_one({
-            "username": forgot_data.username
+            "username_lower": username_lower
         })
+        if not student:
+            student = await tenant_db["students"].find_one(
+                {"username": normalized_username},
+                collation={"locale": "en", "strength": 2}
+            )
 
         if not student:
             # Don't reveal if user exists
@@ -628,7 +637,7 @@ async def student_forgot_password(
             }}
         )
 
-        logger.info(f"Password reset requested for student: {forgot_data.username}")
+        logger.info(f"Password reset requested for student: {normalized_username}")
 
         return {
             "success": True,
@@ -660,83 +669,20 @@ async def verify_token(
         }
     }
 
-@router.get("/admin/subdomain/check/{subdomain}")
-@limiter.limit("10/minute")
-async def check_subdomain_availability(
-    subdomain: str,
-    request: Request,
-    db: DatabaseManager = Depends(get_database)
-):
-    """
-    Check if subdomain is available for registration
-    Returns: {available: boolean, message: string}
-    """
-    try:
-        # Validate subdomain format
-        if not subdomain or len(subdomain) < 3 or len(subdomain) > 50:
-            return {
-                "success": True,
-                "data": {
-                    "available": False,
-                    "message": "Subdomain must be between 3 and 50 characters"
-                }
-            }
-
-        # Check if subdomain contains only lowercase letters, numbers, and hyphens
-        import re
-        if not re.match(r'^[a-z0-9\-]+$', subdomain):
-            return {
-                "success": True,
-                "data": {
-                    "available": False,
-                    "message": "Subdomain can only contain lowercase letters, numbers, and hyphens"
-                }
-            }
-
-        # Check reserved subdomains
-        reserved = ['www', 'app', 'admin', 'api', 'demo', 'test', 'staging', 'dev', 'mail', 'ftp']
-        if subdomain in reserved:
-            return {
-                "success": True,
-                "data": {
-                    "available": False,
-                    "message": "This subdomain is reserved"
-                }
-            }
-
-        # Check if subdomain already exists in tenant registry
-        tenants = await db.get_master_collection("tenants")
-        existing = await tenants.find_one({"subdomain": subdomain}) if tenants else None
-
-        if existing:
-            return {
-                "success": True,
-                "data": {
-                    "available": False,
-                    "message": "This subdomain is already taken"
-                }
-            }
-
-        return {
-            "success": True,
-            "data": {
-                "available": True,
-                "message": "Subdomain is available!"
-            }
-        }
-
-    except Exception as e:
-        logger.error(f"Subdomain check error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to check subdomain availability"
-        )
-
 @router.post("/admin/register", response_model=AdminRegistrationResponse)
 @limiter.limit("3/hour")
 async def register_admin(
     request: Request,
-    register_data: AdminRegisterRequest,
+    full_name: str = Form(..., min_length=2, max_length=100),
+    email: EmailStr = Form(...),
+    password: str = Form(..., min_length=6),
+    organization: str = Form(..., min_length=2, max_length=100),
+    institution_name: Optional[str] = Form(None, max_length=150),
+    contact_email: Optional[EmailStr] = Form(None),
+    phone_country_code: Optional[str] = Form(None, max_length=10),
+    phone_number: Optional[str] = Form(None, max_length=20),
+    attachments: List[UploadFile] = File(default=[]),
+    subdomain: Optional[str] = Form(None, min_length=3, max_length=50),
     db: DatabaseManager = Depends(get_database),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
@@ -753,17 +699,17 @@ async def register_admin(
             )
 
         # Check if email already exists in tenant registry
-        existing_email = await tenants.find_one({"admin_email": register_data.email})
+        existing_email = await tenants.find_one({"admin_email": email})
         if existing_email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered"
             )
 
-        subdomain = register_data.subdomain.lower().strip() if register_data.subdomain else None
-        if subdomain:
+        normalized_subdomain = subdomain.lower().strip() if subdomain else None
+        if normalized_subdomain:
             # Check if subdomain already exists
-            existing_subdomain = await tenants.find_one({"subdomain": subdomain})
+            existing_subdomain = await tenants.find_one({"subdomain": normalized_subdomain})
             if existing_subdomain:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -772,7 +718,7 @@ async def register_admin(
 
             # Validate subdomain format again
             import re
-            if not re.match(r'^[a-z0-9\-]+$', subdomain):
+            if not re.match(r'^[a-z0-9\-]+$', normalized_subdomain):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Subdomain can only contain lowercase letters, numbers, and hyphens"
@@ -780,28 +726,39 @@ async def register_admin(
 
             # Check reserved subdomains
             reserved = ['www', 'app', 'admin', 'api', 'demo', 'test', 'staging', 'dev', 'mail', 'ftp']
-            if subdomain in reserved:
+            if normalized_subdomain in reserved:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="This subdomain is reserved"
                 )
 
         # Hash password
-        password_hash = auth_manager.get_password_hash(register_data.password)
+        password_hash = auth_manager.get_password_hash(password)
+
+        institution_name_value = institution_name or organization
+        contact_email_value = contact_email or email
+        contact_phone_value = None
+        if phone_country_code and phone_number:
+            contact_phone_value = f"{phone_country_code.strip()} {phone_number.strip()}"
 
         tenant_doc = {
             "tenant_id": None,
             "db_name": None,
             "institution_id": None,
-            "subdomain": subdomain,
-            "organization": register_data.organization,
+            "subdomain": normalized_subdomain,
+            "organization": organization,
+            "institution_name": institution_name_value,
+            "contact_email": contact_email_value,
+            "phone_country_code": phone_country_code.strip() if phone_country_code else None,
+            "phone_number": phone_number.strip() if phone_number else None,
+            "contact_phone": contact_phone_value,
             "status": "pending",
-            "admin_email": register_data.email,
-            "admin_full_name": register_data.full_name,
+            "admin_email": email,
+            "admin_full_name": full_name,
             "pending_admin": {
-                "email": register_data.email,
+                "email": email,
                 "password_hash": password_hash,
-                "full_name": register_data.full_name,
+                "full_name": full_name,
                 "role": "master_admin",
                 "created_at": datetime.utcnow(),
                 "two_fa": {
@@ -821,7 +778,47 @@ async def register_admin(
                 detail="Failed to create tenant request"
             )
 
-        logger.info("New tenant request: %s", register_data.email)
+        if attachments:
+            files_collection = await db.get_master_collection("tenant_application_files")
+            if files_collection is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Tenant files collection not available"
+                )
+            allowed_types = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"}
+            max_file_size = 5 * 1024 * 1024  # 5MB
+            if len(attachments) > 10:
+                raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+            file_docs = []
+            for upload in attachments:
+                if not upload.filename:
+                    continue
+                if upload.content_type not in allowed_types:
+                    raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.content_type}")
+                content = await upload.read()
+                if len(content) > max_file_size:
+                    raise HTTPException(status_code=400, detail=f"File too large: {upload.filename}")
+                file_docs.append({
+                    "tenant_request_id": result.inserted_id,
+                    "admin_email": email,
+                    "institution_name": institution_name_value,
+                    "filename": upload.filename,
+                    "content_type": upload.content_type,
+                    "size_bytes": len(content),
+                    "data_base64": base64.b64encode(content).decode("utf-8"),
+                    "uploaded_at": datetime.utcnow(),
+                })
+
+            if file_docs:
+                insert_result = await files_collection.insert_many(file_docs)
+                file_ids = list(insert_result.inserted_ids)
+                await tenants.update_one(
+                    {"_id": result.inserted_id},
+                    {"$set": {"application_files": file_ids}}
+                )
+
+        logger.info("New tenant request: %s", email)
 
         return AdminRegistrationResponse(
             success=True,
