@@ -13,7 +13,6 @@ import asyncio
 import logging
 import os
 import random
-import re
 import string
 import sys
 from datetime import datetime
@@ -96,12 +95,12 @@ EXCLUDED_COLLECTIONS = {
 
 
 def generate_institution_id(existing_ids: Set[str]) -> str:
-    """Generate a unique institution_id in the XXXXX-XXX-XX format."""
+    """Generate a unique institution_id in the AAAA-BBBB-0000 format."""
     while True:
         parts = [
-            "".join(random.choices(string.ascii_uppercase + string.digits, k=5)),
-            "".join(random.choices(string.ascii_uppercase + string.digits, k=3)),
-            "".join(random.choices(string.ascii_uppercase + string.digits, k=2)),
+            "".join(random.choices(string.ascii_uppercase, k=4)),
+            "".join(random.choices(string.ascii_uppercase, k=4)),
+            "".join(random.choices(string.digits, k=4)),
         ]
         institution_id = "-".join(parts)
         if institution_id not in existing_ids:
@@ -128,20 +127,9 @@ def normalize_instance(instance: Optional[Any]) -> str:
     return value
 
 
-def _sanitize_db_segment(value: str) -> str:
-    if not value:
-        return ""
-    segment = re.sub(r"[^A-Za-z0-9]+", "_", value.strip())
-    segment = re.sub(r"_+", "_", segment).strip("_")
-    return segment
-
-
 def build_db_name(region: str, institution_id: str, instance: str) -> str:
-    region_segment = _sanitize_db_segment(region)
-    institution_segment = _sanitize_db_segment(institution_id)
-    if region_segment:
-        return f"skb_{region_segment}_{institution_segment}_{instance}"
-    return f"skb_{institution_segment}_{instance}"
+    normalized_id = normalize_institution_id(institution_id)
+    return f"skb_{normalized_id.lower()}"
 
 
 def build_admin_conditions(admin_oid: ObjectId) -> List[Dict[str, Any]]:
@@ -269,12 +257,6 @@ class TenantMigrator:
             updates["instance"] = instance
 
         db_name = tenant.get("db_name")
-        if db_name and "-" in db_name:
-            normalized_db_name = build_db_name(region, inst_id, instance)
-            if normalized_db_name != db_name:
-                db_name = normalized_db_name
-                updates["db_name"] = db_name
-                self.existing_db_names.add(db_name)
         if not db_name:
             db_name = build_db_name(region, inst_id, instance)
             while db_name in self.existing_db_names:
