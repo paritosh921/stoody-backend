@@ -482,9 +482,14 @@ async def get_test_series_list(
             b2c_admin_id = b2c_admin["_id"] if b2c_admin else None
             
             # Build filter for B2C test series
+            # Accept documents where ocr_status is "completed" OR not set (for manually created tests)
             filter_query = {
                 "document_type": "Test Series",
-                "ocr_status": "completed",
+                "$or": [
+                    {"ocr_status": "completed"},
+                    {"ocr_status": {"$exists": False}},
+                    {"ocr_status": None}
+                ],
                 "is_active": {"$ne": False}
             }
             
@@ -602,7 +607,12 @@ async def get_test_series_list(
 
         # If user is a regular student, apply profile-based filtering
         if current_user.get("user_type") == "student":
-            filter_query["ocr_status"] = "completed"
+            # Accept documents where ocr_status is "completed" OR not set (for manually created tests)
+            filter_query["$or"] = [
+                {"ocr_status": "completed"},
+                {"ocr_status": {"$exists": False}},
+                {"ocr_status": None}
+            ]
             # is_active: {$ne: False} matches True, None, or missing field (default active)
             filter_query["is_active"] = {"$ne": False}
             
