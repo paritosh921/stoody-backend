@@ -2202,8 +2202,8 @@ async def validate_test_series(
                 detail="No questions found for this test series. Please process OCR first."
             )
 
-        # Validation 1: Total points
-        total_allocated = sum(q.get("points", 1) for q in questions)
+        # Validation 1: Total points (auto-calculated from questions, default 4 marks each)
+        total_allocated = sum(q.get("points", 4) for q in questions)  # Default 4 marks per question
         total_points = document.get("total_points", 0)
         if abs(total_allocated - total_points) >= 0.01:
             raise HTTPException(

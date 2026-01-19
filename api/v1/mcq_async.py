@@ -964,8 +964,8 @@ async def get_test_series_questions(
                         "questionType": q.get("question_type", "mcq"),  # Critical for integer input display
                         "question_type": q.get("question_type", "mcq"),
                         "metadata": q.get("metadata", {}),
-                        "points": q.get("points", 1),
-                        "penalty": q.get("penalty", 0),
+                        "points": q.get("points", 4),  # Default 4 marks per question
+                        "penalty": q.get("penalty", 1),  # Default 1 mark penalty
                         "created_at": q.get("created_at"),
                         "extracted_at": q.get("extracted_at"),
                     }
@@ -1118,8 +1118,8 @@ async def get_test_series_questions(
                         "questionType": q.get("question_type", "mcq"),  # Critical for frontend to show correct input type
                         "question_type": q.get("question_type", "mcq"),  # Also include snake_case version
                         "metadata": q.get("metadata", {}),
-                        "points": q.get("points", 1),
-                        "penalty": q.get("penalty", 0),
+                        "points": q.get("points", 4),  # Default 4 marks per question
+                        "penalty": q.get("penalty", 1),  # Default 1 mark penalty
                         "created_at": q.get("created_at"),
                         "extracted_at": q.get("extracted_at"),
                     }

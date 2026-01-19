@@ -2541,7 +2541,7 @@ async def recalculate_document_points(
 
         # Get all questions for this document
         questions = await db.mongo_find("questions", {"pdf_source": document_id})
-        total_points = sum(q.get("points", 1.0) for q in questions)
+        total_points = sum(q.get("points", 4.0) for q in questions)  # Default 4 marks per question
 
         # Update document's total_points
         await db.mongo_update_one(
@@ -3370,7 +3370,7 @@ async def update_question(
                         else:
                             all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
 
-                    total_points = sum(q.get("points", 1.0) for q in all_questions)
+                    total_points = sum(q.get("points", 4.0) for q in all_questions)  # Default 4 marks per question
 
                     # Update document's total_points
                     if is_b2c:
@@ -4689,8 +4689,8 @@ async def process_regions_ocr(
                         "width": region['width'],
                         "height": region['height']
                     },
-                    "points": 1.0,
-                    "penalty": 0.0,
+                    "points": 4.0,  # Default 4 marks per question
+                    "penalty": 1.0,  # Default 1 mark penalty for wrong answer
                     "created_by": current_user.get("user_id"),
                     "created_at": datetime.utcnow()
                 }
