@@ -1520,7 +1520,7 @@ async def submit_session_answer(
             correct_answer = question.get("correct_answer", "")
             is_correct = (answer_data.answer.strip().lower() == correct_answer.strip().lower())
             if is_correct:
-                score = question.get("points", 1.0)
+                score = question.get("points", 4.0)  # Default 4 marks per question
 
         # Create question attempt record in session
         question_attempt = {
