@@ -7,7 +7,12 @@ from typing import List, Optional, Tuple
 
 from ..models.raw_frames import RawFrameCanonical, Stroke, StrokePoint
 
-# Map copied from stoody_pen/backend/services/ble_service.py
+# Book type codes from BLE smart pen
+# SIZING KEY:
+#   S* (0x00-0x04): Small books - A5 equivalent (592 x 840)
+#   M* (0x05-0x09): Medium books - A5 equivalent (592 x 840)
+#   L* (0x0A-0x0E): Large books - A4 equivalent (842 x 1190)
+# Second letter indicates ruling: S=Square, N=Normal, M=Mixed, L=Lines, W=Wide
 BOOK_TYPES = {
     0x00: "SS",
     0x01: "SN",
@@ -19,11 +24,11 @@ BOOK_TYPES = {
     0x07: "MM",
     0x08: "ML",
     0x09: "MW",
-    0x0A: "LS",
-    0x0B: "LN",
-    0x0C: "LM",
-    0x0D: "LL",
-    0x0E: "LW",
+    0x0A: "LS",  # A4 size
+    0x0B: "LN",  # A4 size
+    0x0C: "LM",  # A4 size
+    0x0D: "LL",  # A4 size
+    0x0E: "LW",  # A4 size
 }
 
 SYNC_MARKER = b"\x5a\x5b"

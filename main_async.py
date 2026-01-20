@@ -48,6 +48,7 @@ from api.v1.chat_async import router as chat_router
 from api.v1.auth_async import router as auth_router
 from api.v1.auth_bypass import router as auth_bypass_router
 from api.v1.admin_async import router as admin_router
+from api.v1.student_bulk_upload import router as student_bulk_upload_router
 from api.v1.student_async import router as student_router
 from api.v1.questions_async import router as questions_router
 from api.v1.images_async import router as images_router
@@ -480,6 +481,14 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}/admin",
     tags=["Admin"]
 )
+
+# Student Bulk Upload routes (under admin)
+app.include_router(
+    student_bulk_upload_router,
+    prefix=f"{API_V1_PREFIX}/admin",
+    tags=["Student Bulk Upload"]
+)
+logger.info("✅ Student Bulk Upload routes enabled")
 
 app.include_router(
     student_router,
