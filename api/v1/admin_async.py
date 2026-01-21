@@ -946,27 +946,31 @@ async def create_student(
                 )
             student_data.username = normalized_username
         else:
-            # Auto-generate username from full_name
-            base_name = "".join(c for c in student_data.full_name.lower() if c.isalnum() or c == ' ').strip().replace(' ', '.')
-            if not base_name:
-                base_name = "student"
+            # Auto-generate simple username: {first_name}{4-digit-random}
+            # Extract first name from full_name
+            import re
+            import random
             
-            # Find a unique username
-            username = base_name
-            counter = 1
-            while True:
-                existing = await db.mongo_find_one("students", {"username_lower": username.lower()})
-                if not existing:
-                    existing = await db.mongo_find_one(
-                        "students",
-                        {"username": username},
-                        collation={"locale": "en", "strength": 2}
-                    )
+            # Get first word only, lowercase, alphanumeric only
+            first_name = re.sub(r'[^a-zA-Z0-9]', '', student_data.full_name.split()[0] if student_data.full_name.split() else "student").lower()
+            
+            # Use first name (max 8 chars) + random 4 digits
+            short_name = first_name[:8] if first_name else "student"
+            
+            # Generate unique username with random suffix
+            max_attempts = 100
+            for _ in range(max_attempts):
+                random_suffix = random.randint(1000, 9999)
+                username = f"{short_name}{random_suffix}"
+                
+                # Check if username exists within this tenant
+                existing = await db.mongo_find_one("students", {"username_lower": username.lower(), "admin_id": admin_id})
                 if not existing:
                     student_data.username = username
                     break
-                username = f"{base_name}{counter}"
-                counter += 1
+            else:
+                # Fallback if all attempts fail (extremely rare)
+                student_data.username = f"{short_name}{int(datetime.utcnow().timestamp()) % 10000}"
 
         # Check if email already exists within this admin's tenant
         # Email can be duplicated across different admins, but not within same admin
@@ -981,9 +985,8 @@ async def create_student(
                     detail="Email already exists in your organization"
                 )
 
-        # Auto-generate student_id based on username and timestamp
-        import time
-        auto_student_id = f"STU_{student_data.username}_{int(time.time() * 1000) % 1000000}"
+        # Student_id = username (simplified - username is already unique)
+        auto_student_id = student_data.username
 
         # Auto-generate password if not provided
         plain_password = student_data.password or generate_secure_password()

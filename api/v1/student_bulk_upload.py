@@ -8,6 +8,7 @@ import io
 import re
 import secrets
 import string
+import random
 import bcrypt
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -36,11 +37,11 @@ VALID_GRADES = ["6", "7", "8", "9", "10", "11", "12"]
 # Template columns configuration
 TEMPLATE_COLUMNS = {
     "full_name": {"required": True, "description": "Student's full name (2-100 characters)", "example": "John Doe"},
+    "username": {"required": False, "description": "Custom username (optional - auto-generated if empty, format: {school_prefix}{number})", "example": ""},
     "grade": {"required": True, "description": "Grade/Class (6, 7, 8, 9, 10, 11, or 12)", "example": "10"},
     "section": {"required": False, "description": "Section (A, B, C, D, E, F)", "example": "A"},
     "email": {"required": False, "description": "Email address (unique within institute)", "example": "john@example.com"},
     "phone": {"required": False, "description": "Phone number", "example": "9876543210"},
-    "stream": {"required": False, "description": "Stream (science, commerce, arts, other)", "example": "science"},
     "gender": {"required": False, "description": "Gender (male, female, other)", "example": "male"},
     "date_of_birth": {"required": False, "description": "Date of birth (YYYY-MM-DD format)", "example": "2008-05-15"},
     "school": {"required": False, "description": "School name", "example": "ABC School"},
@@ -65,8 +66,7 @@ class BulkPreviewStudent(BaseModel):
     section: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
-    stream: Optional[str] = None
-    auto_username: str  # Generated username preview
+    auto_username: str  # Generated or custom username preview
 
 
 class BulkPreviewResponse(BaseModel):
@@ -120,15 +120,20 @@ def hash_password(password: str) -> str:
 
 
 def generate_username(full_name: str) -> str:
-    """Generate username from full name"""
-    # Clean and normalize the name
-    base_name = re.sub(r'[^a-zA-Z0-9\s]', '', full_name.lower().strip())
-    base_name = base_name.replace(' ', '.')
-    if not base_name:
-        base_name = "student"
-    # Add random suffix for uniqueness
-    random_suffix = ''.join(secrets.choice(string.digits) for _ in range(4))
-    return f"{base_name}.{random_suffix}"
+    """Generate username preview from full name: first_name + ####"""
+    # Get first word only, lowercase, alphanumeric only
+    words = full_name.strip().split()
+    first_name = re.sub(r'[^a-zA-Z0-9]', '', words[0] if words else "student").lower()
+    short_name = first_name[:8] if first_name else "student"
+    # Return preview with placeholder for random digits
+    return f"{short_name}####"
+
+
+def generate_simple_username_with_random(first_name: str) -> str:
+    """Generate simple username: {first_name}{4-digit-random}"""
+    short_name = re.sub(r'[^a-zA-Z0-9]', '', first_name).lower()[:8] or "student"
+    random_suffix = random.randint(1000, 9999)
+    return f"{short_name}{random_suffix}"
 
 
 def validate_email(email: str) -> bool:
@@ -219,19 +224,23 @@ async def download_bulk_template(
         logger.warning(f"Could not fetch school settings: {e}")
         valid_sections = ["A", "B", "C", "D", "E", "F"]
         valid_classes = VALID_GRADES
-        valid_streams = ["science", "commerce", "arts", "other"]
         valid_plan_types = ["CBSE", "JEE", "NEET", "CUET"]
         valid_subjects = ["Physics", "Chemistry", "Mathematics", "Biology"]
     
-    # Create sample data with 3 example rows
+    # Get school prefix for username example
+    school_prefix = "".join(c for c in (school_name if 'school_name' in dir() else "").lower() if c.isalnum())[:4]
+    if not school_prefix or len(school_prefix) < 2:
+        school_prefix = "ciel"  # Example prefix
+    
+    # Create sample data with 3 example rows (stream removed, username added)
     sample_data = [
         {
             "full_name": "Rahul Sharma",
+            "username": "",  # Empty = auto-generate
             "grade": "10",
             "section": "A",
             "email": "rahul@example.com",
             "phone": "9876543210",
-            "stream": "science",
             "gender": "male",
             "date_of_birth": "2008-05-15",
             "school": "",
@@ -241,11 +250,11 @@ async def download_bulk_template(
         },
         {
             "full_name": "Priya Patel",
+            "username": "",  # Empty = auto-generate
             "grade": "11",
             "section": "B",
             "email": "priya@example.com",
             "phone": "9876543211",
-            "stream": "science",
             "gender": "female",
             "date_of_birth": "2007-03-20",
             "school": "",
@@ -255,11 +264,11 @@ async def download_bulk_template(
         },
         {
             "full_name": "Amit Kumar",
+            "username": "amit2025",  # Example custom username
             "grade": "12",
             "section": "A",
             "email": "",
             "phone": "9876543212",
-            "stream": "commerce",
             "gender": "male",
             "date_of_birth": "2006-11-10",
             "school": "",
@@ -271,14 +280,14 @@ async def download_bulk_template(
     
     df = pd.DataFrame(sample_data)
     
-    # Create instructions DataFrame
+    # Create instructions DataFrame (stream removed, username added)
     instructions_data = [
         {"Column": "full_name", "Required": "YES", "Description": "Student's full name (2-100 characters)"},
+        {"Column": "username", "Required": "NO", "Description": f"Custom username (3-50 chars). Leave empty to auto-generate (format: {school_prefix}0001, {school_prefix}0002, etc.)"},
         {"Column": "grade", "Required": "YES", "Description": f"Grade/Class. Allowed values: {', '.join(valid_classes)}"},
         {"Column": "section", "Required": "NO", "Description": f"Section. Allowed values: {', '.join(valid_sections)}"},
         {"Column": "email", "Required": "NO", "Description": "Email address (must be unique within your institute)"},
         {"Column": "phone", "Required": "NO", "Description": "Phone number"},
-        {"Column": "stream", "Required": "NO", "Description": f"Stream. Allowed values: {', '.join(valid_streams)}"},
         {"Column": "gender", "Required": "NO", "Description": "Gender: male, female, other"},
         {"Column": "date_of_birth", "Required": "NO", "Description": "Date of birth in YYYY-MM-DD format (e.g., 2008-05-15)"},
         {"Column": "school", "Required": "NO", "Description": "School name"},
@@ -403,7 +412,16 @@ async def preview_bulk_upload(
         
         valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
     except Exception:
+        settings_doc = None
         valid_sections = ["A", "B", "C", "D", "E", "F"]
+    
+    # Get school prefix for username generation
+    school_name = ""
+    if settings_doc and settings_doc.get("school_info"):
+        school_name = settings_doc.get("school_info", {}).get("school_name", "")
+    school_prefix = "".join(c for c in school_name.lower() if c.isalnum())[:4]
+    if not school_prefix or len(school_prefix) < 2:
+        school_prefix = "stdy"
     
     # Get existing emails for this admin
     try:
@@ -420,11 +438,12 @@ async def preview_bulk_upload(
     duplicate_emails: List[str] = []
     duplicate_in_file: List[str] = []
     
-    # Track emails within the file for duplicate detection
+    # Track emails and usernames within the file for duplicate detection
     file_emails: Dict[str, int] = {}
-    file_names: Dict[str, int] = {}
+    file_usernames: Dict[str, int] = {}
     
     valid_count = 0
+    preview_username_num = len([u for u in existing_usernames if u.startswith(school_prefix)]) + 1
     
     for idx, row in df.iterrows():
         row_num = idx + 2  # Excel/CSV row number (1-indexed + header)
@@ -432,11 +451,11 @@ async def preview_bulk_upload(
         
         # Get values with defaults
         full_name = str(row.get('full_name', '')).strip()
+        custom_username = str(row.get('username', '')).strip() if row.get('username') else ''
         grade = str(row.get('grade', default_grade or '')).strip()
         section = str(row.get('section', default_section or '')).strip().upper() if row.get('section') or default_section else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip()
-        stream = str(row.get('stream', default_stream or '')).strip().lower() if row.get('stream') or default_stream else ''
         gender = str(row.get('gender', '')).strip().lower() if row.get('gender') else ''
         date_of_birth = str(row.get('date_of_birth', '')).strip() if row.get('date_of_birth') else ''
         
@@ -454,6 +473,20 @@ async def preview_bulk_upload(
         elif not validate_grade(grade):
             errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message=f"Invalid grade. Must be one of: {', '.join(VALID_GRADES)}"))
             row_valid = False
+        
+        # Validate custom username if provided
+        if custom_username:
+            if len(custom_username) < 3 or len(custom_username) > 50:
+                errors.append(BulkUploadError(row=row_num, field="username", value=custom_username, message="Username must be 3-50 characters"))
+                row_valid = False
+            elif custom_username.lower() in existing_usernames:
+                errors.append(BulkUploadError(row=row_num, field="username", value=custom_username, message="Username already exists"))
+                row_valid = False
+            elif custom_username.lower() in file_usernames:
+                errors.append(BulkUploadError(row=row_num, field="username", value=custom_username, message=f"Duplicate username in file (also in row {file_usernames[custom_username.lower()]})"))
+                row_valid = False
+            else:
+                file_usernames[custom_username.lower()] = row_num
         
         # Validate optional fields
         if section and not validate_section(section, valid_sections):
@@ -474,9 +507,6 @@ async def preview_bulk_upload(
             else:
                 file_emails[email] = row_num
         
-        if stream and stream not in ['science', 'commerce', 'arts', 'other']:
-            warnings.append(BulkUploadError(row=row_num, field="stream", value=stream, message="Invalid stream. Will default to empty."))
-        
         if gender and gender not in ['male', 'female', 'other']:
             warnings.append(BulkUploadError(row=row_num, field="gender", value=gender, message="Invalid gender. Will default to empty."))
         
@@ -489,8 +519,13 @@ async def preview_bulk_upload(
         
         if row_valid:
             valid_count += 1
-            # Generate preview username
-            auto_username = generate_username(full_name)
+            # Generate preview username: use custom or auto-generate
+            if custom_username:
+                preview_username = custom_username
+            else:
+                # Show first name + random digits preview
+                first_word = full_name.split()[0] if full_name.split() else "student"
+                preview_username = generate_simple_username_with_random(first_word)
             
             # Only show first 20 valid rows in preview
             if len(preview_data) < 20:
@@ -501,8 +536,7 @@ async def preview_bulk_upload(
                     section=section if section else None,
                     email=email if email else None,
                     phone=phone if phone else None,
-                    stream=stream if stream else None,
-                    auto_username=auto_username
+                    auto_username=preview_username
                 ))
     
     file_type = "Excel" if file_name.endswith(('.xlsx', '.xls')) else "CSV"
@@ -598,17 +632,32 @@ async def import_bulk_students(
     used_emails: set = set()
     used_usernames: set = set(existing_usernames)
     
+    # Get school prefix for username generation
+    school_name = ""
+    if settings_doc and settings_doc.get("school_info"):
+        school_name = settings_doc.get("school_info", {}).get("school_name", "")
+    
+    # Create prefix: first 4 chars of school name (alphanumeric only, lowercase)
+    school_prefix = "".join(c for c in school_name.lower() if c.isalnum())[:4]
+    if not school_prefix or len(school_prefix) < 2:
+        school_prefix = "stdy"  # Default prefix if school name not set
+    
+    # Count existing students with this prefix for numbering
+    existing_count = len([u for u in existing_usernames if u.startswith(school_prefix)])
+    next_username_num = existing_count + 1
+    
     for idx, row in df.iterrows():
         row_num = idx + 2
         row_valid = True
         
         # Get values
         full_name = str(row.get('full_name', '')).strip()
+        custom_username = str(row.get('username', '')).strip() if row.get('username') else ''  # Custom username from file
         grade = str(row.get('grade', default_grade or '')).strip()
         section = str(row.get('section', default_section or '')).strip().upper() if row.get('section') or default_section else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip()
-        stream = str(row.get('stream', default_stream or '')).strip().lower() if row.get('stream') or default_stream else ''
+        stream = None  # Stream is removed/fluid - always None
         gender = str(row.get('gender', '')).strip().lower() if row.get('gender') else ''
         date_of_birth = str(row.get('date_of_birth', '')).strip() if row.get('date_of_birth') else ''
         school = str(row.get('school', '')).strip() if row.get('school') else ''
@@ -624,6 +673,15 @@ async def import_bulk_students(
         if not grade or not validate_grade(grade):
             errors.append(BulkUploadError(row=row_num, field="grade", message=f"Invalid grade: {grade}"))
             row_valid = False
+        
+        # Validate custom username if provided
+        if custom_username:
+            if len(custom_username) < 3 or len(custom_username) > 50:
+                errors.append(BulkUploadError(row=row_num, field="username", message=f"Username must be 3-50 characters: {custom_username}"))
+                row_valid = False
+            elif custom_username.lower() in used_usernames:
+                errors.append(BulkUploadError(row=row_num, field="username", message=f"Duplicate username: {custom_username}"))
+                row_valid = False
         
         if email:
             if not validate_email(email):
@@ -641,13 +699,23 @@ async def import_bulk_students(
                 )
             continue
         
-        # Generate unique username
-        base_username = generate_username(full_name)
-        username = base_username
-        counter = 1
-        while username.lower() in used_usernames:
-            username = f"{base_username.rsplit('.', 1)[0]}.{counter}"
-            counter += 1
+        # Determine username: use custom if provided, otherwise auto-generate
+        if custom_username:
+            username = custom_username
+        else:
+            # Auto-generate simple username: {first_name}{4-digit-random}
+            # Get first word from full_name
+            first_word = full_name.split()[0] if full_name.split() else "student"
+            
+            # Generate unique username with random suffix
+            max_attempts = 100
+            for _ in range(max_attempts):
+                username = generate_simple_username_with_random(first_word)
+                if username.lower() not in used_usernames:
+                    break
+            else:
+                # Fallback with timestamp
+                username = f"{first_word[:8].lower()}{int(datetime.utcnow().timestamp()) % 10000}"
         
         used_usernames.add(username.lower())
         if email:
@@ -657,11 +725,10 @@ async def import_bulk_students(
         plain_password = generate_secure_password()
         password_hash = hash_password(plain_password)
         
-        # Generate student_id
-        import time
-        student_id = f"STU_{username}_{int(time.time() * 1000) % 1000000}"
+        # Username is now the primary identifier - student_id is just for legacy compatibility
+        student_id = username  # Simplified: just use username as student_id
         
-        # Parse list fields - Allow for ALL students (removed stream == 'science' check)
+        # Parse list fields - Allow for ALL students
         plan_types = parse_list_field(plan_types_str)
         subjects = parse_list_field(subjects_str)
         
