@@ -601,6 +601,19 @@ app.include_router(
     tags=["Language Lab"]
 )
 
+# Video Content routes
+try:
+    from api.v1.video_async import router as video_router
+    app.include_router(
+        video_router,
+        prefix=f"{API_V1_PREFIX}/video",
+        tags=["Video"]
+    )
+    logger.info("✅ Video routes enabled")
+except Exception as e:
+    logger.warning(f"Video routes disabled: {str(e)}")
+
+
 # School Settings routes
 app.include_router(
     settings_router,
