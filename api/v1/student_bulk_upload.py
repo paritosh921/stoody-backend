@@ -661,13 +661,29 @@ async def import_bulk_students(
         import time
         student_id = f"STU_{username}_{int(time.time() * 1000) % 1000000}"
         
-        # Parse list fields
-        plan_types = parse_list_field(plan_types_str) if stream == 'science' else []
-        subjects = parse_list_field(subjects_str) if stream == 'science' else []
+        # Parse list fields - Allow for ALL students (removed stream == 'science' check)
+        plan_types = parse_list_field(plan_types_str)
+        subjects = parse_list_field(subjects_str)
+        
+        # Auto-assign from settings if missing
+        # If plan_types is empty, assign ALL valid plan_types from settings
+        if not plan_types and settings_doc:
+            settings_plan_types = settings_doc.get("plan_types", [])
+            if settings_plan_types:
+                plan_types = settings_plan_types
+                
+        # If subjects is empty, assign ALL valid subjects from settings
+        if not subjects and settings_doc:
+            settings_subjects = settings_doc.get("subjects", [])
+            if settings_subjects:
+                subjects = settings_subjects
         
         # Normalize fields
         if stream and stream not in ['science', 'commerce', 'arts', 'other']:
-            stream = ''
+            stream = None # Invalid stream becomes None
+        elif not stream:
+            stream = None # Empty stream becomes None
+            
         if gender and gender not in ['male', 'female', 'other']:
             gender = ''
         if section and section not in [s.upper() for s in valid_sections]:
@@ -692,7 +708,7 @@ async def import_bulk_students(
             "phone": phone if phone else None,
             "grade": grade,
             "section": section if section else None,
-            "stream": stream if stream else None,
+            "stream": None, # Force stream to None as per new policy
             "gender": gender if gender else None,
             "date_of_birth": date_of_birth if date_of_birth else None,
             "school": school if school else None,

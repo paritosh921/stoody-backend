@@ -989,6 +989,21 @@ async def create_student(
         plain_password = student_data.password or generate_secure_password()
         password_hash = hash_password(plain_password)
 
+        # Get School Settings to auto-assign Plan Types and Subjects
+        # Fetch directly from DB to avoid circular dependency or extra import
+        school_settings = await db.mongo_find_one("school_settings", {"admin_id": str(admin_id)})
+        
+        # Determine plan_types and subjects
+        # Priority: 1. Provided in request (if any) 2. From Settings 3. Empty list
+        # Since stream is removed/fluid, we default to ALL available in settings if not provided
+        assigned_plan_types = student_data.plan_types
+        if not assigned_plan_types and school_settings:
+            assigned_plan_types = school_settings.get("plan_types", [])
+            
+        assigned_subjects = student_data.subjects
+        if not assigned_subjects and school_settings:
+            assigned_subjects = school_settings.get("subjects", [])
+
         # Create student document
         new_student = {
             "admin_id": admin_id,  # Links student to admin for multi-tenancy
@@ -1003,11 +1018,11 @@ async def create_student(
             "gender": student_data.gender,
             "location": student_data.location,
             "school": student_data.school,
-            "stream": student_data.stream,
+            "stream": None,  # Stream is removed/fluid
             "grade": student_data.grade,
             "phone": student_data.phone,
-            "plan_types": student_data.plan_types,
-            "subjects": student_data.subjects,
+            "plan_types": assigned_plan_types,
+            "subjects": assigned_subjects,
             "is_active": True,
             "requires_password_change": True,  # NEW - Force password change on first login
             "created_at": datetime.utcnow(),

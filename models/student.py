@@ -271,9 +271,11 @@ class StudentSchema(Schema):
     gender = fields.Str(validate=validate.OneOf(['male', 'female', 'other', 'prefer-not-to-say']), allow_none=True)
     location = fields.Str(validate=validate.Length(max=255), allow_none=True)
     school = fields.Str(validate=validate.Length(max=255), allow_none=True)
-    stream = fields.Str(validate=validate.OneOf(['science', 'arts', 'commerce', 'other']), allow_none=True)
+    stream = fields.Str(allow_none=True)  # Stream is now optional/fluid
     grade = fields.Str(validate=validate.OneOf(['6', '7', '8', '9', '10', '11', '12']), allow_none=True)
     phone = fields.Str(validate=validate.Length(max=20), allow_none=True)
+    plan_types = fields.List(fields.Str(), allow_none=True)
+    subjects = fields.List(fields.Str(), allow_none=True)
     is_active = fields.Bool(missing=True)
 
     @post_load
@@ -306,9 +308,11 @@ class StudentUpdateSchema(Schema):
     gender = fields.Str(validate=validate.OneOf(['male', 'female', 'other', 'prefer-not-to-say']), allow_none=True)
     location = fields.Str(validate=validate.Length(max=255), allow_none=True)
     school = fields.Str(validate=validate.Length(max=255), allow_none=True)
-    stream = fields.Str(validate=validate.OneOf(['science', 'arts', 'commerce', 'other']), allow_none=True)
+    stream = fields.Str(allow_none=True)
     grade = fields.Str(validate=validate.OneOf(['6', '7', '8', '9', '10', '11', '12']), allow_none=True)
     phone = fields.Str(validate=validate.Length(max=20), allow_none=True)
+    plan_types = fields.List(fields.Str(), allow_none=True)
+    subjects = fields.List(fields.Str(), allow_none=True)
     is_active = fields.Bool()
 
 class StudentPasswordChangeSchema(Schema):
