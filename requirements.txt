@@ -103,3 +103,11 @@ celery[redis]==5.3.4
 # Leave commented if not needed anywhere else in your app.
 # ===============================
 openai
+
+# ===============================
+# Data Processing (Added for Bulk Upload)
+# ===============================
+pandas>=2.0.0
+openpyxl>=3.1.2
+xlsxwriter>=3.1.9
+
