@@ -817,6 +817,11 @@ class EvaluateRequest(BaseModel):
     answerText: Optional[str] = None
     canvasData: Optional[str] = None
     canvasPages: Optional[List[str]] = None
+    # Optional tracking fields for practice history
+    documentId: Optional[str] = None  # Practice set document ID
+    sessionId: Optional[str] = None   # Practice session ID
+    timeSpent: Optional[int] = None   # Time spent in seconds
+    hintsUsed: Optional[int] = 0      # Number of hints used
 
     # Be flexible: accept pages as strings or objects with common keys; normalize to data URLs
     @validator('canvasData', pre=True)
@@ -869,7 +874,11 @@ class EvaluateRequest(BaseModel):
             'question_id': 'questionId',
             'answer_text': 'answerText',
             'canvas_data': 'canvasData',
-            'canvas_pages': 'canvasPages'
+            'canvas_pages': 'canvasPages',
+            'document_id': 'documentId',
+            'session_id': 'sessionId',
+            'time_spent': 'timeSpent',
+            'hints_used': 'hintsUsed'
         }
         for src, dst in mapping.items():
             if src in values and dst not in values:
@@ -1396,6 +1405,55 @@ async def evaluate_submission(
              evaluation_data["feedback"] = raw_response
 
         logger.info(f"🎯 Evaluation complete for Q:{qid}. Correct: {evaluation_data['correct']}, Extracted: '{evaluation_data['extractedAnswer']}', Expected: '{correct_answer[:30] if correct_answer else 'N/A'}', Source: {evaluation_data['answerSource']}")
+
+        # === SAVE PRACTICE ATTEMPT TO DATABASE FOR HISTORY ===
+        try:
+            user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+            
+            # Get document_id from question metadata or request payload
+            doc_id = payload.documentId
+            if not doc_id:
+                # Try to extract from question metadata
+                meta = question_doc.get("metadata", {}) or {}
+                doc_id = meta.get("document_id") or meta.get("documentId") or question_doc.get("document_id")
+            
+            # Prepare attempt record
+            practice_attempt = {
+                "student_id": str(user_id),
+                "session_id": payload.sessionId,
+                "document_id": doc_id,
+                "question_id": qid,
+                "question_text": question_text[:2000] if question_text else "",  # Truncate for storage
+                "question_type": "mcq" if is_mcq else "numerical",
+                "options": question_doc.get("options"),
+                "student_answer": evaluation_data.get("extractedAnswer", ""),
+                "correct_answer": correct_answer,
+                "is_correct": evaluation_data.get("correct", False),
+                "score": evaluation_data.get("score", 0.0),
+                "time_spent": payload.timeSpent,
+                "hints_used": payload.hintsUsed or 0,
+                "evaluation_feedback": evaluation_data.get("feedback", "")[:2000] if evaluation_data.get("feedback") else "",
+                "evaluation_reasoning": evaluation_data.get("reasoning", "")[:2000] if evaluation_data.get("reasoning") else "",
+                "work_shown": evaluation_data.get("workShown", ""),
+                "what_went_wrong": evaluation_data.get("whatWentWrong", ""),
+                "correct_solution": evaluation_data.get("correctSolution", ""),
+                "created_at": datetime.utcnow(),
+                "subject": question_doc.get("subject", ""),
+                "difficulty": question_doc.get("difficulty", ""),
+                "topic": (question_doc.get("metadata", {}) or {}).get("topic", ""),
+            }
+            
+            # Save to appropriate database (B2C or main)
+            if is_b2c:
+                await db.b2c_insert_one("practice_attempts", practice_attempt)
+            else:
+                await db.mongo_insert_one("practice_attempts", practice_attempt)
+            
+            logger.info(f"💾 Saved practice attempt for student {user_id}, question {qid}")
+            
+        except Exception as save_err:
+            # Log but don't fail the request if saving fails
+            logger.error(f"❌ Failed to save practice attempt: {save_err}", exc_info=True)
 
         return EvaluateResponse(success=True, evaluation=evaluation_data)
 
@@ -2114,3 +2172,307 @@ async def evaluate_submission_compat(
     db: DatabaseManager = Depends(get_database)
 ):
     return await grade_submission(request, payload, db)
+
+
+# =============================================================================
+# PRACTICE ATTEMPT HISTORY ENDPOINTS
+# =============================================================================
+
+class PracticeAttemptResponse(BaseModel):
+    """Single practice attempt record"""
+    id: str
+    student_id: str
+    question_id: str
+    question_text: Optional[str] = None
+    question_type: Optional[str] = None
+    options: Optional[List[str]] = None
+    student_answer: Optional[str] = None
+    correct_answer: Optional[str] = None
+    is_correct: bool = False
+    score: float = 0.0
+    time_spent: Optional[int] = None
+    hints_used: int = 0
+    evaluation_feedback: Optional[str] = None
+    subject: Optional[str] = None
+    difficulty: Optional[str] = None
+    created_at: datetime
+    document_id: Optional[str] = None
+
+class PracticeHistoryStats(BaseModel):
+    """Aggregated statistics for practice attempts"""
+    total_attempted: int = 0
+    total_correct: int = 0
+    accuracy_percentage: float = 0.0
+    avg_time_per_question: Optional[float] = None
+    total_time_spent: int = 0
+
+class PracticeHistoryResponse(BaseModel):
+    """Response for practice attempt history"""
+    success: bool = True
+    attempts: List[Dict[str, Any]]
+    total: int
+    stats: PracticeHistoryStats
+
+class PracticeSetStatsResponse(BaseModel):
+    """Response for practice set statistics"""
+    success: bool = True
+    document_id: str
+    question_stats: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+@router.get("/attempts")
+@limiter.limit("60/minute")
+async def get_practice_attempts(
+    request: Request,
+    document_id: Optional[str] = Query(None, description="Filter by practice set document ID"),
+    subject: Optional[str] = Query(None, description="Filter by subject"),
+    limit: int = Query(50, le=200, description="Maximum number of attempts to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get practice attempt history for the current student.
+    
+    Returns a list of past practice attempts with:
+    - Question details
+    - Student's answer
+    - Correct/incorrect status
+    - Evaluation feedback
+    - Aggregated statistics
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+        
+        # Detect if user is B2C
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        # Build filter
+        filter_dict = {"student_id": str(user_id)}
+        if document_id:
+            filter_dict["document_id"] = document_id
+        if subject:
+            filter_dict["subject"] = subject
+        
+        # Fetch attempts with pagination
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+                limit=limit,
+                skip=offset
+            )
+            total = await db.b2c_count("practice_attempts", filter_dict)
+        else:
+            attempts = await db.mongo_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+                limit=limit,
+                skip=offset
+            )
+            total = await db.mongo_count("practice_attempts", filter_dict)
+        
+        # Convert ObjectId to string for JSON serialization
+        attempt_list = []
+        for a in attempts:
+            attempt_dict = dict(a)
+            if "_id" in attempt_dict:
+                attempt_dict["id"] = str(attempt_dict.pop("_id"))
+            if "created_at" in attempt_dict and attempt_dict["created_at"]:
+                attempt_dict["created_at"] = attempt_dict["created_at"].isoformat()
+            attempt_list.append(attempt_dict)
+        
+        # Calculate stats
+        total_correct = sum(1 for a in attempt_list if a.get("is_correct"))
+        total_time = sum(a.get("time_spent", 0) or 0 for a in attempt_list)
+        
+        stats = PracticeHistoryStats(
+            total_attempted=total,
+            total_correct=total_correct,
+            accuracy_percentage=(total_correct / total * 100) if total > 0 else 0.0,
+            avg_time_per_question=(total_time / len(attempt_list)) if attempt_list else None,
+            total_time_spent=total_time
+        )
+        
+        return {
+            "success": True,
+            "attempts": attempt_list,
+            "total": total,
+            "stats": stats.dict()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get practice attempts error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch practice attempts"
+        )
+
+
+@router.get("/attempts/{attempt_id}")
+@limiter.limit("60/minute")
+async def get_practice_attempt_detail(
+    request: Request,
+    attempt_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get detailed information about a specific practice attempt.
+    
+    Returns the full attempt record including:
+    - Original question with all details
+    - Student's answer
+    - Correct answer
+    - Full AI feedback and reasoning
+    - Work shown, what went wrong, correct solution
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+        
+        # Detect if user is B2C
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        # Fetch the attempt
+        from bson import ObjectId
+        try:
+            oid = ObjectId(attempt_id)
+            filter_dict = {"_id": oid, "student_id": str(user_id)}
+        except Exception:
+            filter_dict = {"_id": attempt_id, "student_id": str(user_id)}
+        
+        if is_b2c:
+            attempt = await db.b2c_find_one("practice_attempts", filter_dict)
+        else:
+            attempt = await db.mongo_find_one("practice_attempts", filter_dict)
+        
+        if not attempt:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Practice attempt not found"
+            )
+        
+        # Convert for JSON serialization
+        attempt_dict = dict(attempt)
+        if "_id" in attempt_dict:
+            attempt_dict["id"] = str(attempt_dict.pop("_id"))
+        if "created_at" in attempt_dict and attempt_dict["created_at"]:
+            attempt_dict["created_at"] = attempt_dict["created_at"].isoformat()
+        
+        return {
+            "success": True,
+            "attempt": attempt_dict
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get practice attempt detail error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch practice attempt"
+        )
+
+
+@router.get("/documents/{document_id}/stats")
+@limiter.limit("30/minute")
+async def get_practice_set_stats(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Get aggregated statistics for a practice set.
+    
+    Returns:
+    - Per-question statistics (attempts, last correct, mastery status)
+    - Summary (total questions, mastered, needs practice)
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+        
+        # Detect if user is B2C
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+        
+        # Aggregation pipeline
+        pipeline = [
+            {"$match": {
+                "student_id": str(user_id),
+                "document_id": document_id
+            }},
+            {"$sort": {"created_at": -1}},
+            {"$group": {
+                "_id": "$question_id",
+                "attempts": {"$sum": 1},
+                "correct_count": {"$sum": {"$cond": ["$is_correct", 1, 0]}},
+                "last_attempt": {"$first": "$created_at"},
+                "last_correct": {"$first": "$is_correct"},
+                "last_answer": {"$first": "$student_answer"},
+                "question_text": {"$first": "$question_text"},
+                "difficulty": {"$first": "$difficulty"},
+                "avg_time": {"$avg": {"$ifNull": ["$time_spent", 0]}}
+            }}
+        ]
+        
+        if is_b2c:
+            stats = await db.b2c_aggregate("practice_attempts", pipeline)
+        else:
+            stats = await db.mongo_aggregate("practice_attempts", pipeline)
+        
+        stats_list = list(stats)
+        
+        # Convert for JSON serialization
+        question_stats = []
+        for s in stats_list:
+            stat_dict = {
+                "question_id": s.get("_id"),
+                "attempts": s.get("attempts", 0),
+                "correct_count": s.get("correct_count", 0),
+                "last_attempt": s.get("last_attempt").isoformat() if s.get("last_attempt") else None,
+                "last_correct": s.get("last_correct", False),
+                "last_answer": s.get("last_answer"),
+                "question_text": s.get("question_text", "")[:200] if s.get("question_text") else "",
+                "difficulty": s.get("difficulty"),
+                "avg_time": s.get("avg_time"),
+                "mastered": s.get("last_correct", False) and s.get("correct_count", 0) >= 1
+            }
+            question_stats.append(stat_dict)
+        
+        # Summary statistics
+        total_questions = len(question_stats)
+        mastered = sum(1 for q in question_stats if q.get("mastered"))
+        needs_practice = total_questions - mastered
+        total_attempts = sum(q.get("attempts", 0) for q in question_stats)
+        total_correct = sum(q.get("correct_count", 0) for q in question_stats)
+        
+        return {
+            "success": True,
+            "document_id": document_id,
+            "question_stats": question_stats,
+            "summary": {
+                "total_questions": total_questions,
+                "mastered": mastered,
+                "needs_practice": needs_practice,
+                "total_attempts": total_attempts,
+                "total_correct": total_correct,
+                "overall_accuracy": (total_correct / total_attempts * 100) if total_attempts > 0 else 0.0
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get practice set stats error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch practice set statistics"
+        )
