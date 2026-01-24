@@ -42,10 +42,12 @@ from core.auth import AuthManager
 # Import middleware
 from middleware.subdomain import subdomain_middleware
 from middleware.tenant_middleware import TenantMiddleware
+from middleware.security_headers import SecurityHeadersMiddleware
 
 # Import async route modules
 from api.v1.chat_async import router as chat_router
 from api.v1.auth_async import router as auth_router
+from api.v1.auth_cookie import router as auth_cookie_router
 from api.v1.auth_bypass import router as auth_bypass_router
 from api.v1.admin_async import router as admin_router
 from api.v1.student_bulk_upload import router as student_bulk_upload_router
@@ -403,6 +405,9 @@ app.middleware("http")(subdomain_middleware)
 # Tenant context middleware - sets admin_id for data isolation
 app.add_middleware(TenantMiddleware)
 
+# Security headers middleware - adds CSP, HSTS, X-Frame-Options, etc.
+app.add_middleware(SecurityHeadersMiddleware)
+
 @app.middleware("http")
 async def profile_request(request: Request, call_next):
     """Profiler middleware"""
@@ -467,6 +472,21 @@ app.include_router(
     prefix="/auth",
     tags=["Authentication (Legacy)"]
 )
+
+# Cookie-based authentication routes (httpOnly cookies for security)
+app.include_router(
+    auth_cookie_router,
+    prefix=f"{API_V1_PREFIX}/auth",
+    tags=["Cookie Authentication"]
+)
+
+# Also include cookie auth routes at /auth for frontend compatibility
+app.include_router(
+    auth_cookie_router,
+    prefix="/auth",
+    tags=["Cookie Authentication (Legacy)"]
+)
+logger.info("✅ Cookie-based authentication routes enabled")
 
 # Bypass auth for testing when MongoDB is unavailable
 if DEBUG_MODE:
