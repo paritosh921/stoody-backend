@@ -17,10 +17,14 @@ import time
 from config_async import (
     JWT_SECRET_KEY,
     JWT_ALGORITHM,
-    JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES,
+    PASSWORD_MAX_LENGTH,
 )
 
 logger = logging.getLogger(__name__)
+
+# bcrypt 72-byte password limit
+BCRYPT_MAX_BYTES = 72
 
 class AuthManager:
     """Async authentication manager with JWT and caching"""
@@ -49,11 +53,29 @@ class AuthManager:
 
     # Password utilities
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
-        """Verify password against hash"""
+        """
+        Verify password against hash.
+
+        Note: bcrypt has a 72-byte limit. Passwords longer than 72 bytes
+        (when UTF-8 encoded) are silently truncated. This is a known
+        limitation of bcrypt.
+        """
         try:
+            if not plain_password or not hashed_password:
+                return False
+
             if self.use_bcrypt:
                 # Use bcrypt directly
-                password_bytes = plain_password.encode('utf-8')[:72]
+                password_bytes = plain_password.encode('utf-8')
+
+                # Log warning if password was truncated (for debugging only)
+                if len(password_bytes) > BCRYPT_MAX_BYTES:
+                    logger.debug(
+                        f"Password exceeds {BCRYPT_MAX_BYTES} bytes "
+                        f"({len(password_bytes)} bytes) - truncating for verification"
+                    )
+                    password_bytes = password_bytes[:BCRYPT_MAX_BYTES]
+
                 hash_bytes = hashed_password.encode('utf-8')
                 return self.bcrypt.checkpw(password_bytes, hash_bytes)
             else:
@@ -63,12 +85,38 @@ class AuthManager:
             logger.error(f"Password verification failed: {str(e)}")
             return False
 
-    def get_password_hash(self, password: str) -> str:
-        """Generate password hash"""
+    def get_password_hash(self, password: str, warn_on_truncation: bool = True) -> str:
+        """
+        Generate password hash using bcrypt.
+
+        IMPORTANT: bcrypt has a 72-byte limit for passwords. If the password
+        exceeds this limit when encoded as UTF-8, it will be truncated.
+        This is a security consideration - users should be warned about
+        this limitation at the API level.
+
+        Args:
+            password: Plain text password to hash
+            warn_on_truncation: Log warning if password is truncated (default True)
+
+        Returns:
+            Hashed password string
+        """
         if self.use_bcrypt:
-            # Use bcrypt directly - truncate to 72 bytes
-            password_bytes = password.encode('utf-8')[:72]
-            salt = self.bcrypt.gensalt()
+            # Encode password to bytes
+            password_bytes = password.encode('utf-8')
+
+            # Check if truncation will occur
+            if len(password_bytes) > BCRYPT_MAX_BYTES:
+                if warn_on_truncation:
+                    logger.warning(
+                        f"Password exceeds bcrypt {BCRYPT_MAX_BYTES}-byte limit "
+                        f"({len(password_bytes)} bytes). "
+                        "Password will be truncated. Consider validating password "
+                        "length at the API level to warn users."
+                    )
+                password_bytes = password_bytes[:BCRYPT_MAX_BYTES]
+
+            salt = self.bcrypt.gensalt(rounds=12)  # 12 rounds for good security/performance balance
             return self.bcrypt.hashpw(password_bytes, salt).decode('utf-8')
         else:
             # Fallback to passlib

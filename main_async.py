@@ -28,6 +28,7 @@ from config_async import (
     API_V1_PREFIX,
     RATE_LIMIT_DEFAULT,
     REDIS_URL,
+    REDIS_REQUIRED,
     DEBUG_MODE,
     MAX_WORKERS,
     WORKER_CONNECTIONS,
@@ -354,22 +355,117 @@ async def lifespan(app: FastAPI):
             await db_manager.close()
         logger.info("✅ Cleanup completed")
 
-# Rate limiting setup (in-memory for development if Redis unavailable)
-try:
-    limiter = Limiter(
+# =============================================================================
+# RATE LIMITING SETUP (SECURITY-CRITICAL)
+# =============================================================================
+#
+# Rate limiting prevents brute-force attacks. In production, Redis is REQUIRED
+# for distributed rate limiting across multiple workers/instances.
+#
+# In-memory rate limiting is only acceptable in development because:
+# - It doesn't persist across restarts
+# - It doesn't work across multiple workers/processes
+# - It can be easily bypassed during Redis outages
+#
+
+def _test_redis_connection(redis_url: str) -> bool:
+    """Test if Redis is reachable"""
+    try:
+        import redis
+        r = redis.from_url(redis_url, socket_connect_timeout=5)
+        r.ping()
+        return True
+    except Exception as e:
+        logger.error(f"Redis connection test failed: {str(e)}")
+        return False
+
+
+def _setup_rate_limiter() -> Limiter:
+    """
+    Set up rate limiter with proper security checks.
+
+    Production: Requires Redis - fails startup if unavailable
+    Development: Falls back to in-memory (with warning)
+    """
+    if DEBUG_MODE:
+        # Development mode: try Redis, fall back to memory
+        try:
+            if _test_redis_connection(REDIS_URL):
+                logger.info("✅ Rate limiter using Redis (development)")
+                return Limiter(
+                    key_func=get_remote_address,
+                    default_limits=[RATE_LIMIT_DEFAULT],
+                    storage_uri=REDIS_URL,
+                    strategy="fixed-window"
+                )
+        except Exception as e:
+            logger.warning(f"Redis unavailable in dev mode: {str(e)}")
+
+        logger.warning(
+            "⚠️ Rate limiter using IN-MEMORY storage (development only).\n"
+            "   This does NOT work across multiple workers and resets on restart!"
+        )
+        return Limiter(
+            key_func=get_remote_address,
+            default_limits=[RATE_LIMIT_DEFAULT],
+            storage_uri="memory://",
+            strategy="fixed-window"
+        )
+
+    # Production mode: Redis is required
+    if not REDIS_URL or REDIS_URL == "redis://localhost:6379/0":
+        if REDIS_REQUIRED:
+            raise RuntimeError(
+                "\n" + "=" * 70 + "\n"
+                "🚨 CRITICAL: Redis is required for rate limiting in production!\n"
+                "=" * 70 + "\n"
+                "Rate limiting without Redis is a security vulnerability.\n\n"
+                "Please configure REDIS_URL in your environment:\n"
+                "  REDIS_URL=redis://your-redis-host:6379/0\n\n"
+                "Or set REDIS_REQUIRED=false to disable this check (NOT recommended).\n"
+                "=" * 70
+            )
+        else:
+            logger.warning(
+                "⚠️ SECURITY WARNING: Using in-memory rate limiting in production.\n"
+                "   This is NOT recommended and should only be temporary!"
+            )
+
+    # Test Redis connection
+    if not _test_redis_connection(REDIS_URL):
+        if REDIS_REQUIRED:
+            raise RuntimeError(
+                "\n" + "=" * 70 + "\n"
+                "🚨 CRITICAL: Cannot connect to Redis!\n"
+                "=" * 70 + "\n"
+                f"Redis URL: {REDIS_URL}\n\n"
+                "Rate limiting requires a working Redis connection in production.\n"
+                "Please check your Redis configuration and ensure Redis is running.\n"
+                "=" * 70
+            )
+        else:
+            logger.error(
+                "⚠️ SECURITY WARNING: Redis connection failed in production!\n"
+                "   Falling back to in-memory rate limiting (NOT SECURE)."
+            )
+            return Limiter(
+                key_func=get_remote_address,
+                default_limits=[RATE_LIMIT_DEFAULT],
+                storage_uri="memory://",
+                strategy="fixed-window"
+            )
+
+    logger.info("✅ Rate limiter using Redis (production)")
+    return Limiter(
         key_func=get_remote_address,
         default_limits=[RATE_LIMIT_DEFAULT],
-        storage_uri=REDIS_URL if not DEBUG_MODE else "memory://",
+        storage_uri=REDIS_URL,
         strategy="fixed-window"
     )
-except Exception as e:
-    logger.warning(f"⚠️ Rate limiter using in-memory storage: {str(e)}")
-    limiter = Limiter(
-        key_func=get_remote_address,
-        default_limits=[RATE_LIMIT_DEFAULT],
-        storage_uri="memory://",
-        strategy="fixed-window"
-    )
+
+
+# Initialize rate limiter
+limiter = _setup_rate_limiter()
 
 # Create FastAPI app with lifespan
 app = FastAPI(
