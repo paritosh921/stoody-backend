@@ -15,6 +15,7 @@ from bson import ObjectId
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.security import MongoSanitizer
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
 
@@ -176,7 +177,10 @@ async def get_mcq_questions(
         if difficulty:
             filter_dict["difficulty"] = difficulty
         if search:
-            filter_dict["question_text"] = {"$regex": search, "$options": "i"}
+            # SECURITY: Escape regex special characters to prevent NoSQL injection
+            safe_search = MongoSanitizer.escape_for_like_search(search)
+            if safe_search:
+                filter_dict["question_text"] = {"$regex": safe_search, "$options": "i"}
 
         # Get total count
         all_questions = await db.mongo_find("mcq_questions", filter_dict)

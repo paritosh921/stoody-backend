@@ -22,8 +22,12 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.permissions import has_permission, OPERATOR_PERMISSIONS
 from core.cache import CacheManager
+from core.security import MongoSanitizer, get_security_logger
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
+
+# Security logger for audit trail
+security_logger = get_security_logger()
 
 logger = logging.getLogger(__name__)
 
@@ -650,14 +654,17 @@ async def get_students(
             filter_dict = {"admin_id": admin_id}  # Multi-tenancy filter for regular admin
 
         if search:
-            filter_dict["$or"] = [
-                {"student_id": {"$regex": search, "$options": "i"}},
-                {"username": {"$regex": search, "$options": "i"}},
-                {"full_name": {"$regex": search, "$options": "i"}},
-                {"name": {"$regex": search, "$options": "i"}},
-                {"email": {"$regex": search, "$options": "i"}},
-                {"phone": {"$regex": search, "$options": "i"}}
-            ]
+            # SECURITY: Escape regex special characters to prevent NoSQL injection
+            safe_search = MongoSanitizer.escape_for_like_search(search)
+            if safe_search:
+                filter_dict["$or"] = [
+                    {"student_id": {"$regex": safe_search, "$options": "i"}},
+                    {"username": {"$regex": safe_search, "$options": "i"}},
+                    {"full_name": {"$regex": safe_search, "$options": "i"}},
+                    {"name": {"$regex": safe_search, "$options": "i"}},
+                    {"email": {"$regex": safe_search, "$options": "i"}},
+                    {"phone": {"$regex": safe_search, "$options": "i"}}
+                ]
         if is_active is not None:
             filter_dict["is_active"] = is_active
 

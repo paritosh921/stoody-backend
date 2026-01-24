@@ -38,7 +38,7 @@ from core.tenant_registry import (
     get_tenant_by_tenant_id,
     normalize_tenant_id,
 )
-from config_async import settings
+from config_async import settings, JWT_SECRET_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ limiter = Limiter(key_func=get_remote_address)
 # TOTP encryption key - MUST be set in production via environment variable
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 TOTP_ENC_KEY = os.getenv("TOTP_ENC_KEY", "")
-APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", settings.JWT_SECRET_KEY)
+APP_SECRET_KEY = os.getenv("APP_SECRET_KEY", JWT_SECRET_KEY)
 
 # 6-hour session expiry for 2FA users (in minutes)
 TWO_FA_TOKEN_EXPIRE_MINUTES = 360  # 6 hours

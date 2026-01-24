@@ -9,6 +9,7 @@ import random
 import string
 from bson import ObjectId
 from marshmallow import Schema, fields, validate, post_load
+from core.security import MongoSanitizer
 # from .mongodb_client import get_collection
 
 class Student:
@@ -193,15 +194,18 @@ class Student:
         # Build query
         query = {}
         if search:
-            query = {
-                "$or": [
-                    {"name": {"$regex": search, "$options": "i"}},
-                    {"student_id": {"$regex": search, "$options": "i"}},
-                    {"username": {"$regex": search, "$options": "i"}},
-                    {"email": {"$regex": search, "$options": "i"}},
-                    {"school": {"$regex": search, "$options": "i"}}
-                ]
-            }
+            # SECURITY: Escape regex special characters to prevent NoSQL injection
+            safe_search = MongoSanitizer.escape_for_like_search(search)
+            if safe_search:
+                query = {
+                    "$or": [
+                        {"name": {"$regex": safe_search, "$options": "i"}},
+                        {"student_id": {"$regex": safe_search, "$options": "i"}},
+                        {"username": {"$regex": safe_search, "$options": "i"}},
+                        {"email": {"$regex": safe_search, "$options": "i"}},
+                        {"school": {"$regex": safe_search, "$options": "i"}}
+                    ]
+                }
 
         # Get total count
         total = collection.count_documents(query)
