@@ -6,7 +6,7 @@ Provides httpOnly cookie support for secure JWT token storage
 import logging
 import secrets
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 
@@ -59,7 +59,7 @@ class CookieAuthManager:
             key=self.cookie_name,
             value=token,
             max_age=cookie_max_age,
-            expires=datetime.utcnow() + timedelta(seconds=cookie_max_age),
+            expires=datetime.now(timezone.utc) + timedelta(seconds=cookie_max_age),
             path=COOKIE_PATH,
             domain=COOKIE_DOMAIN,
             secure=COOKIE_SECURE,  # HTTPS only in production

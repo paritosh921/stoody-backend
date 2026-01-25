@@ -33,6 +33,7 @@ from core.security import (
     get_user_agent,
 )
 from core.email_service import get_email_service
+from core.cookie_auth import get_current_user_dual_auth
 from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
 
 # Security logger for audit trail
@@ -1127,9 +1128,27 @@ async def complete_password_reset(
 
 @router.get("/verify")
 async def verify_token(
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    request: Request,
+    auth_manager: AuthManager = Depends(get_auth_manager)
 ):
-    """Verify JWT token and return user data"""
+    """
+    Verify JWT token and return user data
+    Supports both cookie-based and header-based authentication for backward compatibility
+    """
+    # Try dual authentication (cookie first, then header)
+    try:
+        current_user = await get_current_user_dual_auth(request, auth_manager)
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Verify token error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return {
         "success": True,
         "data": {
