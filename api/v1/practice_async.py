@@ -1126,6 +1126,17 @@ async def evaluate_submission(
             prompt += "(No answer submitted)\n"
         prompt += "\n"
         
+        # Detect if this is an essay/descriptive question (common in commerce, humanities)
+        is_essay_question = (
+            not is_mcq and
+            any(keyword in question_text.lower() for keyword in [
+                'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
+                'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
+                'what are', 'what is', 'how does', 'why is', 'state', 'mention',
+                'differentiate', 'illustrate', 'comment', 'evaluate', 'justify'
+            ])
+        )
+
         # Specific evaluation instructions based on question type AND whether answer is provided
         if is_mcq:
             prompt += "🎯 EVALUATION RULES (Multiple Choice Question):\n"
@@ -1140,6 +1151,26 @@ async def evaluate_submission(
             else:
                 prompt += "5. Compare the student's letter/work to YOUR solved answer.\n"
             prompt += "6. For numerical MCQs: Check if their calculated value matches one of the options.\n\n"
+        elif is_essay_question:
+            prompt += "🎯 EVALUATION RULES (Essay/Descriptive Question):\n"
+            prompt += "1. Transcribe ALL text from the student's handwriting carefully.\n"
+            prompt += "2. This is an ESSAY/DESCRIPTIVE question - evaluate the CONTENT and KEY POINTS.\n"
+            prompt += "3. KEY EVALUATION CRITERIA for essay questions:\n"
+            prompt += "   - Did the student address the main question?\n"
+            prompt += "   - Did they include relevant points/definitions/concepts?\n"
+            prompt += "   - Is their explanation coherent and logical?\n"
+            prompt += "   - For 'distinguish/compare' questions: Did they mention differences/similarities?\n"
+            if has_correct_answer:
+                prompt += f"4. Compare their answer to: '{correct_answer[:200]}{'...' if len(correct_answer) > 200 else ''}'.\n"
+            else:
+                prompt += "4. You MUST provide the IDEAL ANSWER in 'solved_answer' field.\n"
+                prompt += "   - For essay questions, write a brief model answer (key points only).\n"
+            prompt += "5. SCORING for essays:\n"
+            prompt += "   - 1.0 (correct): Covers most key points adequately\n"
+            prompt += "   - 0.7-0.9: Good answer with minor gaps\n"
+            prompt += "   - 0.4-0.6: Partial answer, some key points missing\n"
+            prompt += "   - 0.1-0.3: Attempted but significantly incomplete\n"
+            prompt += "   - 0.0: No relevant content or completely wrong\n\n"
         else:
             prompt += "🎯 EVALUATION RULES (Subjective Question):\n"
             prompt += "1. Transcribe all text, numbers, and equations from the student's handwriting.\n"
@@ -1158,25 +1189,54 @@ async def evaluate_submission(
         prompt += "═══════════════════════════════════════\n"
         prompt += "```json\n"
         prompt += "{\n"
-        prompt += '  "extracted_answer": "B",\n'  # Simple example
-        prompt += '  "work_shown": "Brief summary of student work",\n'
-        prompt += '  "is_correct": false,\n'
-        prompt += '  "score": 0.0,\n'
-        if not has_correct_answer:
-            prompt += '  "solved_answer": "B",\n'
+
+        # Use different examples based on question type
+        if is_mcq:
+            prompt += '  "extracted_answer": "B",\n'
+            prompt += '  "work_shown": "Student calculated using formula...",\n'
+            prompt += '  "is_correct": false,\n'
+            prompt += '  "score": 0.0,\n'
+            if not has_correct_answer:
+                prompt += '  "solved_answer": "C",\n'
+        elif is_essay_question:
+            prompt += '  "extracted_answer": "Financial Accounting focuses on external users, Management Accounting focuses on internal users...",\n'
+            prompt += '  "work_shown": "Student mentioned key differences including...",\n'
+            prompt += '  "is_correct": true,\n'
+            prompt += '  "score": 0.8,\n'
+            if not has_correct_answer:
+                prompt += '  "solved_answer": "Key points: 1) Financial Accounting - external reporting, GAAP compliance. 2) Management Accounting - internal decision-making, no mandatory standards.",\n'
+        else:
+            prompt += '  "extracted_answer": "42",\n'
+            prompt += '  "work_shown": "Brief summary of student work",\n'
+            prompt += '  "is_correct": false,\n'
+            prompt += '  "score": 0.0,\n'
+            if not has_correct_answer:
+                prompt += '  "solved_answer": "45",\n'
+
         prompt += '  "what_went_wrong": "Explanation if wrong",\n'
         prompt += '  "correct_solution": "Step by step solution",\n'
         prompt += '  "feedback": "Encouraging feedback",\n'
         prompt += '  "reasoning": "Your evaluation logic"\n'
         prompt += "}\n"
         prompt += "```\n\n"
-        
+
         prompt += "📝 FIELD GUIDELINES:\n"
-        prompt += "- extracted_answer: For MCQ, just the LETTER (A, B, C, or D). For numerical, the number.\n"
+        if is_mcq:
+            prompt += "- extracted_answer: Just the LETTER (A, B, C, or D).\n"
+        elif is_essay_question:
+            prompt += "- extracted_answer: A BRIEF summary of what the student wrote (key points only).\n"
+        else:
+            prompt += "- extracted_answer: For numerical, the number. For text, a brief summary.\n"
         prompt += "- is_correct: Must be true or false (boolean, not string)\n"
-        prompt += "- score: 0.0 (wrong), 0.5 (partial), 1.0 (correct)\n"
+        if is_essay_question:
+            prompt += "- score: Use full range 0.0 to 1.0 for partial credit on essays\n"
+        else:
+            prompt += "- score: 0.0 (wrong), 0.5 (partial), 1.0 (correct)\n"
         if not has_correct_answer:
-            prompt += "- solved_answer: The correct answer YOU determined (REQUIRED since no admin answer)\n"
+            if is_essay_question:
+                prompt += "- solved_answer: REQUIRED - Write the key points of the ideal answer (2-4 sentences max)\n"
+            else:
+                prompt += "- solved_answer: The correct answer YOU determined (REQUIRED since no admin answer)\n"
         prompt += "\n"
         
         # Math formatting (simplified)
@@ -1223,26 +1283,50 @@ async def evaluate_submission(
                 "Be generous in interpreting messy handwriting but strict in evaluating correctness."
             )
         else:
-            system_prompt = (
-                f"{language_system_instruction}"
-                f"{latex_instruction}"
-                "You are an expert tutor who can both SOLVE questions AND evaluate student answers. "
-                "CRITICAL: Since NO CORRECT ANSWER was provided, you MUST first SOLVE the question yourself. "
-                "1. First, solve the question to determine the correct answer. "
-                "2. Then, read and interpret the student's handwritten work. "
-                "3. Compare the student's answer to YOUR solution. "
-                "4. Include your 'solved_answer' in the JSON response. "
-                "For MCQ, determine which letter (A/B/C/D) is correct, then check if the student wrote that letter. "
-                "For subjective questions, solve it step-by-step, then compare to the student's work. "
-                "Always output ONLY valid JSON without markdown code blocks. "
-                "Be generous in interpreting messy handwriting but strict in evaluating correctness."
-            )
+            # Different system prompt for essay vs numerical/MCQ questions
+            if is_essay_question:
+                system_prompt = (
+                    f"{language_system_instruction}"
+                    f"{latex_instruction}"
+                    "You are an expert tutor evaluating ESSAY/DESCRIPTIVE answers. "
+                    "CRITICAL: Since NO MODEL ANSWER was provided, you MUST: "
+                    "1. First, determine the KEY POINTS that should be in a good answer. "
+                    "2. Read and transcribe the student's handwritten essay/answer. "
+                    "3. Evaluate based on: content accuracy, completeness, and clarity. "
+                    "4. Include 'solved_answer' with the KEY POINTS (2-4 bullet points). "
+                    "SCORING GUIDELINES for essays: "
+                    "- 1.0: Excellent - covers all key points accurately. "
+                    "- 0.7-0.9: Good - covers most key points with minor gaps. "
+                    "- 0.4-0.6: Partial - some correct points but missing important ones. "
+                    "- 0.1-0.3: Weak - attempted but significantly incomplete/incorrect. "
+                    "- 0.0: No relevant content. "
+                    "Always output ONLY valid JSON without markdown code blocks. "
+                    "Be fair in evaluating - partial credit for partial answers."
+                )
+            else:
+                system_prompt = (
+                    f"{language_system_instruction}"
+                    f"{latex_instruction}"
+                    "You are an expert tutor who can both SOLVE questions AND evaluate student answers. "
+                    "CRITICAL: Since NO CORRECT ANSWER was provided, you MUST first SOLVE the question yourself. "
+                    "1. First, solve the question to determine the correct answer. "
+                    "2. Then, read and interpret the student's handwritten work. "
+                    "3. Compare the student's answer to YOUR solution. "
+                    "4. Include your 'solved_answer' in the JSON response. "
+                    "For MCQ, determine which letter (A/B/C/D) is correct, then check if the student wrote that letter. "
+                    "For subjective questions, solve it step-by-step, then compare to the student's work. "
+                    "Always output ONLY valid JSON without markdown code blocks. "
+                    "Be generous in interpreting messy handwriting but strict in evaluating correctness."
+                )
         
+        # Use higher max_tokens for essay questions that need more detailed responses
+        eval_max_tokens = 1500 if is_essay_question else 1200
+
         if all_images:
             response = await ai.analyze_images_and_text_async(
                 all_images,
                 prompt,
-                max_tokens=1200,
+                max_tokens=eval_max_tokens,
                 system_prompt=system_prompt
             )
         else:
@@ -1251,7 +1335,7 @@ async def evaluate_submission(
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=1000
+                max_tokens=eval_max_tokens
             )
             
         raw_response = (response.get("response") or "").strip()
@@ -1276,18 +1360,25 @@ async def evaluate_submission(
             
             if not parsed:
                 logger.warning(f"⚠️ Initial JSON parse failed, attempting retry request...")
-                
-                # Retry with a simpler prompt to get just the essential data
-                retry_prompt = (
-                    f"Based on the student's work shown earlier, provide ONLY this JSON (no explanation):\n"
-                    f'{{"is_correct": true/false, "score": 0.0-1.0, "extracted_answer": "student answer"}}'
-                )
-                
+
+                # Customize retry prompt based on question type
+                if is_essay_question:
+                    retry_prompt = (
+                        f"Based on the student's essay answer, provide ONLY this JSON:\n"
+                        f'{{"is_correct": true, "score": 0.7, "extracted_answer": "brief summary of student answer", '
+                        f'"solved_answer": "key points of ideal answer", "feedback": "evaluation feedback"}}'
+                    )
+                else:
+                    retry_prompt = (
+                        f"Based on the student's work shown earlier, provide ONLY this JSON (no explanation):\n"
+                        f'{{"is_correct": true/false, "score": 0.0-1.0, "extracted_answer": "student answer"}}'
+                    )
+
                 if all_images:
                     retry_response = await ai.analyze_images_and_text_async(
                         all_images,
                         retry_prompt,
-                        max_tokens=200,
+                        max_tokens=300 if is_essay_question else 200,
                         system_prompt="You are a JSON generator. Output ONLY valid JSON, nothing else."
                     )
                 else:
@@ -1296,12 +1387,27 @@ async def evaluate_submission(
                             {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON."},
                             {"role": "user", "content": retry_prompt}
                         ],
-                        max_tokens=200
+                        max_tokens=300 if is_essay_question else 200
                     )
-                
+
                 retry_raw = (retry_response.get("response") or "").strip()
                 logger.info(f"📥 Retry response: {retry_raw[:200]}")
                 parsed = robust_json_parse(retry_raw)
+
+                # If retry also fails, try to extract useful information from raw response
+                if not parsed and raw_response:
+                    logger.warning(f"⚠️ Retry also failed. Attempting text-based extraction from raw response...")
+                    # For essay questions, attempt to provide partial evaluation
+                    if is_essay_question:
+                        # Extract any useful text from the raw LLM response
+                        evaluation_data["feedback"] = raw_response[:1500]  # Use raw response as feedback
+                        evaluation_data["reasoning"] = "Evaluation completed but JSON parsing failed. See feedback for details."
+                        # For essay questions, give partial credit by default if student wrote something
+                        if ocr_extracted_text or num_s_images > 0:
+                            evaluation_data["score"] = 0.5  # Partial credit for attempted essay
+                            evaluation_data["correct"] = False  # Can't verify without proper parsing
+                        evaluation_data["answerSource"] = "text_extraction_fallback"
+                        logger.info(f"📝 Essay fallback: Providing partial evaluation from raw response")
             
             if parsed and isinstance(parsed, dict):
                 # Parse is_correct - handle various representations
@@ -1383,12 +1489,27 @@ async def evaluate_submission(
                 logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, score={evaluation_data['score']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}', correctAnswer='{evaluation_data['correctAnswer'][:50] if evaluation_data['correctAnswer'] else 'EMPTY'}', has_solution={bool(correct_solution)}")
                     
             else:
-                # Fallback if no JSON found
+                # Fallback if no JSON found - provide meaningful evaluation anyway
                 logger.warning(f"⚠️ Could not parse JSON from LLM response. Raw: {raw_response[:200]}")
-                evaluation_data["feedback"] = raw_response
-                evaluation_data["reasoning"] = "Could not parse JSON from LLM response."
+                evaluation_data["feedback"] = raw_response[:2000] if raw_response else "Unable to evaluate. Please try again."
+                evaluation_data["reasoning"] = "Evaluation completed but structured response parsing failed."
+
+                # For essay questions, give partial credit if student attempted an answer
+                if is_essay_question and (ocr_extracted_text or num_s_images > 0):
+                    evaluation_data["score"] = 0.5  # Partial credit for attempted essay
+                    evaluation_data["correct"] = False
+                    evaluation_data["answerSource"] = "essay_fallback"
+                    # Try to extract key information from raw response for essay feedback
+                    if raw_response:
+                        # Check if LLM mentioned correct/incorrect in its response
+                        raw_lower = raw_response.lower()
+                        if any(word in raw_lower for word in ['correct', 'right', 'good answer', 'well done', 'accurate']):
+                            evaluation_data["score"] = 0.7
+                        elif any(word in raw_lower for word in ['incorrect', 'wrong', 'missing', 'incomplete', 'needs improvement']):
+                            evaluation_data["score"] = 0.3
+                    logger.info(f"📝 Essay fallback: Assigned partial score {evaluation_data['score']} based on attempt")
                 # Still use OCR extraction if available
-                if ocr_extracted_text:
+                elif ocr_extracted_text:
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
                     evaluation_data["answerSource"] = "ocr_fallback"
                 
@@ -1418,13 +1539,15 @@ async def evaluate_submission(
                 doc_id = meta.get("document_id") or meta.get("documentId") or question_doc.get("document_id")
             
             # Prepare attempt record
+            # Determine question type for storage
+            q_type = "mcq" if is_mcq else ("essay" if is_essay_question else "numerical")
             practice_attempt = {
                 "student_id": str(user_id),
                 "session_id": payload.sessionId,
                 "document_id": doc_id,
                 "question_id": qid,
                 "question_text": question_text[:2000] if question_text else "",  # Truncate for storage
-                "question_type": "mcq" if is_mcq else "numerical",
+                "question_type": q_type,
                 "options": question_doc.get("options"),
                 "student_answer": evaluation_data.get("extractedAnswer", ""),
                 "correct_answer": correct_answer,
