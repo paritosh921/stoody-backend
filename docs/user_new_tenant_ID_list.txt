@@ -1,275 +1,88 @@
+shyam.9610      SKLB-1234       System Administrator
+ram.9767        SKLB-1234       System Administrator
+rohan.singh.6020        SKLB-1234       System Administrator
+paritosh21      SKLB-1234       System Administrator
+ss1     SKLB-1234       System Administrator
+ram.1262        SKLB-1234       System Administrator
+pp21    SKLB-1234       System Administrator
+rohan.singh     SKLB-1234       System Administrator
+jiya.srivastava.2150    AVAL-1001       Avalanche
+akshara CIEL-1001       Ciel Knowledge
+saumya.singh    CIEL-1001       Ciel Knowledge
+aryan   CIEL-1001       Ciel Knowledge
+khushi  CIEL-1001       Ciel Knowledge
+aarush  CIEL-1001       Ciel Knowledge
+naman   CIEL-1001       Ciel Knowledge
+anshika CIEL-1001       Ciel Knowledge
+divyansh        CIEL-1001       Ciel Knowledge
+srishti CIEL-1001       Ciel Knowledge
+Aarti   CIEL-1001       Ciel Knowledge
+delisha CIEL-1001       Ciel Knowledge
+jeanisa CIEL-1001       Ciel Knowledge
+uday    CIEL-1001       Ciel Knowledge
+yugaansh        CIEL-1001       Ciel Knowledge
+pushpal CIEL-1001       Ciel Knowledge
+Ridhima CIEL-1001       Ciel Knowledge
+nitya   CIEL-1001       Ciel Knowledge
+ekta    CIEL-1001       Ciel Knowledge
+makusha CIEL-1001       Ciel Knowledge
+pihu    CIEL-1001       Ciel Knowledge
+deboodatta      CIEL-1001       Ciel Knowledge
+sai stuti       CIEL-1001       Ciel Knowledge
+Lavyansh        CIEL-1001       Ciel Knowledge
+riddhima        CIEL-1001       Ciel Knowledge
+anoushka        CIEL-1001       Ciel Knowledge
+riddit  CIEL-1001       Ciel Knowledge
+saisha  CIEL-1001       Ciel Knowledge
+sohani  CIEL-1001       Ciel Knowledge
+rishabh CIEL-1001       Ciel Knowledge
+anjali  CIEL-1001       Ciel Knowledge
+gauransh        CIEL-1001       Ciel Knowledge
+arnav.m CIEL-1001       Ciel Knowledge
+angel   CIEL-1001       Ciel Knowledge
+kanishka        CIEL-1001       Ciel Knowledge
+deepanshu       CIEL-1001       Ciel Knowledge
+utkarsh CIEL-1001       Ciel Knowledge
+anya    CIEL-1001       Ciel Knowledge
+atharv  CIEL-1001       Ciel Knowledge
+niyati.6880     CIEL-1001       Ciel Knowledge
+prisha  CIEL-1001       Ciel Knowledge
+usheen  CIEL-1001       Ciel Knowledge
+jhalak  CIEL-1001       Ciel Knowledge
+arnav   CIEL-1001       Ciel Knowledge
+manvik  CIEL-1001       Ciel Knowledge
+mayank  CIEL-1001       Ciel Knowledge
+ananya  CIEL-1001       Ciel Knowledge
+aryan.s CIEL-1001       Ciel Knowledge
+saumya  CIEL-1001       Ciel Knowledge
+harsh21 CIEL-1001       Ciel Knowledge
+Aaryan  ABCI-0000       ABC International School
+lavyansh        ABCI-0000       ABC International School
+rehan   ABCI-0000       ABC International School
+radhya  ABCI-0000       ABC International School
 
-    username: 'shyam.9610',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'ram.9767',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'rohan.singh.6020',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'ram.1262',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'ss1',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'pp21',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'rohan.singh',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'paritosh21',
-    tenant_id: 'KNAC1217',
-    db_name: 'skb_in_564J5_PCE_BN_001'
-  
-  
-    username: 'jiya.srivastava.2150',
-    tenant_id: 'HVIP1601',
-    db_name: 'skb_in_JQ5JZ_X1S_IG_001'
-  
-  
-    username: 'akshara',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'jeanisa',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'angel',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'saumya.singh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'divyansh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'anjali',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'prisha',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'nitya',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'gauransh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'khushi',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'aarush',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'usheen',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'riddhima',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'ekta',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'pushpal',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'mayank',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'uday',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'utkarsh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'naman',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'anya',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'atharv',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-  
-    username: 'jhalak',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'sai stuti',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'kanishka',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'makusha',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'yugaansh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'Lavyansh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'ananya',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'deepanshu',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'saisha',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'srishti',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'aryan.s',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'arnav',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'pihu',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'anoushka',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'Aarti',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'aryan',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'Ridhima',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'sohani',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
 
-    username: 'manvik',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'riddit',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'deboodatta',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'niyati.6880',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'anshika',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'rishabh',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'saumya',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
-  
-    username: 'delisha',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'arnav.m',
-    tenant_id: 'VVLK2521',
-    db_name: 'skb_in_4GZ4M_M30_DW_001'
- 
-    username: 'Aaryan',
-    tenant_id: 'STLY9179',
-    db_name: 'skb_in_64R33_0YZ_NY_001'
- 
-    username: 'lavyansh',
-    tenant_id: 'STLY9179',
-    db_name: 'skb_in_64R33_0YZ_NY_001'
- 
-    username: 'radhya',
-    tenant_id: 'STLY9179',
-    db_name: 'skb_in_64R33_0YZ_NY_001'
-  
-    username: 'rehan',
-    tenant_id: 'STLY9179',
-    db_name: 'skb_in_64R33_0YZ_NY_001'
-  
+TUTORS
+rrr     SKLB-1234       System Administrator
+tutt    SKLB-1234       System Administrator
+tu2     SKLB-1234       System Administrator
+rohit   SKLB-1234       System Administrator
+Priya   AVAL-1001       Avalanche
+Gaurav  CIEL-1001       Ciel Knowledge
+rohan21 CIEL-1001       Ciel Knowledge
+Seema   ABCI-0000       ABC International School
+Rishi   ABCI-0000       ABC International School
+ashuein TEMP-0000       TEMP Organisation
+
+
+ADMINS
+
+admin@skillbot.app      SKLB-1234       master_admin    System Administrator
+
+srivastavapriya2009@gmail.com   AVAL-1001       master_admin    Avalanche
+
+cielknowledge@gmail.com CIEL-1001       master_admin    Ciel Knowledge
+
+love.mendiratta@indiabe.in      ABCI-0000       master_admin    ABC International School
+
+ashuein@gmail.com       TEMP-0000       master_admin    TEMP Organisation

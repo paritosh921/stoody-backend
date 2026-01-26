@@ -44,6 +44,14 @@ def _get_cors_origins() -> List[str]:
     main_frontend = "https://app.stoody.in"
     production_origins.append(main_frontend)
 
+    # Mobile app origins (Capacitor/Cordova) - always allowed
+    mobile_origins = [
+        "capacitor://localhost",
+        "ionic://localhost",
+        "http://localhost",  # Android WebView
+    ]
+    production_origins.extend(mobile_origins)
+
     # Add any additional production origins from environment (comma-separated)
     additional_origins = os.getenv("CORS_ADDITIONAL_ORIGINS", "")
     if additional_origins:
