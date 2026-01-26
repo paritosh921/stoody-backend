@@ -48,7 +48,8 @@ def _get_cors_origins() -> List[str]:
     mobile_origins = [
         "capacitor://localhost",
         "ionic://localhost",
-        "http://localhost",  # Android WebView
+        "http://localhost",   # Android WebView
+        "https://localhost",  # Capacitor Android with androidScheme: 'https'
     ]
     production_origins.extend(mobile_origins)
 
