@@ -973,12 +973,26 @@ class BookmarkData(BaseModel):
     createdAt: str
 
 
+class CopyAttachmentData(BaseModel):
+    """Attached copy page data - links student's handwritten copy to Teacher Notes"""
+    id: str
+    pageNumber: int  # PDF page this is attached to
+    pen_mac: str
+    book_type: Optional[str] = None
+    copy_page_number: int  # Page number in the copy
+    title: Optional[str] = None
+    order: int = 0  # Order within page (for multiple attachments)
+    createdAt: str
+    updatedAt: str
+
+
 class AnnotationsPayload(BaseModel):
     """Full annotations payload for saving"""
     documentId: str
     highlights: Optional[List[HighlightData]] = []
     notes: Optional[List[NoteData]] = []
     bookmarks: Optional[List[BookmarkData]] = []
+    copyAttachments: Optional[List[CopyAttachmentData]] = []  # Attached copy pages
     lastViewedPage: Optional[int] = 1
     lastViewedAt: Optional[str] = None
     totalReadingTime: Optional[int] = 0
@@ -1021,12 +1035,13 @@ async def get_annotations(
                     "highlights": [],
                     "notes": [],
                     "bookmarks": [],
+                    "copyAttachments": [],
                     "lastViewedPage": 1,
                     "lastViewedAt": None,
                     "totalReadingTime": 0
                 }
             }
-        
+
         # Convert MongoDB document to response format
         return {
             "success": True,
@@ -1036,6 +1051,7 @@ async def get_annotations(
                 "highlights": annotation.get("highlights", []),
                 "notes": annotation.get("notes", []),
                 "bookmarks": annotation.get("bookmarks", []),
+                "copyAttachments": annotation.get("copy_attachments", []),
                 "lastViewedPage": annotation.get("last_viewed_page", 1),
                 "lastViewedAt": annotation.get("last_viewed_at"),
                 "totalReadingTime": annotation.get("total_reading_time", 0)
@@ -1074,6 +1090,7 @@ async def save_annotations(
             "highlights": [h.dict() if hasattr(h, 'dict') else h for h in (payload.highlights or [])],
             "notes": [n.dict() if hasattr(n, 'dict') else n for n in (payload.notes or [])],
             "bookmarks": [b.dict() if hasattr(b, 'dict') else b for b in (payload.bookmarks or [])],
+            "copy_attachments": [a.dict() if hasattr(a, 'dict') else a for a in (payload.copyAttachments or [])],
             "last_viewed_page": payload.lastViewedPage or 1,
             "last_viewed_at": payload.lastViewedAt or datetime.utcnow().isoformat(),
             "total_reading_time": payload.totalReadingTime or 0,
