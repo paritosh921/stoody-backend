@@ -2589,6 +2589,44 @@ async def update_document_metadata(
 
         # Update allowed fields
         update_data = {}
+
+        # String fields that can be updated
+        string_fields = ["title", "subject", "course_plan", "standard", "section"]
+        for field in string_fields:
+            if field in metadata and metadata[field] is not None:
+                value = str(metadata[field]).strip()
+                if value:  # Only update if non-empty
+                    update_data[field] = value
+
+        # Document type with validation
+        if "document_type" in metadata:
+            doc_type = metadata["document_type"]
+            valid_types = ["Practice Sets", "Test Series", "Chapter Notes"]
+            if doc_type not in valid_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid document type. Must be one of: {valid_types}"
+                )
+            update_data["document_type"] = doc_type
+
+        # Difficulty with validation
+        if "difficulty" in metadata:
+            difficulty = metadata["difficulty"]
+            valid_difficulties = ["easy", "medium", "hard"]
+            if difficulty not in valid_difficulties:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid difficulty. Must be one of: {valid_difficulties}"
+                )
+            update_data["difficulty"] = difficulty
+
+        # Teacher IDs (array field)
+        if "teacher_ids" in metadata:
+            teacher_ids = metadata["teacher_ids"]
+            if isinstance(teacher_ids, list):
+                update_data["teacher_ids"] = teacher_ids
+
+        # Numeric fields
         if "total_points" in metadata:
             total_points = metadata["total_points"]
             if total_points < 0:
@@ -2606,7 +2644,7 @@ async def update_document_metadata(
                     detail="Total minutes must be greater than 0"
                 )
             update_data["total_minutes"] = total_minutes
-        
+
         if "is_active" in metadata:
             update_data["is_active"] = bool(metadata["is_active"])
 
@@ -2643,6 +2681,102 @@ async def update_document_metadata(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update document metadata: {str(e)}"
         )
+
+
+@router.post("/documents/{document_id}/duplicate")
+@limiter.limit("10/minute")
+async def duplicate_document(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Duplicate a document with different metadata settings.
+    Creates a new document entry that references the same file but with updated metadata.
+    Questions are also duplicated to the new document.
+    """
+    # Parse metadata from request body
+    try:
+        metadata = await request.json()
+    except Exception:
+        metadata = {}
+
+    try:
+        # Get existing document
+        existing_doc = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not existing_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        # Generate new document_id
+        new_document_id = metadata.get("new_document_id")
+        if not new_document_id:
+            import uuid
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            new_document_id = f"{document_id}_copy_{timestamp}"
+
+        # Check if new_document_id already exists
+        existing_new = await db.mongo_find_one("documents", {"document_id": new_document_id})
+        if existing_new:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Document with ID {new_document_id} already exists"
+            )
+
+        # Create new document with updated metadata
+        new_doc = existing_doc.copy()
+        del new_doc["_id"]  # Remove MongoDB _id
+        new_doc["document_id"] = new_document_id
+        new_doc["uploaded_at"] = datetime.utcnow().isoformat()
+
+        # Update metadata fields from request
+        update_fields = ["title", "subject", "course_plan", "standard", "section",
+                        "difficulty", "document_type", "teacher_ids", "total_minutes"]
+        for field in update_fields:
+            if field in metadata and metadata[field] is not None:
+                new_doc[field] = metadata[field]
+
+        # Insert new document
+        await db.mongo_insert_one("documents", new_doc)
+        logger.info(f"Duplicated document {document_id} to {new_document_id}")
+
+        # Duplicate questions if they exist
+        questions = await db.mongo_find("questions", {"document_id": document_id})
+        questions_duplicated = 0
+        if questions:
+            for q in questions:
+                new_q = q.copy()
+                del new_q["_id"]
+                new_q["document_id"] = new_document_id
+                # Update question fields from new document metadata
+                if "subject" in metadata:
+                    new_q["subject"] = metadata["subject"]
+                if "course_plan" in metadata:
+                    new_q["course_plan"] = metadata["course_plan"]
+                if "standard" in metadata:
+                    new_q["standard"] = metadata["standard"]
+                await db.mongo_insert_one("questions", new_q)
+                questions_duplicated += 1
+
+        return {
+            "message": "Document duplicated successfully",
+            "original_document_id": document_id,
+            "new_document_id": new_document_id,
+            "questions_duplicated": questions_duplicated
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Duplicate document error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to duplicate document: {str(e)}"
+        )
+
 
 @router.get("/documents/{document_id}/questions")
 @limiter.limit("60/minute")
