@@ -278,6 +278,92 @@ class PracticeStats(BaseModel):
 # ----------------------
 # Helper utilities (local)
 # ----------------------
+
+async def _extract_text_from_document(base64_data: str, doc_type: str, filename: str) -> str:
+    """Extract text content from uploaded PDF or DOCX document.
+    
+    Args:
+        base64_data: Base64 encoded document data (may include data URL prefix)
+        doc_type: Type of document ('pdf' or 'docx')
+        filename: Original filename for logging
+        
+    Returns:
+        Extracted text content from the document
+    """
+    import base64
+    import io
+    import tempfile
+    import os
+    
+    try:
+        # Remove data URL prefix if present
+        if ',' in base64_data:
+            base64_data = base64_data.split(',')[-1]
+        
+        # Decode base64 to bytes
+        doc_bytes = base64.b64decode(base64_data)
+        
+        if doc_type == 'pdf':
+            try:
+                import PyPDF2
+                pdf_file = io.BytesIO(doc_bytes)
+                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                
+                text_content = []
+                for page_num, page in enumerate(pdf_reader.pages):
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_content.append(f"[Page {page_num + 1}]\n{page_text}")
+                
+                return "\n\n".join(text_content)
+            except ImportError:
+                logger.warning("PyPDF2 not installed. Trying pdfplumber as fallback...")
+                try:
+                    import pdfplumber
+                    pdf_file = io.BytesIO(doc_bytes)
+                    with pdfplumber.open(pdf_file) as pdf:
+                        text_content = []
+                        for page_num, page in enumerate(pdf.pages):
+                            page_text = page.extract_text()
+                            if page_text:
+                                text_content.append(f"[Page {page_num + 1}]\n{page_text}")
+                        return "\n\n".join(text_content)
+                except ImportError:
+                    logger.error("Neither PyPDF2 nor pdfplumber installed. Cannot extract PDF text.")
+                    return ""
+        
+        elif doc_type == 'docx':
+            try:
+                from docx import Document
+                docx_file = io.BytesIO(doc_bytes)
+                doc = Document(docx_file)
+                
+                text_content = []
+                for para in doc.paragraphs:
+                    if para.text.strip():
+                        text_content.append(para.text)
+                
+                # Also extract text from tables
+                for table in doc.tables:
+                    for row in table.rows:
+                        row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if row_text:
+                            text_content.append(" | ".join(row_text))
+                
+                return "\n".join(text_content)
+            except ImportError:
+                logger.error("python-docx not installed. Cannot extract DOCX text.")
+                return ""
+        
+        else:
+            logger.warning(f"Unsupported document type: {doc_type}")
+            return ""
+            
+    except Exception as e:
+        logger.error(f"Error extracting text from {filename}: {e}")
+        return ""
+
+
 async def _load_question_doc(db: DatabaseManager, qid: str, is_b2c: bool = False) -> Dict[str, Any]:
     """Fetch question from Chroma (fullData) with Mongo fallback.
     
@@ -812,11 +898,28 @@ async def get_next_practice_question(
         )
 
 
+class UploadedImageFile(BaseModel):
+    """Model for uploaded image files from frontend"""
+    data: str  # Base64 encoded image data
+    name: str
+    type: str  # MIME type
+
+
+class UploadedDocumentFile(BaseModel):
+    """Model for uploaded document files (PDF/DOCX) from frontend"""
+    data: str  # Base64 encoded document data
+    name: str
+    type: str  # 'pdf' or 'docx'
+
+
 class EvaluateRequest(BaseModel):
     questionId: str
     answerText: Optional[str] = None
     canvasData: Optional[str] = None
     canvasPages: Optional[List[str]] = None
+    # Uploaded files from mobile/desktop file picker
+    uploadedImages: Optional[List[UploadedImageFile]] = None  # Images uploaded directly
+    uploadedDocuments: Optional[List[UploadedDocumentFile]] = None  # PDF/DOCX files
     # Optional tracking fields for practice history
     documentId: Optional[str] = None  # Practice set document ID
     sessionId: Optional[str] = None   # Practice session ID
@@ -966,12 +1069,34 @@ async def evaluate_submission(
         
         logger.info(f"📷 Total question images: {len(all_question_images)} (figures: {len(question_images)}, option images: {len(option_images)})")
         
-        # 2. Student Canvas Images - ENHANCED PROCESSING
+        # 2. Student Canvas Images + Uploaded Images - ENHANCED PROCESSING
         student_images_raw = []
         if payload.canvasPages and len(payload.canvasPages) > 0:
             student_images_raw = payload.canvasPages
         elif canvas_data:
             student_images_raw = [canvas_data]
+        
+        # Add uploaded images to student submission
+        if payload.uploadedImages:
+            for uploaded_img in payload.uploadedImages:
+                img_data = uploaded_img.data
+                # Ensure proper data URL format
+                if not img_data.startswith('data:'):
+                    img_data = f"data:{uploaded_img.type};base64,{img_data.split(',')[-1] if ',' in img_data else img_data}"
+                student_images_raw.append(img_data)
+            logger.info(f"📎 Added {len(payload.uploadedImages)} uploaded images to submission")
+        
+        # Process uploaded documents (PDF/DOCX) - extract text
+        uploaded_doc_text = ""
+        if payload.uploadedDocuments:
+            for doc in payload.uploadedDocuments:
+                try:
+                    doc_text = await _extract_text_from_document(doc.data, doc.type, doc.name)
+                    if doc_text:
+                        uploaded_doc_text += f"\n[From {doc.name}]:\n{doc_text}\n"
+                        logger.info(f"📄 Extracted {len(doc_text)} chars from {doc.name}")
+                except Exception as doc_err:
+                    logger.warning(f"Failed to extract text from {doc.name}: {doc_err}")
         
         # === STAGE 1: CANVAS OCR EXTRACTION (New Enhanced Pipeline) ===
         ocr_extracted_text = ""
@@ -1017,13 +1142,21 @@ async def evaluate_submission(
             student_images = []
         
         # === STAGE 2: COMBINED EVALUATION WITH ENHANCED PROMPT ===
-        # Combine typed answer with OCR-extracted text
+        # Combine typed answer with OCR-extracted text and uploaded document text
         combined_answer = answer_text
         if ocr_extracted_text and ocr_confidence > 0.3:
             if answer_text:
                 combined_answer = f"{answer_text} (Canvas OCR: {ocr_extracted_text})"
             else:
                 combined_answer = ocr_extracted_text
+        
+        # Add uploaded document text to combined answer
+        if uploaded_doc_text:
+            if combined_answer:
+                combined_answer = f"{combined_answer}\n\n[Uploaded Document Content]:{uploaded_doc_text}"
+            else:
+                combined_answer = f"[Uploaded Document Content]:{uploaded_doc_text}"
+            logger.info(f"📄 Added uploaded document text to combined answer")
         
         # Combine all images for the LLM - STUDENT IMAGES FIRST, then question images
         # This ensures the LLM focuses on the student's work first
