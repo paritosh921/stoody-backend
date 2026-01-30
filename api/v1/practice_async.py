@@ -305,9 +305,9 @@ async def _extract_text_from_document(base64_data: str, doc_type: str, filename:
         
         if doc_type == 'pdf':
             try:
-                import PyPDF2
+                from pypdf import PdfReader
                 pdf_file = io.BytesIO(doc_bytes)
-                pdf_reader = PyPDF2.PdfReader(pdf_file)
+                pdf_reader = PdfReader(pdf_file)
                 
                 text_content = []
                 for page_num, page in enumerate(pdf_reader.pages):
@@ -317,20 +317,8 @@ async def _extract_text_from_document(base64_data: str, doc_type: str, filename:
                 
                 return "\n\n".join(text_content)
             except ImportError:
-                logger.warning("PyPDF2 not installed. Trying pdfplumber as fallback...")
-                try:
-                    import pdfplumber
-                    pdf_file = io.BytesIO(doc_bytes)
-                    with pdfplumber.open(pdf_file) as pdf:
-                        text_content = []
-                        for page_num, page in enumerate(pdf.pages):
-                            page_text = page.extract_text()
-                            if page_text:
-                                text_content.append(f"[Page {page_num + 1}]\n{page_text}")
-                        return "\n\n".join(text_content)
-                except ImportError:
-                    logger.error("Neither PyPDF2 nor pdfplumber installed. Cannot extract PDF text.")
-                    return ""
+                logger.error("pypdf not installed. Cannot extract PDF text. Install with: pip install pypdf")
+                return ""
         
         elif doc_type == 'docx':
             try:
