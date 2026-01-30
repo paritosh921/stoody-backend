@@ -1079,12 +1079,18 @@ async def evaluate_submission(
         # Add uploaded images to student submission
         if payload.uploadedImages:
             for uploaded_img in payload.uploadedImages:
-                img_data = uploaded_img.data
-                # Ensure proper data URL format
-                if not img_data.startswith('data:'):
-                    img_data = f"data:{uploaded_img.type};base64,{img_data.split(',')[-1] if ',' in img_data else img_data}"
-                student_images_raw.append(img_data)
-            logger.info(f"📎 Added {len(payload.uploadedImages)} uploaded images to submission")
+                try:
+                    img_data = uploaded_img.data
+                    logger.info(f"📎 Processing uploaded image: {uploaded_img.name}, type: {uploaded_img.type}, data starts with: {img_data[:50]}...")
+                    # Ensure proper data URL format
+                    if not img_data.startswith('data:'):
+                        # If it doesn't start with data:, add the proper prefix
+                        img_data = f"data:{uploaded_img.type};base64,{img_data.split(',')[-1] if ',' in img_data else img_data}"
+                    student_images_raw.append(img_data)
+                    logger.info(f"✅ Added uploaded image: {uploaded_img.name}")
+                except Exception as img_err:
+                    logger.error(f"❌ Failed to process uploaded image {uploaded_img.name}: {img_err}")
+            logger.info(f"📎 Total uploaded images added: {len(payload.uploadedImages)}, student_images_raw count: {len(student_images_raw)}")
         
         # Process uploaded documents (PDF/DOCX) - extract text
         uploaded_doc_text = ""
@@ -1103,6 +1109,7 @@ async def evaluate_submission(
         ocr_confidence = 0.0
         
         if student_images_raw:
+            logger.info(f"🖼️ Processing {len(student_images_raw)} student images...")
             try:
                 from services.canvas_ocr_service import get_canvas_ocr_service
                 from utils.image_processor import (
@@ -1112,22 +1119,32 @@ async def evaluate_submission(
                 )
                 
                 # Enhance canvas images for better OCR
-                logger.info(f"🖼️ Enhancing {len(student_images_raw)} canvas images...")
-                enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
+                logger.info(f"🖼️ Enhancing {len(student_images_raw)} student images...")
+                try:
+                    enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
+                    if not enhanced_student_images:
+                        logger.warning("⚠️ Image enhancement returned empty list, using raw images")
+                        enhanced_student_images = student_images_raw
+                except Exception as enhance_err:
+                    logger.warning(f"⚠️ Image enhancement failed: {enhance_err}. Using raw images.")
+                    enhanced_student_images = student_images_raw
                 
                 # Run dedicated OCR extraction
-                ocr_service = get_canvas_ocr_service()
-                ocr_result = await ocr_service.extract_text_from_canvas(
-                    canvas_pages=enhanced_student_images,
-                    question_context=question_text,
-                    options_context=options_text if is_mcq else None,
-                    is_mcq=is_mcq
-                )
-                
-                ocr_extracted_text = ocr_result.extracted_text
-                ocr_confidence = ocr_result.confidence
-                
-                logger.info(f"📖 OCR Extraction: '{ocr_extracted_text}' (confidence: {ocr_confidence:.2f}, method: {ocr_result.method})")
+                try:
+                    ocr_service = get_canvas_ocr_service()
+                    ocr_result = await ocr_service.extract_text_from_canvas(
+                        canvas_pages=enhanced_student_images,
+                        question_context=question_text,
+                        options_context=options_text if is_mcq else None,
+                        is_mcq=is_mcq
+                    )
+                    
+                    ocr_extracted_text = ocr_result.extracted_text
+                    ocr_confidence = ocr_result.confidence
+                    
+                    logger.info(f"📖 OCR Extraction: '{ocr_extracted_text}' (confidence: {ocr_confidence:.2f}, method: {ocr_result.method})")
+                except Exception as ocr_inner_err:
+                    logger.warning(f"⚠️ OCR extraction failed: {ocr_inner_err}. Continuing without OCR.")
                 
                 # Use enhanced images for subsequent LLM evaluation
                 student_images = enhanced_student_images
@@ -1136,10 +1153,11 @@ async def evaluate_submission(
                 logger.warning(f"Canvas OCR service not available: {ie}. Using raw images.")
                 student_images = student_images_raw
             except Exception as ocr_err:
-                logger.error(f"OCR extraction failed: {ocr_err}. Continuing with raw images.")
+                logger.error(f"Image processing failed: {ocr_err}. Continuing with raw images.")
                 student_images = student_images_raw
         else:
             student_images = []
+            logger.info("📷 No student images to process")
         
         # === STAGE 2: COMBINED EVALUATION WITH ENHANCED PROMPT ===
         # Combine typed answer with OCR-extracted text and uploaded document text
