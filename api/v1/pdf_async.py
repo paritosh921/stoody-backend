@@ -1282,6 +1282,7 @@ class DocumentMetadata(BaseModel):
     file_path: str
     filename: str
     uploaded_by: str
+    uploaded_by_name: Optional[str] = None  # Display name of who uploaded (Admin or teacher username)
     uploaded_at: datetime
     ocr_status: str
     ocr_job_id: Optional[str] = None
@@ -1897,11 +1898,38 @@ async def get_documents(
 
         # Format response and check file existence
         from pathlib import Path
+
+        # Collect unique uploader IDs to look up their names
+        uploader_ids = list(set(doc.get("uploaded_by") for doc in documents if doc.get("uploaded_by")))
+        uploader_names = {}
+
+        # Look up uploader names from users collection
+        if uploader_ids:
+            try:
+                for uid in uploader_ids:
+                    # Try to find user in the database
+                    user = await db.mongo_find_one("users", {"_id": BsonObjectId(uid)})
+                    if user:
+                        user_type = user.get("user_type", "")
+                        if user_type == "admin":
+                            uploader_names[uid] = "Admin"
+                        else:
+                            # For teachers/tutors, use username or full_name
+                            uploader_names[uid] = user.get("username") or user.get("full_name") or "Teacher"
+                    else:
+                        uploader_names[uid] = "Admin"  # Default to Admin if user not found
+            except Exception as e:
+                logger.warning(f"Could not look up uploader names: {e}")
+
         document_list = []
         for doc in documents:
             # Check if physical file exists on disk
             file_path = Path(doc["file_path"])
             file_exists = file_path.exists()
+
+            # Get uploader display name
+            uploader_id = doc.get("uploaded_by", "")
+            uploaded_by_name = uploader_names.get(uploader_id, "Admin")
 
             document_list.append(DocumentMetadata(
                 document_id=doc["document_id"],
@@ -1914,6 +1942,7 @@ async def get_documents(
                 file_path=doc["file_path"],
                 filename=doc["filename"],
                 uploaded_by=doc["uploaded_by"],
+                uploaded_by_name=uploaded_by_name,
                 uploaded_at=doc["uploaded_at"],
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
