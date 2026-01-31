@@ -144,19 +144,21 @@ async def submit_attempt(
     try:
         user_id = current_user["user_id"]
 
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Get the question from admin's ChromaDB collection
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-        question = question_service.get_question(attempt_data.question_id)
-
+        # Get the question from MongoDB
+        question = await db.mongo_find_one("questions", {"id": attempt_data.question_id})
+        
+        if not question:
+            # Try searching by _id as well
+            try:
+                from bson import ObjectId
+                question = await db.mongo_find_one("questions", {"_id": ObjectId(attempt_data.question_id)})
+            except Exception:
+                pass
+                
         if not question:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Question not found in your admin's collection"
+                detail="Question not found"
             )
 
         # For now, we'll create a simple scoring system

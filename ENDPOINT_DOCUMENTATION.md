@@ -850,7 +850,7 @@ SkillBot is an educational platform backend built with Flask that provides compr
 ---
 
 ### POST /api/questions/save
-**Save a single question to ChromaDB**
+**Save a single question to MongoDB**
 
 **Request Body:**
 ```json
@@ -892,7 +892,7 @@ SkillBot is an educational platform backend built with Flask that provides compr
 ---
 
 ### POST /api/questions/batch-save
-**Save multiple questions to ChromaDB**
+**Save multiple questions to MongoDB**
 
 **Request Body:**
 ```json
@@ -1259,7 +1259,7 @@ SkillBot is an educational platform backend built with Flask that provides compr
 ## Practice Mode Endpoints
 
 ### POST /api/practice/next
-**Get next practice question from ChromaDB**
+**Get next practice question from MongoDB**
 
 **Request Body:**
 ```json
@@ -1651,17 +1651,11 @@ SkillBot is an educational platform backend built with Flask that provides compr
   "services": {
     "database": "healthy",
     "cache": "optional",
-    "chromadb": {
+    "mongodb": {
       "connected": true,
       "status": "online",
       "questions_count": 1250
     }
-  },
-  "chromaConnected": true,
-  "chromadb": {
-    "connected": true,
-    "status": "online",
-    "questions_count": 1250
   },
   "version": "2.0.0",
   "mode": "development"
@@ -1802,7 +1796,7 @@ SkillBot is an educational platform backend built with Flask that provides compr
 
 3. **Image Handling**: Images are stored in the `images/` directory and served via dedicated endpoints
 
-4. **ChromaDB**: Question storage and retrieval uses ChromaDB for semantic search and vector similarity
+4. **MongoDB**: Question storage and retrieval uses MongoDB with flexible queries
 
 5. **Rate Limiting**: Consider implementing rate limiting for chat and evaluation endpoints in production
 

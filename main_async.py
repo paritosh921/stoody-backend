@@ -894,15 +894,13 @@ async def health_check(request: Request):
         cache_required = not DEBUG_MODE
         cache_status = "healthy" if cache_healthy else ("optional" if DEBUG_MODE else "unhealthy")
 
-        # Check ChromaDB connection and count (non-fatal)
-        chroma_healthy = False
-        chroma_count = 0
+        # Get questions count from MongoDB (non-fatal)
+        questions_count = 0
         try:
             if app.state.db:
-                chroma_count = await app.state.db.chroma_count()
-                chroma_healthy = chroma_count is not None
-        except Exception as _chroma_err:
-            logger.warning(f"ChromaDB health probe failed: {str(_chroma_err)}")
+                questions_count = await app.state.db.mongo_count("questions")
+        except Exception as _mongo_err:
+            logger.warning(f"MongoDB questions count failed: {str(_mongo_err)}")
 
         # Check S3 storage status
         try:
@@ -933,18 +931,12 @@ async def health_check(request: Request):
             "services": {
                 "database": "healthy" if db_healthy else "unhealthy",
                 "cache": cache_status,
-                "chromadb": {
-                    "connected": chroma_healthy,
-                    "status": "online" if chroma_healthy else "offline",
-                    "questions_count": chroma_count
-                },
                 "s3_storage": s3_status
             },
-            "chromaConnected": chroma_healthy,
-            "chromadb": {
-                "connected": chroma_healthy,
-                "status": "online" if chroma_healthy else "offline",
-                "questions_count": chroma_count
+            "mongodb": {
+                "connected": db_healthy,
+                "status": "online" if db_healthy else "offline",
+                "questions_count": questions_count
             },
             "s3_storage": s3_status,
             "version": "2.0.0",

@@ -231,8 +231,7 @@ async def get_mcq_questions(
 
 async def _get_mcq_questions_with_images(db: DatabaseManager, where_filter: dict, limit: int = 10000):
     """Helper function to fetch MCQ questions with images from MongoDB"""
-    # Get questions directly from MongoDB instead of ChromaDB
-    # ChromaDB is optional and may not be available
+    # Get questions directly from MongoDB
     question_docs = await db.mongo_find("questions", where_filter, sort=[("page_number", 1)], limit=limit)
 
     if not question_docs:
@@ -384,33 +383,23 @@ async def get_all_mcq_questions(
 ):
     """Get ALL MCQ questions from Test Series and Practice Sets (JEE-style exam mode)"""
     try:
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Build filters - get both Test Series and Practice Sets if no specific type requested
+        # Build filters for MongoDB query
+        query_filter: Dict[str, Any] = {}
+        
         if not document_type:
-            document_types = ["Test Series", "Practice Sets"]
+            query_filter["document_type"] = {"$in": ["Test Series", "Practice Sets"]}
         else:
-            document_types = [document_type]
+            query_filter["document_type"] = document_type
+            
+        if subject:
+            query_filter["subject"] = subject
+        if difficulty:
+            query_filter["difficulty"] = difficulty
 
-        questions = []
-        for doc_type in document_types:
-            # Search questions from admin's collection
-            type_questions = question_service.search_questions(
-                query=None,
-                subject=subject,
-                difficulty=difficulty,
-                document_type=doc_type,
-                limit=1000
-            )
-            questions.extend(type_questions)
+        # Get questions from MongoDB
+        questions = await db.mongo_find("questions", query_filter, limit=1000)
 
-        logger.info(f"Fetched {len(questions)} MCQ questions from admin {admin_id} (subject={subject}, difficulty={difficulty}, document_type={document_type or 'all'})")
+        logger.info(f"Fetched {len(questions)} MCQ questions (subject={subject}, difficulty={difficulty}, document_type={document_type or 'all'})")
 
         if not questions:
             raise HTTPException(
@@ -418,12 +407,15 @@ async def get_all_mcq_questions(
                 detail="No MCQ questions found. Please upload documents and process them, or create questions manually."
             )
 
-        # Normalize to list of dicts
-        normalized = [q if isinstance(q, dict) else q.to_dict() for q in questions]
+        # Convert ObjectId to string for serialization
+        for q in questions:
+            if "_id" in q:
+                q["_id"] = str(q["_id"])
+
         return {
             "success": True,
-            "questions": normalized,
-            "count": len(normalized)
+            "questions": questions,
+            "count": len(questions)
         }
 
     except HTTPException:
@@ -445,8 +437,7 @@ async def get_test_series_list(
     db: DatabaseManager = Depends(get_database)
 ):
     """
-    Get list of available Test Series documents
-    Works with ChromaDB data when MongoDB documents are missing
+    Get list of available Test Series documents from MongoDB
     """
     try:
         user_type = current_user.get("user_type", "student")
@@ -693,101 +684,6 @@ async def get_test_series_list(
                 }
             }
 
-        # Fallback to ChromaDB when MongoDB data is missing
-        logger.info("Using ChromaDB fallback for test series list")
-
-        # Use QuestionService for admin-specific ChromaDB access
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Get test series questions from admin's collection
-        test_series_questions = question_service.search_questions(
-            query=None,
-            document_type="Test Series",
-            limit=1000
-        )
-
-        # Extract unique document info from questions
-        unique_docs: Dict[str, Dict[str, Any]] = {}
-        for question in test_series_questions:
-            # question is a dict (QuestionService returns dicts)
-            qdict = question if isinstance(question, dict) else getattr(question, '__dict__', {})
-            meta = qdict.get('metadata') or {}
-            # Prefer explicit pdfSource; fallback to document_id in dict or metadata
-            doc_id = qdict.get('pdfSource') or qdict.get('document_id') or meta.get('document_id') or 'unknown'
-
-            if doc_id not in unique_docs:
-                unique_docs[doc_id] = {
-                    "document_id": doc_id,
-                    "title": f"Test Series - {doc_id}",
-                    "subject": qdict.get('subject', meta.get('subject', 'General')),
-                    "standard": meta.get('standard', "Unknown"),
-                    "course_plan": meta.get('course_plan', "Unknown"),
-                    "difficulty": qdict.get('difficulty', meta.get('difficulty', 'medium')),
-                    "questions_count": 0,
-                    "total_points": 0,
-                    "total_minutes": 0,
-                    "is_validated": False,
-                    "file_exists": False,
-                    "attempted": False,
-                    "attempt_count": 0,
-                    "latest_attempt": None
-                }
-            unique_docs[doc_id]["questions_count"] += 1
-
-        # Check attempt status for each test (ChromaDB fallback)
-        user_id = current_user["user_id"]
-        for doc_id in unique_docs.keys():
-            attempts = await db.mongo_find(
-                "student_test_attempts",
-                {
-                    "student_id": user_id,
-                    "document_id": doc_id
-                },
-                sort=[("submitted_at", -1)]
-            )
-
-            has_attempted = len(attempts) > 0
-            attempt_count = len(attempts)
-
-            if has_attempted:
-                unique_docs[doc_id]["attempted"] = True
-                unique_docs[doc_id]["attempt_count"] = attempt_count
-                unique_docs[doc_id]["latest_attempt"] = {
-                    "attempt_id": str(attempts[0]["_id"]),
-                    "score": attempts[0].get("score", 0),
-                    "total_points": attempts[0].get("total_points", 0),
-                    "percentage": attempts[0].get("percentage", 0),
-                    "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
-                }
-
-        test_series_list = list(unique_docs.values())
-        if not test_series_list or (len(test_series_list) == 1 and test_series_list[0].get("document_id") in (None, "", "unknown")):
-            test_series_list = [{
-                "document_id": "legacy_all",
-                "title": "All Test Series (Legacy)",
-                "subject": subject or "General",
-                "standard": "Unknown",
-                "course_plan": course_plan or "Unknown",
-                "difficulty": difficulty or "medium" if 'difficulty' in locals() else "medium",
-                "questions_count": len(test_series_questions),
-                "total_points": 0,
-                "total_minutes": 0,
-                "is_validated": False,
-                "file_exists": False,
-                "attempted": False,
-                "attempt_count": 0,
-                "latest_attempt": None
-            }]
-
-        return {
-            "success": True,
-            "data": {
-                "test_series": test_series_list,
-                "total": len(test_series_list)
-            }
-        }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -867,8 +763,7 @@ async def get_test_series_questions(
     db: DatabaseManager = Depends(get_database)
 ):
     """
-    Get all questions from a specific Test Series document
-    Works with ChromaDB data when MongoDB documents are missing
+    Get all questions from a specific Test Series document from MongoDB
     No authentication required for basic access
     """
     try:
@@ -1188,21 +1083,6 @@ async def get_test_series_questions(
                     except Exception:
                         pass
                     questions_with_images.append(to_jsonable(payload))
-            else:
-                # 2) Fallback: use Chroma via QuestionService
-                from services.question_service import QuestionService
-                question_service = QuestionService(admin_id)
-                questions = question_service.search_questions(
-                    query=None,
-                    document_type="Test Series",
-                    limit=1000
-                )
-
-                if document_id in ("legacy_all", "all", "ALL"):
-                    questions_with_images = questions
-                else:
-                    questions_with_images = [q for q in questions if q.get('pdfSource', '') == document_id or q.get('document_id', '') == document_id]
-
             return {
                 "success": True,
                 "data": {
@@ -1216,44 +1096,10 @@ async def get_test_series_questions(
                 }
             }
         else:
-            # Fallback: Get questions directly from admin's collection
-            logger.info(f"Document {document_id} not found in MongoDB, searching admin's collection")
-
-            # Get questions from admin's collection
-            from services.question_service import QuestionService
-            question_service = QuestionService(admin_id)
-            questions = question_service.search_questions(
-                query=None,
-                document_type="Test Series",
-                limit=1000
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document not found: {document_id}"
             )
-
-            # Filter by document_id (questions is already a list of dicts)
-            questions_with_images = [q for q in questions if q.get('pdfSource', '') == document_id or q.get('document_id', '') == document_id]
-
-            if not questions_with_images:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"No questions found for document: {document_id}"
-                )
-
-            # Use first question's metadata for document info
-            first_question = questions_with_images[0]
-            doc_title = first_question.get("metadata", {}).get("document_title", f"Test Series {document_id}")
-            doc_subject = first_question.get("subject", "Unknown")
-
-            return {
-                "success": True,
-                "data": {
-                    "document_id": document_id,
-                    "title": doc_title,
-                    "subject": doc_subject,
-                    "total_points": len(questions_with_images) * 4,  # Estimate 4 points per question
-                    "total_minutes": len(questions_with_images) * 2,  # Estimate 2 minutes per question
-                    "questions": questions_with_images,
-                    "total": len(questions_with_images)
-                }
-            }
 
     except HTTPException:
         raise
@@ -1278,34 +1124,22 @@ async def get_random_mcq_question(
     try:
         import random
 
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Build filters
+        # Build filters for MongoDB query
+        query_filter: Dict[str, Any] = {}
+        
         if not document_type:
             # Get both Test Series and Practice Sets
-            document_types = ["Test Series", "Practice Sets"]
+            query_filter["document_type"] = {"$in": ["Test Series", "Practice Sets"]}
         else:
-            document_types = [document_type]
+            query_filter["document_type"] = document_type
+            
+        if subject:
+            query_filter["subject"] = subject
+        if difficulty:
+            query_filter["difficulty"] = difficulty
 
-        questions = []
-        for doc_type in document_types:
-            # Search questions from admin's collection
-            type_questions = question_service.search_questions(
-                query=None,
-                subject=subject,
-                difficulty=difficulty,
-                document_type=doc_type,
-                limit=1000
-            )
-            questions.extend(type_questions)
-
-        logger.info(f"Fetched {len(questions)} MCQ questions from admin {admin_id} collection")
+        # Get questions from MongoDB
+        questions = await db.mongo_find("questions", query_filter, limit=1000)
 
         logger.info(f"Fetched {len(questions)} MCQ questions for random selection (subject={subject}, difficulty={difficulty}, document_type={document_type or 'all'})")
 
@@ -1318,12 +1152,13 @@ async def get_random_mcq_question(
         # Select random question
         random_question = random.choice(questions)
 
-        # Convert to dict for response
-        question_dict = random_question if isinstance(random_question, dict) else random_question.to_dict()
+        # Convert ObjectId to string
+        if "_id" in random_question:
+            random_question["_id"] = str(random_question["_id"])
 
         return {
             "success": True,
-            "question": question_dict
+            "question": random_question
         }
         
     except HTTPException:
@@ -1477,23 +1312,22 @@ async def check_mcq_answer(
                 detail="Missing required fields: question_id and selected_answer"
             )
         
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Get question from admin's collection
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-        question_obj = question_service.get_question(question_id)
-
-        if not question_obj:
+        # Get question from MongoDB
+        question_doc = await db.mongo_find_one("questions", {"id": question_id})
+        
+        if not question_doc:
+            # Try searching by _id as well
+            try:
+                from bson import ObjectId
+                question_doc = await db.mongo_find_one("questions", {"_id": ObjectId(question_id)})
+            except Exception:
+                pass
+                
+        if not question_doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Question not found in your admin's collection"
+                detail="Question not found"
             )
-
-        # Convert to dict format
-        question_doc = question_obj.to_dict()
         
         # Determine question type (default to 'mcq' for backward compatibility)
         question_type = str(question_doc.get("question_type", "")).lower() or "mcq"

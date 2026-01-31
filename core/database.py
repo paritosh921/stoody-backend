@@ -1,21 +1,16 @@
 """
 Async Database Manager for SkillBot
-Handles ChromaDB and MongoDB connections with connection pooling
+Handles MongoDB connections with connection pooling
 """
 
 import asyncio
 import logging
 from typing import Optional, Dict, Any, List
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import ServerSelectionTimeoutError, OperationFailure, ConfigurationError
-import time
 import certifi
 
 from config_async import (
-    CHROMADB_PATH,
-    CHROMADB_COLLECTION_NAME,
     MONGODB_URL,
     MONGODB_DB_NAME,
     MONGODB_DB_MASTER,
@@ -27,30 +22,19 @@ from config_async import (
 logger = logging.getLogger(__name__)
 
 class DatabaseManager:
-    """Manages all database connections with async support"""
+    """Manages MongoDB connections with async support"""
 
     def __init__(self):
-        self.chroma_client: Optional[chromadb.PersistentClient] = None
-        self.chroma_collection = None
         self.mongo_client: Optional[AsyncIOMotorClient] = None
         self.mongo_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_master_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_tenant_dbs: Dict[str, AsyncIOMotorDatabase] = {}
         self.mongo_db_b2c: Optional[AsyncIOMotorDatabase] = None  # B2C database
-        self._chroma_lock = asyncio.Lock()
         self._mongo_lock = asyncio.Lock()
 
     async def initialize(self) -> bool:
-        """Initialize all database connections"""
+        """Initialize database connections"""
         try:
-            # Initialize ChromaDB (non-blocking - failure won't stop startup)
-            try:
-                await self._init_chromadb()
-            except Exception as chroma_error:
-                logger.warning(f"⚠️  ChromaDB initialization failed (continuing without it): {str(chroma_error)}")
-                self.chroma_client = None
-                self.chroma_collection = None
-
             # Initialize MongoDB (if configured and not disabled)
             if MONGODB_URL and not DISABLE_MONGODB:
                 await self._init_mongodb()
@@ -61,41 +45,6 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"❌ Failed to initialize database manager: {str(e)}")
             raise
-
-    async def _init_chromadb(self) -> None:
-        """Initialize ChromaDB with thread safety"""
-        async with self._chroma_lock:
-            try:
-                # Create ChromaDB client in thread executor to avoid blocking
-                loop = asyncio.get_event_loop()
-
-                def create_chroma_client():
-                    return chromadb.PersistentClient(
-                        path=str(CHROMADB_PATH),
-                        settings=ChromaSettings(
-                            anonymized_telemetry=False,
-                            # Allow reset to gracefully handle mixed ChromaDB versions/schemas
-                            allow_reset=True,
-                            is_persistent=True,
-                        )
-                    )
-
-                self.chroma_client = await loop.run_in_executor(None, create_chroma_client)
-
-                # Get or create collection
-                def get_or_create_collection():
-                    return self.chroma_client.get_or_create_collection(
-                        name=CHROMADB_COLLECTION_NAME,
-                        metadata={"description": "SkillBot async questions collection"}
-                    )
-
-                self.chroma_collection = await loop.run_in_executor(None, get_or_create_collection)
-
-                logger.info(f"✅ ChromaDB initialized - Collection: {CHROMADB_COLLECTION_NAME}")
-
-            except Exception as e:
-                logger.error(f"❌ ChromaDB initialization failed: {str(e)}")
-                raise
 
     async def _init_mongodb(self) -> None:
         """Initialize MongoDB with connection pooling"""
@@ -166,12 +115,6 @@ class DatabaseManager:
             except Exception as e:
                 logger.error(f"❌ MongoDB initialization failed: {str(e)}")
                 raise
-
-    async def get_chroma_collection(self):
-        """Get ChromaDB collection with lazy initialization"""
-        if self.chroma_collection is None:
-            await self._init_chromadb()
-        return self.chroma_collection
 
     async def get_mongo_db(self) -> Optional[AsyncIOMotorDatabase]:
         """Get default MongoDB database (legacy/shared) with lazy initialization"""
@@ -306,130 +249,6 @@ class DatabaseManager:
         except OperationFailure as e:
             # Likely existing duplicates preventing index creation
             logger.warning(f"⚠️ Could not create one or more indexes: {str(e)}")
-
-    # ChromaDB async operations
-    async def chroma_add(self, ids: List[str], documents: List[str],
-                        metadatas: Optional[List[Dict[str, Any]]] = None,
-                        embeddings: Optional[List[List[float]]] = None) -> bool:
-        """Add documents to ChromaDB asynchronously"""
-        try:
-            collection = await self.get_chroma_collection()
-            loop = asyncio.get_event_loop()
-
-            await loop.run_in_executor(
-                None,
-                lambda: collection.add(
-                    ids=ids,
-                    documents=documents,
-                    metadatas=metadatas,
-                    embeddings=embeddings
-                )
-            )
-            return True
-        except Exception as e:
-            logger.error(f"ChromaDB add failed: {str(e)}")
-            return False
-
-    async def chroma_query(self, query_texts: List[str], n_results: int = 10,
-                          where: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Query ChromaDB asynchronously"""
-        try:
-            collection = await self.get_chroma_collection()
-            loop = asyncio.get_event_loop()
-
-            results = await loop.run_in_executor(
-                None,
-                lambda: collection.query(
-                    query_texts=query_texts,
-                    n_results=n_results,
-                    where=where
-                )
-            )
-            return results
-        except Exception as e:
-            logger.error(f"ChromaDB query failed: {str(e)}")
-            return {"ids": [], "documents": [], "metadatas": [], "distances": []}
-
-    async def chroma_get(self, ids: Optional[List[str]] = None,
-                        where: Optional[Dict[str, Any]] = None,
-                        limit: Optional[int] = None) -> Dict[str, Any]:
-        """Get documents from ChromaDB asynchronously"""
-        try:
-            collection = await self.get_chroma_collection()
-            loop = asyncio.get_event_loop()
-
-            results = await loop.run_in_executor(
-                None,
-                lambda: collection.get(ids=ids, where=where, limit=limit)
-            )
-            return results
-        except Exception as e:
-            logger.error(f"ChromaDB get failed: {str(e)}")
-            return {"ids": [], "documents": [], "metadatas": []}
-
-    async def chroma_delete(self, ids: Optional[List[str]] = None,
-                           where: Optional[Dict[str, Any]] = None) -> bool:
-        """Delete documents from ChromaDB asynchronously"""
-        try:
-            collection = await self.get_chroma_collection()
-            loop = asyncio.get_event_loop()
-
-            await loop.run_in_executor(
-                None,
-                lambda: collection.delete(ids=ids, where=where)
-            )
-            return True
-        except Exception as e:
-            logger.error(f"ChromaDB delete failed: {str(e)}")
-            return False
-
-    async def chroma_count(self) -> int:
-        """Get document count from ChromaDB asynchronously"""
-        try:
-            collection = await self.get_chroma_collection()
-            loop = asyncio.get_event_loop()
-
-            count = await loop.run_in_executor(
-                None,
-                lambda: collection.count()
-            )
-            return count
-        except Exception as e:
-            logger.error(f"ChromaDB count failed: {str(e)}")
-            return 0
-
-    async def chroma_reset(self) -> bool:
-        """Reset ChromaDB collection (delete all documents)"""
-        try:
-            if not self.chroma_client:
-                logger.warning("ChromaDB client not initialized")
-                return False
-
-            loop = asyncio.get_event_loop()
-
-            # Delete the collection and recreate it
-            await loop.run_in_executor(
-                None,
-                lambda: self.chroma_client.delete_collection(
-                    name=CHROMADB_COLLECTION_NAME
-                )
-            )
-
-            # Recreate the collection
-            self.chroma_collection = await loop.run_in_executor(
-                None,
-                lambda: self.chroma_client.get_or_create_collection(
-                    name=CHROMADB_COLLECTION_NAME,
-                    metadata={"description": "SkillBot async questions collection"}
-                )
-            )
-
-            logger.info(f"✅ ChromaDB collection reset - {CHROMADB_COLLECTION_NAME}")
-            return True
-
-        except Exception as e:
-            logger.error(f"ChromaDB reset failed: {str(e)}")
-            return False
 
     # MongoDB async operations wrapper
     async def mongo_find_one(self, collection_name: str, filter_dict: Dict[str, Any],
@@ -583,21 +402,8 @@ class DatabaseManager:
             return []
 
     async def health_check(self) -> bool:
-        """Check health of all database connections"""
+        """Check health of MongoDB connection"""
         try:
-            # Check ChromaDB
-            chroma_healthy = False
-            try:
-                collection = await self.get_chroma_collection()
-                if collection:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: collection.count()
-                    )
-                    chroma_healthy = True
-            except Exception as e:
-                logger.error(f"ChromaDB health check failed: {str(e)}")
-
-            # Check MongoDB only if enabled
             mongo_healthy = False
             if not DISABLE_MONGODB and self.mongo_client:
                 try:
@@ -617,8 +423,7 @@ class DatabaseManager:
                     self.mongo_db = None
                     mongo_healthy = False
 
-            # Consider overall healthy if ChromaDB is healthy (Mongo is optional)
-            return chroma_healthy
+            return mongo_healthy
 
         except Exception as e:
             logger.error(f"Health check failed: {str(e)}")
@@ -632,7 +437,6 @@ class DatabaseManager:
                 self.mongo_client.close()
                 logger.info("🔌 MongoDB connection closed")
 
-            # ChromaDB doesn't need explicit closing
             logger.info("🔌 Database connections closed")
 
         except Exception as e:
@@ -734,4 +538,3 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"B2C MongoDB delete_many failed: {str(e)}")
             return False
-

@@ -181,7 +181,7 @@ The backend uses:
 - **Uvicorn**: ASGI server for async Python
 - **MongoDB**: Primary database (via Motor async driver)
 - **Redis**: Caching and rate limiting
-- **ChromaDB**: Vector database for RAG/embeddings
+- **MongoDB**: Primary database for all data storage
 - **LangChain**: AI/LLM orchestration
 
 ## API Endpoints

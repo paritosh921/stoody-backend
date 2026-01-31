@@ -1176,27 +1176,6 @@ async def run_document_ocr_pipeline(
             else:
                 await db.mongo_insert_one("questions", question_doc)
 
-            # Store richer metadata so other services can reconstruct the question fully
-            import json as _json_for_full
-            chromadb_metadata = {
-                "document_id": document_id,
-                "document_type": document_type,
-                "subject": document.get("subject", "General"),
-                "difficulty": document.get("difficulty", "medium"),
-                # Align with legacy readers that expect pdfSource
-                "pdfSource": document_id,
-                # Include serialized full data for robust reconstruction paths
-                "fullData": _json_for_full.dumps(question_doc, default=str),
-                "page": question.metadata.get("page", 0)
-                if isinstance(question.metadata.get("page", 0), (int, float)) else 0
-            }
-
-            await db.chroma_add(
-                [question.id],
-                [question.text],
-                [chromadb_metadata]
-            )
-
         # Check if B2C admin for database routing
         is_b2c = is_b2c_admin(current_user)
         
@@ -3279,30 +3258,6 @@ async def create_question(
         # Insert question into MongoDB
         await db.mongo_insert_one("questions", question_doc)
 
-        # Also add to ChromaDB for searchability and MCQ retrieval
-        try:
-            chromadb_metadata = {
-                "document_id": document_id or full_question_id,
-                "document_type": document_type,
-                "course_plan": course_plan,
-                "standard": standard,
-                "subject": subject,
-                "difficulty": difficulty,
-                "source": "manual_creation",
-                "created_by": current_user.get("user_id"),
-                "created_at": datetime.utcnow().isoformat()
-            }
-
-            await db.chroma_add(
-                [full_question_id],
-                [question_text],
-                [chromadb_metadata]
-            )
-            logger.info(f"Added question {full_question_id} to ChromaDB")
-        except Exception as e:
-            logger.warning(f"Failed to add question to ChromaDB: {str(e)}")
-            # Don't fail the request if ChromaDB insertion fails
-
         logger.info(f"Created question {full_question_id} with {len(question_doc['question_figures'])} question images and {len(question_doc['images'])} option images")
 
         return {
@@ -3477,39 +3432,6 @@ async def update_question(
                 detail="No changes were made or question not found"
             )
 
-        # Update in ChromaDB with proper metadata (CRITICAL for categorization)
-        try:
-            # Get updated question data from appropriate database
-            if is_b2c:
-                updated_question = await db.b2c_find_one("questions", {"id": question_id})
-            else:
-                updated_question = await db.mongo_find_one("questions", {"id": question_id})
-
-            # Build updated ChromaDB metadata with all fields
-            chromadb_metadata = {
-                "document_id": updated_question.get("document_id", question_id),
-                "document_type": updated_question.get("document_type", "Chapter Notes"),  # CRITICAL!
-                "subject": updated_question.get("subject", "General"),
-                "difficulty": updated_question.get("difficulty", "medium"),
-                "hasImages": len(updated_question.get("images", [])) > 0 or len(updated_question.get("question_figures", [])) > 0,
-                "imageCount": len(updated_question.get("images", [])) + len(updated_question.get("question_figures", [])),
-                "source": "manual_edit",
-                "updated_by": current_user.get("user_id"),
-                "updated_at": datetime.utcnow().isoformat()
-            }
-
-            # Update ChromaDB (delete and re-add with updated metadata)
-            await db.chroma_delete(ids=[question_id])
-            await db.chroma_add(
-                [question_id],
-                [updated_question.get("text", "")],
-                [chromadb_metadata]
-            )
-            logger.info(f"Updated question {question_id} in ChromaDB with document_type={chromadb_metadata['document_type']}")
-        except Exception as e:
-            logger.warning(f"Failed to update ChromaDB: {str(e)}")
-        # Don't fail the request if ChromaDB update fails
-
         # If points were updated, recalculate document's total_points
         if "points" in update_data:
             # Use document_id consistently (not pdf_source)
@@ -3646,13 +3568,6 @@ async def delete_question(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Question {question_id} not found"
             )
-
-        # Also delete from ChromaDB if it exists there
-        try:
-            await db.chroma_delete(ids=[question_id])
-            logger.info(f"Deleted question {question_id} from ChromaDB")
-        except Exception as e:
-            logger.warning(f"Failed to delete from ChromaDB (may not exist there): {str(e)}")
 
         logger.info(f"Deleted question {question_id} and {deleted_images_count} associated images")
 
@@ -3986,14 +3901,6 @@ async def delete_document(
             questions = await db.mongo_find("questions", {"document_id": document_id})
 
         logger.info(f"Found {len(questions)} questions to delete for document {document_id}")
-
-        for question in questions:
-            # Delete from ChromaDB
-            try:
-                await db.chroma_delete(question["id"])
-                logger.debug(f"Deleted question {question['id']} from ChromaDB")
-            except Exception as e:
-                logger.warning(f"Failed to delete question {question['id']} from ChromaDB: {str(e)}")
 
         # Delete questions from MongoDB
         try:

@@ -16,7 +16,7 @@ class QuestionImage:
     metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for ChromaDB storage"""
+        """Convert to dictionary for storage"""
         return asdict(self)
 
     @classmethod
@@ -60,7 +60,7 @@ class Question:
     metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for ChromaDB storage"""
+        """Convert to dictionary for storage"""
         data = asdict(self)
         # Convert image objects to dictionaries
         data['images'] = [img.to_dict() for img in self.images]
@@ -86,63 +86,3 @@ class Question:
 
         return cls(**data)
 
-    def to_chromadb_format(self) -> tuple:
-        """Convert to ChromaDB format (document, metadata, id)"""
-        # The main text content for ChromaDB embedding
-        document = f"{self.text} {self.subject}"
-        if self.options:
-            document += " " + " ".join(self.options)
-
-        # Include enhanced options in the document for better search
-        if self.enhancedOptions:
-            for opt in self.enhancedOptions:
-                if opt.type == 'text':
-                    document += " " + opt.content
-                if opt.description:
-                    document += " " + opt.description
-
-        # Extract document_type from metadata if not set directly
-        doc_type = self.document_type
-        if not doc_type and self.metadata:
-            doc_type = self.metadata.get('document_type')
-
-        # Metadata for ChromaDB filtering and retrieval
-        metadata = {
-            "subject": self.subject,
-            "difficulty": self.difficulty,
-            "extractedAt": self.extractedAt,
-            "pdfSource": self.pdfSource,
-            "hasImages": len(self.images) > 0,
-            "imageCount": len(self.images),
-            "optionCount": len(self.options) if self.options else 0,
-            "enhancedOptionCount": len(self.enhancedOptions) if self.enhancedOptions else 0,
-            "correctAnswer": self.correctAnswer or "",
-            # CRITICAL: Add document_type as top-level metadata for filtering
-            "document_type": doc_type or "Chapter Notes",  # Default to Chapter Notes for backward compatibility
-            # Store serialized data for full reconstruction
-            "fullData": json.dumps(self.to_dict())
-        }
-
-        return document, metadata, self.id
-
-    @classmethod
-    def from_chromadb_result(cls, document: str, metadata: Dict[str, Any], id: str) -> 'Question':
-        """Create instance from ChromaDB result"""
-        # Reconstruct from stored full data
-        if 'fullData' in metadata:
-            full_data = json.loads(metadata['fullData'])
-            return cls.from_dict(full_data)
-        
-        # Fallback construction from available metadata
-        return cls(
-            id=id,
-            text=document.split(metadata.get('subject', ''))[0].strip(),
-            subject=metadata.get('subject', ''),
-            difficulty=metadata.get('difficulty', 'medium'),
-            extractedAt=metadata.get('extractedAt', datetime.now().isoformat()),
-            pdfSource=metadata.get('pdfSource', ''),
-            images=[],
-            options=None,
-            correctAnswer=metadata.get('correctAnswer', ''),
-            metadata=metadata
-        )

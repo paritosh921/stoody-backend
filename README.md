@@ -1,10 +1,10 @@
 # SkillBot Backend API
 
-Flask backend server for the SkillBot learning platform with ChromaDB integration for persistent question storage and image management.
+FastAPI backend server for the SkillBot learning platform with MongoDB for persistent question storage and image management.
 
 ## Features
 
-- **ChromaDB Integration**: Persistent storage for questions with semantic search capabilities
+- **MongoDB Integration**: Persistent storage for questions with flexible queries
 - **Image Management**: UUID-based file storage system for question images
 - **RESTful API**: Complete CRUD operations for questions and images
 - **CORS Support**: Configured for frontend integration
@@ -84,10 +84,10 @@ curl http://localhost:5000/
 
 ## Data Storage
 
-### ChromaDB
-- **Location**: `./chromadb_data/`
-- **Collection**: `questions`
-- **Features**: Semantic search, metadata filtering, full-text search
+### MongoDB
+- **Database**: Configured via `MONGODB_URI` environment variable
+- **Collections**: `questions`, `documents`, `images`, etc.
+- **Features**: Flexible queries, aggregation, indexing
 
 ### Images
 - **Location**: `./images/`
@@ -204,14 +204,11 @@ backend/
 ├── requirements.txt       # Python dependencies
 ├── models/
 │   ├── question.py        # Question data models
-│   └── chromadb_client.py # ChromaDB client
 ├── services/
-│   ├── question_service.py # Question business logic
 │   └── image_service.py    # Image processing
 ├── routes/
 │   ├── questions.py       # Question API routes
 │   └── images.py          # Image API routes
-├── chromadb_data/         # ChromaDB storage (auto-created)
 └── images/                # Image files (auto-created)
 ```
 
@@ -297,8 +294,7 @@ CMD ["python", "run.py"]
 
 ### Common Issues
 
-1. **ChromaDB errors**: Ensure write permissions for `chromadb_data/`
-2. **Image upload fails**: Check file size and format restrictions
+1. **Image upload fails**: Check file size and format restrictions
 3. **CORS errors**: Verify frontend URL in `config.py`
 4. **Port conflicts**: Use `--port` flag to change port
 

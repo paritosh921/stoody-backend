@@ -56,23 +56,6 @@ python scripts/admin/update_admin_password.py
 
 ## Database Scripts (`database/`)
 
-### `check_chromadb_questions.py`
-**Purpose**: Check and display questions stored in ChromaDB
-
-**Usage**:
-```bash
-cd backend
-python scripts/database/check_chromadb_questions.py
-```
-
-**What it does**:
-- Connects to ChromaDB
-- Lists all questions in the collection
-- Shows metadata and counts
-- Useful for debugging vector database
-
----
-
 ### `check_mongodb_questions.py`
 **Purpose**: Check and display questions stored in MongoDB
 
@@ -106,67 +89,6 @@ python scripts/database/check_documents.py
 - Useful for auditing uploaded content
 
 ---
-
-### `reset_chromadb.py`
-**Purpose**: Delete all data from ChromaDB
-
-**Usage**:
-```bash
-cd backend
-python scripts/database/reset_chromadb.py
-```
-
-**What it does**:
-- Deletes the entire ChromaDB collection
-- Removes all vector embeddings
-- Clears question data from ChromaDB
-
-**⚠️ DANGER**: This is destructive! Only use when you want to completely reset the vector database.
-
-**When to use**:
-- Before re-syncing all questions
-- When ChromaDB is corrupted
-- During testing/development
-
----
-
-### `sync_chromadb.py`
-**Purpose**: Sync questions from MongoDB to ChromaDB
-
-**Usage**:
-```bash
-cd backend
-python scripts/database/sync_chromadb.py
-```
-
-**What it does**:
-- Reads questions from MongoDB
-- Creates vector embeddings
-- Stores in ChromaDB for semantic search
-- Updates existing questions if already synced
-
-**When to use**:
-- After adding new questions via PDF upload
-- After database restoration
-- When ChromaDB is out of sync with MongoDB
-
----
-
-### `sync_questions_to_chromadb.py`
-**Purpose**: Alternative sync script with more detailed logging
-
-**Usage**:
-```bash
-cd backend
-python scripts/database/sync_questions_to_chromadb.py
-```
-
-**What it does**:
-- Similar to `sync_chromadb.py`
-- More verbose output
-- Shows progress per question
-
-**Note**: Consider merging with `sync_chromadb.py` in the future
 
 ---
 
@@ -212,37 +134,16 @@ python scripts/database/check_documents.py
 
 # 2. Check questions were extracted
 python scripts/database/check_mongodb_questions.py
-
-# 3. Sync to ChromaDB for semantic search
-python scripts/database/sync_chromadb.py
-
-# 4. Verify ChromaDB has questions
-python scripts/database/check_chromadb_questions.py
-```
-
-### Database Maintenance
-```bash
-# Check MongoDB and ChromaDB are in sync
-python scripts/database/check_mongodb_questions.py
-python scripts/database/check_chromadb_questions.py
-
-# If counts don't match, re-sync
-python scripts/database/sync_chromadb.py
 ```
 
 ### Complete Database Reset
 ```bash
 # ⚠️ WARNING: This deletes all questions!
 
-# 1. Reset ChromaDB
-python scripts/database/reset_chromadb.py
-
-# 2. Delete questions from MongoDB
+# 1. Delete questions from MongoDB
 mongosh "your_mongodb_uri" --eval "db.questions.deleteMany({})"
 
-# 3. Re-upload PDFs via admin panel
-# 4. Sync to ChromaDB
-python scripts/database/sync_chromadb.py
+# 2. Re-upload PDFs via admin panel
 ```
 
 ### Password Recovery
@@ -277,7 +178,6 @@ Scripts use environment variables from `backend/.env`:
 ```env
 MONGODB_URI=mongodb+srv://...
 MONGODB_DB_NAME=skillbot_db
-CHROMADB_PATH=./chromadb_data
 ```
 
 Ensure `.env` file is properly configured before running scripts.
@@ -287,19 +187,12 @@ Ensure `.env` file is properly configured before running scripts.
 ## Safety Notes
 
 ### Safe Scripts (Read-Only)
-✅ `check_chromadb_questions.py`
 ✅ `check_mongodb_questions.py`
 ✅ `check_documents.py`
 
 ### Moderate Risk (Write Operations)
 ⚠️ `init_admin_direct.py` - Creates admin account
 ⚠️ `update_admin_password.py` - Modifies admin password
-⚠️ `sync_chromadb.py` - Writes to ChromaDB
-⚠️ `sync_questions_to_chromadb.py` - Writes to ChromaDB
-⚠️ `fix_question_document_types.py` - Modifies MongoDB
-
-### High Risk (Destructive)
-🚨 `reset_chromadb.py` - DELETES all ChromaDB data
 
 ---
 
@@ -314,12 +207,6 @@ pip install -r requirements.txt
 ### Script fails with "MongoDB connection error"
 **Solution**: Check `.env` file has correct `MONGODB_URI`
 
-### ChromaDB scripts fail with "Collection not found"
-**Solution**: ChromaDB may be empty. Run sync script:
-```bash
-python scripts/database/sync_chromadb.py
-```
-
 ### "Permission denied" error
 **Solution**: Ensure you're running from backend directory:
 ```bash
@@ -331,7 +218,6 @@ python scripts/database/script_name.py
 
 ## Future Improvements
 
-- [ ] Consolidate `sync_chromadb.py` and `sync_questions_to_chromadb.py`
 - [ ] Add interactive CLI for admin scripts
 - [ ] Add backup/restore utilities
 - [ ] Create student account bulk import script
