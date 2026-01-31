@@ -251,10 +251,6 @@ class AsyncSettings(BaseSettings):
     # Whether Redis is required (fail if unavailable). True in production.
     REDIS_REQUIRED: bool = os.getenv("REDIS_REQUIRED", "true" if os.getenv("NODE_ENV", "production") != "development" else "false").lower() == "true"
 
-    # ChromaDB configuration
-    CHROMADB_PATH: Path = BASE_DIR / "chromadb_data"
-    CHROMADB_COLLECTION_NAME: str = "questions"
-
     # Connection pools
     MONGODB_MIN_POOL_SIZE: int = int(os.getenv("MONGODB_MIN_POOL_SIZE", 50))
     MONGODB_MAX_POOL_SIZE: int = int(os.getenv("MONGODB_MAX_POOL_SIZE", 500))
@@ -377,8 +373,6 @@ GOOGLE_CLIENT_SECRET = settings.GOOGLE_CLIENT_SECRET
 DISABLE_MONGODB = settings.DISABLE_MONGODB
 REDIS_URL = settings.REDIS_URL
 REDIS_REQUIRED = settings.REDIS_REQUIRED
-CHROMADB_PATH = settings.CHROMADB_PATH
-CHROMADB_COLLECTION_NAME = settings.CHROMADB_COLLECTION_NAME
 RATE_LIMIT_DEFAULT = settings.RATE_LIMIT_DEFAULT
 RATE_LIMIT_AUTH = settings.RATE_LIMIT_AUTH
 RATE_LIMIT_UPLOAD = settings.RATE_LIMIT_UPLOAD
@@ -423,7 +417,6 @@ SECURITY_LOG_FILE = settings.SECURITY_LOG_FILE
 # =============================================================================
 
 # Ensure directories exist
-CHROMADB_PATH.mkdir(exist_ok=True)
 IMAGES_DIR.mkdir(exist_ok=True)
 
 # Create logs directory for security logging

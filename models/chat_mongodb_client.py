@@ -1,6 +1,6 @@
 """
 Chat MongoDB Client - MongoDB-based storage for chat conversations
-Replaces ChromaDB for conversation memory and document storage.
+Handles conversation memory and document storage.
 Uses sentence-transformers for embeddings and MongoDB for persistence.
 """
 
@@ -26,7 +26,7 @@ async def get_embeddings_model():
             if _embeddings_model is None:
                 try:
                     from sentence_transformers import SentenceTransformer
-                    # Use the same model as ChromaDB for consistency
+                    # Use a consistent model for embeddings
                     _embeddings_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
                     logger.info("✅ Sentence Transformers model loaded for embeddings")
                 except ImportError:
@@ -60,7 +60,7 @@ def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
 class ChatMongoDBClient:
     """
     MongoDB client for managing chat conversations and RAG documents.
-    Provides similar interface to ChatChromaDBClient for easy migration.
+    Provides interface for conversation memory management.
     
     Collections used:
     - chat_conversations: Stores conversation messages with embeddings

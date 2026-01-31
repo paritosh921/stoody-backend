@@ -1,7 +1,7 @@
 """
 Async Debugger Chat API - Production-Ready with LangChain RAG
 High-performance debugger endpoints with rate limiting, designed for 1000+ concurrent users
-Uses ChromaDB for conversation memory and document RAG
+
 """
 
 import asyncio
@@ -108,7 +108,7 @@ async def debugger_chat(
     Send a chat message and get AI response with conversation memory and RAG
 
     **Features:**
-    - Full conversation context using ChromaDB
+    - Full conversation context using MongoDB
     - RAG with uploaded documents
     - Semantic search for relevant past messages
     - Image analysis support via GPT-5 multimodal processing
@@ -307,7 +307,7 @@ async def get_history(
     user_id: Optional[str] = None  # For validation
 ):
     """
-    Get conversation history for a session from ChromaDB
+    Get conversation history for a session from MongoDB
 
     **SECURITY**: Validates session ownership to prevent unauthorized access
 
@@ -501,7 +501,7 @@ async def health_check(request: Request):
         return {
             'success': True,
             'message': 'Debugger chat service is healthy',
-            'service': 'LangChain + ChromaDB RAG System with GPT-5',
+            'service': 'LangChain + MongoDB RAG System with GPT-5',
             'active_sessions': stats['data']['active_sessions'],
             'timestamp': datetime.now().isoformat()
         }

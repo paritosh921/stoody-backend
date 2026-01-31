@@ -122,7 +122,7 @@ Scripts will install from `requirements.txt`:
 - FastAPI and Uvicorn (web framework)
 - Motor and PyMongo (MongoDB)
 - Redis and aiocache (caching)
-- ChromaDB (vector database)
+- MongoDB (primary database)
 - LangChain ecosystem (AI/LLM)
 - Authentication libraries (JWT, bcrypt)
 - Document processing (PDF, OCR)

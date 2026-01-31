@@ -353,20 +353,10 @@ async def _extract_text_from_document(base64_data: str, doc_type: str, filename:
 
 
 async def _load_question_doc(db: DatabaseManager, qid: str, is_b2c: bool = False) -> Dict[str, Any]:
-    """Fetch question from Chroma (fullData) with Mongo fallback.
+    """Fetch question from MongoDB.
     
-    For B2C users, falls back to B2C database instead of main database.
+    For B2C users, uses B2C database instead of main database.
     """
-    try:
-        chroma = await db.chroma_get(ids=[qid])
-        metas = chroma.get("metadatas") or []
-        if metas and metas[0].get("fullData"):
-            import json as _json
-            return _json.loads(metas[0]["fullData"]) or {}
-    except Exception:
-        pass
-    
-    # Fallback to MongoDB - use B2C database for B2C users
     if is_b2c:
         return await db.b2c_find_one("questions", {"id": qid}) or {}
     return await db.mongo_find_one("questions", {"id": qid}) or {}
@@ -622,12 +612,11 @@ async def get_next_practice_question(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Return a random next question using ChromaDB metadata first, with robust fallbacks.
+    """Return a random next question from MongoDB.
 
     Behavior:
     - Prefer questions tagged as Practice Sets in metadata when available
     - Fall back gracefully to all questions if tag is missing
-    - Avoid hard dependency on MongoDB `questions` collection; use Chroma `fullData`
     - Build figure/image payloads with base64 when available; else serve via images API
     """
     try:
@@ -656,42 +645,32 @@ async def get_next_practice_question(
             # Fall back to defaults if parsing fails; do not reject
             exclude_ids = []
         
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Search for Practice Sets questions from admin's collection
-        practice_questions = question_service.search_questions(
-            query=None,
-            subject=subject,
-            difficulty=difficulty,
-            document_type="Practice Sets",
-            limit=1000  # High limit for randomization
-        )
-
-        logger.info(f"Fetched {len(practice_questions)} Practice Sets questions from admin {admin_id} collection (subject={subject}, difficulty={difficulty})")
-
-        # If no Practice Sets found, do NOT mix in Test Series; keep Hustle strictly Practice Sets
-        # We'll rely on Mongo fallback below which filters by document_type.
-
-        # Convert to the expected format
-        fetched_ids = [q.id for q in practice_questions]
-        # For metadata, we'll need to reconstruct it from the question objects
+        # Get questions from MongoDB (Practice Sets)
+        fetched_ids = []
         metadatas = []
-        for q in practice_questions:
+        
+        # Build filter for Practice Sets
+        mongo_filter: Dict[str, Any] = {"document_type": "Practice Sets"}
+        if subject:
+            mongo_filter["subject"] = subject
+        if difficulty:
+            mongo_filter["difficulty"] = difficulty
+
+        mongo_questions = await db.mongo_find("questions", mongo_filter, limit=1000)
+        fetched_ids = [q.get("id") for q in mongo_questions if q.get("id")]
+        
+        for q in mongo_questions:
             metadata = {
-                "fullData": json.dumps(q.to_dict()),
-                "subject": q.subject,
-                "difficulty": q.difficulty,
-                "document_type": getattr(q, 'document_type', 'Chapter Notes')
+                "fullData": json.dumps(q, default=str),
+                "subject": q.get("subject", ""),
+                "difficulty": q.get("difficulty", "medium"),
+                "document_type": q.get("document_type", "Practice Sets")
             }
             metadatas.append(metadata)
+            
+        logger.info(f"Fetched {len(fetched_ids)} Practice Sets questions from MongoDB (subject={subject}, difficulty={difficulty})")
 
-        # Fallback to MongoDB if ChromaDB has no entries (strictly Practice Sets)
+        # Additional MongoDB fallback if no results
         if not fetched_ids:
             mongo_filter = {"metadata.document_type": "Practice Sets"}
             # Scope by admin
@@ -714,7 +693,7 @@ async def get_next_practice_question(
                 detail="No practice questions found. Please upload Practice Sets documents and process them."
             )
 
-        # If we have metadatas (from Chroma), prefer to refine the pool via fullData
+        # Refine the pool via fullData if available
         if metadatas and fetched_ids:
             refined: List[str] = []
             for qid, md in zip(fetched_ids, metadatas):
@@ -749,19 +728,8 @@ async def get_next_practice_question(
         # Select random question from available
         question_id = random.choice(available_ids)
         
-        # Try to reconstruct question from Chroma fullData first; fallback to Mongo if needed
-        question_doc: Dict[str, Any] = {}
-        try:
-            chroma_one = await db.chroma_get(ids=[question_id])
-            md_list = chroma_one.get('metadatas') or []
-            if md_list and md_list[0].get('fullData'):
-                import json as _json
-                question_doc = _json.loads(md_list[0]['fullData']) or {}
-        except Exception as _e:
-            logger.warning(f"Failed to load fullData for {question_id}: {_e}")
-
-        if not question_doc:
-            question_doc = await db.mongo_find_one("questions", {"id": question_id}) or {}
+        # Get question from MongoDB
+        question_doc = await db.mongo_find_one("questions", {"id": question_id}) or {}
         
         if not question_doc:
             raise HTTPException(
@@ -1022,7 +990,7 @@ async def evaluate_submission(
         if canvas_data and not canvas_data.startswith("data:image"):
             canvas_data = f"data:image/png;base64,{canvas_data}"
 
-        # Fetch question from Chroma (fullData) first; fallback to MongoDB
+        # Fetch question from MongoDB
         # For B2C users, use B2C database
         question_doc = await _load_question_doc(db, qid, is_b2c=is_b2c)
         if not question_doc:
@@ -2201,20 +2169,19 @@ async def grade_submission(
         if canvas_data and not canvas_data.startswith("data:image"):
             canvas_data = f"data:image/png;base64,{canvas_data}"
 
-        # Get admin_id for data isolation
-        from api.v1.questions_async import get_admin_id_from_user
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Get question from admin's collection
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-        question_obj = question_service.get_question(qid)
-
-        if not question_obj:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in your admin's collection")
-
-        # Convert to dict format expected by the evaluation logic
-        q = question_obj.to_dict()
+        # Get question from MongoDB
+        q = await db.mongo_find_one("questions", {"id": qid})
+        
+        if not q:
+            # Try searching by _id as well
+            try:
+                from bson import ObjectId
+                q = await db.mongo_find_one("questions", {"_id": ObjectId(qid)})
+            except Exception:
+                pass
+                
+        if not q:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
 
         ca_primary = q.get("correctAnswer")
         ca_alt = q.get("correct_answer")

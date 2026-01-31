@@ -2160,26 +2160,21 @@ async def get_database_status(
             "online" if mongo_connected else ("disabled" if DISABLE_MONGODB or not MONGODB_URL else "offline")
         )
 
-        # Check ChromaDB connection
-        chroma_healthy = False
-        chroma_count = 0
-        try:
-            chroma_count = await db.chroma_count()
-            chroma_healthy = True
-        except Exception as e:
-            logger.error(f"ChromaDB health check failed: {str(e)}")
+        # Get questions count from MongoDB
+        questions_count = 0
+        if mongo_connected:
+            try:
+                questions_count = await db.mongo_count("questions")
+            except Exception as e:
+                logger.warning(f"Failed to count questions: {str(e)}")
 
         return {
             "success": True,
             "status": {
                 "mongodb": {
                     "connected": mongo_connected,
-                    "status": mongo_status
-                },
-                "chromadb": {
-                    "connected": chroma_healthy,
-                    "status": "online" if chroma_healthy else "offline",
-                    "questions_count": chroma_count
+                    "status": mongo_status,
+                    "questions_count": questions_count
                 }
             }
         }
@@ -2189,8 +2184,7 @@ async def get_database_status(
         return {
             "success": False,
             "status": {
-                "mongodb": {"connected": False, "status": "offline"},
-                "chromadb": {"connected": False, "status": "offline", "questions_count": 0}
+                "mongodb": {"connected": False, "status": "offline", "questions_count": 0}
             }
         }
 

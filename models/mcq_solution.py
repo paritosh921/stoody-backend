@@ -18,7 +18,7 @@ class MCQSolution:
     metadata: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for ChromaDB storage"""
+        """Convert to dictionary for storage"""
         return asdict(self)
 
     @classmethod
@@ -26,44 +26,4 @@ class MCQSolution:
         """Create instance from dictionary"""
         return cls(**data)
 
-    def to_chromadb_format(self) -> tuple:
-        """Convert to ChromaDB format (document, metadata, id)"""
-        # The main text content for ChromaDB embedding
-        document = f"{self.correct_answer} {self.explanation}"
-        
-        # Metadata for ChromaDB filtering and retrieval
-        metadata = {
-            "question_id": self.question_id,
-            "correct_answer": self.correct_answer,
-            "generated_by": self.generated_by,
-            "generated_at": self.generated_at,
-            "llm_model": self.llm_model or "",
-            "confidence_score": self.confidence_score or 0.0,
-            "validated": self.validated,
-            # Store serialized data for full reconstruction
-            "fullData": json.dumps(self.to_dict())
-        }
-        
-        return document, metadata, self.id
 
-    @classmethod
-    def from_chromadb_result(cls, document: str, metadata: Dict[str, Any], id: str) -> 'MCQSolution':
-        """Create instance from ChromaDB result"""
-        # Reconstruct from stored full data
-        if 'fullData' in metadata:
-            full_data = json.loads(metadata['fullData'])
-            return cls.from_dict(full_data)
-        
-        # Fallback construction from available metadata
-        return cls(
-            id=id,
-            question_id=metadata.get('question_id', ''),
-            correct_answer=metadata.get('correct_answer', ''),
-            explanation=document.replace(metadata.get('correct_answer', ''), '').strip(),
-            generated_by=metadata.get('generated_by', 'unknown'),
-            generated_at=metadata.get('generated_at', datetime.now().isoformat()),
-            llm_model=metadata.get('llm_model', None),
-            confidence_score=metadata.get('confidence_score', None),
-            validated=metadata.get('validated', False),
-            metadata=metadata
-        )

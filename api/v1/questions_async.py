@@ -1,6 +1,6 @@
 """
 Async Questions API for SkillBot
-Question management endpoints with ChromaDB integration
+Question management endpoints with MongoDB integration
 """
 
 import json
@@ -164,30 +164,35 @@ async def search_questions(
             # Return cached dict as-is to preserve response shape (incl. `success`)
             return cached_result
 
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
+        # Build MongoDB query filter
+        mongo_filter: Dict[str, Any] = {}
+        if subject:
+            mongo_filter["subject"] = subject
+        if difficulty:
+            mongo_filter["difficulty"] = difficulty
+        if document_type:
+            mongo_filter["document_type"] = document_type
+        if query:
+            # Text search on question text
+            mongo_filter["$or"] = [
+                {"text": {"$regex": query, "$options": "i"}},
+                {"question_text": {"$regex": query, "$options": "i"}}
+            ]
 
-        # Search questions using admin-specific collection
-        questions = question_service.search_questions(
-            query=query,
-            subject=subject,
-            difficulty=difficulty,
-            document_type=document_type,
-            limit=limit
-        )
+        # Search questions from MongoDB
+        questions = await db.mongo_find("questions", mongo_filter, limit=limit)
 
         # Convert questions to response format
         question_responses = []
-        for question in questions:
+        for q in questions:
             question_response = QuestionResponse(
-                id=question.id,
-                text=question.text,
-                subject=question.subject,
-                difficulty=question.difficulty,
-                images=[QuestionImage(id=img.id, filename=img.filename, path=img.path) for img in question.images],
-                options=question.options,
-                enhancedOptions=[QuestionOption(id=opt.id, type=opt.type, content=opt.content, label=opt.label, description=opt.description) for opt in (question.enhancedOptions or [])]
+                id=q.get("id") or str(q.get("_id")),
+                text=q.get("text", q.get("question_text", "")),
+                subject=q.get("subject", ""),
+                difficulty=q.get("difficulty", "medium"),
+                images=q.get("images", []),
+                options=q.get("options", []),
+                enhancedOptions=q.get("enhanced_options")
             )
             question_responses.append(question_response)
 
@@ -243,44 +248,38 @@ async def get_questions(
             # Return cached dict as-is to preserve response shape (incl. `success`)
             return cached_result
 
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Search questions from admin's collection
+        # Build MongoDB query filter
+        mongo_filter: Dict[str, Any] = {}
+        if subject:
+            mongo_filter["subject"] = subject
+        if difficulty:
+            mongo_filter["difficulty"] = difficulty
+        if document_type:
+            mongo_filter["document_type"] = document_type
         if search:
-            all_questions = question_service.search_questions(
-                query=search,
-                subject=subject,
-                difficulty=difficulty,
-                document_type=document_type,
-                limit=1000  # Get more for pagination
-            )
-        else:
-            all_questions = question_service.search_questions(
-                query=None,
-                subject=subject,
-                difficulty=difficulty,
-                document_type=document_type,
-                limit=1000  # Get more for pagination
-            )
+            mongo_filter["$or"] = [
+                {"text": {"$regex": search, "$options": "i"}},
+                {"question_text": {"$regex": search, "$options": "i"}}
+            ]
 
-        # Apply pagination
-        start_idx = (page - 1) * limit
-        end_idx = start_idx + limit
-        paginated_questions = all_questions[start_idx:end_idx]
+        # Get total count for pagination
+        total_count = len(await db.mongo_find("questions", mongo_filter, limit=10000))
+        
+        # Get paginated questions from MongoDB
+        skip = (page - 1) * limit
+        all_questions = await db.mongo_find("questions", mongo_filter, limit=limit, skip=skip)
 
         # Convert to response format
         question_responses = []
-        for question in paginated_questions:
+        for q in all_questions:
             question_response = QuestionResponse(
-                id=question.id,
-                text=question.text,
-                subject=question.subject,
-                difficulty=question.difficulty,
-                images=[QuestionImage(id=img.id, filename=img.filename, path=img.path) for img in question.images],
-                options=question.options,
-                enhancedOptions=[QuestionOption(id=opt.id, type=opt.type, content=opt.content, label=opt.label, description=opt.description) for opt in (question.enhanced_options or [])]
+                id=q.get("id") or str(q.get("_id")),
+                text=q.get("text", q.get("question_text", "")),
+                subject=q.get("subject", ""),
+                difficulty=q.get("difficulty", "medium"),
+                images=q.get("images", []),
+                options=q.get("options", []),
+                enhancedOptions=q.get("enhanced_options")
             )
             question_responses.append(question_response)
 
@@ -324,14 +323,12 @@ async def get_question_stats(
             if cached_stats:
                 return QuestionStats(**cached_stats)
 
-        # Get admin-specific question count
-        admin_id = get_admin_id_from_user(current_user)
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-        total_questions = len(question_service.search_questions(limit=10000))  # Approximate count
+        # Get question count from MongoDB
+        questions = await db.mongo_find("questions", {}, limit=10000)
+        total_questions = len(questions)
 
         # For now, return mock statistics
-        # In production, you'd aggregate this data from ChromaDB metadata
+        # In production, you'd aggregate this data from MongoDB
         stats_data = {
             "total_questions": total_questions,
             "subjects": {
@@ -381,28 +378,32 @@ async def get_question(
         if cached_question:
             return QuestionResponse(**cached_question)
 
-        # Get from admin-specific ChromaDB collection
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Get question from admin's collection
-        question = question_service.get_question(question_id)
-
+        # Get question from MongoDB
+        question = await db.mongo_find_one("questions", {"id": question_id})
+        
+        if not question:
+            # Try searching by _id as well
+            try:
+                from bson import ObjectId
+                question = await db.mongo_find_one("questions", {"_id": ObjectId(question_id)})
+            except Exception:
+                pass
+                
         if not question:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Question not found in your collection"
+                detail="Question not found"
             )
 
-        # Convert Question object to response
+        # Convert to response format
         question_response = QuestionResponse(
-            id=question.id,
-            text=question.text,
-            subject=question.subject,
-            difficulty=question.difficulty,
-            images=[img.to_dict() for img in question.images] if question.images else [],
-            options=[opt.to_dict() for opt in question.options] if question.options else [],
-            enhancedOptions=[opt.to_dict() for opt in question.enhanced_options] if question.enhanced_options else None
+            id=question.get("id") or str(question.get("_id")),
+            text=question.get("text", question.get("question_text", "")),
+            subject=question.get("subject", ""),
+            difficulty=question.get("difficulty", "medium"),
+            images=question.get("images", []),
+            options=question.get("options", []),
+            enhancedOptions=question.get("enhanced_options")
         )
 
         # Cache the result with admin_id (only if cache is available)
@@ -433,21 +434,22 @@ async def save_question(
         # Get admin_id for data isolation
         admin_id = get_admin_id_from_user(current_user)
 
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Convert Pydantic model to dict for question service
+        # Convert Pydantic model to dict and save to MongoDB
         question_dict = question_data.dict()
-
-        # Save question using admin-specific service
-        success, question_id, error = question_service.save_question(question_dict)
-
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=error or "Failed to save question"
+        
+        # Add admin_id for data isolation
+        question_dict["admin_id"] = admin_id
+        
+        # Upsert the question (update if exists, insert if new)
+        existing = await db.mongo_find_one("questions", {"id": question_dict.get("id")})
+        if existing:
+            await db.mongo_update_one(
+                "questions",
+                {"id": question_dict.get("id")},
+                {"$set": question_dict}
             )
+        else:
+            await db.mongo_insert_one("questions", question_dict)
 
         return {
             "success": True,
@@ -483,15 +485,26 @@ async def batch_save_questions(
         # Get admin_id for data isolation
         admin_id = get_admin_id_from_user(current_user)
 
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Convert Pydantic models to dicts
+        # Convert Pydantic models to dicts and save to MongoDB
         question_dicts = [q.dict() for q in questions_data]
-
-        # Save questions using admin-specific service
-        success_count, total_count = question_service.save_questions_batch(question_dicts)
+        success_count = 0
+        total_count = len(question_dicts)
+        
+        for question_dict in question_dicts:
+            try:
+                question_dict["admin_id"] = admin_id
+                existing = await db.mongo_find_one("questions", {"id": question_dict.get("id")})
+                if existing:
+                    await db.mongo_update_one(
+                        "questions",
+                        {"id": question_dict.get("id")},
+                        {"$set": question_dict}
+                    )
+                else:
+                    await db.mongo_insert_one("questions", question_dict)
+                success_count += 1
+            except Exception as e:
+                logger.error(f"Failed to save question {question_dict.get('id')}: {e}")
 
         if success_count == 0:
             raise HTTPException(
@@ -525,9 +538,9 @@ async def create_question(
 ):
     """Create a new question"""
     try:
-        # Prepare document for ChromaDB
-        document = question_data.text
-        metadata = {
+        # Prepare document for MongoDB
+        question_doc = {
+            "id": question_data.id,
             "text": question_data.text,
             "subject": question_data.subject,
             "difficulty": question_data.difficulty,
@@ -541,14 +554,10 @@ async def create_question(
             "createdAt": datetime.utcnow().isoformat()
         }
 
-        # Add to ChromaDB
-        success = await db.chroma_add(
-            ids=[question_data.id],
-            documents=[document],
-            metadatas=[metadata]
-        )
+        # Add to MongoDB
+        result = await db.mongo_insert_one("questions", question_doc)
 
-        if not success:
+        if not result:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to save question"
@@ -583,20 +592,21 @@ async def delete_question(
 ):
     """Delete question by ID from admin-specific collection"""
     try:
-        # Get admin_id for data isolation
-        admin_id = get_admin_id_from_user(current_user)
-
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Delete question from admin's collection
-        success = question_service.delete_question(question_id)
-
-        if not success:
+        # Delete question from MongoDB
+        result = await db.mongo_delete_one("questions", {"id": question_id})
+        
+        if not result:
+            # Try by _id
+            try:
+                from bson import ObjectId
+                result = await db.mongo_delete_one("questions", {"_id": ObjectId(question_id)})
+            except Exception:
+                pass
+                
+        if not result:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Question not found in your collection"
+                detail="Question not found"
             )
 
         return {"success": True, "message": "Question deleted successfully", "question_id": question_id}
@@ -610,53 +620,4 @@ async def delete_question(
             detail="Failed to delete question"
         )
 
-@router.delete("/chromadb/clear")
-@limiter.limit("5/hour")
-async def clear_chromadb(
-    request: Request,
-    current_user: Dict[str, Any] = Depends(require_admin_for_write),
-    db: DatabaseManager = Depends(get_database)
-):
-    """Clear questions from admin's ChromaDB collection"""
-    try:
-        # Get admin_id for data isolation
-        admin_id = get_admin_id_from_user(current_user)
 
-        # Initialize admin-specific question service
-        from services.question_service import QuestionService
-        question_service = QuestionService(admin_id)
-
-        # Get count before clearing (approximate)
-        search_results = question_service.search_questions(limit=10000)
-        count_before = len(search_results)
-
-        # Clear admin's collection by recreating it
-        chromadb_client = question_service.chromadb_client
-        collection_name = chromadb_client.collection_name
-
-        # Delete and recreate the collection
-        try:
-            chromadb_client.client.delete_collection(collection_name)
-        except:
-            pass  # Collection might not exist
-
-        # Recreate empty collection
-        chromadb_client.collection = chromadb_client.client.create_collection(
-            name=collection_name,
-            metadata={"description": f"Questions for admin {admin_id}"}
-        )
-
-        logger.info(f"Admin {admin_id} ChromaDB collection cleared - {count_before} questions removed")
-
-        return {
-            "success": True,
-            "message": f"Your question collection cleared successfully",
-            "questions_removed": count_before
-        }
-
-    except Exception as e:
-        logger.error(f"Clear ChromaDB error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to clear ChromaDB: {str(e)}"
-        )

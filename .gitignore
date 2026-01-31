@@ -17,8 +17,6 @@ node_modules/
 
 # Runtime data & uploads
 uploads/
-chromadb_data/
-data/chromadb_chat/
 images/
 data/tmp/
 logs/

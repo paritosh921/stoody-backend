@@ -157,7 +157,7 @@ WORKER_CONNECTIONS=${WORKER_CONNECTIONS:-2000}
 
 # Create necessary directories
 print_status "Creating application directories..."
-mkdir -p chromadb_data images logs
+mkdir -p images logs
 
 # Set up Supervisor configuration
 print_status "Configuring Supervisor..."

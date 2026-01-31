@@ -57,7 +57,7 @@ The backend server runs:
 - FastAPI application on port 5001
 - Auto-reload enabled in development mode
 - Full async support for high concurrency
-- Integrated with MongoDB, Redis, and ChromaDB
+- Integrated with MongoDB and Redis
 - LangChain-powered AI features
 - OCR processing capabilities
 

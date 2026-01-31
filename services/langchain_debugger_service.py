@@ -1,6 +1,6 @@
 """
 LangChain-based Debugger Chat Service with RAG
-Uses MongoDB for conversation memory and document storage (V2 - NO ChromaDB)
+Uses MongoDB for conversation memory and document storage
 PRODUCTION-READY for 1000+ concurrent users across multiple workers
 Uses Redis for distributed session state
 """
@@ -20,7 +20,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # Use HuggingFaceEmbeddings for FREE local embeddings
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# Local imports - Using MongoDB client instead of ChromaDB
+# Local imports - Using MongoDB client for storage
 from models.chat_mongodb_client import get_chat_mongodb_client, ChatMongoDBClient
 from services.document_processor import get_document_processor
 from services.async_openai_service import AsyncOpenAIService
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class LangChainDebuggerService:
     """
     Production-ready debugger chat service using LangChain
-    - MongoDB for conversation memory and RAG (ChromaDB-free)
+    - MongoDB for conversation memory and RAG
     - Supports 1000+ concurrent users
     - Clean error handling and logging
     - Document upload support (PDF, Word, Images)
@@ -90,7 +90,7 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
 
     def __init__(self):
         """Initialize LangChain debugger service with Redis for multi-worker support"""
-        # MongoDB client for conversation memory (replaces ChromaDB)
+        # MongoDB client for conversation memory
         self.mongo_client: ChatMongoDBClient = None  # Will be initialized async
         self.document_processor = get_document_processor()
         self.openai_service = AsyncOpenAIService()
@@ -118,7 +118,7 @@ Remember: Your goal is to teach, not just answer. Help students develop problem-
             encode_kwargs={'normalize_embeddings': True}  # Better similarity search
         )
 
-        logger.info("🚀 LangChain Debugger Service initialized with MongoDB (ChromaDB-free)")
+        logger.info("🚀 LangChain Debugger Service initialized with MongoDB")
 
     async def _ensure_mongo_client(self):
         """Initialize MongoDB chat client if not already done"""
