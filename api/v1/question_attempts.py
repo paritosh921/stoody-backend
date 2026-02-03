@@ -19,7 +19,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from .dashboard import dashboard_ws_manager
+from api.v1.dashboard import dashboard_ws_manager
 
 logger = logging.getLogger(__name__)
 

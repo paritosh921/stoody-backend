@@ -20,6 +20,12 @@ Pillow==10.1.0
 aiofiles==23.2.1
 
 # ===============================
+# Diagram Engine (Scientific plotting)
+# ===============================
+matplotlib>=3.8.0
+matplotlib-venn>=0.11.0
+
+# ===============================
 # AWS S3 Storage (optional, enable via USE_S3_STORAGE=true)
 # ===============================
 boto3>=1.34.0

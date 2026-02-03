@@ -303,6 +303,33 @@ class AsyncSettings(BaseSettings):
     OPENAI_MAX_TOKENS: int = int(os.getenv("OPENAI_MAX_TOKENS", 2000))
     OPENAI_TEMPERATURE: float = float(os.getenv("OPENAI_TEMPERATURE", 0.7))
 
+    # Qdrant Vector Database Configuration
+    QDRANT_URL: str = os.getenv("QDRANT_URL", "https://941b0324-5307-4db1-ba43-bddfeba2a93a.sa-east-1-0.aws.cloud.qdrant.io:6333")
+    QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
+    QDRANT_COLLECTION_PREFIX: str = os.getenv("QDRANT_COLLECTION_PREFIX", "stoody_notes")
+    
+    # Embedding Configuration
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    EMBEDDING_DIMENSIONS: int = int(os.getenv("EMBEDDING_DIMENSIONS", 1536))
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", 100))
+    
+    # Text Chunking Configuration
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", 1000))
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", 200))
+    
+    # Question Generation Configuration
+    QUESTION_GEN_MODEL: str = os.getenv("QUESTION_GEN_MODEL", "gpt-4o")
+    QUESTION_GEN_TEMPERATURE: float = float(os.getenv("QUESTION_GEN_TEMPERATURE", 0.7))
+    MAX_CONTEXT_CHUNKS: int = int(os.getenv("MAX_CONTEXT_CHUNKS", 10))
+    
+    # Kimi/Moonshot AI Configuration (for question generation)
+    KIMI_API_KEY: str = os.getenv("KIMI_API_KEY", os.getenv("MOONSHOT_API_KEY", ""))
+    KIMI_BASE_URL: str = os.getenv("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+    KIMI_MODEL: str = os.getenv("KIMI_MODEL", "kimi-k2.5")
+    KIMI_VISION_MODEL: str = os.getenv("KIMI_VISION_MODEL", "moonshot-v1-32k-vision-preview")
+    USE_KIMI_FOR_QUESTIONS: bool = os.getenv("USE_KIMI_FOR_QUESTIONS", "true").lower() == "true"
+    USE_KIMI_FOR_DIAGRAMS: bool = os.getenv("USE_KIMI_FOR_DIAGRAMS", "true").lower() == "true"
+
     # Async configuration
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", 8))
     WORKER_CONNECTIONS: int = int(os.getenv("WORKER_CONNECTIONS", 2000))
@@ -402,6 +429,33 @@ MAX_IMAGE_SIZE = settings.MAX_IMAGE_SIZE
 ALLOWED_IMAGE_EXTENSIONS = settings.ALLOWED_IMAGE_EXTENSIONS
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 OPENAI_MODEL = settings.OPENAI_MODEL
+
+# Kimi/Moonshot configuration
+KIMI_API_KEY = settings.KIMI_API_KEY
+KIMI_BASE_URL = settings.KIMI_BASE_URL
+KIMI_MODEL = settings.KIMI_MODEL
+USE_KIMI_FOR_QUESTIONS = settings.USE_KIMI_FOR_QUESTIONS
+USE_KIMI_FOR_DIAGRAMS = settings.USE_KIMI_FOR_DIAGRAMS
+
+# Qdrant configuration
+QDRANT_URL = settings.QDRANT_URL
+QDRANT_API_KEY = settings.QDRANT_API_KEY
+QDRANT_COLLECTION_PREFIX = settings.QDRANT_COLLECTION_PREFIX
+
+# Embedding configuration
+EMBEDDING_MODEL = settings.EMBEDDING_MODEL
+EMBEDDING_DIMENSIONS = settings.EMBEDDING_DIMENSIONS
+EMBEDDING_BATCH_SIZE = settings.EMBEDDING_BATCH_SIZE
+
+# Chunking configuration
+CHUNK_SIZE = settings.CHUNK_SIZE
+CHUNK_OVERLAP = settings.CHUNK_OVERLAP
+
+# Question generation configuration
+QUESTION_GEN_MODEL = settings.QUESTION_GEN_MODEL
+QUESTION_GEN_TEMPERATURE = settings.QUESTION_GEN_TEMPERATURE
+MAX_CONTEXT_CHUNKS = settings.MAX_CONTEXT_CHUNKS
+
 MAX_WORKERS = settings.MAX_WORKERS
 WORKER_CONNECTIONS = settings.WORKER_CONNECTIONS
 OPENAI_CONCURRENCY_LIMIT = settings.OPENAI_CONCURRENCY_LIMIT

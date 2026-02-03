@@ -39,7 +39,7 @@ class AsyncOpenAIService:
                             max_connections=100,
                             keepalive_expiry=30
                         ),
-                        timeout=httpx.Timeout(30.0)
+                        timeout=httpx.Timeout(120.0)  # Increased for complex tasks
                     )
 
                     # Initialize OpenAI client
@@ -224,7 +224,7 @@ Focus on being supportive while helping students improve their work and understa
                 "model": used_model,
                 "messages": messages,
                 "temperature": temperature,
-                "timeout": 30.0
+                "timeout": 120.0
             }
 
             # Use max_completion_tokens for newer models, max_tokens for older ones
@@ -269,6 +269,109 @@ Focus on being supportive while helping students improve their work and understa
                 "success": False,
                 "error": str(e),
                 "response": None
+            }
+
+    async def chat_completion_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0.7,
+        max_tokens: int = 2000,
+        model: Optional[str] = None,
+        tool_choice: str = "auto"
+    ) -> Dict[str, Any]:
+        """
+        Generate chat completion with tool/function calling support.
+        
+        Args:
+            messages: List of message dicts with role and content
+            tools: List of tool definitions (OpenAI function calling format)
+            temperature: Sampling temperature (0-2)
+            max_tokens: Maximum tokens in response
+            model: Model to use (default: gpt-4o)
+            tool_choice: Tool choice strategy ("auto", "none", or specific tool)
+            
+        Returns:
+            Dict with success status, message (including tool_calls if any), and metadata
+        """
+        await self._initialize_client()
+
+        if not self.client:
+            return {
+                "success": False,
+                "error": "OpenAI client not initialized",
+                "message": None
+            }
+
+        try:
+            used_model = model or "gpt-4o"
+            
+            completion_params = {
+                "model": used_model,
+                "messages": messages,
+                "temperature": temperature,
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "timeout": 60.0
+            }
+            
+            # Use appropriate token parameter for the model
+            if any(m in used_model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1']):
+                completion_params['max_completion_tokens'] = max_tokens
+            else:
+                completion_params['max_tokens'] = max_tokens
+
+            start_time = time.time()
+            
+            response = await self._call_with_concurrency(
+                self.client.chat.completions.create,
+                **completion_params
+            )
+            
+            response_time = time.time() - start_time
+            
+            # Extract the message which may contain tool_calls
+            message = response.choices[0].message
+            
+            # Convert to dict format for easier handling
+            message_dict = {
+                "role": message.role,
+                "content": message.content,
+            }
+            
+            # Add tool_calls if present
+            if message.tool_calls:
+                message_dict["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    for tc in message.tool_calls
+                ]
+            
+            return {
+                "success": True,
+                "message": message_dict,
+                "model": response.model,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                },
+                "response_time": response_time,
+                "finish_reason": response.choices[0].finish_reason
+            }
+
+        except Exception as e:
+            logger.error(f"OpenAI API error (tools): {str(e)}")
+            return {
+                "success": False,
+                "error": str(e),
+                "message": None
             }
 
     async def get_model_info_async(self) -> Dict[str, Any]:
@@ -409,6 +512,99 @@ Focus on being supportive while helping students improve their work and understa
 
         except Exception as e:
             logger.error(f"Multi-image analysis error: {str(e)}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    async def chat_completion_with_image_async(
+        self,
+        prompt: str,
+        image_base64: str,
+        max_tokens: int = 1000,
+        temperature: float = 0.3,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send chat completion request with a base64 encoded image.
+        
+        Used for diagram verification where we need to validate that
+        a generated diagram matches the question requirements.
+        
+        Args:
+            prompt: The text prompt/question
+            image_base64: Base64 encoded image data (without data URI prefix)
+            max_tokens: Maximum tokens for response
+            temperature: Temperature for response generation
+            model: Optional model override (defaults to self.model)
+            
+        Returns:
+            Dict with success status and response or error
+        """
+        await self._initialize_client()
+
+        if not self.client:
+            return {
+                "success": False,
+                "error": "OpenAI client not initialized"
+            }
+
+        try:
+            # Build the image URL with base64 data
+            # Auto-detect image type from base64 data or default to png
+            image_url = f"data:image/png;base64,{image_base64}"
+            
+            # Check if it might be a JPEG (starts with /9j/ in base64)
+            if image_base64.startswith('/9j/'):
+                image_url = f"data:image/jpeg;base64,{image_base64}"
+
+            content = [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url,
+                        "detail": "high"  # Use high detail for diagram verification
+                    }
+                }
+            ]
+
+            messages = [{"role": "user", "content": content}]
+
+            use_model = model or self.model
+            
+            completion_params = {
+                "model": use_model,
+                "messages": messages,
+                "temperature": temperature
+            }
+
+            # Use max_completion_tokens for newer models
+            if any(m in use_model.lower() for m in ['gpt-5.1', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini', 'gpt-4o']):
+                completion_params['max_completion_tokens'] = max_tokens
+            else:
+                completion_params['max_tokens'] = max_tokens
+
+            logger.info(f"Sending image verification request to {use_model}")
+            
+            response = await self._call_with_concurrency(
+                self.client.chat.completions.create,
+                **completion_params
+            )
+
+            return {
+                "success": True,
+                "response": response.choices[0].message.content,
+                "model": response.model,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Chat completion with image error: {str(e)}")
             return {
                 "success": False,
                 "error": str(e)

@@ -192,6 +192,42 @@ except Exception as e:
     _superadmin_available = False
     logging.warning(f"Super Admin routes disabled: {str(e)}")
 
+# Diagram Generation routes (educational diagram rendering)
+try:
+    from api.v1.diagrams import router as diagrams_router
+    _diagrams_available = True
+except Exception as e:
+    diagrams_router = None
+    _diagrams_available = False
+    logging.warning(f"Diagram routes disabled: {str(e)}")
+
+# Knowledge Base routes (RAG for question generation)
+try:
+    from api.v1.knowledge_base import router as knowledge_base_router
+    _knowledge_base_available = True
+except Exception as e:
+    knowledge_base_router = None
+    _knowledge_base_available = False
+    logging.warning(f"Knowledge Base routes disabled: {str(e)}")
+
+# Question Generation routes (RAG-based question paper generation)
+try:
+    from api.v1.question_generation import router as question_generation_router
+    _question_generation_available = True
+except Exception as e:
+    question_generation_router = None
+    _question_generation_available = False
+    logging.warning(f"Question Generation routes disabled: {str(e)}")
+
+# Papers routes (Paper management and PDF generation)
+try:
+    from api.v1.papers import router as papers_router
+    _papers_available = True
+except Exception as e:
+    papers_router = None
+    _papers_available = False
+    logging.warning(f"Papers routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -872,6 +908,50 @@ if _superadmin_available and superadmin_router:
     logger.info("✅ Super Admin routes enabled")
 else:
     logger.warning("⚠️ Super Admin routes disabled")
+
+# Diagram Generation routes (educational diagrams for question papers)
+if _diagrams_available and diagrams_router:
+    app.include_router(
+        diagrams_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["Diagrams"]
+    )
+    logger.info("✅ Diagram Generation routes enabled")
+else:
+    logger.warning("⚠️ Diagram Generation routes disabled")
+
+# Knowledge Base routes (RAG-based document storage and semantic search)
+if _knowledge_base_available and knowledge_base_router:
+    app.include_router(
+        knowledge_base_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["Knowledge Base"]
+    )
+    logger.info("✅ Knowledge Base routes enabled")
+else:
+    logger.warning("⚠️ Knowledge Base routes disabled")
+
+# Question Generation routes (RAG-based question paper generation)
+if _question_generation_available and question_generation_router:
+    app.include_router(
+        question_generation_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["Question Generation"]
+    )
+    logger.info("✅ Question Generation routes enabled")
+else:
+    logger.warning("⚠️ Question Generation routes disabled")
+
+# Papers routes (Paper management and PDF generation)
+if _papers_available and papers_router:
+    app.include_router(
+        papers_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["Papers"]
+    )
+    logger.info("✅ Papers routes enabled")
+else:
+    logger.warning("⚠️ Papers routes disabled")
 
 
 # Static file serving

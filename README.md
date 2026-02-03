@@ -181,7 +181,7 @@ Edit `config.py` to customize settings:
 
 ```python
 # Database configuration
-CHROMADB_COLLECTION_NAME = "questions"
+
 
 # Image storage
 MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB

@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from ..models.raw_frames import RawFrameIn, RawFrameBatchIn
+from models.raw_frames import RawFrameIn, RawFrameBatchIn
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

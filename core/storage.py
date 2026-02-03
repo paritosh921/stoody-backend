@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Iterable, List, Dict, Any
 
-from ..models.raw_frames import RawFrameCanonical, Stroke
+from models.raw_frames import RawFrameCanonical, Stroke
 
 
 class Storage:
