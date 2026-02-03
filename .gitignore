@@ -27,3 +27,5 @@ logs/
 .idea/
 .vscode/
 *.pem
+.env.local
+.env*
