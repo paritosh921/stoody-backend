@@ -159,6 +159,10 @@ SUBJECT: {subject}
    ✓ Values explicitly stated: "mass = 5 kg", "force = 50 N", "angle = 30°"
    ✓ Given relationships: "A is twice B"
    ✓ For MOLECULES: Provide "smiles" string if possible (e.g. "C(Cl)(Cl)(Cl)Cl" for CCl4)
+   ✓ For REACTIONS: Extract "reactants" as a list and "products" as a list
+     Example: {{"reactants": ["H2", "O2"], "products": ["H2O"], "equation": "2H2 + O2 → 2H2O"}}
+     NEVER use placeholder letters like 'A', 'B', 'C' - always use actual formulas!
+   ✓ For LAB SETUPS: Extract measurements like "h_diff": "45 mm"
    ❌ DO NOT calculate derived values (like F=ma results)
    ❌ DO NOT solve for unknowns
    ❌ DO NOT show answers
@@ -196,10 +200,26 @@ SUBJECT: {subject}
 {{
     "diagram_type": "type_name",
     "subject": "{subject}",
-    
+
     "extracted_values": {{
-        "value_name": "value with unit",
-        "example": "50 N"
+        // For PHYSICS: numerical values
+        "mass": "5 kg",
+        "angle": "30°",
+        "force": "50 N",
+
+        // For CHEMISTRY REACTIONS: use actual formulas, NOT placeholders!
+        "reactants": ["H2", "O2"],
+        "products": ["H2O"],
+        "equation": "2H2 + O2 → 2H2O",
+        "conditions": ["heat", "catalyst"],
+
+        // For MOLECULES: provide SMILES
+        "smiles": "CCO",
+        "molecule_name": "Ethanol",
+
+        // For LAB SETUPS: measurements
+        "h_diff": "45 mm",
+        "fluid": "Mercury"
     }},
     
     "objects": [
@@ -303,15 +323,30 @@ FEEDBACK / ISSUES TO FIX:
 
 TASK:
 Update the JSON plan to address the feedback.
-- Keep the structure valid
-- Only change what needs to be fixed
-- RETAIN all existing objects, labels, and values unless explicitly asked to remove them
-- Ensure all extraction rules still apply (no calculations, only given values)
-- For specialized diagrams (molecules, circuits), UPDATE the 'extracted_values' (e.g. 'smiles', 'formula') to fix the content
-- Ensure the complexity remains appropriate
+
+RULES:
+1. Keep the JSON structure valid (proper quotes, no trailing commas)
+2. Only change what needs to be fixed
+3. RETAIN all existing objects, labels, and values unless explicitly asked to remove them
+4. Ensure all extraction rules still apply (no calculations, only given values)
+5. Ensure the complexity remains appropriate
+
+IMPORTANT FOR SPECIFIC DIAGRAM TYPES:
+- For REACTION SCHEMES: Update 'extracted_values' with actual 'reactants' (list) and 'products' (list)
+  Example: "extracted_values": {{"reactants": ["H2", "O2"], "products": ["H2O"], "equation": "2H2 + O2 → 2H2O"}}
+  DO NOT use placeholder values like 'A', 'B', 'C' - use actual chemical formulas from the question!
+
+- For MOLECULES: Update 'extracted_values' with 'smiles' or 'formula'
+  Example: "extracted_values": {{"smiles": "CCO", "molecule_name": "Ethanol"}}
+
+- For CIRCUITS: Update 'extracted_values' with component values
+  Example: "extracted_values": {{"voltage": "9V", "resistance": "10Ω"}}
+
+- For LAB SETUPS: Update 'extracted_values' with measurement values
+  Example: "extracted_values": {{"h_diff": "45 mm", "fluid": "Mercury"}}
 
 RESPONSE FORMAT:
-Return ONLY the full valid JSON of the updated plan.
+Return ONLY the full valid JSON of the updated plan. No explanation, no markdown, just the JSON object.
 """
 
 
@@ -499,16 +534,33 @@ class DiagramPlanner:
     def _parse_plan_response(self, response_text: str, subject: str) -> Tuple[Optional[DiagramPlan], List[str]]:
         """Parse LLM response into DiagramPlan"""
         warnings = []
-        
+
         try:
+            # Log response length for debugging
+            logger.debug(f"Parsing plan response: {len(response_text)} chars")
+
+            if not response_text or len(response_text.strip()) < 10:
+                warnings.append(f"Response too short ({len(response_text)} chars)")
+                return None, warnings
+
             # Extract JSON from response
             json_str = self._extract_json(response_text)
-            
+
             if not json_str:
+                # Log first 500 chars of response for debugging
+                logger.warning(f"Could not extract JSON from response. First 500 chars: {response_text[:500]}")
                 warnings.append("Could not extract JSON from planning response")
                 return None, warnings
-            
-            data = json.loads(json_str)
+
+            logger.debug(f"Extracted JSON: {len(json_str)} chars")
+
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decode error at position {e.pos}: {e.msg}")
+                logger.warning(f"JSON snippet around error: ...{json_str[max(0, e.pos-50):e.pos+50]}...")
+                warnings.append(f"JSON parse error: {e.msg}")
+                return None, warnings
             
             # Parse objects
             objects = []
@@ -579,17 +631,225 @@ class DiagramPlanner:
             return None, warnings
     
     def _extract_json(self, text: str) -> Optional[str]:
-        """Extract JSON from LLM response"""
-        # Remove markdown code blocks
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```\s*', '', text)
-        
-        # Try to find JSON object
+        """
+        Extract JSON from LLM response.
+
+        Handles various formats including:
+        - Plain JSON
+        - JSON wrapped in markdown code blocks (```json, ```JSON, ```)
+        - JSON with leading/trailing text
+        - JSON with nested objects/arrays
+        - Truncated JSON (attempts to fix)
+        """
+        if not text:
+            return None
+
+        original_text = text
+
+        # Strategy 1: Handle markdown code blocks more robustly
+        # Match ```json or ```JSON followed by content and closing ```
+        code_block_match = re.search(r'```(?:json|JSON)?\s*\n?([\s\S]*?)```', text)
+        if code_block_match:
+            text = code_block_match.group(1).strip()
+            logger.debug(f"Extracted from code block: {len(text)} chars")
+        else:
+            # Remove any stray backticks
+            text = re.sub(r'`{1,3}(?:json|JSON)?\s*', '', text)
+            text = re.sub(r'`{1,3}\s*$', '', text)
+
+        # Strategy 2: Try direct JSON parse first (fastest if already clean)
+        text_stripped = text.strip()
+        if text_stripped.startswith('{') and text_stripped.endswith('}'):
+            try:
+                json.loads(text_stripped)
+                return text_stripped
+            except json.JSONDecodeError:
+                # Try fixing common issues
+                fixed = self._fix_common_json_issues(text_stripped)
+                try:
+                    json.loads(fixed)
+                    return fixed
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 3: Use brace matching to find the outermost JSON object
+        start_idx = text.find('{')
+        if start_idx == -1:
+            # Maybe it's in the original text
+            start_idx = original_text.find('{')
+            if start_idx != -1:
+                text = original_text
+            else:
+                return None
+
+        # Count braces to find matching closing brace
+        depth = 0
+        in_string = False
+        escape_next = False
+        end_idx = -1
+
+        for i, char in enumerate(text[start_idx:], start_idx):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == '\\' and in_string:
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    end_idx = i
+                    break
+
+        if end_idx > start_idx:
+            json_str = text[start_idx:end_idx + 1]
+
+            # Validate it's actually valid JSON
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError as e:
+                logger.debug(f"Brace-matched JSON invalid: {e}")
+                # Try to fix common issues
+                json_str = self._fix_common_json_issues(json_str)
+                try:
+                    json.loads(json_str)
+                    return json_str
+                except json.JSONDecodeError:
+                    pass
+        elif depth > 0:
+            # JSON appears truncated - try to close it
+            logger.warning(f"JSON appears truncated (unclosed braces: {depth}). Attempting to fix...")
+            json_str = text[start_idx:]
+            json_str = self._attempt_json_completion(json_str, depth)
+            if json_str:
+                try:
+                    json.loads(json_str)
+                    return json_str
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 4: Fallback - try greedy regex and fix
         brace_match = re.search(r'\{[\s\S]*\}', text)
         if brace_match:
-            return brace_match.group()
-        
+            json_str = brace_match.group()
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError:
+                json_str = self._fix_common_json_issues(json_str)
+                try:
+                    json.loads(json_str)
+                    return json_str
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON after fixes: {e}. First 200 chars: {json_str[:200]}")
+
         return None
+
+    def _attempt_json_completion(self, json_str: str, unclosed_depth: int) -> Optional[str]:
+        """
+        Attempt to complete truncated JSON by adding closing braces/brackets.
+
+        This is a best-effort fix for when the LLM response is cut off.
+        """
+        # First, fix common issues
+        json_str = self._fix_common_json_issues(json_str)
+
+        # Try progressively adding closing characters
+        for attempt in range(unclosed_depth + 3):
+            test_str = json_str
+
+            # Count current bracket imbalance
+            open_braces = test_str.count('{') - test_str.count('}')
+            open_brackets = test_str.count('[') - test_str.count(']')
+
+            # Add closing brackets first, then braces
+            test_str += ']' * max(0, open_brackets)
+            test_str += '}' * max(0, open_braces)
+
+            try:
+                json.loads(test_str)
+                logger.info(f"Successfully completed truncated JSON by adding {open_brackets} ] and {open_braces} }}")
+                return test_str
+            except json.JSONDecodeError:
+                # Try removing trailing comma before closing
+                test_str = re.sub(r',\s*$', '', json_str)
+                test_str += ']' * max(0, open_brackets)
+                test_str += '}' * max(0, open_braces)
+                try:
+                    json.loads(test_str)
+                    return test_str
+                except json.JSONDecodeError:
+                    pass
+
+        return None
+
+    def _fix_common_json_issues(self, json_str: str) -> str:
+        """
+        Fix common JSON issues in LLM responses.
+
+        Common problems:
+        - Trailing commas before ] or }
+        - Single quotes instead of double quotes
+        - Unescaped newlines in strings
+        - Comments (// and /* */)
+        - Control characters
+        - Unicode issues
+        - Missing quotes around keys
+        """
+        # Remove single-line comments (// ...)
+        json_str = re.sub(r'//[^\n]*', '', json_str)
+
+        # Remove multi-line comments (/* ... */)
+        json_str = re.sub(r'/\*[\s\S]*?\*/', '', json_str)
+
+        # Remove trailing commas before } or ] (common LLM mistake)
+        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
+
+        # Remove leading commas after { or [ (rare but happens)
+        json_str = re.sub(r'([{\[])\s*,', r'\1', json_str)
+
+        # Replace single quotes around keys/values with double quotes
+        # Only do this if the JSON looks like it uses single quotes primarily
+        if json_str.count("'") > json_str.count('"'):
+            # More sophisticated replacement - handle escaped quotes
+            json_str = re.sub(r"(?<!\\)'", '"', json_str)
+
+        # Fix unquoted keys (common in some LLM responses)
+        # Match word characters followed by colon that aren't already quoted
+        json_str = re.sub(r'(?<=[{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'"\1":', json_str)
+
+        # Remove control characters that break JSON parsing (except newlines/tabs in structure)
+        # This is important for handling weird LLM outputs
+        json_str = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', json_str)
+
+        # Fix common escaping issues - double-escaped newlines
+        json_str = json_str.replace('\\\\n', '\\n')
+
+        # Replace actual newlines inside string values with escaped newlines
+        # This is tricky - we only want to do this inside strings
+        # For now, just ensure there are no unescaped newlines causing issues
+        json_str = re.sub(r'(?<!\\)\n(?=.*"[^"]*$)', '\\n', json_str)
+
+        # Remove any BOM characters
+        json_str = json_str.replace('\ufeff', '')
+
+        # Normalize whitespace (but preserve structure)
+        json_str = re.sub(r'\r\n', '\n', json_str)
+        json_str = re.sub(r'\r', '\n', json_str)
+
+        return json_str
     
     def validate_plan(self, plan: DiagramPlan) -> ValidationResult:
         """

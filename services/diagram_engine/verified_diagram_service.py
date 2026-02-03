@@ -676,6 +676,9 @@ class VerifiedDiagramService:
             self._extract_circuit_voltage(spec, plan)
         elif "molecule" in engine_type:
             spec["molecule"] = self._build_molecule_spec(plan, question_text)
+        elif engine_type == "reaction_scheme":
+            # ENHANCED: Extract reactants and products for chemical reactions
+            self._extract_reaction_components(spec, plan, question_text)
         elif "ray_diagram" in engine_type:
             spec["optics"] = self._build_optics_spec(plan)
             # ENHANCED: Pass focal length, object distance etc from extracted values
@@ -795,9 +798,9 @@ class VerifiedDiagramService:
     def _build_molecule_spec(self, plan: DiagramPlan, question_text: str) -> Dict[str, Any]:
         """Build molecule spec, trying to extract SMILES or formula."""
         import re
-        
+
         mol_spec = {}
-        
+
         # Try to find SMILES in extracted values
         if plan.extracted_values:
             for key, val in plan.extracted_values.items():
@@ -807,7 +810,7 @@ class VerifiedDiagramService:
                     mol_spec["formula"] = val
                 elif "name" in key.lower() and not mol_spec.get("name"):
                     mol_spec["name"] = val
-        
+
         # Try to extract common molecule names or formulas from question
         if not mol_spec.get("smiles") and not mol_spec.get("formula"):
             # Common molecule patterns
@@ -817,8 +820,138 @@ class VerifiedDiagramService:
                 if len(match) > 1 and any(c.isdigit() for c in match):
                     mol_spec["formula"] = match
                     break
-        
+
         return mol_spec
+
+    def _extract_reaction_components(
+        self,
+        spec: Dict[str, Any],
+        plan: DiagramPlan,
+        question_text: str
+    ) -> None:
+        """
+        Extract reactants and products for chemical reaction diagrams.
+
+        Looks for reaction components in:
+        - plan.extracted_values under various keys
+        - Direct 'equation' or 'reaction' strings that can be parsed
+        - Question text for chemical formulas
+
+        Args:
+            spec: The spec dict to update (modified in place)
+            plan: The diagram plan
+            question_text: The original question text
+        """
+        import re
+
+        extracted = plan.extracted_values or {}
+        reactants = []
+        products = []
+        conditions = []
+
+        # 1. Check for direct 'reactants'/'products' lists
+        if extracted.get('reactants'):
+            val = extracted['reactants']
+            if isinstance(val, list):
+                reactants = [r for r in val if r and r not in ['A', 'B', '?']]
+            elif isinstance(val, str):
+                reactants = [r.strip() for r in re.split(r'[,+]', val) if r.strip() and r.strip() not in ['A', 'B', '?']]
+
+        if extracted.get('products'):
+            val = extracted['products']
+            if isinstance(val, list):
+                products = [p for p in val if p and p not in ['C', '?']]
+            elif isinstance(val, str):
+                products = [p.strip() for p in re.split(r'[,+]', val) if p.strip() and p.strip() not in ['C', '?']]
+
+        # 2. Check for 'equation' or 'reaction' string to parse
+        equation = extracted.get('equation') or extracted.get('reaction') or extracted.get('chemical_equation')
+        if equation and isinstance(equation, str):
+            # Parse equation like "H2 + O2 -> H2O" or "2Na + Cl2 → 2NaCl"
+            arrow_pattern = r'(?:->|→|⟶|=|⇌|-->)'
+            parts = re.split(arrow_pattern, equation)
+            if len(parts) >= 2:
+                left_side = parts[0].strip()
+                right_side = parts[-1].strip()
+
+                # Parse left side (reactants)
+                if not reactants:
+                    left_comps = re.split(r'\s*\+\s*', left_side)
+                    for comp in left_comps:
+                        # Remove leading coefficient
+                        clean = re.sub(r'^\d+\s*', '', comp.strip())
+                        if clean and clean not in ['A', 'B', '?', '']:
+                            reactants.append(clean)
+
+                # Parse right side (products)
+                if not products:
+                    right_comps = re.split(r'\s*\+\s*', right_side)
+                    for comp in right_comps:
+                        # Remove leading coefficient
+                        clean = re.sub(r'^\d+\s*', '', comp.strip())
+                        if clean and clean not in ['C', '?', '']:
+                            products.append(clean)
+
+        # 3. Check for numbered keys like 'reactant_1', 'reactant_2', etc.
+        for key, val in extracted.items():
+            key_lower = key.lower()
+            if 'reactant' in key_lower and val:
+                if isinstance(val, str) and val not in ['A', 'B', '?', '']:
+                    if val not in reactants:
+                        reactants.append(val)
+            elif 'product' in key_lower and val:
+                if isinstance(val, str) and val not in ['C', '?', '']:
+                    if val not in products:
+                        products.append(val)
+            elif 'condition' in key_lower or 'catalyst' in key_lower or 'temp' in key_lower:
+                if val:
+                    conditions.append(str(val))
+
+        # 4. If still empty, try to extract from question text
+        if not reactants or not products:
+            # Look for chemical formulas in question
+            formula_pattern = r'\b([A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)+)\b'
+            all_formulas = re.findall(formula_pattern, question_text)
+            # Deduplicate while preserving order
+            seen = set()
+            unique_formulas = []
+            for f in all_formulas:
+                if f not in seen:
+                    seen.add(f)
+                    unique_formulas.append(f)
+
+            # Look for patterns like "reaction of X with Y to form Z"
+            reaction_pattern = r'reaction\s+(?:of\s+)?(.+?)\s+(?:with|and)\s+(.+?)\s+(?:to\s+(?:form|produce|give)\s+)?(.+?)(?:\.|$)'
+            match = re.search(reaction_pattern, question_text, re.IGNORECASE)
+            if match:
+                if not reactants:
+                    reactants = [match.group(1).strip(), match.group(2).strip()]
+                if not products and match.group(3):
+                    products = [match.group(3).strip()]
+            elif unique_formulas and not reactants:
+                # Assume first half are reactants, second half are products
+                mid = max(1, len(unique_formulas) // 2)
+                reactants = unique_formulas[:mid]
+                if not products:
+                    products = unique_formulas[mid:]
+
+        # 5. Check for arrow type based on keywords
+        arrow_type = 'single'
+        if extracted.get('arrow_type'):
+            arrow_type = extracted['arrow_type']
+        elif 'equilibrium' in question_text.lower() or 'reversible' in question_text.lower():
+            arrow_type = 'equilibrium'
+
+        # Update spec with extracted values
+        if reactants:
+            spec['reactants'] = reactants
+            logger.info(f"Extracted reactants: {reactants}")
+        if products:
+            spec['products'] = products
+            logger.info(f"Extracted products: {products}")
+        if conditions:
+            spec['conditions'] = conditions
+        spec['arrow_type'] = arrow_type
     
     def _build_optics_spec(self, plan: DiagramPlan) -> Dict[str, Any]:
         """Build optics spec from plan."""
@@ -1175,18 +1308,21 @@ class VerifiedDiagramService:
             logger.info(f"Phase 2: Generation attempt {attempt}/{max_attempts}")
             
             # ═══════════════════════════════════════════════════════════
-            # RENDERING STRATEGY (ENHANCED):
-            # - PREFER specialized renderers (SchemDraw/RDKit) for ALL attempts
-            #   when the diagram type supports it - they produce cleaner output
-            # - Modify the plan based on feedback rather than switching renderer
-            # - Fall back to tool-based generator only when specialized fails
+            # RENDERING STRATEGY (FIXED):
+            # - Use specialized renderers (SchemDraw/RDKit) ONLY on first attempt
+            # - For retries with feedback, use tool-based generator which can
+            #   incorporate feedback into the generation process
+            # - Specialized renderers are deterministic and cannot learn from feedback
             # ═══════════════════════════════════════════════════════════
             use_specialized = False
-            
-            # Check if specialized renderer is available for this diagram type
-            if plan:
+
+            # CRITICAL FIX: Only use specialized renderer on FIRST attempt (no feedback)
+            # Specialized renderers are deterministic - they produce the same output
+            # for the same input spec. They cannot incorporate verification feedback.
+            # Tool-based generator can use feedback to adjust its approach.
+            if plan and feedback is None:
                 use_specialized = self._should_use_specialized_renderer(plan.diagram_type, subject)
-            
+
             # Apply feedback to improve the plan (if any)
             if feedback and plan:
                 logger.info(f"Updating plan based on feedback (attempt {attempt})...")
@@ -1220,9 +1356,10 @@ class VerifiedDiagramService:
             # 1. Specialized renderer not applicable for this diagram type
             # 2. Specialized renderer failed
             # 3. No plan available
+            # 4. CRITICAL: On retry attempts WITH FEEDBACK (specialized can't learn from feedback)
             if not use_specialized or image_bytes is None:
                 if feedback:
-                    logger.info(f"Using tool-based generator with feedback (attempt {attempt})")
+                    logger.info(f"Using tool-based generator with feedback (attempt {attempt}) - can incorporate verification feedback")
                 else:
                     logger.info(f"Using tool-based generator (attempt {attempt})")
                     
@@ -1534,11 +1671,16 @@ class VerifiedDiagramService:
                     # Match "molecule as CCl4" or "formula CCl4"
                     (r'(?:molecule|formula)\s+(?:as\s+)?([A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*)', 'formula'),
                 ]
-                
+
                 for pattern, key in value_patterns:
                     match = re.search(pattern, issue.fix, re.IGNORECASE)
                     if match:
                         modified_plan.extracted_values[key] = match.group(0)
+
+                # ENHANCED: Handle chemistry reaction feedback
+                # Look for reactants/products mentioned in feedback
+                if 'reactant' in what_lower or 'product' in what_lower or 'reaction' in what_lower:
+                    self._apply_chemistry_feedback(modified_plan, issue.fix, what_lower)
             
             # ALIGNMENT ISSUES - add missing elements
             elif issue.category.value == "alignment":
@@ -1563,6 +1705,81 @@ class VerifiedDiagramService:
         
         logger.debug(f"Plan modified based on feedback: {len(enhanced_verification.issues)} issues processed")
         return modified_plan
+
+    def _apply_chemistry_feedback(
+        self,
+        plan: DiagramPlan,
+        fix_text: str,
+        issue_text: str
+    ) -> None:
+        """
+        Apply chemistry-specific feedback to update reaction components.
+
+        This handles cases where the verifier identifies wrong reactants/products
+        and provides corrections like:
+        - "Show actual reactants H2 and O2"
+        - "Products should be H2O, not just placeholder"
+        - "Replace A with the actual formula Na"
+
+        Args:
+            plan: The plan to modify (modified in place)
+            fix_text: The fix suggestion from verification
+            issue_text: The issue description
+        """
+        import re
+
+        # Pattern to find chemical formulas in feedback
+        formula_pattern = r'\b([A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*)\b'
+
+        # Look for reactant corrections
+        reactant_patterns = [
+            r'reactants?\s+(?:should\s+be\s+|are\s+|:)?\s*([A-Z][\w\d\s,+]+)',
+            r'show\s+(?:actual\s+)?reactants?\s+([A-Z][\w\d\s,+]+)',
+            r'replace\s+[AB]\s+with\s+([A-Z][\w\d]+)',
+        ]
+
+        for pattern in reactant_patterns:
+            match = re.search(pattern, fix_text, re.IGNORECASE)
+            if match:
+                # Extract formulas from the matched text
+                formulas = re.findall(formula_pattern, match.group(1))
+                valid_formulas = [f for f in formulas if len(f) > 1 and f not in ['The', 'And', 'For', 'With']]
+                if valid_formulas:
+                    plan.extracted_values['reactants'] = valid_formulas
+                    logger.info(f"Updated reactants from feedback: {valid_formulas}")
+                    break
+
+        # Look for product corrections
+        product_patterns = [
+            r'products?\s+(?:should\s+be\s+|are\s+|:)?\s*([A-Z][\w\d\s,+]+)',
+            r'show\s+(?:actual\s+)?products?\s+([A-Z][\w\d\s,+]+)',
+            r'forms?\s+([A-Z][\w\d]+)',
+            r'produces?\s+([A-Z][\w\d]+)',
+        ]
+
+        for pattern in product_patterns:
+            match = re.search(pattern, fix_text, re.IGNORECASE)
+            if match:
+                formulas = re.findall(formula_pattern, match.group(1))
+                valid_formulas = [f for f in formulas if len(f) > 1 and f not in ['The', 'And', 'For', 'With']]
+                if valid_formulas:
+                    plan.extracted_values['products'] = valid_formulas
+                    logger.info(f"Updated products from feedback: {valid_formulas}")
+                    break
+
+        # Also extract any standalone formulas mentioned
+        if 'placeholder' in issue_text or 'generic' in issue_text or "'A'" in issue_text or "'B'" in issue_text:
+            # The feedback is saying we're using placeholders - find real formulas
+            all_formulas = re.findall(formula_pattern, fix_text)
+            valid_formulas = [f for f in all_formulas if len(f) > 1 and f not in ['The', 'And', 'For', 'With', 'Show', 'Use']]
+
+            if valid_formulas and 'reactants' not in plan.extracted_values:
+                # Assume first formula is reactant
+                plan.extracted_values['reactants'] = valid_formulas[:max(1, len(valid_formulas)//2)]
+            if valid_formulas and 'products' not in plan.extracted_values:
+                # Assume last formula is product
+                if len(valid_formulas) > 1:
+                    plan.extracted_values['products'] = valid_formulas[len(valid_formulas)//2:]
 
     def _build_feedback_prompt(self, verification: VerificationResult) -> str:
         """Build a detailed feedback prompt from verification result."""

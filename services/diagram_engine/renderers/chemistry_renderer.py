@@ -173,6 +173,150 @@ class ChemistryRenderer(BaseRenderer):
             logger.error(f"Error rendering {diagram_type}: {e}")
             raise RenderError(str(e), diagram_type, {'exception': type(e).__name__})
     
+    def _extract_reaction_components(self, spec: Dict[str, Any], component_type: str) -> List[str]:
+        """
+        Extract reactants or products from spec, checking multiple possible sources.
+
+        The plan may store these under various keys:
+        - 'reactants'/'products' directly
+        - 'parameters.reactants'/'parameters.products'
+        - 'extracted_values.reactants'/'extracted_values.products'
+        - 'equation' or 'reaction' that needs parsing
+        - 'formula' for simple reactions
+        - Individual keys like 'reactant_1', 'product_a', etc.
+
+        Args:
+            spec: The diagram specification
+            component_type: Either 'reactants' or 'products'
+
+        Returns:
+            List of component formulas (e.g., ['H2', 'O2'] for reactants)
+        """
+        import re
+
+        # 1. Check direct key
+        direct = spec.get(component_type)
+        if direct and isinstance(direct, list) and len(direct) > 0:
+            # Filter out placeholder values
+            filtered = [r for r in direct if r not in ['A', 'B', 'C', '?', '']]
+            if filtered:
+                return filtered
+
+        # 2. Check under 'parameters'
+        params = spec.get('parameters', {})
+        if isinstance(params, dict):
+            param_val = params.get(component_type)
+            if param_val and isinstance(param_val, list):
+                filtered = [r for r in param_val if r not in ['A', 'B', 'C', '?', '']]
+                if filtered:
+                    return filtered
+
+        # 3. Check under 'extracted_values'
+        extracted = spec.get('extracted_values', {})
+        if isinstance(extracted, dict):
+            ext_val = extracted.get(component_type)
+            if ext_val:
+                if isinstance(ext_val, list):
+                    filtered = [r for r in ext_val if r not in ['A', 'B', 'C', '?', '']]
+                    if filtered:
+                        return filtered
+                elif isinstance(ext_val, str):
+                    # Might be comma-separated or plus-separated
+                    parts = re.split(r'[,+]', ext_val)
+                    parts = [p.strip() for p in parts if p.strip() and p.strip() not in ['A', 'B', 'C', '?']]
+                    if parts:
+                        return parts
+
+        # 4. Look for numbered keys like 'reactant_1', 'reactant_2', 'product_1', etc.
+        singular = component_type.rstrip('s')  # 'reactants' -> 'reactant', 'products' -> 'product'
+        numbered = []
+        for key in list(spec.keys()) + list(params.keys()) + list(extracted.keys()):
+            if singular in key.lower():
+                val = spec.get(key) or params.get(key) or extracted.get(key)
+                if val and isinstance(val, str) and val not in ['A', 'B', 'C', '?', '']:
+                    numbered.append(val)
+        if numbered:
+            return numbered
+
+        # 5. Try to parse from 'equation' or 'reaction' string
+        equation = spec.get('equation') or spec.get('reaction') or params.get('equation') or extracted.get('equation')
+        if equation and isinstance(equation, str):
+            # Split by arrow patterns: ->, →, ⟶, =, ⇌
+            arrow_pattern = r'(?:->|→|⟶|=|⇌|-->)'
+            parts = re.split(arrow_pattern, equation)
+            if len(parts) >= 2:
+                left_side = parts[0].strip()
+                right_side = parts[-1].strip()
+
+                # Split each side by + and clean up
+                if component_type == 'reactants':
+                    components = re.split(r'\s*\+\s*', left_side)
+                else:
+                    components = re.split(r'\s*\+\s*', right_side)
+
+                # Clean up: remove coefficients, whitespace
+                cleaned = []
+                for comp in components:
+                    # Remove leading coefficient (e.g., "2H2O" -> "H2O")
+                    cleaned_comp = re.sub(r'^\d+\s*', '', comp.strip())
+                    if cleaned_comp and cleaned_comp not in ['A', 'B', 'C', '?', '']:
+                        cleaned.append(cleaned_comp)
+                if cleaned:
+                    return cleaned
+
+        # 6. Check for 'formula' key (for simple single-component reactions)
+        formula = spec.get('formula') or params.get('formula') or extracted.get('formula')
+        if formula and isinstance(formula, str) and component_type == 'products':
+            # If only formula provided, assume it's the product
+            if formula not in ['A', 'B', 'C', '?', '']:
+                return [formula]
+
+        # 7. Look through labels for chemical formulas
+        labels = spec.get('labels', [])
+        if isinstance(labels, list):
+            formulas_found = []
+            for label in labels:
+                text = label.get('text', '') if isinstance(label, dict) else str(label)
+                # Match chemical formula patterns (e.g., H2O, NaCl, C6H12O6)
+                formula_pattern = r'\b([A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)*)\b'
+                matches = re.findall(formula_pattern, text)
+                for match in matches:
+                    # Filter out single letters and common non-formula words
+                    if len(match) > 1 and match not in ['A', 'B', 'C', 'The', 'For', 'And']:
+                        formulas_found.append(match)
+            if formulas_found:
+                # Return first half as reactants, second half as products (rough heuristic)
+                mid = len(formulas_found) // 2 or 1
+                if component_type == 'reactants':
+                    return formulas_found[:mid]
+                else:
+                    return formulas_found[mid:]
+
+        # 8. Check question_text for chemical formulas as last resort
+        question = spec.get('question_text', '')
+        if question:
+            # Look for patterns like "reaction of X with Y" or "X + Y -> Z"
+            formula_pattern = r'\b([A-Z][a-z]?\d*(?:[A-Z][a-z]?\d*)+)\b'
+            all_formulas = re.findall(formula_pattern, question)
+            # Filter duplicates while preserving order
+            seen = set()
+            unique_formulas = []
+            for f in all_formulas:
+                if f not in seen and f not in ['A', 'B', 'C', '?', '']:
+                    seen.add(f)
+                    unique_formulas.append(f)
+
+            if len(unique_formulas) >= 2:
+                # Assume first ones are reactants, last ones are products
+                mid = len(unique_formulas) // 2 or 1
+                if component_type == 'reactants':
+                    return unique_formulas[:mid]
+                else:
+                    return unique_formulas[mid:]
+
+        # Return empty list if nothing found
+        return []
+
     def _create_figure(
         self,
         spec: Dict[str, Any],
@@ -513,7 +657,7 @@ class ChemistryRenderer(BaseRenderer):
     async def _render_reaction_scheme(self, spec: Dict[str, Any]) -> RenderResult:
         """
         Render chemical reaction scheme.
-        
+
         Spec parameters:
             - reactants: List of reactant formulas
             - products: List of product formulas
@@ -521,10 +665,19 @@ class ChemistryRenderer(BaseRenderer):
             - arrow_type: Type of arrow (single, double, equilibrium)
             - show_coefficients: Whether to show stoichiometric coefficients
         """
-        reactants = spec.get('reactants', ['A', 'B'])
-        products = spec.get('products', ['C'])
+        # ENHANCED: Extract reactants/products from multiple possible sources
+        reactants = self._extract_reaction_components(spec, 'reactants')
+        products = self._extract_reaction_components(spec, 'products')
         conditions = spec.get('conditions', [])
         arrow_type = spec.get('arrow_type', 'single')
+
+        # If still empty after extraction, use placeholder with warning
+        if not reactants:
+            logger.warning("No reactants found in spec - using placeholder")
+            reactants = ['?']
+        if not products:
+            logger.warning("No products found in spec - using placeholder")
+            products = ['?']
         
         fig, ax = self._create_figure(spec, figsize=(12, 4))
         
