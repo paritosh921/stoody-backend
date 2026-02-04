@@ -8,6 +8,7 @@ import asyncio
 
 from core.dashboard_registry import PenDashboardRegistry
 from core.pen_workers import PenWorkers
+from core.observability import track_websocket_connection
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -133,6 +134,7 @@ async def dashboard_ws(websocket: WebSocket, state=Depends(get_app_state)):
         return
 
     await dashboard_ws_manager.connect(websocket)
+    track_websocket_connection("dashboard", 1)
 
     # Send current pen states immediately on connect
     try:
@@ -179,6 +181,7 @@ async def dashboard_ws(websocket: WebSocket, state=Depends(get_app_state)):
     finally:
         heartbeat_task.cancel()
         await dashboard_ws_manager.disconnect(websocket)
+        track_websocket_connection("dashboard", -1)
 
 
 class PenColorRequest(BaseModel):

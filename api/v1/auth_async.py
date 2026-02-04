@@ -34,6 +34,7 @@ from core.security import (
 )
 from core.email_service import get_email_service
 from core.cookie_auth import get_current_user_dual_auth
+from core.observability import record_auth_login
 from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
 
 # Security logger for audit trail
@@ -238,6 +239,7 @@ async def admin_login(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """Admin login endpoint"""
+    login_recorded = False
     try:
         tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
@@ -249,12 +251,16 @@ async def admin_login(
         })
 
         if not admin_doc:
+            record_auth_login("admin", False)
+            login_recorded = True
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
             )
 
         if not auth_manager.verify_password(login_data.password, admin_doc.get("password_hash", "")):
+            record_auth_login("admin", False)
+            login_recorded = True
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid email or password"
@@ -280,6 +286,8 @@ async def admin_login(
         }
 
         session_data = await auth_manager.create_user_session(admin_data)
+        record_auth_login("admin", True)
+        login_recorded = True
 
         return TokenResponse(
             success=True,
@@ -291,8 +299,12 @@ async def admin_login(
         )
 
     except HTTPException:
+        if not login_recorded:
+            record_auth_login("admin", False)
         raise
     except Exception as e:
+        if not login_recorded:
+            record_auth_login("admin", False)
         logger.error(f"Admin login error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -313,6 +325,7 @@ async def student_login(
     - Username is unique per tenant (tenant_id required)
     - Subdomain is optional for non-web clients
     """
+    login_recorded = False
     try:
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
@@ -333,6 +346,8 @@ async def student_login(
 
         if not student:
             logger.warning(f"Student {normalized_username} not found")
+            record_auth_login("student", False)
+            login_recorded = True
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -340,6 +355,8 @@ async def student_login(
 
         if not auth_manager.verify_password(login_data.password, student.get("password_hash", "")):
             logger.warning(f"Invalid password for student {normalized_username}")
+            record_auth_login("student", False)
+            login_recorded = True
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -362,6 +379,8 @@ async def student_login(
         }
 
         session_data = await auth_manager.create_user_session(student_data)
+        record_auth_login("student", True)
+        login_recorded = True
 
         pen_token = None
         pen_token_expires_at = None
@@ -417,8 +436,12 @@ async def student_login(
         )
 
     except HTTPException:
+        if not login_recorded:
+            record_auth_login("student", False)
         raise
     except Exception as e:
+        if not login_recorded:
+            record_auth_login("student", False)
         logger.error(f"Student login error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -434,6 +457,7 @@ async def tutor_login(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """Tutor login endpoint"""
+    login_recorded = False
     try:
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
@@ -444,6 +468,8 @@ async def tutor_login(
         )
 
         if not tutor_data:
+            record_auth_login("tutor", False)
+            login_recorded = True
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid username or password"
@@ -457,6 +483,8 @@ async def tutor_login(
         })
 
         session_data = await auth_manager.create_user_session(tutor_data)
+        record_auth_login("tutor", True)
+        login_recorded = True
 
         # Update tutor last_login is already done; optionally log activity if needed
         return TokenResponse(
@@ -469,8 +497,12 @@ async def tutor_login(
         )
 
     except HTTPException:
+        if not login_recorded:
+            record_auth_login("tutor", False)
         raise
     except Exception as e:
+        if not login_recorded:
+            record_auth_login("tutor", False)
         logger.error(f"Tutor login error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

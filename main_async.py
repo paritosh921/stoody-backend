@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any
 from datetime import datetime, timedelta
@@ -21,6 +22,10 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from pyinstrument import Profiler
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+except Exception:
+    Instrumentator = None
 
 # Import configuration
 from config_async import (
@@ -32,13 +37,15 @@ from config_async import (
     DEBUG_MODE,
     MAX_WORKERS,
     WORKER_CONNECTIONS,
-    OCR_CONCURRENCY_LIMIT
+    OCR_CONCURRENCY_LIMIT,
+    ENABLE_METRICS,
 )
 
 # Import async database clients
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
+from core.observability import set_dependency_health
 
 # Import middleware
 from middleware.subdomain import subdomain_middleware
@@ -199,6 +206,28 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Add rolling file log so Promtail can scrape backend runtime logs.
+try:
+    logs_dir = Path("logs")
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    app_log_file = logs_dir / "app.log"
+    file_handler = RotatingFileHandler(
+        app_log_file,
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    root_logger = logging.getLogger()
+    has_app_log_handler = any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith("app.log")
+        for h in root_logger.handlers
+    )
+    if not has_app_log_handler:
+        root_logger.addHandler(file_handler)
+except Exception as exc:
+    logger.warning(f"Failed to configure app.log file handler: {exc}")
 
 # Suppress httpx/httpcore logging to prevent token leakage in URLs
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -480,6 +509,17 @@ app = FastAPI(
 # Add rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Prometheus metrics endpoint
+if ENABLE_METRICS and Instrumentator is not None:
+    Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+        excluded_handlers=["/metrics"],
+    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=DEBUG_MODE)
+    logger.info("✅ Prometheus metrics enabled at /metrics")
+elif ENABLE_METRICS:
+    logger.warning("⚠️ Metrics enabled but prometheus-fastapi-instrumentator is unavailable")
 
 # Middleware setup
 app.add_middleware(
@@ -889,6 +929,8 @@ async def health_check(request: Request):
 
         # Check cache connection
         cache_healthy = await app.state.cache.health_check() if app.state.cache else False
+        set_dependency_health("database", db_healthy)
+        set_dependency_health("cache", cache_healthy)
 
         # Cache is optional in development mode
         cache_required = not DEBUG_MODE
@@ -911,8 +953,10 @@ async def health_check(request: Request):
                 "use_s3_storage_env": USE_S3_STORAGE,
                 "bucket": S3_BUCKET_NAME if s3_enabled else None
             }
+            set_dependency_health("s3_storage", s3_enabled)
         except Exception as _s3_err:
             s3_status = {"enabled": False, "error": str(_s3_err)}
+            set_dependency_health("s3_storage", False)
 
         # Treat cache as optional in all environments; report overall service as running
         # even if one or more dependencies are degraded. Frontend uses this flag to

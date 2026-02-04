@@ -4,6 +4,8 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
+prometheus-fastapi-instrumentator>=6.1.0,<7
+prometheus-client>=0.20.0,<1
 
 # ===============================
 # Database and caching

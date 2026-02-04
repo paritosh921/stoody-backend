@@ -28,6 +28,7 @@ from bson import ObjectId as BsonObjectId
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.observability import observe_ocr_job
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
@@ -1509,6 +1510,7 @@ async def process_document_ocr(
     cache: CacheManager = Depends(get_cache)
 ):
     """Trigger OCR processing on an existing uploaded document."""
+    ocr_started_at = datetime.utcnow()
     try:
         # Check if B2C admin or B2C user
         user_type = current_user.get("user_type")
@@ -1652,9 +1654,19 @@ async def process_document_ocr(
 
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
-    except HTTPException:
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="document",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         raise
     except Exception as exc:
+        observe_ocr_job(
+            job_type="document",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         logger.error(f"Failed to prepare OCR job for {document_id}: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1685,9 +1697,23 @@ async def process_document_ocr(
         async def background_runner():
             try:
                 await execute_with_semaphore()
-            except HTTPException:
-                pass
+                observe_ocr_job(
+                    job_type="document",
+                    status="success_async",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
+            except HTTPException as exc:
+                observe_ocr_job(
+                    job_type="document",
+                    status=f"error_{exc.status_code}",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
             except Exception as exc:
+                observe_ocr_job(
+                    job_type="document",
+                    status="error_500",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
                 logger.error(f"Background OCR job {job_id} failed: {exc}", exc_info=True)
 
         task = asyncio.create_task(background_runner())
@@ -1699,16 +1725,37 @@ async def process_document_ocr(
 
             task.add_done_callback(_cleanup)
 
+        observe_ocr_job(
+            job_type="document",
+            status="queued",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
             content=jsonable_encoder(PDFProcessingResult(**processing_result))
         )
 
     try:
-        return await execute_with_semaphore()
-    except HTTPException:
+        result = await execute_with_semaphore()
+        observe_ocr_job(
+            job_type="document",
+            status="success",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        return result
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="document",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         raise
     except Exception as exc:
+        observe_ocr_job(
+            job_type="document",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         logger.error(f"OCR processing failed for {document_id}: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1726,6 +1773,7 @@ async def perform_direct_ocr(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Direct OCR processing for authenticated users (no document persistence)."""
+    ocr_started_at = datetime.utcnow()
     try:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(
@@ -1746,7 +1794,7 @@ async def perform_direct_ocr(
         else:
             ocr_result = await _run_ocr()
 
-        return {
+        result = {
             "success": True,
             "filename": file.filename,
             "subject": subject or "General",
@@ -1757,10 +1805,26 @@ async def perform_direct_ocr(
                 "processed_at": datetime.utcnow().isoformat()
             }
         }
+        observe_ocr_job(
+            job_type="direct",
+            status="success",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        return result
 
-    except HTTPException:
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="direct",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         raise
     except Exception as exc:
+        observe_ocr_job(
+            job_type="direct",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         logger.error(f"Direct OCR processing failed: {exc}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -4474,6 +4538,7 @@ async def process_regions_ocr(
     4. Parses the OCR result and creates questions
     5. Returns the results
     """
+    ocr_started_at = datetime.utcnow()
     try:
         is_b2c = is_b2c_admin(current_user)
         
@@ -4824,7 +4889,7 @@ async def process_regions_ocr(
         
         logger.info(f"Region OCR completed for {document_id}: {successful} questions, {total_images_saved} images, {failed} failed")
         
-        return {
+        result = {
             "success": True,
             "documentId": document_id,
             "processedRegions": len(regions_to_process),
@@ -4832,10 +4897,26 @@ async def process_regions_ocr(
             "failedRegions": failed,
             "results": results
         }
+        observe_ocr_job(
+            job_type="region",
+            status="success",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        return result
         
-    except HTTPException:
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="region",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         raise
     except Exception as e:
+        observe_ocr_job(
+            job_type="region",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
         logger.error(f"Region OCR processing error: {str(e)}", exc_info=True)
         
         # Reset status on error

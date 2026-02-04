@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from pydantic import BaseModel
+from core.observability import track_websocket_connection
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ async def get_session(session_code: str):
 async def teacher_websocket(websocket: WebSocket, session_id: str):
     """WebSocket endpoint for teacher."""
     await websocket.accept()
+    connection_tracked = False
     
     session = _sessions.get(session_id)
     if not session:
@@ -114,6 +116,8 @@ async def teacher_websocket(websocket: WebSocket, session_id: str):
         return
     
     session.teacher_ws = websocket
+    track_websocket_connection("online_class_teacher", 1)
+    connection_tracked = True
     logger.info(f"Teacher connected to session {session_id}")
     
     # Notify students
@@ -138,6 +142,8 @@ async def teacher_websocket(websocket: WebSocket, session_id: str):
             "type": "session_update",
             "teacher_connected": False,
         })
+        if connection_tracked:
+            track_websocket_connection("online_class_teacher", -1)
 
 
 @router.websocket("/ws/{session_id}/student")
@@ -150,6 +156,7 @@ async def student_websocket(
 ):
     """WebSocket endpoint for students."""
     await websocket.accept()
+    connection_tracked = False
     
     session = _sessions.get(session_id)
     if not session:
@@ -164,6 +171,8 @@ async def student_websocket(
         pen_id=pen_id or None,
     )
     session.students[student.student_id] = student
+    track_websocket_connection("online_class_student", 1)
+    connection_tracked = True
     
     logger.info(f"Student {student.student_name} joined session {session_id}")
     
@@ -206,6 +215,8 @@ async def student_websocket(
                 })
             except:
                 pass
+        if connection_tracked:
+            track_websocket_connection("online_class_student", -1)
 
 
 async def handle_teacher_message(session: OnlineSession, data: dict):

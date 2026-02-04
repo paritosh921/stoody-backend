@@ -22,6 +22,7 @@ from slowapi.errors import RateLimitExceeded
 from services.async_openai_service import AsyncOpenAIService
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.observability import observe_chat_request
 from config_async import settings
 
 logger = logging.getLogger(__name__)
@@ -270,6 +271,7 @@ async def chat_endpoint(
     Includes caching, rate limiting, and async processing
     """
     start_time = time.time()
+    metric_recorded = False
 
     try:
         logger.info(f"Chat request - User: {chat_request.userId}, Session: {chat_request.sessionId}, Mode: {chat_request.mode}")
@@ -298,6 +300,13 @@ async def chat_endpoint(
 
         if cached_response:
             response_time = time.time() - start_time
+            observe_chat_request(
+                mode=chat_request.mode,
+                status="success",
+                cache_hit=True,
+                duration_seconds=response_time,
+            )
+            metric_recorded = True
 
             # Log analytics in background
             background_tasks.add_task(
@@ -355,6 +364,13 @@ async def chat_endpoint(
 
         response_text = ai_response['response']
         response_time = time.time() - start_time
+        observe_chat_request(
+            mode=chat_request.mode,
+            status="success",
+            cache_hit=False,
+            duration_seconds=response_time,
+        )
+        metric_recorded = True
 
         # Cache the response asynchronously
         asyncio.create_task(cache.cache_chat_response(
@@ -396,9 +412,23 @@ async def chat_endpoint(
             }
         )
 
-    except HTTPException:
+    except HTTPException as exc:
+        if not metric_recorded:
+            observe_chat_request(
+                mode=chat_request.mode,
+                status=f"error_{exc.status_code}",
+                cache_hit=False,
+                duration_seconds=time.time() - start_time,
+            )
         raise
     except Exception as e:
+        if not metric_recorded:
+            observe_chat_request(
+                mode=chat_request.mode,
+                status="error_500",
+                cache_hit=False,
+                duration_seconds=time.time() - start_time,
+            )
         logger.error(f"Chat endpoint error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

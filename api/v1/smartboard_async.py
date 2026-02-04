@@ -16,6 +16,7 @@ from bson import ObjectId
 
 from core.database import DatabaseManager
 from core.permissions import has_permission
+from core.observability import track_websocket_connection
 from api.v1.auth_async import get_current_user
 
 router = APIRouter()
@@ -479,6 +480,7 @@ async def smartboard_websocket(
     - student_submit: Student submits response
     """
     await websocket.accept()
+    connection_tracked = False
     
     # Check if session exists
     if session_id not in _sessions:
@@ -491,6 +493,8 @@ async def smartboard_websocket(
     
     session = _sessions[session_id]
     session.add_websocket(websocket)
+    track_websocket_connection("smartboard", 1)
+    connection_tracked = True
     
     try:
         while True:
@@ -580,3 +584,6 @@ async def smartboard_websocket(
     except Exception as e:
         logger.error(f"WebSocket error in session {session_id}: {e}")
         session.remove_websocket(websocket)
+    finally:
+        if connection_tracked:
+            track_websocket_connection("smartboard", -1)
