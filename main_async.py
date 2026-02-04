@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Any
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -26,6 +26,11 @@ try:
     from prometheus_fastapi_instrumentator import Instrumentator
 except Exception:
     Instrumentator = None
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+except Exception:
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+    generate_latest = None
 
 # Import configuration
 from config_async import (
@@ -198,6 +203,15 @@ except Exception as e:
     superadmin_router = None
     _superadmin_available = False
     logging.warning(f"Super Admin routes disabled: {str(e)}")
+
+# Smartboard Sessions routes (tutor session management)
+try:
+    from api.v1.smartboard_sessions_async import router as smartboard_sessions_router
+    _smartboard_sessions_available = True
+except Exception as e:
+    smartboard_sessions_router = None
+    _smartboard_sessions_available = False
+    logging.warning(f"Smartboard Sessions routes disabled: {str(e)}")
 
 
 # Configure logging
@@ -515,7 +529,7 @@ if ENABLE_METRICS and Instrumentator is not None:
     Instrumentator(
         should_group_status_codes=True,
         should_ignore_untemplated=True,
-        excluded_handlers=["/metrics"],
+        excluded_handlers=["/metrics", "/api/metrics", "/api/v1/metrics"],
     ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=DEBUG_MODE)
     logger.info("✅ Prometheus metrics enabled at /metrics")
 elif ENABLE_METRICS:
@@ -913,6 +927,16 @@ if _superadmin_available and superadmin_router:
 else:
     logger.warning("⚠️ Super Admin routes disabled")
 
+# Smartboard Sessions routes (tutor session management)
+if _smartboard_sessions_available and smartboard_sessions_router:
+    app.include_router(
+        smartboard_sessions_router,
+        tags=["Smartboard Sessions"]
+    )
+    logger.info("✅ Smartboard Sessions routes enabled")
+else:
+    logger.warning("⚠️ Smartboard Sessions routes disabled")
+
 
 # Static file serving
 app.mount("/images", StaticFiles(directory="images"), name="images")
@@ -1025,6 +1049,32 @@ async def health_check_v1_alias(request: Request):
 @limiter.limit("60/minute")
 async def healthz_alias(request: Request):
     return await health_check(request)
+
+# Compatibility metrics endpoints for CDN/proxy path routing.
+if ENABLE_METRICS:
+    def _render_metrics() -> Response:
+        if generate_latest is None:
+            raise HTTPException(status_code=503, detail="prometheus_client unavailable")
+        return Response(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "X-Backend-Server": "fastapi-async",
+            },
+        )
+
+    @app.get("/api/metrics", include_in_schema=DEBUG_MODE)
+    @limiter.limit("120/minute")
+    async def metrics_api_alias(request: Request):
+        return _render_metrics()
+
+    @app.get("/api/v1/metrics", include_in_schema=DEBUG_MODE)
+    @limiter.limit("120/minute")
+    async def metrics_v1_alias(request: Request):
+        return _render_metrics()
 
 # Legacy compatibility endpoint for token verification
 @app.get("/verify")
