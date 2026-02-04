@@ -411,19 +411,16 @@ class EmbeddingService:
                 try:
                     qdrant_service = get_qdrant_service()
                     await qdrant_service.initialize()
-                    
-                    # Ensure collection exists - pass tenant_id, not collection_name
-                    await qdrant_service.create_collection(metadata.tenant_id)
-                    collection_name = qdrant_service.get_collection_name(metadata.tenant_id)
-                    
+
                     # Prepare points for upsert
                     points = [chunk.to_qdrant_point() for chunk in embedded_chunks]
                     point_ids = [p["id"] for p in points]
-                    
-                    # Upsert to Qdrant
-                    await qdrant_service.upsert_points(collection_name, points)
-                    chunks_stored = len(points)
-                    
+
+                    # Upsert to Qdrant - pass tenant_id, NOT collection_name
+                    # (upsert_points internally calls _get_collection_name)
+                    chunks_stored, _ = await qdrant_service.upsert_points(metadata.tenant_id, points)
+
+                    collection_name = qdrant_service.get_collection_name(metadata.tenant_id)
                     logger.info(f"Stored {chunks_stored} points in Qdrant collection {collection_name}")
                     
                 except Exception as e:

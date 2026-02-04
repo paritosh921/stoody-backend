@@ -439,6 +439,8 @@ class FeedbackHandler:
         3. SMILES
         4. Label
         5. Layout
+        
+        Note: This increments the iteration counter when corrections are applied.
         """
         # Sort by priority
         priority_order = [
@@ -458,8 +460,15 @@ class FeedbackHandler:
         )
 
         # Apply each correction
+        applied_count = 0
         for correction in sorted_corrections:
-            state.apply_correction(correction)
+            if state.apply_correction(correction):
+                applied_count += 1
+
+        # Increment iteration if any corrections were applied
+        if applied_count > 0:
+            state.iteration += 1
+            logger.info(f"Applied {applied_count} corrections, now at iteration {state.iteration}")
 
         return state
 

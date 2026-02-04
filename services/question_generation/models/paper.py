@@ -342,22 +342,30 @@ class GeneratedPaper:
                     marking_scheme = []
                     for step in q_data.get("marking_scheme", []):
                         marking_scheme.append(MarkingStep(
-                            step_number=step.get("step_number", 0),
-                            description=step.get("description", ""),
+                            step=step.get("step", ""),
                             marks=step.get("marks", 0),
+                            criteria=step.get("criteria"),
                         ))
-                    
+
                     # Reconstruct diagram spec
                     diagram_spec = None
                     if q_data.get("diagram_spec"):
                         ds = q_data["diagram_spec"]
+                        # Extract known fields
+                        known_fields = {"subject", "diagram_type", "title", "description", "parameters"}
+                        params = ds.get("parameters", {})
+                        # Add other fields to parameters for renderer compatibility
+                        for key, value in ds.items():
+                            if key not in known_fields and value is not None:
+                                params[key] = value
                         diagram_spec = DiagramSpec(
+                            subject=ds.get("subject", ""),
                             diagram_type=ds.get("diagram_type", ""),
-                            description=ds.get("description", ""),
-                            elements=ds.get("elements", []),
-                            labels=ds.get("labels", {}),
+                            title=ds.get("title"),
+                            description=ds.get("description"),
+                            parameters=params,
                         )
-                    
+
                     question = GeneratedQuestion(
                         question_id=q_data.get("question_id", ""),
                         question_text=q_data.get("question_text", ""),
@@ -368,12 +376,12 @@ class GeneratedPaper:
                         marking_scheme=marking_scheme,
                         marks=q_data.get("marks", 1),
                         difficulty=q_data.get("difficulty", "medium"),
-                        bloom_level=q_data.get("bloom_level"),
+                        bloom_level=q_data.get("bloom_level", "understand"),
                         topic=q_data.get("topic"),
                         has_diagram=q_data.get("has_diagram", False),
                         diagram_spec=diagram_spec,
                         diagram_url=q_data.get("diagram_url"),
-                        source_chunks=q_data.get("source_chunks", []),
+                        source_chunk_ids=q_data.get("source_chunk_ids", []),
                     )
                     questions.append(question)
                 

@@ -228,6 +228,15 @@ except Exception as e:
     _papers_available = False
     logging.warning(f"Papers routes disabled: {str(e)}")
 
+# Jobs routes (Async job status polling)
+try:
+    from api.v1.jobs import router as jobs_router
+    _jobs_available = True
+except Exception as e:
+    jobs_router = None
+    _jobs_available = False
+    logging.warning(f"Jobs routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -355,6 +364,22 @@ async def lifespan(app: FastAPI):
         app.state.auth = auth_manager
         app.state.ocr_semaphore = asyncio.Semaphore(max(1, OCR_CONCURRENCY_LIMIT))
         app.state.ocr_tasks = {}
+
+        # Initialize jobs repository for async task management
+        try:
+            from services.question_generation.jobs_repository import init_jobs_repository
+            init_jobs_repository(db_manager)
+            logger.info("✅ Jobs repository initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Jobs repository initialization failed: {e}")
+
+        # Initialize papers repository for paper generation
+        try:
+            from services.question_generation.papers_repository import init_papers_repository
+            init_papers_repository(db_manager)
+            logger.info("✅ Papers repository initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Papers repository initialization failed: {e}")
 
         # Start background task for session timeout
         session_timeout_task = asyncio.create_task(check_inactive_sessions())
@@ -952,6 +977,17 @@ if _papers_available and papers_router:
     logger.info("✅ Papers routes enabled")
 else:
     logger.warning("⚠️ Papers routes disabled")
+
+# Jobs routes (Async job status polling)
+if _jobs_available and jobs_router:
+    app.include_router(
+        jobs_router,
+        prefix=f"{API_V1_PREFIX}",
+        tags=["Jobs"]
+    )
+    logger.info("✅ Jobs routes enabled")
+else:
+    logger.warning("⚠️ Jobs routes disabled")
 
 
 # Static file serving

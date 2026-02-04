@@ -7,8 +7,9 @@ Provides endpoints for generating question papers from:
 """
 
 import logging
-from typing import Any, Dict
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Request, BackgroundTasks
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -21,6 +22,10 @@ from services.question_generation import (
     PaperConfig,
     GeneratedPaper,
     get_papers_repository,
+)
+from services.question_generation.paper_generation_worker import (
+    create_paper_generation_job,
+    run_paper_generation_worker,
 )
 
 # Import schemas from new modular location
@@ -303,6 +308,142 @@ async def preview_questions(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred during preview generation"
+        )
+
+
+# ============================================================================
+# Endpoints - Async Generation (Job-based)
+# ============================================================================
+
+class AsyncGenerationRequest(BaseModel):
+    """Request model for async paper generation."""
+    pdf_ids: List[str] = Field(..., description="Source PDF IDs for RAG context")
+    subject: str = Field(..., description="Subject name")
+    class_grade: str = Field(..., description="Class/grade level")
+    blueprint: Dict[str, Any] = Field(..., description="Paper blueprint configuration")
+    include_diagrams: bool = Field(default=True, description="Include diagrams in questions")
+    exam_style: Optional[str] = Field(default=None, description="Exam style (JEE, NEET, CBSE)")
+    tenant_id: Optional[str] = Field(default=None, description="Optional tenant ID")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "pdf_ids": ["pdf_123", "pdf_456"],
+                "subject": "Physics",
+                "class_grade": "10",
+                "blueprint": {
+                    "total_questions": 20,
+                    "sections": [
+                        {"type": "mcq", "count": 10, "marks_each": 1, "difficulty": {"easy": 0.5, "med": 0.4, "hard": 0.1}},
+                        {"type": "short", "count": 5, "marks_each": 2, "difficulty": {"easy": 0.3, "med": 0.5, "hard": 0.2}},
+                        {"type": "long", "count": 3, "marks_each": 5, "difficulty": {"easy": 0.2, "med": 0.5, "hard": 0.3}}
+                    ],
+                    "include_diagrams": True,
+                    "exam_style": "CBSE"
+                },
+                "include_diagrams": True,
+                "exam_style": "CBSE"
+            }
+        }
+
+
+class AsyncGenerationResponse(BaseModel):
+    """Response model for async paper generation."""
+    job_id: str
+    paper_id: str
+    status: str = "queued"
+    message: str = "Paper generation job created. Poll /api/v1/jobs/{job_id} for status."
+
+
+@router.post(
+    "/generate-async",
+    response_model=AsyncGenerationResponse,
+    summary="Generate paper asynchronously (job-based)",
+    description="""
+    Start async paper generation job. Returns immediately with job_id.
+    
+    This endpoint avoids CloudFront's 30-second timeout by returning immediately
+    and processing the heavy work in a background job.
+    
+    **Workflow:**
+    1. POST to this endpoint → receive job_id
+    2. Poll GET /api/v1/jobs/{job_id} every 2-5 seconds
+    3. When status="succeeded", get paper from GET /api/v1/papers/{paper_id}
+    
+    **Blueprint format:**
+    ```json
+    {
+        "sections": [
+            {"type": "mcq", "count": 10, "marks_each": 1, "difficulty": {"easy": 0.5, "med": 0.4, "hard": 0.1}},
+            {"type": "short", "count": 5, "marks_each": 2},
+            {"type": "long", "count": 3, "marks_each": 5}
+        ]
+    }
+    ```
+    """
+)
+@limiter.limit("3/minute")
+async def generate_paper_async(
+    request: Request,
+    body: AsyncGenerationRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> AsyncGenerationResponse:
+    """
+    Start async paper generation job.
+    
+    Returns job_id immediately. Frontend should poll /api/v1/jobs/{job_id}
+    for status updates.
+    """
+    try:
+        verify_user_role(current_user)
+        
+        tenant_id = current_user.get("tenant_id") or body.tenant_id
+        user_id = current_user.get("user_id", current_user.get("id", "unknown"))
+        
+        if not tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="tenant_id is required"
+            )
+        
+        if not body.pdf_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one pdf_id is required"
+            )
+        
+        # Create job and paper records
+        job, paper_id = await create_paper_generation_job(
+            institution_id=tenant_id,
+            user_id=user_id,
+            pdf_ids=body.pdf_ids,
+            subject=body.subject,
+            class_grade=body.class_grade,
+            blueprint=body.blueprint,
+            include_diagrams=body.include_diagrams,
+            exam_style=body.exam_style,
+        )
+        
+        # Add background task to process the job
+        background_tasks.add_task(run_paper_generation_worker, job.job_id)
+        
+        logger.info(f"Created paper generation job {job.job_id} for paper {paper_id}")
+        
+        return AsyncGenerationResponse(
+            job_id=job.job_id,
+            paper_id=paper_id,
+            status="queued",
+            message=f"Paper generation job created. Poll /api/v1/jobs/{job.job_id} for status.",
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create paper generation job: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create paper generation job"
         )
 
 

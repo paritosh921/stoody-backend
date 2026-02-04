@@ -26,6 +26,23 @@ from .paper import (
     PaperStatus,
 )
 
+from .job import (
+    Job,
+    JobType,
+    JobStatus,
+    JobProgress,
+    QuestionDraft,
+    ReviewResult,
+    ReviewIssue,
+    QuestionGenerationAttempt,
+    GeneratedQuestionRecord,
+    PaperGenerationState,
+    PDFIngestionMetadata,
+    PDFIngestionResult,
+    PaperGenerationMetadata,
+    PaperGenerationResult,
+)
+
 __all__ = [
     # Config models
     "QuestionType",
@@ -45,4 +62,19 @@ __all__ = [
     "PaperSection",
     "GeneratedPaper",
     "PaperStatus",
+    # Job models
+    "Job",
+    "JobType",
+    "JobStatus",
+    "JobProgress",
+    "QuestionDraft",
+    "ReviewResult",
+    "ReviewIssue",
+    "QuestionGenerationAttempt",
+    "GeneratedQuestionRecord",
+    "PaperGenerationState",
+    "PDFIngestionMetadata",
+    "PDFIngestionResult",
+    "PaperGenerationMetadata",
+    "PaperGenerationResult",
 ]

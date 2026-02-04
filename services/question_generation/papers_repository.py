@@ -460,19 +460,49 @@ class PapersRepository:
 
 # Singleton instance holder
 _papers_repository: Optional[PapersRepository] = None
+_db_manager = None
 
 
-def get_papers_repository(db_manager) -> PapersRepository:
+def init_papers_repository(db_manager) -> None:
     """
-    Get or create the papers repository singleton.
-    
+    Initialize the papers repository with a database manager.
+
+    This must be called during app startup before using get_papers_repository().
+
     Args:
-        db_manager: DatabaseManager instance
-        
+        db_manager: DatabaseManager instance from app.state.db
+    """
+    global _db_manager
+    _db_manager = db_manager
+
+
+async def get_papers_repository() -> PapersRepository:
+    """
+    Get the singleton PapersRepository instance.
+
+    Note: init_papers_repository must be called first during app startup.
+
     Returns:
         PapersRepository instance
     """
     global _papers_repository
     if _papers_repository is None:
-        _papers_repository = PapersRepository(db_manager)
+        if _db_manager is None:
+            raise RuntimeError("Papers repository not initialized. Call init_papers_repository first.")
+        _papers_repository = PapersRepository(_db_manager)
     return _papers_repository
+
+
+def get_papers_repository_sync(db_manager) -> PapersRepository:
+    """
+    Get a PapersRepository instance directly from a database manager.
+
+    Use this when you have direct access to db_manager (e.g., in API routes).
+
+    Args:
+        db_manager: DatabaseManager instance
+
+    Returns:
+        PapersRepository instance
+    """
+    return PapersRepository(db_manager)

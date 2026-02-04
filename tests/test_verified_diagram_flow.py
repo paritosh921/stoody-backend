@@ -23,7 +23,9 @@ class TestVerifiedDiagramFlow(unittest.IsolatedAsyncioTestCase):
         self.service._planner.update_plan = AsyncMock()
         self.service._planner.validate_plan = MagicMock()
         
-        self.service._generator = AsyncMock()
+        self.service._generator = MagicMock()
+        self.service._generator.generate_diagram = AsyncMock(return_value=(b"fake_image", {"tool_calls": 5}))
+        
         self.service._verifier = MagicMock()
         self.service._verifier.verify_diagram_enhanced = AsyncMock()
         self.service._verifier.verify_diagram = AsyncMock()

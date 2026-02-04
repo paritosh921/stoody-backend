@@ -10,6 +10,10 @@ Enhanced with Plan → Generate → Verify → Correct workflow:
 4. Correct: Regenerates with targeted feedback if needed
 
 Supports adaptive iterations (3-7 based on complexity) and tracks best result.
+
+REFACTORED: Now integrates with DiagramSpec-based system for better type safety
+and feedback handling. Uses SpecRouter for library enforcement and FeedbackHandler
+for structured feedback parsing.
 """
 
 import logging
@@ -34,7 +38,22 @@ except ImportError:
     HAS_DIAGRAM_ENGINE = False
     DiagramEngine = None
 
+# Import for spec-based refactor integration
+try:
+    from .spec_router import get_spec_router, SpecRouter, RendererType
+    from .feedback_handler import get_feedback_handler, FeedbackHandler, FeedbackState
+    from .specs.diagram_spec import DiagramSpec, create_spec_from_plan, normalize_diagram_type
+    HAS_SPEC_SYSTEM = True
+except ImportError as e:
+    logging.warning(f"Spec-based system not available: {e}")
+    HAS_SPEC_SYSTEM = False
+    SpecRouter = None
+    FeedbackHandler = None
+    DiagramSpec = None
+
 logger = logging.getLogger(__name__)
+
+
 
 
 @dataclass
@@ -504,6 +523,21 @@ class VerifiedDiagramService:
             except Exception as e:
                 logger.warning(f"Failed to initialize DiagramEngine: {e}. Using matplotlib fallback.")
                 self._use_specialized_renderers = False
+        
+        # Initialize spec-based system components (REFACTORED)
+        self._spec_router: Optional[SpecRouter] = None
+        self._feedback_handler: Optional[FeedbackHandler] = None
+        self._use_spec_system = HAS_SPEC_SYSTEM
+        
+        if HAS_SPEC_SYSTEM:
+            try:
+                self._spec_router = get_spec_router()
+                self._feedback_handler = get_feedback_handler()
+                logger.info("Spec-based system initialized (SpecRouter + FeedbackHandler)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize spec-based system: {e}. Using legacy feedback handling.")
+                self._use_spec_system = False
+
     
     def _get_engine_diagram_type(self, plan_type: str) -> Optional[str]:
         """Map plan diagram type to engine-supported type."""

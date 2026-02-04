@@ -154,7 +154,13 @@ class GeneratedQuestion:
             result["diagram_url"] = self.diagram_url
         
         if self.diagram_spec:
-            result["diagram_spec"] = self.diagram_spec.to_dict()
+            # diagram_spec can be a dict (from LLM) or an object with to_dict()
+            if isinstance(self.diagram_spec, dict):
+                result["diagram_spec"] = self.diagram_spec
+            elif hasattr(self.diagram_spec, 'to_dict'):
+                result["diagram_spec"] = self.diagram_spec.to_dict()
+            else:
+                result["diagram_spec"] = self.diagram_spec
         
         if self.solution_diagram_url:
             result["solution_diagram_url"] = self.solution_diagram_url

@@ -26,7 +26,7 @@ from .document_ingestion_service import (
     DocumentIngestionError,
 )
 from .knowledge_base_repository import KnowledgeBaseRepository
-from .papers_repository import PapersRepository, get_papers_repository
+from .papers_repository import PapersRepository, get_papers_repository, get_papers_repository_sync
 from .background_processor import BackgroundProcessor, process_upload_background
 from .question_generator import (
     QuestionGeneratorService,
@@ -92,6 +92,7 @@ __all__ = [
     # Papers Repository (Phase 6)
     "PapersRepository",
     "get_papers_repository",
+    "get_papers_repository_sync",
     # Background Processor
     "BackgroundProcessor",
     "process_upload_background",

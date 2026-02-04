@@ -269,6 +269,7 @@ class QdrantService:
             ("grade", qdrant_models.PayloadSchemaType.KEYWORD),
             ("teacher_id", qdrant_models.PayloadSchemaType.KEYWORD),
             ("source_file_id", qdrant_models.PayloadSchemaType.KEYWORD),
+            ("pdf_id", qdrant_models.PayloadSchemaType.KEYWORD),
         ]
         
         for field_name, field_type in index_fields:
@@ -283,7 +284,24 @@ class QdrantService:
             except Exception as e:
                 # Index might already exist
                 logger.debug(f"Could not create index for {field_name}: {e}")
-    
+
+    async def ensure_indexes(self, tenant_id: str) -> None:
+        """
+        Ensure all required payload indexes exist on an existing collection.
+
+        This is useful for adding new indexes to existing collections without
+        recreating them.
+
+        Args:
+            tenant_id: The tenant identifier
+        """
+        await self._ensure_initialized()
+        collection_name = self._get_collection_name(tenant_id)
+
+        if await self.collection_exists(tenant_id):
+            await self._create_payload_indexes(collection_name)
+            logger.info(f"Ensured indexes on collection: {collection_name}")
+
     async def delete_collection(self, tenant_id: str) -> bool:
         """
         Delete a tenant's collection.
@@ -327,11 +345,16 @@ class QdrantService:
         """
         await self._ensure_initialized()
         collection_name = self._get_collection_name(tenant_id)
-        
-        # Ensure collection exists
+
+        logger.debug(f"Upserting points: tenant_id={tenant_id} -> collection={collection_name}")
+
+        # Ensure collection exists and has proper indexes
         if not await self.collection_exists(tenant_id):
             await self.create_collection(tenant_id)
-        
+        else:
+            # Ensure indexes exist on existing collection (adds new indexes if missing)
+            await self._create_payload_indexes(collection_name)
+
         try:
             # Convert to Qdrant PointStruct
             qdrant_points = []
@@ -395,12 +418,23 @@ class QdrantService:
         """
         await self._ensure_initialized()
         collection_name = self._get_collection_name(tenant_id)
-        
+
         # Check if collection exists
         if not await self.collection_exists(tenant_id):
-            logger.warning(f"Collection does not exist: {collection_name}")
+            logger.warning(f"Collection does not exist: {collection_name}. No vectors to search.")
             return []
-        
+
+        # Log search parameters for debugging
+        logger.debug(
+            f"Qdrant search: collection={collection_name}, "
+            f"top_k={top_k}, threshold={score_threshold}, "
+            f"has_filters={filter_conditions is not None}"
+        )
+
+        # Ensure required indexes exist (will add new indexes if missing)
+        if filter_conditions:
+            await self._create_payload_indexes(collection_name)
+
         try:
             # Build filter
             qdrant_filter = None
@@ -432,6 +466,17 @@ class QdrantService:
             
             # Convert to dict - response.points contains the results
             results = response.points if hasattr(response, 'points') else response
+
+            # Log search results summary
+            if results:
+                best_score = max(r.score for r in results)
+                logger.debug(
+                    f"Qdrant search returned {len(results)} results, "
+                    f"best_score={best_score:.4f}"
+                )
+            else:
+                logger.debug(f"Qdrant search returned 0 results (threshold={score_threshold})")
+
             return [
                 {
                     "id": str(result.id),
@@ -537,13 +582,19 @@ class QdrantService:
                 lambda: self._client.get_collection(collection_name)
             )
             
+            # Handle different Qdrant API versions
+            # Newer versions use info.points_count, older might have vectors_count
+            points_count = getattr(info, 'points_count', 0)
+            vectors_count = getattr(info, 'vectors_count', points_count)  # Fallback to points_count
+            indexed_vectors_count = getattr(info, 'indexed_vectors_count', points_count)
+            
             return {
                 "exists": True,
                 "collection_name": collection_name,
-                "points_count": info.points_count,
-                "vectors_count": info.vectors_count,
-                "indexed_vectors_count": info.indexed_vectors_count,
-                "status": info.status.value if info.status else "unknown",
+                "points_count": points_count,
+                "vectors_count": vectors_count,
+                "indexed_points": indexed_vectors_count,
+                "status": info.status.value if hasattr(info, 'status') and info.status else "unknown",
                 "vector_size": self._vector_size,
             }
             
@@ -555,6 +606,118 @@ class QdrantService:
                 "error": str(e),
             }
     
+
+    async def get_source_file_ids(
+        self,
+        tenant_id: str,
+        limit: int = 100,
+    ) -> List[str]:
+        """
+        Get unique source_file_ids stored in a tenant's collection.
+        
+        Useful for debugging when RAG retrieval returns no results.
+        
+        Args:
+            tenant_id: The tenant identifier
+            limit: Maximum number of unique IDs to return
+            
+        Returns:
+            List of unique source_file_ids in the collection
+        """
+        await self._ensure_initialized()
+        collection_name = self._get_collection_name(tenant_id)
+        
+        if not await self.collection_exists(tenant_id):
+            logger.warning(f"Collection does not exist: {collection_name}")
+            return []
+        
+        try:
+            # Scroll through points to collect unique source_file_ids
+            source_file_ids = set()
+            offset = None
+            
+            while len(source_file_ids) < limit:
+                response = await self._run_sync(
+                    lambda: self._client.scroll(
+                        collection_name=collection_name,
+                        limit=100,
+                        offset=offset,
+                        with_payload=["source_file_id"],
+                        with_vectors=False,
+                    )
+                )
+                
+                points, next_offset = response
+                
+                if not points:
+                    break
+                
+                for point in points:
+                    if point.payload and "source_file_id" in point.payload:
+                        source_file_ids.add(point.payload["source_file_id"])
+                
+                if next_offset is None:
+                    break
+                offset = next_offset
+            
+            return list(source_file_ids)[:limit]
+            
+        except Exception as e:
+            logger.error(f"Failed to get source_file_ids: {e}")
+            return []
+
+    async def verify_source_files_exist(
+        self,
+        tenant_id: str,
+        source_file_ids: List[str],
+    ) -> Dict[str, bool]:
+        """
+        Verify which source_file_ids have chunks stored in Qdrant.
+        
+        Args:
+            tenant_id: The tenant identifier
+            source_file_ids: List of source_file_ids to check
+            
+        Returns:
+            Dict mapping source_file_id to exists (True/False)
+        """
+        await self._ensure_initialized()
+        collection_name = self._get_collection_name(tenant_id)
+        
+        if not await self.collection_exists(tenant_id):
+            return {sfid: False for sfid in source_file_ids}
+        
+        result = {}
+        
+        for source_file_id in source_file_ids:
+            try:
+                # Count points with this source_file_id
+                response = await self._run_sync(
+                    lambda sfid=source_file_id: self._client.count(
+                        collection_name=collection_name,
+                        count_filter=qdrant_models.Filter(
+                            must=[
+                                qdrant_models.FieldCondition(
+                                    key="source_file_id",
+                                    match=qdrant_models.MatchValue(value=sfid),
+                                )
+                            ]
+                        ),
+                    )
+                )
+                result[source_file_id] = response.count > 0
+                
+                if response.count > 0:
+                    logger.debug(f"Found {response.count} chunks for source_file_id={source_file_id}")
+                else:
+                    logger.warning(f"No chunks found for source_file_id={source_file_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error checking source_file_id {source_file_id}: {e}")
+                result[source_file_id] = False
+        
+        return result
+
     async def health_check(self) -> bool:
         """
         Check if the Qdrant service is healthy.

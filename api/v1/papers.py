@@ -32,7 +32,7 @@ from services.question_generation import (
     PaperConfig,
     QuestionGenerationConfig,
     PapersRepository,
-    get_papers_repository,
+    get_papers_repository_sync,
 )
 
 
@@ -135,7 +135,7 @@ async def get_repository(
     db: DatabaseManager = Depends(get_database),
 ) -> PapersRepository:
     """Get papers repository instance."""
-    return get_papers_repository(db)
+    return get_papers_repository_sync(db)
 
 
 async def _store_paper_async(
@@ -212,8 +212,20 @@ async def _count_papers_async(
 
 def require_teacher_or_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     """Require teacher or admin role."""
-    user_role = current_user.get("role", "").lower()
-    if user_role not in ["admin", "tutor", "teacher"]:
+    # Check multiple possible fields for user role
+    user_role = (
+        current_user.get("role") or
+        current_user.get("userType") or
+        current_user.get("user_type") or
+        ""
+    ).lower()
+
+    # Also check boolean flags
+    is_admin = current_user.get("isAdmin", False) or current_user.get("is_admin", False)
+    is_teacher = current_user.get("isTeacher", False) or current_user.get("is_teacher", False)
+    is_tutor = current_user.get("isTutor", False) or current_user.get("is_tutor", False)
+
+    if user_role not in ["admin", "tutor", "teacher", "b2c_admin"] and not (is_admin or is_teacher or is_tutor):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only teachers and admins can access papers"
@@ -275,8 +287,20 @@ def require_teacher_or_admin_with_query_token(
     current_user: Dict[str, Any] = Depends(get_current_user_with_query_token)
 ) -> Dict[str, Any]:
     """Require teacher or admin role, supporting query token."""
-    user_role = current_user.get("role", "").lower()
-    if user_role not in ["admin", "tutor", "teacher"]:
+    # Check multiple possible fields for user role
+    user_role = (
+        current_user.get("role") or
+        current_user.get("userType") or
+        current_user.get("user_type") or
+        ""
+    ).lower()
+
+    # Also check boolean flags
+    is_admin = current_user.get("isAdmin", False) or current_user.get("is_admin", False)
+    is_teacher = current_user.get("isTeacher", False) or current_user.get("is_teacher", False)
+    is_tutor = current_user.get("isTutor", False) or current_user.get("is_tutor", False)
+
+    if user_role not in ["admin", "tutor", "teacher", "b2c_admin"] and not (is_admin or is_teacher or is_tutor):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only teachers and admins can access papers"
