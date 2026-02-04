@@ -1,0 +1,375 @@
+"""
+Kimi 2.5 LLM Client for Diagram Pipeline
+
+Handles both:
+- LLM1: Generating diagram instructions from question text
+- LLM2: Reviewing generated diagrams and providing feedback
+
+Constraints:
+- Uses ONLY Kimi 2.5 model
+- Temperature: 0.6 (fixed)
+"""
+
+import json
+import logging
+import httpx
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+from .models import (
+    DiagramInstructions,
+    DiagramReview,
+    ReviewIssue,
+    IssueCode,
+    SubjectType,
+)
+from config_async import KIMI_API_URL, KIMI_API_KEY
+
+logger = logging.getLogger(__name__)
+
+# Kimi K2.5 API Configuration
+KIMI_MODEL = "kimi-k2.5"  # Kimi K2.5
+KIMI_TEMPERATURE = 0.6  # Instant mode (thinking disabled) uses 0.6
+KIMI_BASE_URL = "https://api.moonshot.ai/v1"  # Correct base URL
+
+
+class KimiClient:
+    """
+    Client for Kimi 2.5 API.
+    
+    Used for both instruction generation (LLM1) and review (LLM2).
+    """
+    
+    def __init__(self):
+        self.api_url = KIMI_API_URL
+        self.api_key = KIMI_API_KEY
+        self.model = KIMI_MODEL
+        self.temperature = KIMI_TEMPERATURE
+        
+        if not self.api_key:
+            logger.warning("KIMI_API_KEY not set - diagram pipeline will not work")
+    
+    async def _call_api(
+        self,
+        messages: list,
+        max_tokens: int = 2000,
+        response_format: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Make a call to the Kimi K2.5 API with retry logic.
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            max_tokens: Maximum tokens in response
+            response_format: Optional response format (e.g., {"type": "json_object"})
+        
+        Returns:
+            The assistant's response text
+        """
+        import asyncio
+        
+        if not self.api_key:
+            raise ValueError("KIMI_API_KEY not configured")
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        # Instant mode (thinking disabled): temperature=0.6, top_p=0.95
+        # Must explicitly pass thinking: {"type": "disabled"} for instant mode
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": max_tokens,
+            "top_p": 0.95,
+            "thinking": {"type": "disabled"},  # Required for instant mode with temp=0.6
+        }
+        
+        if response_format:
+            payload["response_format"] = response_format
+        
+        # Use KIMI_BASE_URL directly for correct API endpoint
+        api_endpoint = f"{KIMI_BASE_URL}/chat/completions"
+        
+        logger.info(f"Calling Kimi K2.5 API at {api_endpoint}")
+        logger.debug(f"Payload: model={self.model}, temp={self.temperature}, max_tokens={max_tokens}")
+        
+        # Retry logic for timeouts
+        max_retries = 3
+        base_timeout = 90.0  # 90 seconds per attempt
+        
+        for attempt in range(max_retries):
+            try:
+                timeout = base_timeout * (attempt + 1)  # Increase timeout with each retry
+                logger.info(f"Kimi API attempt {attempt + 1}/{max_retries}, timeout={timeout}s")
+                
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(
+                        api_endpoint,
+                        headers=headers,
+                        json=payload,
+                    )
+                    
+                    if response.status_code != 200:
+                        error_text = response.text
+                        logger.error(f"Kimi API error: {response.status_code} - {error_text}")
+                        raise Exception(f"Kimi API error {response.status_code}: {error_text}")
+                    
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"]
+                    
+            except httpx.TimeoutException as e:
+                logger.warning(f"Kimi API timeout on attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    logger.info(f"Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                logger.error(f"Kimi API timeout after {max_retries} attempts")
+                raise Exception(f"Kimi API timeout after {max_retries} attempts ({timeout}s each)")
+            except httpx.RequestError as e:
+                logger.warning(f"Kimi API request error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(5)
+                    continue
+                logger.error(f"Kimi API request error: {e}")
+                raise Exception(f"Kimi API request error: {str(e)}")
+            except KeyError as e:
+                logger.error(f"Kimi API response parsing error: {e}")
+                raise Exception(f"Kimi API response missing expected field: {str(e)}")
+            except Exception as e:
+                logger.error(f"Kimi API unexpected error: {type(e).__name__}: {e}")
+                raise
+
+
+class LLM1InstructionGenerator(KimiClient):
+    """
+    LLM1: Generates diagram instructions from question text.
+    
+    Creates clean, precise, exam-style instructions for Nano Banan Pro.
+    """
+    
+    SYSTEM_PROMPT = """You are a Technical Illustrator for high-stakes exams (JEE/NEET).
+Your task is to describe the VISUAL SCENE to a blind artist who will draw it.
+DO NOT solve the problem. DO NOT explain the concept. DESCRIBE THE DRAWING.
+
+STRICT VISUAL RULES:
+1. IMAGERY ONLY: Describe shapes, lines, arrows, and spatial layout.
+2. LABELS: Specify exactly what text to place and where (e.g., "label 'A' at top vertex").
+3. NO CLUTTER: Do not include decorative elements.
+4. EXAM STYLE: Black lines on white background. High contrast.
+5. FIDELITY: Do NOT add elements, labels, or values not stated or directly implied by the question.
+6. COVERAGE: Include ALL named points/labels and ALL numeric values (angles, lengths, coordinates, forces, resistances, etc.) from the question.
+7. CONFLICTS: If hints conflict with the question, ignore the hints and follow the question.
+
+SUBJECT SPECIFIC GUIDES:
+- GEOMETRY: Describe the exact shape (e.g. "a triangle where top angle is obtuse"), label vertices, mark known angles/lengths visually.
+- PHYSICS: Describe the setup (e.g. "block on inclined plane"), force vectors (arrows), and circuit components clearly.
+- CHEMISTRY: Describe the molecular structure clearly (bonds, atoms).
+
+OUTPUT FORMAT:
+Return a single paragraph describing the visual elements to be drawn.
+Example: "Draw a right-angled triangle ABC with the right angle at B. AB is vertical, BC is horizontal. Label A at top, B at bottom-left, C at bottom-right. Draw a circle inscribed within the triangle."
+"""
+
+    async def generate_instructions(
+        self,
+        question_text: str,
+        subject: Optional[SubjectType] = None,
+        diagram_hints: Optional[str] = None,
+        previous_instructions: Optional[str] = None,
+        review_feedback: Optional[str] = None,
+    ) -> DiagramInstructions:
+        """
+        Generate diagram instructions for a question.
+        
+        Args:
+            question_text: The question requiring a diagram
+            subject: The subject (physics/chemistry/maths/biology)
+            diagram_hints: Optional hints about what diagram to create
+            previous_instructions: Previous instructions if refining
+            review_feedback: Feedback from LLM2 review if refining
+        
+        Returns:
+            DiagramInstructions object
+        """
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT}
+        ]
+        
+        # Build the user message
+        user_content = f"Question: {question_text}\n"
+        
+        if subject:
+            user_content += f"Subject: {subject.value}\n"
+        
+        if diagram_hints:
+            user_content += f"Hints (use only if consistent with the question): {diagram_hints}\n"
+        
+        if previous_instructions and review_feedback:
+            user_content += f"\n--- REFINEMENT REQUEST ---\n"
+            user_content += f"Previous instructions that need improvement:\n{previous_instructions}\n\n"
+            user_content += f"Review feedback:\n{review_feedback}\n\n"
+            user_content += "Please write improved instructions that address the feedback."
+        else:
+            user_content += "\nWrite the diagram instructions for this question."
+        
+        messages.append({"role": "user", "content": user_content})
+        
+        # Call Kimi 2.5
+        instruction_text = await self._call_api(messages, max_tokens=1000)
+        
+        # Clean up the response
+        instruction_text = instruction_text.strip()
+        if instruction_text.startswith('"') and instruction_text.endswith('"'):
+            instruction_text = instruction_text[1:-1]
+        
+        version = 1
+        refined_from = None
+        
+        if previous_instructions:
+            # This is a refinement, increment version
+            version = 2  # Will be updated by caller if needed
+            refined_from = 1
+        
+        return DiagramInstructions(
+            instructions=instruction_text,
+            version=version,
+            subject=subject,
+            refined_from_version=refined_from,
+            refinement_reason=review_feedback[:200] if review_feedback else None,
+        )
+
+
+class LLM2DiagramReviewer(KimiClient):
+    """
+    LLM2: Reviews generated diagrams and provides feedback.
+    
+    Determines if the diagram is acceptable for exam use and suggests improvements.
+    """
+    
+    SYSTEM_PROMPT = """You are an expert exam diagram reviewer for JEE/NEET questions.
+
+Your job is to review diagram instructions (and image description, if provided) and determine if they will produce an acceptable exam diagram.
+
+REVIEW CRITERIA:
+1. CLARITY: Will the diagram be clear when printed?
+2. LABELS: Are all necessary labels specified? No overlaps?
+3. ACCURACY: Does it match what the question needs?
+4. SIMPLICITY: Is it simple enough for an exam? No clutter?
+5. COMPLETENESS: Are all required elements specified?
+6. COVERAGE: Only flag MISSING_LABEL/INCOMPLETE_DIAGRAM if a label/value appears in the question BUT is absent from the instructions.
+7. CONSISTENCY: If an image description is provided, reject ONLY on explicit contradictions. Missing info in the description is NOT a rejection reason.
+8. EVIDENCE: If you flag an issue, cite the exact missing/contradicting label/value.
+
+ISSUE CODES (use exactly these):
+- LABEL_OVERLAP: Labels might overlap or be unclear
+- MISSING_LABEL: A required label is missing
+- WRONG_ANGLE: Angles or orientations are incorrect
+- LOW_CLARITY: The diagram would be hard to read
+- WRONG_CONFIGURATION: Elements are incorrectly arranged
+- TOO_CLUTTERED: Too many elements or decoration
+- MISSING_ARROW: Direction indicators are missing
+- WRONG_PROPORTION: Size ratios are wrong
+- INCOMPLETE_DIAGRAM: Missing required elements
+- STYLE_ISSUE: Not suitable for exam printing
+- OTHER: Other issues
+
+OUTPUT FORMAT (JSON only):
+{
+  "is_acceptable": true or false,
+  "issues": [
+    {
+      "code": "ISSUE_CODE",
+      "details": "Brief explanation"
+    }
+  ],
+  "suggested_instruction_update": "New instruction text if needed, or null if acceptable"
+}
+
+Be STRICT but FAIR. Only mark as unacceptable if there are real problems.
+Output ONLY the JSON, no other text."""
+
+    async def review_diagram(
+        self,
+        question_text: str,
+        current_instructions: str,
+        image_description: Optional[str] = None,
+        subject: Optional[SubjectType] = None,
+    ) -> DiagramReview:
+        """
+        Review a diagram's instructions.
+        
+        Args:
+            question_text: The original question
+            current_instructions: The instructions used to generate the diagram
+            image_description: Optional description of the generated image
+            subject: The subject for context
+        
+        Returns:
+            DiagramReview object
+        """
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT}
+        ]
+        
+        # Build the user message
+        user_content = f"Question: {question_text}\n\n"
+        user_content += f"Diagram Instructions:\n{current_instructions}\n"
+        
+        if subject:
+            user_content += f"\nSubject: {subject.value}"
+        
+        if image_description:
+            user_content += f"\n\nGenerated Image Description:\n{image_description}"
+        
+        user_content += "\n\nReview these instructions and provide your assessment as JSON."
+        
+        messages.append({"role": "user", "content": user_content})
+        
+        # Call Kimi 2.5 with JSON response format
+        response_text = await self._call_api(
+            messages, 
+            max_tokens=1000,
+            response_format={"type": "json_object"}
+        )
+        
+        # Parse the JSON response
+        try:
+            review_data = json.loads(response_text)
+        except json.JSONDecodeError:
+            # Try to extract JSON from the response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                review_data = json.loads(json_match.group())
+            else:
+                # Fallback to accepting if we can't parse
+                logger.warning(f"Could not parse review response: {response_text}")
+                return DiagramReview(
+                    is_acceptable=True,
+                    issues=[],
+                    suggested_instruction_update=None,
+                )
+        
+        # Build the review object
+        issues = []
+        for issue_data in review_data.get("issues", []):
+            code_str = issue_data.get("code", "OTHER")
+            try:
+                code = IssueCode(code_str)
+            except ValueError:
+                code = IssueCode.OTHER
+            
+            issues.append(ReviewIssue(
+                code=code,
+                details=issue_data.get("details", ""),
+            ))
+        
+        return DiagramReview(
+            is_acceptable=review_data.get("is_acceptable", True),
+            issues=issues,
+            suggested_instruction_update=review_data.get("suggested_instruction_update"),
+        )

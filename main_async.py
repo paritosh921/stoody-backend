@@ -71,6 +71,24 @@ from api.v1.practice_async import router as practice_router
 from api.v1.mcq_async import router as mcq_router
 from api.v1.tutor_async import router as tutor_router
 
+# Diagram generation pipeline routes (Kimi 2.5 + Gemini Nano Banana)
+try:
+    from api.v1.diagram_async import router as diagram_router
+    _diagram_available = True
+except Exception as e:
+    diagram_router = None
+    _diagram_available = False
+    logging.warning(f"Diagram routes disabled: {str(e)}")
+
+# Paper Builder routes (Question Paper Generation)
+try:
+    from api.v1.paper_builder_async import router as paper_builder_router
+    _paper_builder_available = True
+except Exception as e:
+    paper_builder_router = None
+    _paper_builder_available = False
+    logging.warning(f"Paper Builder routes disabled: {str(e)}")
+
 from api.v1.learning_async import router as learning_router
 from api.v1.strokes_async import router as strokes_router
 
@@ -671,6 +689,24 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}/questions",
     tags=["Questions"]
 )
+
+# Diagram generation pipeline routes
+if _diagram_available:
+    app.include_router(
+        diagram_router,
+        prefix=API_V1_PREFIX,
+        tags=["Diagrams"]
+    )
+    logger.info("✅ Diagram generation pipeline routes enabled")
+
+# Paper Builder routes
+if _paper_builder_available:
+    app.include_router(
+        paper_builder_router,
+        prefix=API_V1_PREFIX,
+        tags=["Paper Builder"]
+    )
+    logger.info("✅ Paper Builder routes enabled")
 
 app.include_router(
     images_router,
