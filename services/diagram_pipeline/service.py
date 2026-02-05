@@ -112,21 +112,21 @@ class DiagramPipelineService:
 
         # 1) Sequence labels like triangle ABC, line PQ, chord AB
         seq_patterns = [
-            r"\b(?:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex)\s+([A-Z]{2,6})\b",
-            r"\b(?:between|join(?:ing)?|from|to)\s+([A-Z]{2,6})\b",
+            r"\b(?:(?i:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex))\s+([A-Z]{2,6})\b",
+            r"\b(?:(?i:between|join(?:ing)?|from|to))\s+([A-Z]{2,6})\b",
         ]
         for pat in seq_patterns:
-            for seq in re.findall(pat, normalized or "", flags=re.IGNORECASE):
+            for seq in re.findall(pat, normalized or ""):
                 labels.update(list(seq.upper()))
 
         # 2) Explicit single-label mentions (point A, vertex B, mass A, block B, label C)
         single_patterns = [
-            r"\b(?:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge)\s+([A-Z])\b",
+            r"\b(?:(?i:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge))\s+([A-Z])\b",
             r"\b([A-Z])\s*=",
             r"\b([A-Z])\s*\(",
         ]
         for pat in single_patterns:
-            for lbl in re.findall(pat, normalized or "", flags=re.IGNORECASE):
+            for lbl in re.findall(pat, normalized or ""):
                 labels.add(lbl.upper())
 
         # 3) Fallback for pure geometry shorthand like "ABC is a triangle"

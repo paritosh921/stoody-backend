@@ -374,6 +374,15 @@ async def _process_paper_diagrams(
             if diagram_image_id and not question.get("diagram_image_id"):
                 question["diagram_image_id"] = diagram_image_id
 
+            # If a stable image reference already exists, do not upload duplicate base64 data.
+            if diagram_base64 and diagram_image_id:
+                stable_url = question.get("diagram_url") or question.get("diagram_image_url") or f"/api/v1/images/{diagram_image_id}"
+                question["diagram_url"] = stable_url
+                question["diagram_image_url"] = stable_url
+                question["has_diagram"] = True
+                question.pop("diagram_base64", None)
+                continue
+
             if diagram_base64:
                 image_ref = await _store_diagram_image(
                     db=db,
@@ -391,6 +400,8 @@ async def _process_paper_diagrams(
                     saved_count += 1
             elif diagram_image_id and not diagram_url:
                 question["diagram_url"] = f"/api/v1/images/{diagram_image_id}"
+                question["diagram_image_url"] = question["diagram_url"]
+                question["has_diagram"] = True
 
     return saved_count
 
@@ -811,7 +822,11 @@ async def update_paper(
         except Exception as sync_err:
             logger.error(f"Content sync failed for paper {paper_id}: {sync_err}")
 
-        response = {"success": True, "message": "Paper updated"}
+        paper.pop("_id", None)
+        paper["total_questions"] = _count_questions(paper)
+        paper["total_marks"] = _calculate_total_marks(paper)
+
+        response = {"success": True, "message": "Paper updated", "paper": paper}
         if sync_result:
             response["content_sync"] = sync_result
         return response
@@ -942,14 +957,46 @@ async def generate_questions(
         # Get subject and standard from paper if not provided
         subject = request.subject or paper.get("subject", "General")
         standard = request.standard or paper.get("standard", "11")
+        subject_key = subject.strip().lower()
+        diagram_subjects = {"physics", "chemistry", "biology", "mathematics", "math", "maths"}
+        diagram_design_enabled = subject_key in diagram_subjects
 
-        def build_system_prompt(count: int) -> str:
+        try:
+            min_diagram_ratio = float(os.getenv("DIAGRAM_MIN_RATIO", "0.2"))
+        except ValueError:
+            min_diagram_ratio = 0.2
+        min_diagram_ratio = max(0.0, min(1.0, min_diagram_ratio))
+
+        min_diagram_questions_target = 0
+        if diagram_design_enabled and request.count > 0 and min_diagram_ratio > 0:
+            min_diagram_questions_target = max(1, int(math.ceil(request.count * min_diagram_ratio)))
+
+        def build_system_prompt(
+            count: int,
+            min_diagram_count: int = 0,
+            require_diagram_only: bool = False,
+        ) -> str:
+            diagram_distribution_block = ""
+            if require_diagram_only and count > 0:
+                diagram_distribution_block = f"""
+DIAGRAM QUOTA (MANDATORY):
+- ALL {count} questions must be naturally diagram-based.
+- Set "needs_diagram": true for every question.
+- Each question must include a concrete visual setup (shape/system/graph/circuit) with specific values and labels."""
+            elif min_diagram_count > 0:
+                diagram_distribution_block = f"""
+DIAGRAM QUOTA (MANDATORY):
+- At least {min_diagram_count} out of {count} questions must be naturally diagram-based.
+- For diagram-based questions, set "needs_diagram": true and provide detailed "diagram_description".
+- Do not force diagrams for purely symbolic/algebraic questions."""
+
             return f"""You are an expert {request.exam_type} exam question creator for {subject}.
 Generate exactly {count} {request.question_type.upper()} questions on: {request.topic}
 Difficulty: {request.difficulty} | Class: {standard}
 
 IMPORTANT: Output ONLY valid JSON. Keep explanations SHORT (1-2 sentences max).
 IMPORTANT: Every question must be scientifically correct and internally consistent. Avoid ambiguous or misleading setups.
+{diagram_distribution_block}
 
 DIAGRAM DECISION - BASED ON QUESTION CONTENT:
 
@@ -1014,10 +1061,13 @@ Rules:
 - Ensure complete, valid JSON
 - Only set needs_diagram: true if the question has a SPECIFIC shape/figure with measurements
 - Always COPY exact values (angles, lengths, coordinates) from question into diagram_description
-- If unsure whether diagram is needed, set needs_diagram: false
+- Prefer diagram-friendly question designs first until quota is met; then use needs_diagram: false for non-visual questions
 """
 
-        system_prompt = build_system_prompt(request.count)
+        system_prompt = build_system_prompt(
+            request.count,
+            min_diagram_count=min_diagram_questions_target,
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1277,7 +1327,16 @@ Rules:
             remaining = request.count - len(questions_data)
             logger.info(f"[QUESTION-VALIDATION] Regenerating {remaining} questions (attempt {attempts}/{max_attempts})")
 
-            regen_system_prompt = build_system_prompt(remaining)
+            current_diagram_count = sum(
+                1 for q in questions_data if bool(q.get("needs_diagram"))
+            )
+            remaining_diagram_target = max(0, min_diagram_questions_target - current_diagram_count)
+            remaining_diagram_target = min(remaining, remaining_diagram_target)
+
+            regen_system_prompt = build_system_prompt(
+                remaining,
+                min_diagram_count=remaining_diagram_target,
+            )
             regen_messages = [
                 {"role": "system", "content": regen_system_prompt},
                 {"role": "user", "content": f"Generate {remaining} NEW questions on {request.topic} for {subject}. Do not repeat previous questions."}
@@ -1342,20 +1401,20 @@ Rules:
                 t = _normalize_visual_text(text)
                 labels = set()
                 seq_patterns = [
-                    r"\b(?:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex)\s+([A-Z]{2,6})\b",
-                    r"\b(?:between|join(?:ing)?|from|to)\s+([A-Z]{2,6})\b",
+                    r"\b(?:(?i:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex))\s+([A-Z]{2,6})\b",
+                    r"\b(?:(?i:between|join(?:ing)?|from|to))\s+([A-Z]{2,6})\b",
                 ]
                 for pat in seq_patterns:
-                    for seq in re.findall(pat, t, flags=re.IGNORECASE):
+                    for seq in re.findall(pat, t):
                         labels.update(list(seq.upper()))
 
                 single_patterns = [
-                    r"\b(?:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge)\s+([A-Z])\b",
+                    r"\b(?:(?i:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge))\s+([A-Z])\b",
                     r"\b([A-Z])\s*=",
                     r"\b([A-Z])\s*\(",
                 ]
                 for pat in single_patterns:
-                    for lbl in re.findall(pat, t, flags=re.IGNORECASE):
+                    for lbl in re.findall(pat, t):
                         labels.add(lbl.upper())
 
                 for seq in re.findall(r'\b([A-Z]{2,6})\b', t):
@@ -1467,6 +1526,106 @@ Rules:
             ]
             return any(re.search(p, q) for p in include_patterns)
 
+        def _is_diagram_marked(question_obj: Dict[str, Any]) -> bool:
+            question_text = (question_obj.get("question_text") or "").strip()
+            if not question_text or not is_diagram_eligible(question_text):
+                return False
+            if not bool(question_obj.get("needs_diagram")):
+                return False
+            diagram_desc = (question_obj.get("diagram_description") or "").strip()
+            return len(diagram_desc) >= 20
+
+        async def _generate_diagram_focused_questions(missing_count: int) -> List[Dict[str, Any]]:
+            """Generate additional diagram-first questions when the minimum quota is not met."""
+            if missing_count <= 0:
+                return []
+
+            generated: List[Dict[str, Any]] = []
+            attempts = 0
+            max_attempts = 3
+
+            while len(generated) < missing_count and attempts < max_attempts:
+                attempts += 1
+                remaining = missing_count - len(generated)
+                # Ask for a slightly larger batch to absorb validation and duplicate drops.
+                batch_size = max(remaining + 2, remaining * 2)
+
+                focused_prompt = build_system_prompt(
+                    batch_size,
+                    min_diagram_count=batch_size,
+                    require_diagram_only=True,
+                )
+                focused_messages = [
+                    {"role": "system", "content": focused_prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Generate {batch_size} NEW diagram-first questions on {request.topic} for {subject}. "
+                            "Do not repeat previous questions."
+                        ),
+                    },
+                ]
+
+                try:
+                    focused_response = await kimi._call_api(focused_messages, max_tokens=7000)
+                    focused_questions = _parse_questions_response(focused_response)
+                    focused_questions = _local_sanity_filter(focused_questions)
+                    focused_valid, _ = await _validate_questions_batch(focused_questions)
+                except Exception as focused_err:
+                    logger.warning(f"[DIAGRAM-MIN] Focused diagram regeneration failed: {focused_err}")
+                    continue
+
+                for question_obj in focused_valid:
+                    key = _normalize_question_text(question_obj.get("question_text", ""))
+                    if not key or key in seen_questions:
+                        continue
+
+                    question_obj["needs_diagram"] = True
+                    if not _is_diagram_marked(question_obj):
+                        continue
+
+                    seen_questions.add(key)
+                    generated.append(question_obj)
+                    if len(generated) >= missing_count:
+                        break
+
+            return generated
+
+        diagram_min_target = min(len(questions_data), min_diagram_questions_target)
+        current_diagram_marked = sum(1 for q in questions_data if _is_diagram_marked(q))
+        diagram_shortfall = max(0, diagram_min_target - current_diagram_marked)
+        if diagram_shortfall > 0:
+            logger.info(
+                f"[DIAGRAM-MIN] Detected shortfall={diagram_shortfall} "
+                f"(current={current_diagram_marked}, target={diagram_min_target})"
+            )
+
+            focused_questions = await _generate_diagram_focused_questions(diagram_shortfall)
+            replaceable_indices = [
+                i for i, q in enumerate(questions_data)
+                if not _is_diagram_marked(q)
+            ]
+
+            replaced = 0
+            for idx, replacement in zip(replaceable_indices, focused_questions):
+                questions_data[idx] = replacement
+                replaced += 1
+                if replaced >= diagram_shortfall:
+                    break
+
+            current_diagram_marked = sum(1 for q in questions_data if _is_diagram_marked(q))
+            diagram_shortfall = max(0, diagram_min_target - current_diagram_marked)
+            if diagram_shortfall > 0:
+                logger.warning(
+                    f"[DIAGRAM-MIN] Could not fully satisfy minimum diagram quota. "
+                    f"remaining_shortfall={diagram_shortfall}, current={current_diagram_marked}, target={diagram_min_target}"
+                )
+            else:
+                logger.info(
+                    f"[DIAGRAM-MIN] Minimum diagram quota satisfied after focused regeneration. "
+                    f"current={current_diagram_marked}, target={diagram_min_target}"
+                )
+
         # Limit diagrams to a configurable ratio of total questions
         try:
             diagram_ratio = float(os.getenv("DIAGRAM_MAX_RATIO", "0.3"))
@@ -1477,6 +1636,12 @@ Rules:
         max_diagrams = int(math.floor(total_questions * diagram_ratio))
         if diagram_ratio > 0 and total_questions > 0 and max_diagrams == 0:
             max_diagrams = 1
+        if diagram_min_target > max_diagrams:
+            logger.info(
+                f"[DIAGRAM-RATIO] Raising max_diagrams from {max_diagrams} to {diagram_min_target} "
+                f"to satisfy minimum ratio target"
+            )
+            max_diagrams = diagram_min_target
 
         # Pick the best candidates first (valid hints + diagrammatic text)
         diagram_candidates = []
@@ -1629,11 +1794,6 @@ Rules:
                 print(f"[DEBUG] SKIPPING diagram for {question_id}: {', '.join(skip_reasons)}")
                 logger.info(f"[DIAGRAM-SKIP] Skipping diagram for {question_id}: {', '.join(skip_reasons)}")
             
-            # Prepare response for frontend
-            stable_diagram_url = None
-            if diagram_url and diagram_url.startswith("/api/v1/images/"):
-                stable_diagram_url = diagram_url
-
             generated_questions_response.append({
                 "id": question_id,
                 "text": q_data.get("question_text", ""),
@@ -1646,8 +1806,8 @@ Rules:
                 "topic": request.topic,
                 "has_diagram": needs_diagram and diagram_base64 is not None,
                 "diagram_instructions": diagram_instructions,
-                "diagram_url": stable_diagram_url,
-                "diagram_image_url": stable_diagram_url,
+                "diagram_url": diagram_url,
+                "diagram_image_url": diagram_url,
                 "diagram_base64": diagram_base64,
                 "source": "ai_generated",
             })
@@ -1722,13 +1882,37 @@ async def generate_question_diagram(
         result = await diagram_service.generate_diagram(diagram_request)
         
         if result.success and result.image:
-            # Update the question with diagram info
+            # Persist the generated image and store a stable image URL.
             stable_diagram_url = None
-            if result.image.path and str(result.image.path).startswith("/api/v1/images/"):
-                stable_diagram_url = result.image.path
+            stable_diagram_id = None
+
+            if result.image.base64_data:
+                is_b2c = current_user.get("user_type") == "b2c_admin"
+                image_ref = await _store_diagram_image(
+                    db=db,
+                    image_base64=result.image.base64_data,
+                    document_id=paper.get("document_id") or paper.get("id") or paper_id,
+                    current_user=current_user,
+                    is_b2c=is_b2c
+                )
+                if image_ref:
+                    stable_diagram_id = image_ref.get("id")
+                    stable_diagram_url = image_ref.get("url")
+
+            if not stable_diagram_url and result.image.path:
+                path = str(result.image.path)
+                stable_diagram_url = path if path.startswith("/") else f"/static/{path}"
+
             paper["sections"][section_idx]["questions"][question_idx]["has_diagram"] = True
+            if stable_diagram_id:
+                paper["sections"][section_idx]["questions"][question_idx]["diagram_image_id"] = stable_diagram_id
+            paper["sections"][section_idx]["questions"][question_idx]["diagram_url"] = stable_diagram_url
             paper["sections"][section_idx]["questions"][question_idx]["diagram_image_url"] = stable_diagram_url
-            paper["sections"][section_idx]["questions"][question_idx]["diagram_base64"] = result.image.base64_data
+            # Keep inline base64 in response for immediate rendering, but persist stable URL in DB.
+            if stable_diagram_id:
+                paper["sections"][section_idx]["questions"][question_idx].pop("diagram_base64", None)
+            else:
+                paper["sections"][section_idx]["questions"][question_idx]["diagram_base64"] = result.image.base64_data
             
             if result.instructions_history:
                 paper["sections"][section_idx]["questions"][question_idx]["diagram_instructions"] = result.instructions_history[-1].instructions
@@ -1738,6 +1922,7 @@ async def generate_question_diagram(
             return {
                 "success": True,
                 "diagram_url": stable_diagram_url,
+                "diagram_image_id": stable_diagram_id,
                 "diagram_base64": result.image.base64_data,
             }
         else:
