@@ -238,6 +238,8 @@ Example: "Draw a right-angled triangle ABC with the right angle at B. AB is vert
         diagram_hints: Optional[str] = None,
         previous_instructions: Optional[str] = None,
         review_feedback: Optional[str] = None,
+        required_labels: Optional[list] = None,
+        required_numbers: Optional[list] = None,
     ) -> DiagramInstructions:
         """
         Generate diagram instructions for a question.
@@ -248,6 +250,8 @@ Example: "Draw a right-angled triangle ABC with the right angle at B. AB is vert
             diagram_hints: Optional hints about what diagram to create
             previous_instructions: Previous instructions if refining
             review_feedback: Feedback from LLM2 review if refining
+            required_labels: Explicit labels that must appear (optional)
+            required_numbers: Explicit numeric values to include (optional)
         
         Returns:
             DiagramInstructions object
@@ -264,6 +268,11 @@ Example: "Draw a right-angled triangle ABC with the right angle at B. AB is vert
         
         if diagram_hints:
             user_content += f"Hints (use only if consistent with the question): {diagram_hints}\n"
+
+        if required_labels:
+            user_content += f"Required labels (must appear exactly): {', '.join(required_labels)}\n"
+        if required_numbers:
+            user_content += f"Required numeric values (include where diagram-relevant): {', '.join(required_numbers)}\n"
         
         if previous_instructions and review_feedback:
             user_content += f"\n--- REFINEMENT REQUEST ---\n"

@@ -3,7 +3,7 @@ Diagram Pipeline Service
 
 Orchestrates the complete diagram generation pipeline:
 1. Question → LLM1 instructions
-2. Instructions → Nano Banan Pro image
+2. Instructions → Kimi-authored TikZ image
 3. Image + instructions → LLM2 review
 4. Review → improved instructions (if needed)
 
@@ -28,7 +28,7 @@ from .models import (
     IssueCode,
 )
 from .kimi_client import LLM1InstructionGenerator, LLM2DiagramReviewer
-from .nano_banan_client import GeminiImageClient
+from .tikz_client import TikzImageClient
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ class DiagramPipelineService:
         self.db_manager = db
         self.llm1 = LLM1InstructionGenerator()
         self.llm2 = LLM2DiagramReviewer()
-        self.image_generator = GeminiImageClient()
+        self.image_generator = TikzImageClient()
         
         # Collection name for diagram records
         self.collection_name = "question_diagrams"
@@ -59,6 +59,8 @@ class DiagramPipelineService:
         # Strict mode rejects diagrams when the rendered image description
         # misses required labels/values or adds contradictory ones.
         self.strict_image_consistency = os.getenv("DIAGRAM_STRICT_IMAGE_CONSISTENCY", "true").lower() in ["1", "true", "yes"]
+        # Strict instruction coverage rejects before rendering when labels/values are missing.
+        self.strict_instruction_coverage = os.getenv("DIAGRAM_STRICT_INSTRUCTION_COVERAGE", "false").lower() in ["1", "true", "yes"]
 
     def _instruction_coverage_issues(self, question_text: str, instructions: str) -> Dict[str, Any]:
         """
@@ -66,8 +68,8 @@ class DiagramPipelineService:
 
         Returns a dict with missing labels and numbers for feedback.
         """
-        q_meta = self._extract_labels_numbers(question_text)
-        i_meta = self._extract_labels_numbers(instructions)
+        q_meta = self._extract_labels_numbers(question_text, exclude_quantity_labels=True)
+        i_meta = self._extract_labels_numbers(instructions, exclude_quantity_labels=True)
 
         q_labels = q_meta["labels"]
         i_labels = i_meta["labels"]
@@ -104,11 +106,12 @@ class DiagramPipelineService:
         })
         return (text or "").translate(subscript_map)
 
-    def _extract_labels_numbers(self, text: str) -> Dict[str, Any]:
+    def _extract_labels_numbers(self, text: str, exclude_quantity_labels: bool = False) -> Dict[str, Any]:
         import re
 
         normalized = self._normalize_visual_text(text)
         labels = set()
+        quantity_labels = set()
 
         # 1) Sequence labels like triangle ABC, line PQ, chord AB
         seq_patterns = [
@@ -119,15 +122,23 @@ class DiagramPipelineService:
             for seq in re.findall(pat, normalized or ""):
                 labels.update(list(seq.upper()))
 
-        # 2) Explicit single-label mentions (point A, vertex B, mass A, block B, label C)
+        # 2) Explicit single-label mentions (point A, vertex B, block B, label C)
         single_patterns = [
-            r"\b(?:(?i:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge))\s+([A-Z])\b",
+            r"\b(?:(?i:point|vertex|label(?:ed)?|block|particle|node|terminal))\s+([A-Z])\b",
             r"\b([A-Z])\s*=",
             r"\b([A-Z])\s*\(",
         ]
         for pat in single_patterns:
             for lbl in re.findall(pat, normalized or ""):
                 labels.add(lbl.upper())
+
+        # Quantity symbols like mass M, radius R, charge Q are optional in many diagrams.
+        quantity_patterns = [
+            r"\b(?i:mass|radius|length|height|distance|separation|diameter|charge|current|voltage|resistance|speed|velocity|acceleration|force|power|energy|time|frequency|wavelength|moment|inertia|temperature|pressure|coefficient)\s+([A-Z])\b",
+        ]
+        for pat in quantity_patterns:
+            for lbl in re.findall(pat, normalized or ""):
+                quantity_labels.add(lbl.upper())
 
         # 3) Fallback for pure geometry shorthand like "ABC is a triangle"
         for seq in re.findall(r'\b([A-Z]{2,6})\b', normalized or ""):
@@ -137,6 +148,8 @@ class DiagramPipelineService:
             labels.update(list(seq))
 
         numbers = set(re.findall(r'\d+(?:\.\d+)?', normalized or ""))
+        if exclude_quantity_labels and quantity_labels:
+            labels = labels - quantity_labels
         return {"labels": labels, "numbers": numbers}
     
     async def generate_diagram(
@@ -186,7 +199,11 @@ class DiagramPipelineService:
             # Start the pipeline
             current_instructions = None
             previous_review = None
-            
+
+            required_meta = self._extract_labels_numbers(request.question_text)
+            required_labels = sorted(required_meta["labels"])
+            required_numbers = sorted(required_meta["numbers"])
+
             for iteration in range(request.max_iterations):
                 logger.info(f"Diagram pipeline iteration {iteration + 1} for question {request.question_id}")
                 
@@ -197,6 +214,8 @@ class DiagramPipelineService:
                         question_text=request.question_text,
                         subject=request.subject,
                         diagram_hints=request.diagram_hints,
+                        required_labels=required_labels,
+                        required_numbers=required_numbers,
                     )
                 else:
                     # Refinement iteration - improve based on review
@@ -212,6 +231,8 @@ class DiagramPipelineService:
                         diagram_hints=request.diagram_hints,
                         previous_instructions=current_instructions.instructions,
                         review_feedback=review_feedback,
+                        required_labels=required_labels,
+                        required_numbers=required_numbers,
                     )
                 
                 # Update version number
@@ -228,37 +249,43 @@ class DiagramPipelineService:
                     instructions.instructions,
                 )
                 if coverage["missing_labels"] or coverage["missing_numbers"]:
-                    issues = []
-                    if coverage["missing_labels"]:
-                        issues.append(ReviewIssue(
-                            code=IssueCode.MISSING_LABEL,
-                            details=f"Missing labels: {', '.join(coverage['missing_labels'])}",
-                        ))
-                    if coverage["missing_numbers"]:
-                        issues.append(ReviewIssue(
-                            code=IssueCode.INCOMPLETE_DIAGRAM,
-                            details=f"Missing values: {', '.join(coverage['missing_numbers'])}",
-                        ))
+                    if not self.strict_instruction_coverage:
+                        logger.info(
+                            "Instruction coverage warnings; proceeding without blocking. "
+                            f"Missing labels={coverage['missing_labels']}, numbers={coverage['missing_numbers']}"
+                        )
+                    else:
+                        issues = []
+                        if coverage["missing_labels"]:
+                            issues.append(ReviewIssue(
+                                code=IssueCode.MISSING_LABEL,
+                                details=f"Missing labels: {', '.join(coverage['missing_labels'])}",
+                            ))
+                        if coverage["missing_numbers"]:
+                            issues.append(ReviewIssue(
+                                code=IssueCode.INCOMPLETE_DIAGRAM,
+                                details=f"Missing values: {', '.join(coverage['missing_numbers'])}",
+                            ))
 
-                    feedback_parts = []
-                    if coverage["missing_labels"]:
-                        feedback_parts.append(f"Add labels: {', '.join(coverage['missing_labels'])}.")
-                    if coverage["missing_numbers"]:
-                        feedback_parts.append(f"Include values: {', '.join(coverage['missing_numbers'])}.")
+                        feedback_parts = []
+                        if coverage["missing_labels"]:
+                            feedback_parts.append(f"Add labels: {', '.join(coverage['missing_labels'])}.")
+                        if coverage["missing_numbers"]:
+                            feedback_parts.append(f"Include values: {', '.join(coverage['missing_numbers'])}.")
 
-                    review = DiagramReview(
-                        is_acceptable=False,
-                        issues=issues,
-                        suggested_instruction_update=" ".join(feedback_parts).strip() or None,
-                    )
-                    review.review_version = iteration + 1
-                    review_history.append(review)
-                    previous_review = review
-                    logger.info(
-                        f"Instruction coverage failed; refining. "
-                        f"Missing labels={coverage['missing_labels']}, numbers={coverage['missing_numbers']}"
-                    )
-                    continue
+                        review = DiagramReview(
+                            is_acceptable=False,
+                            issues=issues,
+                            suggested_instruction_update=" ".join(feedback_parts).strip() or None,
+                        )
+                        review.review_version = iteration + 1
+                        review_history.append(review)
+                        previous_review = review
+                        logger.info(
+                            f"Instruction coverage failed; refining. "
+                            f"Missing labels={coverage['missing_labels']}, numbers={coverage['missing_numbers']}"
+                        )
+                        continue
 
                 # Step 2: Generate image (Nano Banan Pro)
                 try:
@@ -269,7 +296,8 @@ class DiagramPipelineService:
                     )
                     current_image = image
                 except Exception as e:
-                    logger.error(f"Image generation failed: {e}")
+                    logger.error(f"Image generation failed: {e!r}")
+                    logger.exception("Image generation exception stack trace")
                     # Continue to try with refined instructions
                     continue
                 
@@ -346,7 +374,7 @@ class DiagramPipelineService:
 
                 # Post-process review to reduce false negatives on generic physics/math prompts.
                 import re
-                required_meta = self._extract_labels_numbers(request.question_text)
+                required_meta = self._extract_labels_numbers(request.question_text, exclude_quantity_labels=True)
                 required_labels = required_meta["labels"]
                 q_lower = (request.question_text or "").lower()
                 arrow_required = any(

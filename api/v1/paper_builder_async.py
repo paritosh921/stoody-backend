@@ -957,18 +957,14 @@ async def generate_questions(
         # Get subject and standard from paper if not provided
         subject = request.subject or paper.get("subject", "General")
         standard = request.standard or paper.get("standard", "11")
-        subject_key = subject.strip().lower()
-        diagram_subjects = {"physics", "chemistry", "biology", "mathematics", "math", "maths"}
-        diagram_design_enabled = subject_key in diagram_subjects
-
         try:
-            min_diagram_ratio = float(os.getenv("DIAGRAM_MIN_RATIO", "0.2"))
+            min_diagram_ratio = float(os.getenv("DIAGRAM_MIN_RATIO", "0.3"))
         except ValueError:
-            min_diagram_ratio = 0.2
+            min_diagram_ratio = 0.3
         min_diagram_ratio = max(0.0, min(1.0, min_diagram_ratio))
 
         min_diagram_questions_target = 0
-        if diagram_design_enabled and request.count > 0 and min_diagram_ratio > 0:
+        if request.count > 0 and min_diagram_ratio > 0:
             min_diagram_questions_target = max(1, int(math.ceil(request.count * min_diagram_ratio)))
 
         def build_system_prompt(
@@ -1450,12 +1446,13 @@ Rules:
             # EXTRACT: Find numbers from both
             q_numbers = set(re.findall(r'\d+(?:\.\d+)?', _normalize_visual_text(question_text)))
             d_numbers = set(re.findall(r'\d+(?:\.\d+)?', _normalize_visual_text(diagram_desc)))
+            warnings = []
 
             # VALIDATION: If question has specific labels, diagram should include ALL of them
             if q_labels:
                 missing_labels = q_labels - d_labels
                 if missing_labels:
-                    return False, f"Missing labels {sorted(missing_labels)}"
+                    warnings.append(f"Missing labels {sorted(missing_labels)}")
 
             # VALIDATION: Numeric coverage should be substantial, but not absolute.
             # Constants like g=10 may be present in text but not always visualized in diagrams.
@@ -1468,8 +1465,7 @@ Rules:
                     required_matches = (2 * len(q_numbers) + 2) // 3
                 if len(matched_numbers) < required_matches:
                     missing_numbers = q_numbers - d_numbers
-                    return (
-                        False,
+                    warnings.append(
                         f"Low numeric coverage {len(matched_numbers)}/{len(q_numbers)}; "
                         f"missing values {sorted(missing_numbers)}"
                     )
@@ -1485,6 +1481,9 @@ Rules:
             for shape in mentioned_shapes:
                 if shape not in d_lower:
                     return False, f"Missing shape term '{shape}'"
+
+            if warnings:
+                return True, "Partial coverage: " + "; ".join(warnings)
 
             # PASSED all checks
             return True, "Valid"
@@ -1940,25 +1939,23 @@ async def generate_question_diagram(
 
 @router.get("/test-imagen")
 async def test_imagen_api():
-    """Test endpoint to verify Imagen API is working.
-    
-    This helps debug diagram generation issues.
-    """
-    from services.diagram_pipeline.nano_banan_client import GeminiImageClient
-    
-    client = GeminiImageClient()
+    """Test endpoint to verify Kimi+TikZ diagram rendering is working."""
+    from services.diagram_pipeline.tikz_client import TikzImageClient
+
+    client = TikzImageClient()
     
     # Check configuration
     result = {
         "has_api_key": bool(client.api_key),
         "api_key_prefix": client.api_key[:10] + "..." if client.api_key else None,
         "model": client.model,
-        "api_url": client.api_url,
+        "renderer": getattr(client, "pdf_renderer", None),
+        "latex_engine": getattr(client, "latex_engine", None),
         "images_dir": str(client.images_dir),
     }
     
     if not client.api_key:
-        result["error"] = "GEMINI_API_KEY or NANO_BANAN_API_KEY not configured"
+        result["error"] = "KIMI_API_KEY not configured"
         return result
     
     # Try to generate a simple test diagram
@@ -1981,7 +1978,7 @@ async def test_imagen_api():
     except Exception as e:
         result["success"] = False
         result["error"] = str(e)
-        logger.error(f"Imagen test failed: {e}")
+        logger.error(f"TikZ rendering test failed: {e}")
     
     return result
 
