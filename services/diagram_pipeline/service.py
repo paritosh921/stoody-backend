@@ -370,6 +370,7 @@ class DiagramPipelineService:
                     current_instructions=instructions.instructions,
                     subject=request.subject,
                     image_description=image_description,
+                    image_base64=current_image.base64_data if current_image else None,
                 )
 
                 # Post-process review to reduce false negatives on generic physics/math prompts.

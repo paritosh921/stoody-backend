@@ -1675,6 +1675,7 @@ Rules:
             diagram_instructions = diagram_description or None
             diagram_url = None
             diagram_base64 = None
+            diagram_image_id = None
 
             # IMPORTANT: Only generate diagrams when Kimi explicitly provides needs_diagram=true
             # AND a meaningful diagram_description that MATCHES the question content.
@@ -1747,10 +1748,23 @@ Rules:
                         if diagram_result.instructions_history:
                             diagram_instructions = diagram_result.instructions_history[-1].instructions
 
-                        # Upload to S3 if enabled
-                        if is_s3_enabled():
-                            import base64
-                            image_bytes = base64.b64decode(diagram_result.image.base64_data)
+                        # Persist image to storage AND save metadata to MongoDB
+                        is_b2c = current_user.get("user_type") == "b2c_admin"
+                        image_ref = await _store_diagram_image(
+                            db=db,
+                            image_base64=diagram_result.image.base64_data,
+                            document_id=paper_id,
+                            current_user=current_user,
+                            is_b2c=is_b2c,
+                        )
+                        if image_ref:
+                            diagram_url = image_ref.get("url")
+                            diagram_image_id = image_ref.get("id")
+                            logger.info(f"Diagram persisted: id={diagram_image_id}, url={diagram_url}")
+                        elif is_s3_enabled():
+                            # Fallback: direct S3 upload if _store_diagram_image failed
+                            import base64 as b64mod
+                            image_bytes = b64mod.b64decode(diagram_result.image.base64_data)
                             local_path = f"uploads/diagrams/{question_id}_{diagram_result.image.filename}"
                             success, storage_path = await upload_file(
                                 image_bytes,
@@ -1759,9 +1773,8 @@ Rules:
                             )
                             if success:
                                 diagram_url = get_public_url(storage_path)
-                                logger.info(f"Diagram uploaded to S3: {diagram_url[:100]}...")
+                                logger.warning(f"Diagram uploaded to S3 (no DB record): {diagram_url[:100]}...")
                         else:
-                            # Use local path
                             diagram_url = f"/static/{diagram_result.image.path}"
 
                         logger.info(f"✅ Diagram generated for question {question_id}")
@@ -1805,6 +1818,7 @@ Rules:
                 "topic": request.topic,
                 "has_diagram": needs_diagram and diagram_base64 is not None,
                 "diagram_instructions": diagram_instructions,
+                "diagram_image_id": diagram_image_id,
                 "diagram_url": diagram_url,
                 "diagram_image_url": diagram_url,
                 "diagram_base64": diagram_base64,

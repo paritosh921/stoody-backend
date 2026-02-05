@@ -59,6 +59,25 @@ IMPORTANT:
 Return ONLY a corrected standalone LaTeX document.
 No markdown, no explanations."""
 
+    DESCRIBE_PROMPT = """You are a precise diagram analyst for exam question papers.
+Examine the rendered diagram image and describe EXACTLY what you see.
+
+OUTPUT REQUIREMENTS:
+1. List every visible shape (triangles, circles, rectangles, lines, curves, arrows, etc.)
+2. List every visible text label (letters, numbers, symbols, words) and their positions
+3. List every visible arrow and its direction
+4. List every visible angle marking and its value (if shown)
+5. List every visible measurement, dimension, or numeric annotation
+6. Describe the spatial layout and relative positioning of elements
+
+RULES:
+- Be factual and exhaustive — report only what is visually present.
+- Do NOT interpret the physics, chemistry, or mathematics behind the diagram.
+- Do NOT add or infer elements that are not visible.
+- If something is unclear, partially obscured, or overlapping, note that explicitly.
+- Use consistent terminology (e.g., "vertex labeled A at top-left", "arrow pointing rightward from P to Q").
+"""
+
     def __init__(self):
         self.kimi = KimiClient()
         self.api_key = self.kimi.api_key
@@ -324,6 +343,81 @@ No markdown, no explanations."""
             "\\end{document}\n"
         )
 
+    # Libraries that _wrap_tikz_document always includes.  When KIMI returns a
+    # full \documentclass document we inspect the body and inject any of these
+    # that appear to be used but were not declared via \usetikzlibrary.
+    _REQUIRED_TIKZ_LIBRARIES = [
+        "arrows.meta",
+        "angles",
+        "quotes",
+        "calc",
+        "positioning",
+    ]
+
+    # Simple heuristics: patterns in the tikzpicture body that indicate a
+    # particular library is needed.
+    _LIBRARY_USAGE_HINTS = {
+        "calc": [r"\$\(", r"\$\s*\("],  # coordinate calc syntax $(...)
+        "arrows.meta": [r"arrows\s*=\s*\{", r"Stealth", r"Latex\[", r"->"],
+        "angles": [r"\\pic\b", r"angle\s*="],
+        "quotes": [r"\"[^\"]+\""],
+        "positioning": [r"below\s*=\s*of", r"above\s*=\s*of", r"right\s*=\s*of", r"left\s*=\s*of"],
+    }
+
+    def _ensure_tikz_libraries(self, doc: str) -> str:
+        """Inject commonly needed TikZ libraries if the document uses them
+        but KIMI forgot to declare them via \\usetikzlibrary.
+
+        Avoids first-attempt compilation failures for missing libraries.
+        """
+        # Find existing \usetikzlibrary declarations
+        existing_libs: set[str] = set()
+        for m in re.finditer(r"\\usetikzlibrary\{([^}]+)\}", doc):
+            for lib in m.group(1).split(","):
+                existing_libs.add(lib.strip())
+
+        # Determine which libraries are used but not declared
+        missing_libs: list[str] = []
+        for lib in self._REQUIRED_TIKZ_LIBRARIES:
+            if lib in existing_libs:
+                continue
+            hints = self._LIBRARY_USAGE_HINTS.get(lib)
+            if hints is None:
+                continue
+            for pattern in hints:
+                if re.search(pattern, doc):
+                    missing_libs.append(lib)
+                    break
+
+        if not missing_libs:
+            return doc
+
+        # Inject missing libraries right after the last existing \usetikzlibrary
+        # or right after \usepackage{tikz}.
+        inject_line = "\\usetikzlibrary{" + ",".join(missing_libs) + "}\n"
+
+        # Prefer inserting after an existing \usetikzlibrary line
+        last_lib_match = None
+        for m in re.finditer(r"\\usetikzlibrary\{[^}]+\}[^\n]*\n?", doc):
+            last_lib_match = m
+        if last_lib_match:
+            pos = last_lib_match.end()
+            return doc[:pos] + inject_line + doc[pos:]
+
+        # Fallback: insert after \usepackage{tikz}
+        tikz_pkg = re.search(r"\\usepackage\{tikz\}[^\n]*\n?", doc)
+        if tikz_pkg:
+            pos = tikz_pkg.end()
+            return doc[:pos] + inject_line + doc[pos:]
+
+        # Last resort: insert after \documentclass line
+        docclass = re.search(r"\\documentclass[^\n]*\n", doc)
+        if docclass:
+            pos = docclass.end()
+            return doc[:pos] + "\\usepackage{tikz}\n" + inject_line + doc[pos:]
+
+        return doc
+
     def _extract_latex_document(self, raw_text: str) -> str:
         text = self._strip_markdown_fences(raw_text)
 
@@ -333,7 +427,8 @@ No markdown, no explanations."""
             re.IGNORECASE,
         )
         if doc_match:
-            return doc_match.group(1).strip()
+            doc = doc_match.group(1).strip()
+            return self._ensure_tikz_libraries(doc)
 
         tikz_match = re.search(
             r"(\\begin\{tikzpicture\}[\s\S]*\\end\{tikzpicture\})",
@@ -589,8 +684,54 @@ No markdown, no explanations."""
         question_text: str,
         instructions: str,
     ) -> str:
-        """No vision model used in TikZ mode; keep interface compatibility."""
-        return ""
+        """Describe a rendered diagram using KIMI K2.5 vision capabilities.
+
+        Sends the PNG image (base64) to KIMI and asks it to list all visible
+        elements.  The resulting text description is used for:
+        1. Programmatic pre-checks (label/number coverage).
+        2. Additional context supplied to LLM2 during review.
+        """
+        if not image_b64:
+            return ""
+
+        if not self.api_key:
+            logger.warning("[TIKZ] No KIMI API key — skipping image description")
+            return ""
+
+        try:
+            messages = [
+                {"role": "system", "content": self.DESCRIBE_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Question context: {question_text}\n\n"
+                                f"Intended diagram: {instructions}\n\n"
+                                "Describe exactly what is visible in the rendered "
+                                "diagram image below."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_b64}",
+                            },
+                        },
+                    ],
+                },
+            ]
+
+            description = await self.kimi._call_api(messages, max_tokens=1000)
+            description = (description or "").strip()
+            logger.info(
+                f"[TIKZ] Image description generated ({len(description)} chars)"
+            )
+            return description
+        except Exception as e:
+            logger.warning(f"[TIKZ] Image description via KIMI vision failed: {e}")
+            return ""
 
     async def get_image_base64(self, image_path: str) -> Optional[str]:
         full_path = IMAGES_DIR / image_path

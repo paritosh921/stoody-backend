@@ -318,32 +318,33 @@ class LLM2DiagramReviewer(KimiClient):
     
     SYSTEM_PROMPT = """You are an expert exam diagram reviewer for JEE/NEET questions.
 
-Your job is to review diagram instructions (and image description, if provided) and determine if they will produce an acceptable exam diagram.
+Your job is to review diagram instructions AND the rendered diagram image (if provided) to determine if the diagram is acceptable for exam use.
 
 REVIEW CRITERIA:
-1. CLARITY: Will the diagram be clear when printed?
-2. LABELS: Are all necessary labels specified? No overlaps?
-3. ACCURACY: Does it match what the question needs?
-4. SIMPLICITY: Is it simple enough for an exam? No clutter?
-5. COMPLETENESS: Are all required elements specified?
-6. COVERAGE: Only flag MISSING_LABEL/INCOMPLETE_DIAGRAM if a label/value appears in the question BUT is absent from the instructions.
-7. CONSISTENCY: If an image description is provided, reject ONLY on explicit contradictions. Missing info in the description is NOT a rejection reason.
-8. EVIDENCE: If you flag an issue, cite the exact missing/contradicting label/value.
-9. LABEL SAFETY: Do NOT treat grammatical articles (e.g., sentence-start "A") as labels.
-10. ARROWS: Flag MISSING_ARROW only when the question explicitly requires directional arrows (force/velocity/acceleration/current/rays, etc.).
+1. CLARITY: Is the diagram clear and legible when printed? Check for overlapping text, thin lines, or cluttered regions.
+2. LABELS: Are all necessary labels present, correctly placed, and readable? No overlaps?
+3. ACCURACY: Does the rendered diagram correctly represent what the question describes?
+4. SIMPLICITY: Is it simple enough for an exam? No unnecessary decoration or clutter?
+5. COMPLETENESS: Are all required elements (shapes, labels, arrows, values) present?
+6. COVERAGE: Only flag MISSING_LABEL/INCOMPLETE_DIAGRAM if a label/value appears in the question BUT is absent from the instructions or the rendered image.
+7. VISUAL QUALITY: If a rendered image is provided, verify that shapes are correctly drawn, labels are legible, lines are clean, and the spatial layout matches the instructions.
+8. CONSISTENCY: If both instructions and a rendered image are available, flag any discrepancy where the image does not match the instructions.
+9. EVIDENCE: If you flag an issue, cite the exact missing/incorrect element with specifics (e.g., "label 'B' is overlapping with the angle mark at vertex B").
+10. LABEL SAFETY: Do NOT treat grammatical articles (e.g., sentence-start "A") as labels.
+11. ARROWS: Flag MISSING_ARROW only when the question explicitly requires directional arrows (force/velocity/acceleration/current/rays, etc.).
 
 ISSUE CODES (use exactly these):
-- LABEL_OVERLAP: Labels might overlap or be unclear
-- MISSING_LABEL: A required label is missing
-- WRONG_ANGLE: Angles or orientations are incorrect
-- LOW_CLARITY: The diagram would be hard to read
-- WRONG_CONFIGURATION: Elements are incorrectly arranged
-- TOO_CLUTTERED: Too many elements or decoration
-- MISSING_ARROW: Direction indicators are missing
-- WRONG_PROPORTION: Size ratios are wrong
-- INCOMPLETE_DIAGRAM: Missing required elements
-- STYLE_ISSUE: Not suitable for exam printing
-- OTHER: Other issues
+- LABEL_OVERLAP: Labels overlap each other or other elements
+- MISSING_LABEL: A required label is missing from the diagram
+- WRONG_ANGLE: Angles or orientations are visually incorrect
+- LOW_CLARITY: The diagram is hard to read (thin lines, small text, poor contrast)
+- WRONG_CONFIGURATION: Elements are incorrectly arranged or positioned
+- TOO_CLUTTERED: Too many elements or unnecessary decoration
+- MISSING_ARROW: Required direction indicators are missing
+- WRONG_PROPORTION: Size ratios or relative dimensions are wrong
+- INCOMPLETE_DIAGRAM: Missing required shapes, components, or structural elements
+- STYLE_ISSUE: Not suitable for exam printing (color, background, decorative elements)
+- OTHER: Other issues not covered above
 
 OUTPUT FORMAT (JSON only):
 {
@@ -351,13 +352,13 @@ OUTPUT FORMAT (JSON only):
   "issues": [
     {
       "code": "ISSUE_CODE",
-      "details": "Brief explanation"
+      "details": "Brief explanation citing the specific element"
     }
   ],
-  "suggested_instruction_update": "New instruction text if needed, or null if acceptable"
+  "suggested_instruction_update": "Revised instruction text that fixes the issues, or null if acceptable"
 }
 
-Be STRICT but FAIR. Only mark as unacceptable if there are real problems.
+Be STRICT but FAIR. Only mark as unacceptable if there are real problems that would affect exam usability.
 Output ONLY the JSON, no other text."""
 
     async def review_diagram(
@@ -366,15 +367,21 @@ Output ONLY the JSON, no other text."""
         current_instructions: str,
         image_description: Optional[str] = None,
         subject: Optional[SubjectType] = None,
+        image_base64: Optional[str] = None,
     ) -> DiagramReview:
         """
-        Review a diagram's instructions.
-        
+        Review a diagram's instructions and (optionally) the rendered image.
+
+        When *image_base64* is provided the rendered PNG is sent directly to
+        KIMI K2.5 so the reviewer can visually inspect shapes, labels, and
+        layout in addition to reasoning over the textual instructions.
+
         Args:
             question_text: The original question
             current_instructions: The instructions used to generate the diagram
-            image_description: Optional description of the generated image
+            image_description: Optional text description of the generated image
             subject: The subject for context
+            image_base64: Optional base64-encoded PNG of the rendered diagram
         
         Returns:
             DiagramReview object
@@ -383,25 +390,46 @@ Output ONLY the JSON, no other text."""
             {"role": "system", "content": self.SYSTEM_PROMPT}
         ]
         
-        # Build the user message
-        user_content = f"Question: {question_text}\n\n"
-        user_content += f"Diagram Instructions:\n{current_instructions}\n"
+        # Build the textual part of the user message
+        user_text = f"Question: {question_text}\n\n"
+        user_text += f"Diagram Instructions:\n{current_instructions}\n"
         
         if subject:
-            user_content += f"\nSubject: {subject.value}"
+            user_text += f"\nSubject: {subject.value}"
         
         if image_description:
-            user_content += f"\n\nGenerated Image Description:\n{image_description}"
-        
-        user_content += "\n\nReview these instructions and provide your assessment as JSON."
-        
+            user_text += f"\n\nGenerated Image Description:\n{image_description}"
+
+        if image_base64:
+            user_text += (
+                "\n\nThe rendered diagram image is attached below. "
+                "Visually inspect it against the question and instructions, "
+                "then provide your assessment as JSON."
+            )
+        else:
+            user_text += "\n\nReview these instructions and provide your assessment as JSON."
+
+        # Build the user message — multimodal when an image is available
+        if image_base64:
+            user_content = [
+                {"type": "text", "text": user_text},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_base64}",
+                    },
+                },
+            ]
+        else:
+            user_content = user_text
+
         messages.append({"role": "user", "content": user_content})
         
         # Call Kimi 2.5 with JSON response format
         response_text = await self._call_api(
             messages, 
             max_tokens=1000,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
         
         # Parse the JSON response
