@@ -13,6 +13,7 @@ Constraints:
 import json
 import logging
 import httpx
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -30,7 +31,11 @@ logger = logging.getLogger(__name__)
 # Kimi K2.5 API Configuration
 KIMI_MODEL = "kimi-k2.5"  # Kimi K2.5
 KIMI_TEMPERATURE = 0.6  # Instant mode (thinking disabled) uses 0.6
-KIMI_BASE_URL = "https://api.moonshot.ai/v1"  # Correct base URL
+KIMI_BASE_URL = (KIMI_API_URL or "https://api.moonshot.ai/v1").rstrip("/")
+KIMI_FALLBACK_BASE_URLS = [
+    "https://api.moonshot.ai/v1",
+    "https://api.moonshot.cn/v1",
+]
 
 
 class KimiClient:
@@ -41,13 +46,35 @@ class KimiClient:
     """
     
     def __init__(self):
-        self.api_url = KIMI_API_URL
-        self.api_key = KIMI_API_KEY
+        # Endpoint candidates:
+        # 1) configured URL, 2) common Moonshot Open Platform URLs.
+        endpoint_candidates = []
+        configured_url = (KIMI_BASE_URL or "").strip().rstrip("/")
+        if configured_url:
+            endpoint_candidates.append(configured_url)
+        for fallback_url in KIMI_FALLBACK_BASE_URLS:
+            normalized = fallback_url.strip().rstrip("/")
+            if normalized and normalized not in endpoint_candidates:
+                endpoint_candidates.append(normalized)
+        self.api_urls = endpoint_candidates
+        self.api_url = self.api_urls[0] if self.api_urls else "https://api.moonshot.ai/v1"
+
+        # Accept both env var names and sanitize common copy/paste issues.
+        raw_key = KIMI_API_KEY or os.getenv("MOONSHOT_API_KEY", "")
+        raw_key = (raw_key or "").strip().strip('"').strip("'")
+        if raw_key.lower().startswith("bearer "):
+            raw_key = raw_key.split(" ", 1)[1].strip()
+        self.api_key = raw_key
         self.model = KIMI_MODEL
         self.temperature = KIMI_TEMPERATURE
         
         if not self.api_key:
             logger.warning("KIMI_API_KEY not set - diagram pipeline will not work")
+        elif not self.api_key.startswith("sk-"):
+            logger.warning(
+                "Kimi key format looks unusual (expected prefix 'sk-'). "
+                "Verify KIMI_API_KEY or MOONSHOT_API_KEY."
+            )
     
     async def _call_api(
         self,
@@ -90,58 +117,86 @@ class KimiClient:
         if response_format:
             payload["response_format"] = response_format
         
-        # Use KIMI_BASE_URL directly for correct API endpoint
-        api_endpoint = f"{KIMI_BASE_URL}/chat/completions"
-        
-        logger.info(f"Calling Kimi K2.5 API at {api_endpoint}")
+        api_endpoints = [f"{base}/chat/completions" for base in self.api_urls] or [
+            "https://api.moonshot.ai/v1/chat/completions"
+        ]
+
+        logger.info(
+            f"Calling Kimi K2.5 API with {len(api_endpoints)} endpoint candidate(s). "
+            f"Primary endpoint: {api_endpoints[0]}"
+        )
         logger.debug(f"Payload: model={self.model}, temp={self.temperature}, max_tokens={max_tokens}")
-        
+
         # Retry logic for timeouts
         max_retries = 3
         base_timeout = 90.0  # 90 seconds per attempt
-        
-        for attempt in range(max_retries):
-            try:
-                timeout = base_timeout * (attempt + 1)  # Increase timeout with each retry
-                logger.info(f"Kimi API attempt {attempt + 1}/{max_retries}, timeout={timeout}s")
-                
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await client.post(
-                        api_endpoint,
-                        headers=headers,
-                        json=payload,
+        auth_errors = []
+
+        for endpoint_idx, api_endpoint in enumerate(api_endpoints):
+            for attempt in range(max_retries):
+                try:
+                    timeout = base_timeout * (attempt + 1)  # Increase timeout with each retry
+                    logger.info(
+                        f"Kimi API endpoint {endpoint_idx + 1}/{len(api_endpoints)}, "
+                        f"attempt {attempt + 1}/{max_retries}, timeout={timeout}s"
                     )
-                    
-                    if response.status_code != 200:
-                        error_text = response.text
-                        logger.error(f"Kimi API error: {response.status_code} - {error_text}")
-                        raise Exception(f"Kimi API error {response.status_code}: {error_text}")
-                    
-                    data = response.json()
-                    return data["choices"][0]["message"]["content"]
-                    
-            except httpx.TimeoutException as e:
-                logger.warning(f"Kimi API timeout on attempt {attempt + 1}/{max_retries}: {e}")
-                if attempt < max_retries - 1:
-                    wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
-                    logger.info(f"Retrying in {wait_time}s...")
-                    await asyncio.sleep(wait_time)
-                    continue
-                logger.error(f"Kimi API timeout after {max_retries} attempts")
-                raise Exception(f"Kimi API timeout after {max_retries} attempts ({timeout}s each)")
-            except httpx.RequestError as e:
-                logger.warning(f"Kimi API request error on attempt {attempt + 1}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(5)
-                    continue
-                logger.error(f"Kimi API request error: {e}")
-                raise Exception(f"Kimi API request error: {str(e)}")
-            except KeyError as e:
-                logger.error(f"Kimi API response parsing error: {e}")
-                raise Exception(f"Kimi API response missing expected field: {str(e)}")
-            except Exception as e:
-                logger.error(f"Kimi API unexpected error: {type(e).__name__}: {e}")
-                raise
+
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        response = await client.post(
+                            api_endpoint,
+                            headers=headers,
+                            json=payload,
+                        )
+
+                        if response.status_code == 401:
+                            # Usually not retryable on same endpoint; try the next endpoint.
+                            error_text = response.text
+                            logger.error(f"Kimi API auth error at {api_endpoint}: {error_text}")
+                            auth_errors.append(f"{api_endpoint} -> {error_text}")
+                            break
+
+                        if response.status_code != 200:
+                            error_text = response.text
+                            logger.error(f"Kimi API error: {response.status_code} - {error_text}")
+                            raise Exception(f"Kimi API error {response.status_code}: {error_text}")
+
+                        data = response.json()
+                        return data["choices"][0]["message"]["content"]
+
+                except httpx.TimeoutException as e:
+                    logger.warning(f"Kimi API timeout on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        wait_time = 5 * (attempt + 1)  # 5s, 10s, 15s
+                        logger.info(f"Retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    logger.error(f"Kimi API timeout after {max_retries} attempts for endpoint {api_endpoint}")
+                    # Try next endpoint before failing.
+                    break
+                except httpx.RequestError as e:
+                    logger.warning(f"Kimi API request error on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(5)
+                        continue
+                    logger.error(f"Kimi API request error at endpoint {api_endpoint}: {e}")
+                    # Try next endpoint before failing.
+                    break
+                except KeyError as e:
+                    logger.error(f"Kimi API response parsing error: {e}")
+                    raise Exception(f"Kimi API response missing expected field: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Kimi API unexpected error: {type(e).__name__}: {e}")
+                    raise
+
+        # Exhausted all endpoints.
+        if auth_errors:
+            raise Exception(
+                "Kimi API authentication failed on all endpoints. "
+                "Verify KIMI_API_KEY/MOONSHOT_API_KEY belongs to Moonshot Open Platform, "
+                "is active, and has no extra spaces/quotes. "
+                f"Details: {' | '.join(auth_errors)}"
+            )
+        raise Exception("Kimi API request failed on all configured endpoints")
 
 
 class LLM1InstructionGenerator(KimiClient):
@@ -163,6 +218,8 @@ STRICT VISUAL RULES:
 5. FIDELITY: Do NOT add elements, labels, or values not stated or directly implied by the question.
 6. COVERAGE: Include ALL named points/labels and ALL numeric values (angles, lengths, coordinates, forces, resistances, etc.) from the question.
 7. CONFLICTS: If hints conflict with the question, ignore the hints and follow the question.
+8. LABEL SAFETY: Do NOT treat grammatical articles (e.g., leading "A", "An", "The") as diagram labels.
+9. ARROWS: Add arrows only when direction is explicitly relevant (forces, velocity, acceleration, current, ray direction, etc.).
 
 SUBJECT SPECIFIC GUIDES:
 - GEOMETRY: Describe the exact shape (e.g. "a triangle where top angle is obtuse"), label vertices, mark known angles/lengths visually.
@@ -263,6 +320,8 @@ REVIEW CRITERIA:
 6. COVERAGE: Only flag MISSING_LABEL/INCOMPLETE_DIAGRAM if a label/value appears in the question BUT is absent from the instructions.
 7. CONSISTENCY: If an image description is provided, reject ONLY on explicit contradictions. Missing info in the description is NOT a rejection reason.
 8. EVIDENCE: If you flag an issue, cite the exact missing/contradicting label/value.
+9. LABEL SAFETY: Do NOT treat grammatical articles (e.g., sentence-start "A") as labels.
+10. ARROWS: Flag MISSING_ARROW only when the question explicitly requires directional arrows (force/velocity/acceleration/current/rays, etc.).
 
 ISSUE CODES (use exactly these):
 - LABEL_OVERLAP: Labels might overlap or be unclear

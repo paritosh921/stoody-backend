@@ -45,8 +45,9 @@ GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta"
 # - gemini-2.5-flash-image: Nano Banana - fast, efficient (uses :generateContent)
 # - gemini-3-pro-image-preview: Nano Banana Pro - professional quality (uses :generateContent)
 # Note: Imagen models require Vertex AI, use Gemini models for standard API
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+GEMINI_IMAGE_SIZE = os.getenv("GEMINI_IMAGE_SIZE", "2K")
 
 # Image storage configuration
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
@@ -65,6 +66,7 @@ class GeminiImageClient:
         self.api_url = GEMINI_API_URL
         self.model = GEMINI_IMAGE_MODEL
         self.vision_model = GEMINI_VISION_MODEL
+        self.image_size = GEMINI_IMAGE_SIZE
         self.images_dir = IMAGES_DIR / DIAGRAMS_SUBDIR
         
         # Ensure diagrams directory exists
@@ -79,7 +81,7 @@ class GeminiImageClient:
         question_id: str,
         instructions_version: int = 1,
         aspect_ratio: str = "1:1",
-        resolution: str = "1K",
+        resolution: str = "2K",
     ) -> DiagramImage:
         """
         Generate a diagram image from text instructions using Gemini API.
@@ -133,23 +135,34 @@ class GeminiImageClient:
             # Nano Banana / Gemini native image generation uses :generateContent
             # Based on Google's official docs: https://ai.google.dev/gemini-api/docs/image-generation
             url = f"{self.api_url}/models/{self.model}:generateContent"
+            image_size = (resolution or self.image_size or "2K").upper()
+            if image_size not in {"1K", "2K", "4K"}:
+                image_size = "2K"
+
+            image_config = {
+                "aspectRatio": aspect_ratio,
+            }
+            # Gemini 3 Pro image preview supports explicit image size.
+            if "pro-image-preview" in self.model:
+                image_config["imageSize"] = image_size
+
             payload = {
                 "contents": [{
                     "parts": [
                         {"text": enhanced_prompt}
                     ]
-                }]
+                }],
+                "generationConfig": {
+                    # Force image output path, but still allow accompanying text diagnostics.
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "imageConfig": image_config,
+                },
             }
-            # Note: For basic text-to-image, no generationConfig needed
-            # The model will return image in response.candidates[0].content.parts[].inlineData
+            # The model returns image bytes in candidates[].content.parts[].inlineData.data
         
         headers = {
             "Content-Type": "application/json",
-        }
-        
-        # Add API key as query parameter (Gemini style)
-        params = {
-            "key": self.api_key,
+            "x-goog-api-key": self.api_key,
         }
         
         api_type = "Imagen" if is_imagen else ("Nano Banana" if is_nano_banana else "Gemini")
@@ -171,7 +184,6 @@ class GeminiImageClient:
                 response = await client.post(
                     url,
                     headers=headers,
-                    params=params,
                     json=payload,
                 )
                 
@@ -230,25 +242,45 @@ class GeminiImageClient:
                 # Nano Banana / Gemini response format: {"candidates": [{"content": {"parts": [...]}}]}
                 logger.info(f"[{api_type.upper()}] Parsing response, keys: {list(data.keys())}")
                 if "candidates" in data and len(data["candidates"]) > 0:
-                    candidate = data["candidates"][0]
-                    logger.info(f"[{api_type.upper()}] Candidate keys: {list(candidate.keys())}")
-                    if "content" in candidate and "parts" in candidate["content"]:
-                        parts = candidate["content"]["parts"]
-                        logger.info(f"[{api_type.upper()}] Found {len(parts)} parts in response")
+                    image_parts = []
+                    text_parts = []
+                    for candidate_idx, candidate in enumerate(data["candidates"]):
+                        logger.info(f"[{api_type.upper()}] Candidate {candidate_idx} keys: {list(candidate.keys())}")
+                        parts = candidate.get("content", {}).get("parts", [])
+                        logger.info(f"[{api_type.upper()}] Candidate {candidate_idx} has {len(parts)} parts")
                         for i, part in enumerate(parts):
-                            logger.info(f"[{api_type.upper()}] Part {i} keys: {list(part.keys())}")
-                            if "text" in part:
-                                text_response = part["text"]
-                                logger.info(f"[{api_type.upper()}] Text response: {text_response[:200] if text_response else 'None'}")
-                            elif "inlineData" in part:
-                                image_b64 = part["inlineData"].get("data")
-                                logger.info(f"[{api_type.upper()}] Image data received, size: {len(image_b64) if image_b64 else 0}")
-                                break
+                            logger.info(f"[{api_type.upper()}] Part {candidate_idx}:{i} keys: {list(part.keys())}")
+                            if "text" in part and part.get("text"):
+                                text_parts.append(part["text"])
+                            inline_data = part.get("inlineData") or part.get("inline_data")
+                            if inline_data and inline_data.get("data"):
+                                image_parts.append({
+                                    "data": inline_data["data"],
+                                    "is_thought": bool(part.get("thought")),
+                                })
+
+                    if text_parts:
+                        text_response = "\n".join(text_parts).strip()
+                        logger.info(f"[{api_type.upper()}] Text response: {text_response[:300]}")
+
+                    if image_parts:
+                        # Prefer the final non-thought image; fall back to the last image if needed.
+                        non_thought_images = [p for p in image_parts if not p["is_thought"]]
+                        selected = non_thought_images[-1] if non_thought_images else image_parts[-1]
+                        image_b64 = selected["data"]
+                        logger.info(
+                            f"[{api_type.upper()}] Selected image part "
+                            f"(thought={selected['is_thought']}), size={len(image_b64)}"
+                        )
                 else:
                     logger.warning(f"[{api_type.upper()}] No candidates in response: {json.dumps(data)[:500]}")
             
             if not image_b64:
-                error_msg = f"No image in response. Data: {json.dumps(data)[:500]}"
+                text_preview = (text_response[:300] + "...") if text_response and len(text_response) > 300 else text_response
+                error_msg = (
+                    f"No image in response from model={self.model}. "
+                    f"text_response={text_preview!r}. Data: {json.dumps(data)[:500]}"
+                )
                 logger.error(error_msg)
                 raise Exception(error_msg)
             
@@ -386,14 +418,19 @@ class GeminiImageClient:
                     {"text": prompt},
                     {"inlineData": {"mimeType": "image/png", "data": image_b64}},
                 ]
-            }]
+            }],
+            "generationConfig": {
+                "responseModalities": ["TEXT"],
+            },
         }
 
-        headers = {"Content-Type": "application/json"}
-        params = {"key": self.api_key}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, headers=headers, params=params, json=payload)
+            response = await client.post(url, headers=headers, json=payload)
             if response.status_code != 200:
                 raise Exception(f"Gemini vision error: {response.status_code} - {response.text[:200]}")
 

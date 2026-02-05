@@ -56,7 +56,9 @@ class DiagramPipelineService:
         # Collection name for diagram records
         self.collection_name = "question_diagrams"
         self.image_review_enabled = os.getenv("DIAGRAM_IMAGE_REVIEW_ENABLED", "true").lower() not in ["0", "false", "no"]
-        self.strict_image_consistency = os.getenv("DIAGRAM_STRICT_IMAGE_CONSISTENCY", "false").lower() in ["1", "true", "yes"]
+        # Strict mode rejects diagrams when the rendered image description
+        # misses required labels/values or adds contradictory ones.
+        self.strict_image_consistency = os.getenv("DIAGRAM_STRICT_IMAGE_CONSISTENCY", "true").lower() in ["1", "true", "yes"]
 
     def _instruction_coverage_issues(self, question_text: str, instructions: str) -> Dict[str, Any]:
         """
@@ -64,28 +66,77 @@ class DiagramPipelineService:
 
         Returns a dict with missing labels and numbers for feedback.
         """
-        import re
+        q_meta = self._extract_labels_numbers(question_text)
+        i_meta = self._extract_labels_numbers(instructions)
 
-        q_labels = set(re.findall(r'\b([A-Z])\b', question_text))
-        for seq in re.findall(r'\b([A-Z]{2,6})\b', question_text or ""):
-            q_labels.update(list(seq))
-        q_numbers = set(re.findall(r'\d+(?:\.\d+)?', question_text))
+        q_labels = q_meta["labels"]
+        i_labels = i_meta["labels"]
+        q_numbers = q_meta["numbers"]
+        i_numbers = i_meta["numbers"]
 
-        missing_labels = [l for l in q_labels if l not in instructions]
-        missing_numbers = [n for n in q_numbers if n not in instructions]
+        missing_labels = sorted(q_labels - i_labels)
+
+        # Numeric coverage should be strong but not absolute.
+        # Require full match for tiny sets; otherwise require >= ceil(2n/3).
+        matched_numbers = q_numbers & i_numbers
+        if len(q_numbers) <= 2:
+            required_matches = len(q_numbers)
+        else:
+            required_matches = (2 * len(q_numbers) + 2) // 3
+        missing_numbers = sorted(q_numbers - i_numbers) if len(matched_numbers) < required_matches else []
 
         return {
             "missing_labels": missing_labels,
             "missing_numbers": missing_numbers,
         }
 
+    def _normalize_visual_text(self, text: str) -> str:
+        """Normalize common Unicode symbols so regex extraction is stable."""
+        if not text:
+            return ""
+        subscript_map = str.maketrans({
+            "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+            "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+            "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+            "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+            "−": "-", "–": "-", "—": "-",
+            "°": " deg ",
+        })
+        return (text or "").translate(subscript_map)
+
     def _extract_labels_numbers(self, text: str) -> Dict[str, Any]:
         import re
 
-        labels = set(re.findall(r'\b([A-Z])\b', text or ""))
-        for seq in re.findall(r'\b([A-Z]{2,6})\b', text or ""):
+        normalized = self._normalize_visual_text(text)
+        labels = set()
+
+        # 1) Sequence labels like triangle ABC, line PQ, chord AB
+        seq_patterns = [
+            r"\b(?:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex)\s+([A-Z]{2,6})\b",
+            r"\b(?:between|join(?:ing)?|from|to)\s+([A-Z]{2,6})\b",
+        ]
+        for pat in seq_patterns:
+            for seq in re.findall(pat, normalized or "", flags=re.IGNORECASE):
+                labels.update(list(seq.upper()))
+
+        # 2) Explicit single-label mentions (point A, vertex B, mass A, block B, label C)
+        single_patterns = [
+            r"\b(?:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge)\s+([A-Z])\b",
+            r"\b([A-Z])\s*=",
+            r"\b([A-Z])\s*\(",
+        ]
+        for pat in single_patterns:
+            for lbl in re.findall(pat, normalized or "", flags=re.IGNORECASE):
+                labels.add(lbl.upper())
+
+        # 3) Fallback for pure geometry shorthand like "ABC is a triangle"
+        for seq in re.findall(r'\b([A-Z]{2,6})\b', normalized or ""):
+            seq = seq.upper()
+            if seq in {"JEE", "NEET", "MCQ", "N", "KG", "CM", "MM", "MS"}:
+                continue
             labels.update(list(seq))
-        numbers = set(re.findall(r'\d+(?:\.\d+)?', text or ""))
+
+        numbers = set(re.findall(r'\d+(?:\.\d+)?', normalized or ""))
         return {"labels": labels, "numbers": numbers}
     
     async def generate_diagram(
@@ -241,27 +292,31 @@ class DiagramPipelineService:
                     instr_meta = self._extract_labels_numbers(instructions.instructions)
                     i_meta = self._extract_labels_numbers(image_description)
 
+                    missing_labels = sorted(instr_meta["labels"] - i_meta["labels"])
+                    missing_numbers = sorted(instr_meta["numbers"] - i_meta["numbers"])
                     extra_labels = sorted(i_meta["labels"] - instr_meta["labels"])
                     extra_numbers = sorted(i_meta["numbers"] - instr_meta["numbers"])
 
-                    if extra_labels or extra_numbers:
+                    # Hard-reject only when required instruction elements are missing.
+                    # Extra labels/values are logged and then left to LLM2 for semantic judgment.
+                    if missing_labels or missing_numbers:
                         issues = []
-                        if extra_labels:
+                        if missing_labels:
                             issues.append(ReviewIssue(
-                                code=IssueCode.WRONG_CONFIGURATION,
-                                details=f"Image shows unexpected labels: {', '.join(extra_labels)}",
+                                code=IssueCode.MISSING_LABEL,
+                                details=f"Image is missing required labels: {', '.join(missing_labels)}",
                             ))
-                        if extra_numbers:
+                        if missing_numbers:
                             issues.append(ReviewIssue(
-                                code=IssueCode.WRONG_PROPORTION,
-                                details=f"Image shows unexpected values: {', '.join(extra_numbers)}",
+                                code=IssueCode.INCOMPLETE_DIAGRAM,
+                                details=f"Image is missing required values: {', '.join(missing_numbers)}",
                             ))
 
                         feedback_parts = []
-                        if extra_labels:
-                            feedback_parts.append(f"Remove unexpected labels: {', '.join(extra_labels)}.")
-                        if extra_numbers:
-                            feedback_parts.append(f"Remove unexpected values: {', '.join(extra_numbers)}.")
+                        if missing_labels:
+                            feedback_parts.append(f"Ensure labels are visible: {', '.join(missing_labels)}.")
+                        if missing_numbers:
+                            feedback_parts.append(f"Ensure values are visible: {', '.join(missing_numbers)}.")
 
                         review = DiagramReview(
                             is_acceptable=False,
@@ -272,10 +327,15 @@ class DiagramPipelineService:
                         review_history.append(review)
                         previous_review = review
                         logger.info(
-                            f"Image contradiction detected; refining. "
-                            f"Extra labels={extra_labels}, numbers={extra_numbers}"
+                            f"Image missing required elements; refining. "
+                            f"Missing labels={missing_labels}, missing numbers={missing_numbers}"
                         )
                         continue
+                    elif extra_labels or extra_numbers:
+                        logger.info(
+                            f"Image has extra labels/values (soft warning). "
+                            f"extra labels={extra_labels}, extra numbers={extra_numbers}"
+                        )
 
                 review = await self.llm2.review_diagram(
                     question_text=request.question_text,
@@ -283,6 +343,49 @@ class DiagramPipelineService:
                     subject=request.subject,
                     image_description=image_description,
                 )
+
+                # Post-process review to reduce false negatives on generic physics/math prompts.
+                import re
+                required_meta = self._extract_labels_numbers(request.question_text)
+                required_labels = required_meta["labels"]
+                q_lower = (request.question_text or "").lower()
+                arrow_required = any(
+                    re.search(p, q_lower)
+                    for p in [
+                        r"\bforce\b", r"\bvelocity\b", r"\bacceleration\b",
+                        r"\bcurrent\b", r"\bfield\b", r"\bray\b", r"\bdirection\b",
+                        r"\bvector\b",
+                    ]
+                )
+
+                filtered_issues = []
+                for issue in review.issues:
+                    if issue.code == IssueCode.MISSING_LABEL and not required_labels:
+                        logger.info("Downgrading MISSING_LABEL: no explicit labels required by question")
+                        continue
+                    if issue.code == IssueCode.MISSING_ARROW and not arrow_required:
+                        logger.info("Downgrading MISSING_ARROW: no directional arrow requirement detected")
+                        continue
+                    filtered_issues.append(issue)
+                review.issues = filtered_issues
+
+                soft_issue_codes = {
+                    IssueCode.STYLE_ISSUE,
+                    IssueCode.LABEL_OVERLAP,
+                    IssueCode.LOW_CLARITY,
+                    IssueCode.MISSING_ARROW,
+                    IssueCode.WRONG_CONFIGURATION,
+                    IssueCode.WRONG_PROPORTION,
+                }
+                if review.issues and all(i.code in soft_issue_codes for i in review.issues):
+                    logger.info(
+                        "Accepting diagram with only soft review issues: "
+                        f"{[i.code.value for i in review.issues]}"
+                    )
+                    review.is_acceptable = True
+                elif not review.issues:
+                    review.is_acceptable = True
+
                 logger.info(
                     f"Diagram review (iter {iteration + 1}): acceptable={review.is_acceptable}, "
                     f"issues={[i.code.value for i in review.issues]}"

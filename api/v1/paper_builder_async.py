@@ -207,6 +207,21 @@ def _count_questions(paper: Dict) -> int:
     return total
 
 
+def _parse_subject_type(subject_name: Optional[str]) -> Optional[SubjectType]:
+    """Map subject aliases to diagram pipeline SubjectType."""
+    if not subject_name:
+        return None
+    subject_map = {
+        "physics": SubjectType.PHYSICS,
+        "chemistry": SubjectType.CHEMISTRY,
+        "mathematics": SubjectType.MATHEMATICS,
+        "maths": SubjectType.MATHEMATICS,
+        "math": SubjectType.MATHEMATICS,
+        "biology": SubjectType.BIOLOGY,
+    }
+    return subject_map.get(subject_name.strip().lower())
+
+
 def _resolve_document_type(paper: Dict[str, Any]) -> str:
     """Resolve document type for content sync."""
     allowed_types = {"Practice Sets", "Test Series", "Chapter Notes"}
@@ -1312,6 +1327,44 @@ Rules:
             """
             import re
 
+            def _normalize_visual_text(text: str) -> str:
+                subscript_map = str.maketrans({
+                    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+                    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+                    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+                    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+                    "−": "-", "–": "-", "—": "-",
+                    "°": " deg ",
+                })
+                return (text or "").translate(subscript_map)
+
+            def _extract_labels(text: str) -> set:
+                t = _normalize_visual_text(text)
+                labels = set()
+                seq_patterns = [
+                    r"\b(?:triangle|line|segment|chord|arc|angle|quadrilateral|polygon|points?|vertices|vertex)\s+([A-Z]{2,6})\b",
+                    r"\b(?:between|join(?:ing)?|from|to)\s+([A-Z]{2,6})\b",
+                ]
+                for pat in seq_patterns:
+                    for seq in re.findall(pat, t, flags=re.IGNORECASE):
+                        labels.update(list(seq.upper()))
+
+                single_patterns = [
+                    r"\b(?:point|vertex|label(?:ed)?|mass|block|particle|node|terminal|charge)\s+([A-Z])\b",
+                    r"\b([A-Z])\s*=",
+                    r"\b([A-Z])\s*\(",
+                ]
+                for pat in single_patterns:
+                    for lbl in re.findall(pat, t, flags=re.IGNORECASE):
+                        labels.add(lbl.upper())
+
+                for seq in re.findall(r'\b([A-Z]{2,6})\b', t):
+                    seq = seq.upper()
+                    if seq in {"JEE", "NEET", "MCQ", "N", "KG", "CM", "MM", "MS"}:
+                        continue
+                    labels.update(list(seq))
+                return labels
+
             q_lower = question_text.lower()
             d_lower = diagram_desc.lower()
 
@@ -1331,17 +1384,13 @@ Rules:
                 if re.match(pattern, d_lower.strip()):
                     return False, "Description too generic"
 
-            # EXTRACT: Find named entities (capital letters like A, B, C, P, Q, O)
-            q_labels = set(re.findall(r'\b([A-Z])\b', question_text))
-            d_labels = set(re.findall(r'\b([A-Z])\b', diagram_desc))
-            for seq in re.findall(r'\b([A-Z]{2,6})\b', question_text):
-                q_labels.update(list(seq))
-            for seq in re.findall(r'\b([A-Z]{2,6})\b', diagram_desc):
-                d_labels.update(list(seq))
+            # EXTRACT: Named labels/points with context-aware parsing
+            q_labels = _extract_labels(question_text)
+            d_labels = _extract_labels(diagram_desc)
 
             # EXTRACT: Find numbers from both
-            q_numbers = set(re.findall(r'\d+(?:\.\d+)?', question_text))
-            d_numbers = set(re.findall(r'\d+(?:\.\d+)?', diagram_desc))
+            q_numbers = set(re.findall(r'\d+(?:\.\d+)?', _normalize_visual_text(question_text)))
+            d_numbers = set(re.findall(r'\d+(?:\.\d+)?', _normalize_visual_text(diagram_desc)))
 
             # VALIDATION: If question has specific labels, diagram should include ALL of them
             if q_labels:
@@ -1349,11 +1398,22 @@ Rules:
                 if missing_labels:
                     return False, f"Missing labels {sorted(missing_labels)}"
 
-            # VALIDATION: If question has specific numbers, diagram should include ALL of them
+            # VALIDATION: Numeric coverage should be substantial, but not absolute.
+            # Constants like g=10 may be present in text but not always visualized in diagrams.
             if q_numbers:
-                missing_numbers = q_numbers - d_numbers
-                if missing_numbers:
-                    return False, f"Missing values {sorted(missing_numbers)}"
+                matched_numbers = q_numbers & d_numbers
+                if len(q_numbers) <= 2:
+                    required_matches = len(q_numbers)
+                else:
+                    # ceil(2n/3): n=3 -> 2, n=4 -> 3, n=5 -> 4
+                    required_matches = (2 * len(q_numbers) + 2) // 3
+                if len(matched_numbers) < required_matches:
+                    missing_numbers = q_numbers - d_numbers
+                    return (
+                        False,
+                        f"Low numeric coverage {len(matched_numbers)}/{len(q_numbers)}; "
+                        f"missing values {sorted(missing_numbers)}"
+                    )
 
             # VALIDATION: If question mentions a shape, diagram description should include it
             shape_terms = [
@@ -1505,9 +1565,9 @@ Rules:
                     diagram_request = DiagramRequest(
                         question_id=question_id,
                         question_text=question_text,
-                        subject=SubjectType(subject.lower()) if subject.lower() in ["physics", "chemistry", "mathematics", "biology"] else None,
+                        subject=_parse_subject_type(subject),
                         diagram_hints=diagram_hints,
-                        max_iterations=2,
+                        max_iterations=3,
                         force_regenerate=True,
                     )
 
@@ -1648,16 +1708,14 @@ async def generate_question_diagram(
         from services.diagram_pipeline.models import DiagramGenerationRequest as DiagramRequest
 
         # Determine subject type
-        subject_type = None
-        if subject.lower() in ["physics", "chemistry", "mathematics", "biology"]:
-            subject_type = SubjectType(subject.lower())
+        subject_type = _parse_subject_type(subject)
 
         diagram_request = DiagramRequest(
             question_id=question_id,
             question_text=question_text,
             subject=subject_type,
             diagram_hints=diagram_hints,
-            max_iterations=2,
+            max_iterations=3,
             force_regenerate=True,
         )
         

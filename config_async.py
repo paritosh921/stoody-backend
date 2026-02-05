@@ -304,12 +304,14 @@ class AsyncSettings(BaseSettings):
     OPENAI_TEMPERATURE: float = float(os.getenv("OPENAI_TEMPERATURE", 0.7))
 
     # Diagram Pipeline Configuration (Kimi 2.5 + Gemini Nano Banana Pro)
-    KIMI_API_URL: str = os.getenv("KIMI_API_URL", "https://api.moonshot.cn/v1")
+    KIMI_API_URL: str = os.getenv("KIMI_API_URL", "https://api.moonshot.ai/v1")
     KIMI_API_KEY: str = os.getenv("KIMI_API_KEY", "")
     # Gemini API for image generation (Nano Banana / Nano Banana Pro)
     # Models: gemini-2.5-flash-image (fast) or gemini-3-pro-image-preview (pro quality)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_IMAGE_MODEL: str = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+    GEMINI_IMAGE_MODEL: str = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+    # Used by gemini-3-pro-image-preview. Valid values: 1K, 2K, 4K
+    GEMINI_IMAGE_SIZE: str = os.getenv("GEMINI_IMAGE_SIZE", "2K")
 
     # Async configuration
     MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", 8))
@@ -416,6 +418,7 @@ KIMI_API_URL = settings.KIMI_API_URL
 KIMI_API_KEY = settings.KIMI_API_KEY
 GEMINI_API_KEY = settings.GEMINI_API_KEY
 GEMINI_IMAGE_MODEL = settings.GEMINI_IMAGE_MODEL
+GEMINI_IMAGE_SIZE = settings.GEMINI_IMAGE_SIZE
 
 MAX_WORKERS = settings.MAX_WORKERS
 WORKER_CONNECTIONS = settings.WORKER_CONNECTIONS
