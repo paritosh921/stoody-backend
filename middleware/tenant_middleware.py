@@ -23,6 +23,7 @@ from starlette.responses import Response
 
 from core.tenant import TenantContext, TenantAwareDB, TenantContextError, TenantIsolationError
 from core.database import DatabaseManager
+from core.cookie_auth import COOKIE_NAME as AUTH_COOKIE_NAME, cookie_auth_manager
 from api.v1.auth_async import get_database, get_current_user
 from config_async import MONGODB_DB_STOODY
 
@@ -69,48 +70,82 @@ class TenantMiddleware(BaseHTTPMiddleware):
         if any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
-        # Try to extract tenant info from authorization header
+        # Try to extract JWT from Authorization header first, then fall
+        # back to the auth cookie.  Browser-initiated requests such as
+        # <img src="..."> do not carry the Authorization header but *do*
+        # send cookies automatically, so this fallback is essential for
+        # tenant-scoped resources served to the browser directly.
+        _needs_cookie_bridge = False
+        _bridge_token = None
+
         try:
+            token = None
             auth_header = request.headers.get("Authorization")
             if auth_header and auth_header.startswith("Bearer "):
                 token = auth_header.split(" ")[1]
+                # If authenticated via header but no cookie exists yet,
+                # we'll set the cookie on the response so that future
+                # browser-initiated requests (img, link, etc.) carry it.
+                if not request.cookies.get(AUTH_COOKIE_NAME):
+                    _needs_cookie_bridge = True
+                    _bridge_token = token
 
-                # Get auth manager and verify token
+            if not token:
+                token = request.cookies.get(AUTH_COOKIE_NAME)
+
+            if token:
                 auth_manager = request.app.state.auth
                 user_data = await auth_manager.verify_token_and_get_user(token)
 
                 if user_data:
-                    # Set tenant context
                     admin_id = user_data.get("admin_id")
                     user_type = user_data.get("user_type")
                     is_b2c = user_data.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
                     db_name = user_data.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
                     if not db_name and not is_b2c:
-                        return Response(
-                            content='{"detail":"Tenant database missing. Please log in again with tenant ID."}',
-                            status_code=status.HTTP_401_UNAUTHORIZED,
-                            media_type="application/json",
-                        )
-                    if user_data.get("user_type") == "admin":
-                        # For admins, admin_id is their own user_id
-                        admin_id = admin_id or user_data.get("user_id")
+                        # Only reject if this was an explicit auth attempt
+                        # (header-based).  Cookie-based requests may be
+                        # browser resource fetches where a hard 401 would
+                        # break rendered content (e.g. images).
+                        if auth_header:
+                            return Response(
+                                content='{"detail":"Tenant database missing. Please log in again with tenant ID."}',
+                                status_code=status.HTTP_401_UNAUTHORIZED,
+                                media_type="application/json",
+                            )
+                        # For cookie-only requests without db_name, skip
+                        # tenant context silently so the request proceeds
+                        # against the default database.
+                    else:
+                        if user_data.get("user_type") == "admin":
+                            admin_id = admin_id or user_data.get("user_id")
 
-                    TenantContext.set(
-                        admin_id=admin_id,
-                        user_type=user_type,
-                        user_id=user_data.get("user_id"),
-                        tutor_id=user_data.get("tutor_id"),
-                        db_name=db_name,
-                        tenant_id=user_data.get("tenant_id"),
-                        institution_id=user_data.get("institution_id"),
-                    )
-                    logger.debug(f"Tenant context set for user {user_data.get('user_id')}, admin_id={admin_id}")
+                        TenantContext.set(
+                            admin_id=admin_id,
+                            user_type=user_type,
+                            user_id=user_data.get("user_id"),
+                            tutor_id=user_data.get("tutor_id"),
+                            db_name=db_name,
+                            tenant_id=user_data.get("tenant_id"),
+                            institution_id=user_data.get("institution_id"),
+                        )
+                        logger.debug(f"Tenant context set for user {user_data.get('user_id')}, admin_id={admin_id}")
 
         except Exception as e:
             logger.debug(f"Could not set tenant context from token: {e}")
 
         try:
             response = await call_next(request)
+
+            # Bridge: if the user authenticated via header but has no
+            # cookie yet, set one so that subsequent browser-initiated
+            # requests (e.g. <img> tags) can resolve the tenant context.
+            if _needs_cookie_bridge and _bridge_token:
+                try:
+                    cookie_auth_manager.set_auth_cookie(response, _bridge_token)
+                except Exception:
+                    pass  # non-critical; don't break the response
+
             return response
         except TenantContextError as e:
             logger.error(f"Tenant context error: {e}")

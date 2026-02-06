@@ -10,6 +10,7 @@ from datetime import datetime
 from bson import ObjectId
 
 from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
 from slowapi import Limiter
@@ -33,7 +34,7 @@ from core.security import (
     get_user_agent,
 )
 from core.email_service import get_email_service
-from core.cookie_auth import get_current_user_dual_auth
+from core.cookie_auth import get_current_user_dual_auth, cookie_auth_manager
 from core.observability import record_auth_login
 from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
 
@@ -289,14 +290,18 @@ async def admin_login(
         record_auth_login("admin", True)
         login_recorded = True
 
-        return TokenResponse(
-            success=True,
-            data={
+        response_data = {
+            "success": True,
+            "data": {
                 "access_token": session_data["access_token"],
                 "user_type": "admin",
                 "user": session_data["user"]
             }
-        )
+        }
+
+        response = JSONResponse(content=response_data)
+        cookie_auth_manager.set_auth_cookie(response, session_data["access_token"])
+        return response
 
     except HTTPException:
         if not login_recorded:
@@ -423,9 +428,9 @@ async def student_login(
         except Exception as e:
             logger.warning(f"Failed to track student login: {str(e)}")
 
-        return TokenResponse(
-            success=True,
-            data={
+        response_data = {
+            "success": True,
+            "data": {
                 "access_token": session_data["access_token"],
                 "user_type": "student",
                 "user": session_data["user"],
@@ -433,7 +438,11 @@ async def student_login(
                 "pen_token": pen_token,
                 "pen_token_expires_at": pen_token_expires_at.isoformat() if pen_token_expires_at else None
             }
-        )
+        }
+
+        response = JSONResponse(content=response_data)
+        cookie_auth_manager.set_auth_cookie(response, session_data["access_token"])
+        return response
 
     except HTTPException:
         if not login_recorded:
@@ -486,15 +495,18 @@ async def tutor_login(
         record_auth_login("tutor", True)
         login_recorded = True
 
-        # Update tutor last_login is already done; optionally log activity if needed
-        return TokenResponse(
-            success=True,
-            data={
+        response_data = {
+            "success": True,
+            "data": {
                 "access_token": session_data["access_token"],
                 "user_type": "tutor",
                 "user": session_data["user"]
             }
-        )
+        }
+
+        response = JSONResponse(content=response_data)
+        cookie_auth_manager.set_auth_cookie(response, session_data["access_token"])
+        return response
 
     except HTTPException:
         if not login_recorded:
