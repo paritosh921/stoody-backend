@@ -14,7 +14,7 @@ Stroke Format (from BLE Agent):
 
 Canvas Dimensions (from StoodyPenCanvas):
 - A5: 592 x 840
-- A4: 842 x 1190
+- A4: 840 x 1188
 - Default (pen coordinate space): 1480 x 2100
 """
 
@@ -25,39 +25,39 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# Canvas dimensions mapping
-# Book type codes from BLE pen:
-#   S* = Small books (A5 equivalent): SS, SN, SM, SL, SW
-#   M* = Medium books (A5 equivalent): MS, MN, MM, ML, MW
-#   L* = Large books (A4 equivalent): LS, LN, LM, LL, LW
-BOOK_DIMENSIONS = {
-    # Standard paper sizes
-    'A5': (592, 840),
-    'A4': (842, 1190),
-    
-    # Small books (S* series) - A5 size (592 x 840)
-    'SS': (592, 840),
-    'SN': (592, 840),
-    'SM': (592, 840),
-    'SL': (592, 840),
-    'SW': (592, 840),
-    
-    # Medium books (M* series) - A5 size (592 x 840)
-    'MS': (592, 840),
-    'MN': (592, 840),
-    'MM': (592, 840),
-    'ML': (592, 840),
-    'MW': (592, 840),
-    
-    # Large books (L* series) - A4 size (842 x 1190)
-    'LS': (842, 1190),
-    'LN': (842, 1190),
-    'LM': (842, 1190),
-    'LL': (842, 1190),
-    'LW': (842, 1190),
-    
-    'default': (592, 840),  # Use A5 as default for better display
+# Canonical paper dimensions in millimeters (must match BLE agent).
+BOOK_DIMENSIONS_MM = {
+    # Standard sizes
+    'A6': (105, 148),
+    'A5': (148, 210),
+    'A4': (210, 297),
+    'A3': (297, 420),
+
+    # Book type codes from BLE pen
+    'SS': (105, 148),
+    'SN': (105, 148),
+    'SM': (105, 148),
+    'SL': (210, 148),  # A5 landscape
+    'SW': (210, 148),
+    'MS': (148, 210),  # A5 portrait
+    'MN': (148, 210),
+    'MM': (148, 210),
+    'ML': (297, 210),  # A4 landscape
+    'MW': (297, 210),
+    'LS': (210, 297),  # A4 portrait
+    'LN': (210, 297),
+    'LM': (210, 297),
+    'LL': (420, 297),  # A3 landscape
+    'LW': (420, 297),
 }
+
+PIXELS_PER_MM = 4
+
+BOOK_DIMENSIONS = {
+    key: (round(width_mm * PIXELS_PER_MM), round(height_mm * PIXELS_PER_MM))
+    for key, (width_mm, height_mm) in BOOK_DIMENSIONS_MM.items()
+}
+BOOK_DIMENSIONS['default'] = BOOK_DIMENSIONS['MS']
 
 # Default stroke styling
 DEFAULT_STROKE_COLOR = "#1a1a1a"
