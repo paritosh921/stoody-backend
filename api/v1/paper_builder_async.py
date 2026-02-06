@@ -339,10 +339,15 @@ async def _store_diagram_image(
         "is_s3": is_s3_enabled()
     }
 
+    success = False
     if is_b2c:
-        await db.b2c_update_one("images", {"_id": image_id}, {"$set": image_metadata}, upsert=True)
+        success = await db.b2c_update_one("images", {"_id": image_id}, {"$set": image_metadata}, upsert=True)
     else:
-        await db.mongo_update_one("images", {"_id": image_id}, {"$set": image_metadata}, upsert=True)
+        success = await db.mongo_update_one("images", {"_id": image_id}, {"$set": image_metadata}, upsert=True)
+
+    if not success:
+        logger.error(f"Failed to save image metadata to DB for id: {image_id}")
+        return None
 
     return {
         "id": image_id,

@@ -248,12 +248,36 @@ async def get_image(
 ):
     """Get image file by ID"""
     try:
-        # Get image metadata - try main DB first, then B2C
+        # Get image metadata - try context DB first, then B2C
         image_data = await db.mongo_find_one("images", {"_id": image_id})
         
         if not image_data:
             # Try B2C database
             image_data = await db.b2c_find_one("images", {"_id": image_id})
+
+        # If still not found and we have a mongo_client, search across all tenant databases
+        # This handles the case where image was saved with tenant context but fetched without auth
+        if not image_data and db.mongo_client is not None:
+            try:
+                master_db = await db.get_master_db()
+                if master_db is not None:
+                    tenants = await master_db["tenants"].find(
+                        {"status": "active"},
+                        {"db_name": 1}
+                    ).to_list(length=100)
+                    
+                    for tenant in tenants:
+                        tenant_db_name = tenant.get("db_name")
+                        if not tenant_db_name:
+                            continue
+                        tenant_db = await db.get_tenant_db(tenant_db_name)
+                        if tenant_db is not None:
+                            image_data = await tenant_db["images"].find_one({"_id": image_id})
+                            if image_data:
+                                logger.info(f"Found image {image_id} in tenant DB: {tenant_db_name}")
+                                break
+            except Exception as tenant_search_err:
+                logger.warning(f"Tenant search for image failed: {tenant_search_err}")
 
         if not image_data:
             logger.error(f"Image not found in database: {image_id}")
