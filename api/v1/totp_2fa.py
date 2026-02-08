@@ -311,6 +311,67 @@ async def update_user_2fa(tenant_db, user_id: str, user_type: str,
         return False
 
 
+def _build_user_response(user: Dict[str, Any], user_id: str, user_type: str,
+                         payload: Optional[Dict[str, Any]] = None,
+                         tenant: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a complete user response dict, including tutor-specific fields when applicable."""
+    response = {
+        "user_id": user_id,
+        "user_type": user_type,
+        "email": user.get("email"),
+        "username": user.get("username"),
+        "full_name": user.get("name") or user.get("full_name"),
+        "subdomain": user.get("subdomain"),
+        "tenant_id": (payload or {}).get("tenant_id") or (tenant or {}).get("tenant_id"),
+        "db_name": (payload or {}).get("db_name") or (tenant or {}).get("db_name"),
+        "institution_id": (payload or {}).get("institution_id") or (tenant or {}).get("institution_id"),
+    }
+
+    if user_type == "admin":
+        response["admin_role"] = user.get("role", "master_admin")
+        response["permissions"] = user.get("permissions") or []
+    elif user_type == "tutor":
+        # Use the custom tutor_id from the document, not the MongoDB _id
+        response["tutor_id"] = user.get("tutor_id") or user_id
+        response["can_edit_students"] = user.get("can_edit_students", False)
+        response["standards"] = user.get("standards") or []
+        response["sections"] = user.get("sections") or []
+        response["subjects"] = user.get("subjects") or []
+        response["plan_types"] = user.get("plan_types") or []
+        response["teaching_assignments"] = user.get("teaching_assignments") or []
+        response["requires_password_change"] = user.get("requires_password_change", False)
+
+    return response
+
+
+def _build_user_token_data(user: Dict[str, Any], user_id: str, user_type: str,
+                           payload: Optional[Dict[str, Any]] = None,
+                           tenant: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build token data dict for creating access tokens."""
+    data = {
+        "user_id": user_id,
+        "user_type": user_type,
+        "email": user.get("email"),
+        "username": user.get("username"),
+        "full_name": user.get("name") or user.get("full_name"),
+        "subdomain": user.get("subdomain"),
+        "tenant_id": (payload or {}).get("tenant_id") or (tenant or {}).get("tenant_id"),
+        "db_name": (payload or {}).get("db_name") or (tenant or {}).get("db_name"),
+        "institution_id": (payload or {}).get("institution_id") or (tenant or {}).get("institution_id"),
+    }
+
+    if user_type == "admin":
+        data["admin_id"] = user_id
+        data["admin_role"] = user.get("role", "master_admin")
+        data["permissions"] = user.get("permissions") or []
+    elif user_type == "tutor":
+        data["admin_id"] = str(user.get("created_by", ""))
+        # Use the custom tutor_id from the document, not the MongoDB _id
+        data["tutor_id"] = user.get("tutor_id") or user_id
+
+    return data
+
+
 def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any]) -> str:
     """Create an access token with 6-hour expiry for 2FA users"""
     token_data = {
@@ -444,28 +505,18 @@ async def login_with_2fa(
             )
         
         # 2FA not required and not enabled - direct login
-        user_data = {
-            "user_id": user_id,
-            "user_type": user_type,
-            "email": user.get("email"),
-            "username": user.get("username"),
-            "full_name": user.get("name") or user.get("full_name"),
-            "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
-            "subdomain": user.get("subdomain"),
-            "tenant_id": tenant.get("tenant_id"),
-            "db_name": tenant.get("db_name"),
-            "institution_id": tenant.get("institution_id"),
-            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
-            "permissions": user.get("permissions") or [],
-        }
+        user_data = _build_user_token_data(user, user_id, user_type, tenant=tenant)
         
         session_data = await auth_manager.create_user_session(user_data)
+        
+        # Build complete user response with role-specific fields
+        user_response = _build_user_response(user, user_id, user_type, tenant=tenant)
         
         return LoginResponse(
             success=True,
             next="DONE",
             access_token=session_data["access_token"],
-            user=session_data["user"]
+            user=user_response
         )
     
     except HTTPException:
@@ -607,37 +658,11 @@ async def verify_2fa_setup(
         })
         
         # Create access token with 6h expiry
-        user_data = {
-            "user_id": user_id,
-            "user_type": user_type,
-            "email": user.get("email"),
-            "username": user.get("username"),
-            "full_name": user.get("name") or user.get("full_name"),
-            "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
-            "subdomain": user.get("subdomain"),
-            "tenant_id": payload.get("tenant_id"),
-            "db_name": payload.get("db_name"),
-            "institution_id": payload.get("institution_id"),
-            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
-            "permissions": user.get("permissions") or [],
-        }
-        
+        user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
         access_token = create_6h_access_token(auth_manager, user_data)
         
-        # Build user response
-        user_response = {
-            "user_id": user_id,
-            "user_type": user_type,
-            "email": user.get("email"),
-            "username": user.get("username"),
-            "full_name": user.get("name") or user.get("full_name"),
-            "subdomain": user.get("subdomain"),
-            "tenant_id": payload.get("tenant_id"),
-            "db_name": payload.get("db_name"),
-            "institution_id": payload.get("institution_id"),
-            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
-            "permissions": user.get("permissions") or [],
-        }
+        # Build complete user response with role-specific fields
+        user_response = _build_user_response(user, user_id, user_type, payload=payload)
         
         logger.info(f"2FA enabled for {user_type} {user_id}")
         
@@ -719,37 +744,11 @@ async def verify_otp(
         )
         
         # Create access token with 6h expiry
-        user_data = {
-            "user_id": user_id,
-            "user_type": user_type,
-            "email": user.get("email"),
-            "username": user.get("username"),
-            "full_name": user.get("name") or user.get("full_name"),
-            "admin_id": user_id if user_type == "admin" else str(user.get("created_by", "")),
-            "subdomain": user.get("subdomain"),
-            "tenant_id": payload.get("tenant_id"),
-            "db_name": payload.get("db_name"),
-            "institution_id": payload.get("institution_id"),
-            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
-            "permissions": user.get("permissions") or [],
-        }
-        
+        user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
         access_token = create_6h_access_token(auth_manager, user_data)
         
-        # Build user response
-        user_response = {
-            "user_id": user_id,
-            "user_type": user_type,
-            "email": user.get("email"),
-            "username": user.get("username"),
-            "full_name": user.get("name") or user.get("full_name"),
-            "subdomain": user.get("subdomain"),
-            "tenant_id": payload.get("tenant_id"),
-            "db_name": payload.get("db_name"),
-            "institution_id": payload.get("institution_id"),
-            "admin_role": user.get("role", "master_admin") if user_type == "admin" else None,
-            "permissions": user.get("permissions") or [],
-        }
+        # Build complete user response with role-specific fields
+        user_response = _build_user_response(user, user_id, user_type, payload=payload)
         
         return OTPVerifyResponse(
             success=True,
