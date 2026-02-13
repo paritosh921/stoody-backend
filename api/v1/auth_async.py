@@ -5,11 +5,12 @@ JWT-based authentication with rate limiting and caching
 
 import base64
 import logging
+import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from bson import ObjectId
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File
+from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File, Query
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
@@ -1218,6 +1219,7 @@ async def register_admin(
     phone_number: Optional[str] = Form(None, max_length=20),
     attachments: List[UploadFile] = File(default=[]),
     subdomain: Optional[str] = Form(None, min_length=3, max_length=50),
+    requested_tenant_id: Optional[str] = Form(None, max_length=9),
     db: DatabaseManager = Depends(get_database),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
@@ -1226,6 +1228,15 @@ async def register_admin(
     Creates a pending tenant request for super-admin review
     """
     try:
+        # Validate requested_tenant_id format if provided
+        if requested_tenant_id:
+            requested_tenant_id = requested_tenant_id.strip()
+            if not re.match(r'^[A-Z]{4}-[0-9]{4}$', requested_tenant_id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Requested tenant ID must match format XXXX-0000"
+                )
+
         tenants = await db.get_master_collection("tenants")
         if tenants is None:
             raise HTTPException(
@@ -1252,7 +1263,6 @@ async def register_admin(
                 )
 
             # Validate subdomain format again
-            import re
             if not re.match(r'^[a-z0-9\-]+$', normalized_subdomain):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -1278,6 +1288,7 @@ async def register_admin(
 
         tenant_doc = {
             "tenant_id": None,
+            "requested_tenant_id": requested_tenant_id or None,
             "db_name": None,
             "institution_id": None,
             "subdomain": normalized_subdomain,
@@ -1422,6 +1433,37 @@ async def get_registration_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check status"
         )
+
+
+@router.get("/tenant/check-availability")
+@limiter.limit("30/minute")
+async def check_tenant_availability(
+    request: Request,
+    tenant_id: str = Query(..., max_length=9),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Check if a requested tenant ID is available."""
+    if not re.match(r'^[A-Z]{4}-[0-9]{4}$', tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant ID must match format XXXX-0000 (4 uppercase letters, hyphen, 4 digits)"
+        )
+
+    tenants = await db.get_master_collection("tenants")
+    if tenants is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unavailable"
+        )
+
+    existing = await tenants.find_one({
+        "$or": [
+            {"tenant_id": tenant_id},
+            {"requested_tenant_id": tenant_id},
+        ]
+    })
+
+    return {"available": existing is None}
 
 
 @router.get("/tenant/lookup", response_model=TenantLookupResponse)
