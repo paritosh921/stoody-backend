@@ -64,6 +64,7 @@ from api.v1.auth_cookie import router as auth_cookie_router
 from api.v1.auth_bypass import router as auth_bypass_router
 from api.v1.admin_async import router as admin_router
 from api.v1.student_bulk_upload import router as student_bulk_upload_router
+from api.v1.tutor_bulk_upload import router as tutor_bulk_upload_router
 from api.v1.student_async import router as student_router
 from api.v1.questions_async import router as questions_router
 from api.v1.images_async import router as images_router
@@ -739,6 +740,14 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}/tutor",
     tags=["Tutor (Prefixed)"]
 )
+
+# Teacher Bulk Upload routes (under /api/v1/tutor)
+app.include_router(
+    tutor_bulk_upload_router,
+    prefix=f"{API_V1_PREFIX}/tutor",
+    tags=["Teacher Bulk Upload"]
+)
+logger.info("✅ Teacher Bulk Upload routes enabled")
 
 app.include_router(
     pdf_router,
