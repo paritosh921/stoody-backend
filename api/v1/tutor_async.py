@@ -80,6 +80,7 @@ class CreateTutorRequest(BaseModel):
     plan_types: Optional[List[str]] = None  # Multiple plan types
     can_edit_students: bool = False  # Permission to add/edit students
     teaching_assignments: Optional[List[TeachingAssignment]] = None  # Class / subject / section mapping
+    class_teacher_of: Optional[Dict[str, str]] = None  # e.g. {"standard": "11", "section": "A"}
 
 
 class TutorResponse(BaseModel):
@@ -103,6 +104,7 @@ class TutorResponse(BaseModel):
     last_login: Optional[datetime] = None
     generated_password: Optional[str] = None  # Only included on creation
     teaching_assignments: Optional[List[TeachingAssignment]] = None
+    class_teacher_of: Optional[Dict[str, str]] = None
 
 
 def derive_assignment_meta(assignments: Optional[List[TeachingAssignment]]):
@@ -201,6 +203,7 @@ async def create_tutor(
         "requires_password_change": True,  # Must change on first login
         "password_reset_requested": False,
         "teaching_assignments": normalized_assignments,
+        "class_teacher_of": tutor_data.class_teacher_of,
         "created_by": admin_id,
         "created_at": datetime.utcnow(),
         "last_login": None,
@@ -276,7 +279,8 @@ async def get_tutors(
             password_reset_requested=tutor.get("password_reset_requested"),
             created_at=tutor.get("created_at"),
             last_login=tutor.get("last_login"),
-            teaching_assignments=tutor.get("teaching_assignments", [])
+            teaching_assignments=tutor.get("teaching_assignments", []),
+            class_teacher_of=tutor.get("class_teacher_of")
         )
         for tutor in tutors
     ]
