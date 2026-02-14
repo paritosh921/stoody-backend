@@ -1457,7 +1457,7 @@ async def upload_pdf(
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
-            "is_active": True,  # Default to enabled
+            "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled()  # Track storage location
         }
 
