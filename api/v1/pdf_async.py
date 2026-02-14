@@ -4406,15 +4406,25 @@ async def extract_region_from_pdf(
                             })
                 
                 extracted_text = extracted_text.strip()
-                
-                logger.info(f"Successfully extracted from region {region_id}: {len(extracted_text)} chars, {len(extracted_images)} images")
-                
+
+                # Filter images: only keep those referenced as figures in the markdown.
+                # Mistral OCR markdown uses ![desc](image_id) for actual figures.
+                # Images not referenced in markdown are artifacts, not real diagrams.
+                import re
+                referenced_ids = set(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', extracted_text))
+                real_figures = [img for img in extracted_images if img['id'] in referenced_ids]
+
+                logger.info(
+                    f"Region {region_id}: {len(extracted_text)} chars, "
+                    f"{len(extracted_images)} raw images, {len(real_figures)} actual figures"
+                )
+
                 return {
                     "success": True,
                     "extractedText": extracted_text,
-                    "extractedImages": extracted_images,  # Individual cropped figures
-                    "regionImageBase64": region_img_base64,  # Region screenshot (for fallback)
-                    "ocrResult": ocr_result  # Full OCR result for advanced processing
+                    "extractedImages": real_figures,  # Only actual figures/diagrams
+                    "regionImageBase64": region_img_base64,  # Region screenshot (for fallback only)
+                    "ocrResult": ocr_result
                 }
                 
     except ImportError as e:
@@ -4729,11 +4739,13 @@ async def process_regions_ocr(
                             except Exception as img_err:
                                 logger.error(f"Failed to save cropped figure {img_id} for region {region_id}: {img_err}")
                 
-                elif region_image_base64:
-                    # Fallback: No extracted figures, use the region screenshot
-                    # This happens when Pixtral fallback was used or OCR didn't find any images
-                    logger.warning(f"⚠️ No cropped figures for region {region_id}, using region screenshot as fallback")
-                    
+                elif region_image_base64 and len(extracted_text.strip()) < 50:
+                    # Fallback: Save region screenshot ONLY when text extraction failed.
+                    # Short text (< 50 chars) means the content is likely a pure diagram/figure
+                    # that OCR couldn't read as text. Don't save for text-heavy questions —
+                    # that would just duplicate the already-extracted text as an image.
+                    logger.info(f"Region {region_id}: minimal text extracted, saving screenshot as figure fallback")
+
                     try:
                         saved_images = await save_image_to_disk(
                             image_base64=region_image_base64,
@@ -4744,11 +4756,10 @@ async def process_regions_ocr(
                             split_composite=False,
                             is_b2c=is_b2c
                         )
-                        
+
                         if saved_images:
-                            logger.info(f"📸 Saved region screenshot as fallback for {region_id}")
                             total_images_saved += len(saved_images)
-                            
+
                             for saved_img in saved_images:
                                 image_obj = {
                                     'id': saved_img['id'],
@@ -4773,7 +4784,7 @@ async def process_regions_ocr(
                     except Exception as img_err:
                         logger.error(f"Failed to save region screenshot for {region_id}: {img_err}")
                 else:
-                    logger.warning(f"No images available for region {region_id}")
+                    logger.info(f"Region {region_id}: text extracted successfully, no figures needed")
                 
                 results.append({
                     "regionId": region_id,
