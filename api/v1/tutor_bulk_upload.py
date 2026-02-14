@@ -42,7 +42,8 @@ TEMPLATE_COLUMNS = {
     "standard": {"required": True, "description": "Class/grade to teach", "example": "10"},
     "subject": {"required": True, "description": "Subject to teach", "example": "Mathematics"},
     "sections": {"required": False, "description": "Comma-separated sections", "example": "A,B,C"},
-    "can_edit_students": {"required": False, "description": "Allow student management (true/false)", "example": "false"},
+    "can_edit_students": {"required": False, "description": "Self-manage students (true/false)", "example": "false"},
+    "class_teacher_of": {"required": False, "description": "Class teacher of (format: standard-section, e.g. 11-A)", "example": ""},
 }
 
 
@@ -193,6 +194,7 @@ async def download_teacher_bulk_template(
             "subject": "Mathematics",
             "sections": "A,B,C",
             "can_edit_students": "false",
+            "class_teacher_of": "10-A",
         },
         {
             "full_name": "Priya Gupta",
@@ -203,6 +205,7 @@ async def download_teacher_bulk_template(
             "subject": "Physics",
             "sections": "A,B",
             "can_edit_students": "true",
+            "class_teacher_of": "",
         },
         {
             "full_name": "Raj Kumar",
@@ -213,6 +216,7 @@ async def download_teacher_bulk_template(
             "subject": "Chemistry",
             "sections": "A",
             "can_edit_students": "false",
+            "class_teacher_of": "",
         },
     ]
 
@@ -227,7 +231,8 @@ async def download_teacher_bulk_template(
         {"Column": "standard", "Required": "YES", "Description": f"Class/grade to teach. Allowed: {', '.join(valid_classes)}. For multiple classes, add separate rows."},
         {"Column": "subject", "Required": "YES", "Description": f"Subject to teach. Allowed: {', '.join(valid_subjects)}. For multiple subjects, add separate rows."},
         {"Column": "sections", "Required": "NO", "Description": f"Comma-separated sections. Allowed: {', '.join(valid_sections)}"},
-        {"Column": "can_edit_students", "Required": "NO", "Description": "Allow teacher to manage students (true/false). Default: false"},
+        {"Column": "can_edit_students", "Required": "NO", "Description": "Self-manage students (true/false). Default: false"},
+        {"Column": "class_teacher_of", "Required": "NO", "Description": "Class teacher of (format: standard-section, e.g. 11-A). Leave empty if not a class teacher."},
     ]
     instructions_df = pd.DataFrame(instructions_data)
 
@@ -348,6 +353,7 @@ async def preview_teacher_bulk_upload(
         subject = str(row.get('subject', '')).strip()
         sections_str = str(row.get('sections', '')).strip() if row.get('sections') else ''
         can_edit = str(row.get('can_edit_students', 'false')).strip().lower()
+        class_teacher_of_raw = str(row.get('class_teacher_of', '')).strip() if row.get('class_teacher_of') else ''
 
         row_valid = True
 
@@ -395,6 +401,18 @@ async def preview_teacher_bulk_upload(
         else:
             key = f"name:{full_name.lower()}|{email}"
 
+        # Parse class_teacher_of (format: standard-section, e.g. 11-A)
+        class_teacher_of = None
+        if class_teacher_of_raw:
+            ct_match = re.match(r'^(\w+)-([A-Za-z]+)$', class_teacher_of_raw)
+            if ct_match:
+                class_teacher_of = {"standard": ct_match.group(1), "section": ct_match.group(2).upper()}
+            else:
+                warnings.append(TeacherBulkUploadError(
+                    row=row_num, field="class_teacher_of", value=class_teacher_of_raw,
+                    message="Invalid format for class_teacher_of. Expected: standard-section (e.g. 11-A). Ignoring."
+                ))
+
         sections = parse_sections(sections_str)
         assignment = {"standard": standard, "subject": subject, "sections": sections}
 
@@ -417,10 +435,12 @@ async def preview_teacher_bulk_upload(
                 "email": email,
                 "phone": phone,
                 "can_edit_students": can_edit in ('true', '1', 'yes'),
+                "class_teacher_of": class_teacher_of,
                 "assignments": [assignment],
             }
         else:
             # Merge assignment into existing teacher
+            # class_teacher_of is teacher-level, only use from first row
             teacher_groups[key]["assignments"].append(assignment)
 
     # Build preview data
@@ -533,6 +553,7 @@ async def import_bulk_teachers(
         subject = str(row.get('subject', '')).strip()
         sections_str = str(row.get('sections', '')).strip() if row.get('sections') else ''
         can_edit = str(row.get('can_edit_students', 'false')).strip().lower()
+        class_teacher_of_raw = str(row.get('class_teacher_of', '')).strip() if row.get('class_teacher_of') else ''
 
         row_valid = True
 
@@ -572,6 +593,13 @@ async def import_bulk_teachers(
                 )
             continue
 
+        # Parse class_teacher_of (format: standard-section, e.g. 11-A)
+        class_teacher_of = None
+        if class_teacher_of_raw:
+            ct_match = re.match(r'^(\w+)-([A-Za-z]+)$', class_teacher_of_raw)
+            if ct_match:
+                class_teacher_of = {"standard": ct_match.group(1), "section": ct_match.group(2).upper()}
+
         sections = parse_sections(sections_str)
         assignment = {"standard": standard, "subject": subject, "sections": sections}
 
@@ -587,9 +615,11 @@ async def import_bulk_teachers(
                 "email": email,
                 "phone": phone,
                 "can_edit_students": can_edit in ('true', '1', 'yes'),
+                "class_teacher_of": class_teacher_of,
                 "assignments": [assignment],
             }
         else:
+            # class_teacher_of is teacher-level, only use from first row
             teacher_groups[key]["assignments"].append(assignment)
 
     # Create teacher documents
@@ -643,6 +673,7 @@ async def import_bulk_teachers(
             "subjects": subjects,
             "plan_types": [],
             "can_edit_students": teacher["can_edit_students"],
+            "class_teacher_of": teacher["class_teacher_of"],
             "is_active": True,
             "assigned_student_ids": [],
             "requires_password_change": True,
