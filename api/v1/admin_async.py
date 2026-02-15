@@ -632,6 +632,8 @@ async def get_students(
     limit: int = Query(20, ge=1, le=100),
     search: Optional[str] = Query(None, max_length=100),
     is_active: Optional[bool] = Query(None),
+    grade: Optional[str] = Query(None, max_length=20),
+    recently_active_days: Optional[int] = Query(None, ge=1, le=365, description="Filter students who logged in within N days"),
     current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
@@ -667,9 +669,15 @@ async def get_students(
                 ]
         if is_active is not None:
             filter_dict["is_active"] = is_active
+        if grade is not None:
+            filter_dict["grade"] = grade
+        if recently_active_days is not None:
+            from datetime import timedelta
+            cutoff = datetime.utcnow() - timedelta(days=recently_active_days)
+            filter_dict["last_login"] = {"$gte": cutoff}
 
         # Check cache first (include admin_id and is_b2c for tenant isolation)
-        cache_key = f"students:{'b2c' if is_b2c else str(admin_id)}:{page}:{limit}:{search}:{is_active}"
+        cache_key = f"students:{'b2c' if is_b2c else str(admin_id)}:{page}:{limit}:{search}:{is_active}:{grade}:{recently_active_days}"
         cached_result = await cache.get(cache_key, "admin")
 
         if cached_result:
@@ -1532,6 +1540,221 @@ async def get_school_dashboard_stats(
         docs_by_class_list = list(docs_by_class.values())
         docs_by_class_list.sort(key=lambda x: str(x["grade"]))
 
+        # ===== SCHOOL STATISTICS (new overview cards) =====
+        now = datetime.utcnow()
+        active_student_cutoff = now - timedelta(days=15)
+        active_teacher_cutoff = now - timedelta(days=7)
+
+        # --- Total Students by class/section ---
+        total_students_by_class = {}
+        active_students_by_class = {}
+        for student in admin_students:
+            grade = str(student.get("grade") or "Unknown")
+            section = str(student.get("section") or "Unknown")
+
+            # Total students
+            if grade not in total_students_by_class:
+                total_students_by_class[grade] = {"total": 0, "sections": {}}
+            total_students_by_class[grade]["total"] += 1
+            total_students_by_class[grade]["sections"][section] = total_students_by_class[grade]["sections"].get(section, 0) + 1
+
+            # Active students (logged in within last 15 days)
+            last_login = student.get("last_login")
+            if last_login and last_login >= active_student_cutoff:
+                if grade not in active_students_by_class:
+                    active_students_by_class[grade] = {"total": 0, "sections": {}}
+                active_students_by_class[grade]["total"] += 1
+                active_students_by_class[grade]["sections"][section] = active_students_by_class[grade]["sections"].get(section, 0) + 1
+
+        total_active_students = sum(v["total"] for v in active_students_by_class.values())
+
+        # --- Teachers by highest grade taught ---
+        teachers_by_class = {}
+        total_active_teachers = 0
+        teachers_with_docs = set()
+
+        for tutor in admin_tutors:
+            tutor_id = tutor.get("tutor_id")
+            standards = tutor.get("standards", []) or []
+            # Find highest grade
+            numeric_grades = [s for s in standards if s.isdigit()]
+            if numeric_grades:
+                highest_grade = str(max(int(g) for g in numeric_grades))
+            else:
+                highest_grade = "Unknown"
+
+            if highest_grade not in teachers_by_class:
+                teachers_by_class[highest_grade] = {"total": 0, "active": 0}
+            teachers_by_class[highest_grade]["total"] += 1
+
+            # Check if active (logged in within last 7 days)
+            tutor_last_login = tutor.get("last_login")
+            if tutor_last_login and tutor_last_login >= active_teacher_cutoff:
+                teachers_by_class[highest_grade]["active"] += 1
+                total_active_teachers += 1
+
+            # Check if teacher has uploaded any documents
+            tutor_docs = [d for d in admin_documents if tutor_id in (d.get("teacher_ids", []) or [])]
+            if tutor_docs:
+                teachers_with_docs.add(tutor_id)
+
+        # --- Adoption rates ---
+        total_teachers_count = len(admin_tutors)
+        teacher_adoption_pct = round((len(teachers_with_docs) / total_teachers_count * 100), 1) if total_teachers_count > 0 else 0.0
+
+        # Student adoption: attempted >= 1 question
+        try:
+            question_attempts = await db.mongo_find("question_attempts", {"admin_id": str(admin_id)})
+            students_with_attempts = set()
+            for attempt in question_attempts:
+                sid = attempt.get("student_id")
+                if sid:
+                    students_with_attempts.add(str(sid))
+        except Exception:
+            question_attempts = []
+            students_with_attempts = set()
+
+        # Build student lookup by grade for adoption
+        students_by_grade = {}
+        for student in admin_students:
+            grade = str(student.get("grade") or "Unknown")
+            if grade not in students_by_grade:
+                students_by_grade[grade] = []
+            students_by_grade[grade].append(student)
+
+        total_student_count = len(admin_students)
+        # Count students who have attempts
+        students_with_attempts_count = 0
+        for student in admin_students:
+            sid = str(student.get("user_id") or student.get("_id", ""))
+            if sid in students_with_attempts:
+                students_with_attempts_count += 1
+
+        student_adoption_pct = round((students_with_attempts_count / total_student_count * 100), 1) if total_student_count > 0 else 0.0
+
+        # Per-class adoption
+        teacher_adoption_by_class = {}
+        for tutor in admin_tutors:
+            tutor_id = tutor.get("tutor_id")
+            standards = tutor.get("standards", []) or []
+            for std in standards:
+                grade = str(std)
+                if grade not in teacher_adoption_by_class:
+                    teacher_adoption_by_class[grade] = {"total": 0, "with_docs": 0}
+                teacher_adoption_by_class[grade]["total"] += 1
+                if tutor_id in teachers_with_docs:
+                    teacher_adoption_by_class[grade]["with_docs"] += 1
+
+        teacher_adoption_by_class_pct = {}
+        for grade, data in teacher_adoption_by_class.items():
+            teacher_adoption_by_class_pct[grade] = round((data["with_docs"] / data["total"] * 100), 1) if data["total"] > 0 else 0.0
+
+        student_adoption_by_class = {}
+        for grade, grade_students in students_by_grade.items():
+            with_attempts = 0
+            for student in grade_students:
+                sid = str(student.get("user_id") or student.get("_id", ""))
+                if sid in students_with_attempts:
+                    with_attempts += 1
+            total_in_grade = len(grade_students)
+            student_adoption_by_class[grade] = round((with_attempts / total_in_grade * 100), 1) if total_in_grade > 0 else 0.0
+
+        # --- Active-only document counts (Practice Papers & Class Notes) ---
+        active_practice_papers = {"total": 0, "by_class": {}}
+        active_class_notes = {"total": 0, "by_class": {}}
+        for doc in admin_documents:
+            if not doc.get("is_active", True):
+                continue
+            standard = str(doc.get("standard", "Unknown"))
+            doc_type = doc.get("document_type", "")
+            if doc_type == "Practice Sets":
+                active_practice_papers["total"] += 1
+                active_practice_papers["by_class"][standard] = active_practice_papers["by_class"].get(standard, 0) + 1
+            elif doc_type == "Chapter Notes":
+                active_class_notes["total"] += 1
+                active_class_notes["by_class"][standard] = active_class_notes["by_class"].get(standard, 0) + 1
+
+        school_statistics = {
+            "total_students": {
+                "total": len(admin_students),
+                "by_class": total_students_by_class
+            },
+            "active_students": {
+                "total": total_active_students,
+                "by_class": active_students_by_class
+            },
+            "total_teachers": {
+                "total": total_teachers_count,
+                "active": total_active_teachers,
+                "by_class": teachers_by_class
+            },
+            "adoption": {
+                "teacher_pct": teacher_adoption_pct,
+                "student_pct": student_adoption_pct,
+                "teacher_by_class": teacher_adoption_by_class_pct,
+                "student_by_class": student_adoption_by_class
+            },
+            "practice_papers": active_practice_papers,
+            "class_notes": active_class_notes
+        }
+
+        # ===== CONTENT SUMMARY (all documents + videos + question papers) =====
+        # Notes (Chapter Notes - ALL)
+        content_notes = {"total": 0, "by_class": {}}
+        # Practice Papers (Practice Sets - ALL)
+        content_practice = {"total": 0, "by_class": {}}
+        # Exam Tests (Test Series - ALL)
+        content_exam_tests = {"total": 0, "by_class": {}}
+        # Class Notes (Chapter Notes - ACTIVE only) - same as active_class_notes
+        content_class_notes = {"total": active_class_notes["total"], "by_class": dict(active_class_notes["by_class"])}
+
+        for doc in admin_documents:
+            standard = str(doc.get("standard", "Unknown"))
+            doc_type = doc.get("document_type", "")
+            if doc_type == "Chapter Notes":
+                content_notes["total"] += 1
+                content_notes["by_class"][standard] = content_notes["by_class"].get(standard, 0) + 1
+            elif doc_type == "Practice Sets":
+                content_practice["total"] += 1
+                content_practice["by_class"][standard] = content_practice["by_class"].get(standard, 0) + 1
+            elif doc_type == "Test Series":
+                content_exam_tests["total"] += 1
+                content_exam_tests["by_class"][standard] = content_exam_tests["by_class"].get(standard, 0) + 1
+
+        # Videos - query from videos collection
+        content_videos = {"total": 0, "by_class": {}}
+        try:
+            admin_id_str = str(admin_id)
+            tutor_user_ids = [str(t.get("user_id", "")) for t in admin_tutors if t.get("user_id")]
+            all_user_ids = [admin_id_str] + tutor_user_ids
+            admin_videos = await db.mongo_find("videos", {"uploaded_by": {"$in": all_user_ids}})
+            for video in admin_videos:
+                standard = str(video.get("standard", "Unknown"))
+                content_videos["total"] += 1
+                content_videos["by_class"][standard] = content_videos["by_class"].get(standard, 0) + 1
+        except Exception:
+            pass
+
+        # Question Papers (Class Tests)
+        content_class_tests = {"total": 0, "by_class": {}}
+        try:
+            admin_question_papers = await db.mongo_find("question_papers", {"admin_id": str(admin_id)})
+            for qp in admin_question_papers:
+                standard = str(qp.get("standard", "Unknown"))
+                content_class_tests["total"] += 1
+                content_class_tests["by_class"][standard] = content_class_tests["by_class"].get(standard, 0) + 1
+        except Exception:
+            pass
+
+        content_summary = {
+            "notes": content_notes,
+            "videos": content_videos,
+            "practice_papers": content_practice,
+            "exam_tests": content_exam_tests,
+            "class_notes": content_class_notes,
+            "class_tests": content_class_tests
+        }
+
         result = {
             "success": True,
             "class_division_stats": class_division_list,
@@ -1542,7 +1765,9 @@ async def get_school_dashboard_stats(
                 "total_teachers": len(teacher_summary),
                 "total_students": len(admin_students),
                 "total_documents": len(admin_documents)
-            }
+            },
+            "school_statistics": school_statistics,
+            "content_summary": content_summary
         }
 
         # Cache for 5 minutes
