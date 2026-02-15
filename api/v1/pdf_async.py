@@ -1121,6 +1121,7 @@ async def run_document_ocr_pipeline(
                     "text": question.text,
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
+                    "question_type": document.get("question_type", "mcq"),
                     "document_type": document_type,
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document["filename"],
@@ -1155,6 +1156,7 @@ async def run_document_ocr_pipeline(
                     "text": question.text,
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
+                    "question_type": document.get("question_type", "mcq"),
                     "document_type": document_type,
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document["filename"],
@@ -1296,6 +1298,7 @@ async def upload_pdf(
     teacher_ids: Optional[str] = Form(None),  # Comma-separated teacher IDs for filtering
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
+    question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
     current_user: Dict[str, Any] = Depends(require_admin),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
@@ -1457,6 +1460,7 @@ async def upload_pdf(
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
+            "question_type": question_type if question_type in ["mcq", "subjective"] else "mcq",  # Default question type for extracted questions
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled()  # Track storage location
         }
@@ -4809,6 +4813,7 @@ async def process_regions_ocr(
                     "text": question_text,  # For Practice Sets, this includes the full text with options
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
+                    "question_type": document.get("question_type", "mcq"),
                     "document_type": document.get("document_type", "Practice Sets"),
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document.get("filename", ""),
