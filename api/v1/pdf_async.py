@@ -3468,7 +3468,7 @@ async def update_question(
         # Support question_type (mcq or integer) - accept both snake_case and camelCase
         question_type = question_data.get("question_type") or question_data.get("questionType")
         if question_type:
-            if question_type not in ["mcq", "integer"]:
+            if question_type not in ["mcq", "integer", "subjective"]:
                 question_type = "mcq"  # Default to MCQ
             update_data["question_type"] = question_type
 
