@@ -37,6 +37,7 @@ limiter = Limiter(key_func=get_remote_address)
 TEMPLATE_COLUMNS = {
     "full_name": {"required": True, "description": "Teacher's full name (2-100 characters)", "example": "Amit Sharma"},
     "username": {"required": False, "description": "Custom username (optional - auto-generated if empty)", "example": ""},
+    "password": {"required": False, "description": "Login password (min 6 chars). Leave empty to auto-generate.", "example": ""},
     "email": {"required": False, "description": "Email address (unique)", "example": "amit@school.com"},
     "phone": {"required": False, "description": "Phone number", "example": "9876543210"},
     "standard": {"required": True, "description": "Class/grade to teach", "example": "10"},
@@ -188,6 +189,7 @@ async def download_teacher_bulk_template(
         {
             "full_name": "Amit Sharma",
             "username": "",
+            "password": "mypass123",
             "email": "amit@school.com",
             "phone": "9876543210",
             "standard": "10",
@@ -199,6 +201,7 @@ async def download_teacher_bulk_template(
         {
             "full_name": "Priya Gupta",
             "username": "",
+            "password": "",
             "email": "priya@school.com",
             "phone": "9876543211",
             "standard": "11",
@@ -210,6 +213,7 @@ async def download_teacher_bulk_template(
         {
             "full_name": "Raj Kumar",
             "username": "rajkumar2025",
+            "password": "raj@2025",
             "email": "",
             "phone": "9876543212",
             "standard": "12",
@@ -226,6 +230,7 @@ async def download_teacher_bulk_template(
     instructions_data = [
         {"Column": "full_name", "Required": "YES", "Description": "Teacher's full name (2-100 characters)"},
         {"Column": "username", "Required": "NO", "Description": "Custom username (3-50 chars). Leave empty to auto-generate."},
+        {"Column": "password", "Required": "NO", "Description": "Login password (min 6 chars). Leave empty to auto-generate a secure password."},
         {"Column": "email", "Required": "NO", "Description": "Email address (must be unique)"},
         {"Column": "phone", "Required": "NO", "Description": "Phone number"},
         {"Column": "standard", "Required": "YES", "Description": f"Class/grade to teach. Allowed: {', '.join(valid_classes)}. For multiple classes, add separate rows."},
@@ -345,7 +350,7 @@ async def preview_teacher_bulk_upload(
 
     for idx, row in df.iterrows():
         row_num = idx + 2
-        full_name = str(row.get('full_name', '')).strip()
+        full_name = str(row.get('full_name', '')).strip().title()
         custom_username = str(row.get('username', '')).strip() if row.get('username') else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip() if row.get('phone') else ''
@@ -545,8 +550,9 @@ async def import_bulk_teachers(
 
     for idx, row in df.iterrows():
         row_num = idx + 2
-        full_name = str(row.get('full_name', '')).strip()
+        full_name = str(row.get('full_name', '')).strip().title()
         custom_username = str(row.get('username', '')).strip() if row.get('username') else ''
+        custom_password = str(row.get('password', '')).strip() if row.get('password') else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip() if row.get('phone') else ''
         standard = str(row.get('standard', '')).strip()
@@ -612,6 +618,7 @@ async def import_bulk_teachers(
             teacher_groups[key] = {
                 "full_name": full_name,
                 "username": custom_username,
+                "password": custom_password,
                 "email": email,
                 "phone": phone,
                 "can_edit_students": can_edit in ('true', '1', 'yes'),
@@ -642,8 +649,8 @@ async def import_bulk_teachers(
 
         used_usernames.add(username.lower())
 
-        # Generate password
-        plain_password = generate_secure_password()
+        # Use password from sheet, or auto-generate
+        plain_password = teacher["password"] if teacher["password"] and len(teacher["password"]) >= 6 else generate_secure_password()
         password_hash = bcrypt.hashpw(plain_password.encode('utf-8')[:72], bcrypt.gensalt()).decode('utf-8')
 
         # Generate tutor_id
@@ -701,12 +708,12 @@ async def import_bulk_teachers(
             subjects=subjects,
         ))
 
-    # Bulk insert
+    # Bulk insert using tenant-aware method
     total_imported = 0
     if teachers_to_insert:
         try:
-            result = await db.mongo_db["tutors"].insert_many(teachers_to_insert, ordered=False)
-            total_imported = len(result.inserted_ids)
+            result = await db.mongo_insert_many("tutors", teachers_to_insert)
+            total_imported = len(result) if result else 0
         except Exception as e:
             logger.error(f"Bulk teacher insert error: {str(e)}")
             if hasattr(e, 'details') and 'nInserted' in e.details:
