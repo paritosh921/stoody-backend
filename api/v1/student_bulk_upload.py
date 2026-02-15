@@ -721,8 +721,8 @@ async def import_bulk_students(
         if email:
             used_emails.add(email)
         
-        # Generate password
-        plain_password = generate_secure_password()
+        # Default password for all bulk-uploaded students
+        plain_password = "123456789"
         password_hash = hash_password(plain_password)
         
         # Username is now the primary identifier - student_id is just for legacy compatibility
@@ -774,7 +774,7 @@ async def import_bulk_students(
             "email": email if email else None,
             "phone": phone if phone else None,
             "grade": grade,
-            "section": section if section else None,
+            "section": section if section else "A",
             "stream": None, # Force stream to None as per new policy
             "gender": gender if gender else None,
             "date_of_birth": date_of_birth if date_of_birth else None,

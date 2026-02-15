@@ -649,8 +649,8 @@ async def import_bulk_teachers(
 
         used_usernames.add(username.lower())
 
-        # Use password from sheet, or auto-generate
-        plain_password = teacher["password"] if teacher["password"] and len(teacher["password"]) >= 6 else generate_secure_password()
+        # Use password from sheet as-is, default to 123456789 if not provided
+        plain_password = teacher["password"] if teacher["password"] else "123456789"
         password_hash = bcrypt.hashpw(plain_password.encode('utf-8')[:72], bcrypt.gensalt()).decode('utf-8')
 
         # Generate tutor_id

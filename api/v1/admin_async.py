@@ -68,6 +68,7 @@ class CreateStudentRequest(BaseModel):
     stream: Optional[str] = None
     grade: Optional[str] = Field(None, description="Student grade/class (6-12)")
     phone: Optional[str] = None
+    section: Optional[str] = Field(None, description="Section (e.g. A, B, C)")
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
 
@@ -1038,6 +1039,7 @@ async def create_student(
             "school": student_data.school,
             "stream": None,  # Stream is removed/fluid
             "grade": student_data.grade,
+            "section": student_data.section or "A",
             "phone": student_data.phone,
             "plan_types": assigned_plan_types,
             "subjects": assigned_subjects,
