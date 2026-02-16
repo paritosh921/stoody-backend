@@ -1618,14 +1618,21 @@ async def get_school_dashboard_stats(
         except Exception:
             admin_papers = []
 
-        # question_attempts: student_id stored as ObjectId, admin_id may be missing
-        try:
-            question_attempts = await db.mongo_find(
-                "question_attempts",
-                {"student_id": {"$in": student_ids_combined}}
-            )
-        except Exception:
-            question_attempts = []
+        # Practice activity: spread across multiple collections with different ID formats
+        # practice_attempts (string), practice_sessions (string), question_attempts (ObjectId), mcq_attempts (string)
+        practice_student_ids = set()
+        for coll_name in ["practice_attempts", "practice_sessions", "question_attempts", "mcq_attempts"]:
+            try:
+                docs = await db.mongo_find(
+                    coll_name,
+                    {"student_id": {"$in": student_ids_combined}}
+                )
+                for doc in docs:
+                    sid = doc.get("student_id")
+                    if sid:
+                        practice_student_ids.add(str(sid))
+            except Exception:
+                pass
 
         # student_test_attempts: student_id stored as string, NO admin_id field
         try:
@@ -1713,11 +1720,7 @@ async def get_school_dashboard_stats(
         teacher_adoption_pct = round(sum(teacher_adoption_scores) / len(teacher_adoption_scores), 1) if teacher_adoption_scores else 0.0
 
         # --- Student feature sets ---
-        students_with_practice = set()
-        for attempt in question_attempts:
-            sid = attempt.get("student_id")
-            if sid:
-                students_with_practice.add(str(sid))
+        # practice_student_ids already built above from all practice collections
 
         students_with_tests = set()
         for attempt in admin_test_attempts:
@@ -1744,7 +1747,7 @@ async def get_school_dashboard_stats(
             sid = str(student["_id"])
             features = {}
             features["notes"] = sid in students_with_notes
-            features["practice"] = sid in students_with_practice
+            features["practice"] = sid in practice_student_ids
             features["test_attempt"] = sid in students_with_tests
             features["login"] = student.get("last_login") is not None
             features["chat"] = sid in students_with_chat
@@ -2054,13 +2057,21 @@ async def get_adoption_details(
             student_ids_combined = student_oids + student_id_strs
 
             # Query activity collections by student IDs directly
-            try:
-                question_attempts = await db.mongo_find(
-                    "question_attempts",
-                    {"student_id": {"$in": student_ids_combined}}
-                )
-            except Exception:
-                question_attempts = []
+            # Practice: check all 4 practice-related collections
+            practice_student_ids = set()
+            for coll_name in ["practice_attempts", "practice_sessions", "question_attempts", "mcq_attempts"]:
+                try:
+                    docs = await db.mongo_find(
+                        coll_name,
+                        {"student_id": {"$in": student_ids_combined}}
+                    )
+                    for doc in docs:
+                        sid = doc.get("student_id")
+                        if sid:
+                            practice_student_ids.add(str(sid))
+                except Exception:
+                    pass
+
             try:
                 test_attempts = await db.mongo_find(
                     "student_test_attempts",
@@ -2089,12 +2100,6 @@ async def get_adoption_details(
                 sid = v.get("student_id")
                 if sid:
                     students_with_notes.add(str(sid))
-
-            students_with_practice = set()
-            for a in question_attempts:
-                sid = a.get("student_id")
-                if sid:
-                    students_with_practice.add(str(sid))
 
             students_with_tests = set()
             for a in test_attempts:
@@ -2125,7 +2130,7 @@ async def get_adoption_details(
 
                 features = {
                     "notes": sid_str in students_with_notes,
-                    "practice": sid_str in students_with_practice,
+                    "practice": sid_str in practice_student_ids,
                     "test_attempt": sid_str in students_with_tests,
                     "login": student.get("last_login") is not None,
                     "chat": sid_str in students_with_chat
