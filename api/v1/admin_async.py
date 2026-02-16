@@ -1600,21 +1600,155 @@ async def get_school_dashboard_stats(
             if tutor_docs:
                 teachers_with_docs.add(tutor_id)
 
-        # --- Adoption rates ---
-        total_teachers_count = len(admin_tutors)
-        teacher_adoption_pct = round((len(teachers_with_docs) / total_teachers_count * 100), 1) if total_teachers_count > 0 else 0.0
+        # --- Multi-feature Adoption rates ---
+        # Teacher features: upload_content, generate_paper, check_paper, share_feedback
+        # Student features: practice, test_attempt, login, chat
 
-        # Student adoption: attempted >= 1 question
+        total_teachers_count = len(admin_tutors)
+
+        # Build student ID lists for querying activity collections
+        # (some collections don't store admin_id, so query by student IDs)
+        all_student_oids = [s["_id"] for s in admin_students]
+        all_student_id_strs = [str(s["_id"]) for s in admin_students]
+        student_ids_combined = all_student_oids + all_student_id_strs
+
+        # Fetch additional collections for adoption tracking
         try:
-            question_attempts = await db.mongo_find("question_attempts", {"admin_id": str(admin_id)})
-            students_with_attempts = set()
-            for attempt in question_attempts:
-                sid = attempt.get("student_id")
-                if sid:
-                    students_with_attempts.add(str(sid))
+            admin_papers = await db.mongo_find("question_papers", {"admin_id": admin_id})
+        except Exception:
+            admin_papers = []
+
+        # question_attempts: student_id stored as ObjectId, admin_id may be missing
+        try:
+            question_attempts = await db.mongo_find(
+                "question_attempts",
+                {"student_id": {"$in": student_ids_combined}}
+            )
         except Exception:
             question_attempts = []
-            students_with_attempts = set()
+
+        # student_test_attempts: student_id stored as string, NO admin_id field
+        try:
+            admin_test_attempts = await db.mongo_find(
+                "student_test_attempts",
+                {"student_id": {"$in": student_ids_combined}}
+            )
+        except Exception:
+            admin_test_attempts = []
+
+        # chat_sessions: student_id stored as ObjectId, admin_id may be missing
+        try:
+            admin_chat_sessions = await db.mongo_find(
+                "chat_sessions",
+                {"student_id": {"$in": student_ids_combined}}
+            )
+        except Exception:
+            admin_chat_sessions = []
+
+        # student_activity_log: tracks chapter_viewed events (student_id as ObjectId)
+        try:
+            note_views = await db.mongo_find(
+                "student_activity_log",
+                {"student_id": {"$in": student_ids_combined}, "action": "chapter_viewed"}
+            )
+        except Exception:
+            note_views = []
+
+        # --- Teacher feature sets ---
+        # 1. Upload content: tutor in document teacher_ids or uploaded_by
+        teachers_with_docs_set = set()
+        for doc in admin_documents:
+            for tid in (doc.get("teacher_ids", []) or []):
+                teachers_with_docs_set.add(str(tid))
+            ub = doc.get("uploaded_by")
+            if ub:
+                teachers_with_docs_set.add(str(ub))
+
+        # 2. Generate paper: created_by in question_papers
+        teachers_paper_creators = set()
+        for paper in admin_papers:
+            creator = paper.get("created_by")
+            if creator:
+                teachers_paper_creators.add(str(creator))
+
+        # 3. Check paper: graded_by/tutor_id in test attempts
+        teachers_paper_checkers = set()
+        for attempt in admin_test_attempts:
+            graded_at = attempt.get("graded_at")
+            grader = attempt.get("tutor_id") or attempt.get("graded_by")
+            if graded_at and grader:
+                teachers_paper_checkers.add(str(grader))
+
+        # 4. Share feedback: tutor has active (shared) documents
+        teachers_with_active_docs = set()
+        for doc in admin_documents:
+            if doc.get("is_active", False):
+                for tid in (doc.get("teacher_ids", []) or []):
+                    teachers_with_active_docs.add(str(tid))
+                ub = doc.get("uploaded_by")
+                if ub:
+                    teachers_with_active_docs.add(str(ub))
+
+        TEACHER_FEATURES = ["upload_content", "generate_paper", "check_paper", "share_feedback"]
+
+        def get_teacher_features(tutor):
+            """Return dict of feature_name -> bool for a teacher."""
+            tutor_id = str(tutor.get("tutor_id", ""))
+            user_id = str(tutor.get("_id", ""))
+            all_ids = {tutor_id, user_id} - {""}
+            features = {}
+            features["upload_content"] = bool(all_ids & teachers_with_docs_set)
+            features["generate_paper"] = bool(all_ids & teachers_paper_creators)
+            features["check_paper"] = bool(all_ids & teachers_paper_checkers)
+            features["share_feedback"] = bool(all_ids & teachers_with_active_docs)
+            return features
+
+        # Compute overall teacher adoption (avg of feature completion)
+        teacher_adoption_scores = []
+        for tutor in admin_tutors:
+            features = get_teacher_features(tutor)
+            score = sum(1 for v in features.values() if v) / len(TEACHER_FEATURES) * 100
+            teacher_adoption_scores.append(score)
+
+        teacher_adoption_pct = round(sum(teacher_adoption_scores) / len(teacher_adoption_scores), 1) if teacher_adoption_scores else 0.0
+
+        # --- Student feature sets ---
+        students_with_practice = set()
+        for attempt in question_attempts:
+            sid = attempt.get("student_id")
+            if sid:
+                students_with_practice.add(str(sid))
+
+        students_with_tests = set()
+        for attempt in admin_test_attempts:
+            sid = attempt.get("student_id")
+            if sid:
+                students_with_tests.add(str(sid))
+
+        students_with_chat = set()
+        for session in admin_chat_sessions:
+            sid = session.get("student_id")
+            if sid:
+                students_with_chat.add(str(sid))
+
+        students_with_notes = set()
+        for view in note_views:
+            sid = view.get("student_id")
+            if sid:
+                students_with_notes.add(str(sid))
+
+        STUDENT_FEATURES = ["notes", "practice", "test_attempt", "login", "chat"]
+
+        def get_student_features(student):
+            """Return dict of feature_name -> bool for a student."""
+            sid = str(student["_id"])
+            features = {}
+            features["notes"] = sid in students_with_notes
+            features["practice"] = sid in students_with_practice
+            features["test_attempt"] = sid in students_with_tests
+            features["login"] = student.get("last_login") is not None
+            features["chat"] = sid in students_with_chat
+            return features
 
         # Build student lookup by grade for adoption
         students_by_grade = {}
@@ -1625,41 +1759,40 @@ async def get_school_dashboard_stats(
             students_by_grade[grade].append(student)
 
         total_student_count = len(admin_students)
-        # Count students who have attempts
-        students_with_attempts_count = 0
+        student_adoption_scores = []
         for student in admin_students:
-            sid = str(student.get("user_id") or student.get("_id", ""))
-            if sid in students_with_attempts:
-                students_with_attempts_count += 1
+            features = get_student_features(student)
+            score = sum(1 for v in features.values() if v) / len(STUDENT_FEATURES) * 100
+            student_adoption_scores.append(score)
 
-        student_adoption_pct = round((students_with_attempts_count / total_student_count * 100), 1) if total_student_count > 0 else 0.0
+        student_adoption_pct = round(sum(student_adoption_scores) / len(student_adoption_scores), 1) if student_adoption_scores else 0.0
 
-        # Per-class adoption
-        teacher_adoption_by_class = {}
+        # Per-class teacher adoption
+        teacher_adoption_by_class_pct = {}
         for tutor in admin_tutors:
-            tutor_id = tutor.get("tutor_id")
             standards = tutor.get("standards", []) or []
+            features = get_teacher_features(tutor)
+            score = sum(1 for v in features.values() if v) / len(TEACHER_FEATURES) * 100
             for std in standards:
                 grade = str(std)
-                if grade not in teacher_adoption_by_class:
-                    teacher_adoption_by_class[grade] = {"total": 0, "with_docs": 0}
-                teacher_adoption_by_class[grade]["total"] += 1
-                if tutor_id in teachers_with_docs:
-                    teacher_adoption_by_class[grade]["with_docs"] += 1
+                if grade not in teacher_adoption_by_class_pct:
+                    teacher_adoption_by_class_pct[grade] = {"sum": 0, "count": 0}
+                teacher_adoption_by_class_pct[grade]["sum"] += score
+                teacher_adoption_by_class_pct[grade]["count"] += 1
 
-        teacher_adoption_by_class_pct = {}
-        for grade, data in teacher_adoption_by_class.items():
-            teacher_adoption_by_class_pct[grade] = round((data["with_docs"] / data["total"] * 100), 1) if data["total"] > 0 else 0.0
+        for grade in teacher_adoption_by_class_pct:
+            data = teacher_adoption_by_class_pct[grade]
+            teacher_adoption_by_class_pct[grade] = round(data["sum"] / data["count"], 1) if data["count"] > 0 else 0.0
 
+        # Per-class student adoption
         student_adoption_by_class = {}
         for grade, grade_students in students_by_grade.items():
-            with_attempts = 0
+            scores = []
             for student in grade_students:
-                sid = str(student.get("user_id") or student.get("_id", ""))
-                if sid in students_with_attempts:
-                    with_attempts += 1
-            total_in_grade = len(grade_students)
-            student_adoption_by_class[grade] = round((with_attempts / total_in_grade * 100), 1) if total_in_grade > 0 else 0.0
+                features = get_student_features(student)
+                score = sum(1 for v in features.values() if v) / len(STUDENT_FEATURES) * 100
+                scores.append(score)
+            student_adoption_by_class[grade] = round(sum(scores) / len(scores), 1) if scores else 0.0
 
         # --- Active-only document counts (Practice Papers & Class Notes) ---
         active_practice_papers = {"total": 0, "by_class": {}}
@@ -1694,7 +1827,9 @@ async def get_school_dashboard_stats(
                 "teacher_pct": teacher_adoption_pct,
                 "student_pct": student_adoption_pct,
                 "teacher_by_class": teacher_adoption_by_class_pct,
-                "student_by_class": student_adoption_by_class
+                "student_by_class": student_adoption_by_class,
+                "teacher_features": TEACHER_FEATURES,
+                "student_features": STUDENT_FEATURES
             },
             "practice_papers": active_practice_papers,
             "class_notes": active_class_notes
@@ -1782,6 +1917,248 @@ async def get_school_dashboard_stats(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get school dashboard statistics"
+        )
+
+
+@router.get("/dashboard/adoption-details")
+@limiter.limit("30/minute")
+async def get_adoption_details(
+    request: Request,
+    grade: str = Query(..., description="Grade/class to get adoption details for"),
+    role: str = Query(..., description="'teachers' or 'students'"),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor_permission("view_analytics")),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
+):
+    """
+    Get per-person adoption feature usage for a specific grade.
+    Returns each teacher/student with their feature completion status.
+    """
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        admin_id_str = str(admin_id)
+
+        if role == "teachers":
+            # Fetch tutors for this admin
+            admin_tutors = await db.mongo_find("tutors", {"created_by": admin_id_str})
+            # Filter to tutors who teach this grade (standards may be int or str)
+            grade_tutors = [t for t in admin_tutors if grade in [str(s) for s in (t.get("standards", []) or [])]]
+
+            # Fetch documents (has admin_id field)
+            admin_documents = await db.mongo_find("documents", {"admin_id": admin_id})
+            try:
+                admin_papers = await db.mongo_find("question_papers", {"admin_id": admin_id})
+            except Exception:
+                admin_papers = []
+
+            # For check_paper: student_test_attempts does NOT store admin_id,
+            # so query by student IDs belonging to this admin
+            all_students = await db.mongo_find("students", {"admin_id": admin_id})
+            student_oids = [s["_id"] for s in all_students]
+            student_id_strs = [str(s["_id"]) for s in all_students]
+            try:
+                admin_test_attempts = await db.mongo_find(
+                    "student_test_attempts",
+                    {"student_id": {"$in": student_id_strs}}
+                )
+            except Exception:
+                admin_test_attempts = []
+
+            # Build feature lookup sets
+            # 1. Upload content: tutor_id in document teacher_ids or uploaded_by
+            teachers_with_docs = set()
+            for doc in admin_documents:
+                for tid in (doc.get("teacher_ids", []) or []):
+                    teachers_with_docs.add(str(tid))
+                ub = doc.get("uploaded_by")
+                if ub:
+                    teachers_with_docs.add(str(ub))
+
+            # 2. Generate paper: created_by in question_papers
+            teachers_paper_creators = set()
+            for paper in admin_papers:
+                creator = paper.get("created_by")
+                if creator:
+                    teachers_paper_creators.add(str(creator))
+
+            # 3. Check paper: graded_by/tutor_id in test attempts
+            teachers_paper_checkers = set()
+            for attempt in admin_test_attempts:
+                graded_at = attempt.get("graded_at")
+                grader = attempt.get("tutor_id") or attempt.get("graded_by")
+                if graded_at and grader:
+                    teachers_paper_checkers.add(str(grader))
+
+            # 4. Share feedback: tutor has active (shared) documents
+            teachers_with_active_docs = set()
+            for doc in admin_documents:
+                if doc.get("is_active", False):
+                    for tid in (doc.get("teacher_ids", []) or []):
+                        teachers_with_active_docs.add(str(tid))
+                    ub = doc.get("uploaded_by")
+                    if ub:
+                        teachers_with_active_docs.add(str(ub))
+
+            features_list = ["upload_content", "generate_paper", "check_paper", "share_feedback"]
+            feature_labels = {
+                "upload_content": "Upload Content",
+                "generate_paper": "Generate Paper",
+                "check_paper": "Check Paper",
+                "share_feedback": "Share Feedback"
+            }
+
+            persons = []
+            for tutor in grade_tutors:
+                tutor_id = str(tutor.get("tutor_id", ""))
+                user_id = str(tutor.get("_id", ""))
+                display_name = tutor.get("full_name") or tutor.get("name") or tutor.get("username") or "Unknown"
+                # Collect all possible IDs for this tutor
+                all_ids = {tutor_id, user_id} - {""}
+
+                features = {
+                    "upload_content": bool(all_ids & teachers_with_docs),
+                    "generate_paper": bool(all_ids & teachers_paper_creators),
+                    "check_paper": bool(all_ids & teachers_paper_checkers),
+                    "share_feedback": bool(all_ids & teachers_with_active_docs)
+                }
+                score = sum(1 for v in features.values() if v) / len(features_list) * 100
+
+                persons.append({
+                    "id": tutor_id or user_id,
+                    "name": display_name,
+                    "email": tutor.get("email", ""),
+                    "subjects": tutor.get("subjects", []),
+                    "features": features,
+                    "score": round(score, 1)
+                })
+
+            return {
+                "success": True,
+                "grade": grade,
+                "role": role,
+                "features": features_list,
+                "feature_labels": feature_labels,
+                "persons": sorted(persons, key=lambda x: x["score"], reverse=True)
+            }
+
+        elif role == "students":
+            # Fetch all students and filter by grade (grade may be int or str in DB)
+            all_students = await db.mongo_find("students", {"admin_id": admin_id})
+            admin_students = [s for s in all_students if str(s.get("grade", "")) == grade]
+
+            # Build student ID lists for querying activity collections directly
+            # (these collections may not have admin_id)
+            student_oids = [s["_id"] for s in admin_students]
+            student_id_strs = [str(s["_id"]) for s in admin_students]
+            # Combine both formats for $in queries (ObjectId + string)
+            student_ids_combined = student_oids + student_id_strs
+
+            # Query activity collections by student IDs directly
+            try:
+                question_attempts = await db.mongo_find(
+                    "question_attempts",
+                    {"student_id": {"$in": student_ids_combined}}
+                )
+            except Exception:
+                question_attempts = []
+            try:
+                test_attempts = await db.mongo_find(
+                    "student_test_attempts",
+                    {"student_id": {"$in": student_ids_combined}}
+                )
+            except Exception:
+                test_attempts = []
+            try:
+                chat_sessions = await db.mongo_find(
+                    "chat_sessions",
+                    {"student_id": {"$in": student_ids_combined}}
+                )
+            except Exception:
+                chat_sessions = []
+            try:
+                note_views = await db.mongo_find(
+                    "student_activity_log",
+                    {"student_id": {"$in": student_ids_combined}, "action": "chapter_viewed"}
+                )
+            except Exception:
+                note_views = []
+
+            # Build sets of student IDs (as strings) who used each feature
+            students_with_notes = set()
+            for v in note_views:
+                sid = v.get("student_id")
+                if sid:
+                    students_with_notes.add(str(sid))
+
+            students_with_practice = set()
+            for a in question_attempts:
+                sid = a.get("student_id")
+                if sid:
+                    students_with_practice.add(str(sid))
+
+            students_with_tests = set()
+            for a in test_attempts:
+                sid = a.get("student_id")
+                if sid:
+                    students_with_tests.add(str(sid))
+
+            students_with_chat = set()
+            for s in chat_sessions:
+                sid = s.get("student_id")
+                if sid:
+                    students_with_chat.add(str(sid))
+
+            features_list = ["notes", "practice", "test_attempt", "login", "chat"]
+            feature_labels = {
+                "notes": "Notes",
+                "practice": "Practice",
+                "test_attempt": "Tests",
+                "login": "Login",
+                "chat": "Chat"
+            }
+
+            persons = []
+            for student in admin_students:
+                sid_str = str(student["_id"])
+                display_name = student.get("name") or student.get("username") or "Unknown"
+                section = student.get("section", "")
+
+                features = {
+                    "notes": sid_str in students_with_notes,
+                    "practice": sid_str in students_with_practice,
+                    "test_attempt": sid_str in students_with_tests,
+                    "login": student.get("last_login") is not None,
+                    "chat": sid_str in students_with_chat
+                }
+                score = sum(1 for v in features.values() if v) / len(features_list) * 100
+
+                persons.append({
+                    "id": student.get("student_id") or sid_str,
+                    "name": display_name,
+                    "section": section,
+                    "features": features,
+                    "score": round(score, 1)
+                })
+
+            return {
+                "success": True,
+                "grade": grade,
+                "role": role,
+                "features": features_list,
+                "feature_labels": feature_labels,
+                "persons": sorted(persons, key=lambda x: x["score"], reverse=True)
+            }
+
+        else:
+            raise HTTPException(status_code=400, detail="role must be 'teachers' or 'students'")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Adoption details error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get adoption details"
         )
 
 
