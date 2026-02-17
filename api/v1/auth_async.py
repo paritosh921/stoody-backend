@@ -52,6 +52,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 # Pydantic models
 TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
+SUPERADMIN_AUTH_CODE_PATTERN = r'^[A-Z0-9]{6}$'
 
 class AdminLoginRequest(BaseModel):
     email: EmailStr
@@ -1220,6 +1221,7 @@ async def register_admin(
     attachments: List[UploadFile] = File(default=[]),
     subdomain: Optional[str] = Form(None, min_length=3, max_length=50),
     requested_tenant_id: Optional[str] = Form(None, max_length=9),
+    authorization_code: str = Form(..., min_length=6, max_length=6),
     db: DatabaseManager = Depends(get_database),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
@@ -1228,6 +1230,13 @@ async def register_admin(
     Creates a pending tenant request for super-admin review
     """
     try:
+        normalized_auth_code = authorization_code.strip().upper()
+        if not re.match(SUPERADMIN_AUTH_CODE_PATTERN, normalized_auth_code):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Authorization code must be 6 uppercase alphanumeric characters"
+            )
+
         # Validate requested_tenant_id format if provided
         if requested_tenant_id:
             requested_tenant_id = requested_tenant_id.strip()
@@ -1238,10 +1247,26 @@ async def register_admin(
                 )
 
         tenants = await db.get_master_collection("tenants")
+        super_admins = await db.get_master_collection("super_admins")
         if tenants is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Tenant registry not available"
+            )
+        if super_admins is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Super admin registry not available"
+            )
+
+        assigned_super_admin = await super_admins.find_one({
+            "authorization_code": normalized_auth_code,
+            "is_active": True,
+        })
+        if not assigned_super_admin:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid authorization code"
             )
 
         # Check if email already exists in tenant registry
@@ -1301,6 +1326,8 @@ async def register_admin(
             "status": "pending",
             "admin_email": email,
             "admin_full_name": full_name,
+            "assigned_superadmin_id": assigned_super_admin["_id"],
+            "authorization_code_used": normalized_auth_code,
             "pending_admin": {
                 "email": email,
                 "password_hash": password_hash,

@@ -4,21 +4,23 @@ Handles tenant management, registration approval, and feature flags
 """
 
 import logging
-import secrets
-import string
+import os
 import re
-from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
-from bson import ObjectId
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, EmailStr
-from passlib.context import CryptContext
 import jwt
+import pyotp
+from bson import ObjectId
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
 
-from core.database import DatabaseManager
 from config_async import settings
+from core.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,14 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SUPERADMIN_JWT_SECRET = getattr(settings, "SUPERADMIN_JWT_SECRET", None) or getattr(settings, "JWT_SECRET_KEY", "")
 SUPERADMIN_JWT_ALGORITHM = "HS256"
 SUPERADMIN_JWT_EXPIRATION_HOURS = 24
-SUPERADMIN_SETUP_KEY = getattr(settings, "SUPERADMIN_SETUP_KEY", "")
+
+# Temp token + 2FA settings
+APP_SECRET_KEY = getattr(settings, "JWT_SECRET_KEY", SUPERADMIN_JWT_SECRET)
+TEMP_TOKEN_MAX_AGE_SECONDS = 600
+TOTP_ISSUER = "Stoody Super Admin"
+TOTP_ENC_KEY = os.getenv("TOTP_ENC_KEY", "")
+AUTHORIZATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
+INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
 
 
 # ============ PYDANTIC MODELS ============
@@ -42,11 +51,29 @@ class SuperAdminLoginRequest(BaseModel):
     password: str = Field(..., min_length=6)
 
 
-class SuperAdminSetupRequest(BaseModel):
-    name: str = Field(..., min_length=2)
-    email: EmailStr
-    password: str = Field(..., min_length=8)
-    setup_key: str
+class SuperAdminAuthResponse(BaseModel):
+    success: bool = True
+    next: Literal["RESET_PASSWORD", "SETUP_2FA", "OTP", "DONE"]
+    temp_token: Optional[str] = None
+    access_token: Optional[str] = None
+    admin: Dict[str, Any]
+    requires_password_change: bool = False
+    message: Optional[str] = None
+
+
+class SuperAdminPasswordChangeRequest(BaseModel):
+    temp_token: str
+    old_password: str = Field(..., min_length=6)
+    new_password: str = Field(..., min_length=8)
+
+
+class TempTokenRequest(BaseModel):
+    temp_token: str
+
+
+class OTPVerifyRequest(BaseModel):
+    temp_token: str
+    otp: str = Field(..., min_length=6, max_length=6)
 
 
 class TenantFeatures(BaseModel):
@@ -92,12 +119,18 @@ class ResetPasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
-class SuperAdminResponse(BaseModel):
-    _id: str
-    email: str
-    name: str
-    role: str
-    permissions: List[str]
+class UpdateTenantIdRequest(BaseModel):
+    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
+
+
+class SendMessageRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1)
+    priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
+
+
+class DeleteTenantRequest(BaseModel):
+    confirmation: str = Field(..., description="Must match institution name to confirm deletion")
 
 
 # ============ HELPERS ============
@@ -106,35 +139,77 @@ async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
 
 
+def _model_dump(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
+
+
 def convert_objectids(obj):
     """Recursively convert ObjectId fields to strings"""
     if isinstance(obj, ObjectId):
         return str(obj)
-    elif isinstance(obj, dict):
+    if isinstance(obj, dict):
         return {k: convert_objectids(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
+    if isinstance(obj, list):
         return [convert_objectids(item) for item in obj]
-    elif isinstance(obj, datetime):
+    if isinstance(obj, datetime):
         return obj.isoformat()
     return obj
 
 
-def generate_tenant_id() -> str:
-    """Generate a tenant ID with pattern: AAAA-0000."""
-    letters = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
-    digits = ''.join(secrets.choice(string.digits) for _ in range(4))
-    return f"{letters}-{digits}"
+def _get_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(APP_SECRET_KEY)
 
 
-def generate_institution_id() -> str:
-    """Generate an institution ID with pattern: AAAA-BBBB-0000."""
-    prefix = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
-    school = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(4))
-    digits = ''.join(secrets.choice(string.digits) for _ in range(4))
-    return f"{prefix}-{school}-{digits}"
+def create_temp_token(admin_id: str, purpose: str) -> str:
+    return _get_serializer().dumps({
+        "uid": admin_id,
+        "purpose": purpose,
+        "type": "superadmin",
+    })
 
 
-INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
+def verify_temp_token(token: str, expected_purpose: str) -> Dict[str, Any]:
+    try:
+        payload = _get_serializer().loads(token, max_age=TEMP_TOKEN_MAX_AGE_SECONDS)
+        if payload.get("type") != "superadmin":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        if payload.get("purpose") != expected_purpose:
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        return payload
+    except SignatureExpired:
+        raise HTTPException(status_code=401, detail="Session expired. Please login again.")
+    except BadSignature:
+        raise HTTPException(status_code=401, detail="Invalid session token")
+
+
+def _get_fernet() -> Optional[Fernet]:
+    if not TOTP_ENC_KEY:
+        logger.warning("TOTP_ENC_KEY not set - 2FA secrets stored unencrypted")
+        return None
+    try:
+        return Fernet(TOTP_ENC_KEY.encode())
+    except Exception as e:
+        logger.error("Invalid TOTP_ENC_KEY: %s", e)
+        return None
+
+
+def encrypt_secret(secret: str) -> str:
+    fernet = _get_fernet()
+    if not fernet:
+        return secret
+    return fernet.encrypt(secret.encode()).decode()
+
+
+def decrypt_secret(encrypted: str) -> str:
+    fernet = _get_fernet()
+    if not fernet:
+        return encrypted
+    try:
+        return fernet.decrypt(encrypted.encode()).decode()
+    except InvalidToken:
+        raise HTTPException(status_code=500, detail="2FA configuration error")
 
 
 def normalize_institution_id(institution_id: str) -> str:
@@ -144,10 +219,7 @@ def normalize_institution_id(institution_id: str) -> str:
 def derive_tenant_id(institution_id: str) -> str:
     normalized = normalize_institution_id(institution_id)
     if not INSTITUTION_ID_PATTERN.match(normalized):
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID must match AAAA-BBBB-0000 format"
-        )
+        raise HTTPException(status_code=400, detail="Institution ID must match AAAA-BBBB-0000 format")
     parts = normalized.split("-")
     return f"{parts[1]}-{parts[2]}"
 
@@ -155,6 +227,82 @@ def derive_tenant_id(institution_id: str) -> str:
 def build_db_name(institution_id: str) -> str:
     normalized = normalize_institution_id(institution_id)
     return f"skb_{normalized.lower()}"
+
+
+def create_superadmin_token(admin_id: str, email: str) -> str:
+    payload = {
+        "sub": admin_id,
+        "email": email,
+        "type": "superadmin",
+        "exp": datetime.utcnow() + timedelta(hours=SUPERADMIN_JWT_EXPIRATION_HOURS),
+        "iat": datetime.utcnow(),
+    }
+    return jwt.encode(payload, SUPERADMIN_JWT_SECRET, algorithm=SUPERADMIN_JWT_ALGORITHM)
+
+
+def build_admin_response(admin_doc: Dict[str, Any]) -> Dict[str, Any]:
+    two_fa = admin_doc.get("two_fa") or {}
+    auth_code = (admin_doc.get("authorization_code") or "").upper()
+    if auth_code and not AUTHORIZATION_CODE_PATTERN.match(auth_code):
+        logger.warning("Super admin %s has invalid authorization code format", admin_doc.get("email"))
+
+    return {
+        "_id": str(admin_doc["_id"]),
+        "email": admin_doc["email"],
+        "name": admin_doc.get("name", ""),
+        "role": admin_doc.get("role", "super_admin"),
+        "permissions": admin_doc.get("permissions", ["all"]),
+        "is_active": bool(admin_doc.get("is_active", True)),
+        "requires_password_change": bool(admin_doc.get("requires_password_change", False)),
+        "two_fa": {
+            "enabled": bool(two_fa.get("enabled", False)),
+            "required": bool(two_fa.get("required", True)),
+        },
+        "authorization_code": auth_code,
+    }
+
+
+async def get_master_db_or_503(db: DatabaseManager):
+    master_db = await db.get_master_db()
+    if master_db is None:
+        raise HTTPException(status_code=503, detail="Master database unavailable")
+    return master_db
+
+
+async def get_superadmin_by_id_or_401(master_db, admin_id: str) -> Dict[str, Any]:
+    try:
+        admin_oid = ObjectId(admin_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+
+    admin = await master_db["super_admins"].find_one({"_id": admin_oid, "is_active": True})
+    if not admin:
+        raise HTTPException(status_code=401, detail="Admin not found or inactive")
+    return admin
+
+
+def ensure_tenant_owned_by_admin(tenant: Dict[str, Any], admin_id: str) -> None:
+    assigned = tenant.get("assigned_superadmin_id")
+    if not assigned:
+        raise HTTPException(
+            status_code=403,
+            detail="Tenant is not assigned to any super admin. Run migration assignment first."
+        )
+    if str(assigned) != admin_id:
+        raise HTTPException(status_code=403, detail="Access denied for this tenant")
+
+
+async def get_tenant_for_admin_or_error(master_db, tenant_id: str, admin_id: str) -> Dict[str, Any]:
+    try:
+        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    ensure_tenant_owned_by_admin(tenant, admin_id)
+    return tenant
 
 
 async def ensure_tenant_indexes(tenant_db) -> None:
@@ -168,18 +316,6 @@ async def ensure_tenant_indexes(tenant_db) -> None:
     await tenant_db["strokes"].create_index([("user_id", 1), ("timestamp", -1)], name="idx_strokes_user_ts")
     await tenant_db["smartboard_sessions"].create_index([("session_id", 1)], unique=True, name="uniq_smartboard_session_id")
     await tenant_db["smartboard_sessions"].create_index([("tutor_id", 1), ("status", 1)], name="idx_smartboard_tutor_status")
-
-
-def create_superadmin_token(admin_id: str, email: str) -> str:
-    """Create JWT token for super admin"""
-    payload = {
-        "sub": admin_id,
-        "email": email,
-        "type": "superadmin",
-        "exp": datetime.utcnow() + timedelta(hours=SUPERADMIN_JWT_EXPIRATION_HOURS),
-        "iat": datetime.utcnow(),
-    }
-    return jwt.encode(payload, SUPERADMIN_JWT_SECRET, algorithm=SUPERADMIN_JWT_ALGORITHM)
 
 
 async def verify_superadmin_token(
@@ -198,22 +334,15 @@ async def verify_superadmin_token(
         if not admin_id:
             raise HTTPException(status_code=401, detail="Invalid token")
 
-        # Verify admin exists and is active
-        master_db = await db.get_master_db()
-        admin = await master_db["super_admins"].find_one({
-            "_id": ObjectId(admin_id),
-            "is_active": True,
-        })
-
-        if not admin:
-            raise HTTPException(status_code=401, detail="Admin not found or inactive")
+        master_db = await get_master_db_or_503(db)
+        admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
 
         return {
-            "admin_id": str(admin["_id"]),
-            "email": admin["email"],
-            "name": admin["name"],
-            "role": admin.get("role", "super_admin"),
-            "permissions": admin.get("permissions", ["all"]),
+            "admin_id": str(admin_doc["_id"]),
+            "email": admin_doc["email"],
+            "name": admin_doc.get("name", ""),
+            "role": admin_doc.get("role", "super_admin"),
+            "permissions": admin_doc.get("permissions", ["all"]),
         }
 
     except jwt.ExpiredSignatureError:
@@ -222,88 +351,246 @@ async def verify_superadmin_token(
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 
+async def _complete_superadmin_login(master_db, admin_doc: Dict[str, Any]) -> SuperAdminAuthResponse:
+    await master_db["super_admins"].update_one(
+        {"_id": admin_doc["_id"]},
+        {"$set": {"last_login": datetime.utcnow()}}
+    )
+    token = create_superadmin_token(str(admin_doc["_id"]), admin_doc["email"])
+    return SuperAdminAuthResponse(
+        next="DONE",
+        access_token=token,
+        admin=build_admin_response(admin_doc),
+        requires_password_change=False,
+    )
+
+
 # ============ AUTH ENDPOINTS ============
 
 @router.get("/health")
 async def health_check():
-    """Health check for connection testing"""
     return {"status": "ok", "service": "superadmin"}
 
 
-@router.post("/login")
+@router.post("/login", response_model=SuperAdminAuthResponse)
 async def superadmin_login(
     request: SuperAdminLoginRequest,
     db: DatabaseManager = Depends(get_database),
 ):
-    """Authenticate super admin"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
 
     admin = await master_db["super_admins"].find_one({
         "email": request.email,
         "is_active": True,
     })
 
-    if not admin:
+    if not admin or not pwd_context.verify(request.password, admin.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not pwd_context.verify(request.password, admin["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+    requires_password_change = bool(admin.get("requires_password_change", False))
+    if requires_password_change:
+        return SuperAdminAuthResponse(
+            next="RESET_PASSWORD",
+            temp_token=create_temp_token(str(admin["_id"]), "RESET_PASSWORD"),
+            admin=build_admin_response(admin),
+            requires_password_change=True,
+            message="Password change required before access.",
+        )
 
-    # Update last login
+    two_fa = admin.get("two_fa") or {}
+    two_fa_required = bool(two_fa.get("required", True))
+    two_fa_enabled = bool(two_fa.get("enabled", False))
+
+    if two_fa_required and not two_fa_enabled:
+        return SuperAdminAuthResponse(
+            next="SETUP_2FA",
+            temp_token=create_temp_token(str(admin["_id"]), "SETUP_2FA"),
+            admin=build_admin_response(admin),
+            requires_password_change=False,
+            message="2FA setup required.",
+        )
+
+    if two_fa_enabled:
+        return SuperAdminAuthResponse(
+            next="OTP",
+            temp_token=create_temp_token(str(admin["_id"]), "OTP"),
+            admin=build_admin_response(admin),
+            requires_password_change=False,
+            message="Enter authenticator OTP.",
+        )
+
+    return await _complete_superadmin_login(master_db, admin)
+
+
+@router.post("/password/change", response_model=SuperAdminAuthResponse)
+async def change_superadmin_password(
+    request: SuperAdminPasswordChangeRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    payload = verify_temp_token(request.temp_token, "RESET_PASSWORD")
+    admin_id = payload.get("uid")
+    if not admin_id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    master_db = await get_master_db_or_503(db)
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+
+    if not pwd_context.verify(request.old_password, admin_doc.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    new_hash = pwd_context.hash(request.new_password)
     await master_db["super_admins"].update_one(
-        {"_id": admin["_id"]},
-        {"$set": {"last_login": datetime.utcnow()}}
+        {"_id": admin_doc["_id"]},
+        {
+            "$set": {
+                "password_hash": new_hash,
+                "requires_password_change": False,
+                "password_changed_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+        }
     )
 
-    token = create_superadmin_token(str(admin["_id"]), admin["email"])
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+    two_fa = admin_doc.get("two_fa") or {}
+    two_fa_required = bool(two_fa.get("required", True))
+    two_fa_enabled = bool(two_fa.get("enabled", False))
+
+    if two_fa_required and not two_fa_enabled:
+        return SuperAdminAuthResponse(
+            next="SETUP_2FA",
+            temp_token=create_temp_token(str(admin_doc["_id"]), "SETUP_2FA"),
+            admin=build_admin_response(admin_doc),
+            requires_password_change=False,
+            message="Password updated. 2FA setup required.",
+        )
+
+    if two_fa_enabled:
+        return SuperAdminAuthResponse(
+            next="OTP",
+            temp_token=create_temp_token(str(admin_doc["_id"]), "OTP"),
+            admin=build_admin_response(admin_doc),
+            requires_password_change=False,
+            message="Password updated. Enter authenticator OTP.",
+        )
+
+    return await _complete_superadmin_login(master_db, admin_doc)
+
+
+@router.post("/2fa/setup/start")
+async def superadmin_2fa_setup_start(
+    request: TempTokenRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    payload = verify_temp_token(request.temp_token, "SETUP_2FA")
+    admin_id = payload.get("uid")
+    if not admin_id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    master_db = await get_master_db_or_503(db)
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+
+    secret = pyotp.random_base32()
+    totp = pyotp.TOTP(secret)
+    otpauth_url = totp.provisioning_uri(name=admin_doc["email"], issuer_name=TOTP_ISSUER)
+
+    await master_db["super_admins"].update_one(
+        {"_id": admin_doc["_id"]},
+        {
+            "$set": {
+                "two_fa.temp_secret_enc": encrypt_secret(secret),
+                "two_fa.setup_started_at": datetime.utcnow(),
+                "two_fa.required": True,
+            }
+        }
+    )
 
     return {
-        "access_token": token,
-        "admin": {
-            "_id": str(admin["_id"]),
-            "email": admin["email"],
-            "name": admin["name"],
-            "role": admin.get("role", "super_admin"),
-            "permissions": admin.get("permissions", ["all"]),
-        }
+        "success": True,
+        "otpauth_url": otpauth_url,
+        "setup_key": secret,
+        "message": "Scan QR URL or enter setup key in Google Authenticator.",
     }
+
+
+@router.post("/2fa/setup/verify", response_model=SuperAdminAuthResponse)
+async def superadmin_2fa_setup_verify(
+    request: OTPVerifyRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    payload = verify_temp_token(request.temp_token, "SETUP_2FA")
+    admin_id = payload.get("uid")
+    if not admin_id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    master_db = await get_master_db_or_503(db)
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+
+    temp_secret_enc = (admin_doc.get("two_fa") or {}).get("temp_secret_enc")
+    if not temp_secret_enc:
+        raise HTTPException(status_code=400, detail="2FA setup not started")
+
+    secret = decrypt_secret(temp_secret_enc)
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(request.otp.strip(), valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid verification code")
+
+    await master_db["super_admins"].update_one(
+        {"_id": admin_doc["_id"]},
+        {
+            "$set": {
+                "two_fa.enabled": True,
+                "two_fa.required": True,
+                "two_fa.secret_enc": encrypt_secret(secret),
+                "two_fa.temp_secret_enc": None,
+                "two_fa.verified_at": datetime.utcnow(),
+                "two_fa.setup_started_at": None,
+                "two_fa.last_verified_at": datetime.utcnow(),
+            }
+        }
+    )
+
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+    return await _complete_superadmin_login(master_db, admin_doc)
+
+
+@router.post("/2fa/verify-otp", response_model=SuperAdminAuthResponse)
+async def superadmin_2fa_verify_otp(
+    request: OTPVerifyRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    payload = verify_temp_token(request.temp_token, "OTP")
+    admin_id = payload.get("uid")
+    if not admin_id:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+    master_db = await get_master_db_or_503(db)
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+
+    secret_enc = (admin_doc.get("two_fa") or {}).get("secret_enc")
+    if not secret_enc:
+        raise HTTPException(status_code=400, detail="2FA is not enabled for this account")
+
+    secret = decrypt_secret(secret_enc)
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(request.otp.strip(), valid_window=1):
+        raise HTTPException(status_code=401, detail="Invalid verification code")
+
+    await master_db["super_admins"].update_one(
+        {"_id": admin_doc["_id"]},
+        {"$set": {"two_fa.last_verified_at": datetime.utcnow()}}
+    )
+
+    admin_doc = await get_superadmin_by_id_or_401(master_db, admin_id)
+    return await _complete_superadmin_login(master_db, admin_doc)
 
 
 @router.post("/setup")
-async def first_time_setup(
-    request: SuperAdminSetupRequest,
-    db: DatabaseManager = Depends(get_database),
-):
-    """Create first super admin (requires setup key)"""
-    if request.setup_key != SUPERADMIN_SETUP_KEY:
-        raise HTTPException(status_code=403, detail="Invalid setup key")
-
-    master_db = await db.get_master_db()
-
-    # Check if any super admin already exists
-    existing = await master_db["super_admins"].find_one({"is_active": True})
-    if existing:
-        raise HTTPException(status_code=400, detail="Super admin already exists")
-
-    # Check if email already exists
-    existing_email = await master_db["super_admins"].find_one({"email": request.email})
-    if existing_email:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Create super admin
-    admin_doc = {
-        "email": request.email,
-        "password_hash": pwd_context.hash(request.password),
-        "name": request.name,
-        "role": "super_admin",
-        "permissions": ["all"],
-        "created_at": datetime.utcnow(),
-        "is_active": True,
-    }
-
-    result = await master_db["super_admins"].insert_one(admin_doc)
-
-    return {"admin_id": str(result.inserted_id)}
+async def first_time_setup_disabled():
+    raise HTTPException(
+        status_code=410,
+        detail="Super-admin setup via API is disabled. Use backend provisioning script instead."
+    )
 
 
 # ============ DASHBOARD ENDPOINTS ============
@@ -313,25 +600,26 @@ async def get_dashboard_stats(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Get dashboard statistics"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
 
     now = datetime.utcnow()
     week_ago = now - timedelta(days=7)
     month_ago = now - timedelta(days=30)
 
-    # Count tenants by status
-    pipeline = [
-        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
-    ]
-    status_counts = await master_db["tenants"].aggregate(pipeline).to_list(length=100)
+    owner_filter = {"assigned_superadmin_id": ObjectId(admin["admin_id"])}
+
+    status_counts = await master_db["tenants"].aggregate([
+        {"$match": owner_filter},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+    ]).to_list(length=100)
     status_map = {item["_id"]: item["count"] for item in status_counts}
 
-    # Count recent registrations
     week_count = await master_db["tenants"].count_documents({
+        **owner_filter,
         "created_at": {"$gte": week_ago}
     })
     month_count = await master_db["tenants"].count_documents({
+        **owner_filter,
         "created_at": {"$gte": month_ago}
     })
 
@@ -343,7 +631,7 @@ async def get_dashboard_stats(
         "active_tenants": status_map.get("active", 0),
         "suspended_tenants": status_map.get("suspended", 0),
         "rejected_registrations": status_map.get("rejected", 0),
-        "total_students": 0,  # Would need to aggregate across tenant DBs
+        "total_students": 0,
         "total_tutors": 0,
         "registrations_this_week": week_count,
         "registrations_this_month": month_count,
@@ -358,21 +646,18 @@ async def get_tenants(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Get all tenants with optional status filter"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
 
-    query = {}
+    query: Dict[str, Any] = {"assigned_superadmin_id": ObjectId(admin["admin_id"])}
     if status:
         query["status"] = status
 
     tenants = await master_db["tenants"].find(query).sort("created_at", -1).to_list(length=1000)
 
-    # Convert all ObjectIds and dates to JSON-serializable format
     result = []
     for tenant in tenants:
         tenant = convert_objectids(tenant)
         if "pending_admin" in tenant and tenant["pending_admin"]:
-            # Remove password hash from response
             tenant["pending_admin"].pop("password_hash", None)
         result.append(tenant)
 
@@ -385,16 +670,8 @@ async def get_tenant_by_id(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Get a specific tenant by ID"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     tenant = convert_objectids(tenant)
     if "pending_admin" in tenant and tenant["pending_admin"]:
@@ -409,15 +686,12 @@ async def get_tenant_files(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Get application files for a tenant"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        files = await master_db["tenant_application_files"].find({
-            "tenant_request_id": ObjectId(tenant_id)
-        }).to_list(length=100)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+    files = await master_db["tenant_application_files"].find({
+        "tenant_request_id": ObjectId(tenant_id)
+    }).to_list(length=100)
 
     return [convert_objectids(file) for file in files]
 
@@ -429,16 +703,8 @@ async def approve_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Approve a pending tenant registration"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     if tenant["status"] != "pending":
         raise HTTPException(status_code=400, detail="Tenant is not in pending status")
@@ -447,7 +713,6 @@ async def approve_tenant(
     new_tenant_id = derive_tenant_id(normalized_institution_id)
     db_name = build_db_name(normalized_institution_id)
 
-    # Ensure unique institution_id, tenant_id, and db_name
     existing = await master_db["tenants"].find_one({
         "_id": {"$ne": ObjectId(tenant_id)},
         "$or": [
@@ -457,18 +722,13 @@ async def approve_tenant(
         ]
     })
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID or tenant ID already in use"
-        )
+        raise HTTPException(status_code=400, detail="Institution ID or tenant ID already in use")
 
-    # Prepare subdomain
     subdomain = tenant.get("subdomain")
     if not subdomain:
         subdomain = tenant.get("organization", "").lower()
         subdomain = ''.join(c for c in subdomain if c.isalnum())[:20]
 
-    # Default features
     default_features = {
         "smartboard": True,
         "online_class": False,
@@ -485,9 +745,8 @@ async def approve_tenant(
     }
 
     if request.features:
-        default_features.update(request.features.dict())
+        default_features.update(_model_dump(request.features))
 
-    # Approval action
     approval_action = {
         "action": "approved",
         "by": admin["email"],
@@ -495,8 +754,6 @@ async def approve_tenant(
         "notes": request.notes,
     }
 
-    # Update tenant
-    # Create tenant database + master admin
     tenant_db = await db.get_tenant_db(db_name)
     if tenant_db is None:
         raise HTTPException(status_code=503, detail="Tenant database unavailable")
@@ -522,7 +779,7 @@ async def approve_tenant(
                 "enabled": False,
                 "required": True,
                 "secret_enc": None,
-                "verified_at": None
+                "verified_at": None,
             }
         }
         await tenant_db["admins"].insert_one(admin_doc)
@@ -563,16 +820,8 @@ async def reject_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Reject a tenant registration"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     rejection_action = {
         "action": "rejected",
@@ -604,16 +853,8 @@ async def activate_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Activate an approved tenant (after database setup)"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     if tenant["status"] not in ["approved", "suspended"]:
         raise HTTPException(status_code=400, detail="Tenant must be approved or suspended to activate")
@@ -642,16 +883,8 @@ async def suspend_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Suspend an active tenant"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     suspend_action = {
         "action": "suspended",
@@ -678,28 +911,22 @@ async def update_tenant_features(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Update feature flags for a tenant"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    features_data = _model_dump(request.features)
 
     feature_action = {
         "action": "feature_changed",
         "by": admin["email"],
         "at": datetime.utcnow(),
-        "changes": request.features.dict(),
+        "changes": features_data,
     }
 
     await master_db["tenants"].update_one(
         {"_id": ObjectId(tenant_id)},
         {
-            "$set": {"enabled_features": request.features.dict()},
+            "$set": {"enabled_features": features_data},
             "$push": {"approval_history": feature_action}
         }
     )
@@ -714,18 +941,10 @@ async def update_tenant_limits(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Update limits for a tenant"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    update_fields = {}
+    update_fields: Dict[str, Any] = {}
     if request.max_students is not None:
         update_fields["max_students"] = request.max_students
     if request.max_tutors is not None:
@@ -749,20 +968,11 @@ async def reset_tenant_admin_password(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Reset the master admin password for a tenant"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     new_password_hash = pwd_context.hash(request.new_password)
 
-    # If tenant is still pending, update pending_admin
     if tenant["status"] == "pending" and tenant.get("pending_admin"):
         await master_db["tenants"].update_one(
             {"_id": ObjectId(tenant_id)},
@@ -780,11 +990,9 @@ async def reset_tenant_admin_password(
         )
         return {"success": True}
 
-    # For active tenants, update in their tenant database
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
         if tenant_db:
-            # Find master admin in tenant database
             master_admin = await tenant_db["admins"].find_one({"role": "master_admin"})
             if master_admin:
                 await tenant_db["admins"].update_one(
@@ -792,7 +1000,6 @@ async def reset_tenant_admin_password(
                     {"$set": {"password_hash": new_password_hash}}
                 )
 
-                # Log the action
                 await master_db["tenants"].update_one(
                     {"_id": ObjectId(tenant_id)},
                     {
@@ -811,20 +1018,6 @@ async def reset_tenant_admin_password(
     raise HTTPException(status_code=400, detail="Unable to reset password for this tenant")
 
 
-class UpdateTenantIdRequest(BaseModel):
-    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
-
-
-class SendMessageRequest(BaseModel):
-    subject: str = Field(..., min_length=1, max_length=200)
-    message: str = Field(..., min_length=1)
-    priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
-
-
-class DeleteTenantRequest(BaseModel):
-    confirmation: str = Field(..., description="Must match institution name to confirm deletion")
-
-
 @router.put("/tenants/{tenant_id}/institution-id")
 async def update_tenant_institution_id(
     tenant_id: str,
@@ -832,21 +1025,12 @@ async def update_tenant_institution_id(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Update the institution/tenant ID for a tenant"""
-    master_db = await db.get_master_db()
-
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     new_id = normalize_institution_id(request.institution_id)
     new_tenant_id = derive_tenant_id(new_id)
 
-    # Check if this ID is already in use by another tenant
     existing = await master_db["tenants"].find_one({
         "_id": {"$ne": ObjectId(tenant_id)},
         "$or": [
@@ -855,14 +1039,10 @@ async def update_tenant_institution_id(
         ]
     })
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail="Institution ID or tenant ID already in use by another tenant"
-        )
+        raise HTTPException(status_code=400, detail="Institution ID or tenant ID already in use by another tenant")
 
     old_id = tenant.get("institution_id")
 
-    # Update institution_id + derived tenant_id (db_name unchanged)
     update_action = {
         "action": "id_changed",
         "by": admin["email"],
@@ -896,20 +1076,12 @@ async def send_message_to_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Send a message from super admin to tenant master admin"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    # Create message document
     message_doc = {
         "tenant_id": ObjectId(tenant_id),
+        "superadmin_id": ObjectId(admin["admin_id"]),
         "from_admin": admin["email"],
         "from_name": admin["name"],
         "to_email": tenant.get("admin_email"),
@@ -935,15 +1107,13 @@ async def get_tenant_messages(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Get all messages sent to a specific tenant"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        messages = await master_db["superadmin_messages"].find({
-            "tenant_id": ObjectId(tenant_id)
-        }).sort("created_at", -1).to_list(length=100)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
+    messages = await master_db["superadmin_messages"].find({
+        "tenant_id": ObjectId(tenant_id),
+        "superadmin_id": ObjectId(admin["admin_id"]),
+    }).sort("created_at", -1).to_list(length=100)
 
     return [convert_objectids(msg) for msg in messages]
 
@@ -955,41 +1125,27 @@ async def delete_tenant(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Delete a tenant permanently (requires confirmation)"""
-    master_db = await db.get_master_db()
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    try:
-        tenant = await master_db["tenants"].find_one({"_id": ObjectId(tenant_id)})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid tenant ID")
-
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    # Verify confirmation matches institution name
     if request.confirmation.lower() != tenant["institution_name"].lower():
-        raise HTTPException(
-            status_code=400,
-            detail="Confirmation text does not match institution name"
-        )
+        raise HTTPException(status_code=400, detail="Confirmation text does not match institution name")
 
-    # Log the deletion before removing
     logger.warning(
-        f"Super admin {admin['email']} deleting tenant {tenant_id} "
-        f"({tenant['institution_name']})"
+        "Super admin %s deleting tenant %s (%s)",
+        admin["email"],
+        tenant_id,
+        tenant["institution_name"],
     )
 
-    # Delete associated files
     await master_db["tenant_application_files"].delete_many({
         "tenant_request_id": ObjectId(tenant_id)
     })
 
-    # Delete associated messages
     await master_db["superadmin_messages"].delete_many({
         "tenant_id": ObjectId(tenant_id)
     })
 
-    # Delete the tenant
     await master_db["tenants"].delete_one({"_id": ObjectId(tenant_id)})
 
     return {"success": True, "deleted": tenant["institution_name"]}

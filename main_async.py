@@ -61,7 +61,6 @@ from middleware.security_headers import SecurityHeadersMiddleware
 from api.v1.chat_async import router as chat_router
 from api.v1.auth_async import router as auth_router
 from api.v1.auth_cookie import router as auth_cookie_router
-from api.v1.auth_bypass import router as auth_bypass_router
 from api.v1.admin_async import router as admin_router
 from api.v1.student_bulk_upload import router as student_bulk_upload_router
 from api.v1.tutor_bulk_upload import router as tutor_bulk_upload_router
@@ -656,14 +655,6 @@ app.include_router(
     tags=["Cookie Authentication (Legacy)"]
 )
 logger.info("✅ Cookie-based authentication routes enabled")
-
-# Bypass auth for testing when MongoDB is unavailable
-if DEBUG_MODE:
-    app.include_router(
-        auth_bypass_router,
-        prefix=f"{API_V1_PREFIX}/auth",
-        tags=["Authentication Bypass (DEV ONLY)"]
-    )
 
 app.include_router(
     admin_router,

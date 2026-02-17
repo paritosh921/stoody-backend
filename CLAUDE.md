@@ -419,6 +419,37 @@ scrape_configs:
 - **Logging**: Use module logger, not print()
 - **Security**: Validate JWT on protected routes, use permissions decorator
 
+## Security Bypasses & Vulnerabilities (MUST FIX before production)
+
+### CRITICAL
+
+1. **`api/v1/auth_bypass.py` — Full auth bypass endpoint (REMOVE)**
+   - `POST /bypass/admin/login` accepts hardcoded `admin@skillbot.app` / `admin123` without MongoDB
+   - Returns a real JWT token with hardcoded ObjectId `68e8d0d9a78ac3146233970f`
+   - File header says "Remove this file in production!" — **it has not been removed**
+   - **Action**: Delete this file and remove its router registration from `main_async.py`
+
+2. **Hardcoded default credentials in multiple files**
+   - `admin@skillbot.app` / `admin123` appears in:
+     - `api/v1/auth_bypass.py` (line 22)
+     - `models/admin.py` → `create_default_admin()` (line ~134-153)
+     - `scripts/admin/init_admin_direct.py`
+     - `scripts/admin/setup_demo_admin.py`
+   - **Action**: Remove hardcoded credentials; use env vars or interactive prompts for seeding
+
+3. **Super-admin setup key in `.env` — `stoody-super-admin108`**
+   - Used for first-time super-admin creation via `POST /superadmin/setup`
+   - **Action**: Rotate this key on the deployed EC2 instance; use a strong random value
+
+### HIGH
+
+4. **`SUPERADMIN_JWT_SECRET` committed in `.env`**
+   - `LoAtCioeLPxnTx7Ox-kf_iADYhH6Ju6xVfD4OGjqJ2k`
+   - **Action**: Rotate this secret on EC2; ensure `.env` is in `.gitignore`
+
+5. **No rate limiting on super-admin login endpoint**
+   - `POST /superadmin/login` should have aggressive rate limiting (e.g., 5 attempts/min)
+
 ## Known Issues
 
 - Python 3.12 incompatible with MongoDB Atlas (TLS issues)
