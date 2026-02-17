@@ -1463,33 +1463,39 @@ async def _authenticate_registration_status_admin(
             detail="Service unavailable"
         )
 
-    tenant = await tenants.find_one({"admin_email": email})
-    if not tenant:
+    email_regex = {"$regex": f"^{re.escape(email.strip())}$", "$options": "i"}
+    candidate_tenants = await tenants.find(
+        {"admin_email": email_regex}
+    ).sort("created_at", -1).to_list(length=20)
+
+    if not candidate_tenants:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password"
         )
 
-    password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
-    if not password_hash:
-        tenant_db = None
-        if tenant.get("db_name"):
-            tenant_db = await db.get_tenant_db(tenant.get("db_name"))
-        if tenant_db is not None:
-            admin_doc = await tenant_db["admins"].find_one({
-                "email": email,
-                "is_active": True,
-            })
-            if admin_doc:
-                password_hash = admin_doc.get("password_hash")
+    for tenant in candidate_tenants:
+        password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
+        if not password_hash:
+            tenant_db = None
+            if tenant.get("db_name"):
+                tenant_db = await db.get_tenant_db(tenant.get("db_name"))
+            if tenant_db is not None:
+                admin_doc = await tenant_db["admins"].find_one({
+                    "email": email_regex,
+                    "is_active": True,
+                })
+                if admin_doc:
+                    password_hash = admin_doc.get("password_hash")
 
-    if not password_hash or not auth_manager.verify_password(password, password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
+        if password_hash and auth_manager.verify_password(password, password_hash):
+            return tenant
 
-    return tenant
+    # No matching tenant/password pair found
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid email or password"
+    )
 
 
 def _serialize_registration_status_message(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1531,11 +1537,76 @@ async def _get_registration_thread_messages(
     if not tenant_oid:
         return []
 
-    messages = await master_db["superadmin_messages"].find({
-        "tenant_id": tenant_oid,
-    }).sort("created_at", -1).to_list(length=100)
+    admin_email = (tenant.get("admin_email") or "").strip()
+    auth_code = (tenant.get("authorization_code_used") or "").strip().upper()
+    assigned_superadmin_id = tenant.get("assigned_superadmin_id")
+    superadmin_oid = None
+    if assigned_superadmin_id:
+        if isinstance(assigned_superadmin_id, ObjectId):
+            superadmin_oid = assigned_superadmin_id
+        else:
+            try:
+                superadmin_oid = ObjectId(str(assigned_superadmin_id))
+            except Exception:
+                superadmin_oid = None
 
-    return [_serialize_registration_status_message(msg) for msg in messages]
+    created_at_filter = {"$gte": tenant.get("created_at")} if tenant.get("created_at") else None
+    email_filter_value = {"$regex": f"^{re.escape(admin_email)}$", "$options": "i"} if admin_email else None
+
+    async def fetch_messages(query: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return await master_db["superadmin_messages"].find(query).sort("created_at", -1).to_list(length=100)
+
+    # Priority 1: strict tenant_id match (most deterministic)
+    tenant_id_query: Dict[str, Any] = {"tenant_id": tenant_oid}
+    messages = await fetch_messages(tenant_id_query)
+    if messages:
+        return [_serialize_registration_status_message(msg) for msg in messages]
+
+    # Legacy safety where tenant_id may have been stored as string
+    try:
+        legacy_tenant_id_query: Dict[str, Any] = {"tenant_id": str(tenant_oid)}
+        messages = await fetch_messages(legacy_tenant_id_query)
+        if messages:
+            return [_serialize_registration_status_message(msg) for msg in messages]
+    except Exception:
+        pass
+
+    # Priority 2: authorization-code anchored match
+    if auth_code and email_filter_value:
+        code_query: Dict[str, Any] = {
+            "authorization_code": auth_code,
+            "to_email": email_filter_value,
+        }
+        if created_at_filter:
+            code_query["created_at"] = created_at_filter
+        if superadmin_oid is not None:
+            code_query["superadmin_id"] = superadmin_oid
+        messages = await fetch_messages(code_query)
+        if messages:
+            return [_serialize_registration_status_message(msg) for msg in messages]
+
+    # Priority 3: owner + email fallback
+    if superadmin_oid is not None and email_filter_value:
+        owner_query: Dict[str, Any] = {
+            "superadmin_id": superadmin_oid,
+            "to_email": email_filter_value,
+        }
+        if created_at_filter:
+            owner_query["created_at"] = created_at_filter
+        messages = await fetch_messages(owner_query)
+        if messages:
+            return [_serialize_registration_status_message(msg) for msg in messages]
+
+    # Priority 4: email-only fallback (least strict, kept for backward compatibility)
+    if email_filter_value:
+        email_query: Dict[str, Any] = {"to_email": email_filter_value}
+        if created_at_filter:
+            email_query["created_at"] = created_at_filter
+        messages = await fetch_messages(email_query)
+        if messages:
+            return [_serialize_registration_status_message(msg) for msg in messages]
+
+    return []
 
 
 def _build_registration_status_payload(tenant: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -1685,6 +1756,7 @@ async def send_registration_status_message(
         message_doc = {
             "tenant_id": tenant.get("_id"),
             "superadmin_id": superadmin_oid,
+            "authorization_code": (tenant.get("authorization_code_used") or "").strip().upper() or None,
             "from_admin": tenant.get("admin_email"),
             "from_name": tenant.get("admin_full_name") or (tenant.get("pending_admin") or {}).get("full_name"),
             "to_email": (super_admin or {}).get("email"),

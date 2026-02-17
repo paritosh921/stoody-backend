@@ -1124,9 +1124,10 @@ async def send_message_to_tenant(
     message_doc = {
         "tenant_id": ObjectId(tenant_id),
         "superadmin_id": ObjectId(admin["admin_id"]),
+        "authorization_code": (tenant.get("authorization_code_used") or "").strip().upper() or None,
         "from_admin": admin["email"],
         "from_name": admin["name"],
-        "to_email": tenant.get("admin_email"),
+        "to_email": (tenant.get("admin_email") or "").strip().lower(),
         "subject": request.subject,
         "message": request.message,
         "priority": request.priority,
