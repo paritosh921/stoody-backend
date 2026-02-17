@@ -1163,6 +1163,33 @@ async def get_tenant_messages(
     return [convert_objectids(msg) for msg in messages]
 
 
+@router.delete("/tenants/{tenant_id}/messages/{message_id}")
+async def delete_tenant_message(
+    tenant_id: str,
+    message_id: str,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    try:
+        message_oid = ObjectId(message_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    result = await master_db["superadmin_messages"].delete_one({
+        "_id": message_oid,
+        "tenant_id": ObjectId(tenant_id),
+        "superadmin_id": ObjectId(admin["admin_id"]),
+    })
+
+    if result.deleted_count != 1:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    return {"success": True, "deleted_message_id": message_id}
+
+
 @router.delete("/tenants/{tenant_id}")
 async def delete_tenant(
     tenant_id: str,

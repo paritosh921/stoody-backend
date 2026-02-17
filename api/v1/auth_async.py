@@ -1474,6 +1474,7 @@ async def _authenticate_registration_status_admin(
             detail="Invalid email or password"
         )
 
+    matched_tenants: List[Dict[str, Any]] = []
     for tenant in candidate_tenants:
         password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
         if not password_hash:
@@ -1489,13 +1490,67 @@ async def _authenticate_registration_status_admin(
                     password_hash = admin_doc.get("password_hash")
 
         if password_hash and auth_manager.verify_password(password, password_hash):
-            return tenant
+            matched_tenants.append(tenant)
 
-    # No matching tenant/password pair found
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid email or password"
-    )
+    if not matched_tenants:
+        # No matching tenant/password pair found
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    if len(matched_tenants) == 1:
+        return matched_tenants[0]
+
+    # Duplicate-email safety: choose the most likely tenant based on message anchors.
+    email_lower = email.strip().lower()
+    master_db = await db.get_master_db()
+    if master_db is not None:
+        scored: List[tuple[int, datetime, Dict[str, Any]]] = []
+        for tenant in matched_tenants:
+            tenant_oid = tenant.get("_id")
+            if not tenant_oid:
+                continue
+
+            created_at = tenant.get("created_at") or datetime.min
+            anchor_queries: List[Dict[str, Any]] = [{"tenant_id": tenant_oid}]
+
+            auth_code = (tenant.get("authorization_code_used") or "").strip().upper()
+            if auth_code:
+                query: Dict[str, Any] = {
+                    "authorization_code": auth_code,
+                    "to_email": email_lower,
+                }
+                if tenant.get("created_at"):
+                    query["created_at"] = {"$gte": tenant.get("created_at")}
+                anchor_queries.append(query)
+
+            assigned_superadmin_id = tenant.get("assigned_superadmin_id")
+            if assigned_superadmin_id:
+                superadmin_oid = assigned_superadmin_id if isinstance(assigned_superadmin_id, ObjectId) else None
+                if superadmin_oid is None:
+                    try:
+                        superadmin_oid = ObjectId(str(assigned_superadmin_id))
+                    except Exception:
+                        superadmin_oid = None
+                if superadmin_oid is not None:
+                    query = {
+                        "superadmin_id": superadmin_oid,
+                        "to_email": email_lower,
+                    }
+                    if tenant.get("created_at"):
+                        query["created_at"] = {"$gte": tenant.get("created_at")}
+                    anchor_queries.append(query)
+
+            score = await master_db["superadmin_messages"].count_documents({"$or": anchor_queries})
+            scored.append((score, created_at, tenant))
+
+        if scored:
+            scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return scored[0][2]
+
+    # Final fallback: most recently created matching tenant.
+    return matched_tenants[0]
 
 
 def _serialize_registration_status_message(msg: Dict[str, Any]) -> Dict[str, Any]:
