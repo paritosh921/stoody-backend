@@ -26,6 +26,7 @@ from core.tenant_registry import (
     get_tenant_by_tenant_id,
     normalize_tenant_id,
 )
+from core.tenant_features import merge_tenant_features, is_feature_enabled
 from api.v1.auth_async import (
     get_database,
     get_auth_manager,
@@ -94,6 +95,7 @@ async def admin_cookie_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
 
         admin_doc = await tenant_db["admins"].find_one({
             "email": login_data.email,
@@ -128,7 +130,8 @@ async def admin_cookie_login(
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
             "admin_role": admin_doc.get("role", "master_admin"),
-            "permissions": admin_doc.get("permissions") or []
+            "permissions": admin_doc.get("permissions") or [],
+            "enabled_features": enabled_features,
         }
 
         session_data = await auth_manager.create_user_session(admin_data)
@@ -187,6 +190,7 @@ async def student_cookie_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
 
         normalized_username = login_data.username.strip()
         username_lower = normalized_username.lower()
@@ -229,6 +233,7 @@ async def student_cookie_login(
             "tenant_id": tenant.get("tenant_id"),
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
+            "enabled_features": enabled_features,
         }
 
         session_data = await auth_manager.create_user_session(student_data)
@@ -334,6 +339,13 @@ async def tutor_cookie_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
+
+        if not is_feature_enabled(enabled_features, "tutor_panel"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tutor panel is disabled for this institution"
+            )
 
         tutor_data = await auth_manager.authenticate_tutor(
             login_data.username, login_data.password, db, tenant_db
@@ -350,6 +362,7 @@ async def tutor_cookie_login(
             "tenant_id": tenant.get("tenant_id"),
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
+            "enabled_features": enabled_features,
         })
 
         session_data = await auth_manager.create_user_session(tutor_data)

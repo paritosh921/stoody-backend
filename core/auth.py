@@ -187,6 +187,7 @@ class AuthManager:
             "institution_id": user_data.get("institution_id"),
             "admin_role": user_data.get("admin_role"),
             "permissions": user_data.get("permissions"),
+            "enabled_features": user_data.get("enabled_features"),
         }
 
         access_token = self.create_access_token(token_data)
@@ -206,6 +207,7 @@ class AuthManager:
             "institution_id": user_data.get("institution_id"),
             "admin_role": user_data.get("admin_role"),
             "permissions": user_data.get("permissions"),
+            "enabled_features": user_data.get("enabled_features"),
             # Content scoping fields (mainly for tutors)
             "standards": user_data.get("standards"),
             "sections": user_data.get("sections"),
@@ -274,6 +276,7 @@ class AuthManager:
                 "institution_id": payload.get("institution_id"),
                 "admin_role": payload.get("admin_role"),
                 "permissions": payload.get("permissions"),
+                "enabled_features": payload.get("enabled_features"),
             }
 
         except Exception as e:

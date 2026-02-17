@@ -27,6 +27,7 @@ from core.tenant_registry import (
     get_tenant_by_tenant_id,
     normalize_tenant_id,
 )
+from core.tenant_features import merge_tenant_features, is_feature_enabled
 from core.security import (
     PasswordResetTokenManager,
     get_security_logger,
@@ -184,6 +185,29 @@ async def _get_tenant_db_from_user(
         return None
     return await db.get_tenant_db(db_name)
 
+
+async def _get_enabled_features_for_tenant(
+    db: DatabaseManager,
+    tenant: Optional[Dict[str, Any]] = None,
+    tenant_id: Optional[str] = None,
+) -> Dict[str, bool]:
+    if tenant and isinstance(tenant.get("enabled_features"), dict):
+        return merge_tenant_features(tenant.get("enabled_features"))
+
+    tenant_lookup_id = (tenant_id or (tenant or {}).get("tenant_id") or "").strip().upper()
+    if not tenant_lookup_id:
+        return merge_tenant_features(None)
+
+    tenants = await db.get_master_collection("tenants")
+    if tenants is None:
+        return merge_tenant_features(None)
+
+    tenant_doc = await tenants.find_one(
+        {"$or": [{"tenant_id": tenant_lookup_id}, {"institution_id": tenant_lookup_id}]},
+        {"enabled_features": 1},
+    )
+    return merge_tenant_features((tenant_doc or {}).get("enabled_features"))
+
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -256,6 +280,7 @@ async def admin_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
 
         admin_doc = await tenant_db["admins"].find_one({
             "email": login_data.email,
@@ -294,7 +319,8 @@ async def admin_login(
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
             "admin_role": admin_doc.get("role", "master_admin"),
-            "permissions": admin_doc.get("permissions") or []
+            "permissions": admin_doc.get("permissions") or [],
+            "enabled_features": enabled_features,
         }
 
         session_data = await auth_manager.create_user_session(admin_data)
@@ -346,6 +372,7 @@ async def student_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
 
         normalized_username = login_data.username.strip()
         username_lower = normalized_username.lower()
@@ -392,6 +419,7 @@ async def student_login(
             "tenant_id": tenant.get("tenant_id"),
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
+            "enabled_features": enabled_features,
         }
 
         session_data = await auth_manager.create_user_session(student_data)
@@ -482,6 +510,13 @@ async def tutor_login(
         tenant_id = normalize_tenant_id(login_data.tenant_id)
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
+        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
+
+        if not is_feature_enabled(enabled_features, "tutor_panel"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tutor panel is disabled for this institution"
+            )
 
         tutor_data = await auth_manager.authenticate_tutor(
             login_data.username, login_data.password, db, tenant_db
@@ -500,6 +535,7 @@ async def tutor_login(
             "tenant_id": tenant.get("tenant_id"),
             "db_name": tenant.get("db_name"),
             "institution_id": tenant.get("institution_id"),
+            "enabled_features": enabled_features,
         })
 
         session_data = await auth_manager.create_user_session(tutor_data)
@@ -1184,7 +1220,8 @@ async def complete_password_reset(
 @router.get("/verify")
 async def verify_token(
     request: Request,
-    auth_manager: AuthManager = Depends(get_auth_manager)
+    auth_manager: AuthManager = Depends(get_auth_manager),
+    db: DatabaseManager = Depends(get_database),
 ):
     """
     Verify JWT token and return user data
@@ -1204,6 +1241,11 @@ async def verify_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    enabled_features = await _get_enabled_features_for_tenant(
+        db,
+        tenant_id=current_user.get("tenant_id"),
+    )
+
     return {
         "success": True,
         "data": {
@@ -1211,7 +1253,8 @@ async def verify_token(
             "user_type": current_user.get("user_type"),
             "email": current_user.get("email"),
             "username": current_user.get("username"),
-            "full_name": current_user.get("full_name")
+            "full_name": current_user.get("full_name"),
+            "enabled_features": enabled_features,
         }
     }
 

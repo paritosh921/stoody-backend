@@ -24,6 +24,7 @@ from starlette.responses import Response
 from core.tenant import TenantContext, TenantAwareDB, TenantContextError, TenantIsolationError
 from core.database import DatabaseManager
 from core.cookie_auth import COOKIE_NAME as AUTH_COOKIE_NAME, cookie_auth_manager
+from core.tenant_features import merge_tenant_features, required_feature_for_path
 from api.v1.auth_async import get_database, get_current_user
 from config_async import MONGODB_DB_STOODY
 
@@ -98,6 +99,37 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 user_data = await auth_manager.verify_token_and_get_user(token)
 
                 if user_data:
+                    required_feature = required_feature_for_path(path)
+                    if (
+                        required_feature
+                        and user_data.get("user_type") in {"admin", "tutor", "student"}
+                        and user_data.get("tenant_id")
+                    ):
+                        enabled_features = None
+                        try:
+                            master_db = await request.app.state.db.get_master_db()
+                            tenant_key = str(user_data.get("tenant_id", "")).strip().upper()
+                            if master_db is not None and tenant_key:
+                                tenant_doc = await master_db["tenants"].find_one(
+                                    {"$or": [{"tenant_id": tenant_key}, {"institution_id": tenant_key}]},
+                                    {"enabled_features": 1},
+                                )
+                                enabled_features = (tenant_doc or {}).get("enabled_features")
+                        except Exception as feature_load_error:
+                            logger.debug(f"Could not fetch tenant features from master DB: {feature_load_error}")
+
+                        merged_features = merge_tenant_features(
+                            enabled_features or user_data.get("enabled_features")
+                        )
+                        user_data["enabled_features"] = merged_features
+
+                        if not merged_features.get(required_feature, True):
+                            return Response(
+                                content=f'{{"detail":"Feature \\"{required_feature}\\" is disabled by super admin"}}',
+                                status_code=status.HTTP_403_FORBIDDEN,
+                                media_type="application/json",
+                            )
+
                     admin_id = user_data.get("admin_id")
                     user_type = user_data.get("user_type")
                     is_b2c = user_data.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
