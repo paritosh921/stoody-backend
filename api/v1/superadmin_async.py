@@ -624,10 +624,11 @@ async def get_dashboard_stats(
     })
 
     total = sum(status_map.values())
+    pending_count = status_map.get("pending", 0) + status_map.get("verification", 0)
 
     return {
         "total_tenants": total,
-        "pending_registrations": status_map.get("pending", 0),
+        "pending_registrations": pending_count,
         "active_tenants": status_map.get("active", 0),
         "suspended_tenants": status_map.get("suspended", 0),
         "rejected_registrations": status_map.get("rejected", 0),
@@ -650,7 +651,10 @@ async def get_tenants(
 
     query: Dict[str, Any] = {"assigned_superadmin_id": ObjectId(admin["admin_id"])}
     if status:
-        query["status"] = status
+        if status == "pending":
+            query["status"] = {"$in": ["pending", "verification"]}
+        else:
+            query["status"] = status
 
     tenants = await master_db["tenants"].find(query).sort("created_at", -1).to_list(length=1000)
 
@@ -672,6 +676,33 @@ async def get_tenant_by_id(
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    if tenant.get("status") == "pending":
+        verification_at = datetime.utcnow()
+        verification_action = {
+            "action": "verification_started",
+            "by": admin["email"],
+            "at": verification_at,
+            "notes": "Application opened for review",
+        }
+        update_result = await master_db["tenants"].update_one(
+            {"_id": tenant["_id"], "status": "pending"},
+            {
+                "$set": {
+                    "status": "verification",
+                    "verification_started_at": verification_at,
+                },
+                "$push": {
+                    "approval_history": verification_action,
+                },
+            }
+        )
+        if update_result.modified_count == 1:
+            tenant["status"] = "verification"
+            tenant["verification_started_at"] = verification_at
+            history = tenant.get("approval_history") or []
+            history.append(verification_action)
+            tenant["approval_history"] = history
 
     tenant = convert_objectids(tenant)
     if "pending_admin" in tenant and tenant["pending_admin"]:
@@ -706,8 +737,8 @@ async def approve_tenant(
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    if tenant["status"] != "pending":
-        raise HTTPException(status_code=400, detail="Tenant is not in pending status")
+    if tenant["status"] not in ["pending", "verification"]:
+        raise HTTPException(status_code=400, detail="Tenant is not in pending or verification status")
 
     normalized_institution_id = normalize_institution_id(request.institution_id)
     new_tenant_id = derive_tenant_id(normalized_institution_id)

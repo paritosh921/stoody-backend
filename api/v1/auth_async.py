@@ -5,6 +5,7 @@ JWT-based authentication with rate limiting and caching
 
 import base64
 import logging
+import mimetypes
 import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -1311,6 +1312,48 @@ async def register_admin(
         if phone_country_code and phone_number:
             contact_phone_value = f"{phone_country_code.strip()} {phone_number.strip()}"
 
+        files_collection = None
+        prepared_file_docs: List[Dict[str, Any]] = []
+        if attachments:
+            files_collection = await db.get_master_collection("tenant_application_files")
+            if files_collection is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Tenant files collection not available"
+                )
+
+            allowed_types = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"}
+            max_file_size = 5 * 1024 * 1024  # 5MB
+
+            if len(attachments) > 10:
+                raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+            for upload in attachments:
+                if not upload.filename:
+                    continue
+
+                content_type = (upload.content_type or "").lower().strip()
+                if content_type == "application/octet-stream" or not content_type:
+                    guessed_type, _ = mimetypes.guess_type(upload.filename)
+                    if guessed_type:
+                        content_type = guessed_type.lower()
+
+                if content_type not in allowed_types:
+                    raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.content_type or upload.filename}")
+
+                content = await upload.read()
+                if len(content) > max_file_size:
+                    raise HTTPException(status_code=400, detail=f"File too large: {upload.filename}")
+
+                prepared_file_docs.append({
+                    "admin_email": email,
+                    "institution_name": institution_name_value,
+                    "filename": upload.filename,
+                    "content_type": content_type,
+                    "size_bytes": len(content),
+                    "data_base64": base64.b64encode(content).decode("utf-8"),
+                })
+
         tenant_doc = {
             "tenant_id": None,
             "requested_tenant_id": requested_tenant_id or None,
@@ -1351,40 +1394,18 @@ async def register_admin(
                 detail="Failed to create tenant request"
             )
 
-        if attachments:
-            files_collection = await db.get_master_collection("tenant_application_files")
-            if files_collection is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Tenant files collection not available"
-                )
-            allowed_types = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"}
-            max_file_size = 5 * 1024 * 1024  # 5MB
-            if len(attachments) > 10:
-                raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
-
-            file_docs = []
-            for upload in attachments:
-                if not upload.filename:
-                    continue
-                if upload.content_type not in allowed_types:
-                    raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.content_type}")
-                content = await upload.read()
-                if len(content) > max_file_size:
-                    raise HTTPException(status_code=400, detail=f"File too large: {upload.filename}")
-                file_docs.append({
+        if prepared_file_docs and files_collection is not None:
+            timestamp = datetime.utcnow()
+            file_docs = [
+                {
+                    **file_doc,
                     "tenant_request_id": result.inserted_id,
-                    "admin_email": email,
-                    "institution_name": institution_name_value,
-                    "filename": upload.filename,
-                    "content_type": upload.content_type,
-                    "size_bytes": len(content),
-                    "data_base64": base64.b64encode(content).decode("utf-8"),
-                    "uploaded_at": datetime.utcnow(),
-                })
-
-            if file_docs:
-                insert_result = await files_collection.insert_many(file_docs)
+                    "uploaded_at": timestamp,
+                }
+                for file_doc in prepared_file_docs
+            ]
+            insert_result = await files_collection.insert_many(file_docs)
+            if insert_result.inserted_ids:
                 file_ids = list(insert_result.inserted_ids)
                 await tenants.update_one(
                     {"_id": result.inserted_id},
