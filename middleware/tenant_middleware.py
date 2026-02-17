@@ -146,8 +146,12 @@ class TenantMiddleware(BaseHTTPMiddleware):
                                 media_type="application/json",
                             )
                         # For cookie-only requests without db_name, skip
-                        # tenant context silently so the request proceeds
-                        # against the default database.
+                        # tenant context — the request will proceed without
+                        # a tenant-scoped database.
+                        logger.warning(
+                            "Cookie auth succeeded but db_name missing for user %s (type=%s, path=%s) — no tenant context set",
+                            user_data.get("user_id"), user_data.get("user_type"), path,
+                        )
                     else:
                         if user_data.get("user_type") == "admin":
                             admin_id = admin_id or user_data.get("user_id")

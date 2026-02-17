@@ -2000,43 +2000,32 @@ async def logout(
         # For students, track session end
         if user_type == "student":
             try:
-                # Set offline status
                 if tenant_db is not None:
+                    # Set offline status
                     await tenant_db["students"].update_one(
                         {"_id": ObjectId(user_id)},
                         {"$set": {"is_online": False}}
                     )
-                else:
-                    await db.mongo_update_one(
-                        "students",
-                        {"_id": ObjectId(user_id)},
-                        {"$set": {"is_online": False}}
-                    )
 
-                # Get last login to calculate session duration
-                if tenant_db is not None:
+                    # Get last login to calculate session duration
                     student = await tenant_db["students"].find_one({"_id": ObjectId(user_id)})
-                else:
-                    student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)})
-                last_login = student.get("last_login") if student else None
+                    last_login = student.get("last_login") if student else None
 
-                session_duration = 0
-                if last_login:
-                    session_duration = (datetime.utcnow() - last_login).total_seconds()
+                    session_duration = 0
+                    if last_login:
+                        session_duration = (datetime.utcnow() - last_login).total_seconds()
 
-                # Log session end activity
-                log_doc = {
-                    "student_id": ObjectId(user_id),
-                    "action": "session_end",
-                    "timestamp": datetime.utcnow(),
-                    "metadata": {
-                        "session_duration": session_duration
-                    }
-                }
-                if tenant_db is not None:
-                    await tenant_db["student_activity_log"].insert_one(log_doc)
+                    # Log session end activity
+                    await tenant_db["student_activity_log"].insert_one({
+                        "student_id": ObjectId(user_id),
+                        "action": "session_end",
+                        "timestamp": datetime.utcnow(),
+                        "metadata": {
+                            "session_duration": session_duration
+                        }
+                    })
                 else:
-                    await db.mongo_insert_one("student_activity_log", log_doc)
+                    logger.warning(f"No tenant_db for student {user_id} during logout — skipping activity tracking")
             except Exception as e:
                 logger.warning(f"Failed to track student logout: {str(e)}")
 
@@ -2050,105 +2039,6 @@ async def logout(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Logout failed"
-        )
-
-@router.post("/init-admin")
-@limiter.limit("5/minute")
-async def init_admin(
-    request: Request,
-    db: DatabaseManager = Depends(get_database),
-    auth_manager: AuthManager = Depends(get_auth_manager)
-):
-    """Initialize default admin account (dev/testing only)"""
-    if not settings.DEBUG_MODE:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Not found"
-        )
-
-    try:
-        # Check if admin already exists
-        existing_admin = await db.mongo_find_one("admins", {"email": "admin@skillbot.app"})
-
-        if existing_admin:
-            return {"message": "Admin already exists"}
-
-        # Create default admin
-        admin_data = {
-            "email": "admin@skillbot.app",
-            "password_hash": auth_manager.get_password_hash("admin123"),
-            "full_name": "System Administrator",
-            "is_active": True,
-            "created_at": datetime.utcnow()
-        }
-
-        admin_id = await db.mongo_insert_one("admins", admin_data)
-
-        if admin_id:
-            return {"message": "Default admin created successfully", "admin_id": admin_id}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create admin"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Init admin error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to initialize admin"
-        )
-
-@router.post("/init-demo-student")
-@limiter.limit("5/minute")
-async def init_demo_student(
-    request: Request,
-    db: DatabaseManager = Depends(get_database),
-    auth_manager: AuthManager = Depends(get_auth_manager)
-):
-    """Initialize demo student account (dev/testing only)"""
-    if not settings.DEBUG_MODE:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Not found"
-        )
-
-    try:
-        # Check if demo student already exists
-        existing_student = await db.mongo_find_one("students", {"username": "demo_student"})
-
-        if existing_student:
-            return {"message": "Demo student already exists"}
-
-        # Create demo student
-        student_data = {
-            "username": "demo_student",
-            "password_hash": auth_manager.get_password_hash("student123"),
-            "full_name": "Demo Student",
-            "email": "demo@student.com",
-            "is_active": True,
-            "created_at": datetime.utcnow()
-        }
-
-        student_id = await db.mongo_insert_one("students", student_data)
-
-        if student_id:
-            return {"message": "Demo student created successfully", "student_id": student_id}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create demo student"
-            )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Init demo student error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to initialize demo student"
         )
 
 @router.get("/me", response_model=UserResponse)
@@ -2169,46 +2059,49 @@ async def get_full_user_profile(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Get full user profile from database"""
+    """Get full user profile from tenant database"""
     try:
         user_type = current_user.get("user_type")
         user_id = current_user.get("user_id")
 
+        tenant_db = await _get_tenant_db_from_user(db, current_user)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
         if user_type == "student":
-            # Fetch full student profile from database
-            student = await db.mongo_find_one("students", {"_id": ObjectId(user_id)})
+            student = await tenant_db["students"].find_one({"_id": ObjectId(user_id)})
             if not student:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Student profile not found"
                 )
-
-            # Convert ObjectId to string for JSON serialization
             student["_id"] = str(student["_id"])
             if "admin_id" in student:
                 student["admin_id"] = str(student["admin_id"])
-
-            return {
-                "success": True,
-                "data": student
-            }
+            return {"success": True, "data": student}
 
         elif user_type == "admin":
-            # Fetch admin profile from database
-            admin = await db.mongo_find_one("admins", {"_id": ObjectId(user_id)})
+            admin = await tenant_db["admins"].find_one({"_id": ObjectId(user_id)})
             if not admin:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail="Admin profile not found"
                 )
-
-            # Convert ObjectId to string
             admin["_id"] = str(admin["_id"])
+            return {"success": True, "data": admin}
 
-            return {
-                "success": True,
-                "data": admin
-            }
+        elif user_type == "tutor":
+            tutor = await tenant_db["tutors"].find_one({"_id": ObjectId(user_id)})
+            if not tutor:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Tutor profile not found"
+                )
+            tutor["_id"] = str(tutor["_id"])
+            return {"success": True, "data": tutor}
 
         else:
             raise HTTPException(

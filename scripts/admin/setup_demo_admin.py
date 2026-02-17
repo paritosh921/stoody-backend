@@ -1,44 +1,46 @@
 """
-Setup Demo Admin Account and Associate Existing Data
-This script creates a demo admin with subdomain 'demo' and associates all existing students and content.
+Setup Demo Admin Account and Associate Existing Data.
+
+Usage:
+    python setup_demo_admin.py --db-name skb_XXXX-0000 --email admin@example.com --password <password>
 """
+import argparse
 import os
+import sys
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from passlib.context import CryptContext
 from datetime import datetime
 
-# Load environment
 load_dotenv()
 
-# Password hasher
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# MongoDB connection
-MONGODB_URI = os.getenv("MONGODB_URI")
-client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=30000, connectTimeoutMS=30000)
-db = client["skillbot_db"]
 
-def setup_demo_admin():
-    """Create demo admin and associate existing data"""
+def setup_demo_admin(args):
+    MONGODB_URI = os.getenv("MONGODB_URI")
+    if not MONGODB_URI:
+        print("[ERROR] MONGODB_URI not set in environment")
+        sys.exit(1)
+
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=30000, connectTimeoutMS=30000)
+    db = client[args.db_name]
 
     print("=" * 60)
-    print("DEMO ADMIN SETUP")
+    print(f"DEMO ADMIN SETUP — database: {args.db_name}")
     print("=" * 60)
 
     try:
-        # Check if demo admin already exists
         existing_demo = db.admins.find_one({"subdomain": "demo"})
 
         if existing_demo:
             demo_admin_id = existing_demo["_id"]
             print(f"\nDemo admin already exists with ID: {demo_admin_id}")
         else:
-            # Create demo admin
-            password_hash = pwd_context.hash("admin123")
+            password_hash = pwd_context.hash(args.password)
 
             demo_admin = {
-                "email": "admin@skillbot.app",
+                "email": args.email,
                 "password_hash": password_hash,
                 "name": "Demo Administrator",
                 "subdomain": "demo",
@@ -52,8 +54,7 @@ def setup_demo_admin():
             result = db.admins.insert_one(demo_admin)
             demo_admin_id = result.inserted_id
             print(f"\nCreated demo admin with ID: {demo_admin_id}")
-            print(f"  Email: admin@skillbot.app")
-            print(f"  Password: admin123")
+            print(f"  Email: {args.email}")
             print(f"  Subdomain: demo")
             print(f"  Organization: SkillBot Demo School")
 
@@ -135,11 +136,6 @@ def setup_demo_admin():
         print(f"Total Students: {total_students}")
         print(f"Total Documents: {total_documents}")
         print(f"Total Questions: {total_questions}")
-        print("\n" + "=" * 60)
-        print("NEXT STEP: Update bypass login")
-        print("=" * 60)
-        print(f"\nCopy this admin_id to update auth_bypass.py:")
-        print(f"{demo_admin_id}")
         print("\nSetup complete!")
 
     except Exception as e:
@@ -149,5 +145,15 @@ def setup_demo_admin():
     finally:
         client.close()
 
+
+def main():
+    parser = argparse.ArgumentParser(description="Setup demo admin in tenant database")
+    parser.add_argument("--db-name", required=True, help="Target database name (e.g. skb_XXXX-0000)")
+    parser.add_argument("--email", required=True, help="Demo admin email address")
+    parser.add_argument("--password", required=True, help="Demo admin password")
+    args = parser.parse_args()
+    setup_demo_admin(args)
+
+
 if __name__ == "__main__":
-    setup_demo_admin()
+    main()

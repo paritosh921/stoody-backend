@@ -26,11 +26,12 @@ class DatabaseManager:
 
     def __init__(self):
         self.mongo_client: Optional[AsyncIOMotorClient] = None
-        self.mongo_db: Optional[AsyncIOMotorDatabase] = None
+        self._legacy_default_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_master_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_tenant_dbs: Dict[str, AsyncIOMotorDatabase] = {}
         self.mongo_db_b2c: Optional[AsyncIOMotorDatabase] = None  # B2C database
         self._mongo_lock = asyncio.Lock()
+        self._indexed_dbs: set = set()
 
     async def initialize(self) -> bool:
         """Initialize database connections"""
@@ -54,7 +55,7 @@ class DatabaseManager:
                 if not MONGODB_URL or DISABLE_MONGODB:
                     logger.info("MongoDB disabled or not configured; skipping initialization")
                     self.mongo_client = None
-                    self.mongo_db = None
+                    self._legacy_default_db = None
                     self.mongo_master_db = None
                     self.mongo_db_b2c = None
                     self.mongo_tenant_dbs.clear()
@@ -87,7 +88,7 @@ class DatabaseManager:
 
                 # Get database instances
                 self.mongo_master_db = self.mongo_client[MONGODB_DB_MASTER]
-                self.mongo_db = self.mongo_client[MONGODB_DB_NAME]
+                self._legacy_default_db = self.mongo_client[MONGODB_DB_NAME]
 
                 # Test connection
                 await self.mongo_client.admin.command('ping')
@@ -99,16 +100,16 @@ class DatabaseManager:
                 self.mongo_db_b2c = self.mongo_client[MONGODB_DB_STOODY]
                 logger.info(f"✅ B2C MongoDB initialized - Database: {MONGODB_DB_STOODY}")
 
-                # Ensure indexes (unique constraints, performance)
+                # Ensure indexes on B2C database
                 try:
-                    await self.ensure_indexes()
+                    await self.ensure_indexes_for_db(self.mongo_db_b2c)
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to ensure indexes: {str(e)}")
+                    logger.warning(f"⚠️ Failed to ensure B2C indexes: {str(e)}")
 
             except (ServerSelectionTimeoutError, ConfigurationError) as e:
                 logger.warning(f"⚠️ MongoDB connection failed ({type(e).__name__}) - continuing without MongoDB")
                 self.mongo_client = None
-                self.mongo_db = None
+                self._legacy_default_db = None
                 self.mongo_master_db = None
                 self.mongo_db_b2c = None
                 self.mongo_tenant_dbs.clear()
@@ -117,10 +118,15 @@ class DatabaseManager:
                 raise
 
     async def get_mongo_db(self) -> Optional[AsyncIOMotorDatabase]:
-        """Get default MongoDB database (legacy/shared) with lazy initialization"""
-        if self.mongo_db is None and MONGODB_URL and not DISABLE_MONGODB:
+        """Get default MongoDB database (legacy/shared) with lazy initialization.
+
+        DEPRECATED: Use get_tenant_db(db_name) instead. This method only
+        exists for connectivity checks.
+        """
+        logger.warning("DEPRECATED: get_mongo_db() called — use get_tenant_db(db_name) instead", stack_info=True)
+        if self._legacy_default_db is None and MONGODB_URL and not DISABLE_MONGODB:
             await self._init_mongodb()
-        return self.mongo_db
+        return self._legacy_default_db
 
     async def get_master_db(self) -> Optional[AsyncIOMotorDatabase]:
         """Get master MongoDB database (tenant registry) with lazy initialization"""
@@ -140,14 +146,24 @@ class DatabaseManager:
             return self.mongo_tenant_dbs[db_name]
         tenant_db = self.mongo_client[db_name]
         self.mongo_tenant_dbs[db_name] = tenant_db
+        # Lazily ensure indexes on first access per database
+        try:
+            await self.ensure_indexes_for_db(tenant_db)
+        except Exception as e:
+            logger.warning(f"Failed to ensure indexes on {db_name}: {str(e)}")
         return tenant_db
 
     async def get_mongo_collection(self, collection_name: str):
-        """Get MongoDB collection from main database (skillbot_db)"""
-        db = await self.get_mongo_db()
-        if db is None:
+        """Get MongoDB collection from main database (skillbot_db).
+
+        DEPRECATED: Use get_tenant_collection(db_name, collection_name) instead.
+        """
+        logger.warning("DEPRECATED: get_mongo_collection() called — use get_tenant_collection() instead", stack_info=True)
+        if self._legacy_default_db is None and MONGODB_URL and not DISABLE_MONGODB:
+            await self._init_mongodb()
+        if self._legacy_default_db is None:
             return None
-        return db[collection_name]
+        return self._legacy_default_db[collection_name]
 
     async def _get_context_db(self) -> Optional[AsyncIOMotorDatabase]:
         """Resolve MongoDB database for the current request context."""
@@ -166,7 +182,8 @@ class DatabaseManager:
         if db_name:
             return await self.get_tenant_db(db_name)
 
-        return self.mongo_db
+        logger.warning("No tenant context set — returning None instead of fallback DB", stack_info=True)
+        return None
 
     async def _get_context_collection(self, collection_name: str):
         """Get MongoDB collection for the current request context."""
@@ -206,29 +223,26 @@ class DatabaseManager:
             return None
         return db[collection_name]
 
-    async def ensure_indexes(self) -> None:
-        """Create necessary indexes if they don't exist."""
-        if self.mongo_db is None:
+    async def ensure_indexes_for_db(self, db: AsyncIOMotorDatabase) -> None:
+        """Create necessary indexes on the given database (idempotent)."""
+        db_name = db.name
+        if db_name in self._indexed_dbs:
             return
         try:
-            students = self.mongo_db["students"]
-            # Unique index on business key student_id
+            students = db["students"]
             await students.create_index(
                 [("student_id", 1)],
                 unique=True,
                 name="uniq_student_id"
             )
-            logger.info("✅ Ensured unique index on students.student_id")
             await students.create_index(
                 [("username_lower", 1)],
                 unique=True,
                 sparse=True,
                 name="uniq_student_username_lower"
             )
-            logger.info("✅ Ensured unique index on students.username_lower")
 
-            # Tutor indexes
-            tutors = self.mongo_db["tutors"]
+            tutors = db["tutors"]
             await tutors.create_index(
                 [("username", 1)],
                 unique=True,
@@ -245,10 +259,11 @@ class DatabaseManager:
                 unique=True,
                 name="uniq_tutor_id"
             )
-            logger.info("✅ Ensured indexes on tutors.username and tutors.tutor_id")
+
+            self._indexed_dbs.add(db_name)
+            logger.info(f"Ensured indexes on database: {db_name}")
         except OperationFailure as e:
-            # Likely existing duplicates preventing index creation
-            logger.warning(f"⚠️ Could not create one or more indexes: {str(e)}")
+            logger.warning(f"Could not create one or more indexes on {db_name}: {str(e)}")
 
     # MongoDB async operations wrapper
     async def mongo_find_one(self, collection_name: str, filter_dict: Dict[str, Any],
@@ -420,7 +435,7 @@ class DatabaseManager:
                     except Exception:
                         pass
                     self.mongo_client = None
-                    self.mongo_db = None
+                    self._legacy_default_db = None
                     mongo_healthy = False
 
             return mongo_healthy

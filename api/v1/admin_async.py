@@ -929,7 +929,7 @@ async def create_student(
     """Create a new student"""
     try:
         # Ensure MongoDB is available
-        if await db.get_mongo_db() is None:
+        if db.mongo_client is None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="MongoDB is not configured or unavailable"
@@ -1053,7 +1053,7 @@ async def create_student(
         inserted_id = await db.mongo_insert_one("students", new_student)
         if not inserted_id:
             # Distinguish likely causes
-            if await db.get_mongo_db() is None:
+            if db.mongo_client is None:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Database unavailable"
