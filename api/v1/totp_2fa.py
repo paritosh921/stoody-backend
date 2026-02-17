@@ -38,7 +38,11 @@ from core.tenant_registry import (
     get_tenant_by_tenant_id,
     normalize_tenant_id,
 )
-from core.tenant_features import merge_tenant_features, is_feature_enabled
+from core.tenant_features import (
+    build_enabled_features_v2,
+    is_feature_enabled,
+    merge_tenant_features,
+)
 from config_async import settings, JWT_SECRET_KEY
 
 logger = logging.getLogger(__name__)
@@ -130,6 +134,7 @@ def create_temp_token(
     db_name: Optional[str] = None,
     institution_id: Optional[str] = None,
     enabled_features: Optional[Dict[str, Any]] = None,
+    enabled_features_v2: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Create a short-lived temp token for 2FA flow.
@@ -143,6 +148,7 @@ def create_temp_token(
         "db_name": db_name,
         "institution_id": institution_id,
         "enabled_features": enabled_features,
+        "enabled_features_v2": enabled_features_v2,
     })
 
 
@@ -318,6 +324,14 @@ def _build_user_response(user: Dict[str, Any], user_id: str, user_type: str,
                          payload: Optional[Dict[str, Any]] = None,
                          tenant: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build a complete user response dict, including tutor-specific fields when applicable."""
+    merged_features = merge_tenant_features(
+        (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features"),
+        (payload or {}).get("enabled_features_v2") or (tenant or {}).get("enabled_features_v2"),
+    )
+    merged_features_v2 = build_enabled_features_v2(
+        (payload or {}).get("enabled_features_v2") or (tenant or {}).get("enabled_features_v2"),
+        (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features"),
+    )
     response = {
         "user_id": user_id,
         "user_type": user_type,
@@ -328,9 +342,8 @@ def _build_user_response(user: Dict[str, Any], user_id: str, user_type: str,
         "tenant_id": (payload or {}).get("tenant_id") or (tenant or {}).get("tenant_id"),
         "db_name": (payload or {}).get("db_name") or (tenant or {}).get("db_name"),
         "institution_id": (payload or {}).get("institution_id") or (tenant or {}).get("institution_id"),
-        "enabled_features": merge_tenant_features(
-            (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features")
-        ),
+        "enabled_features": merged_features,
+        "enabled_features_v2": merged_features_v2,
     }
 
     if user_type == "admin":
@@ -354,6 +367,14 @@ def _build_user_token_data(user: Dict[str, Any], user_id: str, user_type: str,
                            payload: Optional[Dict[str, Any]] = None,
                            tenant: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build token data dict for creating access tokens."""
+    merged_features = merge_tenant_features(
+        (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features"),
+        (payload or {}).get("enabled_features_v2") or (tenant or {}).get("enabled_features_v2"),
+    )
+    merged_features_v2 = build_enabled_features_v2(
+        (payload or {}).get("enabled_features_v2") or (tenant or {}).get("enabled_features_v2"),
+        (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features"),
+    )
     data = {
         "user_id": user_id,
         "user_type": user_type,
@@ -364,9 +385,8 @@ def _build_user_token_data(user: Dict[str, Any], user_id: str, user_type: str,
         "tenant_id": (payload or {}).get("tenant_id") or (tenant or {}).get("tenant_id"),
         "db_name": (payload or {}).get("db_name") or (tenant or {}).get("db_name"),
         "institution_id": (payload or {}).get("institution_id") or (tenant or {}).get("institution_id"),
-        "enabled_features": merge_tenant_features(
-            (payload or {}).get("enabled_features") or (tenant or {}).get("enabled_features")
-        ),
+        "enabled_features": merged_features,
+        "enabled_features_v2": merged_features_v2,
     }
 
     if user_type == "admin":
@@ -397,6 +417,7 @@ def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any])
         "admin_role": user_data.get("admin_role"),
         "permissions": user_data.get("permissions"),
         "enabled_features": user_data.get("enabled_features"),
+        "enabled_features_v2": user_data.get("enabled_features_v2"),
     }
     return auth_manager.create_access_token(
         token_data, 
@@ -429,7 +450,14 @@ async def login_with_2fa(
         tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
         tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
         tenant_db = await _get_tenant_db_or_503(db, tenant)
-        enabled_features = merge_tenant_features(tenant.get("enabled_features"))
+        enabled_features = merge_tenant_features(
+            tenant.get("enabled_features"),
+            tenant.get("enabled_features_v2"),
+        )
+        enabled_features_v2 = build_enabled_features_v2(
+            tenant.get("enabled_features_v2"),
+            tenant.get("enabled_features"),
+        )
         
         if user_type == "admin":
             # Authenticate admin
@@ -443,7 +471,7 @@ async def login_with_2fa(
                 )
             user = await tenant_db["admins"].find_one({"email": login_data.username})
         elif user_type == "tutor":
-            if not is_feature_enabled(enabled_features, "tutor_panel"):
+            if not is_feature_enabled(enabled_features, "tutor_portal_access", enabled_features_v2):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Tutor panel is disabled for this institution"
@@ -498,6 +526,7 @@ async def login_with_2fa(
                 db_name=tenant.get("db_name"),
                 institution_id=tenant.get("institution_id"),
                 enabled_features=enabled_features,
+                enabled_features_v2=enabled_features_v2,
             )
             return LoginResponse(
                 success=True,
@@ -515,6 +544,7 @@ async def login_with_2fa(
                 db_name=tenant.get("db_name"),
                 institution_id=tenant.get("institution_id"),
                 enabled_features=enabled_features,
+                enabled_features_v2=enabled_features_v2,
             )
             return LoginResponse(
                 success=True,

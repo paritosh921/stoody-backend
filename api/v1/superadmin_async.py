@@ -21,6 +21,12 @@ from pydantic import BaseModel, EmailStr, Field
 
 from config_async import settings
 from core.database import DatabaseManager
+from core.tenant_features import (
+    LEGACY_DEFAULT_TENANT_FEATURES,
+    build_enabled_features_v2,
+    export_legacy_features,
+    get_feature_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,25 +82,10 @@ class OTPVerifyRequest(BaseModel):
     otp: str = Field(..., min_length=6, max_length=6)
 
 
-class TenantFeatures(BaseModel):
-    smartboard: bool = True
-    online_class: bool = False
-    ai_chat: bool = True
-    stoody_pen: bool = False
-    exam_mode: bool = True
-    tutor_panel: bool = True
-    analytics_dashboard: bool = True
-    document_management: bool = True
-    video_lessons: bool = False
-    question_bank: bool = True
-    leaderboard: bool = True
-    student_monitoring: bool = True
-
-
 class ApproveTenantRequest(BaseModel):
     institution_id: str = Field(..., min_length=9, max_length=9, pattern=r'^[A-Z]{4}-[0-9]{4}$')
     notes: Optional[str] = None
-    features: Optional[TenantFeatures] = None
+    features: Optional[Dict[str, bool]] = None
 
 
 class RejectTenantRequest(BaseModel):
@@ -106,7 +97,12 @@ class SuspendTenantRequest(BaseModel):
 
 
 class UpdateFeaturesRequest(BaseModel):
-    features: TenantFeatures
+    features: Dict[str, bool]
+
+
+class UpdateFeaturesV2Request(BaseModel):
+    tier: Literal["core", "advanced", "max"] = "core"
+    overrides: Dict[str, bool] = Field(default_factory=dict)
 
 
 class UpdateLimitsRequest(BaseModel):
@@ -156,6 +152,43 @@ def convert_objectids(obj):
     if isinstance(obj, datetime):
         return obj.isoformat()
     return obj
+
+
+def _sanitize_legacy_features(raw: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+    sanitized = dict(LEGACY_DEFAULT_TENANT_FEATURES)
+    if not isinstance(raw, dict):
+        return sanitized
+    for key in LEGACY_DEFAULT_TENANT_FEATURES.keys():
+        if key in raw:
+            sanitized[key] = bool(raw.get(key))
+    return sanitized
+
+
+def _sanitize_v2_overrides(raw: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): bool(value) for key, value in raw.items()}
+
+
+def _tenant_features_v2_from_doc(tenant: Dict[str, Any]) -> Dict[str, Any]:
+    return build_enabled_features_v2(
+        tenant.get("enabled_features_v2"),
+        tenant.get("enabled_features"),
+    )
+
+
+def _feature_diff(before_effective: Dict[str, bool], after_effective: Dict[str, bool]) -> List[Dict[str, Any]]:
+    diff: List[Dict[str, Any]] = []
+    for key in sorted(set(before_effective.keys()) | set(after_effective.keys())):
+        before_value = bool(before_effective.get(key))
+        after_value = bool(after_effective.get(key))
+        if before_value != after_value:
+            diff.append({
+                "key": key,
+                "from": before_value,
+                "to": after_value,
+            })
+    return diff
 
 
 def _get_serializer() -> URLSafeTimedSerializer:
@@ -667,6 +700,93 @@ async def get_tenants(
     return result
 
 
+@router.get("/features/catalog")
+async def get_features_catalog(
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    _ = admin  # authenticated super-admin context
+    return {
+        "success": True,
+        "version": 2,
+        "categories": ["core", "advanced", "max"],
+        "features": get_feature_catalog(),
+    }
+
+
+@router.get("/tenants/{tenant_id}/features-v2")
+async def get_tenant_features_v2(
+    tenant_id: str,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+    features_v2 = _tenant_features_v2_from_doc(tenant)
+    return {
+        "success": True,
+        "tenant_id": tenant_id,
+        "features_v2": features_v2,
+    }
+
+
+@router.put("/tenants/{tenant_id}/features-v2")
+async def update_tenant_features_v2(
+    tenant_id: str,
+    request: UpdateFeaturesV2Request,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    before_v2 = _tenant_features_v2_from_doc(tenant)
+    after_v2 = build_enabled_features_v2(
+        {
+            "tier": request.tier,
+            "overrides": _sanitize_v2_overrides(request.overrides),
+        },
+        tenant.get("enabled_features"),
+    )
+    changed_features = _feature_diff(before_v2.get("effective", {}), after_v2.get("effective", {}))
+
+    feature_action = {
+        "action": "feature_changed",
+        "by": admin["email"],
+        "at": datetime.utcnow(),
+        "changes": after_v2.get("effective", {}),
+        "details": {
+            "tier_before": before_v2.get("tier"),
+            "tier_after": after_v2.get("tier"),
+            "changed_features": changed_features,
+        },
+        "notes": (
+            f"Tier changed from {before_v2.get('tier')} to {after_v2.get('tier')}"
+            if before_v2.get("tier") != after_v2.get("tier")
+            else "Feature overrides updated"
+        ),
+    }
+
+    legacy_export = export_legacy_features(after_v2.get("effective", {}))
+
+    await master_db["tenants"].update_one(
+        {"_id": ObjectId(tenant_id)},
+        {
+            "$set": {
+                "enabled_features_v2": after_v2,
+                "enabled_features": legacy_export,
+            },
+            "$push": {"approval_history": feature_action},
+        },
+    )
+
+    return {
+        "success": True,
+        "tenant_id": tenant_id,
+        "features_v2": after_v2,
+        "changed_features": changed_features,
+    }
+
+
 @router.get("/tenants/{tenant_id}")
 async def get_tenant_by_id(
     tenant_id: str,
@@ -771,23 +891,8 @@ async def approve_tenant(
     if existing:
         raise HTTPException(status_code=400, detail="Institution ID or tenant ID already in use")
 
-    default_features = {
-        "smartboard": True,
-        "online_class": False,
-        "ai_chat": True,
-        "stoody_pen": False,
-        "exam_mode": True,
-        "tutor_panel": True,
-        "analytics_dashboard": True,
-        "document_management": True,
-        "video_lessons": False,
-        "question_bank": True,
-        "leaderboard": True,
-        "student_monitoring": True,
-    }
-
-    if request.features:
-        default_features.update(_model_dump(request.features))
+    default_features = _sanitize_legacy_features(request.features)
+    default_features_v2 = build_enabled_features_v2(None, default_features)
 
     approval_action = {
         "action": "approved",
@@ -839,6 +944,7 @@ async def approve_tenant(
                 "subdomain": None,
                 "approved_at": datetime.utcnow(),
                 "enabled_features": default_features,
+                "enabled_features_v2": default_features_v2,
                 "max_students": 100,
                 "max_tutors": 10,
                 "subscription_tier": "standard",
@@ -954,26 +1060,38 @@ async def update_tenant_features(
     admin: Dict = Depends(verify_superadmin_token),
 ):
     master_db = await get_master_db_or_503(db)
-    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    features_data = _model_dump(request.features)
+    features_data = _sanitize_legacy_features(request.features)
+    before_v2 = _tenant_features_v2_from_doc(tenant)
+    after_v2 = build_enabled_features_v2(None, features_data)
+    changed_features = _feature_diff(before_v2.get("effective", {}), after_v2.get("effective", {}))
 
     feature_action = {
         "action": "feature_changed",
         "by": admin["email"],
         "at": datetime.utcnow(),
-        "changes": features_data,
+        "changes": after_v2.get("effective", {}),
+        "details": {
+            "tier_before": before_v2.get("tier"),
+            "tier_after": after_v2.get("tier"),
+            "changed_features": changed_features,
+            "source": "legacy_endpoint",
+        },
     }
 
     await master_db["tenants"].update_one(
         {"_id": ObjectId(tenant_id)},
         {
-            "$set": {"enabled_features": features_data},
+            "$set": {
+                "enabled_features": features_data,
+                "enabled_features_v2": after_v2,
+            },
             "$push": {"approval_history": feature_action}
         }
     )
 
-    return {"success": True}
+    return {"success": True, "features_v2": after_v2, "changed_features": changed_features}
 
 
 @router.put("/tenants/{tenant_id}/limits")
