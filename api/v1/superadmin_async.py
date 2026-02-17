@@ -41,7 +41,7 @@ TEMP_TOKEN_MAX_AGE_SECONDS = 600
 TOTP_ISSUER = "Stoody Super Admin"
 TOTP_ENC_KEY = os.getenv("TOTP_ENC_KEY", "")
 AUTHORIZATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
-INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$")
+INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[0-9]{4}$")
 
 
 # ============ PYDANTIC MODELS ============
@@ -92,7 +92,7 @@ class TenantFeatures(BaseModel):
 
 
 class ApproveTenantRequest(BaseModel):
-    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
+    institution_id: str = Field(..., min_length=9, max_length=9, pattern=r'^[A-Z]{4}-[0-9]{4}$')
     notes: Optional[str] = None
     features: Optional[TenantFeatures] = None
 
@@ -120,7 +120,7 @@ class ResetPasswordRequest(BaseModel):
 
 
 class UpdateTenantIdRequest(BaseModel):
-    institution_id: str = Field(..., min_length=14, max_length=14, pattern=r'^[A-Z]{4}-[A-Z]{4}-[0-9]{4}$')
+    institution_id: str = Field(..., min_length=9, max_length=9, pattern=r'^[A-Z]{4}-[0-9]{4}$')
 
 
 class SendMessageRequest(BaseModel):
@@ -219,9 +219,8 @@ def normalize_institution_id(institution_id: str) -> str:
 def derive_tenant_id(institution_id: str) -> str:
     normalized = normalize_institution_id(institution_id)
     if not INSTITUTION_ID_PATTERN.match(normalized):
-        raise HTTPException(status_code=400, detail="Institution ID must match AAAA-BBBB-0000 format")
-    parts = normalized.split("-")
-    return f"{parts[1]}-{parts[2]}"
+        raise HTTPException(status_code=400, detail="Institution ID must match XXXX-0000 format")
+    return normalized
 
 
 def build_db_name(institution_id: str) -> str:
@@ -741,6 +740,23 @@ async def approve_tenant(
         raise HTTPException(status_code=400, detail="Tenant is not in pending or verification status")
 
     normalized_institution_id = normalize_institution_id(request.institution_id)
+    if not INSTITUTION_ID_PATTERN.match(normalized_institution_id):
+        raise HTTPException(status_code=400, detail="Institution ID must match XXXX-0000 format")
+
+    required_fields = {
+        "institution_name": tenant.get("institution_name"),
+        "organization": tenant.get("organization"),
+        "admin_email": tenant.get("admin_email"),
+        "admin_full_name": tenant.get("admin_full_name"),
+        "contact_email": tenant.get("contact_email"),
+    }
+    missing = [field for field, value in required_fields.items() if not (value and str(value).strip())]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot approve tenant. Missing required fields: {', '.join(missing)}"
+        )
+
     new_tenant_id = derive_tenant_id(normalized_institution_id)
     db_name = build_db_name(normalized_institution_id)
 
@@ -754,11 +770,6 @@ async def approve_tenant(
     })
     if existing:
         raise HTTPException(status_code=400, detail="Institution ID or tenant ID already in use")
-
-    subdomain = tenant.get("subdomain")
-    if not subdomain:
-        subdomain = tenant.get("organization", "").lower()
-        subdomain = ''.join(c for c in subdomain if c.isalnum())[:20]
 
     default_features = {
         "smartboard": True,
@@ -825,7 +836,7 @@ async def approve_tenant(
                 "tenant_id": new_tenant_id,
                 "db_name": db_name,
                 "institution_id": normalized_institution_id,
-                "subdomain": subdomain,
+                "subdomain": None,
                 "approved_at": datetime.utcnow(),
                 "enabled_features": default_features,
                 "max_students": 100,
@@ -1119,6 +1130,8 @@ async def send_message_to_tenant(
         "subject": request.subject,
         "message": request.message,
         "priority": request.priority,
+        "direction": "superadmin_to_admin",
+        "attachments": [],
         "created_at": datetime.utcnow(),
         "read": False,
         "read_at": None,

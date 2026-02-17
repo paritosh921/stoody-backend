@@ -54,6 +54,10 @@ limiter = Limiter(key_func=get_remote_address)
 # Pydantic models
 TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
 SUPERADMIN_AUTH_CODE_PATTERN = r'^[A-Z0-9]{6}$'
+ALLOWED_SUPPORTING_FILE_TYPES = {"application/pdf", "image/png", "image/jpeg", "image/jpg"}
+MAX_REGISTRATION_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB per file
+MAX_REGISTRATION_FILES = 10
+MAX_STATUS_REPLY_FILES = 5
 
 class AdminLoginRequest(BaseModel):
     email: EmailStr
@@ -1224,6 +1228,7 @@ async def register_admin(
     phone_country_code: Optional[str] = Form(None, max_length=10),
     phone_number: Optional[str] = Form(None, max_length=20),
     attachments: List[UploadFile] = File(default=[]),
+    attachment_types: List[str] = Form(default=[]),
     subdomain: Optional[str] = Form(None, min_length=3, max_length=50),
     requested_tenant_id: Optional[str] = Form(None, max_length=9),
     authorization_code: str = Form(..., min_length=6, max_length=6),
@@ -1326,13 +1331,17 @@ async def register_admin(
                     detail="Tenant files collection not available"
                 )
 
-            allowed_types = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp"}
-            max_file_size = 5 * 1024 * 1024  # 5MB
+            uploads = [upload for upload in attachments if upload and upload.filename]
+            if len(uploads) > MAX_REGISTRATION_FILES:
+                raise HTTPException(status_code=400, detail=f"Maximum {MAX_REGISTRATION_FILES} files allowed")
 
-            if len(attachments) > 10:
-                raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+            if uploads and len(attachment_types) != len(uploads):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please provide a document type for every uploaded file"
+                )
 
-            for upload in attachments:
+            for index, upload in enumerate(uploads):
                 if not upload.filename:
                     continue
 
@@ -1342,16 +1351,24 @@ async def register_admin(
                     if guessed_type:
                         content_type = guessed_type.lower()
 
-                if content_type not in allowed_types:
+                if content_type not in ALLOWED_SUPPORTING_FILE_TYPES:
                     raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.content_type or upload.filename}")
 
                 content = await upload.read()
-                if len(content) > max_file_size:
+                if len(content) > MAX_REGISTRATION_FILE_SIZE_BYTES:
                     raise HTTPException(status_code=400, detail=f"File too large: {upload.filename}")
+
+                document_type = attachment_types[index].strip() if index < len(attachment_types) else ""
+                if not document_type:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Document type missing for file: {upload.filename}"
+                    )
 
                 prepared_file_docs.append({
                     "admin_email": email,
                     "institution_name": institution_name_value,
+                    "document_type": document_type[:80],
                     "filename": upload.filename,
                     "content_type": content_type,
                     "size_bytes": len(content),
@@ -1433,7 +1450,95 @@ async def register_admin(
             detail="Registration failed"
         )
 
-def _build_registration_status_payload(tenant: Dict[str, Any]) -> Dict[str, Any]:
+async def _authenticate_registration_status_admin(
+    db: DatabaseManager,
+    auth_manager: AuthManager,
+    email: str,
+    password: str,
+) -> Dict[str, Any]:
+    tenants = await db.get_master_collection("tenants")
+    if tenants is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unavailable"
+        )
+
+    tenant = await tenants.find_one({"admin_email": email})
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
+    if not password_hash:
+        tenant_db = None
+        if tenant.get("db_name"):
+            tenant_db = await db.get_tenant_db(tenant.get("db_name"))
+        if tenant_db is not None:
+            admin_doc = await tenant_db["admins"].find_one({
+                "email": email,
+                "is_active": True,
+            })
+            if admin_doc:
+                password_hash = admin_doc.get("password_hash")
+
+    if not password_hash or not auth_manager.verify_password(password, password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password"
+        )
+
+    return tenant
+
+
+def _serialize_registration_status_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+    attachments = msg.get("attachments") or []
+    serialized_attachments: List[Dict[str, Any]] = []
+    for file_doc in attachments:
+        if not isinstance(file_doc, dict):
+            continue
+        serialized_attachments.append({
+            "filename": file_doc.get("filename"),
+            "content_type": file_doc.get("content_type"),
+            "size_bytes": file_doc.get("size_bytes"),
+            "data_base64": file_doc.get("data_base64"),
+        })
+
+    return {
+        "_id": str(msg.get("_id")),
+        "subject": msg.get("subject"),
+        "message": msg.get("message"),
+        "priority": msg.get("priority", "normal"),
+        "direction": msg.get("direction", "superadmin_to_admin"),
+        "from_name": msg.get("from_name"),
+        "from_admin": msg.get("from_admin"),
+        "created_at": msg.get("created_at").isoformat() if msg.get("created_at") else None,
+        "attachments": serialized_attachments,
+        "read": bool(msg.get("read", False)),
+    }
+
+
+async def _get_registration_thread_messages(
+    db: DatabaseManager,
+    tenant: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    master_db = await db.get_master_db()
+    if master_db is None:
+        return []
+
+    tenant_oid = tenant.get("_id")
+    if not tenant_oid:
+        return []
+
+    messages = await master_db["superadmin_messages"].find({
+        "tenant_id": tenant_oid,
+    }).sort("created_at", -1).to_list(length=100)
+
+    return [_serialize_registration_status_message(msg) for msg in messages]
+
+
+def _build_registration_status_payload(tenant: Dict[str, Any], messages: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     response: Dict[str, Any] = {
         "status": tenant.get("status", "pending"),
         "institution_name": tenant.get("institution_name") or tenant.get("organization"),
@@ -1446,6 +1551,9 @@ def _build_registration_status_payload(tenant: Dict[str, Any]) -> Dict[str, Any]
     if tenant.get("status") in ["approved", "active", "verification", "suspended"]:
         response["approved_at"] = tenant.get("approved_at").isoformat() if tenant.get("approved_at") else None
         response["tenant_id"] = tenant.get("tenant_id")
+
+    if messages is not None:
+        response["messages"] = messages
 
     return response
 
@@ -1463,40 +1571,14 @@ async def get_registration_status_authenticated(
     This endpoint is intended for institution admins before activation.
     """
     try:
-        tenants = await db.get_master_collection("tenants")
-        if tenants is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Service unavailable"
-            )
-
-        tenant = await tenants.find_one({"admin_email": status_data.email})
-        if not tenant:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-
-        password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
-        if not password_hash:
-            tenant_db = None
-            if tenant.get("db_name"):
-                tenant_db = await db.get_tenant_db(tenant.get("db_name"))
-            if tenant_db is not None:
-                admin_doc = await tenant_db["admins"].find_one({
-                    "email": status_data.email,
-                    "is_active": True,
-                })
-                if admin_doc:
-                    password_hash = admin_doc.get("password_hash")
-
-        if not password_hash or not auth_manager.verify_password(status_data.password, password_hash):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-
-        return _build_registration_status_payload(tenant)
+        tenant = await _authenticate_registration_status_admin(
+            db=db,
+            auth_manager=auth_manager,
+            email=status_data.email,
+            password=status_data.password,
+        )
+        thread_messages = await _get_registration_thread_messages(db, tenant)
+        return _build_registration_status_payload(tenant, thread_messages)
 
     except HTTPException:
         raise
@@ -1505,6 +1587,132 @@ async def get_registration_status_authenticated(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check status"
+        )
+
+
+@router.post("/admin/registration-status-message")
+@limiter.limit("10/minute")
+async def send_registration_status_message(
+    request: Request,
+    email: EmailStr = Form(...),
+    password: str = Form(..., min_length=6),
+    subject: str = Form(..., min_length=1, max_length=200),
+    message: str = Form(..., min_length=1),
+    attachments: List[UploadFile] = File(default=[]),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    """
+    Send a message from institution admin to assigned super admin
+    while the institution is in registration flow.
+    """
+    try:
+        tenant = await _authenticate_registration_status_admin(
+            db=db,
+            auth_manager=auth_manager,
+            email=email,
+            password=password,
+        )
+
+        clean_subject = subject.strip()
+        clean_message = message.strip()
+        if not clean_subject or not clean_message:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Subject and message are required"
+            )
+
+        master_db = await db.get_master_db()
+        if master_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Service unavailable"
+            )
+
+        superadmin_oid = tenant.get("assigned_superadmin_id")
+        if not superadmin_oid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No super admin is assigned to this registration yet"
+            )
+
+        if not isinstance(superadmin_oid, ObjectId):
+            try:
+                superadmin_oid = ObjectId(str(superadmin_oid))
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid super admin assignment"
+                )
+
+        super_admin = await master_db["super_admins"].find_one({"_id": superadmin_oid})
+
+        uploads = [upload for upload in attachments if upload and upload.filename]
+        if len(uploads) > MAX_STATUS_REPLY_FILES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum {MAX_STATUS_REPLY_FILES} attachments are allowed"
+            )
+
+        serialized_attachments: List[Dict[str, Any]] = []
+        for upload in uploads:
+            content_type = (upload.content_type or "").lower().strip()
+            if content_type == "application/octet-stream" or not content_type:
+                guessed_type, _ = mimetypes.guess_type(upload.filename)
+                if guessed_type:
+                    content_type = guessed_type.lower()
+
+            if content_type not in ALLOWED_SUPPORTING_FILE_TYPES:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unsupported file type: {upload.content_type or upload.filename}"
+                )
+
+            content = await upload.read()
+            if len(content) > MAX_REGISTRATION_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"File too large: {upload.filename}"
+                )
+
+            serialized_attachments.append({
+                "filename": upload.filename,
+                "content_type": content_type,
+                "size_bytes": len(content),
+                "data_base64": base64.b64encode(content).decode("utf-8"),
+            })
+
+        message_doc = {
+            "tenant_id": tenant.get("_id"),
+            "superadmin_id": superadmin_oid,
+            "from_admin": tenant.get("admin_email"),
+            "from_name": tenant.get("admin_full_name") or (tenant.get("pending_admin") or {}).get("full_name"),
+            "to_email": (super_admin or {}).get("email"),
+            "subject": clean_subject,
+            "message": clean_message,
+            "priority": "normal",
+            "direction": "admin_to_superadmin",
+            "attachments": serialized_attachments,
+            "created_at": datetime.utcnow(),
+            "read": False,
+            "read_at": None,
+        }
+
+        insert_result = await master_db["superadmin_messages"].insert_one(message_doc)
+
+        return {
+            "success": True,
+            "message_id": str(insert_result.inserted_id),
+            "message": "Message sent successfully",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration status message send error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send message"
         )
 
 

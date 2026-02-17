@@ -3263,7 +3263,13 @@ async def get_superadmin_messages(
             return {"success": True, "messages": [], "unread_count": 0}
 
         # Build query
-        query = {"tenant_id": tenant["_id"]}
+        query = {
+            "tenant_id": tenant["_id"],
+            "$or": [
+                {"direction": {"$exists": False}},
+                {"direction": "superadmin_to_admin"},
+            ],
+        }
         if unread_only:
             query["read"] = False
 
@@ -3274,6 +3280,10 @@ async def get_superadmin_messages(
         # Count unread
         unread_count = await master_db["superadmin_messages"].count_documents({
             "tenant_id": tenant["_id"],
+            "$or": [
+                {"direction": {"$exists": False}},
+                {"direction": "superadmin_to_admin"},
+            ],
             "read": False
         })
 
@@ -3287,9 +3297,19 @@ async def get_superadmin_messages(
                 "subject": msg.get("subject"),
                 "message": msg.get("message"),
                 "priority": msg.get("priority", "normal"),
+                "direction": msg.get("direction", "superadmin_to_admin"),
                 "created_at": msg.get("created_at").isoformat() if msg.get("created_at") else None,
                 "read": msg.get("read", False),
                 "read_at": msg.get("read_at").isoformat() if msg.get("read_at") else None,
+                "attachments": [
+                    {
+                        "filename": att.get("filename"),
+                        "content_type": att.get("content_type"),
+                        "size_bytes": att.get("size_bytes"),
+                    }
+                    for att in (msg.get("attachments") or [])
+                    if isinstance(att, dict)
+                ],
             })
 
         return {
