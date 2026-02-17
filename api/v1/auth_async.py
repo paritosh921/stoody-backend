@@ -96,6 +96,10 @@ class AdminRegistrationResponse(BaseModel):
     message: str
     status: str
 
+class AdminRegistrationStatusAuthRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+
 class TenantLookupResponse(BaseModel):
     tenant_id: str
 
@@ -1429,17 +1433,34 @@ async def register_admin(
             detail="Registration failed"
         )
 
+def _build_registration_status_payload(tenant: Dict[str, Any]) -> Dict[str, Any]:
+    response: Dict[str, Any] = {
+        "status": tenant.get("status", "pending"),
+        "institution_name": tenant.get("institution_name") or tenant.get("organization"),
+        "created_at": tenant.get("created_at").isoformat() if tenant.get("created_at") else None,
+    }
 
-@router.get("/admin/registration-status")
-@limiter.limit("30/minute")
-async def get_registration_status(
+    if tenant.get("status") == "rejected":
+        response["rejection_reason"] = tenant.get("rejection_reason")
+
+    if tenant.get("status") in ["approved", "active", "verification", "suspended"]:
+        response["approved_at"] = tenant.get("approved_at").isoformat() if tenant.get("approved_at") else None
+        response["tenant_id"] = tenant.get("tenant_id")
+
+    return response
+
+
+@router.post("/admin/registration-status-auth")
+@limiter.limit("10/minute")
+async def get_registration_status_authenticated(
     request: Request,
-    email: str,
+    status_data: AdminRegistrationStatusAuthRequest,
     db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
 ):
     """
-    Check the status of a tenant registration by admin email.
-    Returns the current status and relevant details for the registration page.
+    Check registration status using admin credentials.
+    This endpoint is intended for institution admins before activation.
     """
     try:
         tenants = await db.get_master_collection("tenants")
@@ -1449,38 +1470,59 @@ async def get_registration_status(
                 detail="Service unavailable"
             )
 
-        tenant = await tenants.find_one({"admin_email": email})
+        tenant = await tenants.find_one({"admin_email": status_data.email})
         if not tenant:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No application found for this email"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
             )
 
-        # Build response based on status
-        response = {
-            "status": tenant.get("status", "pending"),
-            "institution_name": tenant.get("institution_name") or tenant.get("organization"),
-            "created_at": tenant.get("created_at").isoformat() if tenant.get("created_at") else None,
-        }
+        password_hash = (tenant.get("pending_admin") or {}).get("password_hash")
+        if not password_hash:
+            tenant_db = None
+            if tenant.get("db_name"):
+                tenant_db = await db.get_tenant_db(tenant.get("db_name"))
+            if tenant_db is not None:
+                admin_doc = await tenant_db["admins"].find_one({
+                    "email": status_data.email,
+                    "is_active": True,
+                })
+                if admin_doc:
+                    password_hash = admin_doc.get("password_hash")
 
-        # Add status-specific fields
-        if tenant.get("status") == "rejected":
-            response["rejection_reason"] = tenant.get("rejection_reason")
+        if not password_hash or not auth_manager.verify_password(status_data.password, password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
 
-        if tenant.get("status") in ["approved", "active"]:
-            response["approved_at"] = tenant.get("approved_at").isoformat() if tenant.get("approved_at") else None
-            response["tenant_id"] = tenant.get("tenant_id")
-
-        return response
+        return _build_registration_status_payload(tenant)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Registration status check error: {str(e)}", exc_info=True)
+        logger.error(f"Authenticated registration status check error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to check status"
         )
+
+
+@router.get("/admin/registration-status")
+@limiter.limit("30/minute")
+async def get_registration_status(
+    request: Request,
+    email: str,
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Deprecated public endpoint.
+    Registration status must be checked via credential-gated endpoint.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use POST /auth/admin/registration-status-auth with registered email and password",
+    )
 
 
 @router.get("/tenant/check-availability")
