@@ -7,13 +7,13 @@ import itertools
 from collections import defaultdict
 from typing import Any, Awaitable, Callable, Dict, Optional, List
 
-from ..models.raw_frames import RawFrameCanonical, Stroke
+from models.raw_frames import RawFrameCanonical, Stroke
 
 logger = logging.getLogger(__name__)
 
 # Lazy import to avoid circular dependency
 def _get_question_attempt_funcs():
-    from ..api.question_attempts import get_active_attempt_for_pen, add_stroke_to_attempt
+    from api.v1.question_attempts import get_active_attempt_for_pen, add_stroke_to_attempt
     return get_active_attempt_for_pen, add_stroke_to_attempt
 
 

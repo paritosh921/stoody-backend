@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from ..models.raw_frames import RawFrameCanonical, Stroke, StrokePoint
+from models.raw_frames import RawFrameCanonical, Stroke, StrokePoint
 
 # Book type codes from BLE smart pen
 # SIZING KEY:

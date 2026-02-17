@@ -1299,7 +1299,7 @@ async def upload_pdf(
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -1429,10 +1429,19 @@ async def upload_pdf(
         if teacher_ids:
             teacher_ids_list = [tid.strip() for tid in teacher_ids.split(",") if tid.strip()]
 
+        # If a tutor is uploading, ensure their ID is in teacher_ids
+        if current_user.get("user_type") == "tutor":
+            tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
+            if tutor_id and str(tutor_id) not in teacher_ids_list:
+                teacher_ids_list.append(str(tutor_id))
+
         # Create document metadata
-        # Attach tenant context
+        # Attach tenant context — tutors use their admin's ID for multi-tenancy
         try:
-            admin_oid = BsonObjectId(current_user.get("user_id"))
+            if current_user.get("user_type") == "tutor" and current_user.get("admin_id"):
+                admin_oid = BsonObjectId(current_user["admin_id"])
+            else:
+                admin_oid = BsonObjectId(current_user.get("user_id"))
         except Exception:
             admin_oid = None
 
@@ -1509,7 +1518,7 @@ async def process_document_ocr(
     request: Request,
     document_id: str,
     async_mode: bool = Query(True, description="Queue OCR and return immediately when true"),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):
@@ -1841,7 +1850,7 @@ async def perform_direct_ocr(
 async def get_processing_status(
     request: Request,
     job_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     cache: CacheManager = Depends(get_cache)
 ):
     """Get PDF processing job status"""
@@ -2596,7 +2605,7 @@ async def get_document_file(
 async def recalculate_document_points(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Recalculate total_points for a Test Series document based on question points"""
@@ -2650,7 +2659,7 @@ async def update_document_metadata(
     request: Request,
     document_id: str,
     metadata: Dict[str, Any],
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Update document metadata (e.g., total_points)"""
@@ -2764,7 +2773,7 @@ async def update_document_metadata(
 async def duplicate_document(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -3205,7 +3214,7 @@ async def create_question(
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
     option_images: List[UploadFile] = File(default=[]),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Create a new question with optional image uploads"""
@@ -3346,7 +3355,7 @@ async def update_question(
     request: Request,
     question_id: str,
     question_data: Dict[str, Any],
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Update a question"""
@@ -3559,7 +3568,7 @@ async def update_question(
 async def delete_question(
     request: Request,
     question_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Delete a question and all its associated images and metadata"""
@@ -3660,7 +3669,7 @@ async def get_document_images(
     request: Request,
     document_id: str,
     include_orphaned: bool = Query(False, description="Include images that don't exist on disk"),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -3729,7 +3738,7 @@ async def get_document_images(
 async def clean_document_orphaned_images(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -3819,7 +3828,7 @@ async def clean_document_orphaned_images(
 async def clean_question_orphaned_images(
     request: Request,
     question_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -3887,7 +3896,7 @@ async def clean_question_orphaned_images(
 async def get_document_orphaned_images(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -3932,7 +3941,7 @@ async def get_document_orphaned_images(
 async def delete_document(
     request: Request,
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """Delete document and all associated data (cascading delete)"""
@@ -4157,7 +4166,7 @@ async def get_document_regions(
 async def save_document_regions(
     document_id: str,
     request: DocumentRegionsRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -4240,7 +4249,7 @@ async def save_document_regions(
 @router.delete("/documents/{document_id}/regions")
 async def delete_document_regions(
     document_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
     """
@@ -4538,7 +4547,7 @@ async def process_regions_ocr(
     request: Request,
     document_id: str,
     ocr_request: RegionOCRRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
 ):

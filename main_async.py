@@ -599,10 +599,26 @@ async def profile_request(request: Request, call_next):
         return await call_next(request)
 
 # Request timing middleware
+def _is_client_disconnect_runtime_error(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and str(exc) == "No response returned."
+
+
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except RuntimeError as exc:
+        if _is_client_disconnect_runtime_error(exc):
+            if DEBUG_MODE:
+                logger.debug(
+                    "Client disconnected before response was sent: %s %s",
+                    request.method,
+                    request.url.path,
+                )
+            # Non-standard but widely used for client-aborted requests.
+            return Response(status_code=499)
+        raise
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
     return response
@@ -616,7 +632,18 @@ async def log_requests(request: Request, call_next):
             logger.info(f"📨 {request.method} {request.url.path}")
         else:
             logger.info(f"📨 {request.method} {request.url.path} (OCR processing - body not logged)")
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except RuntimeError as exc:
+        if _is_client_disconnect_runtime_error(exc):
+            if DEBUG_MODE:
+                logger.debug(
+                    "Request aborted by client before response: %s %s",
+                    request.method,
+                    request.url.path,
+                )
+            return Response(status_code=499)
+        raise
     if DEBUG_MODE:
         logger.info(f"📤 {response.status_code}")
     return response
