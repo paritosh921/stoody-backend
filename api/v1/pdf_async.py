@@ -1941,7 +1941,7 @@ async def get_documents(
                 sort=[("uploaded_at", -1)]
             )
         else:
-            # Regular admin/tutor - query skillbot_db
+            # Regular admin/tutor - query tenant database
             total = len(await db.mongo_find("documents", filter_query))
             skip = (page - 1) * limit
             documents = await db.mongo_find(

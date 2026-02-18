@@ -1023,13 +1023,14 @@ async def health_check(request: Request):
         cache_required = not DEBUG_MODE
         cache_status = "healthy" if cache_healthy else ("optional" if DEBUG_MODE else "unhealthy")
 
-        # Get questions count from MongoDB (non-fatal)
-        questions_count = 0
+        # Get active tenant count from master DB (non-fatal, no tenant context needed)
+        active_tenants_count = 0
         try:
-            if app.state.db:
-                questions_count = await app.state.db.mongo_count("questions")
-        except Exception as _mongo_err:
-            logger.warning(f"MongoDB questions count failed: {str(_mongo_err)}")
+            master_db = await app.state.db.get_master_db() if app.state.db else None
+            if master_db is not None:
+                active_tenants_count = await master_db["tenants"].count_documents({"status": "active"})
+        except Exception as _master_err:
+            logger.warning(f"Master DB tenant count failed: {str(_master_err)}")
 
         # Check S3 storage status
         try:
@@ -1067,7 +1068,7 @@ async def health_check(request: Request):
             "mongodb": {
                 "connected": db_healthy,
                 "status": "online" if db_healthy else "offline",
-                "questions_count": questions_count
+                "active_tenants": active_tenants_count
             },
             "s3_storage": s3_status,
             "version": "2.0.0",

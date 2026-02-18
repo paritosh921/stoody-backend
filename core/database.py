@@ -12,7 +12,6 @@ import certifi
 
 from config_async import (
     MONGODB_URL,
-    MONGODB_DB_NAME,
     MONGODB_DB_MASTER,
     MONGODB_DB_STOODY,
     DISABLE_MONGODB,
@@ -26,7 +25,6 @@ class DatabaseManager:
 
     def __init__(self):
         self.mongo_client: Optional[AsyncIOMotorClient] = None
-        self._legacy_default_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_master_db: Optional[AsyncIOMotorDatabase] = None
         self.mongo_tenant_dbs: Dict[str, AsyncIOMotorDatabase] = {}
         self.mongo_db_b2c: Optional[AsyncIOMotorDatabase] = None  # B2C database
@@ -55,7 +53,6 @@ class DatabaseManager:
                 if not MONGODB_URL or DISABLE_MONGODB:
                     logger.info("MongoDB disabled or not configured; skipping initialization")
                     self.mongo_client = None
-                    self._legacy_default_db = None
                     self.mongo_master_db = None
                     self.mongo_db_b2c = None
                     self.mongo_tenant_dbs.clear()
@@ -86,15 +83,13 @@ class DatabaseManager:
                     tlsCAFile=certifi.where(),
                 )
 
-                # Get database instances
+                # Get database instances (master + B2C only — tenant DBs resolved per-request)
                 self.mongo_master_db = self.mongo_client[MONGODB_DB_MASTER]
-                self._legacy_default_db = self.mongo_client[MONGODB_DB_NAME]
 
                 # Test connection
                 await self.mongo_client.admin.command('ping')
 
                 logger.info(f"✅ MongoDB initialized - Master DB: {MONGODB_DB_MASTER}")
-                logger.info(f"✅ MongoDB initialized - Default DB: {MONGODB_DB_NAME}")
 
                 # Also initialize B2C database using same client
                 self.mongo_db_b2c = self.mongo_client[MONGODB_DB_STOODY]
@@ -109,7 +104,6 @@ class DatabaseManager:
             except (ServerSelectionTimeoutError, ConfigurationError) as e:
                 logger.warning(f"⚠️ MongoDB connection failed ({type(e).__name__}) - continuing without MongoDB")
                 self.mongo_client = None
-                self._legacy_default_db = None
                 self.mongo_master_db = None
                 self.mongo_db_b2c = None
                 self.mongo_tenant_dbs.clear()
@@ -117,16 +111,16 @@ class DatabaseManager:
                 logger.error(f"❌ MongoDB initialization failed: {str(e)}")
                 raise
 
-    async def get_mongo_db(self) -> Optional[AsyncIOMotorDatabase]:
-        """Get default MongoDB database (legacy/shared) with lazy initialization.
+    async def get_mongo_db(self) -> None:
+        """REMOVED: This method no longer returns a database.
 
-        DEPRECATED: Use get_tenant_db(db_name) instead. This method only
-        exists for connectivity checks.
+        All callers must use get_tenant_db(db_name) or get_master_db() instead.
+        Raises RuntimeError to surface any remaining callers.
         """
-        logger.warning("DEPRECATED: get_mongo_db() called — use get_tenant_db(db_name) instead", stack_info=True)
-        if self._legacy_default_db is None and MONGODB_URL and not DISABLE_MONGODB:
-            await self._init_mongodb()
-        return self._legacy_default_db
+        raise RuntimeError(
+            "get_mongo_db() is removed. Use get_tenant_db(db_name) for tenant data "
+            "or get_master_db() for the tenant registry."
+        )
 
     async def get_master_db(self) -> Optional[AsyncIOMotorDatabase]:
         """Get master MongoDB database (tenant registry) with lazy initialization"""
@@ -154,16 +148,15 @@ class DatabaseManager:
         return tenant_db
 
     async def get_mongo_collection(self, collection_name: str):
-        """Get MongoDB collection from main database (skillbot_db).
+        """REMOVED: This method no longer returns a collection.
 
-        DEPRECATED: Use get_tenant_collection(db_name, collection_name) instead.
+        All callers must use get_tenant_db(db_name)[collection_name] instead.
+        Raises RuntimeError to surface any remaining callers.
         """
-        logger.warning("DEPRECATED: get_mongo_collection() called — use get_tenant_collection() instead", stack_info=True)
-        if self._legacy_default_db is None and MONGODB_URL and not DISABLE_MONGODB:
-            await self._init_mongodb()
-        if self._legacy_default_db is None:
-            return None
-        return self._legacy_default_db[collection_name]
+        raise RuntimeError(
+            f"get_mongo_collection('{collection_name}') is removed. "
+            "Use get_tenant_db(db_name) to get the tenant database first."
+        )
 
     async def _get_context_db(self) -> Optional[AsyncIOMotorDatabase]:
         """Resolve MongoDB database for the current request context."""
@@ -182,7 +175,7 @@ class DatabaseManager:
         if db_name:
             return await self.get_tenant_db(db_name)
 
-        logger.warning("No tenant context set — returning None instead of fallback DB", stack_info=True)
+        logger.warning("No tenant context set — returning None (strict mode, no default DB)", stack_info=True)
         return None
 
     async def _get_context_collection(self, collection_name: str):
@@ -435,7 +428,9 @@ class DatabaseManager:
                     except Exception:
                         pass
                     self.mongo_client = None
-                    self._legacy_default_db = None
+                    self.mongo_master_db = None
+                    self.mongo_db_b2c = None
+                    self.mongo_tenant_dbs.clear()
                     mongo_healthy = False
 
             return mongo_healthy

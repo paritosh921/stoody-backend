@@ -48,6 +48,10 @@ class TenantMiddleware(BaseHTTPMiddleware):
     # Paths that don't require tenant context
     EXEMPT_PATHS = {
         "/health",
+        "/healthz",
+        "/alb-health",
+        "/api/health",
+        "/api/v1/health",
         "/docs",
         "/openapi.json",
         "/redoc",
@@ -55,6 +59,17 @@ class TenantMiddleware(BaseHTTPMiddleware):
         "/api/v1/auth/tutor/login",
         "/api/v1/auth/student/login",
         "/api/v1/auth/register",
+        "/api/v1/auth/admin/register",
+        "/api/v1/auth/password-reset/request",
+        "/api/v1/auth/password-reset/verify",
+        "/api/v1/auth/password-reset/complete",
+        "/api/v1/auth/student/forgot-password",
+        "/api/v1/auth/verify",
+        "/api/v1/auth/tenant/check-availability",
+        "/api/v1/auth/tenant/lookup",
+        "/api/v1/auth/admin/registration-status-auth",
+        "/api/v1/auth/admin/registration-status-message",
+        "/api/v1/auth/admin/registration-status",
     }
 
     # Path prefixes that should be exempt (super admin uses different JWT)
@@ -62,23 +77,35 @@ class TenantMiddleware(BaseHTTPMiddleware):
         "/api/v1/superadmin",
     }
 
+    # Static/resource prefixes — served without tenant context (images, uploads, etc.)
+    STATIC_PREFIXES = (
+        "/images/",
+        "/uploads/",
+        "/static/",
+        "/favicon",
+    )
+
     async def dispatch(self, request: Request, call_next) -> Response:
         # Clear any stale tenant context
         TenantContext.clear()
 
-        # Skip tenant context for exempt paths
+        # Skip tenant context for exact exempt paths (no prefix matching — prevents accidental exemptions)
         path = request.url.path
-        if any(path.startswith(exempt) for exempt in self.EXEMPT_PATHS):
+        if path in self.EXEMPT_PATHS:
             return await call_next(request)
 
-        # Skip tenant context for exempt path prefixes (e.g., super admin routes)
+        # Skip tenant context for exempt path prefixes (super admin uses separate JWT)
         if any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
-        # Try to extract JWT from Authorization header first, then fall
-        # back to the auth cookie.  Browser-initiated requests such as
+        # Static resources (images, uploads) served without tenant context
+        if any(path.startswith(prefix) for prefix in self.STATIC_PREFIXES):
+            return await call_next(request)
+
+        # Try to extract JWT from Authorization header first, then check
+        # the auth cookie.  Browser-initiated requests such as
         # <img src="..."> do not carry the Authorization header but *do*
-        # send cookies automatically, so this fallback is essential for
+        # send cookies automatically, so the cookie path is essential for
         # tenant-scoped resources served to the browser directly.
         _needs_cookie_bridge = False
         _bridge_token = None
@@ -146,22 +173,16 @@ class TenantMiddleware(BaseHTTPMiddleware):
                     is_b2c = user_data.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
                     db_name = user_data.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
                     if not db_name and not is_b2c:
-                        # Only reject if this was an explicit auth attempt
-                        # (header-based).  Cookie-based requests may be
-                        # browser resource fetches where a hard 401 would
-                        # break rendered content (e.g. images).
-                        if auth_header:
-                            return Response(
-                                content='{"detail":"Tenant database missing. Please log in again with tenant ID."}',
-                                status_code=status.HTTP_401_UNAUTHORIZED,
-                                media_type="application/json",
-                            )
-                        # For cookie-only requests without db_name, skip
-                        # tenant context — the request will proceed without
-                        # a tenant-scoped database.
+                        # STRICT MODE: All authenticated tenant requests must
+                        # have db_name. Reject regardless of auth method.
                         logger.warning(
-                            "Cookie auth succeeded but db_name missing for user %s (type=%s, path=%s) — no tenant context set",
+                            "Tenant db_name missing for user %s (type=%s, path=%s) — rejecting request",
                             user_data.get("user_id"), user_data.get("user_type"), path,
+                        )
+                        return Response(
+                            content='{"detail":"Tenant database missing. Please log in again with tenant ID."}',
+                            status_code=status.HTTP_401_UNAUTHORIZED,
+                            media_type="application/json",
                         )
                     else:
                         if user_data.get("user_type") == "admin":

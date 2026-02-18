@@ -102,21 +102,31 @@ GET /alb-health                    # ALB probe
 
 ## Database Architecture
 
-### MongoDB Collections
+### MongoDB Databases (Strict Tenant Model)
 ```
-skillbot_db_fallback/    # Main app data
-├── questions            # Question content + images
-├── students             # Student accounts
-├── admins               # School administrators
-├── tutors               # Teacher accounts
-├── sessions             # Session management
-├── activity_logs        # Audit trail
-├── strokes              # Pen stroke data
-└── documents            # PDF documents
+skb_master/              # Tenant registry (super-admin managed)
+├── tenants              # Tenant records (status, features, db_name)
+├── super_admins         # Super-admin accounts
+└── superadmin_messages  # Registration messaging
 
-skb_master/              # Tenant registry
-STOODY-b2c/              # B2C users (separate tenant)
+skb_<institution_id>/    # Per-tenant databases (e.g. skb_indl-ciel-1001)
+├── admins               # School administrators
+├── students             # Student accounts (admin_id scoped)
+├── tutors               # Teacher accounts (admin_id scoped)
+├── questions            # Question content + images (admin_id scoped)
+├── documents            # PDF documents (admin_id scoped)
+├── chat_sessions        # AI chat sessions (admin_id scoped)
+├── assignments          # Assignments (admin_id scoped)
+├── meetings             # Online class meetings (admin_id scoped)
+├── notifications        # Notifications (admin_id scoped)
+├── class_schedules      # Schedules (admin_id scoped)
+├── smartboard_sessions  # Whiteboard sessions (admin_id scoped)
+└── school_settings      # Per-tenant configuration
+
+STOODY-b2c/              # B2C users (separate, no tenant scoping)
 ```
+
+> **No fallback database.** All tenant-scoped operations require `TenantContext` with `db_name` from JWT. Requests without valid tenant context are rejected (401).
 
 ### Connection Pooling
 - MongoDB: 50-500 connections
@@ -423,18 +433,13 @@ scrape_configs:
 
 ### CRITICAL
 
-1. **`api/v1/auth_bypass.py` — Full auth bypass endpoint (REMOVE)**
-   - `POST /bypass/admin/login` accepts hardcoded `admin@skillbot.app` / `admin123` without MongoDB
-   - Returns a real JWT token with hardcoded ObjectId `68e8d0d9a78ac3146233970f`
-   - File header says "Remove this file in production!" — **it has not been removed**
-   - **Action**: Delete this file and remove its router registration from `main_async.py`
+1. ~~`api/v1/auth_bypass.py`~~ — **RESOLVED**: File deleted, .pyc remnants cleaned, no router registration.
 
 2. **Hardcoded default credentials in multiple files**
    - `admin@skillbot.app` / `admin123` appears in:
-     - `api/v1/auth_bypass.py` (line 22)
      - `models/admin.py` → `create_default_admin()` (line ~134-153)
-     - `scripts/admin/init_admin_direct.py`
-     - `scripts/admin/setup_demo_admin.py`
+     - `scripts/admin/init_admin_direct.py` (now requires `--db-name`)
+     - `scripts/admin/setup_demo_admin.py` (now requires `--db-name`)
    - **Action**: Remove hardcoded credentials; use env vars or interactive prompts for seeding
 
 3. **Super-admin setup key in `.env` — `stoody-super-admin108`**

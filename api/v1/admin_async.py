@@ -643,7 +643,7 @@ async def get_students(
     try:
         # Determine which collection to use based on user type
         # B2C admin uses 'users' collection in STOODY-b2c database
-        # Regular admin uses 'students' collection in skillbot_db
+        # Regular admin uses 'students' collection in tenant database
         is_b2c = is_b2c_admin(current_user)
         collection = "users" if is_b2c else "students"
         
@@ -1344,7 +1344,7 @@ async def get_dashboard_stats(
             test_series = await db.b2c_find("documents", {"document_type": "Test Series"})
             chapter_notes = await db.b2c_find("documents", {"document_type": "Chapter Notes"})
         else:
-            # Regular Admin - query skillbot_db
+            # Regular Admin - query tenant database
             admin_students = await db.mongo_find("students", {"admin_id": admin_id})
             total_students = len(admin_students)
 

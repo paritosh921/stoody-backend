@@ -803,7 +803,7 @@ async def import_bulk_students(
     total_imported = 0
     if students_to_insert:
         try:
-            result = await db.mongo_db["students"].insert_many(students_to_insert, ordered=False)
+            result = await tenant_db["students"].insert_many(students_to_insert, ordered=False)
             total_imported = len(result.inserted_ids)
         except Exception as e:
             logger.error(f"Bulk insert error: {str(e)}")
