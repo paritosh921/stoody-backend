@@ -65,13 +65,15 @@ class TenantOverviewScreen(Screen):
 
     def _populate_table(self, result: dict) -> None:
         cs = result["pricing"].get("currency_symbol", "$")
+        cycle = result.get("billing_cycle", "monthly")
         table = self.query_one("#cost-table", CostTable)
         table.load_costs(result["tenant_costs"], cs)
 
         totals = (
             f"  Tenants: {cs}{result['total_tenants_cost']:.2f}"
-            f"  |  Base Fee: {cs}{result['superadmin_base_fee']:.2f}"
+            f"  |  SA Fee: {cs}{result['superadmin_fee']:.2f}"
             f"  |  GRAND TOTAL: {cs}{result['total_platform_cost']:.2f}"
+            f"  ({cycle})"
         )
         try:
             self.query_one("#totals-line", Static).update(totals)

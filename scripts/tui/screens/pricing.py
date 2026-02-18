@@ -16,7 +16,11 @@ from textual.widgets import (
 from textual import work
 
 
-CURRENCIES = [("USD ($)", "USD"), ("EUR (\u20ac)", "EUR"), ("INR (\u20b9)", "INR")]
+CURRENCIES = [("USD ($)", "USD"), ("EUR (€)", "EUR"), ("INR (₹)", "INR")]
+BILLING_CYCLES = [("Monthly", "monthly"), ("Annual", "annual")]
+TIER_NAMES = ["core", "advanced", "max"]
+ROLES = ["student", "tutor", "admin"]
+PERIODS = ["monthly", "annual"]
 
 
 class PricingScreen(Screen):
@@ -35,37 +39,102 @@ class PricingScreen(Screen):
                 yield Static("Select Super-Admin:", classes="field-label")
                 yield DataTable(id="sa-picker")
             with VerticalScroll(id="pricing-right"):
-                yield Static("Pricing Details", classes="field-label")
+                yield Static("Tiered Pricing Rates", classes="field-label")
                 yield Static("Currency:")
                 yield Select(CURRENCIES, id="currency-select", value="USD")
+
+                # --- Core Tier ---
+                yield Static("--- Core Tier ---", classes="field-label")
                 with Horizontal(classes="form-row"):
                     with Vertical():
-                        yield Label("Core Tier:")
-                        yield Input(placeholder="50.0", id="tier-core", type="number")
+                        yield Label("Student Monthly:")
+                        yield Input(placeholder="0.50", id="core-student-monthly", type="number")
                     with Vertical():
-                        yield Label("Advanced Tier:")
-                        yield Input(placeholder="120.0", id="tier-advanced", type="number")
+                        yield Label("Student Annual:")
+                        yield Input(placeholder="5.00", id="core-student-annual", type="number")
                 with Horizontal(classes="form-row"):
                     with Vertical():
-                        yield Label("Max Tier:")
-                        yield Input(placeholder="250.0", id="tier-max", type="number")
+                        yield Label("Tutor Monthly:")
+                        yield Input(placeholder="2.00", id="core-tutor-monthly", type="number")
                     with Vertical():
-                        yield Label("Custom Tier:")
-                        yield Input(placeholder="200.0", id="tier-custom", type="number")
+                        yield Label("Tutor Annual:")
+                        yield Input(placeholder="20.00", id="core-tutor-annual", type="number")
                 with Horizontal(classes="form-row"):
                     with Vertical():
-                        yield Label("Per Student:")
-                        yield Input(placeholder="0.50", id="per-student", type="number")
+                        yield Label("Admin Monthly:")
+                        yield Input(placeholder="10.00", id="core-admin-monthly", type="number")
                     with Vertical():
-                        yield Label("Per Tutor:")
-                        yield Input(placeholder="2.00", id="per-tutor", type="number")
+                        yield Label("Admin Annual:")
+                        yield Input(placeholder="100.00", id="core-admin-annual", type="number")
+
+                # --- Advanced Tier ---
+                yield Static("--- Advanced Tier ---", classes="field-label")
                 with Horizontal(classes="form-row"):
                     with Vertical():
-                        yield Label("Per Admin:")
-                        yield Input(placeholder="10.00", id="per-admin", type="number")
+                        yield Label("Student Monthly:")
+                        yield Input(placeholder="1.00", id="advanced-student-monthly", type="number")
                     with Vertical():
-                        yield Label("Base Fee:")
-                        yield Input(placeholder="100.00", id="base-fee", type="number")
+                        yield Label("Student Annual:")
+                        yield Input(placeholder="10.00", id="advanced-student-annual", type="number")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Tutor Monthly:")
+                        yield Input(placeholder="4.00", id="advanced-tutor-monthly", type="number")
+                    with Vertical():
+                        yield Label("Tutor Annual:")
+                        yield Input(placeholder="40.00", id="advanced-tutor-annual", type="number")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Admin Monthly:")
+                        yield Input(placeholder="15.00", id="advanced-admin-monthly", type="number")
+                    with Vertical():
+                        yield Label("Admin Annual:")
+                        yield Input(placeholder="150.00", id="advanced-admin-annual", type="number")
+
+                # --- Max Tier ---
+                yield Static("--- Max Tier ---", classes="field-label")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Student Monthly:")
+                        yield Input(placeholder="2.00", id="max-student-monthly", type="number")
+                    with Vertical():
+                        yield Label("Student Annual:")
+                        yield Input(placeholder="20.00", id="max-student-annual", type="number")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Tutor Monthly:")
+                        yield Input(placeholder="8.00", id="max-tutor-monthly", type="number")
+                    with Vertical():
+                        yield Label("Tutor Annual:")
+                        yield Input(placeholder="80.00", id="max-tutor-annual", type="number")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Admin Monthly:")
+                        yield Input(placeholder="25.00", id="max-admin-monthly", type="number")
+                    with Vertical():
+                        yield Label("Admin Annual:")
+                        yield Input(placeholder="250.00", id="max-admin-annual", type="number")
+
+                # --- Super-Admin Fee ---
+                yield Static("--- Super-Admin Fee ---", classes="field-label")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Monthly:")
+                        yield Input(placeholder="100.00", id="sa-fee-monthly", type="number")
+                    with Vertical():
+                        yield Label("Annual:")
+                        yield Input(placeholder="1000.00", id="sa-fee-annual", type="number")
+
+                # --- Billing ---
+                yield Static("--- Billing ---", classes="field-label")
+                with Horizontal(classes="form-row"):
+                    with Vertical():
+                        yield Label("Cycle:")
+                        yield Select(BILLING_CYCLES, id="billing-cycle-select", value="monthly")
+                    with Vertical():
+                        yield Label("Billing Day (1-28):")
+                        yield Input(placeholder="1", id="billing-day", type="integer")
+
                 yield Button("Save Pricing", id="save-pricing", variant="primary")
                 yield Static("", id="pricing-status")
         yield Footer()
@@ -110,22 +179,37 @@ class PricingScreen(Screen):
             self.query_one("#currency-select", Select).value = pricing.get("currency", "USD")
         except Exception:
             pass
-        tr = pricing.get("tier_rates", {})
-        field_map = {
-            "tier-core": str(tr.get("core", 50.0)),
-            "tier-advanced": str(tr.get("advanced", 120.0)),
-            "tier-max": str(tr.get("max", 250.0)),
-            "tier-custom": str(tr.get("custom", 200.0)),
-            "per-student": str(pricing.get("flat_per_student", 0.5)),
-            "per-tutor": str(pricing.get("flat_per_tutor", 2.0)),
-            "per-admin": str(pricing.get("flat_per_admin", 10.0)),
-            "base-fee": str(pricing.get("superadmin_base_fee", 100.0)),
-        }
-        for field_id, val in field_map.items():
-            try:
-                self.query_one(f"#{field_id}", Input).value = val
-            except Exception:
-                pass
+
+        tiers = pricing.get("tiers", {})
+        for tier_name in TIER_NAMES:
+            tier_data = tiers.get(tier_name, {})
+            for role in ROLES:
+                for period in PERIODS:
+                    field_id = f"{tier_name}-{role}-{period}"
+                    val = tier_data.get(f"{role}_{period}", 0)
+                    try:
+                        self.query_one(f"#{field_id}", Input).value = str(val)
+                    except Exception:
+                        pass
+
+        sa_fee = pricing.get("superadmin_fee", {})
+        try:
+            self.query_one("#sa-fee-monthly", Input).value = str(sa_fee.get("monthly", 100.0))
+        except Exception:
+            pass
+        try:
+            self.query_one("#sa-fee-annual", Input).value = str(sa_fee.get("annual", 1000.0))
+        except Exception:
+            pass
+
+        try:
+            self.query_one("#billing-cycle-select", Select).value = pricing.get("billing_cycle", "monthly")
+        except Exception:
+            pass
+        try:
+            self.query_one("#billing-day", Input).value = str(pricing.get("billing_day", 1))
+        except Exception:
+            pass
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-pricing":
@@ -149,18 +233,37 @@ class PricingScreen(Screen):
         except Exception:
             pass
 
+        tiers = {}
+        for tier_name in TIER_NAMES:
+            tier_data = {}
+            for role in ROLES:
+                for period in PERIODS:
+                    field_id = f"{tier_name}-{role}-{period}"
+                    tier_data[f"{role}_{period}"] = _get_val(field_id)
+            tiers[tier_name] = tier_data
+
+        billing_cycle = "monthly"
+        try:
+            billing_cycle = str(self.query_one("#billing-cycle-select", Select).value)
+        except Exception:
+            pass
+
+        billing_day = 1
+        try:
+            billing_day = int(float(self.query_one("#billing-day", Input).value))
+            billing_day = max(1, min(28, billing_day))
+        except (ValueError, Exception):
+            pass
+
         fields = {
             "currency": currency,
-            "tier_rates": {
-                "core": _get_val("tier-core"),
-                "advanced": _get_val("tier-advanced"),
-                "max": _get_val("tier-max"),
-                "custom": _get_val("tier-custom"),
+            "tiers": tiers,
+            "superadmin_fee": {
+                "monthly": _get_val("sa-fee-monthly"),
+                "annual": _get_val("sa-fee-annual"),
             },
-            "flat_per_student": _get_val("per-student"),
-            "flat_per_tutor": _get_val("per-tutor"),
-            "flat_per_admin": _get_val("per-admin"),
-            "superadmin_base_fee": _get_val("base-fee"),
+            "billing_cycle": billing_cycle,
+            "billing_day": billing_day,
         }
 
         db = self.app.db  # type: ignore

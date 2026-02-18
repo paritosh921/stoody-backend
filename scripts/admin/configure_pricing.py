@@ -3,7 +3,8 @@ Get or set per-super-admin pricing configuration.
 
 Usage:
   python configure_pricing.py --superadmin-email admin@example.com --action get
-  python configure_pricing.py --superadmin-email admin@example.com --action set --currency INR --per-student 10
+  python configure_pricing.py --superadmin-email admin@example.com --action set --core-student-monthly 1.0
+  python configure_pricing.py --superadmin-email admin@example.com --action set --sa-fee-monthly 150 --billing-cycle annual
 """
 
 import argparse
@@ -19,13 +20,26 @@ CURRENCY_MAP = {"USD": "$", "EUR": "\u20ac", "INR": "\u20b9"}
 DEFAULT_PRICING = {
     "currency": "USD",
     "currency_symbol": "$",
-    "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
-    "flat_per_student": 0.50,
-    "flat_per_tutor": 2.00,
-    "flat_per_admin": 10.00,
-    "superadmin_base_fee": 100.00,
+    "tiers": {
+        "core": {"student_monthly": 0.50, "student_annual": 5.00,
+                 "tutor_monthly": 2.00, "tutor_annual": 20.00,
+                 "admin_monthly": 10.00, "admin_annual": 100.00},
+        "advanced": {"student_monthly": 1.00, "student_annual": 10.00,
+                     "tutor_monthly": 4.00, "tutor_annual": 40.00,
+                     "admin_monthly": 15.00, "admin_annual": 150.00},
+        "max": {"student_monthly": 2.00, "student_annual": 20.00,
+                "tutor_monthly": 8.00, "tutor_annual": 80.00,
+                "admin_monthly": 25.00, "admin_annual": 250.00},
+    },
+    "superadmin_fee": {"monthly": 100.00, "annual": 1000.00},
+    "billing_cycle": "monthly",
+    "billing_day": 1,
     "notes": "",
 }
+
+TIER_ROLES = ["student", "tutor", "admin"]
+PERIODS = ["monthly", "annual"]
+TIER_NAMES = ["core", "advanced", "max"]
 
 
 def main() -> int:
@@ -33,14 +47,24 @@ def main() -> int:
     parser.add_argument("--superadmin-email", required=True, help="Email of the super-admin")
     parser.add_argument("--action", required=True, choices=["get", "set"], help="Action to perform")
     parser.add_argument("--currency", default=None, choices=["USD", "EUR", "INR"], help="Currency code")
-    parser.add_argument("--tier-core", type=float, default=None, help="Core tier monthly rate")
-    parser.add_argument("--tier-advanced", type=float, default=None, help="Advanced tier monthly rate")
-    parser.add_argument("--tier-max", type=float, default=None, help="Max tier monthly rate")
-    parser.add_argument("--tier-custom", type=float, default=None, help="Custom tier monthly rate")
-    parser.add_argument("--per-student", type=float, default=None, help="Per-student monthly surcharge")
-    parser.add_argument("--per-tutor", type=float, default=None, help="Per-tutor monthly surcharge")
-    parser.add_argument("--per-admin", type=float, default=None, help="Per-admin monthly surcharge")
-    parser.add_argument("--base-fee", type=float, default=None, help="Super-admin base fee")
+
+    # Per-tier, per-role rate args
+    for tier in TIER_NAMES:
+        for role in TIER_ROLES:
+            for period in PERIODS:
+                parser.add_argument(
+                    f"--{tier}-{role}-{period}",
+                    type=float, default=None,
+                    help=f"{tier.capitalize()} tier {role} {period} rate",
+                )
+
+    # Super-admin fee
+    parser.add_argument("--sa-fee-monthly", type=float, default=None, help="Super-admin monthly fee")
+    parser.add_argument("--sa-fee-annual", type=float, default=None, help="Super-admin annual fee")
+
+    # Billing
+    parser.add_argument("--billing-cycle", default=None, choices=["monthly", "annual"], help="Billing cycle")
+    parser.add_argument("--billing-day", type=int, default=None, help="Billing day (1-28)")
     parser.add_argument("--notes", default=None, help="Optional notes")
     parser.add_argument("--mongo-uri", default=None, help="MongoDB URI (defaults to MONGODB_URI env)")
     parser.add_argument("--master-db", default=None, help="Master DB name (defaults to MONGODB_DB_MASTER env)")
@@ -52,6 +76,10 @@ def main() -> int:
 
     if not mongo_uri:
         print("ERROR: MONGODB_URI is not set.")
+        return 1
+
+    if args.billing_day is not None and not (1 <= args.billing_day <= 28):
+        print("ERROR: --billing-day must be between 1 and 28.")
         return 1
 
     email = args.superadmin_email.strip().lower()
@@ -92,33 +120,42 @@ def main() -> int:
             update_fields["currency"] = args.currency
             update_fields["currency_symbol"] = CURRENCY_MAP.get(args.currency, args.currency)
 
-        # Build tier_rates from individual args
+        # Build tiers from individual args (deep merge with existing)
         existing = pricing_col.find_one({"superadmin_id": sa_id})
-        existing_rates = (existing or {}).get("tier_rates", dict(DEFAULT_PRICING["tier_rates"]))
-        tier_changed = False
-        if args.tier_core is not None:
-            existing_rates["core"] = args.tier_core
-            tier_changed = True
-        if args.tier_advanced is not None:
-            existing_rates["advanced"] = args.tier_advanced
-            tier_changed = True
-        if args.tier_max is not None:
-            existing_rates["max"] = args.tier_max
-            tier_changed = True
-        if args.tier_custom is not None:
-            existing_rates["custom"] = args.tier_custom
-            tier_changed = True
-        if tier_changed:
-            update_fields["tier_rates"] = existing_rates
+        existing_tiers = (existing or {}).get("tiers", dict(DEFAULT_PRICING["tiers"]))
+        # Ensure each tier dict exists
+        for t in TIER_NAMES:
+            if t not in existing_tiers:
+                existing_tiers[t] = dict(DEFAULT_PRICING["tiers"].get(t, {}))
 
-        if args.per_student is not None:
-            update_fields["flat_per_student"] = args.per_student
-        if args.per_tutor is not None:
-            update_fields["flat_per_tutor"] = args.per_tutor
-        if args.per_admin is not None:
-            update_fields["flat_per_admin"] = args.per_admin
-        if args.base_fee is not None:
-            update_fields["superadmin_base_fee"] = args.base_fee
+        tiers_changed = False
+        for tier in TIER_NAMES:
+            for role in TIER_ROLES:
+                for period in PERIODS:
+                    arg_name = f"{tier}_{role}_{period}"
+                    val = getattr(args, arg_name, None)
+                    if val is not None:
+                        existing_tiers[tier][f"{role}_{period}"] = val
+                        tiers_changed = True
+        if tiers_changed:
+            update_fields["tiers"] = existing_tiers
+
+        # Super-admin fee
+        existing_fee = (existing or {}).get("superadmin_fee", dict(DEFAULT_PRICING["superadmin_fee"]))
+        fee_changed = False
+        if args.sa_fee_monthly is not None:
+            existing_fee["monthly"] = args.sa_fee_monthly
+            fee_changed = True
+        if args.sa_fee_annual is not None:
+            existing_fee["annual"] = args.sa_fee_annual
+            fee_changed = True
+        if fee_changed:
+            update_fields["superadmin_fee"] = existing_fee
+
+        if args.billing_cycle is not None:
+            update_fields["billing_cycle"] = args.billing_cycle
+        if args.billing_day is not None:
+            update_fields["billing_day"] = args.billing_day
         if args.notes is not None:
             update_fields["notes"] = args.notes
 
@@ -126,9 +163,23 @@ def main() -> int:
             print("ERROR: No fields to update. Provide at least one --flag.")
             return 1
 
+        # Remove legacy flat-rate fields if present
+        unset_fields = {}
+        if existing:
+            for old_key in ("tier_rates", "flat_per_student", "flat_per_tutor", "flat_per_admin", "superadmin_base_fee"):
+                if old_key in existing:
+                    unset_fields[old_key] = ""
+
+        update_op = {
+            "$set": update_fields,
+            "$setOnInsert": {"created_at": now, "superadmin_id": sa_id},
+        }
+        if unset_fields:
+            update_op["$unset"] = unset_fields
+
         result = pricing_col.update_one(
             {"superadmin_id": sa_id},
-            {"$set": update_fields, "$setOnInsert": {"created_at": now, "superadmin_id": sa_id}},
+            update_op,
             upsert=True,
         )
 

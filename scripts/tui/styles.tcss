@@ -168,6 +168,54 @@ StatCard {
     max-height: 12;
 }
 
+/* ---- Billing screen ---- */
+
+#billing-layout {
+    height: 1fr;
+}
+
+#billing-left {
+    width: 40%;
+    border-right: solid $accent;
+    padding: 0 1;
+}
+
+#billing-right {
+    width: 60%;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#billing-summary-panel {
+    height: auto;
+    padding: 1;
+    border: solid $accent;
+    margin: 1 0;
+    color: $text;
+}
+
+#billing-sa-select {
+    height: auto;
+}
+
+#payments-table {
+    height: auto;
+    min-height: 6;
+    max-height: 16;
+    margin: 1 0;
+}
+
+#billing-status {
+    height: auto;
+    color: $success;
+    margin: 0 1;
+}
+
+#record-payment {
+    height: auto;
+    margin: 1 0;
+}
+
 /* ---- Global DataTable default ---- */
 
 DataTable {

@@ -3,8 +3,9 @@ Synchronous MongoDB helper for the Textual TUI.
 All methods use pymongo (sync) and are called from Textual @work(thread=True) workers.
 """
 
+import calendar
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
@@ -18,13 +19,81 @@ CURRENCY_MAP = {"USD": "$", "EUR": "\u20ac", "INR": "\u20b9"}
 DEFAULT_PRICING = {
     "currency": "USD",
     "currency_symbol": "$",
-    "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
-    "flat_per_student": 0.50,
-    "flat_per_tutor": 2.00,
-    "flat_per_admin": 10.00,
-    "superadmin_base_fee": 100.00,
+    "tiers": {
+        "core": {"student_monthly": 0.50, "student_annual": 5.00,
+                 "tutor_monthly": 2.00, "tutor_annual": 20.00,
+                 "admin_monthly": 10.00, "admin_annual": 100.00},
+        "advanced": {"student_monthly": 1.00, "student_annual": 10.00,
+                     "tutor_monthly": 4.00, "tutor_annual": 40.00,
+                     "admin_monthly": 15.00, "admin_annual": 150.00},
+        "max": {"student_monthly": 2.00, "student_annual": 20.00,
+                "tutor_monthly": 8.00, "tutor_annual": 80.00,
+                "admin_monthly": 25.00, "admin_annual": 250.00},
+    },
+    "superadmin_fee": {"monthly": 100.00, "annual": 1000.00},
+    "billing_cycle": "monthly",
+    "billing_day": 1,
     "notes": "",
 }
+
+
+# ---- Module-level helpers ----
+
+def _convert_legacy_pricing(doc):
+    """Convert a legacy pricing document (with tier_rates) to the new tiered format."""
+    per_student = doc.get("flat_per_student", 0.50)
+    per_tutor = doc.get("flat_per_tutor", 2.00)
+    per_admin = doc.get("flat_per_admin", 10.00)
+    base_fee = doc.get("superadmin_base_fee", 100.00)
+    return {
+        "currency": doc.get("currency", "USD"),
+        "currency_symbol": doc.get("currency_symbol", "$"),
+        "tiers": {
+            "core": {"student_monthly": per_student, "student_annual": per_student * 10,
+                     "tutor_monthly": per_tutor, "tutor_annual": per_tutor * 10,
+                     "admin_monthly": per_admin, "admin_annual": per_admin * 10},
+            "advanced": {"student_monthly": per_student * 2, "student_annual": per_student * 20,
+                         "tutor_monthly": per_tutor * 2, "tutor_annual": per_tutor * 20,
+                         "admin_monthly": per_admin * 1.5, "admin_annual": per_admin * 15},
+            "max": {"student_monthly": per_student * 4, "student_annual": per_student * 40,
+                    "tutor_monthly": per_tutor * 4, "tutor_annual": per_tutor * 40,
+                    "admin_monthly": per_admin * 2.5, "admin_annual": per_admin * 25},
+        },
+        "superadmin_fee": {"monthly": base_fee, "annual": base_fee * 10},
+        "billing_cycle": "monthly",
+        "billing_day": 1,
+        "notes": doc.get("notes", ""),
+    }
+
+
+def _compute_billing_period(now, cycle, billing_day):
+    """Return (period_start, period_end, next_due) datetimes for the current billing period."""
+    if cycle == "annual":
+        year = now.year if now.month > 1 or now.day >= billing_day else now.year - 1
+        period_start = datetime(year, 1, min(billing_day, 28))
+        period_end = datetime(year, 12, 31, 23, 59, 59)
+        next_due = datetime(year + 1, 1, min(billing_day, 28))
+    else:
+        day = min(billing_day, calendar.monthrange(now.year, now.month)[1])
+        if now.day >= day:
+            period_start = datetime(now.year, now.month, day)
+            if now.month == 12:
+                next_month_year, next_month = now.year + 1, 1
+            else:
+                next_month_year, next_month = now.year, now.month + 1
+            next_day = min(billing_day, calendar.monthrange(next_month_year, next_month)[1])
+            period_end = datetime(next_month_year, next_month, next_day) - timedelta(seconds=1)
+            next_due = datetime(next_month_year, next_month, next_day)
+        else:
+            if now.month == 1:
+                prev_year, prev_month = now.year - 1, 12
+            else:
+                prev_year, prev_month = now.year, now.month - 1
+            prev_day = min(billing_day, calendar.monthrange(prev_year, prev_month)[1])
+            period_start = datetime(prev_year, prev_month, prev_day)
+            period_end = datetime(now.year, now.month, day) - timedelta(seconds=1)
+            next_due = datetime(now.year, now.month, day)
+    return period_start, period_end, next_due
 
 
 class DB:
@@ -83,6 +152,9 @@ class DB:
             {"superadmin_id": ObjectId(superadmin_id)}
         )
         if doc:
+            # Legacy detection: old docs have tier_rates but not tiers
+            if "tier_rates" in doc and "tiers" not in doc:
+                return _convert_legacy_pricing(doc)
             result = {**DEFAULT_PRICING}
             for key in DEFAULT_PRICING:
                 if key in doc and doc[key] is not None:
@@ -135,11 +207,10 @@ class DB:
 
     def compute_costs_for_superadmin(self, superadmin_id: str) -> Dict[str, Any]:
         pricing = self.get_pricing(superadmin_id)
-        tier_rates = pricing["tier_rates"]
-        per_student = pricing["flat_per_student"]
-        per_tutor = pricing["flat_per_tutor"]
-        per_admin = pricing["flat_per_admin"]
-        base_fee = pricing["superadmin_base_fee"]
+        tiers = pricing["tiers"]
+        sa_fee_data = pricing["superadmin_fee"]
+        cycle = pricing.get("billing_cycle", "monthly")
+        suffix = "monthly" if cycle == "monthly" else "annual"
 
         tenants = list(
             self.master["tenants"].find({
@@ -154,17 +225,17 @@ class DB:
         for t in tenants:
             fv2 = t.get("enabled_features_v2") or {}
             tier = fv2.get("tier", "core")
-            flat_fee = tier_rates.get(tier, tier_rates.get("core", 50.0))
+            tier_rates = tiers.get(tier, tiers.get("core", DEFAULT_PRICING["tiers"]["core"]))
 
             counts = {"students": 0, "tutors": 0, "admins": 0}
             db_name = t.get("db_name")
             if db_name:
                 counts = self.get_tenant_user_counts(db_name)
 
-            s_cost = counts["students"] * per_student
-            t_cost = counts["tutors"] * per_tutor
-            a_cost = counts["admins"] * per_admin
-            total = flat_fee + s_cost + t_cost + a_cost
+            s_cost = round(counts["students"] * tier_rates.get(f"student_{suffix}", 0), 2)
+            t_cost = round(counts["tutors"] * tier_rates.get(f"tutor_{suffix}", 0), 2)
+            a_cost = round(counts["admins"] * tier_rates.get(f"admin_{suffix}", 0), 2)
+            total = round(s_cost + t_cost + a_cost, 2)
             total_tenants_cost += total
 
             tenant_costs.append({
@@ -172,22 +243,118 @@ class DB:
                 "institution_name": t.get("institution_name", ""),
                 "tier": tier,
                 "status": t.get("status", ""),
-                "flat_fee": round(flat_fee, 2),
                 "student_count": counts["students"],
                 "tutor_count": counts["tutors"],
                 "admin_count": counts["admins"],
-                "student_surcharge": round(s_cost, 2),
-                "tutor_surcharge": round(t_cost, 2),
-                "admin_surcharge": round(a_cost, 2),
-                "total_cost": round(total, 2),
+                "student_cost": s_cost,
+                "tutor_cost": t_cost,
+                "admin_cost": a_cost,
+                "total_cost": total,
             })
+
+        sa_fee = sa_fee_data.get(suffix, sa_fee_data.get("monthly", 100.0))
 
         return {
             "pricing": pricing,
+            "billing_cycle": cycle,
             "tenant_costs": tenant_costs,
             "total_tenants_cost": round(total_tenants_cost, 2),
-            "superadmin_base_fee": round(base_fee, 2),
-            "total_platform_cost": round(total_tenants_cost + base_fee, 2),
+            "superadmin_fee": round(sa_fee, 2),
+            "total_platform_cost": round(total_tenants_cost + sa_fee, 2),
+        }
+
+    # ---- Payments & Billing ----
+
+    def list_payments(self, superadmin_id: str, skip: int = 0, limit: int = 50) -> List[Dict[str, Any]]:
+        payments = list(
+            self.master["superadmin_payments"].find(
+                {"superadmin_id": ObjectId(superadmin_id)}
+            ).sort("payment_date", -1).skip(skip).limit(limit)
+        )
+        for p in payments:
+            p["_id"] = str(p["_id"])
+            p["superadmin_id"] = str(p["superadmin_id"])
+            for key in ("payment_date", "period_start", "period_end", "created_at"):
+                if isinstance(p.get(key), datetime):
+                    p[key] = p[key].isoformat()
+        return payments
+
+    def record_payment(
+        self,
+        superadmin_id: str,
+        amount: float,
+        payment_method: str = "bank_transfer",
+        reference: str = "",
+        notes: str = "",
+        payment_date: Optional[datetime] = None,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+        recorded_by: str = "",
+    ) -> str:
+        now = datetime.utcnow()
+        doc = {
+            "superadmin_id": ObjectId(superadmin_id),
+            "amount": amount,
+            "currency": self.get_pricing(superadmin_id).get("currency", "USD"),
+            "payment_date": payment_date or now,
+            "payment_method": payment_method,
+            "reference": reference,
+            "period_start": period_start,
+            "period_end": period_end,
+            "notes": notes,
+            "recorded_by": recorded_by,
+            "created_at": now,
+        }
+        result = self.master["superadmin_payments"].insert_one(doc)
+        return str(result.inserted_id)
+
+    def get_payment_totals(
+        self,
+        superadmin_id: str,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        match: Dict[str, Any] = {"superadmin_id": ObjectId(superadmin_id)}
+        if period_start or period_end:
+            date_filter: Dict[str, Any] = {}
+            if period_start:
+                date_filter["$gte"] = period_start
+            if period_end:
+                date_filter["$lte"] = period_end
+            match["payment_date"] = date_filter
+        pipeline = [
+            {"$match": match},
+            {"$group": {"_id": None, "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+        ]
+        result = list(self.master["superadmin_payments"].aggregate(pipeline))
+        if result:
+            return {"total": result[0]["total"], "count": result[0]["count"]}
+        return {"total": 0.0, "count": 0}
+
+    def get_billing_summary(self, superadmin_id: str) -> Dict[str, Any]:
+        pricing = self.get_pricing(superadmin_id)
+        costs = self.compute_costs_for_superadmin(superadmin_id)
+        cycle = pricing.get("billing_cycle", "monthly")
+        billing_day = pricing.get("billing_day", 1)
+        now = datetime.utcnow()
+        period_start, period_end, next_due = _compute_billing_period(now, cycle, billing_day)
+
+        paid_period = self.get_payment_totals(superadmin_id, period_start, period_end)
+        paid_all = self.get_payment_totals(superadmin_id)
+
+        current_cost = costs["total_platform_cost"]
+        return {
+            "billing_cycle": cycle,
+            "billing_day": billing_day,
+            "period_start": period_start.strftime("%Y-%m-%d"),
+            "period_end": period_end.strftime("%Y-%m-%d"),
+            "current_period_cost": current_cost,
+            "paid_this_period": round(paid_period["total"], 2),
+            "balance_due": round(current_cost - paid_period["total"], 2),
+            "total_paid_all_time": round(paid_all["total"], 2),
+            "next_due_date": next_due.strftime("%Y-%m-%d"),
+            "currency": pricing.get("currency", "USD"),
+            "currency_symbol": pricing.get("currency_symbol", "$"),
         }
 
     # ---- Aggregate stats ----

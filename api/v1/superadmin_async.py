@@ -3,6 +3,7 @@ Super Admin API for Stoody Platform
 Handles tenant management, registration approval, and feature flags
 """
 
+import calendar
 import logging
 import os
 import re
@@ -134,15 +135,38 @@ class DeleteTenantRequest(BaseModel):
     confirmation: str = Field(..., description="Must match institution name to confirm deletion")
 
 
+class TierRates(BaseModel):
+    student_monthly: float = Field(0, ge=0)
+    student_annual: float = Field(0, ge=0)
+    tutor_monthly: float = Field(0, ge=0)
+    tutor_annual: float = Field(0, ge=0)
+    admin_monthly: float = Field(0, ge=0)
+    admin_annual: float = Field(0, ge=0)
+
+
+class SuperAdminFee(BaseModel):
+    monthly: float = Field(100.0, ge=0)
+    annual: float = Field(1000.0, ge=0)
+
+
 class SuperAdminPricingUpdate(BaseModel):
     currency: Optional[str] = Field(None, pattern=r'^[A-Z]{3}$')
     currency_symbol: Optional[str] = Field(None, max_length=5)
-    tier_rates: Optional[Dict[str, float]] = None
-    flat_per_student: Optional[float] = Field(None, ge=0)
-    flat_per_tutor: Optional[float] = Field(None, ge=0)
-    flat_per_admin: Optional[float] = Field(None, ge=0)
-    superadmin_base_fee: Optional[float] = Field(None, ge=0)
+    tiers: Optional[Dict[str, TierRates]] = None
+    superadmin_fee: Optional[SuperAdminFee] = None
+    billing_cycle: Optional[Literal["monthly", "annual"]] = None
+    billing_day: Optional[int] = Field(None, ge=1, le=28)
     notes: Optional[str] = None
+
+
+class RecordPaymentRequest(BaseModel):
+    amount: float = Field(..., gt=0)
+    payment_date: Optional[str] = None
+    payment_method: str = Field("bank_transfer")
+    reference: str = Field("")
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
+    notes: str = Field("")
 
 
 CURRENCY_MAP = {"USD": "$", "EUR": "\u20ac", "INR": "\u20b9"}
@@ -150,11 +174,20 @@ CURRENCY_MAP = {"USD": "$", "EUR": "\u20ac", "INR": "\u20b9"}
 DEFAULT_SUPERADMIN_PRICING = {
     "currency": "USD",
     "currency_symbol": "$",
-    "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
-    "flat_per_student": 0.50,
-    "flat_per_tutor": 2.00,
-    "flat_per_admin": 10.00,
-    "superadmin_base_fee": 100.00,
+    "tiers": {
+        "core": {"student_monthly": 0.50, "student_annual": 5.00,
+                 "tutor_monthly": 2.00, "tutor_annual": 20.00,
+                 "admin_monthly": 10.00, "admin_annual": 100.00},
+        "advanced": {"student_monthly": 1.00, "student_annual": 10.00,
+                     "tutor_monthly": 4.00, "tutor_annual": 40.00,
+                     "admin_monthly": 15.00, "admin_annual": 150.00},
+        "max": {"student_monthly": 2.00, "student_annual": 20.00,
+                "tutor_monthly": 8.00, "tutor_annual": 80.00,
+                "admin_monthly": 25.00, "admin_annual": 250.00},
+    },
+    "superadmin_fee": {"monthly": 100.00, "annual": 1000.00},
+    "billing_cycle": "monthly",
+    "billing_day": 1,
     "notes": "",
 }
 
@@ -187,6 +220,147 @@ def convert_objectids(obj):
     if isinstance(obj, datetime):
         return obj.isoformat()
     return obj
+
+
+def _convert_legacy_pricing(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert old flat-rate pricing doc to new tiered structure."""
+    per_student = doc.get("flat_per_student", 0.50)
+    per_tutor = doc.get("flat_per_tutor", 2.00)
+    per_admin = doc.get("flat_per_admin", 10.00)
+    base_fee = doc.get("superadmin_base_fee", 100.00)
+    return {
+        "currency": doc.get("currency", "USD"),
+        "currency_symbol": doc.get("currency_symbol", "$"),
+        "tiers": {
+            "core": {"student_monthly": per_student, "student_annual": per_student * 10,
+                     "tutor_monthly": per_tutor, "tutor_annual": per_tutor * 10,
+                     "admin_monthly": per_admin, "admin_annual": per_admin * 10},
+            "advanced": {"student_monthly": per_student * 2, "student_annual": per_student * 20,
+                         "tutor_monthly": per_tutor * 2, "tutor_annual": per_tutor * 20,
+                         "admin_monthly": per_admin * 1.5, "admin_annual": per_admin * 15},
+            "max": {"student_monthly": per_student * 4, "student_annual": per_student * 40,
+                    "tutor_monthly": per_tutor * 4, "tutor_annual": per_tutor * 40,
+                    "admin_monthly": per_admin * 2.5, "admin_annual": per_admin * 25},
+        },
+        "superadmin_fee": {"monthly": base_fee, "annual": base_fee * 10},
+        "billing_cycle": "monthly",
+        "billing_day": 1,
+        "notes": doc.get("notes", ""),
+    }
+
+
+async def _get_pricing(master_db, admin_id: str) -> Dict[str, Any]:
+    """Read pricing with legacy fallback."""
+    doc = await master_db["superadmin_pricing"].find_one(
+        {"superadmin_id": ObjectId(admin_id)}
+    )
+    if doc:
+        doc.pop("_id", None)
+        doc.pop("superadmin_id", None)
+        # Legacy format detection: has tier_rates (flat dict) but no tiers
+        if "tier_rates" in doc and "tiers" not in doc:
+            return _convert_legacy_pricing(doc)
+        # New format
+        result = {**DEFAULT_SUPERADMIN_PRICING}
+        for key in DEFAULT_SUPERADMIN_PRICING:
+            if key in doc and doc[key] is not None:
+                result[key] = doc[key]
+        return result
+    return {**DEFAULT_SUPERADMIN_PRICING}
+
+
+def _compute_billing_period(now: datetime, cycle: str, billing_day: int):
+    """Returns (period_start, period_end, next_due_date)."""
+    if cycle == "annual":
+        year = now.year if now.month > 1 or now.day >= billing_day else now.year - 1
+        period_start = datetime(year, 1, min(billing_day, 28))
+        period_end = datetime(year, 12, 31, 23, 59, 59)
+        next_due = datetime(year + 1, 1, min(billing_day, 28))
+    else:
+        # monthly
+        day = min(billing_day, calendar.monthrange(now.year, now.month)[1])
+        if now.day >= day:
+            period_start = datetime(now.year, now.month, day)
+            if now.month == 12:
+                next_month_year, next_month = now.year + 1, 1
+            else:
+                next_month_year, next_month = now.year, now.month + 1
+            next_day = min(billing_day, calendar.monthrange(next_month_year, next_month)[1])
+            period_end = datetime(next_month_year, next_month, next_day) - timedelta(seconds=1)
+            next_due = datetime(next_month_year, next_month, next_day)
+        else:
+            if now.month == 1:
+                prev_year, prev_month = now.year - 1, 12
+            else:
+                prev_year, prev_month = now.year, now.month - 1
+            prev_day = min(billing_day, calendar.monthrange(prev_year, prev_month)[1])
+            period_start = datetime(prev_year, prev_month, prev_day)
+            period_end = datetime(now.year, now.month, day) - timedelta(seconds=1)
+            next_due = datetime(now.year, now.month, day)
+    return period_start, period_end, next_due
+
+
+async def _compute_total_cost(master_db, db, admin_id: str, pricing: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared cost computation for platform-costs and billing-summary."""
+    tiers = pricing["tiers"]
+    sa_fee_data = pricing["superadmin_fee"]
+    cycle = pricing.get("billing_cycle", "monthly")
+    suffix = "monthly" if cycle == "monthly" else "annual"
+
+    tenants = await master_db["tenants"].find({
+        "assigned_superadmin_id": ObjectId(admin_id),
+        "status": {"$in": ["active", "approved"]},
+    }).to_list(length=1000)
+
+    tenant_costs = []
+    total_tenants_cost = 0.0
+
+    for tenant in tenants:
+        features_v2 = _tenant_features_v2_from_doc(tenant)
+        tier = features_v2.get("tier", "core")
+        tier_rates = tiers.get(tier, tiers.get("core", DEFAULT_SUPERADMIN_PRICING["tiers"]["core"]))
+
+        student_count = 0
+        tutor_count = 0
+        admin_count = 0
+        db_name = tenant.get("db_name")
+        if db_name:
+            try:
+                tenant_db = await db.get_tenant_db(db_name)
+                if tenant_db:
+                    student_count = await tenant_db["students"].count_documents({})
+                    tutor_count = await tenant_db["tutors"].count_documents({})
+                    admin_count = await tenant_db["admins"].count_documents({})
+            except Exception:
+                pass
+
+        student_cost = round(student_count * tier_rates.get(f"student_{suffix}", 0), 2)
+        tutor_cost = round(tutor_count * tier_rates.get(f"tutor_{suffix}", 0), 2)
+        admin_cost = round(admin_count * tier_rates.get(f"admin_{suffix}", 0), 2)
+        total_cost = round(student_cost + tutor_cost + admin_cost, 2)
+        total_tenants_cost += total_cost
+
+        tenant_costs.append({
+            "tenant_id": str(tenant["_id"]),
+            "institution_name": tenant.get("institution_name", ""),
+            "tier": tier,
+            "student_count": student_count,
+            "tutor_count": tutor_count,
+            "admin_count": admin_count,
+            "student_cost": student_cost,
+            "tutor_cost": tutor_cost,
+            "admin_cost": admin_cost,
+            "total_cost": total_cost,
+        })
+
+    sa_fee = sa_fee_data.get(suffix, sa_fee_data.get("monthly", 100.0))
+
+    return {
+        "tenant_costs": tenant_costs,
+        "total_tenants_cost": round(total_tenants_cost, 2),
+        "superadmin_fee": round(sa_fee, 2),
+        "total_platform_cost": round(total_tenants_cost + sa_fee, 2),
+    }
 
 
 def _sanitize_legacy_features(raw: Optional[Dict[str, Any]]) -> Dict[str, bool]:
@@ -1864,20 +2038,18 @@ async def get_superadmin_pricing(
 ):
     """Get pricing configuration for the current super-admin."""
     master_db = await get_master_db_or_503(db)
-    pricing_doc = await master_db["superadmin_pricing"].find_one(
+    pricing = await _get_pricing(master_db, admin["admin_id"])
+    # Attach timestamps from the raw doc
+    raw_doc = await master_db["superadmin_pricing"].find_one(
         {"superadmin_id": ObjectId(admin["admin_id"])}
     )
-    if pricing_doc:
-        pricing_doc.pop("_id", None)
-        pricing_doc.pop("superadmin_id", None)
-        result = {**DEFAULT_SUPERADMIN_PRICING}
-        for key in DEFAULT_SUPERADMIN_PRICING:
-            if key in pricing_doc and pricing_doc[key] is not None:
-                result[key] = pricing_doc[key]
-        result["created_at"] = pricing_doc.get("created_at", "").isoformat() if isinstance(pricing_doc.get("created_at"), datetime) else str(pricing_doc.get("created_at", ""))
-        result["updated_at"] = pricing_doc.get("updated_at", "").isoformat() if isinstance(pricing_doc.get("updated_at"), datetime) else str(pricing_doc.get("updated_at", ""))
-        return result
-    return {**DEFAULT_SUPERADMIN_PRICING, "created_at": None, "updated_at": None}
+    if raw_doc:
+        pricing["created_at"] = raw_doc.get("created_at", "").isoformat() if isinstance(raw_doc.get("created_at"), datetime) else str(raw_doc.get("created_at", ""))
+        pricing["updated_at"] = raw_doc.get("updated_at", "").isoformat() if isinstance(raw_doc.get("updated_at"), datetime) else str(raw_doc.get("updated_at", ""))
+    else:
+        pricing["created_at"] = None
+        pricing["updated_at"] = None
+    return pricing
 
 
 @router.put("/pricing")
@@ -1892,21 +2064,61 @@ async def update_superadmin_pricing(
 
     update_fields: Dict[str, Any] = {"updated_at": now}
     data = _model_dump(request)
-    for key, value in data.items():
-        if value is not None:
-            update_fields[key] = value
+
+    # Deep-merge tiers: read existing, overlay provided
+    if data.get("tiers") is not None:
+        existing_pricing = await _get_pricing(master_db, admin["admin_id"])
+        merged_tiers = {**existing_pricing.get("tiers", {})}
+        for tier_name, rates in data["tiers"].items():
+            if tier_name not in merged_tiers:
+                merged_tiers[tier_name] = {}
+            if isinstance(rates, dict):
+                merged_tiers[tier_name] = {**merged_tiers[tier_name], **rates}
+            else:
+                merged_tiers[tier_name] = {**merged_tiers[tier_name], **_model_dump(rates)}
+        update_fields["tiers"] = merged_tiers
+    if data.get("superadmin_fee") is not None:
+        fee = data["superadmin_fee"]
+        update_fields["superadmin_fee"] = _model_dump(fee) if hasattr(fee, "model_dump") or hasattr(fee, "dict") else fee
+    if data.get("currency") is not None:
+        update_fields["currency"] = data["currency"]
+    if data.get("currency_symbol") is not None:
+        update_fields["currency_symbol"] = data["currency_symbol"]
+    if data.get("billing_cycle") is not None:
+        update_fields["billing_cycle"] = data["billing_cycle"]
+    if data.get("billing_day") is not None:
+        update_fields["billing_day"] = data["billing_day"]
+    if data.get("notes") is not None:
+        update_fields["notes"] = data["notes"]
 
     # Auto-resolve currency_symbol from CURRENCY_MAP if currency is set but symbol is not
     if "currency" in update_fields and "currency_symbol" not in update_fields:
         update_fields["currency_symbol"] = CURRENCY_MAP.get(update_fields["currency"], update_fields["currency"])
 
+    # Remove old flat-rate fields if they exist (migration cleanup)
+    remove_fields = {}
+    existing_doc = await master_db["superadmin_pricing"].find_one(
+        {"superadmin_id": ObjectId(admin["admin_id"])}
+    )
+    if existing_doc:
+        for old_key in ("tier_rates", "flat_per_student", "flat_per_tutor", "flat_per_admin", "superadmin_base_fee"):
+            if old_key in existing_doc:
+                remove_fields[old_key] = ""
+
     await master_db["superadmin_pricing"].create_index(
         [("superadmin_id", 1)], unique=True, name="uniq_superadmin_pricing"
     )
 
+    update_op: Dict[str, Any] = {
+        "$set": update_fields,
+        "$setOnInsert": {"created_at": now, "superadmin_id": ObjectId(admin["admin_id"])},
+    }
+    if remove_fields:
+        update_op["$unset"] = remove_fields
+
     result = await master_db["superadmin_pricing"].update_one(
         {"superadmin_id": ObjectId(admin["admin_id"])},
-        {"$set": update_fields, "$setOnInsert": {"created_at": now, "superadmin_id": ObjectId(admin["admin_id"])}},
+        update_op,
         upsert=True,
     )
 
@@ -1919,103 +2131,159 @@ async def update_superadmin_pricing(
 
 @router.get("/platform-costs")
 async def get_platform_costs(
-    db: DatabaseManager = Depends(get_database),
+    db_manager: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
     """Calculate platform costs for all active tenants based on per-SA pricing."""
-    master_db = await get_master_db_or_503(db)
-
-    # Pricing fallback chain: per-SA pricing -> old global platform_pricing -> hardcoded defaults
-    sa_pricing = await master_db["superadmin_pricing"].find_one(
-        {"superadmin_id": ObjectId(admin["admin_id"])}
-    )
-    if sa_pricing:
-        pricing = {**DEFAULT_SUPERADMIN_PRICING}
-        for key in DEFAULT_SUPERADMIN_PRICING:
-            if key in sa_pricing and sa_pricing[key] is not None:
-                pricing[key] = sa_pricing[key]
-    else:
-        legacy_doc = await master_db["platform_pricing"].find_one({})
-        if legacy_doc:
-            pricing = {
-                "currency": legacy_doc.get("currency", "USD"),
-                "currency_symbol": legacy_doc.get("currency_symbol", "$"),
-                "tier_rates": legacy_doc.get("tier_rates", DEFAULT_SUPERADMIN_PRICING["tier_rates"]),
-                "flat_per_student": legacy_doc.get("per_student_surcharge", legacy_doc.get("flat_per_student", 0.50)),
-                "flat_per_tutor": legacy_doc.get("per_tutor_surcharge", legacy_doc.get("flat_per_tutor", 2.00)),
-                "flat_per_admin": legacy_doc.get("flat_per_admin", 10.00),
-                "superadmin_base_fee": legacy_doc.get("superadmin_base_fee", 100.00),
-                "notes": legacy_doc.get("notes", ""),
-            }
-        else:
-            pricing = {**DEFAULT_SUPERADMIN_PRICING}
-
-    tier_rates = pricing["tier_rates"]
-    per_student = pricing["flat_per_student"]
-    per_tutor = pricing["flat_per_tutor"]
-    per_admin = pricing["flat_per_admin"]
-    base_fee = pricing["superadmin_base_fee"]
-
-    tenants = await master_db["tenants"].find({
-        "assigned_superadmin_id": ObjectId(admin["admin_id"]),
-        "status": {"$in": ["active", "approved"]},
-    }).to_list(length=1000)
-
-    tenant_costs = []
-    total_tenants_cost = 0.0
-
-    for tenant in tenants:
-        features_v2 = _tenant_features_v2_from_doc(tenant)
-        tier = features_v2.get("tier", "core")
-        flat_fee = tier_rates.get(tier, tier_rates.get("core", 50.0))
-
-        student_count = 0
-        tutor_count = 0
-        admin_count = 0
-        db_name = tenant.get("db_name")
-        if db_name:
-            try:
-                tenant_db = await db.get_tenant_db(db_name)
-                if tenant_db:
-                    student_count = await tenant_db["students"].count_documents({})
-                    tutor_count = await tenant_db["tutors"].count_documents({})
-                    admin_count = await tenant_db["admins"].count_documents({})
-            except Exception:
-                pass
-
-        student_surcharge = student_count * per_student
-        tutor_surcharge = tutor_count * per_tutor
-        admin_surcharge = admin_count * per_admin
-        total_cost = flat_fee + student_surcharge + tutor_surcharge + admin_surcharge
-        total_tenants_cost += total_cost
-
-        tenant_costs.append({
-            "tenant_id": str(tenant["_id"]),
-            "institution_name": tenant.get("institution_name", ""),
-            "tier": tier,
-            "flat_fee": round(flat_fee, 2),
-            "student_count": student_count,
-            "tutor_count": tutor_count,
-            "admin_count": admin_count,
-            "student_surcharge": round(student_surcharge, 2),
-            "tutor_surcharge": round(tutor_surcharge, 2),
-            "admin_surcharge": round(admin_surcharge, 2),
-            "total_cost": round(total_cost, 2),
-        })
+    master_db = await get_master_db_or_503(db_manager)
+    pricing = await _get_pricing(master_db, admin["admin_id"])
+    cost_data = await _compute_total_cost(master_db, db_manager, admin["admin_id"], pricing)
+    cycle = pricing.get("billing_cycle", "monthly")
 
     return {
         "platform_pricing": {
             "currency": pricing["currency"],
             "currency_symbol": pricing["currency_symbol"],
-            "tier_rates": tier_rates,
-            "flat_per_student": per_student,
-            "flat_per_tutor": per_tutor,
-            "flat_per_admin": per_admin,
-            "superadmin_base_fee": base_fee,
+            "tiers": pricing["tiers"],
+            "superadmin_fee": pricing["superadmin_fee"],
+            "billing_cycle": cycle,
+            "billing_day": pricing.get("billing_day", 1),
             "notes": pricing.get("notes", ""),
         },
-        "tenant_costs": tenant_costs,
-        "total_tenants_cost": round(total_tenants_cost, 2),
-        "superadmin_base_fee": round(base_fee, 2),
-        "total_platform_cost": round(total_tenants_cost + base_fee, 2),
+        "billing_cycle": cycle,
+        "tenant_costs": cost_data["tenant_costs"],
+        "total_tenants_cost": cost_data["total_tenants_cost"],
+        "superadmin_fee": cost_data["superadmin_fee"],
+        "total_platform_cost": cost_data["total_platform_cost"],
+        "period_label": cycle,
+    }
+
+
+# ============ PAYMENTS & BILLING ============
+
+
+@router.post("/payments")
+async def record_payment(
+    request: RecordPaymentRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Record a payment made by this super-admin."""
+    master_db = await get_master_db_or_503(db)
+    now = datetime.utcnow()
+
+    payment_date = now
+    if request.payment_date:
+        try:
+            payment_date = datetime.fromisoformat(request.payment_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid payment_date format (use ISO 8601)")
+
+    period_start = None
+    period_end = None
+    if request.period_start:
+        try:
+            period_start = datetime.fromisoformat(request.period_start)
+        except ValueError:
+            pass
+    if request.period_end:
+        try:
+            period_end = datetime.fromisoformat(request.period_end)
+        except ValueError:
+            pass
+
+    payment_doc = {
+        "superadmin_id": ObjectId(admin["admin_id"]),
+        "amount": request.amount,
+        "currency": (await _get_pricing(master_db, admin["admin_id"])).get("currency", "USD"),
+        "payment_date": payment_date,
+        "payment_method": request.payment_method,
+        "reference": request.reference,
+        "period_start": period_start,
+        "period_end": period_end,
+        "notes": request.notes,
+        "recorded_by": admin["email"],
+        "created_at": now,
+    }
+
+    result = await master_db["superadmin_payments"].insert_one(payment_doc)
+    return {"success": True, "payment_id": str(result.inserted_id)}
+
+
+@router.get("/payments")
+async def list_payments(
+    skip: int = 0,
+    limit: int = 50,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """List payments for this super-admin, newest first."""
+    master_db = await get_master_db_or_503(db)
+
+    payments = await master_db["superadmin_payments"].find(
+        {"superadmin_id": ObjectId(admin["admin_id"])}
+    ).sort("payment_date", -1).skip(skip).limit(limit).to_list(length=limit)
+
+    total = await master_db["superadmin_payments"].count_documents(
+        {"superadmin_id": ObjectId(admin["admin_id"])}
+    )
+
+    return {
+        "payments": [convert_objectids(p) for p in payments],
+        "total": total,
+        "skip": skip,
+        "limit": limit,
+    }
+
+
+@router.get("/billing-summary")
+async def get_billing_summary(
+    db_manager: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Current billing period summary: cost, paid, balance, next due date."""
+    master_db = await get_master_db_or_503(db_manager)
+    pricing = await _get_pricing(master_db, admin["admin_id"])
+    cost_data = await _compute_total_cost(master_db, db_manager, admin["admin_id"], pricing)
+
+    cycle = pricing.get("billing_cycle", "monthly")
+    billing_day = pricing.get("billing_day", 1)
+    now = datetime.utcnow()
+
+    period_start, period_end, next_due = _compute_billing_period(now, cycle, billing_day)
+
+    # Sum payments in current period
+    paid_pipeline = [
+        {"$match": {
+            "superadmin_id": ObjectId(admin["admin_id"]),
+            "payment_date": {"$gte": period_start, "$lte": period_end},
+        }},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]
+    paid_result = await master_db["superadmin_payments"].aggregate(paid_pipeline).to_list(1)
+    paid_this_period = paid_result[0]["total"] if paid_result else 0.0
+
+    # Total paid all time
+    all_time_pipeline = [
+        {"$match": {"superadmin_id": ObjectId(admin["admin_id"])}},
+        {"$group": {"_id": None, "total": {"$sum": "$amount"}}},
+    ]
+    all_time_result = await master_db["superadmin_payments"].aggregate(all_time_pipeline).to_list(1)
+    total_paid_all_time = all_time_result[0]["total"] if all_time_result else 0.0
+
+    current_period_cost = cost_data["total_platform_cost"]
+    balance_due = round(current_period_cost - paid_this_period, 2)
+
+    return {
+        "billing_cycle": cycle,
+        "billing_day": billing_day,
+        "period_start": period_start.strftime("%Y-%m-%d"),
+        "period_end": period_end.strftime("%Y-%m-%d"),
+        "current_period_cost": current_period_cost,
+        "paid_this_period": round(paid_this_period, 2),
+        "balance_due": balance_due,
+        "total_paid_all_time": round(total_paid_all_time, 2),
+        "next_due_date": next_due.strftime("%Y-%m-%d"),
+        "currency": pricing.get("currency", "USD"),
+        "currency_symbol": pricing.get("currency_symbol", "$"),
     }
