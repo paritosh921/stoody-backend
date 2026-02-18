@@ -1,7 +1,7 @@
 """Pricing configuration screen."""
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import (
     Button,
@@ -34,7 +34,7 @@ class PricingScreen(Screen):
             with Vertical(id="pricing-left"):
                 yield Static("Select Super-Admin:", classes="field-label")
                 yield DataTable(id="sa-picker")
-            with Vertical(id="pricing-right"):
+            with VerticalScroll(id="pricing-right"):
                 yield Static("Pricing Details", classes="field-label")
                 yield Static("Currency:")
                 yield Select(CURRENCIES, id="currency-select", value="USD")
