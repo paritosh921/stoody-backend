@@ -1,0 +1,117 @@
+/* Skiller TUI Styles */
+
+Screen {
+    background: $surface;
+}
+
+.screen-title {
+    text-style: bold;
+    background: $accent;
+    color: $text;
+    padding: 0 1;
+    margin-bottom: 1;
+    text-align: center;
+}
+
+.stat-row {
+    height: auto;
+    margin: 1 0;
+}
+
+StatCard {
+    width: 1fr;
+    border: solid $accent;
+    padding: 1 2;
+    margin: 0 1;
+    height: auto;
+}
+
+.stat-label {
+    color: $text-muted;
+}
+
+.stat-value {
+    text-style: bold;
+    color: $text;
+}
+
+.field-label {
+    color: $text-muted;
+    text-style: bold;
+    margin: 1 0 0 0;
+    padding: 0 1;
+}
+
+#pricing-layout {
+    height: 1fr;
+}
+
+#pricing-left {
+    width: 40%;
+    border-right: solid $accent;
+    padding: 0 1;
+}
+
+#pricing-right {
+    width: 60%;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+.form-row {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.form-row > Vertical {
+    width: 1fr;
+    margin: 0 1 0 0;
+}
+
+#save-pricing {
+    margin: 1 0;
+}
+
+#pricing-status {
+    color: $success;
+    margin: 0 1;
+}
+
+#dashboard-container {
+    padding: 1;
+}
+
+#tenants-container {
+    padding: 1;
+}
+
+#stats-container {
+    padding: 1;
+}
+
+#cost-table {
+    height: 1fr;
+    margin: 1 0;
+}
+
+#totals-line {
+    text-style: bold;
+    background: $boost;
+    padding: 0 1;
+}
+
+DataTable {
+    height: 1fr;
+}
+
+#sa-picker {
+    height: 1fr;
+}
+
+#sa-summary-table {
+    height: 12;
+}
+
+#tier-table {
+    height: 8;
+}

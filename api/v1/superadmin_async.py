@@ -134,6 +134,31 @@ class DeleteTenantRequest(BaseModel):
     confirmation: str = Field(..., description="Must match institution name to confirm deletion")
 
 
+class SuperAdminPricingUpdate(BaseModel):
+    currency: Optional[str] = Field(None, pattern=r'^[A-Z]{3}$')
+    currency_symbol: Optional[str] = Field(None, max_length=5)
+    tier_rates: Optional[Dict[str, float]] = None
+    flat_per_student: Optional[float] = Field(None, ge=0)
+    flat_per_tutor: Optional[float] = Field(None, ge=0)
+    flat_per_admin: Optional[float] = Field(None, ge=0)
+    superadmin_base_fee: Optional[float] = Field(None, ge=0)
+    notes: Optional[str] = None
+
+
+CURRENCY_MAP = {"USD": "$", "EUR": "\u20ac", "INR": "\u20b9"}
+
+DEFAULT_SUPERADMIN_PRICING = {
+    "currency": "USD",
+    "currency_symbol": "$",
+    "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
+    "flat_per_student": 0.50,
+    "flat_per_tutor": 2.00,
+    "flat_per_admin": 10.00,
+    "superadmin_base_fee": 100.00,
+    "notes": "",
+}
+
+
 class MarkNotificationsReadRequest(BaseModel):
     message_ids: Optional[List[str]] = None
     tenant_id: Optional[str] = None
@@ -1832,26 +1857,104 @@ async def set_tenant_pricing(
     return {"success": True, "tenant_id": tenant_id, "price": request.price}
 
 
+@router.get("/pricing")
+async def get_superadmin_pricing(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Get pricing configuration for the current super-admin."""
+    master_db = await get_master_db_or_503(db)
+    pricing_doc = await master_db["superadmin_pricing"].find_one(
+        {"superadmin_id": ObjectId(admin["admin_id"])}
+    )
+    if pricing_doc:
+        pricing_doc.pop("_id", None)
+        pricing_doc.pop("superadmin_id", None)
+        result = {**DEFAULT_SUPERADMIN_PRICING}
+        for key in DEFAULT_SUPERADMIN_PRICING:
+            if key in pricing_doc and pricing_doc[key] is not None:
+                result[key] = pricing_doc[key]
+        result["created_at"] = pricing_doc.get("created_at", "").isoformat() if isinstance(pricing_doc.get("created_at"), datetime) else str(pricing_doc.get("created_at", ""))
+        result["updated_at"] = pricing_doc.get("updated_at", "").isoformat() if isinstance(pricing_doc.get("updated_at"), datetime) else str(pricing_doc.get("updated_at", ""))
+        return result
+    return {**DEFAULT_SUPERADMIN_PRICING, "created_at": None, "updated_at": None}
+
+
+@router.put("/pricing")
+async def update_superadmin_pricing(
+    request: SuperAdminPricingUpdate,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Upsert pricing configuration for the current super-admin."""
+    master_db = await get_master_db_or_503(db)
+    now = datetime.utcnow()
+
+    update_fields: Dict[str, Any] = {"updated_at": now}
+    data = _model_dump(request)
+    for key, value in data.items():
+        if value is not None:
+            update_fields[key] = value
+
+    # Auto-resolve currency_symbol from CURRENCY_MAP if currency is set but symbol is not
+    if "currency" in update_fields and "currency_symbol" not in update_fields:
+        update_fields["currency_symbol"] = CURRENCY_MAP.get(update_fields["currency"], update_fields["currency"])
+
+    await master_db["superadmin_pricing"].create_index(
+        [("superadmin_id", 1)], unique=True, name="uniq_superadmin_pricing"
+    )
+
+    result = await master_db["superadmin_pricing"].update_one(
+        {"superadmin_id": ObjectId(admin["admin_id"])},
+        {"$set": update_fields, "$setOnInsert": {"created_at": now, "superadmin_id": ObjectId(admin["admin_id"])}},
+        upsert=True,
+    )
+
+    return {
+        "success": True,
+        "upserted": result.upserted_id is not None,
+        "modified": result.modified_count > 0,
+    }
+
+
 @router.get("/platform-costs")
 async def get_platform_costs(
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
-    """Calculate platform costs for all active tenants based on pricing doc."""
+    """Calculate platform costs for all active tenants based on per-SA pricing."""
     master_db = await get_master_db_or_503(db)
 
-    pricing_doc = await master_db["platform_pricing"].find_one({})
-    if not pricing_doc:
-        pricing_doc = {
-            "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
-            "per_student_surcharge": 0.50,
-            "per_tutor_surcharge": 2.00,
-            "notes": "Default rates. Seed platform_pricing collection to customize.",
-        }
+    # Pricing fallback chain: per-SA pricing -> old global platform_pricing -> hardcoded defaults
+    sa_pricing = await master_db["superadmin_pricing"].find_one(
+        {"superadmin_id": ObjectId(admin["admin_id"])}
+    )
+    if sa_pricing:
+        pricing = {**DEFAULT_SUPERADMIN_PRICING}
+        for key in DEFAULT_SUPERADMIN_PRICING:
+            if key in sa_pricing and sa_pricing[key] is not None:
+                pricing[key] = sa_pricing[key]
+    else:
+        legacy_doc = await master_db["platform_pricing"].find_one({})
+        if legacy_doc:
+            pricing = {
+                "currency": legacy_doc.get("currency", "USD"),
+                "currency_symbol": legacy_doc.get("currency_symbol", "$"),
+                "tier_rates": legacy_doc.get("tier_rates", DEFAULT_SUPERADMIN_PRICING["tier_rates"]),
+                "flat_per_student": legacy_doc.get("per_student_surcharge", legacy_doc.get("flat_per_student", 0.50)),
+                "flat_per_tutor": legacy_doc.get("per_tutor_surcharge", legacy_doc.get("flat_per_tutor", 2.00)),
+                "flat_per_admin": legacy_doc.get("flat_per_admin", 10.00),
+                "superadmin_base_fee": legacy_doc.get("superadmin_base_fee", 100.00),
+                "notes": legacy_doc.get("notes", ""),
+            }
+        else:
+            pricing = {**DEFAULT_SUPERADMIN_PRICING}
 
-    tier_rates = pricing_doc.get("tier_rates", {})
-    per_student = pricing_doc.get("per_student_surcharge", 0)
-    per_tutor = pricing_doc.get("per_tutor_surcharge", 0)
+    tier_rates = pricing["tier_rates"]
+    per_student = pricing["flat_per_student"]
+    per_tutor = pricing["flat_per_tutor"]
+    per_admin = pricing["flat_per_admin"]
+    base_fee = pricing["superadmin_base_fee"]
 
     tenants = await master_db["tenants"].find({
         "assigned_superadmin_id": ObjectId(admin["admin_id"]),
@@ -1859,16 +1962,16 @@ async def get_platform_costs(
     }).to_list(length=1000)
 
     tenant_costs = []
-    total_platform_cost = 0.0
+    total_tenants_cost = 0.0
 
     for tenant in tenants:
         features_v2 = _tenant_features_v2_from_doc(tenant)
         tier = features_v2.get("tier", "core")
         flat_fee = tier_rates.get(tier, tier_rates.get("core", 50.0))
 
-        # Count students and tutors from tenant DB
         student_count = 0
         tutor_count = 0
+        admin_count = 0
         db_name = tenant.get("db_name")
         if db_name:
             try:
@@ -1876,33 +1979,43 @@ async def get_platform_costs(
                 if tenant_db:
                     student_count = await tenant_db["students"].count_documents({})
                     tutor_count = await tenant_db["tutors"].count_documents({})
+                    admin_count = await tenant_db["admins"].count_documents({})
             except Exception:
                 pass
 
         student_surcharge = student_count * per_student
         tutor_surcharge = tutor_count * per_tutor
-        total_cost = flat_fee + student_surcharge + tutor_surcharge
-        total_platform_cost += total_cost
+        admin_surcharge = admin_count * per_admin
+        total_cost = flat_fee + student_surcharge + tutor_surcharge + admin_surcharge
+        total_tenants_cost += total_cost
 
         tenant_costs.append({
             "tenant_id": str(tenant["_id"]),
             "institution_name": tenant.get("institution_name", ""),
             "tier": tier,
-            "flat_fee": flat_fee,
+            "flat_fee": round(flat_fee, 2),
             "student_count": student_count,
             "tutor_count": tutor_count,
+            "admin_count": admin_count,
             "student_surcharge": round(student_surcharge, 2),
             "tutor_surcharge": round(tutor_surcharge, 2),
+            "admin_surcharge": round(admin_surcharge, 2),
             "total_cost": round(total_cost, 2),
         })
 
     return {
         "platform_pricing": {
+            "currency": pricing["currency"],
+            "currency_symbol": pricing["currency_symbol"],
             "tier_rates": tier_rates,
-            "per_student_surcharge": per_student,
-            "per_tutor_surcharge": per_tutor,
-            "notes": pricing_doc.get("notes", ""),
+            "flat_per_student": per_student,
+            "flat_per_tutor": per_tutor,
+            "flat_per_admin": per_admin,
+            "superadmin_base_fee": base_fee,
+            "notes": pricing.get("notes", ""),
         },
         "tenant_costs": tenant_costs,
-        "total_platform_cost": round(total_platform_cost, 2),
+        "total_tenants_cost": round(total_tenants_cost, 2),
+        "superadmin_base_fee": round(base_fee, 2),
+        "total_platform_cost": round(total_tenants_cost + base_fee, 2),
     }

@@ -116,6 +116,12 @@ xlsxwriter>=3.1.9
 pyinstrument==5.1.2
 
 # ===============================
+# TUI (Textual terminal UI for admin management)
+# ===============================
+textual>=0.47.0
+rich>=13.7.0
+
+# ===============================
 # Production WSGI/ASGI Server
 # ===============================
 gunicorn>=21.0.0
