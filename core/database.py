@@ -5,7 +5,7 @@ Handles MongoDB connections with connection pooling
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import ServerSelectionTimeoutError, OperationFailure, ConfigurationError
 import certifi
@@ -216,6 +216,48 @@ class DatabaseManager:
             return None
         return db[collection_name]
 
+    @staticmethod
+    def _normalize_index_keys(keys: List[Tuple[str, int]]) -> Tuple[Tuple[str, int], ...]:
+        """Normalize index keys to a stable tuple representation for comparisons."""
+        return tuple((str(field), int(direction)) for field, direction in keys)
+
+    async def _ensure_index_with_spec_check(
+        self,
+        collection,
+        keys: List[Tuple[str, int]],
+        *,
+        name: str,
+        unique: bool = False,
+        sparse: bool = False,
+    ) -> None:
+        """Create index only when an equivalent spec does not already exist under another name."""
+        target_keys = self._normalize_index_keys(keys)
+        index_info = await collection.index_information()
+
+        for existing_name, existing_def in index_info.items():
+            existing_keys = self._normalize_index_keys(existing_def.get("key", []))
+            if existing_keys != target_keys:
+                continue
+
+            existing_unique = bool(existing_def.get("unique", False))
+            existing_sparse = bool(existing_def.get("sparse", False))
+            if existing_unique == unique and existing_sparse == sparse:
+                if existing_name != name:
+                    logger.info(
+                        "Equivalent index already exists on %s as '%s'; skipping '%s'",
+                        collection.full_name,
+                        existing_name,
+                        name,
+                    )
+                return
+
+        create_kwargs: Dict[str, Any] = {"name": name}
+        if unique:
+            create_kwargs["unique"] = True
+        if sparse:
+            create_kwargs["sparse"] = True
+        await collection.create_index(keys, **create_kwargs)
+
     async def ensure_indexes_for_db(self, db: AsyncIOMotorDatabase) -> None:
         """Create necessary indexes on the given database (idempotent)."""
         db_name = db.name
@@ -223,34 +265,39 @@ class DatabaseManager:
             return
         try:
             students = db["students"]
-            await students.create_index(
+            await self._ensure_index_with_spec_check(
+                students,
                 [("student_id", 1)],
                 unique=True,
                 name="uniq_student_id"
             )
-            await students.create_index(
+            await self._ensure_index_with_spec_check(
+                students,
                 [("username_lower", 1)],
                 unique=True,
                 sparse=True,
-                name="uniq_student_username_lower"
+                name="uniq_students_username_lower"
             )
 
             tutors = db["tutors"]
-            await tutors.create_index(
+            await self._ensure_index_with_spec_check(
+                tutors,
                 [("username", 1)],
                 unique=True,
-                name="uniq_tutor_username"
+                name="uniq_tutors_username"
             )
-            await tutors.create_index(
+            await self._ensure_index_with_spec_check(
+                tutors,
                 [("username_lower", 1)],
                 unique=True,
                 sparse=True,
-                name="uniq_tutor_username_lower"
+                name="uniq_tutors_username_lower"
             )
-            await tutors.create_index(
+            await self._ensure_index_with_spec_check(
+                tutors,
                 [("tutor_id", 1)],
                 unique=True,
-                name="uniq_tutor_id"
+                name="uniq_tutors_tutor_id"
             )
 
             self._indexed_dbs.add(db_name)
