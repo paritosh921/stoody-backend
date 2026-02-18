@@ -13,7 +13,7 @@ from textual.widgets import (
     Select,
     Static,
 )
-from textual.worker import work
+from textual import work
 
 
 CURRENCIES = [("USD ($)", "USD"), ("EUR (\u20ac)", "EUR"), ("INR (\u20b9)", "INR")]

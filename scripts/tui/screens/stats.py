@@ -4,7 +4,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
-from textual.worker import work
+from textual import work
 
 
 class StatsScreen(Screen):

@@ -4,7 +4,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Select, Static
-from textual.worker import work
+from textual import work
 
 from ..widgets.cost_table import CostTable
 

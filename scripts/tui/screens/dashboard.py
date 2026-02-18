@@ -4,7 +4,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
-from textual.worker import Worker, work
+from textual import work
 
 
 class StatCard(Static):
