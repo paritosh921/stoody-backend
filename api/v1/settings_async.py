@@ -487,3 +487,58 @@ async def get_public_school_settings(
     except Exception as e:
         logger.error(f"Error getting public school settings: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to get school settings")
+
+
+# ============ SUBSCRIPTION INFO ============
+
+
+@router.get("/subscription-info")
+@limiter.limit("30/minute")
+async def get_subscription_info(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Return subscription tier, limits, and current usage for this tenant."""
+    try:
+        tenant_id = current_user.get("tenant_id") or current_user.get("institution_id")
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="No tenant context")
+
+        master_db = await db.get_master_db()
+        if master_db is None:
+            raise HTTPException(status_code=503, detail="Master database unavailable")
+
+        from core.tenant_features import build_enabled_features_v2
+
+        tenant_doc = await master_db["tenants"].find_one(
+            {"$or": [{"tenant_id": tenant_id}, {"institution_id": tenant_id}]}
+        )
+        if not tenant_doc:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        features_v2 = build_enabled_features_v2(
+            tenant_doc.get("enabled_features_v2"),
+            tenant_doc.get("enabled_features"),
+        )
+        subscription_tier = features_v2.get("tier", "core")
+
+        max_students = tenant_doc.get("max_students", 0)
+        max_tutors = tenant_doc.get("max_tutors", 0)
+
+        current_students = await db.mongo_count_documents("students", {})
+        current_tutors = await db.mongo_count_documents("tutors", {})
+
+        return {
+            "subscription_tier": subscription_tier,
+            "max_students": max_students,
+            "max_tutors": max_tutors,
+            "current_students": current_students,
+            "current_tutors": current_tutors,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting subscription info: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to get subscription info")

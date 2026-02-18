@@ -25,7 +25,7 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
-from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403
+from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403, check_registration_limit
 from models.tutor import Tutor
 
 logger = logging.getLogger(__name__)
@@ -534,6 +534,9 @@ async def import_bulk_teachers(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File is empty. Please add teacher data."
         )
+
+    # Check registration limit (uses row count as upper bound; merged teachers may be fewer)
+    await check_registration_limit(db, current_user, "tutors", "max_tutors", additional=len(df))
 
     admin_id = current_user.get("user_id")
 

@@ -14,11 +14,13 @@ from typing import Any, Dict, List, Optional, Tuple
 FEATURE_TIER_CORE = "core"
 FEATURE_TIER_ADVANCED = "advanced"
 FEATURE_TIER_MAX = "max"
+FEATURE_TIER_CUSTOM = "custom"
 FEATURE_TIER_ORDER: Tuple[str, ...] = (
     FEATURE_TIER_CORE,
     FEATURE_TIER_ADVANCED,
     FEATURE_TIER_MAX,
 )
+VALID_TIERS = set(FEATURE_TIER_ORDER) | {FEATURE_TIER_CUSTOM}
 
 FEATURE_CATEGORY_CORE = "core"
 FEATURE_CATEGORY_ADVANCED = "advanced"
@@ -389,7 +391,7 @@ def normalize_tier(raw_tier: Optional[str]) -> str:
     if not raw_tier:
         return FEATURE_TIER_CORE
     tier = str(raw_tier).strip().lower()
-    if tier in FEATURE_TIER_ORDER:
+    if tier in VALID_TIERS:
         return tier
     return FEATURE_TIER_CORE
 
@@ -412,13 +414,15 @@ def compute_effective_features(
     normalized_tier = normalize_tier(tier)
     effective = {key: False for key in FEATURE_CATALOG_BY_KEY.keys()}
 
-    tier_rank = _tier_index(normalized_tier)
-    for category in (FEATURE_CATEGORY_CORE, FEATURE_CATEGORY_ADVANCED, FEATURE_CATEGORY_MAX):
-        category_rank = _tier_index(category)
-        if category_rank <= tier_rank:
-            for key in FEATURE_KEYS_BY_CATEGORY[category]:
-                default_enabled = bool(FEATURE_CATALOG_BY_KEY[key].get("default_enabled", True))
-                effective[key] = default_enabled
+    # For custom tier, base is all-false; only overrides apply
+    if normalized_tier != FEATURE_TIER_CUSTOM:
+        tier_rank = _tier_index(normalized_tier)
+        for category in (FEATURE_CATEGORY_CORE, FEATURE_CATEGORY_ADVANCED, FEATURE_CATEGORY_MAX):
+            category_rank = _tier_index(category)
+            if category_rank <= tier_rank:
+                for key in FEATURE_KEYS_BY_CATEGORY[category]:
+                    default_enabled = bool(FEATURE_CATALOG_BY_KEY[key].get("default_enabled", True))
+                    effective[key] = default_enabled
 
     if isinstance(overrides, dict):
         for key, value in overrides.items():

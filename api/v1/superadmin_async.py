@@ -101,7 +101,7 @@ class UpdateFeaturesRequest(BaseModel):
 
 
 class UpdateFeaturesV2Request(BaseModel):
-    tier: Literal["core", "advanced", "max"] = "core"
+    tier: Literal["core", "advanced", "max", "custom"] = "core"
     overrides: Dict[str, bool] = Field(default_factory=dict)
 
 
@@ -123,6 +123,11 @@ class SendMessageRequest(BaseModel):
     subject: str = Field(..., min_length=1, max_length=200)
     message: str = Field(..., min_length=1)
     priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
+
+
+class SetTenantPricingRequest(BaseModel):
+    price: float = Field(..., ge=0)
+    notes: Optional[str] = None
 
 
 class DeleteTenantRequest(BaseModel):
@@ -1765,4 +1770,139 @@ async def get_stats_overview(
         "top_tenants_by_students": top_by_students[:5],
         "top_tenants_by_activity": top_by_activity[:5],
         "feature_adoption": feature_adoption,
+    }
+
+
+# ============ ACCOUNTS & PLATFORM COSTS ============
+
+
+@router.get("/accounts-overview")
+async def get_accounts_overview(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Return all tenants for this super-admin with account overview data."""
+    master_db = await get_master_db_or_503(db)
+
+    tenants = await master_db["tenants"].find({
+        "assigned_superadmin_id": ObjectId(admin["admin_id"]),
+        "status": {"$in": ["active", "approved", "suspended"]},
+    }).to_list(length=1000)
+
+    accounts = []
+    for tenant in tenants:
+        features_v2 = _tenant_features_v2_from_doc(tenant)
+        accounts.append({
+            "tenant_id": str(tenant["_id"]),
+            "institution_name": tenant.get("institution_name", ""),
+            "institution_id": tenant.get("institution_id"),
+            "status": tenant.get("status"),
+            "subscription_tier": features_v2.get("tier", "core"),
+            "max_students": tenant.get("max_students", 0),
+            "max_tutors": tenant.get("max_tutors", 0),
+            "admin_set_price": tenant.get("admin_set_price", 0),
+            "admin_email": tenant.get("admin_email", ""),
+        })
+
+    return {"accounts": accounts}
+
+
+@router.put("/tenants/{tenant_id}/pricing")
+async def set_tenant_pricing(
+    tenant_id: str,
+    request: SetTenantPricingRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Set the price charged to a tenant by the super-admin distributor."""
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    update_fields: Dict[str, Any] = {
+        "admin_set_price": request.price,
+    }
+    if request.notes:
+        update_fields["pricing_notes"] = request.notes
+
+    await master_db["tenants"].update_one(
+        {"_id": ObjectId(tenant_id)},
+        {"$set": update_fields},
+    )
+
+    return {"success": True, "tenant_id": tenant_id, "price": request.price}
+
+
+@router.get("/platform-costs")
+async def get_platform_costs(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Calculate platform costs for all active tenants based on pricing doc."""
+    master_db = await get_master_db_or_503(db)
+
+    pricing_doc = await master_db["platform_pricing"].find_one({})
+    if not pricing_doc:
+        pricing_doc = {
+            "tier_rates": {"core": 50.0, "advanced": 120.0, "max": 250.0, "custom": 200.0},
+            "per_student_surcharge": 0.50,
+            "per_tutor_surcharge": 2.00,
+            "notes": "Default rates. Seed platform_pricing collection to customize.",
+        }
+
+    tier_rates = pricing_doc.get("tier_rates", {})
+    per_student = pricing_doc.get("per_student_surcharge", 0)
+    per_tutor = pricing_doc.get("per_tutor_surcharge", 0)
+
+    tenants = await master_db["tenants"].find({
+        "assigned_superadmin_id": ObjectId(admin["admin_id"]),
+        "status": {"$in": ["active", "approved"]},
+    }).to_list(length=1000)
+
+    tenant_costs = []
+    total_platform_cost = 0.0
+
+    for tenant in tenants:
+        features_v2 = _tenant_features_v2_from_doc(tenant)
+        tier = features_v2.get("tier", "core")
+        flat_fee = tier_rates.get(tier, tier_rates.get("core", 50.0))
+
+        # Count students and tutors from tenant DB
+        student_count = 0
+        tutor_count = 0
+        db_name = tenant.get("db_name")
+        if db_name:
+            try:
+                tenant_db = await db.get_tenant_db(db_name)
+                if tenant_db:
+                    student_count = await tenant_db["students"].count_documents({})
+                    tutor_count = await tenant_db["tutors"].count_documents({})
+            except Exception:
+                pass
+
+        student_surcharge = student_count * per_student
+        tutor_surcharge = tutor_count * per_tutor
+        total_cost = flat_fee + student_surcharge + tutor_surcharge
+        total_platform_cost += total_cost
+
+        tenant_costs.append({
+            "tenant_id": str(tenant["_id"]),
+            "institution_name": tenant.get("institution_name", ""),
+            "tier": tier,
+            "flat_fee": flat_fee,
+            "student_count": student_count,
+            "tutor_count": tutor_count,
+            "student_surcharge": round(student_surcharge, 2),
+            "tutor_surcharge": round(tutor_surcharge, 2),
+            "total_cost": round(total_cost, 2),
+        })
+
+    return {
+        "platform_pricing": {
+            "tier_rates": tier_rates,
+            "per_student_surcharge": per_student,
+            "per_tutor_surcharge": per_tutor,
+            "notes": pricing_doc.get("notes", ""),
+        },
+        "tenant_costs": tenant_costs,
+        "total_platform_cost": round(total_platform_cost, 2),
     }

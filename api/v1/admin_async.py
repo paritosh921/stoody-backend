@@ -304,6 +304,46 @@ def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
     return current_user.get("user_type") == "b2c_admin"
 
+
+async def check_registration_limit(
+    db: DatabaseManager, current_user: Dict[str, Any], collection: str, limit_field: str, additional: int = 1
+) -> None:
+    """Raise 403 if adding records would exceed tenant registration limit."""
+    if is_b2c_admin(current_user):
+        return  # B2C admins are not subject to tenant limits
+
+    tenant_id = current_user.get("tenant_id") or current_user.get("institution_id")
+    if not tenant_id:
+        return  # No tenant context - skip check
+
+    try:
+        master_db = await db.get_master_db()
+        if master_db is None:
+            return  # Master DB unavailable - fail open
+        tenant_doc = await master_db["tenants"].find_one(
+            {"$or": [{"tenant_id": tenant_id}, {"institution_id": tenant_id}]}
+        )
+        if not tenant_doc:
+            return  # Tenant not found in master - skip
+
+        limit = tenant_doc.get(limit_field, 0)
+        if not limit or limit <= 0:
+            return  # No limit configured
+
+        current_count = await db.mongo_count_documents(collection, {})
+        if current_count + additional > limit:
+            entity_name = "Student" if collection == "students" else "Tutor"
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"{entity_name} registration limit reached ({current_count}/{limit}). "
+                       f"Contact your administrator to increase the limit.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning("Registration limit check failed (allowing request): %s", e)
+
+
 async def db_find_one(db: DatabaseManager, collection: str, query: dict, current_user: Dict[str, Any], **kwargs):
     """Route find_one to B2C or regular database based on user type"""
     if is_b2c_admin(current_user):
@@ -934,6 +974,9 @@ async def create_student(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="MongoDB is not configured or unavailable"
             )
+
+        # Check registration limit before proceeding
+        await check_registration_limit(db, current_user, "students", "max_students")
 
         from core.auth import AuthManager
         auth_manager = AuthManager()
@@ -3376,3 +3419,66 @@ async def mark_superadmin_message_read(
     except Exception as e:
         logger.error(f"Mark message read error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============ ADMIN → SUPER-ADMIN MESSAGING ============
+
+
+class AdminToSuperAdminMessageRequest(BaseModel):
+    subject: str = Field(..., min_length=1, max_length=200)
+    message: str = Field(..., min_length=1)
+    priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
+
+
+@router.post("/superadmin-messages")
+@limiter.limit("10/minute")
+async def send_message_to_superadmin(
+    request: Request,
+    body: AdminToSuperAdminMessageRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Send a message from tenant admin to their assigned super-admin."""
+    try:
+        tenant_id = current_user.get("tenant_id") or current_user.get("institution_id")
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="No tenant context")
+
+        master_db = await db.get_master_db()
+        if master_db is None:
+            raise HTTPException(status_code=503, detail="Master database unavailable")
+
+        tenant_doc = await master_db["tenants"].find_one(
+            {"$or": [{"tenant_id": tenant_id}, {"institution_id": tenant_id}]}
+        )
+        if not tenant_doc:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        superadmin_id = tenant_doc.get("assigned_superadmin_id")
+        if not superadmin_id:
+            raise HTTPException(status_code=400, detail="No super-admin assigned to this tenant")
+
+        message_doc = {
+            "tenant_id": tenant_doc["_id"],
+            "superadmin_id": ObjectId(str(superadmin_id)),
+            "from_admin": current_user.get("email", ""),
+            "from_name": current_user.get("full_name", current_user.get("name", "")),
+            "to_email": "",
+            "subject": body.subject,
+            "message": body.message,
+            "priority": body.priority or "normal",
+            "direction": "admin_to_superadmin",
+            "attachments": [],
+            "created_at": datetime.utcnow(),
+            "read": False,
+            "read_at": None,
+        }
+
+        result = await master_db["superadmin_messages"].insert_one(message_doc)
+        return {"success": True, "message_id": str(result.inserted_id)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send message to superadmin error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to send message")

@@ -24,7 +24,7 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
-from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403
+from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403, check_registration_limit
 
 logger = logging.getLogger(__name__)
 
@@ -607,7 +607,10 @@ async def import_bulk_students(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="File is empty. Please add student data."
         )
-    
+
+    # Check registration limit for all rows being imported
+    await check_registration_limit(db, current_user, "students", "max_students", additional=len(df))
+
     # Get tenant info
     tenant_db = await get_tenant_db_or_403(db, current_user)
     admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))

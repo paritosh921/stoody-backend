@@ -14,6 +14,9 @@ from models.student import Student
 from core.database import DatabaseManager
 from core.permissions import has_permission
 from api.v1.auth_async import get_current_user, get_database
+import logging
+
+_logger = logging.getLogger(__name__)
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -155,6 +158,10 @@ async def create_tutor(
     Create a new tutor account (Admin only)
     Auto-generates tutor_id and password
     """
+    # Check registration limit before proceeding
+    from api.v1.admin_async import check_registration_limit
+    await check_registration_limit(db, current_user, "tutors", "max_tutors")
+
     normalized_username = tutor_data.username.strip()
     username_lower = normalized_username.lower()
     # Check if username already exists (case-insensitive)
