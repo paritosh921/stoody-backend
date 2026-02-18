@@ -473,12 +473,12 @@ def _setup_rate_limiter() -> Limiter:
             strategy="fixed-window"
         )
 
-    # Production mode: Redis is required
-    if not REDIS_URL or REDIS_URL == "redis://localhost:6379/0":
+    # Production mode: Redis is required for proper rate limiting
+    if not REDIS_URL:
         if REDIS_REQUIRED:
             raise RuntimeError(
                 "\n" + "=" * 70 + "\n"
-                "🚨 CRITICAL: Redis is required for rate limiting in production!\n"
+                "🚨 CRITICAL: Redis URL is not configured!\n"
                 "=" * 70 + "\n"
                 "Rate limiting without Redis is a security vulnerability.\n\n"
                 "Please configure REDIS_URL in your environment:\n"
@@ -491,8 +491,14 @@ def _setup_rate_limiter() -> Limiter:
                 "⚠️ SECURITY WARNING: Using in-memory rate limiting in production.\n"
                 "   This is NOT recommended and should only be temporary!"
             )
+            return Limiter(
+                key_func=get_remote_address,
+                default_limits=[RATE_LIMIT_DEFAULT],
+                storage_uri="memory://",
+                strategy="fixed-window"
+            )
 
-    # Test Redis connection
+    # Test Redis connection (works for localhost or remote)
     if not _test_redis_connection(REDIS_URL):
         if REDIS_REQUIRED:
             raise RuntimeError(
