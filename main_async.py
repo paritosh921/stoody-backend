@@ -231,6 +231,17 @@ except Exception as e:
     _smartboard_sessions_available = False
     logging.warning(f"Smartboard Sessions routes disabled: {str(e)}")
 
+# Timetable routes (class timetable, teacher calendar, pre-reads)
+try:
+    from api.v1.timetable_async import router as timetable_router
+    from api.v1.timetable_bulk_upload import router as timetable_bulk_upload_router
+    _timetable_available = True
+except Exception as e:
+    timetable_router = None
+    timetable_bulk_upload_router = None
+    _timetable_available = False
+    logging.warning(f"Timetable routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -1005,6 +1016,22 @@ if _smartboard_sessions_available and smartboard_sessions_router:
     logger.info("✅ Smartboard Sessions routes enabled")
 else:
     logger.warning("⚠️ Smartboard Sessions routes disabled")
+
+# Timetable routes (class timetable, teacher calendar, academic calendar, pre-reads)
+if _timetable_available and timetable_router:
+    app.include_router(
+        timetable_router,
+        prefix=f"{API_V1_PREFIX}/timetable",
+        tags=["Timetable"]
+    )
+    app.include_router(
+        timetable_bulk_upload_router,
+        prefix=f"{API_V1_PREFIX}/admin",
+        tags=["Timetable Bulk Upload"]
+    )
+    logger.info("✅ Timetable routes enabled")
+else:
+    logger.warning("⚠️ Timetable routes disabled")
 
 
 # Static file serving

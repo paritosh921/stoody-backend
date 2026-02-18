@@ -45,6 +45,10 @@ TENANT_SCOPED_COLLECTIONS: Set[str] = {
     "notifications",
     "class_schedules",
     "smartboard_sessions",  # SmartBoard whiteboard sessions
+    "class_timetables",     # Class timetable definitions
+    "timetable_periods",    # Individual period entries
+    "academic_calendar",    # Holidays, exams, events
+    "pre_reads",            # Pre-read material for periods
 }
 
 # Collections that are global (not tenant-scoped)
