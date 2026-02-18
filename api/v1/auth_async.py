@@ -1788,6 +1788,17 @@ async def get_registration_status_authenticated(
             email=status_data.email,
             password=status_data.password,
         )
+
+        if not is_feature_enabled(
+            tenant.get("enabled_features"),
+            "admin_registration_status_tools",
+            tenant.get("enabled_features_v2"),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Registration status tools are not enabled for this institution",
+            )
+
         thread_messages = await _get_registration_thread_messages(db, tenant)
         return _build_registration_status_payload(tenant, thread_messages)
 
@@ -1824,6 +1835,16 @@ async def send_registration_status_message(
             email=email,
             password=password,
         )
+
+        if not is_feature_enabled(
+            tenant.get("enabled_features"),
+            "admin_registration_status_tools",
+            tenant.get("enabled_features_v2"),
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Registration status tools are not enabled for this institution",
+            )
 
         clean_subject = subject.strip()
         clean_message = message.strip()

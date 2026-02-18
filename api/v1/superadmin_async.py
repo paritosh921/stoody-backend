@@ -129,6 +129,11 @@ class DeleteTenantRequest(BaseModel):
     confirmation: str = Field(..., description="Must match institution name to confirm deletion")
 
 
+class MarkNotificationsReadRequest(BaseModel):
+    message_ids: Optional[List[str]] = None
+    tenant_id: Optional[str] = None
+
+
 # ============ HELPERS ============
 
 async def get_database(request: Request) -> DatabaseManager:
@@ -1278,6 +1283,21 @@ async def get_tenant_messages(
         "superadmin_id": ObjectId(admin["admin_id"]),
     }).sort("created_at", -1).to_list(length=100)
 
+    # Auto-mark unread admin-to-superadmin messages as read
+    unread_ids = [
+        msg["_id"] for msg in messages
+        if msg.get("direction") == "admin_to_superadmin" and not msg.get("read")
+    ]
+    if unread_ids:
+        await master_db["superadmin_messages"].update_many(
+            {"_id": {"$in": unread_ids}},
+            {"$set": {"read": True, "read_at": datetime.utcnow()}},
+        )
+        for msg in messages:
+            if msg["_id"] in unread_ids:
+                msg["read"] = True
+                msg["read_at"] = datetime.utcnow()
+
     return [convert_objectids(msg) for msg in messages]
 
 
@@ -1339,3 +1359,410 @@ async def delete_tenant(
     await master_db["tenants"].delete_one({"_id": ObjectId(tenant_id)})
 
     return {"success": True, "deleted": tenant["institution_name"]}
+
+
+# ============ NOTIFICATIONS ============
+
+
+@router.get("/notifications/unread")
+async def get_unread_notifications(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Return unread admin-to-superadmin messages for the notification bell."""
+    master_db = await get_master_db_or_503(db)
+
+    pipeline = [
+        {
+            "$match": {
+                "superadmin_id": ObjectId(admin["admin_id"]),
+                "direction": "admin_to_superadmin",
+                "read": False,
+            }
+        },
+        {"$sort": {"created_at": -1}},
+        {"$limit": 50},
+        {
+            "$lookup": {
+                "from": "tenants",
+                "localField": "tenant_id",
+                "foreignField": "_id",
+                "as": "tenant_info",
+            }
+        },
+        {
+            "$project": {
+                "message_id": {"$toString": "$_id"},
+                "tenant_id": {"$toString": "$tenant_id"},
+                "tenant_name": {"$arrayElemAt": ["$tenant_info.institution_name", 0]},
+                "from_email": "$from_admin",
+                "subject": 1,
+                "created_at": 1,
+            }
+        },
+    ]
+
+    notifications = await master_db["superadmin_messages"].aggregate(pipeline).to_list(length=50)
+
+    for n in notifications:
+        n.pop("_id", None)
+        if isinstance(n.get("created_at"), datetime):
+            n["created_at"] = n["created_at"].isoformat()
+
+    return {
+        "unread_count": len(notifications),
+        "notifications": notifications,
+    }
+
+
+@router.post("/notifications/mark-read")
+async def mark_notifications_read(
+    request: MarkNotificationsReadRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Mark notifications as read by message IDs or by tenant ID."""
+    master_db = await get_master_db_or_503(db)
+
+    query: Dict[str, Any] = {
+        "superadmin_id": ObjectId(admin["admin_id"]),
+        "direction": "admin_to_superadmin",
+        "read": False,
+    }
+
+    if request.message_ids:
+        try:
+            oids = [ObjectId(mid) for mid in request.message_ids]
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid message ID format")
+        query["_id"] = {"$in": oids}
+    elif request.tenant_id:
+        try:
+            query["tenant_id"] = ObjectId(request.tenant_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid tenant ID format")
+    else:
+        raise HTTPException(status_code=400, detail="Provide message_ids or tenant_id")
+
+    result = await master_db["superadmin_messages"].update_many(
+        query,
+        {"$set": {"read": True, "read_at": datetime.utcnow()}},
+    )
+
+    return {"success": True, "marked_count": result.modified_count}
+
+
+# ============ TENANT STATS ============
+
+
+@router.get("/tenants/{tenant_id}/stats")
+async def get_tenant_stats(
+    tenant_id: str,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Get detailed usage stats for a specific tenant."""
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    db_name = tenant.get("db_name")
+    if not db_name:
+        raise HTTPException(status_code=400, detail="Tenant database not provisioned yet")
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Could not connect to tenant database")
+
+    now = datetime.utcnow()
+    thirty_days_ago = now - timedelta(days=30)
+    seven_days_ago = now - timedelta(days=7)
+
+    # Gather counts in parallel via individual queries
+    students_total = await tenant_db["students"].count_documents({})
+    students_active_7d = await tenant_db["students"].count_documents(
+        {"last_login": {"$gte": seven_days_ago}}
+    )
+    students_active_30d = await tenant_db["students"].count_documents(
+        {"last_login": {"$gte": thirty_days_ago}}
+    )
+
+    tutors_total = await tenant_db["tutors"].count_documents({})
+    tutors_active_7d = await tenant_db["tutors"].count_documents(
+        {"last_login": {"$gte": seven_days_ago}}
+    )
+    tutors_active_30d = await tenant_db["tutors"].count_documents(
+        {"last_login": {"$gte": thirty_days_ago}}
+    )
+
+    admins_total = await tenant_db["admins"].count_documents({})
+
+    documents_count = await tenant_db["documents"].count_documents({})
+    questions_count = await tenant_db["questions"].count_documents({})
+
+    # Paper count (papers collection or distinct paper_id in questions)
+    papers_count = 0
+    try:
+        papers_count = len(await tenant_db["questions"].distinct("paper_id"))
+    except Exception:
+        pass
+
+    # Activity counts
+    practice_total = 0
+    practice_30d = 0
+    try:
+        practice_total = await tenant_db["practice_attempts"].count_documents({})
+        practice_30d = await tenant_db["practice_attempts"].count_documents(
+            {"created_at": {"$gte": thirty_days_ago}}
+        )
+    except Exception:
+        pass
+
+    mcq_total = 0
+    mcq_30d = 0
+    try:
+        mcq_total = await tenant_db["test_attempts"].count_documents({})
+        mcq_30d = await tenant_db["test_attempts"].count_documents(
+            {"submitted_at": {"$gte": thirty_days_ago}}
+        )
+    except Exception:
+        pass
+
+    chat_total = 0
+    chat_30d = 0
+    try:
+        chat_total = await tenant_db["chat_sessions"].count_documents({})
+        chat_30d = await tenant_db["chat_sessions"].count_documents(
+            {"created_at": {"$gte": thirty_days_ago}}
+        )
+    except Exception:
+        pass
+
+    smartboard_total = 0
+    smartboard_30d = 0
+    try:
+        smartboard_total = await tenant_db["smartboard_sessions"].count_documents({})
+        smartboard_30d = await tenant_db["smartboard_sessions"].count_documents(
+            {"created_at": {"$gte": thirty_days_ago}}
+        )
+    except Exception:
+        pass
+
+    pen_total = 0
+    pen_30d = 0
+    try:
+        pen_total = await tenant_db["strokes"].count_documents({})
+        pen_30d = await tenant_db["strokes"].count_documents(
+            {"timestamp": {"$gte": thirty_days_ago}}
+        )
+    except Exception:
+        pass
+
+    # Feature usage mapping
+    features_v2 = build_enabled_features_v2(
+        tenant.get("enabled_features_v2"),
+        tenant.get("enabled_features"),
+    )
+    effective = features_v2.get("effective", {})
+
+    feature_usage = {
+        "learning_mode": {
+            "enabled": bool(effective.get("student_learning_mode")),
+            "active": practice_30d > 0,
+        },
+        "exam_mode": {
+            "enabled": bool(effective.get("student_exam_mode")),
+            "active": mcq_30d > 0,
+        },
+        "ai_mentor": {
+            "enabled": bool(effective.get("student_ai_mentor")),
+            "active": chat_30d > 0,
+        },
+        "online_class": {
+            "enabled": bool(effective.get("tutor_online_class")),
+            "active": False,  # Would need meetings collection check
+        },
+        "pen_capture": {
+            "enabled": bool(effective.get("stoody_pen_capture")),
+            "active": pen_30d > 0,
+        },
+        "paper_builder": {
+            "enabled": bool(effective.get("admin_question_bank")),
+            "active": questions_count > 0,
+        },
+        "video_lessons": {
+            "enabled": bool(effective.get("student_video_lessons")),
+            "active": False,  # Would need video views tracking
+        },
+    }
+
+    max_students = tenant.get("max_students") or 0
+    max_tutors = tenant.get("max_tutors") or 0
+    student_util = round((students_total / max_students * 100), 1) if max_students > 0 else 0
+    tutor_util = round((tutors_total / max_tutors * 100), 1) if max_tutors > 0 else 0
+
+    enabled_count = sum(1 for v in effective.values() if v)
+    total_count = len(effective)
+
+    return {
+        "tenant_id": str(tenant["_id"]),
+        "institution_name": tenant.get("institution_name", ""),
+        "snapshot_at": now.isoformat(),
+        "limits": {
+            "max_students": max_students,
+            "max_tutors": max_tutors,
+            "current_students": students_total,
+            "current_tutors": tutors_total,
+            "student_utilization_pct": student_util,
+            "tutor_utilization_pct": tutor_util,
+        },
+        "users": {
+            "students": {
+                "total": students_total,
+                "active_7d": students_active_7d,
+                "active_30d": students_active_30d,
+            },
+            "tutors": {
+                "total": tutors_total,
+                "active_7d": tutors_active_7d,
+                "active_30d": tutors_active_30d,
+            },
+            "admins": {"total": admins_total},
+        },
+        "content": {
+            "documents": documents_count,
+            "questions": questions_count,
+            "papers": papers_count,
+        },
+        "activity": {
+            "practice_attempts": {"total": practice_total, "last_30d": practice_30d},
+            "mcq_attempts": {"total": mcq_total, "last_30d": mcq_30d},
+            "chat_sessions": {"total": chat_total, "last_30d": chat_30d},
+            "smartboard_sessions": {"total": smartboard_total, "last_30d": smartboard_30d},
+            "pen_strokes": {"total": pen_total, "last_30d": pen_30d},
+        },
+        "feature_usage": feature_usage,
+        "subscription_tier": features_v2.get("tier", "core"),
+        "enabled_features_count": enabled_count,
+        "total_features_count": total_count,
+    }
+
+
+@router.get("/stats/overview")
+async def get_stats_overview(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Aggregate stats overview across all tenants assigned to this super admin."""
+    master_db = await get_master_db_or_503(db)
+
+    tenants = await master_db["tenants"].find({
+        "assigned_superadmin_id": ObjectId(admin["admin_id"]),
+        "status": {"$in": ["active", "approved"]},
+    }).to_list(length=500)
+
+    total_students = 0
+    total_tutors = 0
+    top_by_students: List[Dict[str, Any]] = []
+    top_by_activity: List[Dict[str, Any]] = []
+
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+
+    # Feature adoption tracking
+    feature_keys = [
+        "student_ai_mentor", "admin_question_bank", "tutor_online_class",
+        "stoody_pen_capture", "student_video_lessons", "student_leaderboard_view",
+    ]
+    feature_enabled: Dict[str, int] = {k: 0 for k in feature_keys}
+    feature_active: Dict[str, int] = {k: 0 for k in feature_keys}
+
+    for tenant in tenants:
+        db_name = tenant.get("db_name")
+        if not db_name:
+            continue
+
+        try:
+            tenant_db = await db.get_tenant_db(db_name)
+            if tenant_db is None:
+                continue
+
+            s_count = await tenant_db["students"].count_documents({})
+            t_count = await tenant_db["tutors"].count_documents({})
+            total_students += s_count
+            total_tutors += t_count
+
+            attempts_30d = 0
+            try:
+                practice_30d = await tenant_db["practice_attempts"].count_documents(
+                    {"created_at": {"$gte": thirty_days_ago}}
+                )
+                mcq_30d = await tenant_db["test_attempts"].count_documents(
+                    {"submitted_at": {"$gte": thirty_days_ago}}
+                )
+                attempts_30d = practice_30d + mcq_30d
+            except Exception:
+                pass
+
+            tenant_name = tenant.get("institution_name", "Unknown")
+            tid = str(tenant["_id"])
+
+            top_by_students.append({"tenant_id": tid, "name": tenant_name, "students": s_count})
+            top_by_activity.append({"tenant_id": tid, "name": tenant_name, "attempts_30d": attempts_30d})
+
+            # Feature adoption
+            features_v2 = build_enabled_features_v2(
+                tenant.get("enabled_features_v2"),
+                tenant.get("enabled_features"),
+            )
+            effective = features_v2.get("effective", {})
+            for fk in feature_keys:
+                if effective.get(fk):
+                    feature_enabled[fk] += 1
+                    # Rough activity check
+                    if fk == "student_ai_mentor" and attempts_30d > 0:
+                        feature_active[fk] += 1
+                    elif fk == "admin_question_bank":
+                        try:
+                            q = await tenant_db["questions"].count_documents({})
+                            if q > 0:
+                                feature_active[fk] += 1
+                        except Exception:
+                            pass
+                    elif fk in ("tutor_online_class", "student_video_lessons", "student_leaderboard_view"):
+                        if attempts_30d > 0:
+                            feature_active[fk] += 1
+                    elif fk == "stoody_pen_capture":
+                        try:
+                            sc = await tenant_db["strokes"].count_documents(
+                                {"timestamp": {"$gte": thirty_days_ago}}
+                            )
+                            if sc > 0:
+                                feature_active[fk] += 1
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning("Failed to gather stats for tenant %s: %s", tenant.get("institution_name"), e)
+            continue
+
+    top_by_students.sort(key=lambda x: x["students"], reverse=True)
+    top_by_activity.sort(key=lambda x: x["attempts_30d"], reverse=True)
+
+    total_active = len(tenants)
+    feature_adoption = {}
+    for fk in feature_keys:
+        enabled = feature_enabled[fk]
+        active = feature_active[fk]
+        pct = round(active / enabled * 100, 1) if enabled > 0 else 0
+        feature_adoption[fk] = {
+            "enabled_count": enabled,
+            "active_count": active,
+            "pct": pct,
+        }
+
+    return {
+        "total_active_tenants": total_active,
+        "total_students": total_students,
+        "total_tutors": total_tutors,
+        "top_tenants_by_students": top_by_students[:5],
+        "top_tenants_by_activity": top_by_activity[:5],
+        "feature_adoption": feature_adoption,
+    }

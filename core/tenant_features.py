@@ -347,6 +347,7 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
     ),
     "admin_question_bank": (
         "/api/v1/questions",
+        "/api/v1/paper-builder",
     ),
     "admin_monitoring": (
         "/api/v1/admin/monitoring",
