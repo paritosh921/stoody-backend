@@ -481,19 +481,28 @@ def create_superadmin_token(admin_id: str, email: str) -> str:
     return jwt.encode(payload, SUPERADMIN_JWT_SECRET, algorithm=SUPERADMIN_JWT_ALGORITHM)
 
 
+def _derive_sa_status(doc: Dict[str, Any]) -> str:
+    """Derive status from doc, falling back to is_active for legacy docs."""
+    if "status" in doc:
+        return doc["status"]
+    return "active" if doc.get("is_active", True) else "deactivated"
+
+
 def build_admin_response(admin_doc: Dict[str, Any]) -> Dict[str, Any]:
     two_fa = admin_doc.get("two_fa") or {}
     auth_code = (admin_doc.get("authorization_code") or "").upper()
     if auth_code and not AUTHORIZATION_CODE_PATTERN.match(auth_code):
         logger.warning("Super admin %s has invalid authorization code format", admin_doc.get("email"))
 
+    sa_status = _derive_sa_status(admin_doc)
     return {
         "_id": str(admin_doc["_id"]),
         "email": admin_doc["email"],
         "name": admin_doc.get("name", ""),
         "role": admin_doc.get("role", "super_admin"),
         "permissions": admin_doc.get("permissions", ["all"]),
-        "is_active": bool(admin_doc.get("is_active", True)),
+        "is_active": sa_status == "active",
+        "status": sa_status,
         "requires_password_change": bool(admin_doc.get("requires_password_change", False)),
         "two_fa": {
             "enabled": bool(two_fa.get("enabled", False)),
@@ -516,9 +525,15 @@ async def get_superadmin_by_id_or_401(master_db, admin_id: str) -> Dict[str, Any
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
-    admin = await master_db["super_admins"].find_one({"_id": admin_oid, "is_active": True})
+    admin = await master_db["super_admins"].find_one({"_id": admin_oid})
     if not admin:
         raise HTTPException(status_code=401, detail="Admin not found or inactive")
+
+    sa_status = _derive_sa_status(admin)
+    if sa_status == "suspended":
+        raise HTTPException(status_code=403, detail="Account suspended")
+    if sa_status == "deactivated":
+        raise HTTPException(status_code=403, detail="Account deactivated")
     return admin
 
 
@@ -620,13 +635,16 @@ async def superadmin_login(
 ):
     master_db = await get_master_db_or_503(db)
 
-    admin = await master_db["super_admins"].find_one({
-        "email": request.email,
-        "is_active": True,
-    })
+    admin = await master_db["super_admins"].find_one({"email": request.email})
 
     if not admin or not pwd_context.verify(request.password, admin.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    sa_status = _derive_sa_status(admin)
+    if sa_status == "suspended":
+        raise HTTPException(status_code=403, detail="Account suspended. Contact platform administrator.")
+    if sa_status == "deactivated":
+        raise HTTPException(status_code=403, detail="Account deactivated. Contact platform administrator.")
 
     requires_password_change = bool(admin.get("requires_password_change", False))
     if requires_password_change:

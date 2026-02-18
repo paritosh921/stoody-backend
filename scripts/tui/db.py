@@ -129,10 +129,18 @@ class DB:
 
     # ---- Super-admins ----
 
+    @staticmethod
+    def _derive_sa_status(doc: Dict[str, Any]) -> str:
+        """Derive status from doc, falling back to is_active for legacy docs."""
+        if "status" in doc:
+            return doc["status"]
+        return "active" if doc.get("is_active", True) else "deactivated"
+
     def list_superadmins(self) -> List[Dict[str, Any]]:
         rows = list(self.master["super_admins"].find({}))
         for r in rows:
             r["_id"] = str(r["_id"])
+            r["status"] = self._derive_sa_status(r)
             # count tenants assigned
             r["tenant_count"] = self.master["tenants"].count_documents(
                 {"assigned_superadmin_id": ObjectId(r["_id"])}
@@ -144,6 +152,100 @@ class DB:
         if doc:
             doc["_id"] = str(doc["_id"])
         return doc
+
+    def get_superadmin_by_id(self, sa_id: str) -> Optional[Dict[str, Any]]:
+        doc = self.master["super_admins"].find_one({"_id": ObjectId(sa_id)})
+        if doc:
+            doc["_id"] = str(doc["_id"])
+            doc["status"] = self._derive_sa_status(doc)
+        return doc
+
+    # ---- Super-admin lifecycle management ----
+
+    def _cascade_platform_suspended(self, sa_id: str, suspended: bool) -> int:
+        """Set platform_suspended on all tenants assigned to a super-admin."""
+        now = datetime.utcnow()
+        update: Dict[str, Any] = {"$set": {"platform_suspended": suspended}}
+        if suspended:
+            update["$set"]["platform_suspended_at"] = now
+        else:
+            update["$unset"] = {"platform_suspended_at": ""}
+        result = self.master["tenants"].update_many(
+            {"assigned_superadmin_id": ObjectId(sa_id)},
+            update,
+        )
+        return result.modified_count
+
+    def suspend_superadmin(self, sa_id: str, reason: str = "") -> Dict[str, Any]:
+        """Suspend a super-admin and cascade platform_suspended to their tenants."""
+        now = datetime.utcnow()
+        self.master["super_admins"].update_one(
+            {"_id": ObjectId(sa_id)},
+            {"$set": {
+                "status": "suspended",
+                "is_active": False,
+                "suspended_at": now,
+                "suspended_reason": reason or None,
+            }},
+        )
+        affected = self._cascade_platform_suspended(sa_id, True)
+        return {"status": "suspended", "tenants_affected": affected}
+
+    def activate_superadmin(self, sa_id: str) -> Dict[str, Any]:
+        """Reactivate a super-admin and lift platform_suspended from their tenants."""
+        self.master["super_admins"].update_one(
+            {"_id": ObjectId(sa_id)},
+            {"$set": {"status": "active", "is_active": True},
+             "$unset": {"suspended_at": "", "suspended_reason": "",
+                        "deactivated_at": "", "deactivated_reason": ""}},
+        )
+        affected = self._cascade_platform_suspended(sa_id, False)
+        return {"status": "active", "tenants_affected": affected}
+
+    def deactivate_superadmin(self, sa_id: str, reason: str = "") -> Dict[str, Any]:
+        """Deactivate a super-admin and cascade platform_suspended to their tenants."""
+        now = datetime.utcnow()
+        self.master["super_admins"].update_one(
+            {"_id": ObjectId(sa_id)},
+            {"$set": {
+                "status": "deactivated",
+                "is_active": False,
+                "deactivated_at": now,
+                "deactivated_reason": reason or None,
+            }},
+        )
+        affected = self._cascade_platform_suspended(sa_id, True)
+        return {"status": "deactivated", "tenants_affected": affected}
+
+    def delete_superadmin(self, sa_id: str) -> Dict[str, Any]:
+        """Delete a super-admin, orphan their tenants (set platform_suspended)."""
+        # Orphan tenants: clear assignment and suspend platform access
+        result = self.master["tenants"].update_many(
+            {"assigned_superadmin_id": ObjectId(sa_id)},
+            {"$unset": {"assigned_superadmin_id": ""},
+             "$set": {"platform_suspended": True, "platform_suspended_at": datetime.utcnow()}},
+        )
+        tenants_orphaned = result.modified_count
+        self.master["super_admins"].delete_one({"_id": ObjectId(sa_id)})
+        return {"deleted": True, "tenants_orphaned": tenants_orphaned}
+
+    def assign_all_tenants_to_superadmin(
+        self, sa_id: str, include_all_statuses: bool = False
+    ) -> int:
+        """Assign unassigned tenants to a super-admin. Returns count updated."""
+        query: Dict[str, Any] = {
+            "$or": [
+                {"assigned_superadmin_id": {"$exists": False}},
+                {"assigned_superadmin_id": None},
+            ]
+        }
+        if not include_all_statuses:
+            query["status"] = {"$in": ["active", "approved", "pending"]}
+        result = self.master["tenants"].update_many(
+            query,
+            {"$set": {"assigned_superadmin_id": ObjectId(sa_id)}},
+        )
+        return result.modified_count
 
     # ---- Pricing ----
 

@@ -130,26 +130,40 @@ class TenantMiddleware(BaseHTTPMiddleware):
                 user_data = await auth_manager.verify_token_and_get_user(token)
 
                 if user_data:
-                    required_feature = required_feature_for_path(path, user_data.get("user_type"))
-                    if (
-                        required_feature
-                        and user_data.get("user_type") in {"admin", "tutor", "student"}
+                    is_tenant_user = (
+                        user_data.get("user_type") in {"admin", "tutor", "student"}
                         and user_data.get("tenant_id")
-                    ):
-                        enabled_features = None
-                        enabled_features_v2 = None
+                    )
+                    required_feature = required_feature_for_path(path, user_data.get("user_type"))
+
+                    # Fetch tenant doc for all authenticated tenant users
+                    # (needed for platform_suspended check + feature gating)
+                    tenant_doc = None
+                    if is_tenant_user:
                         try:
                             master_db = await request.app.state.db.get_master_db()
                             tenant_key = str(user_data.get("tenant_id", "")).strip().upper()
                             if master_db is not None and tenant_key:
                                 tenant_doc = await master_db["tenants"].find_one(
                                     {"$or": [{"tenant_id": tenant_key}, {"institution_id": tenant_key}]},
-                                    {"enabled_features": 1, "enabled_features_v2": 1},
+                                    {"enabled_features": 1, "enabled_features_v2": 1,
+                                     "platform_suspended": 1, "status": 1},
                                 )
-                                enabled_features = (tenant_doc or {}).get("enabled_features")
-                                enabled_features_v2 = (tenant_doc or {}).get("enabled_features_v2")
-                        except Exception as feature_load_error:
-                            logger.debug(f"Could not fetch tenant features from master DB: {feature_load_error}")
+                        except Exception as tenant_load_error:
+                            logger.debug(f"Could not fetch tenant doc from master DB: {tenant_load_error}")
+
+                    # Block requests if platform access is suspended by super-admin lifecycle
+                    if tenant_doc and tenant_doc.get("platform_suspended"):
+                        return Response(
+                            content='{"detail":"Platform access suspended. Contact your service provider."}',
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            media_type="application/json",
+                        )
+
+                    # Feature gating check
+                    if required_feature and is_tenant_user:
+                        enabled_features = (tenant_doc or {}).get("enabled_features")
+                        enabled_features_v2 = (tenant_doc or {}).get("enabled_features_v2")
 
                         merged_features = merge_tenant_features(
                             enabled_features or user_data.get("enabled_features"),

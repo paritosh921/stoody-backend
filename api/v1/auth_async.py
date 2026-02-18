@@ -168,6 +168,11 @@ async def _resolve_tenant_for_auth(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tenant is not active"
         )
+    if tenant.get("platform_suspended"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform access suspended. Contact your service provider."
+        )
     return tenant
 
 async def _get_tenant_db_or_503(db: DatabaseManager, tenant: Dict[str, Any]):

@@ -216,6 +216,15 @@ StatCard {
     margin: 1 0;
 }
 
+/* ---- Super-Admins screen ---- */
+
+#sa-status-bar {
+    height: auto;
+    background: $boost;
+    color: $text;
+    padding: 0 1;
+}
+
 /* ---- Global DataTable default ---- */
 
 DataTable {
