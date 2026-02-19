@@ -194,7 +194,7 @@ class SuperAdminScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#sa-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Name", "Email", "Auth Code", "Status", "Tenants", "Last Login")
+        table.add_columns("Name", "Email", "Auth Code", "Status", "Temp Password", "Tenants", "Last Login")
         self._sa_rows: list = []
         self.load_data()
 
@@ -220,11 +220,13 @@ class SuperAdminScreen(Screen):
             if hasattr(last_login, "strftime"):
                 last_login = last_login.strftime("%Y-%m-%d %H:%M")
             sa_status = sa.get("status", "active")
+            temp_pw = sa.get("temp_password", "") if sa.get("requires_password_change") else ""
             table.add_row(
                 sa.get("name", ""),
                 sa.get("email", ""),
                 sa.get("authorization_code", ""),
                 STATUS_DISPLAY.get(sa_status, sa_status),
+                temp_pw,
                 str(sa.get("tenant_count", 0)),
                 str(last_login or "Never"),
             )
@@ -264,8 +266,7 @@ class SuperAdminScreen(Screen):
             info = db.create_superadmin(email, name, authorization_code)
             msg = (
                 f"Created: {info['name']} ({info['email']})  "
-                f"Auth Code: {info['authorization_code']}  "
-                f"Temp Password: {info['temporary_password']}"
+                f"Auth Code: {info['authorization_code']}"
             )
         except Exception as exc:
             msg = f"Error: {exc}"

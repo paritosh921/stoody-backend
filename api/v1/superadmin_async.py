@@ -706,7 +706,10 @@ async def change_superadmin_password(
                 "requires_password_change": False,
                 "password_changed_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
-            }
+            },
+            "$unset": {
+                "temp_password": "",
+            },
         }
     )
 

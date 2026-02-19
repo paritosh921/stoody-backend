@@ -193,6 +193,7 @@ class DB:
             "email": email,
             "name": name.strip(),
             "password_hash": pwd_context.hash(temp_password),
+            "temp_password": temp_password,
             "role": "super_admin",
             "permissions": ["all"],
             "is_active": True,
