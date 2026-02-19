@@ -12,7 +12,7 @@ from datetime import datetime
 from bson import ObjectId
 
 from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response as RawResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, EmailStr
 from slowapi import Limiter
@@ -1649,12 +1649,18 @@ def _serialize_registration_status_message(msg: Dict[str, Any]) -> Dict[str, Any
     for file_doc in attachments:
         if not isinstance(file_doc, dict):
             continue
-        serialized_attachments.append({
+        att_entry: Dict[str, Any] = {
             "filename": file_doc.get("filename"),
             "content_type": file_doc.get("content_type"),
             "size_bytes": file_doc.get("size_bytes"),
-            "data_base64": file_doc.get("data_base64"),
-        })
+        }
+        # Include data_base64 for legacy inline attachments
+        if file_doc.get("data_base64"):
+            att_entry["data_base64"] = file_doc["data_base64"]
+        # Flag S3-stored attachments (don't expose the actual storage path)
+        if file_doc.get("storage_path"):
+            att_entry["stored_on_server"] = True
+        serialized_attachments.append(att_entry)
 
     return {
         "_id": str(msg.get("_id")),
@@ -1951,6 +1957,83 @@ async def send_registration_status_message(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to send message"
+        )
+
+
+@router.post("/admin/registration-message-attachment")
+@limiter.limit("30/minute")
+async def download_registration_message_attachment(
+    request: Request,
+    email: EmailStr = Form(...),
+    password: str = Form(..., min_length=6),
+    message_id: str = Form(...),
+    attachment_index: int = Form(...),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    """
+    Download an attachment from a registration-phase message.
+    Uses email+password auth since tenants are not logged in during registration.
+    """
+    from utils.s3_storage import download_file as s3_download_file
+
+    try:
+        tenant = await _authenticate_registration_status_admin(
+            db=db,
+            auth_manager=auth_manager,
+            email=email,
+            password=password,
+        )
+
+        master_db = await db.get_master_db()
+        if master_db is None:
+            raise HTTPException(status_code=503, detail="Master database unavailable")
+
+        # Find the message and verify it belongs to this tenant
+        msg = await master_db["superadmin_messages"].find_one({
+            "_id": ObjectId(message_id),
+            "tenant_id": tenant["_id"],
+        })
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        attachments = msg.get("attachments") or []
+        if attachment_index < 0 or attachment_index >= len(attachments):
+            raise HTTPException(status_code=404, detail="Attachment not found")
+
+        att = attachments[attachment_index]
+        filename = att.get("filename", "attachment")
+        content_type = att.get("content_type", "application/octet-stream")
+
+        # S3-stored attachment (new format)
+        if att.get("storage_path"):
+            file_data = await s3_download_file(att["storage_path"])
+            if file_data is None:
+                raise HTTPException(status_code=404, detail="Attachment file not found in storage")
+            return RawResponse(
+                content=file_data,
+                media_type=content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # Legacy base64-encoded attachment
+        if att.get("data_base64"):
+            file_data = base64.b64decode(att["data_base64"])
+            return RawResponse(
+                content=file_data,
+                media_type=content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        raise HTTPException(status_code=404, detail="Attachment has no file data")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration attachment download error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to download attachment"
         )
 
 
