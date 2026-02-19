@@ -11,7 +11,8 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from bson import ObjectId
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status, Query
+from fastapi import APIRouter, File, Form, Request, HTTPException, Depends, UploadFile, status, Query
+from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel, Field, EmailStr, field_validator
 
 # Valid grades for students (class 6 to 12)
@@ -3284,7 +3285,7 @@ async def get_superadmin_messages(
     current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Get messages sent from super admin to this tenant"""
+    """Get all messages for this tenant (both directions: SA→admin and admin→SA)"""
     try:
         # Get tenant_id from current user's context
         tenant_id = current_user.get("tenant_id")
@@ -3305,22 +3306,16 @@ async def get_superadmin_messages(
         if not tenant:
             return {"success": True, "messages": [], "unread_count": 0}
 
-        # Build query
-        query = {
-            "tenant_id": tenant["_id"],
-            "$or": [
-                {"direction": {"$exists": False}},
-                {"direction": "superadmin_to_admin"},
-            ],
-        }
+        # Build query — bidirectional: return all messages for this tenant
+        query: Dict[str, Any] = {"tenant_id": tenant["_id"]}
         if unread_only:
             query["read"] = False
 
         # Fetch messages
         messages_cursor = master_db["superadmin_messages"].find(query).sort("created_at", -1)
-        messages = await messages_cursor.to_list(length=50)
+        messages = await messages_cursor.to_list(length=100)
 
-        # Count unread
+        # Count unread — only incoming (superadmin_to_admin) messages count as unread
         unread_count = await master_db["superadmin_messages"].count_documents({
             "tenant_id": tenant["_id"],
             "$or": [
@@ -3424,21 +3419,20 @@ async def mark_superadmin_message_read(
 # ============ ADMIN → SUPER-ADMIN MESSAGING ============
 
 
-class AdminToSuperAdminMessageRequest(BaseModel):
-    subject: str = Field(..., min_length=1, max_length=200)
-    message: str = Field(..., min_length=1)
-    priority: Optional[str] = Field(default="normal", pattern=r'^(low|normal|high|urgent)$')
-
-
 @router.post("/superadmin-messages")
 @limiter.limit("10/minute")
 async def send_message_to_superadmin(
     request: Request,
-    body: AdminToSuperAdminMessageRequest,
+    subject: str = Form(..., min_length=1, max_length=200),
+    message: str = Form(..., min_length=1),
+    priority: str = Form("normal", pattern=r'^(low|normal|high|urgent)$'),
+    attachments: List[UploadFile] = File(default=[]),
     current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
     db: DatabaseManager = Depends(get_database),
 ):
     """Send a message from tenant admin to their assigned super-admin."""
+    from utils.message_attachments import upload_message_attachments
+
     try:
         tenant_id = current_user.get("tenant_id") or current_user.get("institution_id")
         if not tenant_id:
@@ -3458,17 +3452,22 @@ async def send_message_to_superadmin(
         if not superadmin_id:
             raise HTTPException(status_code=400, detail="No super-admin assigned to this tenant")
 
+        # Upload attachments to S3
+        attachment_metadata = await upload_message_attachments(
+            [f for f in attachments if f.filename]
+        )
+
         message_doc = {
             "tenant_id": tenant_doc["_id"],
             "superadmin_id": ObjectId(str(superadmin_id)),
             "from_admin": current_user.get("email", ""),
             "from_name": current_user.get("full_name", current_user.get("name", "")),
             "to_email": "",
-            "subject": body.subject,
-            "message": body.message,
-            "priority": body.priority or "normal",
+            "subject": subject,
+            "message": message,
+            "priority": priority or "normal",
             "direction": "admin_to_superadmin",
-            "attachments": [],
+            "attachments": attachment_metadata,
             "created_at": datetime.utcnow(),
             "read": False,
             "read_at": None,
@@ -3482,3 +3481,76 @@ async def send_message_to_superadmin(
     except Exception as e:
         logger.error(f"Send message to superadmin error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to send message")
+
+
+@router.get("/superadmin-messages/{message_id}/attachments/{attachment_index}")
+@limiter.limit("30/minute")
+async def download_message_attachment(
+    message_id: str,
+    attachment_index: int,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin_permission("view_admin")),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Download an attachment from a superadmin message."""
+    import base64
+    from utils.s3_storage import download_file as s3_download_file
+
+    try:
+        tenant_id = current_user.get("tenant_id")
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="Tenant context not found")
+
+        master_db = await db.get_master_db()
+
+        tenant = await master_db["tenants"].find_one({
+            "$or": [
+                {"institution_id": tenant_id},
+                {"tenant_id": tenant_id}
+            ]
+        })
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+        msg = await master_db["superadmin_messages"].find_one({
+            "_id": ObjectId(message_id),
+            "tenant_id": tenant["_id"],
+        })
+        if not msg:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        attachments = msg.get("attachments") or []
+        if attachment_index < 0 or attachment_index >= len(attachments):
+            raise HTTPException(status_code=404, detail="Attachment not found")
+
+        att = attachments[attachment_index]
+        filename = att.get("filename", "attachment")
+        content_type = att.get("content_type", "application/octet-stream")
+
+        # S3-stored attachment (new format)
+        if att.get("storage_path"):
+            file_data = await s3_download_file(att["storage_path"])
+            if file_data is None:
+                raise HTTPException(status_code=404, detail="Attachment file not found in storage")
+            return RawResponse(
+                content=file_data,
+                media_type=content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # Legacy base64-encoded attachment
+        if att.get("data_base64"):
+            file_data = base64.b64decode(att["data_base64"])
+            return RawResponse(
+                content=file_data,
+                media_type=content_type,
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        raise HTTPException(status_code=404, detail="Attachment has no file data")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Download message attachment error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to download attachment")

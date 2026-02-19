@@ -14,7 +14,7 @@ import jwt
 import pyotp
 from bson import ObjectId
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from passlib.context import CryptContext
@@ -1459,12 +1459,22 @@ async def update_tenant_institution_id(
 @router.post("/tenants/{tenant_id}/messages")
 async def send_message_to_tenant(
     tenant_id: str,
-    request: SendMessageRequest,
+    subject: str = Form(..., min_length=1, max_length=200),
+    message: str = Form(..., min_length=1),
+    priority: str = Form("normal", pattern=r'^(low|normal|high|urgent)$'),
+    attachments: List[UploadFile] = File(default=[]),
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
 ):
+    from utils.message_attachments import upload_message_attachments
+
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    # Upload attachments to S3
+    attachment_metadata = await upload_message_attachments(
+        [f for f in attachments if f.filename]
+    )
 
     message_doc = {
         "tenant_id": ObjectId(tenant_id),
@@ -1473,11 +1483,11 @@ async def send_message_to_tenant(
         "from_admin": admin["email"],
         "from_name": admin["name"],
         "to_email": (tenant.get("admin_email") or "").strip().lower(),
-        "subject": request.subject,
-        "message": request.message,
-        "priority": request.priority,
+        "subject": subject,
+        "message": message,
+        "priority": priority,
         "direction": "superadmin_to_admin",
-        "attachments": [],
+        "attachments": attachment_metadata,
         "created_at": datetime.utcnow(),
         "read": False,
         "read_at": None,
@@ -1548,6 +1558,65 @@ async def delete_tenant_message(
         raise HTTPException(status_code=404, detail="Message not found")
 
     return {"success": True, "deleted_message_id": message_id}
+
+
+@router.get("/tenants/{tenant_id}/messages/{message_id}/attachments/{attachment_index}")
+async def download_tenant_message_attachment(
+    tenant_id: str,
+    message_id: str,
+    attachment_index: int,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Download an attachment from a tenant message (super-admin access)."""
+    import base64
+    from fastapi.responses import Response as RawResponse
+    from utils.s3_storage import download_file as s3_download_file
+
+    master_db = await get_master_db_or_503(db)
+    await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+
+    try:
+        message_oid = ObjectId(message_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    msg = await master_db["superadmin_messages"].find_one({
+        "_id": message_oid,
+        "tenant_id": ObjectId(tenant_id),
+    })
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    attachments = msg.get("attachments") or []
+    if attachment_index < 0 or attachment_index >= len(attachments):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    att = attachments[attachment_index]
+    filename = att.get("filename", "attachment")
+    content_type = att.get("content_type", "application/octet-stream")
+
+    # S3-stored attachment (new format)
+    if att.get("storage_path"):
+        file_data = await s3_download_file(att["storage_path"])
+        if file_data is None:
+            raise HTTPException(status_code=404, detail="Attachment file not found in storage")
+        return RawResponse(
+            content=file_data,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Legacy base64-encoded attachment
+    if att.get("data_base64"):
+        file_data = base64.b64decode(att["data_base64"])
+        return RawResponse(
+            content=file_data,
+            media_type=content_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    raise HTTPException(status_code=404, detail="Attachment has no file data")
 
 
 @router.delete("/tenants/{tenant_id}")

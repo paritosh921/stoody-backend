@@ -103,8 +103,80 @@ class ConfirmActionScreen(ModalScreen[dict | None]):
             self.dismiss(None)
 
 
+class CreateSuperAdminScreen(ModalScreen[dict | None]):
+    """Modal form for creating a new super-admin."""
+
+    DEFAULT_CSS = """
+    CreateSuperAdminScreen {
+        align: center middle;
+    }
+
+    #create-dialog {
+        width: 70;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    .create-title {
+        text-style: bold;
+        text-align: center;
+        width: 100%;
+        height: auto;
+        margin: 0 0 1 0;
+    }
+
+    .create-field {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+
+    .create-buttons {
+        height: auto;
+        align: center middle;
+    }
+
+    .create-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="create-dialog"):
+            yield Static(" Create Super-Admin ", classes="create-title")
+            with Vertical(classes="create-field"):
+                yield Label("Full Name (required):")
+                yield Input(id="input-name", placeholder="e.g. John Doe")
+            with Vertical(classes="create-field"):
+                yield Label("Email (required):")
+                yield Input(id="input-email", placeholder="e.g. admin@example.com")
+            with Vertical(classes="create-field"):
+                yield Label("Authorization Code (leave blank to auto-generate):")
+                yield Input(
+                    id="input-auth-code",
+                    placeholder="6-char uppercase alphanumeric",
+                    max_length=6,
+                )
+            with Horizontal(classes="create-buttons"):
+                yield Button("Create", variant="success", id="btn-create")
+                yield Button("Cancel", variant="primary", id="btn-create-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-create":
+            name = self.query_one("#input-name", Input).value.strip()
+            email = self.query_one("#input-email", Input).value.strip()
+            auth_code = self.query_one("#input-auth-code", Input).value.strip() or None
+            if not name or not email:
+                return  # do nothing if required fields empty
+            self.dismiss({"name": name, "email": email, "authorization_code": auth_code})
+        else:
+            self.dismiss(None)
+
+
 class SuperAdminScreen(Screen):
     BINDINGS = [
+        ("n", "create_sa", "New"),
         ("r", "refresh", "Refresh"),
         ("s", "suspend", "Suspend"),
         ("a", "activate", "Activate"),
@@ -166,6 +238,41 @@ class SuperAdminScreen(Screen):
             self._set_status("No row selected.")
             return None
         return self._sa_rows[table.cursor_row]
+
+    # ---- Create ----
+
+    def action_create_sa(self) -> None:
+        self.app.push_screen(
+            CreateSuperAdminScreen(),
+            callback=self._on_create_result,
+        )
+
+    def _on_create_result(self, result: dict | None) -> None:
+        if result is None:
+            self._set_status("Cancelled.")
+            return
+        self._execute_create(
+            result["name"], result["email"], result.get("authorization_code"),
+        )
+
+    @work(thread=True)
+    def _execute_create(
+        self, name: str, email: str, authorization_code: str | None
+    ) -> None:
+        db = self.app.db  # type: ignore
+        try:
+            info = db.create_superadmin(email, name, authorization_code)
+            msg = (
+                f"Created: {info['name']} ({info['email']})  "
+                f"Auth Code: {info['authorization_code']}  "
+                f"Temp Password: {info['temporary_password']}"
+            )
+        except Exception as exc:
+            msg = f"Error: {exc}"
+
+        self.app.call_from_thread(self._set_status, msg)
+        rows = db.list_superadmins()
+        self.app.call_from_thread(self._populate, rows)
 
     # ---- Lifecycle actions ----
 

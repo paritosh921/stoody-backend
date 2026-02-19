@@ -11,6 +11,14 @@ from typing import Any, Dict, List, Optional
 from bson import ObjectId
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+
+from scripts.admin.create_superadmin import (
+    ensure_indexes,
+    generate_temp_password,
+    normalize_email,
+    resolve_unique_auth_code,
+)
 
 load_dotenv()
 
@@ -159,6 +167,59 @@ class DB:
             doc["_id"] = str(doc["_id"])
             doc["status"] = self._derive_sa_status(doc)
         return doc
+
+    def create_superadmin(
+        self, email: str, name: str, authorization_code: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Create a new super-admin. Reuses logic from scripts.admin.create_superadmin."""
+        from passlib.context import CryptContext
+
+        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        col = self.master["super_admins"]
+        ensure_indexes(col)
+
+        email = normalize_email(email)
+        if "@" not in email:
+            raise ValueError("Invalid email format.")
+
+        if col.find_one({"email": email}):
+            raise ValueError(f"Super-admin with email '{email}' already exists.")
+
+        auth_code = resolve_unique_auth_code(col, authorization_code)
+        temp_password = generate_temp_password()
+        now = datetime.utcnow()
+
+        insert_doc = {
+            "email": email,
+            "name": name.strip(),
+            "password_hash": pwd_context.hash(temp_password),
+            "role": "super_admin",
+            "permissions": ["all"],
+            "is_active": True,
+            "status": "active",
+            "authorization_code": auth_code,
+            "requires_password_change": True,
+            "password_changed_at": None,
+            "created_at": now,
+            "updated_at": now,
+            "two_fa": {
+                "enabled": False,
+                "required": True,
+                "secret_enc": None,
+                "temp_secret_enc": None,
+                "verified_at": None,
+                "last_verified_at": None,
+            },
+        }
+
+        result = col.insert_one(insert_doc)
+        return {
+            "admin_id": str(result.inserted_id),
+            "email": email,
+            "name": name.strip(),
+            "authorization_code": auth_code,
+            "temporary_password": temp_password,
+        }
 
     # ---- Super-admin lifecycle management ----
 
