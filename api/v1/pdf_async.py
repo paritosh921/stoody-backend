@@ -1,6 +1,6 @@
 """
 Async PDF Processing API for SkillBot
-PDF upload and OCR processing endpoints with Mistral AI integration
+PDF upload and OCR processing endpoints with Sarvam AI Document Intelligence
 """
 
 import logging
@@ -42,9 +42,9 @@ router = APIRouter()
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
-# Mistral OCR API configuration
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
+# Sarvam AI Document Intelligence configuration
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+OCR_FALLBACK_MODEL = os.getenv("OCR_FALLBACK_MODEL", "gpt-5-mini")
 
 # IMPORTANT: Grade/Standard matching uses EXACT string matching
 # Both student.grade and document.standard should come from the same admin settings
@@ -53,7 +53,7 @@ MISTRAL_OCR_URL = "https://api.mistral.ai/v1/ocr"
 # No normalization or fuzzy matching is needed or desired
 
 # Pydantic models
-class MistralOCRImage(BaseModel):
+class OCRImage(BaseModel):
     id: str
     top_left_x: int
     top_left_y: int
@@ -61,10 +61,10 @@ class MistralOCRImage(BaseModel):
     bottom_right_y: int
     image_base64: Optional[str] = None
 
-class MistralOCRPage(BaseModel):
+class OCRPage(BaseModel):
     index: int
     markdown: str
-    images: List[MistralOCRImage]
+    images: List[OCRImage]
     dimensions: Dict[str, Any]
 
 class ExtractedQuestion(BaseModel):
@@ -86,7 +86,7 @@ class PDFProcessingResult(BaseModel):
     output_folder: Optional[str] = None
     error: Optional[str] = None
     timestamp: datetime
-    pages: Optional[List[MistralOCRPage]] = None
+    pages: Optional[List[OCRPage]] = None
 
 class QuestionImage(BaseModel):
     id: str
@@ -134,77 +134,411 @@ def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
     return current_user.get("user_type") == "b2c_admin"
 
-async def call_mistral_ocr(pdf_base64: str) -> Dict[str, Any]:
-    """Call Mistral OCR API with base64 PDF data"""
-    import aiohttp
+async def call_gpt_vision_ocr(file_content: bytes) -> Dict[str, Any]:
+    """
+    OCR using GPT Vision. Renders PDF pages and extracts text via GPT.
+    All pages are processed IN PARALLEL for speed.
+    Figures are detected deterministically with OpenCV after OCR.
+    """
+    import fitz  # PyMuPDF
+    from openai import AsyncOpenAI
 
-    # Validate API key
-    if not MISTRAL_API_KEY:
-        logger.error("MISTRAL_API_KEY is not configured in environment variables")
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        raise Exception("OPENAI_API_KEY is not configured — cannot use GPT Vision fallback")
+
+    client = AsyncOpenAI(api_key=openai_key)
+    print(f"[GPT-OCR] Starting OCR (PDF size: {len(file_content)} bytes)", flush=True)
+
+    doc = fitz.open(stream=file_content, filetype="pdf")
+    total_pages = len(doc)
+    print(f"[GPT-OCR] PDF has {total_pages} page(s) — processing all in parallel", flush=True)
+
+    # Step 1: Render all pages to images (CPU-bound, fast)
+    page_renders = []
+    for page_idx in range(total_pages):
+        page = doc[page_idx]
+        mat = fitz.Matrix(200 / 72, 200 / 72)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        page_b64 = base64.b64encode(img_bytes).decode("utf-8")
+        page_renders.append({
+            "index": page_idx,
+            "b64": page_b64,
+            "width": pix.width,
+            "height": pix.height,
+        })
+    doc.close()
+    print(f"[GPT-OCR] Rendered {total_pages} pages, sending to GPT in parallel...", flush=True)
+
+    ocr_prompt = (
+        "Extract ALL text from this exam paper page as clean markdown.\n"
+        "Rules:\n"
+        "- Keep question numbers with a dot: 1. 2. 3. and on the SAME line as question text\n"
+        "- Keep option labels exactly: (a), (b), a), b), A., B. etc.\n"
+        "- Preserve LaTeX math: $...$ inline, $$...$$ display\n"
+        "- Preserve Hindi/regional text as-is\n"
+        "- For diagrams/figures, write: [FIGURE]\n"
+        "- Output ONLY the extracted text, no explanations"
+    )
+
+    # Step 2: OCR all pages in parallel
+    async def ocr_single_page(pr: Dict) -> Dict:
+        page_idx = pr["index"]
+        try:
+            response = await client.chat.completions.create(
+                model=OCR_FALLBACK_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ocr_prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/png;base64,{pr['b64']}",
+                            "detail": "high"
+                        }}
+                    ]
+                }],
+                max_completion_tokens=4096,
+            )
+            md = response.choices[0].message.content or ""
+            print(f"[GPT-OCR] Page {page_idx + 1}: {len(md)} chars", flush=True)
+            return {"index": page_idx, "markdown": md, "b64": pr["b64"], "w": pr["width"], "h": pr["height"]}
+        except Exception as e:
+            print(f"[GPT-OCR] Page {page_idx + 1} failed: {e}", flush=True)
+            return {"index": page_idx, "markdown": "", "b64": pr["b64"], "w": pr["width"], "h": pr["height"]}
+
+    ocr_results = await asyncio.gather(*[ocr_single_page(pr) for pr in page_renders])
+    ocr_results.sort(key=lambda r: r["index"])  # maintain page order
+
+    # Build final result — figures are detected deterministically with OpenCV
+    # in _extract_figures_for_questions() after question extraction.
+    pages_result = []
+    for r in ocr_results:
+        pages_result.append({
+            "index": r["index"],
+            "markdown": r["markdown"],
+            "images": [],  # figures added later by _extract_figures_for_questions
+            "page_render": r["b64"],
+            "dimensions": {"dpi": 200, "width": r["w"], "height": r["h"]}
+        })
+
+    print(f"[GPT-OCR] Done! {total_pages} pages OCR'd (figures detected with OpenCV later)", flush=True)
+    return {"pages": pages_result}
+
+
+async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
+    """
+    Call Sarvam AI Document Intelligence API with raw PDF bytes.
+    Falls back to GPT Vision if Sarvam fails.
+
+    Returns the same structure as the old Mistral OCR for downstream compatibility:
+    {
+        "pages": [
+            {
+                "index": 0,
+                "markdown": "extracted text...",
+                "images": [{"id": "img-0-0", "image_base64": "...", ...}],
+                "dimensions": {"dpi": 150, "width": 0, "height": 0}
+            }
+        ]
+    }
+    """
+    # --- GPT Vision as primary OCR provider (Sarvam disabled) ---
+    print("[OCR] Using GPT Vision as primary OCR provider...", flush=True)
+    try:
+        result = await call_gpt_vision_ocr(file_content)
+        print("[OCR] Provider: GPT Vision", flush=True)
+        return result
+    except Exception as gpt_err:
+        logger.error(f"GPT Vision OCR failed: {gpt_err}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Mistral API key is not configured. Please set MISTRAL_API_KEY in environment variables."
+            detail=f"GPT Vision OCR failed: {gpt_err}"
         )
+
+    # --- Sarvam AI disabled — uncomment below and remove the block above to re-enable ---
+    # if not SARVAM_API_KEY:
+    #     logger.warning("SARVAM_API_KEY is not configured, skipping Sarvam — trying GPT Vision directly")
+    #     print("[OCR] SARVAM_API_KEY not set, using GPT Vision directly...", flush=True)
+    #     try:
+    #         result = await call_gpt_vision_ocr(file_content)
+    #         print("[OCR] Provider: GPT Vision (no Sarvam key)", flush=True)
+    #         return result
+    #     except Exception as gpt_err:
+    #         logger.error(f"GPT Vision OCR failed (no Sarvam key): {gpt_err}")
+    #         raise HTTPException(
+    #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #             detail=f"Sarvam API key not configured and GPT Vision fallback failed: {gpt_err}"
+    #         )
+
+    # Sarvam can take 3-5 minutes for large PDFs — use generous timeout
+    sarvam_timeout = max(OCR_TIMEOUT_SECONDS, 600)  # At least 10 minutes
+
+    def _run_sarvam_sync() -> Dict[str, Any]:
+        """Run synchronous Sarvam SDK calls (executed in thread pool)."""
+        import tempfile
+        import zipfile
+        import time as _time
+        from sarvamai import SarvamAI
+
+        print(f"[SARVAM] Starting OCR (PDF size: {len(file_content)} bytes)", flush=True)
+        logger.info(f"Calling Sarvam AI Document Intelligence (PDF size: {len(file_content)} bytes)")
+
+        client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+        start_time = _time.time()
+
+        # Save PDF to temp file (Sarvam SDK needs a file path)
+        tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+        try:
+            with os.fdopen(tmp_pdf_fd, "wb") as tmp_pdf:
+                tmp_pdf.write(file_content)
+
+            # Create document intelligence job
+            print("[SARVAM] Creating job...", flush=True)
+            job = client.document_intelligence.create_job(
+                language="en-IN",
+                output_format="html"
+            )
+            print(f"[SARVAM] Job created: {job.job_id}", flush=True)
+            logger.info(f"Sarvam job created: {job.job_id}")
+
+            # Upload and start processing
+            job.upload_file(tmp_pdf_path)
+            print("[SARVAM] File uploaded, starting processing...", flush=True)
+            logger.info("Sarvam: File uploaded, starting processing...")
+            job.start()
+            print("[SARVAM] Job started, polling for completion...", flush=True)
+
+            # Poll with get_status() instead of wait_until_complete() for better control
+            completed_states = {"completed", "Completed", "COMPLETED"}
+            failed_states = {"failed", "Failed", "FAILED", "error", "Error", "ERROR"}
+            max_polls = 180  # 180 x 5s = 15 minutes max
+            poll_interval = 5  # seconds
+
+            for poll_num in range(1, max_polls + 1):
+                _time.sleep(poll_interval)
+                elapsed = _time.time() - start_time
+
+                try:
+                    job_status = job.get_status()
+                    state = job_status.job_state
+                    print(f"[SARVAM] Poll {poll_num}: state={state} ({elapsed:.0f}s)", flush=True)
+
+                    if state in completed_states:
+                        logger.info(f"Sarvam job completed in {elapsed:.0f}s")
+                        break
+                    elif state in failed_states:
+                        raise Exception(f"Sarvam job failed with state: {state}")
+                except AttributeError:
+                    # If get_status() not available, fall back to wait_until_complete
+                    print(f"[SARVAM] get_status() not available, using wait_until_complete()", flush=True)
+                    job.wait_until_complete()
+                    logger.info(f"Sarvam job completed via wait_until_complete in {elapsed:.0f}s")
+                    break
+            else:
+                raise Exception(f"Sarvam job did not complete after {max_polls * poll_interval}s")
+
+            # Download output ZIP
+            tmp_out_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
+            os.close(tmp_out_fd)
+            try:
+                print("[SARVAM] Downloading output...", flush=True)
+                job.download_output(tmp_zip_path)
+                zip_size = os.path.getsize(tmp_zip_path)
+                print(f"[SARVAM] Output downloaded ({zip_size} bytes), parsing...", flush=True)
+                logger.info(f"Sarvam output downloaded ({zip_size} bytes)")
+
+                result = _parse_sarvam_zip(tmp_zip_path)
+                total_time = _time.time() - start_time
+                print(f"[SARVAM] Done! {len(result.get('pages', []))} pages, {sum(len(p.get('images', [])) for p in result.get('pages', []))} images ({total_time:.0f}s total)", flush=True)
+                return result
+            finally:
+                if os.path.exists(tmp_zip_path):
+                    os.unlink(tmp_zip_path)
+        except Exception as e:
+            print(f"[SARVAM] ERROR: {type(e).__name__}: {e}", flush=True)
+            raise
+        finally:
+            if os.path.exists(tmp_pdf_path):
+                os.unlink(tmp_pdf_path)
 
     try:
-        document_url = f"data:application/pdf;base64,{pdf_base64}"
-
-        headers = {
-            "Authorization": f"Bearer {MISTRAL_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": "mistral-ocr-2512",
-            "document": {
-                "type": "document_url",
-                "document_url": document_url
-            },
-            "include_image_base64": True
-        }
-
-        # Log request without base64 data
-        logger.info(f"Calling Mistral OCR API (PDF size: {len(pdf_base64)} chars)")
-
-        # Create session with trace disabled to prevent logging base64
-        async with aiohttp.ClientSession(trace_configs=[]) as session:
-            async with session.post(
-                MISTRAL_OCR_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=OCR_TIMEOUT_SECONDS)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Mistral OCR API error: {response.status} - {error_text}")
-                    raise HTTPException(
-                        status_code=response.status,
-                        detail=f"Mistral OCR API error: {error_text}"
-                    )
-
-                return await response.json()
-
-    except HTTPException:
-        # Re-raise HTTPException without wrapping it
-        raise
-    except asyncio.TimeoutError:
-        logger.error("Mistral OCR API timeout")
-        raise HTTPException(
-            status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail="OCR processing timeout"
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _run_sarvam_sync),
+            timeout=sarvam_timeout
         )
-    except aiohttp.ClientError as e:
-        logger.error(f"Mistral OCR API client error: {type(e).__name__} - {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"OCR API connection error: {str(e)}"
+        logger.info(f"Sarvam OCR completed: {len(result.get('pages', []))} pages extracted")
+        print("[OCR] Provider: Sarvam AI", flush=True)
+        return result
+    except Exception as sarvam_err:
+        print(f"[OCR] Sarvam failed ({type(sarvam_err).__name__}), falling back to GPT Vision...", flush=True)
+        logger.warning(f"Sarvam OCR failed ({type(sarvam_err).__name__}: {sarvam_err}), attempting GPT Vision fallback")
+        try:
+            result = await call_gpt_vision_ocr(file_content)
+            print("[OCR] Provider: GPT Vision (fallback)", flush=True)
+            logger.info(f"GPT Vision fallback succeeded: {len(result.get('pages', []))} pages extracted")
+            return result
+        except Exception as gpt_err:
+            print(f"[OCR] GPT Vision also failed: {gpt_err}", flush=True)
+            logger.error(f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}"
+            )
+
+
+def _parse_sarvam_zip(zip_path: str) -> Dict[str, Any]:
+    """Parse Sarvam output ZIP using metadata JSON for text (preserves LaTeX)
+    and HTML for base64 images.
+
+    Metadata JSON gives us clean OCR text with layout info and reading order.
+    HTML is only used to extract embedded base64 images.
+    """
+    import zipfile
+    import json
+    import re as _re
+
+    pages: List[Dict[str, Any]] = []
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        file_list = zf.namelist()
+
+        # ── Collect base64 images from HTML + standalone image files ──
+        html_images: List[str] = []  # ordered base64 strings
+        html_files = [f for f in file_list if f.lower().endswith(".html")]
+        if html_files:
+            html_content = zf.read(html_files[0]).decode("utf-8")
+            for m in _re.finditer(
+                r'<img[^>]+src="data:image/[^;]+;base64,([^"]+)"', html_content
+            ):
+                html_images.append(m.group(1))
+
+        image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+        for entry in sorted(file_list):
+            if entry.lower().endswith(image_exts):
+                img_data = zf.read(entry)
+                html_images.append(base64.b64encode(img_data).decode("utf-8"))
+
+        # ── Read metadata JSON files (preferred path) ──
+        meta_files = sorted(
+            f for f in file_list if f.startswith("metadata/") and f.endswith(".json")
         )
-    except Exception as e:
-        logger.error(f"Mistral OCR API unexpected error: {type(e).__name__} - {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"OCR processing failed: {str(e)}"
-        )
+
+        if not meta_files:
+            # Fallback: old HTML-based conversion
+            logger.warning("No metadata JSON in Sarvam ZIP, falling back to HTML")
+            try:
+                import html2text
+                h2t = html2text.HTML2Text()
+                h2t.body_width = 0
+                h2t.unicode_snob = True
+                h2t.images_to_alt = False
+                h2t.single_line_break = False
+                for idx, hf in enumerate(html_files):
+                    pages.append({
+                        "index": idx,
+                        "markdown": h2t.handle(zf.read(hf).decode("utf-8")),
+                        "images": [],
+                        "dimensions": {"dpi": 150, "width": 0, "height": 0},
+                    })
+            except ImportError:
+                logger.error("html2text not installed and no metadata JSON available")
+            return {"pages": pages}
+
+        global_img_idx = 0  # tracks which HTML image to assign next
+        print(f"[SARVAM-PARSE] ZIP files: {file_list}", flush=True)
+        print(f"[SARVAM-PARSE] {len(meta_files)} metadata files, {len(html_images)} HTML images", flush=True)
+
+        for meta_file in meta_files:
+            meta = json.loads(zf.read(meta_file).decode("utf-8"))
+            page_num = meta.get("page_num", 1)
+            page_idx = page_num - 1
+            img_w = meta.get("image_width", 0)
+            img_h = meta.get("image_height", 0)
+
+            # Sort blocks by reading_order (they arrive sorted by confidence)
+            blocks = sorted(
+                meta.get("blocks", []),
+                key=lambda b: b.get("reading_order", 0),
+            )
+            print(f"[SARVAM-PARSE] Page {page_idx}: {len(blocks)} blocks", flush=True)
+
+            page_imgs: List[Dict[str, Any]] = []
+            md_parts: List[str] = []
+
+            for block in blocks:
+                tag = block.get("layout_tag", "paragraph")
+                text = (block.get("text") or "").strip()
+                coords = block.get("coordinates", {})
+                ro = block.get("reading_order", 0)
+                preview = text[:80].replace('\n', '\\n') if text else "(empty)"
+                print(f"[SARVAM-PARSE]   [{ro:2d}] {tag:15s} | {preview}", flush=True)
+
+                if tag == "image":
+                    img_id = f"img-{page_idx}-{len(page_imgs)}"
+                    if global_img_idx < len(html_images):
+                        page_imgs.append({
+                            "id": img_id,
+                            "image_base64": html_images[global_img_idx],
+                            "top_left_x": int(coords.get("x1", 0)),
+                            "top_left_y": int(coords.get("y1", 0)),
+                            "bottom_right_x": int(coords.get("x2", 0)),
+                            "bottom_right_y": int(coords.get("y2", 0)),
+                        })
+                        global_img_idx += 1
+                    md_parts.append(f"![{img_id}]({img_id})")
+                elif tag == "formula":
+                    md_parts.append(text if text.startswith("$$") else f"$$ {text} $$")
+                elif tag in ("section-title", "headline"):
+                    md_parts.append(f"## {text}")
+                elif tag == "table":
+                    # Convert HTML table to plain text with question numbers.
+                    # Many Indian exam papers are formatted as tables:
+                    #   <td>Q.No</td><td>Question text</td><td>Marks</td>
+                    tbl = (text or "").replace("<br/>", "\n").replace("<br>", "\n")
+                    rows = _re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, _re.DOTALL | _re.IGNORECASE)
+                    tbl_lines: List[str] = []
+                    for row in rows:
+                        cells = _re.findall(
+                            r"<t[dh][^>]*>(.*?)</t[dh]>", row, _re.DOTALL | _re.IGNORECASE
+                        )
+                        clean = [_re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+                        if not any(clean):
+                            continue
+                        # First cell is a question number → "N. question_text"
+                        if (
+                            clean[0]
+                            and _re.match(r"^\d{1,3}$", clean[0])
+                            and len(clean) > 1
+                            and clean[1]
+                        ):
+                            tbl_lines.append(f"{clean[0]}. {clean[1]}")
+                        else:
+                            combined = " ".join(c for c in clean if c)
+                            if combined:
+                                tbl_lines.append(combined)
+                    print(f"[SARVAM-PARSE]   Table converted: {len(rows)} rows -> {len(tbl_lines)} text lines", flush=True)
+                    for tl in tbl_lines[:3]:
+                        preview = tl[:100].replace('\n', '\\n')
+                        print(f"[SARVAM-PARSE]     => {preview}", flush=True)
+                    if tbl_lines:
+                        md_parts.append("\n\n".join(tbl_lines))
+                else:  # paragraph, footnote, etc.
+                    if text:
+                        md_parts.append(text)
+
+            pages.append({
+                "index": page_idx,
+                "markdown": "\n\n".join(md_parts),
+                "images": page_imgs,
+                "dimensions": {"dpi": 150, "width": int(img_w), "height": int(img_h)},
+            })
+
+    logger.info(
+        f"Parsed Sarvam ZIP (metadata): {len(pages)} pages, "
+        f"{sum(len(p['images']) for p in pages)} images"
+    )
+    return {"pages": pages}
 
 def split_composite_image(image_data: bytes, image_id: str) -> List[bytes]:
     """
@@ -474,417 +808,533 @@ async def save_image_to_disk(
         logger.error(f"Failed to save image {image_id}: {str(e)}")
         return []
 
-def extract_questions_from_ocr(
+async def extract_questions_with_gpt(
     ocr_result: Dict[str, Any],
     subject: str,
     difficulty: str,
-    skip_option_extraction: bool = False  # When True, keep options in question text (for Practice Sets)
+    skip_option_extraction: bool = False
 ) -> List[ExtractedQuestion]:
-    """Extract questions from Mistral OCR result.
-    
-    Args:
-        ocr_result: The raw OCR result from Mistral
-        subject: Subject of the document
-        difficulty: Difficulty level
-        skip_option_extraction: If True, don't extract options separately - keep them in question text.
-                               This is used for Practice Sets where we want the full question with options
-                               to be displayed inline.
     """
-    questions = []
-    
-    # ------------------------------
-    # Helper: generic LaTeX + text normalisation
-    # ------------------------------
-    import re
+    Use GPT to extract structured questions from OCR text.
+    Works with ANY question paper format — no hardcoded regex patterns.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
 
-    # Match inline/display LaTeX blocks
-    _MATH_BLOCK_RE = re.compile(r"(\$\$[\s\S]*?\$\$|\$[^$\n]+?\$|\\\[[\s\S]*?\\\]|\\\([^)]*?\\\))")
+    pages = ocr_result.get("pages", [])
+    if not pages:
+        return []
 
-    # Characters typically present in a plain rendered math echo (no natural language)
-    _MATHY_TEXT_RE = re.compile(r"^[\s0-9A-Za-z_\^\-\+=*/()\[\]{}|.,:×·%°<>²³⁴⁵⁶⁷⁸⁹⁰⁻⁺±∞≤≥≠≈√⁄~]*$")
+    # Build full text with page markers so GPT can report which page each question is on
+    full_text = ""
+    for page in pages:
+        pidx = page.get("index", 0)
+        md = page.get("markdown", "")
+        full_text += f"\n=== PAGE {pidx} ===\n{md}"
 
-    def _dedupe_latex_echo(text: str) -> str:
-        """If a string contains LaTeX and an immediate plain-text echo of the
-        same formula, prefer keeping the LaTeX only.
+    print(f"[GPT-EXTRACT] Sending {len(full_text)} chars from {len(pages)} pages for question extraction", flush=True)
 
-        The heuristic is conservative:
-        - Detect one or more LaTeX blocks
-        - Compute the residual (non-LaTeX) text
-        - If residual appears to be purely math-like (no words) keep only the LaTeX blocks
-        - Otherwise, return the original text
-        """
-        if not text:
-            return text
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        raise Exception("OPENAI_API_KEY not configured — cannot extract questions")
 
-        parts = _MATH_BLOCK_RE.split(text)
-        if len(parts) == 1:
-            # No LaTeX blocks
-            return text
+    client = AsyncOpenAI(api_key=openai_key)
 
-        latex_blocks = [p for p in parts if _MATH_BLOCK_RE.match(p)]
-        non_latex = "".join(p for p in parts if not _MATH_BLOCK_RE.match(p)).strip()
+    extraction_prompt = (
+        "You are a question paper parser. Extract ONLY the questions from the text below.\n\n"
+        "RULES:\n"
+        "- Extract every question (MCQ, subjective, fill-in-the-blank, true/false, assertion-reason, case study, etc.)\n"
+        "- Ignore headers, instructions, school name, exam title, general instructions, section headers, marks info\n"
+        "- For MCQs: separate the question text from the options\n"
+        "- For subjective questions: include the full question text, leave options as empty array\n"
+        "- IMPORTANT: If a question has sub-parts (a, b, c or i, ii, iii or (1), (2) etc.), keep them as ONE question. Include ALL sub-parts in the question text. Do NOT split sub-parts into separate questions.\n"
+        "- For case study / passage-based questions: include the passage/context + ALL sub-questions as ONE question\n"
+        "- If a question has an OR alternative, include the OR part in the same question text\n"
+        "- Preserve ALL math notation, LaTeX, symbols, superscripts, subscripts exactly as they appear\n"
+        "- Preserve Hindi or regional language text exactly as-is\n"
+        "- If a question references a figure/diagram/graph/image/table, set has_figure to true\n"
+        "- Report the page number (from the === PAGE N === markers) where each question starts\n\n"
+        "Return ONLY valid JSON in this exact format (no markdown fences, no explanation):\n"
+        '{"questions": [\n'
+        '  {"number": "1", "text": "full question text here", "options": ["option a", "option b", "option c", "option d"], "page": 0, "has_figure": false},\n'
+        '  {"number": "27", "text": "(a) first sub-part here\\n(b) second sub-part here", "options": [], "page": 3, "has_figure": true}\n'
+        "]}\n\n"
+        "--- DOCUMENT TEXT ---\n"
+        f"{full_text}"
+    )
 
-        # If we have LaTeX and the rest is only mathy symbols/digits (likely OCR echo), drop it
-        if latex_blocks and (not non_latex or _MATHY_TEXT_RE.match(non_latex)):
-            # Join multiple LaTeX blocks with a space to preserve intent
-            return " ".join(latex_blocks).strip()
+    # Try extraction with retry — model can return empty responses
+    raw_response = ""
+    max_retries = 2
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await client.chat.completions.create(
+                model=OCR_FALLBACK_MODEL,
+                messages=[{"role": "user", "content": extraction_prompt}],
+                max_completion_tokens=16384,
+            )
+            raw_response = response.choices[0].message.content or ""
+            print(f"[GPT-EXTRACT] Attempt {attempt}: got {len(raw_response)} chars", flush=True)
+            if raw_response.strip():
+                break
+            if attempt < max_retries:
+                print(f"[GPT-EXTRACT] Empty response, retrying...", flush=True)
+        except Exception as e:
+            print(f"[GPT-EXTRACT] Attempt {attempt} failed: {e}", flush=True)
+            if attempt >= max_retries:
+                logger.error(f"GPT question extraction failed after {max_retries} attempts: {e}")
+                return []
 
-        # Additional check: if the text starts with LaTeX and contains rendered math symbols, 
-        # extract only the LaTeX part
-        if latex_blocks and any(char in non_latex for char in '⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺±×÷∞≤≥≠≈√⁄'):
-            return " ".join(latex_blocks).strip()
+    if not raw_response.strip():
+        print(f"[GPT-EXTRACT] All {max_retries} attempts returned empty response", flush=True)
+        return []
 
-        return text
+    # Parse JSON — handle markdown fences if GPT wraps it
+    raw_response = raw_response.strip()
+    if raw_response.startswith("```"):
+        raw_response = raw_response.split("\n", 1)[-1]  # remove first ```json line
+        if raw_response.endswith("```"):
+            raw_response = raw_response[:-3].strip()
 
-    def _clean_option_text(text: str) -> str:
-        # Normalise whitespace
-        t = re.sub(r"\s+", " ", (text or "")).strip()
-        # Remove duplicated plain echo when LaTeX is present
-        t = _dedupe_latex_echo(t)
-        return t
-    # Parse pages from OCR result
+    try:
+        data = _json.loads(raw_response)
+    except _json.JSONDecodeError as e:
+        logger.error(f"Failed to parse GPT extraction response as JSON: {e}")
+        print(f"[GPT-EXTRACT] JSON parse error: {e}", flush=True)
+        print(f"[GPT-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
+        return []
+
+    raw_questions = data.get("questions", [])
+    print(f"[GPT-EXTRACT] Parsed {len(raw_questions)} questions from GPT response", flush=True)
+
+    # Build page → image IDs map from OCR result so we can associate real image IDs
+    page_image_ids: Dict[int, List[str]] = {}
+    for page in pages:
+        pidx = page.get("index", 0)
+        img_ids = [img.get("id", "") for img in page.get("images", []) if img.get("image_base64")]
+        if img_ids:
+            page_image_ids[pidx] = img_ids
+    if page_image_ids:
+        print(f"[GPT-EXTRACT] Page image map: {page_image_ids}", flush=True)
+
+    questions: List[ExtractedQuestion] = []
+    for q in raw_questions:
+        q_text = q.get("text", "").strip()
+        if not q_text:
+            continue
+
+        q_num = q.get("number", "")
+        q_page = q.get("page", 0)
+        options = q.get("options", [])
+        has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
+
+        # Use real image IDs from the page if this question references a figure
+        if has_image and q_page in page_image_ids:
+            img_refs = page_image_ids[q_page]
+        else:
+            img_refs = []
+
+        # For Practice Sets mode, inline options into the question text
+        if skip_option_extraction and options:
+            inline = q_text + "\n\n"
+            for i, opt in enumerate(options):
+                inline += f"({chr(65 + i)}) {opt}\n"
+            questions.append(ExtractedQuestion(
+                id=str(uuid.uuid4()),
+                text=inline.strip(),
+                options=[],
+                metadata={
+                    "subject": subject,
+                    "difficulty": difficulty,
+                    "page": q_page,
+                    "question_number": q_num,
+                    "has_figure": has_image,
+                    "image_refs": img_refs,
+                    "question_image_refs": img_refs,
+                    "is_image_based_mcq": False,
+                    "options_inline": True,
+                },
+            ))
+        else:
+            questions.append(ExtractedQuestion(
+                id=str(uuid.uuid4()),
+                text=q_text,
+                options=[o for o in options if o.strip()],
+                metadata={
+                    "subject": subject,
+                    "difficulty": difficulty,
+                    "page": q_page,
+                    "question_number": q_num,
+                    "has_figure": has_image,
+                    "image_refs": img_refs,
+                    "question_image_refs": img_refs,
+                    "is_image_based_mcq": False,
+                },
+            ))
+
+        q_preview = q_text[:80].replace('\n', ' | ')
+        fig_flag = " [HAS_FIGURE]" if has_image else ""
+        print(f"[GPT-EXTRACT]   Q#{q_num} p{q_page}: \"{q_preview}\" opts={len(options)}{fig_flag}", flush=True)
+
+    # Validation: warn if extracted count seems low for the number of pages
+    expected_min = max(1, len(pages) * 2)  # heuristic: at least 2 questions per page
+    if len(questions) < expected_min:
+        print(
+            f"[GPT-EXTRACT] WARNING: Only {len(questions)} questions extracted from "
+            f"{len(pages)} pages (expected at least ~{expected_min}). "
+            f"Response may be truncated.",
+            flush=True
+        )
+        logger.warning(
+            f"Low question count: {len(questions)} from {len(pages)} pages "
+            f"(expected >= {expected_min})"
+        )
+
+    logger.info(f"GPT extracted {len(questions)} questions from {len(pages)} pages")
+    return questions
+
+
+async def _llm_assign_candidates(
+    questions: List[ExtractedQuestion],
+    candidates: List,  # List[FigureCandidate] — imported at call site
+    page_index: int,
+) -> Dict[str, Any]:
+    """
+    Use gpt-5.2-mini to assign figure candidates to questions on ambiguous pages.
+
+    Sends candidate crop thumbnails (detail="low") + question list and asks the
+    model to return {assignments: [{qid, candidate_id}]} — just mapping, no
+    bounding-box coordinates.
+
+    Returns dict mapping question id → FigureCandidate.
+    On any failure returns {} (non-fatal — questions just lack figures).
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    openai_key = os.getenv("OPENAI_API_KEY", "")
+    if not openai_key:
+        return {}
+
+    client = AsyncOpenAI(api_key=openai_key)
+
+    # Build content blocks: candidate images + question list
+    content_blocks: List[Dict[str, Any]] = []
+
+    # Add candidate images
+    for cand in candidates:
+        if not cand.crop_b64:
+            continue
+        content_blocks.append({
+            "type": "text",
+            "text": f"Candidate {cand.candidate_id}:"
+        })
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/png;base64,{cand.crop_b64}",
+                "detail": "low"
+            }
+        })
+
+    if not content_blocks:
+        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: no candidate crops available", flush=True)
+        return {}
+
+    # Limit to at most 8 candidate images to avoid token limits
+    image_count = sum(1 for b in content_blocks if b.get("type") == "image_url")
+    if image_count > 8:
+        # Keep only the first 8 image+label pairs
+        limited: List[Dict[str, Any]] = []
+        kept = 0
+        for b in content_blocks:
+            limited.append(b)
+            if b.get("type") == "image_url":
+                kept += 1
+                if kept >= 8:
+                    break
+        content_blocks = limited
+        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: limited to 8/{image_count} candidate images", flush=True)
+
+    # Add question list
+    q_list_text = "Questions that need figures:\n"
+    for q in questions:
+        q_short = q.text[:200].replace('\n', ' ')
+        q_list_text += f"- qid={q.id}: {q_short}\n"
+
+    cand_ids = [c.candidate_id for c in candidates if c.crop_b64]
+    prompt_text = (
+        f"{q_list_text}\n"
+        f"Available candidate IDs: {cand_ids}\n\n"
+        "For each question, decide which candidate image (if any) is its "
+        "diagram/figure/graph/circuit. A candidate may belong to at most one question.\n"
+        "IGNORE logos, watermarks, stamps, headers — only match actual diagrams.\n\n"
+        "Return ONLY valid JSON (no markdown fences):\n"
+        '{"assignments": [{"qid": "...", "candidate_id": "..."}]}\n'
+        'If no assignments: {"assignments": []}'
+    )
+    content_blocks.append({"type": "text", "text": prompt_text})
+
+    try:
+        response = await client.chat.completions.create(
+            model=OCR_FALLBACK_MODEL,
+            messages=[{"role": "user", "content": content_blocks}],
+            max_completion_tokens=512,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM call failed: {e}", flush=True)
+        return {}
+
+    if not raw:
+        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM returned empty response", flush=True)
+        return {}
+
+    print(f"[FIGURE-ASSIGN] Page {page_index + 1}: raw LLM response: {raw[:500]}", flush=True)
+
+    # Strip markdown fences if present
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+
+    try:
+        data = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: JSON parse failed: {e}", flush=True)
+        return {}
+
+    # Build qid → candidate mapping
+    cand_lookup = {c.candidate_id: c for c in candidates}
+    valid_qids = {q.id for q in questions}
+    result: Dict[str, Any] = {}
+    for assignment in data.get("assignments", []):
+        qid = assignment.get("qid", "")
+        cid = assignment.get("candidate_id", "")
+        if not qid or not cid:
+            continue
+        if cid not in cand_lookup:
+            print(f"[FIGURE-ASSIGN] Page {page_index + 1}: unknown candidate_id '{cid}'", flush=True)
+            continue
+        if qid not in valid_qids:
+            print(f"[FIGURE-ASSIGN] Page {page_index + 1}: unknown qid '{qid}'", flush=True)
+            continue
+        result[qid] = cand_lookup[cid]
+
+    print(
+        f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM assigned {len(result)} figures "
+        f"from {len(candidates)} candidates to {len(questions)} questions",
+        flush=True
+    )
+    return result
+
+
+async def _extract_figures_for_questions(
+    ocr_result: Dict[str, Any],
+    extracted_questions: List[ExtractedQuestion],
+    document_id: str,
+) -> None:
+    """
+    Deterministic figure extraction using OpenCV + heuristic/LLM assignment.
+
+    3-stage pipeline:
+    1. Detect figure candidates per page (OpenCV or pre-existing OCR images)
+    2. Group questions needing figures by page
+    3. Assign candidates to questions (heuristic first, LLM for ambiguous)
+
+    Mutates ocr_result in-place: adds cropped images to the appropriate page's
+    images list. Also updates question metadata with correct image_refs.
+    """
+    from utils.figure_extractor import (
+        detect_figure_candidates, crop_candidates,
+        FigureCandidate, PageFigureResult, CV2_AVAILABLE,
+    )
+
     pages = ocr_result.get("pages", [])
 
+    # ── Stage 1: Detect figure candidates per page ──────────────────────
+    page_candidates: Dict[int, PageFigureResult] = {}
+
     for page in pages:
-        markdown_content = page.get("markdown", "")
+        pidx = page.get("index", 0)
+        existing_images = page.get("images", [])
 
-        # Log a sample of the markdown to understand structure
-        logger.info(f"Page {page.get('index', 0)} markdown sample (first 1500 chars):\n{markdown_content[:1500]}")
+        if existing_images:
+            # Sarvam/OCR provider already extracted images → use as candidates
+            pr = PageFigureResult(
+                page_index=pidx,
+                page_width=page.get("dimensions", {}).get("width", 0),
+                page_height=page.get("dimensions", {}).get("height", 0),
+            )
+            for i, img in enumerate(existing_images):
+                pr.candidates.append(FigureCandidate(
+                    candidate_id=f"cand-p{pidx}-{i}",
+                    page_index=pidx,
+                    bbox=(
+                        img.get("top_left_x", 0), img.get("top_left_y", 0),
+                        img.get("bottom_right_x", 0), img.get("bottom_right_y", 0),
+                    ),
+                    area=(img.get("bottom_right_x", 0) - img.get("top_left_x", 0)) *
+                         (img.get("bottom_right_y", 0) - img.get("top_left_y", 0)),
+                    confidence=0.95,
+                    crop_b64=img.get("image_base64"),
+                ))
+            if pr.candidates:
+                page_candidates[pidx] = pr
+        elif page.get("page_render") and CV2_AVAILABLE:
+            # Run OpenCV detection on the rendered page image
+            page_b64 = page["page_render"]
+            page_img_bytes = base64.b64decode(page_b64)
+            pr = detect_figure_candidates(page_img_bytes, pidx)
+            if pr.candidates:
+                crop_candidates(page_img_bytes, pr)
+                page_candidates[pidx] = pr
 
-        # Count potential questions in markdown for debugging
-        potential_questions = len(re.findall(r'(?:^|\n)(?:#{1,3}\s+)?Q\.?\s*\d+|(?:^|\n)\d+[\.\)]\s+', markdown_content, re.MULTILINE))
-        logger.info(f"Potential questions detected in markdown: {potential_questions}")
+    total_candidates = sum(len(pr.candidates) for pr in page_candidates.values())
+    if total_candidates == 0 and not any(page.get("images") for page in pages):
+        print("[FIGURE-DETECT] No figure candidates found on any page — skipping", flush=True)
+        return
 
-        # Simple question extraction logic
-        # Look for patterns like:
-        # - Lines ending with "?"
-        # - Numbered items (1., 2., etc.)
-        # - MCQ patterns (A), B), C), D))
+    print(
+        f"[FIGURE-DETECT] Found {total_candidates} candidates across "
+        f"{len(page_candidates)} pages",
+        flush=True
+    )
 
-        lines = markdown_content.split("\n")
-        current_question = None
-        current_question_text = ""
-        current_options = []
-        current_image_refs = []
-        current_question_images = []  # Images that are part of the question itself (diagrams)
-        current_option_images = []  # Images that are MCQ options
-        # Track multi-line text option accumulation (A/B/C/D spilling to next lines)
-        accumulating_option_idx: Optional[int] = None
-        previous_line = ""  # Track previous line to detect option labels before images
+    # ── Stage 2: Group questions needing figures by page ────────────────
+    # key: page_idx, value: list of questions (using q.id as key, NOT question_number)
+    page_questions: Dict[int, List[ExtractedQuestion]] = {}
+    total_needing = 0
+    for q in extracted_questions:
+        has_fig = q.metadata.get("has_figure", False)
+        q_lower = q.text.lower()
+        needs_figure = (
+            has_fig
+            or "[figure]" in q_lower
+            or "diagram" in q_lower
+            or "figure" in q_lower
+            or "graph" in q_lower
+            or "circuit" in q_lower
+        )
+        if needs_figure:
+            q_page = q.metadata.get("page", 0)
+            if q_page not in page_questions:
+                page_questions[q_page] = []
+            page_questions[q_page].append(q)
+            total_needing += 1
 
-        # Compile regex patterns for option label detection
-        option_label_pattern = re.compile(r'^\s*\(([A-Da-d]|[ivxIVX]+)\)\s*$')  # (A), (B), (i), (ii), etc.
+    if not page_questions:
+        print("[FIGURE-DETECT] No questions reference figures — skipping assignment", flush=True)
+        return
 
-        # Buffer for images detected before the corresponding question text starts
-        pending_images: List[str] = []
+    print(
+        f"[FIGURE-DETECT] {total_needing} questions need figures across "
+        f"{len(page_questions)} pages",
+        flush=True
+    )
 
-        for line_num, line in enumerate(lines):
-            line_stripped = line.strip()
-            if not line_stripped:
-                previous_line = line_stripped
+    # ── Stage 3: Assign candidates to questions (per page) ──────────────
+    figures_added = 0
+
+    for page_idx, qs_on_page in page_questions.items():
+        # Gather candidates from this page AND next page (cross-page lookahead)
+        candidates: List[FigureCandidate] = []
+        if page_idx in page_candidates:
+            candidates.extend(page_candidates[page_idx].candidates)
+        if (page_idx + 1) in page_candidates:
+            candidates.extend(page_candidates[page_idx + 1].candidates)
+
+        if not candidates:
+            print(f"[FIGURE-DETECT] Page {page_idx + 1}: no candidates for {len(qs_on_page)} questions", flush=True)
+            continue
+
+        # Try heuristic assignment first (no LLM cost)
+        assignment: Dict[str, FigureCandidate] = {}  # qid → candidate
+
+        if len(candidates) == 1 and len(qs_on_page) == 1:
+            # 1:1 — assign directly
+            assignment[qs_on_page[0].id] = candidates[0]
+            print(f"[FIGURE-DETECT] Page {page_idx + 1}: 1:1 heuristic assignment", flush=True)
+
+        elif len(candidates) == len(qs_on_page):
+            # Same count — assign top-to-bottom
+            sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
+            for q, cand in zip(qs_on_page, sorted_cands):
+                assignment[q.id] = cand
+            print(
+                f"[FIGURE-DETECT] Page {page_idx + 1}: {len(candidates)}:{len(qs_on_page)} "
+                f"top-to-bottom heuristic",
+                flush=True
+            )
+
+        elif len(candidates) < len(qs_on_page) and all(c.confidence >= 0.5 for c in candidates):
+            # Fewer candidates than questions, all confident — assign top-to-bottom for available
+            sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
+            for i, cand in enumerate(sorted_cands):
+                if i < len(qs_on_page):
+                    assignment[qs_on_page[i].id] = cand
+            print(
+                f"[FIGURE-DETECT] Page {page_idx + 1}: partial heuristic "
+                f"({len(candidates)} candidates for {len(qs_on_page)} questions)",
+                flush=True
+            )
+
+        else:
+            # Ambiguous — use LLM for assignment
+            print(
+                f"[FIGURE-DETECT] Page {page_idx + 1}: ambiguous "
+                f"({len(candidates)} candidates, {len(qs_on_page)} questions) — calling LLM",
+                flush=True
+            )
+            assignment = await _llm_assign_candidates(qs_on_page, candidates, page_idx)
+
+        # ── Stage 4: Apply assignments ──────────────────────────────────
+        for q in qs_on_page:
+            cand = assignment.get(q.id)
+            if not cand:
                 continue
 
-            # Log first few lines for debugging
-            if line_num < 10:
-                logger.debug(f"Line {line_num}: {line_stripped[:100]}")
+            # Generate document-unique figure ID
+            fig_id = f"fig-{document_id[:8]}-{q.id[:8]}"
 
-            # Extract image references from the line (format: ![alt](url) or ![alt])
-            # Updated regex to capture both alt text and URL to handle cases like ![](img-0.jpeg)
-            image_refs_raw = re.findall(r'!\[([^\]]*)\](?:\(([^)]+)\))?', line)
-            # Build image_refs list: prefer alt text if not empty, otherwise use URL
-            image_refs = []
-            for alt_text, url_text in image_refs_raw:
-                img_ref = alt_text.strip() if alt_text.strip() else url_text.strip()
-                if img_ref:
-                    image_refs.append(img_ref)
-            
-            # Log image extraction for debugging
-            if image_refs:
-                logger.info(f"📸 Line {line_num}: Extracted {len(image_refs)} image refs: {image_refs}")
+            img_dict = {
+                "id": fig_id,
+                "top_left_x": cand.bbox[0],
+                "top_left_y": cand.bbox[1],
+                "bottom_right_x": cand.bbox[2],
+                "bottom_right_y": cand.bbox[3],
+                "image_base64": cand.crop_b64,
+            }
 
-            # NEW LOGIC: Classify images based on previous line
-            if image_refs and not current_question:
-                # Buffer images appearing before question starts
-                for img_ref in image_refs:
-                    if img_ref not in pending_images:
-                        pending_images.append(img_ref)
-                logger.info(f"Buffered {len(image_refs)} images appearing before question start")
-            elif image_refs and current_question:
-                # Check if previous line was an option label
-                is_option_image = option_label_pattern.match(previous_line)
+            # Add image to the candidate's page images list
+            target_page_idx = cand.page_index
+            for page in pages:
+                if page.get("index") == target_page_idx:
+                    page["images"].append(img_dict)
+                    break
 
-                for img_ref in image_refs:
-                    # Avoid duplicates
-                    if is_option_image:
-                        # This image is an MCQ option (has label like (A), (B) before it)
-                        if img_ref not in current_option_images:
-                            current_option_images.append(img_ref)
-                            logger.info(f"✓ Detected option image: {img_ref} (preceded by label: {previous_line.strip()})")
-                        if img_ref not in current_image_refs:
-                            current_image_refs.append(img_ref)
-                    else:
-                        # This image is a question figure (diagram)
-                        if img_ref not in current_question_images:
-                            current_question_images.append(img_ref)
-                            logger.info(f"✓ Detected question figure: {img_ref} (no option label detected)")
-                        if img_ref not in current_image_refs:
-                            current_image_refs.append(img_ref)
+            # APPEND to existing image_refs (bug fix: old code overwrote)
+            existing_refs = q.metadata.get("image_refs", [])
+            existing_refs.append(fig_id)
+            q.metadata["image_refs"] = existing_refs
 
-            previous_line = line_stripped
+            existing_q_refs = q.metadata.get("question_image_refs", [])
+            existing_q_refs.append(fig_id)
+            q.metadata["question_image_refs"] = existing_q_refs
 
-            # Detect question - improved detection with Q. numbering
-            # Match patterns: Q. 1, Q 2, Q.14, ## Q. 15, Question 5, etc.
-            # Strip markdown heading markers (##, ###) before checking
-            line_without_heading = re.sub(r'^#+\s*', '', line_stripped)
-            is_question = (
-                line_stripped.endswith("?") or
-                line_stripped.startswith(("Question", "Problem", "Q.", "Q ")) or
-                re.match(r'^\d+[\.\)]\s+', line_stripped) or  # 1. or 1) followed by space
-                re.match(r'^Q\.?\s*\d+', line_stripped) or  # Q. 1, Q 2, Q.14
-                re.match(r'^Q\.?\s*\d+', line_without_heading) or  # ## Q. 15 after stripping ##
-                (line_stripped and line_stripped[0].isdigit() and ('.' in line_stripped or ')' in line_stripped))  # More flexible number detection
-            )
+            q.metadata["has_figure"] = True
+            figures_added += 1
 
-            if is_question:
-                logger.info(f"Detected new question starting: {line_stripped[:80]}...")
-                # Save previous question if exists
-                if current_question:
-                    # NEW CLASSIFICATION: Use the already-classified image arrays
-                    total_images = len(current_image_refs)
-                    num_option_images = len(current_option_images)
-                    num_question_figures = len(current_question_images)
-                    has_text_options = len(current_options) > 0 and any(opt.strip() for opt in current_options)
-
-                    # Determine final classification
-                    final_question_images = current_question_images.copy()
-                    final_options = current_options
-                    is_image_based_mcq = False
-
-                    # If we have option images (detected by label pattern), it's image-based MCQ
-                    if num_option_images > 0:
-                        # We have option images - check if text options are valid or corrupted
-                        valid_text_options = [opt for opt in current_options if opt.strip()]
-
-                        if not valid_text_options:
-                            # No valid text options - pure image-based MCQ
-                            logger.info(f"📊 Image-based MCQ: {num_option_images} option images, {num_question_figures} question figures")
-                            final_options = []  # Empty options - images will be mapped to A, B, C, etc. later
-                            is_image_based_mcq = True
-                        else:
-                            # Both option images AND valid text - unusual mixed case
-                            logger.warning(f"⚠️ Mixed question: {num_option_images} option images + {len(valid_text_options)} text options")
-                            final_options = valid_text_options
-                            is_image_based_mcq = False
-                    elif total_images > 0 and not has_text_options:
-                        # Fallback: No labels detected, but images exist and no text options
-                        # Assume all are option images if 3+
-                        if total_images >= 3:
-                            logger.info(f"✅ Fallback RULE 1: {total_images} images, no labels, no text → Treating as option images")
-                            final_question_images = []
-                            final_options = []
-                            is_image_based_mcq = True
-                        else:
-                            logger.info(f"📊 {total_images} question figures (no option labels detected)")
-                    else:
-                        # Text-based MCQ or question with diagrams
-                        logger.info(f"📝 Text-based question: {len(current_options)} text options, {num_question_figures} question figures")
-
-                    logger.info(f"Extracted question: {len(final_options)} options, {len(final_question_images)} question figures, {total_images} total images")
-                    
-                    # If skip_option_extraction is True, include options in the question text
-                    if skip_option_extraction and final_options:
-                        # Build question text with options inline
-                        inline_question_text = current_question_text + "\n\n"
-                        for idx, opt in enumerate(final_options):
-                            label = chr(65 + idx)  # A, B, C, D...
-                            inline_question_text += f"({label}) {opt}\n"
-                        
-                        questions.append(ExtractedQuestion(
-                            id=str(uuid.uuid4()),
-                            text=inline_question_text.strip(),
-                            options=[],  # Empty options - they're now in the text
-                            metadata={
-                                "subject": subject,
-                                "difficulty": difficulty,
-                                "page": page.get("index", 0),
-                                "image_refs": current_image_refs,
-                                "question_image_refs": final_question_images,
-                                "is_image_based_mcq": is_image_based_mcq,
-                                "options_inline": True  # Flag to indicate options are in text
-                            }
-                        ))
-                        logger.info(f"📝 Practice mode: Included {len(final_options)} options inline with question text")
-                    else:
-                        questions.append(ExtractedQuestion(
-                            id=str(uuid.uuid4()),
-                            text=current_question_text,
-                            options=final_options,
-                            metadata={
-                                "subject": subject,
-                                "difficulty": difficulty,
-                                "page": page.get("index", 0),
-                                "image_refs": current_image_refs,  # All images (question + option)
-                                "question_image_refs": final_question_images,  # Only question figures
-                                "is_image_based_mcq": is_image_based_mcq
-                            }
-                        ))
-
-                # Use the line without heading markers for question text
-                current_question = line_without_heading
-                current_question_text = line_without_heading
-                current_options = []
-                current_image_refs = []
-                current_question_images = []
-                current_option_images = []
-                
-                # Ingest pending images (found before this question started)
-                if pending_images:
-                    logger.info(f"Attaching {len(pending_images)} pending images to new question")
-                    current_image_refs.extend(pending_images)
-                    # Assume pending images are question figures
-                    for img in pending_images:
-                        if img not in current_question_images:
-                            current_question_images.append(img)
-                    pending_images = []
-
-                accumulating_option_idx = None
-
-            # Detect text options - ONLY accept lines that start with option label
-            # This is consistent with image option detection logic
-            elif current_question and not image_refs:
-                # Check if this line starts with an option marker (A. / (A) / A) / (1) / (i) etc.)
-                # Updated regex to be more inclusive of formats like (a), (1), (i), etc.
-                option_match = re.match(r'^\s*(?:\(|\[)?([A-Za-z]|[0-9]{1,2}|[ivxIVX]+)[\.|\)]\s*(.*)', line_stripped)
-                if option_match:
-                    option_label = option_match.group(1).upper()
-                    option_text = option_match.group(2).strip()
-
-                    # Start new option accumulation slot
-                    cleaned = _clean_option_text(option_text) if option_text else f"Option {option_label}"
-                    logger.debug(
-                        f"Detected text option {option_label}: {cleaned[:80] if cleaned else '(empty)'}..."
-                    )
-                    current_options.append(cleaned)
-                    accumulating_option_idx = len(current_options) - 1
-                else:
-                    # If we're in the middle of an option and the current line looks like a continuation,
-                    # append it to the last option (helps for LaTeX broken across lines)
-                    if accumulating_option_idx is not None:
-                        # Stop accumulating if the line looks like a heading for a new question
-                        is_new_question_like = (
-                            line_stripped.startswith(("Question", "Problem", "Q.", "Q ")) or
-                            re.match(r'^\d+[\.\)]\s+', line_stripped) is not None or
-                            re.match(r'^Q\.?\s*\d+', line_stripped) is not None
-                        )
-                        if not is_new_question_like:
-                            addon = line_stripped
-                            # Avoid accidental "Answer:" or "Solution:" lines
-                            if not re.match(r'^(Answer|Solution)\b', addon, re.IGNORECASE):
-                                merged = (current_options[accumulating_option_idx] + " " + addon).strip()
-                                current_options[accumulating_option_idx] = _clean_option_text(merged)
-                                logger.debug(
-                                    f"Appended continuation to option {accumulating_option_idx}: "
-                                    f"{current_options[accumulating_option_idx][:120]}..."
-                                )
-                        else:
-                            # Stop accumulating when a new question-ish line appears
-                            accumulating_option_idx = None
-
-        # Add last question if exists
-        if current_question:
-            # NEW CLASSIFICATION: Use the already-classified image arrays
-            total_images = len(current_image_refs)
-            num_option_images = len(current_option_images)
-            num_question_figures = len(current_question_images)
-            has_text_options = len(current_options) > 0 and any(opt.strip() for opt in current_options)
-
-            # Determine final classification
-            final_question_images = current_question_images.copy()
-            final_options = current_options
-            is_image_based_mcq = False
-
-            # If we have option images (detected by label pattern), it's image-based MCQ
-            if num_option_images > 0:
-                # We have option images - check if text options are valid or corrupted
-                valid_text_options = [opt for opt in current_options if opt.strip()]
-
-                if not valid_text_options:
-                    # No valid text options - pure image-based MCQ
-                    logger.info(f"📊 Image-based MCQ (last): {num_option_images} option images, {num_question_figures} question figures")
-                    final_options = []  # Empty options - images will be mapped to A, B, C, etc. later
-                    is_image_based_mcq = True
-                else:
-                    # Both option images AND valid text - unusual mixed case
-                    logger.warning(f"⚠️ Mixed question (last): {num_option_images} option images + {len(valid_text_options)} text options")
-                    final_options = valid_text_options
-                    is_image_based_mcq = False
-            elif total_images > 0 and not has_text_options:
-                # Fallback: No labels detected, but images exist and no text options
-                # Assume all are option images if 3+
-                if total_images >= 3:
-                    logger.info(f"✅ Fallback RULE 1 (last): {total_images} images, no labels, no text → Treating as option images")
-                    final_question_images = []
-                    final_options = []
-                    is_image_based_mcq = True
-                else:
-                    logger.info(f"📊 {total_images} question figures (last, no option labels detected)")
-            else:
-                # Text-based MCQ or question with diagrams
-                logger.info(f"📝 Text-based question (last): {len(current_options)} text options, {num_question_figures} question figures")
-
-            # Final clean-up for text options (dedupe LaTeX/plain echoes)
-            if final_options:
-                final_options = [_clean_option_text(o) for o in final_options]
-
-            logger.info(
-                f"Extracted last question: {len(final_options)} options, "
-                f"{len(final_question_images)} question figures, {total_images} total images"
-            )
-            
-            # If skip_option_extraction is True, include options in the question text
-            if skip_option_extraction and final_options:
-                # Build question text with options inline
-                inline_question_text = current_question_text + "\n\n"
-                for idx, opt in enumerate(final_options):
-                    label = chr(65 + idx)  # A, B, C, D...
-                    inline_question_text += f"({label}) {opt}\n"
-                
-                questions.append(ExtractedQuestion(
-                    id=str(uuid.uuid4()),
-                    text=inline_question_text.strip(),
-                    options=[],  # Empty options - they're now in the text
-                    metadata={
-                        "subject": subject,
-                        "difficulty": difficulty,
-                        "page": page.get("index", 0),
-                        "image_refs": current_image_refs,
-                        "question_image_refs": final_question_images,
-                        "is_image_based_mcq": is_image_based_mcq,
-                        "options_inline": True
-                    }
-                ))
-                logger.info(f"📝 Practice mode (last): Included {len(final_options)} options inline with question text")
-            else:
-                questions.append(ExtractedQuestion(
-                    id=str(uuid.uuid4()),
-                    text=current_question_text,
-                    options=final_options,
-                    metadata={
-                        "subject": subject,
-                        "difficulty": difficulty,
-                        "page": page.get("index", 0),
-                        "image_refs": current_image_refs,
-                        "question_image_refs": final_question_images,  # Only question figures
-                        "is_image_based_mcq": is_image_based_mcq
-                    }
-                ))
-
-    return questions
+    print(
+        f"[FIGURE-DETECT] Done! Assigned {figures_added} figures across "
+        f"{len(page_questions)} pages",
+        flush=True
+    )
 
 
 async def run_document_ocr_pipeline(
     document: Dict[str, Any],
-    pdf_base64: str,
+    file_content: bytes,
     job_id: str,
     processing_result: Dict[str, Any],
     current_user: Dict[str, Any],
@@ -894,19 +1344,29 @@ async def run_document_ocr_pipeline(
     """Run the full OCR extraction pipeline for a stored document."""
     document_id = document["document_id"]
     try:
-        logger.info(f"Calling Mistral OCR API for job {job_id}")
-        ocr_result = await call_mistral_ocr(pdf_base64)
+        logger.info(f"Calling Sarvam AI OCR for job {job_id}")
+        ocr_result = await call_sarvam_ocr(file_content)
 
         processing_result["progress"] = 60
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
         document_type = document.get("document_type", "Chapter Notes")
         logger.info(f"Extracting questions from OCR result for job {job_id}, document_type: {document_type}")
-        
+
+        # Delete old questions/images for this document before re-processing
+        is_b2c_pre = is_b2c_admin(current_user)
+        if is_b2c_pre:
+            old_q = await db.b2c_delete_many("questions", {"document_id": document_id})
+            old_i = await db.b2c_delete_many("images", {"source_pdf": document.get("filename", "")})
+        else:
+            old_q = await db.mongo_delete_many("questions", {"document_id": document_id})
+            old_i = await db.mongo_delete_many("images", {"source_pdf": document.get("filename", "")})
+        print(f"[OCR-PIPELINE] Cleaned up old data for {document_id}: questions={old_q}, images={old_i}", flush=True)
+
         # For Practice Sets, don't extract options separately - keep them in question text
         skip_option_extraction = document_type == "Practice Sets"
-        
-        extracted_questions = extract_questions_from_ocr(
+
+        extracted_questions = await extract_questions_with_gpt(
             ocr_result,
             document.get("subject", "General"),
             document.get("difficulty", "medium"),
@@ -916,7 +1376,11 @@ async def run_document_ocr_pipeline(
         if skip_option_extraction:
             logger.info(f"📝 Practice Sets mode: Options kept inline with question text")
 
-        logger.info(f"Processing extracted images for job {job_id}, document type: {document_type}")
+        # Per-question figure extraction — OpenCV detection + heuristic/LLM assignment
+        if document_type in ["Practice Sets", "Test Series"]:
+            await _extract_figures_for_questions(ocr_result, extracted_questions, document_id)
+
+        print(f"[OCR-PIPELINE] Processing embedded images...", flush=True)
 
         all_images: List[Dict[str, Any]] = []
         image_base64_map: Dict[str, Dict[str, Any]] = {}
@@ -927,38 +1391,40 @@ async def run_document_ocr_pipeline(
         for page in ocr_result.get("pages", []):
             for img in page.get("images", []):
                 if img.get("image_base64"):
-                    saved_images = await save_image_to_disk(
-                        img["image_base64"],
-                        img["id"],
-                        document["filename"],
-                        db,
-                        current_user.get("user_id"),
-                        split_composite=True,
-                        is_b2c=is_b2c
-                    )
-                    if saved_images:
-                        all_images.extend(saved_images)
-                        for saved_img in saved_images:
-                            image_base64_map[img["id"]] = {
-                                "image_base64": img.get("image_base64", ""),
-                                "top_left_x": img.get("top_left_x", 0),
-                                "top_left_y": img.get("top_left_y", 0),
-                                "bottom_right_x": img.get("bottom_right_x", 0),
-                                "bottom_right_y": img.get("bottom_right_y", 0),
-                                "page": page.get("index", 0)
-                            }
-                            if saved_img["id"] != img["id"]:
-                                image_base64_map[saved_img["id"]] = image_base64_map[img["id"]]
+                    try:
+                        saved_images = await save_image_to_disk(
+                            img["image_base64"],
+                            img["id"],
+                            document["filename"],
+                            db,
+                            current_user.get("user_id"),
+                            split_composite=True,
+                            is_b2c=is_b2c
+                        )
+                        if saved_images:
+                            all_images.extend(saved_images)
+                            for saved_img in saved_images:
+                                image_base64_map[img["id"]] = {
+                                    "image_base64": img.get("image_base64", ""),
+                                    "top_left_x": img.get("top_left_x", 0),
+                                    "top_left_y": img.get("top_left_y", 0),
+                                    "bottom_right_x": img.get("bottom_right_x", 0),
+                                    "bottom_right_y": img.get("bottom_right_y", 0),
+                                    "page": page.get("index", 0)
+                                }
+                                if saved_img["id"] != img["id"]:
+                                    image_base64_map[saved_img["id"]] = image_base64_map[img["id"]]
+                    except Exception as img_err:
+                        print(f"[OCR-PIPELINE] Warning: Failed to save image {img.get('id')}: {img_err}", flush=True)
 
-        logger.info(f"Saved {len(all_images)} images to disk and database")
-        logger.info(f"Image base64 map contains {len(image_base64_map)} entries")
+        print(f"[OCR-PIPELINE] Saved {len(all_images)} images", flush=True)
 
         processing_result["progress"] = 80
         processing_result["extracted_questions"] = len(extracted_questions)
         processing_result["extracted_images"] = len(all_images)
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
-        logger.info(f"Storing {len(extracted_questions)} questions for {document_type}")
+        print(f"[OCR-PIPELINE] Storing {len(extracted_questions)} questions for {document_type}...", flush=True)
 
         for question in extracted_questions:
             if document_type in ["Practice Sets", "Test Series"]:
@@ -976,20 +1442,20 @@ async def run_document_ocr_pipeline(
                 if image_refs:
                     for page in ocr_result.get("pages", []):
                         if page.get("index") == page_index:
-                            for mistral_img in page.get("images", []):
-                                mistral_img_id = mistral_img.get('id')
-                                base_img_id = mistral_img_id.split('.')[0] if '.' in mistral_img_id else mistral_img_id
+                            for ocr_img in page.get("images", []):
+                                ocr_img_id = ocr_img.get('id')
+                                base_img_id = ocr_img_id.split('.')[0] if '.' in ocr_img_id else ocr_img_id
 
                                 is_referenced = any(
-                                    base_img_id in ref or mistral_img_id in ref
+                                    base_img_id in ref or ocr_img_id in ref
                                     for ref in image_refs
                                 )
 
                                 if not is_referenced:
-                                    logger.debug(f"Skipping non-referenced image {mistral_img_id}")
+                                    logger.debug(f"Skipping non-referenced image {ocr_img_id}")
                                     continue
 
-                                logger.info(f"Including {mistral_img_id} - referenced in question")
+                                logger.info(f"Including {ocr_img_id} - referenced in question")
 
                                 # Find saved images - check for both exact match and split variants
                                 # If image was split, the IDs become img-X-A, img-X-B, etc.
@@ -998,18 +1464,18 @@ async def run_document_ocr_pipeline(
                                     if img['id'] == base_img_id or img['id'].startswith(f"{base_img_id}-")
                                 ]
                                 
-                                img_base64_data = image_base64_map.get(mistral_img_id) or image_base64_map.get(base_img_id, {})
+                                img_base64_data = image_base64_map.get(ocr_img_id) or image_base64_map.get(base_img_id, {})
 
                                 if matching_saved_images and img_base64_data:
                                     is_question_figure = any(
-                                        base_img_id in ref or mistral_img_id in ref
+                                        base_img_id in ref or ocr_img_id in ref
                                         for ref in question_image_refs
                                     )
 
                                     is_image_based_mcq = question.metadata.get("is_image_based_mcq", False)
                                     if is_image_based_mcq and not is_question_figure:
                                         is_question_figure = False
-                                        logger.info(f"Treating {mistral_img_id} as option image for image-based MCQ")
+                                        logger.info(f"Treating {ocr_img_id} as option image for image-based MCQ")
                                     
                                     # For question figures, use the first image (or unsplit original)
                                     # For option images (image-based MCQ), include all split parts
@@ -1036,7 +1502,7 @@ async def run_document_ocr_pipeline(
                                                 'bottom_right_y': img_base64_data.get('bottom_right_y', 0)
                                             },
                                             'metadata': {
-                                                'source': 'mistral_ocr',
+                                                'source': 'sarvam_ocr',
                                                 'page': page_index,
                                                 'extractedAt': datetime.utcnow().isoformat()
                                             }
@@ -1066,7 +1532,7 @@ async def run_document_ocr_pipeline(
                                                     'bottom_right_y': split_base64_data.get('bottom_right_y', 0)
                                                 },
                                                 'metadata': {
-                                                    'source': 'mistral_ocr',
+                                                    'source': 'sarvam_ocr',
                                                     'page': page_index,
                                                     'extractedAt': datetime.utcnow().isoformat()
                                                 }
@@ -1078,7 +1544,7 @@ async def run_document_ocr_pipeline(
                                     if not matching_saved_images:
                                         logger.warning(f"⚠️ Image {base_img_id} not found in all_images (available: {[img['id'] for img in all_images[:10]]}...)")
                                     if not img_base64_data:
-                                        logger.warning(f"⚠️ Image {mistral_img_id} not found in image_base64_map (keys: {list(image_base64_map.keys())[:10]}...)")
+                                        logger.warning(f"⚠️ Image {ocr_img_id} not found in image_base64_map (keys: {list(image_base64_map.keys())[:10]}...)")
 
                 logger.info(
                     f"Associated {len(question_figures)} question figures and "
@@ -1174,10 +1640,15 @@ async def run_document_ocr_pipeline(
                 }
 
             # Save question to appropriate database (B2C or regular)
-            if is_b2c:
-                await db.b2c_insert_one("questions", question_doc)
-            else:
-                await db.mongo_insert_one("questions", question_doc)
+            try:
+                if is_b2c:
+                    await db.b2c_insert_one("questions", question_doc)
+                else:
+                    await db.mongo_insert_one("questions", question_doc)
+            except Exception as db_err:
+                print(f"[OCR-PIPELINE] ERROR saving question {question.id}: {db_err}", flush=True)
+
+        print(f"[OCR-PIPELINE] All {len(extracted_questions)} questions stored in DB", flush=True)
 
         # Check if B2C admin for database routing
         is_b2c = is_b2c_admin(current_user)
@@ -1222,9 +1693,10 @@ async def run_document_ocr_pipeline(
         processing_result["pages"] = ocr_result.get("pages", [])
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
-        logger.info(f"OCR processing completed for document {document_id}")
+        print(f"[OCR-PIPELINE] DONE! {document_id}: {len(extracted_questions)} questions, {len(all_images)} images", flush=True)
         return PDFProcessingResult(**processing_result)
     except Exception as exc:
+        print(f"[OCR-PIPELINE] FAILED for {document_id}: {type(exc).__name__}: {exc}", flush=True)
         logger.error(f"OCR pipeline failed for document {document_id}: {exc}", exc_info=True)
         # Check if B2C admin for error update
         is_b2c = is_b2c_admin(current_user)
@@ -1639,7 +2111,6 @@ async def process_document_ocr(
             async with aiofiles.open(str(file_path), "rb") as f:
                 file_content = await f.read()
 
-        pdf_base64 = base64.b64encode(file_content).decode('utf-8')
         job_id = str(uuid.uuid4())
 
         if is_b2c:
@@ -1689,7 +2160,7 @@ async def process_document_ocr(
     async def execute_pipeline() -> PDFProcessingResult:
         return await run_document_ocr_pipeline(
             document=document,
-            pdf_base64=pdf_base64,
+            file_content=file_content,
             job_id=job_id,
             processing_result=processing_result,
             current_user=current_user,
@@ -1716,6 +2187,7 @@ async def process_document_ocr(
                     duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
                 )
             except HTTPException as exc:
+                logger.error(f"Background OCR job {job_id} failed with HTTP {exc.status_code}: {exc.detail}")
                 observe_ocr_job(
                     job_type="document",
                     status=f"error_{exc.status_code}",
@@ -1795,10 +2267,9 @@ async def perform_direct_ocr(
             )
 
         file_content = await file.read()
-        pdf_base64 = base64.b64encode(file_content).decode("utf-8")
 
         async def _run_ocr() -> Dict[str, Any]:
-            return await call_mistral_ocr(pdf_base64)
+            return await call_sarvam_ocr(file_content)
 
         semaphore = getattr(request.app.state, "ocr_semaphore", None)
         if semaphore:
@@ -4284,16 +4755,16 @@ async def extract_region_from_pdf(
 ) -> Dict[str, Any]:
     """
     Extract a specific region from a PDF page and process it with OCR.
-    
-    Uses Mistral OCR API (mistral-ocr-2512) to extract text AND images from the region,
+
+    Uses Sarvam AI Document Intelligence to extract text AND images from the region,
     just like the direct OCR pipeline does for full documents.
-    
+
     Args:
         pdf_content: Raw PDF bytes
         page_number: Page number (1-indexed)
         bbox: Bounding box as percentages {x, y, width, height}
         region_id: ID of the region being processed
-    
+
     Returns:
         Dict with extracted text, images list, and region screenshot
     """
@@ -4323,7 +4794,7 @@ async def extract_region_from_pdf(
         clip_rect = fitz.Rect(x0, y0, x1, y1)
         
         # Create a new single-page PDF with just the region
-        # This allows us to use Mistral OCR API which expects a PDF
+        # This allows us to use Sarvam OCR which expects a PDF file
         region_doc = fitz.open()  # Create new empty PDF
         
         # Create a new page with the region dimensions
@@ -4351,94 +4822,58 @@ async def extract_region_from_pdf(
         region_img_base64 = base64.b64encode(region_img_bytes).decode('utf-8')
         
         doc.close()
-        
-        # Encode region PDF as base64 for Mistral OCR API
-        region_pdf_base64 = base64.b64encode(region_pdf_bytes).decode('utf-8')
-        
-        import aiohttp
-        
-        if not MISTRAL_API_KEY:
+
+        # Use Sarvam AI to OCR the cropped region PDF
+        logger.info(f"Calling Sarvam AI OCR for region {region_id} (PDF size: {len(region_pdf_bytes)} bytes)")
+
+        try:
+            ocr_result = await call_sarvam_ocr(region_pdf_bytes)
+        except Exception as ocr_err:
+            logger.error(f"Sarvam OCR failed for region {region_id}: {ocr_err}")
             return {
                 "success": False,
-                "error": "Mistral API key not configured"
+                "error": f"OCR failed for region: {ocr_err}",
+                "regionImageBase64": region_img_base64
             }
-        
-        headers = {
-            "Authorization": f"Bearer {MISTRAL_API_KEY}",
-            "Content-Type": "application/json"
+
+        # Extract text and images from OCR result
+        extracted_text = ""
+        extracted_images = []
+
+        for page_data in ocr_result.get("pages", []):
+            page_markdown = page_data.get("markdown", "")
+            extracted_text += page_markdown + "\n"
+
+            for img in page_data.get("images", []):
+                if img.get("image_base64"):
+                    extracted_images.append({
+                        "id": img.get("id", f"img-{len(extracted_images)}"),
+                        "base64": img.get("image_base64"),
+                        "top_left_x": img.get("top_left_x", 0),
+                        "top_left_y": img.get("top_left_y", 0),
+                        "bottom_right_x": img.get("bottom_right_x", 0),
+                        "bottom_right_y": img.get("bottom_right_y", 0)
+                    })
+
+        extracted_text = extracted_text.strip()
+
+        # Filter images: only keep those referenced in the markdown
+        import re
+        referenced_ids = set(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', extracted_text))
+        real_figures = [img for img in extracted_images if img['id'] in referenced_ids]
+
+        logger.info(
+            f"Region {region_id}: {len(extracted_text)} chars, "
+            f"{len(extracted_images)} raw images, {len(real_figures)} actual figures"
+        )
+
+        return {
+            "success": True,
+            "extractedText": extracted_text,
+            "extractedImages": real_figures,
+            "regionImageBase64": region_img_base64,
+            "ocrResult": ocr_result
         }
-        
-        # Use Mistral OCR API (same as direct OCR) to extract both text AND images
-        payload = {
-            "model": "mistral-ocr-2512",
-            "document": {
-                "type": "document_url",
-                "document_url": f"data:application/pdf;base64,{region_pdf_base64}"
-            },
-            "include_image_base64": True  # Important: This extracts individual figures
-        }
-        
-        logger.info(f"Calling Mistral OCR API for region {region_id} (PDF size: {len(region_pdf_base64)} chars)")
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                MISTRAL_OCR_URL,
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Mistral OCR API error for region {region_id}: {error_text}")
-                    
-                    # Fall back to Pixtral for text extraction if OCR fails
-                    logger.info(f"Falling back to Pixtral for region {region_id}")
-                    return await _extract_region_with_pixtral(region_img_base64, region_id)
-                
-                ocr_result = await response.json()
-                
-                # Extract text from OCR result
-                extracted_text = ""
-                extracted_images = []
-                
-                for page_data in ocr_result.get("pages", []):
-                    # Get markdown text
-                    page_markdown = page_data.get("markdown", "")
-                    extracted_text += page_markdown + "\n"
-                    
-                    # Get extracted images (these are the cropped figures!)
-                    for img in page_data.get("images", []):
-                        if img.get("image_base64"):
-                            extracted_images.append({
-                                "id": img.get("id", f"img-{len(extracted_images)}"),
-                                "base64": img.get("image_base64"),
-                                "top_left_x": img.get("top_left_x", 0),
-                                "top_left_y": img.get("top_left_y", 0),
-                                "bottom_right_x": img.get("bottom_right_x", 0),
-                                "bottom_right_y": img.get("bottom_right_y", 0)
-                            })
-                
-                extracted_text = extracted_text.strip()
-
-                # Filter images: only keep those referenced as figures in the markdown.
-                # Mistral OCR markdown uses ![desc](image_id) for actual figures.
-                # Images not referenced in markdown are artifacts, not real diagrams.
-                import re
-                referenced_ids = set(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', extracted_text))
-                real_figures = [img for img in extracted_images if img['id'] in referenced_ids]
-
-                logger.info(
-                    f"Region {region_id}: {len(extracted_text)} chars, "
-                    f"{len(extracted_images)} raw images, {len(real_figures)} actual figures"
-                )
-
-                return {
-                    "success": True,
-                    "extractedText": extracted_text,
-                    "extractedImages": real_figures,  # Only actual figures/diagrams
-                    "regionImageBase64": region_img_base64,  # Region screenshot (for fallback only)
-                    "ocrResult": ocr_result
-                }
                 
     except ImportError as e:
         logger.error(f"Missing dependency for region extraction: {e}")
@@ -4448,93 +4883,6 @@ async def extract_region_from_pdf(
         }
     except Exception as e:
         logger.error(f"Error extracting region {region_id}: {str(e)}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-async def _extract_region_with_pixtral(img_base64: str, region_id: str) -> Dict[str, Any]:
-    """
-    Fallback: Extract text from region image using Pixtral chat API.
-    This is used when OCR API fails or doesn't return images.
-    """
-    import aiohttp
-    
-    headers = {
-        "Authorization": f"Bearer {MISTRAL_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "model": "pixtral-12b-2409",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": """Extract all text from this question image. This is a question from an exam or practice paper.
-
-Please extract:
-1. The complete question text
-2. All options (if this is an MCQ, label them as A), B), C), D))
-3. Any mathematical formulas or equations (use LaTeX notation)
-4. Descriptions of any diagrams or figures
-
-Format the output as:
-QUESTION: [question text]
-OPTIONS:
-A) [option A text]
-B) [option B text]
-C) [option C text]
-D) [option D text]
-FIGURES: [description of any images/diagrams if present]
-
-If this is not an MCQ, just provide the question text and any figure descriptions."""
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": 2000,
-        "temperature": 0.1
-    }
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.mistral.ai/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Pixtral API error for region {region_id}: {error_text}")
-                    return {
-                        "success": False,
-                        "error": f"Pixtral API error: {response.status}"
-                    }
-                
-                result = await response.json()
-                extracted_text = result['choices'][0]['message']['content'].strip()
-                
-                logger.info(f"Pixtral fallback extracted text for region {region_id}: {len(extracted_text)} chars")
-                
-                return {
-                    "success": True,
-                    "extractedText": extracted_text,
-                    "extractedImages": [],  # Pixtral doesn't extract images
-                    "regionImageBase64": img_base64
-                }
-    except Exception as e:
-        logger.error(f"Pixtral fallback error for region {region_id}: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -4557,7 +4905,7 @@ async def process_regions_ocr(
     This endpoint:
     1. Retrieves saved regions for the document
     2. For each region, extracts that portion of the PDF page
-    3. Sends each region to Mistral OCR
+    3. Sends each region to Sarvam AI OCR
     4. Parses the OCR result and creates questions
     5. Returns the results
     """
@@ -4693,7 +5041,7 @@ async def process_regions_ocr(
                 
                 # ============================================
                 # SAVE THE EXTRACTED IMAGES (CROPPED FIGURES)
-                # These are individually cropped diagrams from Mistral OCR
+                # These are individually cropped diagrams from OCR
                 # ============================================
                 question_figures = []
                 page_images = []
@@ -4703,7 +5051,7 @@ async def process_regions_ocr(
                 region_image_base64 = extraction_result.get('regionImageBase64', '')
                 
                 if extracted_images:
-                    # We have cropped figures from Mistral OCR - save each one
+                    # We have cropped figures from OCR - save each one
                     logger.info(f"📸 Region {region_id} has {len(extracted_images)} extracted images from OCR")
                     
                     for idx, img_data in enumerate(extracted_images):
