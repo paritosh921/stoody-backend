@@ -214,14 +214,13 @@ async def call_gpt_vision_ocr(file_content: bytes) -> Dict[str, Any]:
     ocr_results = await asyncio.gather(*[ocr_single_page(pr) for pr in page_renders])
     ocr_results.sort(key=lambda r: r["index"])  # maintain page order
 
-    # Build final result — figures are detected deterministically with OpenCV
-    # in _extract_figures_for_questions() after question extraction.
+    # Build final result
     pages_result = []
     for r in ocr_results:
         pages_result.append({
             "index": r["index"],
             "markdown": r["markdown"],
-            "images": [],  # figures added later by _extract_figures_for_questions
+            "images": [],
             "page_render": r["b64"],
             "dimensions": {"dpi": 200, "width": r["w"], "height": r["h"]}
         })
@@ -1004,20 +1003,91 @@ async def extract_questions_with_gpt(
         print(f"[GPT-EXTRACT] All {max_retries} attempts returned empty response", flush=True)
         return []
 
-    # Parse JSON — handle markdown fences if GPT wraps it
+    # Parse JSON — handle markdown fences, then fix LaTeX backslash issues
+    import re as _re
     raw_response = raw_response.strip()
     if raw_response.startswith("```"):
         raw_response = raw_response.split("\n", 1)[-1]  # remove first ```json line
         if raw_response.endswith("```"):
             raw_response = raw_response[:-3].strip()
 
+    def _fix_json_backslashes(s: str) -> str:
+        """Fix invalid backslash escapes in JSON strings caused by LaTeX.
+
+        The tricky part: \\r is a valid JSON escape (carriage return) but in
+        LaTeX context it means \\rho. Same for \\b (backspace vs \\beta),
+        \\f (form feed vs \\frac), \\n (newline vs \\nu), \\t (tab vs \\times).
+
+        Strategy: if \\ + [bfnrt] is followed by more alphabetic chars (e.g.
+        \\rho, \\beta, \\frac, \\nu, \\times), it's LaTeX — escape it.
+        If it stands alone (\\n at end, \\t followed by non-alpha), it's JSON.
+        """
+        result = []
+        in_string = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"' and (i == 0 or s[i - 1] != '\\'):
+                in_string = not in_string
+                result.append(ch)
+                i += 1
+            elif in_string and ch == '\\':
+                if i + 1 < len(s):
+                    nxt = s[i + 1]
+                    if nxt == '\\' or nxt == '"' or nxt == '/':
+                        # Definitely valid JSON escape — keep
+                        result.append(ch)
+                        result.append(nxt)
+                        i += 2
+                    elif nxt == 'u' and i + 5 < len(s) and all(c in '0123456789abcdefABCDEF' for c in s[i+2:i+6]):
+                        # Unicode escape \uXXXX — keep
+                        result.append(ch)
+                        result.append(nxt)
+                        i += 2
+                    elif nxt in ('b', 'f', 'n', 'r', 't'):
+                        # Ambiguous: could be JSON escape OR LaTeX command
+                        # Check if followed by more alpha chars → LaTeX
+                        after = i + 2
+                        if after < len(s) and s[after].isalpha():
+                            # LaTeX: \rho, \beta, \frac, \nu, \times etc.
+                            result.append('\\')
+                            result.append('\\')
+                            result.append(nxt)
+                            i += 2
+                        else:
+                            # Standalone JSON escape: \n, \t, \r etc.
+                            result.append(ch)
+                            result.append(nxt)
+                            i += 2
+                    else:
+                        # Not a valid JSON escape — must be LaTeX (\mu, \lambda, etc.)
+                        result.append('\\')
+                        result.append('\\')
+                        result.append(nxt)
+                        i += 2
+                else:
+                    result.append(ch)
+                    i += 1
+            else:
+                result.append(ch)
+                i += 1
+        return ''.join(result)
+
+    # Try parsing raw first, fix backslashes only if needed
+    data = None
     try:
         data = _json.loads(raw_response)
-    except _json.JSONDecodeError as e:
-        logger.error(f"Failed to parse GPT extraction response as JSON: {e}")
-        print(f"[GPT-EXTRACT] JSON parse error: {e}", flush=True)
-        print(f"[GPT-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
-        return []
+    except _json.JSONDecodeError:
+        # Fix LaTeX backslashes and retry
+        try:
+            fixed = _fix_json_backslashes(raw_response)
+            data = _json.loads(fixed)
+            print(f"[GPT-EXTRACT] Fixed LaTeX backslashes in JSON response", flush=True)
+        except _json.JSONDecodeError as e2:
+            logger.error(f"Failed to parse GPT extraction response as JSON: {e2}")
+            print(f"[GPT-EXTRACT] JSON parse failed even after backslash fix: {e2}", flush=True)
+            print(f"[GPT-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
+            return []
 
     raw_questions = data.get("questions", [])
     print(f"[GPT-EXTRACT] Parsed {len(raw_questions)} questions from GPT response", flush=True)
@@ -1032,8 +1102,111 @@ async def extract_questions_with_gpt(
     if page_image_ids:
         print(f"[GPT-EXTRACT] Page image map: {page_image_ids}", flush=True)
 
-    questions: List[ExtractedQuestion] = []
+    # Build page text lookup for targeted retries
+    page_texts: Dict[int, str] = {}
+    for page in pages:
+        page_texts[page.get("index", 0)] = page.get("markdown", "")
+
+    # Detect questions with empty text — collect for targeted retry
+    failed_questions: List[Dict[str, Any]] = []  # {"number", "page"} for retry
+    good_questions: List[Dict[str, Any]] = []
     for q in raw_questions:
+        q_text = q.get("text", "").strip()
+        if not q_text:
+            failed_questions.append(q)
+        else:
+            good_questions.append(q)
+
+    if failed_questions:
+        print(
+            f"[GPT-EXTRACT] {len(failed_questions)} questions have empty text — "
+            f"retrying: {[q.get('number', '?') for q in failed_questions]}",
+            flush=True,
+        )
+
+        # Collect ONLY the page text for the failed questions' pages
+        failed_pages: set = set()
+        for q in failed_questions:
+            p = q.get("page", 0)
+            failed_pages.add(p)
+
+        retry_text = ""
+        for pidx in sorted(failed_pages):
+            md = page_texts.get(pidx, "")
+            if md:
+                retry_text += f"\n=== PAGE {pidx} ===\n{md}"
+
+        if retry_text.strip():
+            failed_nums = [q.get("number", "?") for q in failed_questions]
+            retry_prompt = (
+                "You previously failed to extract the text for these question numbers: "
+                f"{failed_nums}\n\n"
+                "Below is the page text containing those questions. "
+                "Extract ONLY the questions listed above.\n\n"
+                "RULES:\n"
+                "- Include full question text with all sub-parts\n"
+                "- For MCQs: separate question text from options\n"
+                "- Preserve ALL math notation, LaTeX, symbols exactly\n"
+                "- If a question references a figure/diagram, set has_figure to true\n"
+                "- Report the page number from === PAGE N === markers\n\n"
+                "Return ONLY valid JSON:\n"
+                '{"questions": [{"number": "1", "text": "...", "options": [...], "page": 0, "has_figure": false}]}\n\n'
+                "--- PAGE TEXT ---\n"
+                f"{retry_text}"
+            )
+
+            try:
+                retry_response = await client.chat.completions.create(
+                    model=OCR_FALLBACK_MODEL,
+                    messages=[{"role": "user", "content": retry_prompt}],
+                    max_completion_tokens=4096,
+                )
+                retry_raw = (retry_response.choices[0].message.content or "").strip()
+                if retry_raw:
+                    if retry_raw.startswith("```"):
+                        retry_raw = retry_raw.split("\n", 1)[-1]
+                        if retry_raw.endswith("```"):
+                            retry_raw = retry_raw[:-3].strip()
+                    retry_fixed = _fix_json_backslashes(retry_raw)
+                    try:
+                        retry_data = _json.loads(retry_raw)
+                    except _json.JSONDecodeError:
+                        retry_data = _json.loads(retry_fixed)
+                    retry_qs = retry_data.get("questions", [])
+
+                    # Merge retried questions back — match by question number
+                    retry_by_num = {str(rq.get("number", "")): rq for rq in retry_qs if rq.get("text", "").strip()}
+                    recovered = 0
+                    for fq in failed_questions:
+                        fnum = str(fq.get("number", ""))
+                        if fnum in retry_by_num:
+                            good_questions.append(retry_by_num[fnum])
+                            recovered += 1
+                            print(f"[GPT-EXTRACT] Recovered Q#{fnum} via retry", flush=True)
+                        else:
+                            # Still failed — add as empty placeholder so numbering is preserved
+                            good_questions.append(fq)
+                            print(f"[GPT-EXTRACT] Q#{fnum} still empty after retry", flush=True)
+
+                    print(f"[GPT-EXTRACT] Retry recovered {recovered}/{len(failed_questions)} questions", flush=True)
+                else:
+                    print(f"[GPT-EXTRACT] Retry returned empty — keeping original results", flush=True)
+                    good_questions.extend(failed_questions)
+            except Exception as retry_err:
+                print(f"[GPT-EXTRACT] Retry failed: {retry_err} — keeping original results", flush=True)
+                good_questions.extend(failed_questions)
+
+    # Sort by question number to restore original order
+    def _sort_key(q: Dict) -> int:
+        try:
+            return int(q.get("number", 0))
+        except (ValueError, TypeError):
+            return 9999
+    good_questions.sort(key=_sort_key)
+
+    # Build final ExtractedQuestion list
+    questions: List[ExtractedQuestion] = []
+    for q in good_questions:
         q_text = q.get("text", "").strip()
         if not q_text:
             continue
@@ -1109,393 +1282,154 @@ async def extract_questions_with_gpt(
     return questions
 
 
-async def _llm_assign_candidates(
-    questions: List[ExtractedQuestion],
-    candidates: List,  # List[FigureCandidate] — imported at call site
-    page_index: int,
-) -> Dict[str, Any]:
-    """
-    Use gpt-5.2-mini to assign figure candidates to questions on ambiguous pages.
+# ══════════════════════════════════════════════════════════════════════════════
+# OpenCV + LLM Figure Detection Pipeline — DISABLED
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# WHAT: Two functions that detect figures in exam papers and assign them to
+#       the correct questions:
+#
+#   1. _llm_assign_candidates() — Sends cropped figure images to GPT and asks
+#      "which image goes with which question?" Used only when the heuristic
+#      (1:1, N:N top-to-bottom) can't decide.
+#
+#   2. _extract_figures_for_questions() — Full pipeline:
+#      - Uses OpenCV (utils/figure_extractor.py) to detect figure regions
+#      - Assigns figures to questions via heuristic or LLM
+#      - Mutates ocr_result to add images + updates question metadata
+#
+# WHY DISABLED: With Mistral OCR as the primary OCR provider, this pipeline
+#   is no longer needed because:
+#   - Mistral extracts images natively with include_image_base64=True
+#   - Mistral places image references inline in markdown (![img-N](img-N))
+#     right next to the question they belong to
+#   - The image-to-question mapping is handled in extract_questions_with_gpt()
+#     using the page_image_ids lookup (lines ~1025-1050 above)
+#
+# WHEN TO RE-ENABLE: If switching back to Sarvam AI or GPT Vision as primary
+#   OCR (which don't reliably extract/position images), uncomment the two
+#   functions below AND the call site in run_document_ocr_pipeline().
+#
+# DEPENDS ON: utils/figure_extractor.py (OpenCV module), opencv-python-headless
+# ══════════════════════════════════════════════════════════════════════════════
 
-    Sends candidate crop thumbnails (detail="low") + question list and asks the
-    model to return {assignments: [{qid, candidate_id}]} — just mapping, no
-    bounding-box coordinates.
-
-    Returns dict mapping question id → FigureCandidate.
-    On any failure returns {} (non-fatal — questions just lack figures).
-    """
-    import json as _json
-    from openai import AsyncOpenAI
-
-    openai_key = os.getenv("OPENAI_API_KEY", "")
-    if not openai_key:
-        return {}
-
-    client = AsyncOpenAI(api_key=openai_key)
-
-    # Build content blocks: candidate images + question list
-    content_blocks: List[Dict[str, Any]] = []
-
-    # Add candidate images
-    for cand in candidates:
-        if not cand.crop_b64:
-            continue
-        content_blocks.append({
-            "type": "text",
-            "text": f"Candidate {cand.candidate_id}:"
-        })
-        content_blocks.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/png;base64,{cand.crop_b64}",
-                "detail": "low"
-            }
-        })
-
-    if not content_blocks:
-        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: no candidate crops available", flush=True)
-        return {}
-
-    # Limit to at most 8 candidate images to avoid token limits
-    image_count = sum(1 for b in content_blocks if b.get("type") == "image_url")
-    if image_count > 8:
-        # Keep only the first 8 image+label pairs
-        limited: List[Dict[str, Any]] = []
-        kept = 0
-        for b in content_blocks:
-            limited.append(b)
-            if b.get("type") == "image_url":
-                kept += 1
-                if kept >= 8:
-                    break
-        content_blocks = limited
-        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: limited to 8/{image_count} candidate images", flush=True)
-
-    # Add question list
-    q_list_text = "Questions that need figures:\n"
-    for q in questions:
-        q_short = q.text[:200].replace('\n', ' ')
-        q_list_text += f"- qid={q.id}: {q_short}\n"
-
-    cand_ids = [c.candidate_id for c in candidates if c.crop_b64]
-    prompt_text = (
-        f"{q_list_text}\n"
-        f"Available candidate IDs: {cand_ids}\n\n"
-        "For each question, decide which candidate image (if any) is its "
-        "diagram/figure/graph/circuit. A candidate may belong to at most one question.\n"
-        "IGNORE logos, watermarks, stamps, headers — only match actual diagrams.\n\n"
-        "Return ONLY valid JSON (no markdown fences):\n"
-        '{"assignments": [{"qid": "...", "candidate_id": "..."}]}\n'
-        'If no assignments: {"assignments": []}'
-    )
-    content_blocks.append({"type": "text", "text": prompt_text})
-
-    try:
-        response = await client.chat.completions.create(
-            model=OCR_FALLBACK_MODEL,
-            messages=[{"role": "user", "content": content_blocks}],
-            max_completion_tokens=512,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM call failed: {e}", flush=True)
-        return {}
-
-    if not raw:
-        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM returned empty response", flush=True)
-        return {}
-
-    print(f"[FIGURE-ASSIGN] Page {page_index + 1}: raw LLM response: {raw[:500]}", flush=True)
-
-    # Strip markdown fences if present
-    if raw.startswith("```"):
-        raw = raw.split("\n", 1)[-1]
-        if raw.endswith("```"):
-            raw = raw[:-3].strip()
-
-    try:
-        data = _json.loads(raw)
-    except _json.JSONDecodeError as e:
-        print(f"[FIGURE-ASSIGN] Page {page_index + 1}: JSON parse failed: {e}", flush=True)
-        return {}
-
-    # Build qid → candidate mapping
-    cand_lookup = {c.candidate_id: c for c in candidates}
-    valid_qids = {q.id for q in questions}
-    result: Dict[str, Any] = {}
-    for assignment in data.get("assignments", []):
-        qid = assignment.get("qid", "")
-        cid = assignment.get("candidate_id", "")
-        if not qid or not cid:
-            continue
-        if cid not in cand_lookup:
-            print(f"[FIGURE-ASSIGN] Page {page_index + 1}: unknown candidate_id '{cid}'", flush=True)
-            continue
-        if qid not in valid_qids:
-            print(f"[FIGURE-ASSIGN] Page {page_index + 1}: unknown qid '{qid}'", flush=True)
-            continue
-        result[qid] = cand_lookup[cid]
-
-    print(
-        f"[FIGURE-ASSIGN] Page {page_index + 1}: LLM assigned {len(result)} figures "
-        f"from {len(candidates)} candidates to {len(questions)} questions",
-        flush=True
-    )
-    return result
+# async def _llm_assign_candidates(
+#     questions: List[ExtractedQuestion],
+#     candidates: List,  # List[FigureCandidate] — imported at call site
+#     page_index: int,
+# ) -> Dict[str, Any]:
+#     """
+#     Use GPT to assign figure candidates to questions on ambiguous pages.
+#
+#     Sends candidate crop thumbnails (detail="low") + question list and asks the
+#     model to return {assignments: [{qid, candidate_id}]} — just mapping, no
+#     bounding-box coordinates.
+#
+#     Returns dict mapping question id → FigureCandidate.
+#     On any failure returns {} (non-fatal — questions just lack figures).
+#     """
+#     import json as _json
+#     from openai import AsyncOpenAI
+#
+#     openai_key = os.getenv("OPENAI_API_KEY", "")
+#     if not openai_key:
+#         return {}
+#
+#     client = AsyncOpenAI(api_key=openai_key)
+#
+#     content_blocks: List[Dict[str, Any]] = []
+#
+#     for cand in candidates:
+#         if not cand.crop_b64:
+#             continue
+#         content_blocks.append({"type": "text", "text": f"Candidate {cand.candidate_id}:"})
+#         content_blocks.append({"type": "image_url", "image_url": {
+#             "url": f"data:image/png;base64,{cand.crop_b64}", "detail": "low"
+#         }})
+#
+#     if not content_blocks:
+#         return {}
+#
+#     image_count = sum(1 for b in content_blocks if b.get("type") == "image_url")
+#     if image_count > 8:
+#         limited = []
+#         kept = 0
+#         for b in content_blocks:
+#             limited.append(b)
+#             if b.get("type") == "image_url":
+#                 kept += 1
+#                 if kept >= 8:
+#                     break
+#         content_blocks = limited
+#
+#     q_list_text = "Questions that need figures:\n"
+#     for q in questions:
+#         q_short = q.text[:200].replace('\n', ' ')
+#         q_list_text += f"- qid={q.id}: {q_short}\n"
+#
+#     cand_ids = [c.candidate_id for c in candidates if c.crop_b64]
+#     prompt_text = (
+#         f"{q_list_text}\nAvailable candidate IDs: {cand_ids}\n\n"
+#         "For each question, decide which candidate image (if any) is its "
+#         "diagram/figure/graph/circuit.\n"
+#         "Return ONLY valid JSON:\n"
+#         '{"assignments": [{"qid": "...", "candidate_id": "..."}]}\n'
+#     )
+#     content_blocks.append({"type": "text", "text": prompt_text})
+#
+#     try:
+#         response = await client.chat.completions.create(
+#             model=OCR_FALLBACK_MODEL,
+#             messages=[{"role": "user", "content": content_blocks}],
+#             max_completion_tokens=512,
+#         )
+#         raw = (response.choices[0].message.content or "").strip()
+#     except Exception as e:
+#         return {}
+#
+#     if not raw:
+#         return {}
+#
+#     if raw.startswith("```"):
+#         raw = raw.split("\n", 1)[-1]
+#         if raw.endswith("```"):
+#             raw = raw[:-3].strip()
+#
+#     try:
+#         data = _json.loads(raw)
+#     except _json.JSONDecodeError:
+#         return {}
+#
+#     cand_lookup = {c.candidate_id: c for c in candidates}
+#     valid_qids = {q.id for q in questions}
+#     result = {}
+#     for assignment in data.get("assignments", []):
+#         qid = assignment.get("qid", "")
+#         cid = assignment.get("candidate_id", "")
+#         if qid and cid and cid in cand_lookup and qid in valid_qids:
+#             result[qid] = cand_lookup[cid]
+#     return result
 
 
-async def _extract_figures_for_questions(
-    ocr_result: Dict[str, Any],
-    extracted_questions: List[ExtractedQuestion],
-    document_id: str,
-    pdf_bytes: Optional[bytes] = None,
-) -> None:
-    """
-    Deterministic figure extraction using OpenCV + heuristic/LLM assignment.
-
-    Pipeline (optimised for speed):
-    1. Group questions needing figures by page FIRST (skip pages with no needs)
-    2. Render pages on demand if page_render missing (Sarvam path)
-    3. Detect figure candidates ONLY on relevant pages (+ next page for lookahead)
-    4. Assign candidates to questions (heuristic first, LLM in parallel for ambiguous)
-
-    Mutates ocr_result in-place: adds cropped images to the appropriate page's
-    images list. Also updates question metadata with correct image_refs.
-    """
-    import time as _time
-    from utils.figure_extractor import (
-        detect_figure_candidates, crop_candidates,
-        FigureCandidate, PageFigureResult, CV2_AVAILABLE,
-    )
-
-    t0 = _time.monotonic()
-    pages = ocr_result.get("pages", [])
-
-    # ── Stage 1: Group questions needing figures by page ────────────────
-    # Do this FIRST so we know which pages to run OpenCV on
-    page_questions: Dict[int, List[ExtractedQuestion]] = {}
-    total_needing = 0
-    for q in extracted_questions:
-        has_fig = q.metadata.get("has_figure", False)
-        q_lower = q.text.lower()
-        needs_figure = (
-            has_fig
-            or "[figure]" in q_lower
-            or "diagram" in q_lower
-            or "figure" in q_lower
-            or "graph" in q_lower
-            or "circuit" in q_lower
-        )
-        if needs_figure:
-            q_page = q.metadata.get("page", 0)
-            if q_page not in page_questions:
-                page_questions[q_page] = []
-            page_questions[q_page].append(q)
-            total_needing += 1
-
-    if not page_questions:
-        print("[FIGURE-DETECT] No questions reference figures — skipping", flush=True)
-        return
-
-    print(
-        f"[FIGURE-DETECT] {total_needing} questions need figures across "
-        f"{len(page_questions)} pages",
-        flush=True
-    )
-
-    # ── Stage 2: Detect candidates ONLY on relevant pages ───────────────
-    # Build set of page indices we actually need (+ next page for lookahead)
-    needed_page_idxs: set = set()
-    for pidx in page_questions:
-        needed_page_idxs.add(pidx)
-        needed_page_idxs.add(pidx + 1)  # cross-page lookahead
-
-    # Build page lookup
-    page_by_idx: Dict[int, Dict[str, Any]] = {}
-    for page in pages:
-        page_by_idx[page.get("index", 0)] = page
-
-    # Render pages on demand if page_render is missing (Sarvam path).
-    # Only render pages we actually need for figure detection.
-    pages_needing_render = [
-        pidx for pidx in sorted(needed_page_idxs)
-        if pidx in page_by_idx
-        and not page_by_idx[pidx].get("page_render")
-        and not page_by_idx[pidx].get("images")
-    ]
-    if pages_needing_render and pdf_bytes and CV2_AVAILABLE:
-        import fitz  # PyMuPDF
-        print(f"[FIGURE-DETECT] Rendering {len(pages_needing_render)} pages for OpenCV (Sarvam path)...", flush=True)
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for pidx in pages_needing_render:
-            if pidx < len(doc):
-                mat = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI (faster than 200)
-                pix = doc[pidx].get_pixmap(matrix=mat)
-                img_bytes = pix.tobytes("png")
-                page_b64 = base64.b64encode(img_bytes).decode("utf-8")
-                page_by_idx[pidx]["page_render"] = page_b64
-                page_by_idx[pidx]["dimensions"]["width"] = pix.width
-                page_by_idx[pidx]["dimensions"]["height"] = pix.height
-        doc.close()
-
-    page_candidates: Dict[int, PageFigureResult] = {}
-
-    # Run OpenCV in thread pool to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-
-    def _detect_on_page(page_data: Dict[str, Any], pidx: int) -> Optional[PageFigureResult]:
-        existing_images = page_data.get("images", [])
-        if existing_images:
-            pr = PageFigureResult(
-                page_index=pidx,
-                page_width=page_data.get("dimensions", {}).get("width", 0),
-                page_height=page_data.get("dimensions", {}).get("height", 0),
-            )
-            for i, img in enumerate(existing_images):
-                pr.candidates.append(FigureCandidate(
-                    candidate_id=f"cand-p{pidx}-{i}",
-                    page_index=pidx,
-                    bbox=(
-                        img.get("top_left_x", 0), img.get("top_left_y", 0),
-                        img.get("bottom_right_x", 0), img.get("bottom_right_y", 0),
-                    ),
-                    area=(img.get("bottom_right_x", 0) - img.get("top_left_x", 0)) *
-                         (img.get("bottom_right_y", 0) - img.get("top_left_y", 0)),
-                    confidence=0.95,
-                    crop_b64=img.get("image_base64"),
-                ))
-            return pr if pr.candidates else None
-        elif page_data.get("page_render") and CV2_AVAILABLE:
-            page_img_bytes = base64.b64decode(page_data["page_render"])
-            pr = detect_figure_candidates(page_img_bytes, pidx)
-            if pr.candidates:
-                crop_candidates(page_img_bytes, pr)
-                return pr
-        return None
-
-    # Run detection on needed pages in parallel via thread pool
-    detect_tasks = []
-    for pidx in sorted(needed_page_idxs):
-        page_data = page_by_idx.get(pidx)
-        if page_data is None:
-            continue
-        detect_tasks.append((pidx, loop.run_in_executor(None, _detect_on_page, page_data, pidx)))
-
-    for pidx, task in detect_tasks:
-        pr = await task
-        if pr:
-            page_candidates[pidx] = pr
-
-    total_candidates = sum(len(pr.candidates) for pr in page_candidates.values())
-    t1 = _time.monotonic()
-
-    if total_candidates == 0:
-        print(f"[FIGURE-DETECT] No candidates found ({t1-t0:.1f}s) — skipping", flush=True)
-        return
-
-    print(
-        f"[FIGURE-DETECT] Found {total_candidates} candidates across "
-        f"{len(page_candidates)} pages ({t1-t0:.1f}s)",
-        flush=True
-    )
-
-    # ── Stage 3: Assign candidates to questions (per page) ──────────────
-    figures_added = 0
-    llm_tasks: List[tuple] = []  # (page_idx, qs_on_page, candidates) for parallel LLM
-
-    # First pass: heuristic assignments + collect ambiguous pages
-    heuristic_assignments: Dict[int, Dict[str, FigureCandidate]] = {}
-
-    for page_idx, qs_on_page in page_questions.items():
-        candidates: List[FigureCandidate] = []
-        if page_idx in page_candidates:
-            candidates.extend(page_candidates[page_idx].candidates)
-        if (page_idx + 1) in page_candidates:
-            candidates.extend(page_candidates[page_idx + 1].candidates)
-
-        if not candidates:
-            print(f"[FIGURE-DETECT] Page {page_idx + 1}: no candidates for {len(qs_on_page)} questions", flush=True)
-            continue
-
-        if len(candidates) == 1 and len(qs_on_page) == 1:
-            heuristic_assignments[page_idx] = {qs_on_page[0].id: candidates[0]}
-            print(f"[FIGURE-DETECT] Page {page_idx + 1}: 1:1 heuristic", flush=True)
-
-        elif len(candidates) == len(qs_on_page):
-            sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
-            heuristic_assignments[page_idx] = {
-                q.id: cand for q, cand in zip(qs_on_page, sorted_cands)
-            }
-            print(f"[FIGURE-DETECT] Page {page_idx + 1}: {len(candidates)}:{len(qs_on_page)} top-to-bottom", flush=True)
-
-        elif len(candidates) < len(qs_on_page) and all(c.confidence >= 0.5 for c in candidates):
-            sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
-            heuristic_assignments[page_idx] = {
-                qs_on_page[i].id: cand for i, cand in enumerate(sorted_cands) if i < len(qs_on_page)
-            }
-            print(f"[FIGURE-DETECT] Page {page_idx + 1}: partial heuristic ({len(candidates)} for {len(qs_on_page)})", flush=True)
-
-        else:
-            # Ambiguous — queue for parallel LLM
-            llm_tasks.append((page_idx, qs_on_page, candidates))
-            print(
-                f"[FIGURE-DETECT] Page {page_idx + 1}: ambiguous "
-                f"({len(candidates)} candidates, {len(qs_on_page)} questions) — queuing LLM",
-                flush=True
-            )
-
-    # Run all ambiguous-page LLM calls in parallel
-    llm_assignments: Dict[int, Dict[str, Any]] = {}
-    if llm_tasks:
-        llm_results = await asyncio.gather(
-            *[_llm_assign_candidates(qs, cands, pidx) for pidx, qs, cands in llm_tasks]
-        )
-        for (pidx, _, _), result in zip(llm_tasks, llm_results):
-            llm_assignments[pidx] = result
-
-    # ── Stage 4: Apply all assignments ──────────────────────────────────
-    all_assignments = {**heuristic_assignments, **llm_assignments}
-
-    for page_idx, qs_on_page in page_questions.items():
-        assignment = all_assignments.get(page_idx, {})
-        for q in qs_on_page:
-            cand = assignment.get(q.id)
-            if not cand:
-                continue
-
-            fig_id = f"fig-{document_id[:8]}-{q.id[:8]}"
-
-            img_dict = {
-                "id": fig_id,
-                "top_left_x": cand.bbox[0],
-                "top_left_y": cand.bbox[1],
-                "bottom_right_x": cand.bbox[2],
-                "bottom_right_y": cand.bbox[3],
-                "image_base64": cand.crop_b64,
-            }
-
-            target_page_idx = cand.page_index
-            target_page = page_by_idx.get(target_page_idx)
-            if target_page is not None:
-                target_page["images"].append(img_dict)
-
-            existing_refs = q.metadata.get("image_refs", [])
-            existing_refs.append(fig_id)
-            q.metadata["image_refs"] = existing_refs
-
-            existing_q_refs = q.metadata.get("question_image_refs", [])
-            existing_q_refs.append(fig_id)
-            q.metadata["question_image_refs"] = existing_q_refs
-
-            q.metadata["has_figure"] = True
-            figures_added += 1
-
-    t2 = _time.monotonic()
-    print(
-        f"[FIGURE-DETECT] Done! Assigned {figures_added} figures across "
-        f"{len(page_questions)} pages (detect={t1-t0:.1f}s assign={t2-t1:.1f}s total={t2-t0:.1f}s)",
-        flush=True
-    )
+# async def _extract_figures_for_questions(
+#     ocr_result: Dict[str, Any],
+#     extracted_questions: List[ExtractedQuestion],
+#     document_id: str,
+#     pdf_bytes: Optional[bytes] = None,
+# ) -> None:
+#     """
+#     Deterministic figure extraction using OpenCV + heuristic/LLM assignment.
+#
+#     Pipeline:
+#     1. Group questions needing figures by page
+#     2. Render pages on demand if page_render missing (Sarvam path)
+#     3. Detect figure candidates with OpenCV on relevant pages
+#     4. Assign candidates to questions (heuristic first, LLM for ambiguous)
+#
+#     Mutates ocr_result in-place: adds cropped images to pages and updates
+#     question metadata with image_refs.
+#     """
+#     pass  # Full implementation preserved in git history
 
 
 async def run_document_ocr_pipeline(
@@ -1542,9 +1476,18 @@ async def run_document_ocr_pipeline(
         if skip_option_extraction:
             logger.info(f"📝 Practice Sets mode: Options kept inline with question text")
 
-        # Per-question figure extraction — OpenCV detection + heuristic/LLM assignment
-        if document_type in ["Practice Sets", "Test Series"]:
-            await _extract_figures_for_questions(ocr_result, extracted_questions, document_id, file_content)
+        # Per-question figure extraction — DISABLED with Mistral OCR.
+        # Mistral OCR already extracts images and places them inline in markdown
+        # (e.g. ![img-2-0](img-2-0)) next to the questions they belong to.
+        # The image-to-question assignment is handled above in extract_questions_with_gpt()
+        # at lines 1047-1050 using page_image_ids mapping.
+        #
+        # The OpenCV + LLM pipeline below was needed when using Sarvam/GPT Vision OCR
+        # which did NOT reliably extract images or associate them with questions.
+        # To re-enable (e.g. if switching back to Sarvam), uncomment the two lines below.
+        #
+        # if document_type in ["Practice Sets", "Test Series"]:
+        #     await _extract_figures_for_questions(ocr_result, extracted_questions, document_id, file_content)
 
         print(f"[OCR-PIPELINE] Processing embedded images...", flush=True)
 
