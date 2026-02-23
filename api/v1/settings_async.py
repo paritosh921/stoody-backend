@@ -71,7 +71,7 @@ class SchoolSettingsResponse(BaseModel):
     created_at: Optional[datetime] = None
 
 
-# Default settings for new admins
+# Default settings for new admins (empty — admin must configure their own school)
 DEFAULT_SETTINGS = {
     "school_info": {
         "school_name": "",
@@ -81,17 +81,12 @@ DEFAULT_SETTINGS = {
         "address": "",
         "website": ""
     },
-    "classes": ["9", "10", "11", "12"],
-    "sections": ["A", "B", "C", "D", "E", "F"],
-    "class_sections": {
-        "9": ["A", "B", "C", "D", "E", "F"],
-        "10": ["A", "B", "C", "D", "E", "F"],
-        "11": ["A", "B", "C", "D", "E", "F"],
-        "12": ["A", "B", "C", "D", "E", "F"]
-    },
-    "subjects": ["Physics", "Chemistry", "Mathematics", "Biology", "English", "Hindi"],
-    "plan_types": ["CBSE", "JEE", "NEET", "CUET"],
-    "streams": ["Science", "Commerce", "Arts", "Other"]
+    "classes": [],
+    "sections": [],
+    "class_sections": {},
+    "subjects": [],
+    "plan_types": [],
+    "streams": []
 }
 
 
