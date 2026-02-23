@@ -144,9 +144,10 @@ def validate_email(email: str) -> bool:
     return bool(re.match(pattern, email))
 
 
-def validate_grade(grade: str) -> bool:
-    """Validate grade is in allowed list"""
-    return str(grade).strip() in VALID_GRADES
+def validate_grade(grade: str, valid_grades: List[str] = None) -> bool:
+    """Validate grade is in allowed list (from school settings or default)"""
+    allowed = valid_grades if valid_grades else VALID_GRADES
+    return str(grade).strip() in allowed
 
 
 def validate_section(section: str, valid_sections: List[str]) -> bool:
@@ -409,12 +410,16 @@ async def preview_bulk_upload(
         tenant_db = await get_tenant_db_or_403(db, current_user)
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
         settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
-        
+
         valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
+        valid_classes = settings_doc.get("classes", VALID_GRADES) if settings_doc else VALID_GRADES
+        valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
     except Exception:
         settings_doc = None
         valid_sections = ["A", "B", "C", "D", "E", "F"]
-    
+        valid_classes = VALID_GRADES
+        valid_subjects = []
+
     # Get school prefix for username generation
     school_name = ""
     if settings_doc and settings_doc.get("school_info"):
@@ -470,8 +475,8 @@ async def preview_bulk_upload(
         if not grade:
             errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message="Grade is required"))
             row_valid = False
-        elif not validate_grade(grade):
-            errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message=f"Invalid grade. Must be one of: {', '.join(VALID_GRADES)}"))
+        elif not validate_grade(grade, valid_classes):
+            errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message=f"Invalid grade. Must be one of: {', '.join(valid_classes)}"))
             row_valid = False
         
         # Validate custom username if provided
@@ -490,7 +495,8 @@ async def preview_bulk_upload(
         
         # Validate optional fields
         if section and not validate_section(section, valid_sections):
-            warnings.append(BulkUploadError(row=row_num, field="section", value=section, message=f"Invalid section. Allowed: {', '.join(valid_sections)}"))
+            errors.append(BulkUploadError(row=row_num, field="section", value=section, message=f"Invalid section. Must be one of: {', '.join(valid_sections)}"))
+            row_valid = False
         
         if email:
             if not validate_email(email):
@@ -507,9 +513,17 @@ async def preview_bulk_upload(
             else:
                 file_emails[email] = row_num
         
+        # Validate subjects against school settings (if provided)
+        subjects_str_val = str(row.get('subjects', '')).strip() if row.get('subjects') else ''
+        if subjects_str_val and valid_subjects:
+            parsed_subjects = parse_list_field(subjects_str_val)
+            invalid_subjects = [s for s in parsed_subjects if s not in valid_subjects]
+            if invalid_subjects:
+                warnings.append(BulkUploadError(row=row_num, field="subjects", value=', '.join(invalid_subjects), message=f"Unknown subjects. Allowed: {', '.join(valid_subjects)}"))
+
         if gender and gender not in ['male', 'female', 'other']:
             warnings.append(BulkUploadError(row=row_num, field="gender", value=gender, message="Invalid gender. Will default to empty."))
-        
+
         # Validate date format
         if date_of_birth:
             try:
@@ -619,9 +633,12 @@ async def import_bulk_students(
     try:
         settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
         valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
+        valid_classes = settings_doc.get("classes", VALID_GRADES) if settings_doc else VALID_GRADES
     except Exception:
+        settings_doc = None
         valid_sections = ["A", "B", "C", "D", "E", "F"]
-    
+        valid_classes = VALID_GRADES
+
     # Get existing emails and usernames
     existing_students = await db.mongo_find("students", {"admin_id": admin_id}, projection={"email": 1, "username_lower": 1})
     existing_emails = {s.get("email", "").lower() for s in existing_students if s.get("email")}
@@ -673,8 +690,8 @@ async def import_bulk_students(
             errors.append(BulkUploadError(row=row_num, field="full_name", message="Invalid full name"))
             row_valid = False
         
-        if not grade or not validate_grade(grade):
-            errors.append(BulkUploadError(row=row_num, field="grade", message=f"Invalid grade: {grade}"))
+        if not grade or not validate_grade(grade, valid_classes):
+            errors.append(BulkUploadError(row=row_num, field="grade", message=f"Invalid grade: {grade}. Must be one of: {', '.join(valid_classes)}"))
             row_valid = False
         
         # Validate custom username if provided
