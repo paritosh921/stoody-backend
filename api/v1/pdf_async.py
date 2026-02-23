@@ -1,6 +1,6 @@
 """
 Async PDF Processing API for SkillBot
-PDF upload and OCR processing endpoints with Sarvam AI Document Intelligence
+PDF upload and OCR processing endpoints with Mistral AI OCR (primary) and GPT Vision (fallback)
 """
 
 import logging
@@ -42,7 +42,11 @@ router = APIRouter()
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
-# Sarvam AI Document Intelligence configuration
+# Mistral AI OCR configuration (primary)
+MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
+MISTRAL_OCR_MODEL = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
+
+# Sarvam AI Document Intelligence configuration (disabled — kept for reference)
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 OCR_FALLBACK_MODEL = os.getenv("OCR_FALLBACK_MODEL", "gpt-5-mini")
 
@@ -226,37 +230,148 @@ async def call_gpt_vision_ocr(file_content: bytes) -> Dict[str, Any]:
     return {"pages": pages_result}
 
 
-async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
+async def call_mistral_ocr(file_content: bytes) -> Dict[str, Any]:
     """
-    Call Sarvam AI Document Intelligence API with raw PDF bytes.
-    Falls back to GPT Vision if Sarvam fails.
+    OCR using Mistral AI's dedicated OCR endpoint.
+    Direct API call — no polling, returns immediately.
 
-    Returns the same structure as the old Mistral OCR for downstream compatibility:
+    Returns the same structure for downstream compatibility:
     {
         "pages": [
             {
                 "index": 0,
                 "markdown": "extracted text...",
                 "images": [{"id": "img-0-0", "image_base64": "...", ...}],
-                "dimensions": {"dpi": 150, "width": 0, "height": 0}
+                "dimensions": {"dpi": 200, "width": 1700, "height": 2200}
             }
         ]
     }
     """
-    # --- GPT Vision as primary OCR provider (Sarvam disabled) ---
-    print("[OCR] Using GPT Vision as primary OCR provider...", flush=True)
-    try:
-        result = await call_gpt_vision_ocr(file_content)
-        print("[OCR] Provider: GPT Vision", flush=True)
-        return result
-    except Exception as gpt_err:
-        logger.error(f"GPT Vision OCR failed: {gpt_err}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"GPT Vision OCR failed: {gpt_err}"
+    import time as _time
+    from mistralai import Mistral
+
+    if not MISTRAL_API_KEY:
+        raise Exception("MISTRAL_API_KEY is not configured")
+
+    client = Mistral(api_key=MISTRAL_API_KEY)
+    pdf_b64 = base64.b64encode(file_content).decode("utf-8")
+
+    print(f"[MISTRAL-OCR] Starting OCR (PDF size: {len(file_content)} bytes, model: {MISTRAL_OCR_MODEL})", flush=True)
+    t0 = _time.monotonic()
+
+    # Mistral OCR is synchronous SDK — run in thread pool to not block event loop
+    def _run_mistral_sync() -> Any:
+        return client.ocr.process(
+            model=MISTRAL_OCR_MODEL,
+            document={
+                "type": "document_url",
+                "document_url": f"data:application/pdf;base64,{pdf_b64}",
+            },
+            include_image_base64=True,
         )
 
-    # --- Sarvam AI disabled — uncomment below and remove the block above to re-enable ---
+    ocr_response = await asyncio.get_event_loop().run_in_executor(None, _run_mistral_sync)
+
+    t1 = _time.monotonic()
+
+    # Convert Mistral response to our standard format
+    pages_result: List[Dict[str, Any]] = []
+    total_images = 0
+
+    for page in ocr_response.pages:
+        page_idx = page.index
+        markdown = page.markdown or ""
+
+        # Extract images — Mistral returns them in page.images
+        page_images: List[Dict[str, Any]] = []
+        if hasattr(page, "images") and page.images:
+            for i, img in enumerate(page.images):
+                img_id = f"img-{page_idx}-{i}"
+                img_b64 = None
+                # Mistral image objects have image_base64 attribute
+                if hasattr(img, "image_base64") and img.image_base64:
+                    img_b64 = img.image_base64
+                    # Replace the markdown image placeholder with our img_id
+                    # Mistral uses ![img-N.jpeg](img-N.jpeg) style
+                    if hasattr(img, "id") and img.id:
+                        markdown = markdown.replace(f"![{img.id}]({img.id})", f"![{img_id}]({img_id})")
+
+                page_images.append({
+                    "id": img_id,
+                    "image_base64": img_b64,
+                    "top_left_x": 0,
+                    "top_left_y": 0,
+                    "bottom_right_x": 0,
+                    "bottom_right_y": 0,
+                })
+                total_images += 1
+
+        # Page dimensions
+        dims = {"dpi": 200, "width": 0, "height": 0}
+        if hasattr(page, "dimensions") and page.dimensions:
+            dims = {
+                "dpi": getattr(page.dimensions, "dpi", 200),
+                "width": getattr(page.dimensions, "width", 0),
+                "height": getattr(page.dimensions, "height", 0),
+            }
+
+        pages_result.append({
+            "index": page_idx,
+            "markdown": markdown,
+            "images": page_images,
+            "dimensions": dims,
+        })
+
+    print(
+        f"[MISTRAL-OCR] Done! {len(pages_result)} pages, {total_images} images "
+        f"({t1 - t0:.1f}s)",
+        flush=True,
+    )
+    return {"pages": pages_result}
+
+
+async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
+    """
+    Primary OCR entry point for the pipeline.
+    Uses Mistral OCR as primary, GPT Vision as fallback.
+
+    Returns:
+    {
+        "pages": [
+            {
+                "index": 0,
+                "markdown": "extracted text...",
+                "images": [{"id": "img-0-0", "image_base64": "...", ...}],
+                "dimensions": {"dpi": 200, "width": 1700, "height": 2200}
+            }
+        ]
+    }
+    """
+    # --- Mistral OCR primary, GPT Vision fallback ---
+    if MISTRAL_API_KEY:
+        try:
+            result = await call_mistral_ocr(file_content)
+            print("[OCR] Provider: Mistral AI", flush=True)
+            return result
+        except Exception as mistral_err:
+            print(f"[OCR] Mistral OCR failed ({type(mistral_err).__name__}: {mistral_err}), falling back to GPT Vision...", flush=True)
+            logger.warning(f"Mistral OCR failed: {mistral_err}")
+    else:
+        print("[OCR] MISTRAL_API_KEY not set, skipping Mistral...", flush=True)
+
+    # GPT Vision fallback
+    try:
+        result = await call_gpt_vision_ocr(file_content)
+        print("[OCR] Provider: GPT Vision (fallback)", flush=True)
+        return result
+    except Exception as gpt_err:
+        logger.error(f"GPT Vision OCR also failed: {gpt_err}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"All OCR providers failed. GPT Vision: {gpt_err}"
+        )
+
+    # --- Sarvam AI (disabled — kept for reference) ---
     # if not SARVAM_API_KEY:
     #     logger.warning("SARVAM_API_KEY is not configured, skipping Sarvam — trying GPT Vision directly")
     #     print("[OCR] SARVAM_API_KEY not set, using GPT Vision directly...", flush=True)
@@ -270,121 +385,121 @@ async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
     #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
     #             detail=f"Sarvam API key not configured and GPT Vision fallback failed: {gpt_err}"
     #         )
-
-    # Sarvam can take 3-5 minutes for large PDFs — use generous timeout
-    sarvam_timeout = max(OCR_TIMEOUT_SECONDS, 600)  # At least 10 minutes
-
-    def _run_sarvam_sync() -> Dict[str, Any]:
-        """Run synchronous Sarvam SDK calls (executed in thread pool)."""
-        import tempfile
-        import zipfile
-        import time as _time
-        from sarvamai import SarvamAI
-
-        print(f"[SARVAM] Starting OCR (PDF size: {len(file_content)} bytes)", flush=True)
-        logger.info(f"Calling Sarvam AI Document Intelligence (PDF size: {len(file_content)} bytes)")
-
-        client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
-        start_time = _time.time()
-
-        # Save PDF to temp file (Sarvam SDK needs a file path)
-        tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
-        try:
-            with os.fdopen(tmp_pdf_fd, "wb") as tmp_pdf:
-                tmp_pdf.write(file_content)
-
-            # Create document intelligence job
-            print("[SARVAM] Creating job...", flush=True)
-            job = client.document_intelligence.create_job(
-                language="en-IN",
-                output_format="html"
-            )
-            print(f"[SARVAM] Job created: {job.job_id}", flush=True)
-            logger.info(f"Sarvam job created: {job.job_id}")
-
-            # Upload and start processing
-            job.upload_file(tmp_pdf_path)
-            print("[SARVAM] File uploaded, starting processing...", flush=True)
-            logger.info("Sarvam: File uploaded, starting processing...")
-            job.start()
-            print("[SARVAM] Job started, polling for completion...", flush=True)
-
-            # Poll with get_status() instead of wait_until_complete() for better control
-            completed_states = {"completed", "Completed", "COMPLETED"}
-            failed_states = {"failed", "Failed", "FAILED", "error", "Error", "ERROR"}
-            max_polls = 180  # 180 x 5s = 15 minutes max
-            poll_interval = 5  # seconds
-
-            for poll_num in range(1, max_polls + 1):
-                _time.sleep(poll_interval)
-                elapsed = _time.time() - start_time
-
-                try:
-                    job_status = job.get_status()
-                    state = job_status.job_state
-                    print(f"[SARVAM] Poll {poll_num}: state={state} ({elapsed:.0f}s)", flush=True)
-
-                    if state in completed_states:
-                        logger.info(f"Sarvam job completed in {elapsed:.0f}s")
-                        break
-                    elif state in failed_states:
-                        raise Exception(f"Sarvam job failed with state: {state}")
-                except AttributeError:
-                    # If get_status() not available, fall back to wait_until_complete
-                    print(f"[SARVAM] get_status() not available, using wait_until_complete()", flush=True)
-                    job.wait_until_complete()
-                    logger.info(f"Sarvam job completed via wait_until_complete in {elapsed:.0f}s")
-                    break
-            else:
-                raise Exception(f"Sarvam job did not complete after {max_polls * poll_interval}s")
-
-            # Download output ZIP
-            tmp_out_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
-            os.close(tmp_out_fd)
-            try:
-                print("[SARVAM] Downloading output...", flush=True)
-                job.download_output(tmp_zip_path)
-                zip_size = os.path.getsize(tmp_zip_path)
-                print(f"[SARVAM] Output downloaded ({zip_size} bytes), parsing...", flush=True)
-                logger.info(f"Sarvam output downloaded ({zip_size} bytes)")
-
-                result = _parse_sarvam_zip(tmp_zip_path)
-                total_time = _time.time() - start_time
-                print(f"[SARVAM] Done! {len(result.get('pages', []))} pages, {sum(len(p.get('images', [])) for p in result.get('pages', []))} images ({total_time:.0f}s total)", flush=True)
-                return result
-            finally:
-                if os.path.exists(tmp_zip_path):
-                    os.unlink(tmp_zip_path)
-        except Exception as e:
-            print(f"[SARVAM] ERROR: {type(e).__name__}: {e}", flush=True)
-            raise
-        finally:
-            if os.path.exists(tmp_pdf_path):
-                os.unlink(tmp_pdf_path)
-
-    try:
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(None, _run_sarvam_sync),
-            timeout=sarvam_timeout
-        )
-        logger.info(f"Sarvam OCR completed: {len(result.get('pages', []))} pages extracted")
-        print("[OCR] Provider: Sarvam AI", flush=True)
-        return result
-    except Exception as sarvam_err:
-        print(f"[OCR] Sarvam failed ({type(sarvam_err).__name__}), falling back to GPT Vision...", flush=True)
-        logger.warning(f"Sarvam OCR failed ({type(sarvam_err).__name__}: {sarvam_err}), attempting GPT Vision fallback")
-        try:
-            result = await call_gpt_vision_ocr(file_content)
-            print("[OCR] Provider: GPT Vision (fallback)", flush=True)
-            logger.info(f"GPT Vision fallback succeeded: {len(result.get('pages', []))} pages extracted")
-            return result
-        except Exception as gpt_err:
-            print(f"[OCR] GPT Vision also failed: {gpt_err}", flush=True)
-            logger.error(f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}", exc_info=True)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}"
-            )
+    #
+    # # Sarvam can take 3-5 minutes for large PDFs — use generous timeout
+    # sarvam_timeout = max(OCR_TIMEOUT_SECONDS, 600)  # At least 10 minutes
+    #
+    # def _run_sarvam_sync() -> Dict[str, Any]:
+    #     """Run synchronous Sarvam SDK calls (executed in thread pool)."""
+    #     import tempfile
+    #     import zipfile
+    #     import time as _time
+    #     from sarvamai import SarvamAI
+    #
+    #     print(f"[SARVAM] Starting OCR (PDF size: {len(file_content)} bytes)", flush=True)
+    #     logger.info(f"Calling Sarvam AI Document Intelligence (PDF size: {len(file_content)} bytes)")
+    #
+    #     client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+    #     start_time = _time.time()
+    #
+    #     # Save PDF to temp file (Sarvam SDK needs a file path)
+    #     tmp_pdf_fd, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+    #     try:
+    #         with os.fdopen(tmp_pdf_fd, "wb") as tmp_pdf:
+    #             tmp_pdf.write(file_content)
+    #
+    #         # Create document intelligence job
+    #         print("[SARVAM] Creating job...", flush=True)
+    #         job = client.document_intelligence.create_job(
+    #             language="en-IN",
+    #             output_format="html"
+    #         )
+    #         print(f"[SARVAM] Job created: {job.job_id}", flush=True)
+    #         logger.info(f"Sarvam job created: {job.job_id}")
+    #
+    #         # Upload and start processing
+    #         job.upload_file(tmp_pdf_path)
+    #         print("[SARVAM] File uploaded, starting processing...", flush=True)
+    #         logger.info("Sarvam: File uploaded, starting processing...")
+    #         job.start()
+    #         print("[SARVAM] Job started, polling for completion...", flush=True)
+    #
+    #         # Poll with get_status() instead of wait_until_complete() for better control
+    #         completed_states = {"completed", "Completed", "COMPLETED"}
+    #         failed_states = {"failed", "Failed", "FAILED", "error", "Error", "ERROR"}
+    #         max_polls = 180  # 180 x 5s = 15 minutes max
+    #         poll_interval = 5  # seconds
+    #
+    #         for poll_num in range(1, max_polls + 1):
+    #             _time.sleep(poll_interval)
+    #             elapsed = _time.time() - start_time
+    #
+    #             try:
+    #                 job_status = job.get_status()
+    #                 state = job_status.job_state
+    #                 print(f"[SARVAM] Poll {poll_num}: state={state} ({elapsed:.0f}s)", flush=True)
+    #
+    #                 if state in completed_states:
+    #                     logger.info(f"Sarvam job completed in {elapsed:.0f}s")
+    #                     break
+    #                 elif state in failed_states:
+    #                     raise Exception(f"Sarvam job failed with state: {state}")
+    #             except AttributeError:
+    #                 # If get_status() not available, fall back to wait_until_complete
+    #                 print(f"[SARVAM] get_status() not available, using wait_until_complete()", flush=True)
+    #                 job.wait_until_complete()
+    #                 logger.info(f"Sarvam job completed via wait_until_complete in {elapsed:.0f}s")
+    #                 break
+    #         else:
+    #             raise Exception(f"Sarvam job did not complete after {max_polls * poll_interval}s")
+    #
+    #         # Download output ZIP
+    #         tmp_out_fd, tmp_zip_path = tempfile.mkstemp(suffix=".zip")
+    #         os.close(tmp_out_fd)
+    #         try:
+    #             print("[SARVAM] Downloading output...", flush=True)
+    #             job.download_output(tmp_zip_path)
+    #             zip_size = os.path.getsize(tmp_zip_path)
+    #             print(f"[SARVAM] Output downloaded ({zip_size} bytes), parsing...", flush=True)
+    #             logger.info(f"Sarvam output downloaded ({zip_size} bytes)")
+    #
+    #             result = _parse_sarvam_zip(tmp_zip_path)
+    #             total_time = _time.time() - start_time
+    #             print(f"[SARVAM] Done! {len(result.get('pages', []))} pages, {sum(len(p.get('images', [])) for p in result.get('pages', []))} images ({total_time:.0f}s total)", flush=True)
+    #             return result
+    #         finally:
+    #             if os.path.exists(tmp_zip_path):
+    #                 os.unlink(tmp_zip_path)
+    #     except Exception as e:
+    #         print(f"[SARVAM] ERROR: {type(e).__name__}: {e}", flush=True)
+    #         raise
+    #     finally:
+    #         if os.path.exists(tmp_pdf_path):
+    #             os.unlink(tmp_pdf_path)
+    #
+    # try:
+    #     result = await asyncio.wait_for(
+    #         asyncio.get_event_loop().run_in_executor(None, _run_sarvam_sync),
+    #         timeout=sarvam_timeout
+    #     )
+    #     logger.info(f"Sarvam OCR completed: {len(result.get('pages', []))} pages extracted")
+    #     print("[OCR] Provider: Sarvam AI", flush=True)
+    #     return result
+    # except Exception as sarvam_err:
+    #     print(f"[OCR] Sarvam failed ({type(sarvam_err).__name__}), falling back to GPT Vision...", flush=True)
+    #     logger.warning(f"Sarvam OCR failed ({type(sarvam_err).__name__}: {sarvam_err}), attempting GPT Vision fallback")
+    #     try:
+    #         result = await call_gpt_vision_ocr(file_content)
+    #         print("[OCR] Provider: GPT Vision (fallback)", flush=True)
+    #         logger.info(f"GPT Vision fallback succeeded: {len(result.get('pages', []))} pages extracted")
+    #         return result
+    #     except Exception as gpt_err:
+    #         print(f"[OCR] GPT Vision also failed: {gpt_err}", flush=True)
+    #         logger.error(f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}", exc_info=True)
+    #         raise HTTPException(
+    #             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+    #             detail=f"Both OCR providers failed. Sarvam: {sarvam_err}, GPT: {gpt_err}"
+    #         )
 
 
 def _parse_sarvam_zip(zip_path: str) -> Dict[str, Any]:
@@ -1133,76 +1248,31 @@ async def _extract_figures_for_questions(
     ocr_result: Dict[str, Any],
     extracted_questions: List[ExtractedQuestion],
     document_id: str,
+    pdf_bytes: Optional[bytes] = None,
 ) -> None:
     """
     Deterministic figure extraction using OpenCV + heuristic/LLM assignment.
 
-    3-stage pipeline:
-    1. Detect figure candidates per page (OpenCV or pre-existing OCR images)
-    2. Group questions needing figures by page
-    3. Assign candidates to questions (heuristic first, LLM for ambiguous)
+    Pipeline (optimised for speed):
+    1. Group questions needing figures by page FIRST (skip pages with no needs)
+    2. Render pages on demand if page_render missing (Sarvam path)
+    3. Detect figure candidates ONLY on relevant pages (+ next page for lookahead)
+    4. Assign candidates to questions (heuristic first, LLM in parallel for ambiguous)
 
     Mutates ocr_result in-place: adds cropped images to the appropriate page's
     images list. Also updates question metadata with correct image_refs.
     """
+    import time as _time
     from utils.figure_extractor import (
         detect_figure_candidates, crop_candidates,
         FigureCandidate, PageFigureResult, CV2_AVAILABLE,
     )
 
+    t0 = _time.monotonic()
     pages = ocr_result.get("pages", [])
 
-    # ── Stage 1: Detect figure candidates per page ──────────────────────
-    page_candidates: Dict[int, PageFigureResult] = {}
-
-    for page in pages:
-        pidx = page.get("index", 0)
-        existing_images = page.get("images", [])
-
-        if existing_images:
-            # Sarvam/OCR provider already extracted images → use as candidates
-            pr = PageFigureResult(
-                page_index=pidx,
-                page_width=page.get("dimensions", {}).get("width", 0),
-                page_height=page.get("dimensions", {}).get("height", 0),
-            )
-            for i, img in enumerate(existing_images):
-                pr.candidates.append(FigureCandidate(
-                    candidate_id=f"cand-p{pidx}-{i}",
-                    page_index=pidx,
-                    bbox=(
-                        img.get("top_left_x", 0), img.get("top_left_y", 0),
-                        img.get("bottom_right_x", 0), img.get("bottom_right_y", 0),
-                    ),
-                    area=(img.get("bottom_right_x", 0) - img.get("top_left_x", 0)) *
-                         (img.get("bottom_right_y", 0) - img.get("top_left_y", 0)),
-                    confidence=0.95,
-                    crop_b64=img.get("image_base64"),
-                ))
-            if pr.candidates:
-                page_candidates[pidx] = pr
-        elif page.get("page_render") and CV2_AVAILABLE:
-            # Run OpenCV detection on the rendered page image
-            page_b64 = page["page_render"]
-            page_img_bytes = base64.b64decode(page_b64)
-            pr = detect_figure_candidates(page_img_bytes, pidx)
-            if pr.candidates:
-                crop_candidates(page_img_bytes, pr)
-                page_candidates[pidx] = pr
-
-    total_candidates = sum(len(pr.candidates) for pr in page_candidates.values())
-    if total_candidates == 0 and not any(page.get("images") for page in pages):
-        print("[FIGURE-DETECT] No figure candidates found on any page — skipping", flush=True)
-        return
-
-    print(
-        f"[FIGURE-DETECT] Found {total_candidates} candidates across "
-        f"{len(page_candidates)} pages",
-        flush=True
-    )
-
-    # ── Stage 2: Group questions needing figures by page ────────────────
-    # key: page_idx, value: list of questions (using q.id as key, NOT question_number)
+    # ── Stage 1: Group questions needing figures by page ────────────────
+    # Do this FIRST so we know which pages to run OpenCV on
     page_questions: Dict[int, List[ExtractedQuestion]] = {}
     total_needing = 0
     for q in extracted_questions:
@@ -1224,7 +1294,7 @@ async def _extract_figures_for_questions(
             total_needing += 1
 
     if not page_questions:
-        print("[FIGURE-DETECT] No questions reference figures — skipping assignment", flush=True)
+        print("[FIGURE-DETECT] No questions reference figures — skipping", flush=True)
         return
 
     print(
@@ -1233,11 +1303,110 @@ async def _extract_figures_for_questions(
         flush=True
     )
 
+    # ── Stage 2: Detect candidates ONLY on relevant pages ───────────────
+    # Build set of page indices we actually need (+ next page for lookahead)
+    needed_page_idxs: set = set()
+    for pidx in page_questions:
+        needed_page_idxs.add(pidx)
+        needed_page_idxs.add(pidx + 1)  # cross-page lookahead
+
+    # Build page lookup
+    page_by_idx: Dict[int, Dict[str, Any]] = {}
+    for page in pages:
+        page_by_idx[page.get("index", 0)] = page
+
+    # Render pages on demand if page_render is missing (Sarvam path).
+    # Only render pages we actually need for figure detection.
+    pages_needing_render = [
+        pidx for pidx in sorted(needed_page_idxs)
+        if pidx in page_by_idx
+        and not page_by_idx[pidx].get("page_render")
+        and not page_by_idx[pidx].get("images")
+    ]
+    if pages_needing_render and pdf_bytes and CV2_AVAILABLE:
+        import fitz  # PyMuPDF
+        print(f"[FIGURE-DETECT] Rendering {len(pages_needing_render)} pages for OpenCV (Sarvam path)...", flush=True)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for pidx in pages_needing_render:
+            if pidx < len(doc):
+                mat = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI (faster than 200)
+                pix = doc[pidx].get_pixmap(matrix=mat)
+                img_bytes = pix.tobytes("png")
+                page_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                page_by_idx[pidx]["page_render"] = page_b64
+                page_by_idx[pidx]["dimensions"]["width"] = pix.width
+                page_by_idx[pidx]["dimensions"]["height"] = pix.height
+        doc.close()
+
+    page_candidates: Dict[int, PageFigureResult] = {}
+
+    # Run OpenCV in thread pool to avoid blocking the event loop
+    loop = asyncio.get_event_loop()
+
+    def _detect_on_page(page_data: Dict[str, Any], pidx: int) -> Optional[PageFigureResult]:
+        existing_images = page_data.get("images", [])
+        if existing_images:
+            pr = PageFigureResult(
+                page_index=pidx,
+                page_width=page_data.get("dimensions", {}).get("width", 0),
+                page_height=page_data.get("dimensions", {}).get("height", 0),
+            )
+            for i, img in enumerate(existing_images):
+                pr.candidates.append(FigureCandidate(
+                    candidate_id=f"cand-p{pidx}-{i}",
+                    page_index=pidx,
+                    bbox=(
+                        img.get("top_left_x", 0), img.get("top_left_y", 0),
+                        img.get("bottom_right_x", 0), img.get("bottom_right_y", 0),
+                    ),
+                    area=(img.get("bottom_right_x", 0) - img.get("top_left_x", 0)) *
+                         (img.get("bottom_right_y", 0) - img.get("top_left_y", 0)),
+                    confidence=0.95,
+                    crop_b64=img.get("image_base64"),
+                ))
+            return pr if pr.candidates else None
+        elif page_data.get("page_render") and CV2_AVAILABLE:
+            page_img_bytes = base64.b64decode(page_data["page_render"])
+            pr = detect_figure_candidates(page_img_bytes, pidx)
+            if pr.candidates:
+                crop_candidates(page_img_bytes, pr)
+                return pr
+        return None
+
+    # Run detection on needed pages in parallel via thread pool
+    detect_tasks = []
+    for pidx in sorted(needed_page_idxs):
+        page_data = page_by_idx.get(pidx)
+        if page_data is None:
+            continue
+        detect_tasks.append((pidx, loop.run_in_executor(None, _detect_on_page, page_data, pidx)))
+
+    for pidx, task in detect_tasks:
+        pr = await task
+        if pr:
+            page_candidates[pidx] = pr
+
+    total_candidates = sum(len(pr.candidates) for pr in page_candidates.values())
+    t1 = _time.monotonic()
+
+    if total_candidates == 0:
+        print(f"[FIGURE-DETECT] No candidates found ({t1-t0:.1f}s) — skipping", flush=True)
+        return
+
+    print(
+        f"[FIGURE-DETECT] Found {total_candidates} candidates across "
+        f"{len(page_candidates)} pages ({t1-t0:.1f}s)",
+        flush=True
+    )
+
     # ── Stage 3: Assign candidates to questions (per page) ──────────────
     figures_added = 0
+    llm_tasks: List[tuple] = []  # (page_idx, qs_on_page, candidates) for parallel LLM
+
+    # First pass: heuristic assignments + collect ambiguous pages
+    heuristic_assignments: Dict[int, Dict[str, FigureCandidate]] = {}
 
     for page_idx, qs_on_page in page_questions.items():
-        # Gather candidates from this page AND next page (cross-page lookahead)
         candidates: List[FigureCandidate] = []
         if page_idx in page_candidates:
             candidates.extend(page_candidates[page_idx].candidates)
@@ -1248,53 +1417,52 @@ async def _extract_figures_for_questions(
             print(f"[FIGURE-DETECT] Page {page_idx + 1}: no candidates for {len(qs_on_page)} questions", flush=True)
             continue
 
-        # Try heuristic assignment first (no LLM cost)
-        assignment: Dict[str, FigureCandidate] = {}  # qid → candidate
-
         if len(candidates) == 1 and len(qs_on_page) == 1:
-            # 1:1 — assign directly
-            assignment[qs_on_page[0].id] = candidates[0]
-            print(f"[FIGURE-DETECT] Page {page_idx + 1}: 1:1 heuristic assignment", flush=True)
+            heuristic_assignments[page_idx] = {qs_on_page[0].id: candidates[0]}
+            print(f"[FIGURE-DETECT] Page {page_idx + 1}: 1:1 heuristic", flush=True)
 
         elif len(candidates) == len(qs_on_page):
-            # Same count — assign top-to-bottom
             sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
-            for q, cand in zip(qs_on_page, sorted_cands):
-                assignment[q.id] = cand
-            print(
-                f"[FIGURE-DETECT] Page {page_idx + 1}: {len(candidates)}:{len(qs_on_page)} "
-                f"top-to-bottom heuristic",
-                flush=True
-            )
+            heuristic_assignments[page_idx] = {
+                q.id: cand for q, cand in zip(qs_on_page, sorted_cands)
+            }
+            print(f"[FIGURE-DETECT] Page {page_idx + 1}: {len(candidates)}:{len(qs_on_page)} top-to-bottom", flush=True)
 
         elif len(candidates) < len(qs_on_page) and all(c.confidence >= 0.5 for c in candidates):
-            # Fewer candidates than questions, all confident — assign top-to-bottom for available
             sorted_cands = sorted(candidates, key=lambda c: c.bbox[1])
-            for i, cand in enumerate(sorted_cands):
-                if i < len(qs_on_page):
-                    assignment[qs_on_page[i].id] = cand
-            print(
-                f"[FIGURE-DETECT] Page {page_idx + 1}: partial heuristic "
-                f"({len(candidates)} candidates for {len(qs_on_page)} questions)",
-                flush=True
-            )
+            heuristic_assignments[page_idx] = {
+                qs_on_page[i].id: cand for i, cand in enumerate(sorted_cands) if i < len(qs_on_page)
+            }
+            print(f"[FIGURE-DETECT] Page {page_idx + 1}: partial heuristic ({len(candidates)} for {len(qs_on_page)})", flush=True)
 
         else:
-            # Ambiguous — use LLM for assignment
+            # Ambiguous — queue for parallel LLM
+            llm_tasks.append((page_idx, qs_on_page, candidates))
             print(
                 f"[FIGURE-DETECT] Page {page_idx + 1}: ambiguous "
-                f"({len(candidates)} candidates, {len(qs_on_page)} questions) — calling LLM",
+                f"({len(candidates)} candidates, {len(qs_on_page)} questions) — queuing LLM",
                 flush=True
             )
-            assignment = await _llm_assign_candidates(qs_on_page, candidates, page_idx)
 
-        # ── Stage 4: Apply assignments ──────────────────────────────────
+    # Run all ambiguous-page LLM calls in parallel
+    llm_assignments: Dict[int, Dict[str, Any]] = {}
+    if llm_tasks:
+        llm_results = await asyncio.gather(
+            *[_llm_assign_candidates(qs, cands, pidx) for pidx, qs, cands in llm_tasks]
+        )
+        for (pidx, _, _), result in zip(llm_tasks, llm_results):
+            llm_assignments[pidx] = result
+
+    # ── Stage 4: Apply all assignments ──────────────────────────────────
+    all_assignments = {**heuristic_assignments, **llm_assignments}
+
+    for page_idx, qs_on_page in page_questions.items():
+        assignment = all_assignments.get(page_idx, {})
         for q in qs_on_page:
             cand = assignment.get(q.id)
             if not cand:
                 continue
 
-            # Generate document-unique figure ID
             fig_id = f"fig-{document_id[:8]}-{q.id[:8]}"
 
             img_dict = {
@@ -1306,14 +1474,11 @@ async def _extract_figures_for_questions(
                 "image_base64": cand.crop_b64,
             }
 
-            # Add image to the candidate's page images list
             target_page_idx = cand.page_index
-            for page in pages:
-                if page.get("index") == target_page_idx:
-                    page["images"].append(img_dict)
-                    break
+            target_page = page_by_idx.get(target_page_idx)
+            if target_page is not None:
+                target_page["images"].append(img_dict)
 
-            # APPEND to existing image_refs (bug fix: old code overwrote)
             existing_refs = q.metadata.get("image_refs", [])
             existing_refs.append(fig_id)
             q.metadata["image_refs"] = existing_refs
@@ -1325,9 +1490,10 @@ async def _extract_figures_for_questions(
             q.metadata["has_figure"] = True
             figures_added += 1
 
+    t2 = _time.monotonic()
     print(
         f"[FIGURE-DETECT] Done! Assigned {figures_added} figures across "
-        f"{len(page_questions)} pages",
+        f"{len(page_questions)} pages (detect={t1-t0:.1f}s assign={t2-t1:.1f}s total={t2-t0:.1f}s)",
         flush=True
     )
 
@@ -1344,7 +1510,7 @@ async def run_document_ocr_pipeline(
     """Run the full OCR extraction pipeline for a stored document."""
     document_id = document["document_id"]
     try:
-        logger.info(f"Calling Sarvam AI OCR for job {job_id}")
+        logger.info(f"Calling OCR for job {job_id}")
         ocr_result = await call_sarvam_ocr(file_content)
 
         processing_result["progress"] = 60
@@ -1378,7 +1544,7 @@ async def run_document_ocr_pipeline(
 
         # Per-question figure extraction — OpenCV detection + heuristic/LLM assignment
         if document_type in ["Practice Sets", "Test Series"]:
-            await _extract_figures_for_questions(ocr_result, extracted_questions, document_id)
+            await _extract_figures_for_questions(ocr_result, extracted_questions, document_id, file_content)
 
         print(f"[OCR-PIPELINE] Processing embedded images...", flush=True)
 
@@ -4823,8 +4989,8 @@ async def extract_region_from_pdf(
         
         doc.close()
 
-        # Use Sarvam AI to OCR the cropped region PDF
-        logger.info(f"Calling Sarvam AI OCR for region {region_id} (PDF size: {len(region_pdf_bytes)} bytes)")
+        # OCR the cropped region PDF
+        logger.info(f"Calling OCR for region {region_id} (PDF size: {len(region_pdf_bytes)} bytes)")
 
         try:
             ocr_result = await call_sarvam_ocr(region_pdf_bytes)

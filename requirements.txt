@@ -99,11 +99,16 @@ limits==3.6.0
 celery[redis]==5.3.4
 
 # ===============================
-# Sarvam AI (Document Intelligence OCR)
+# Sarvam AI (Document Intelligence OCR) — currently disabled, kept for reference
 # ===============================
 sarvamai
 html2text
 beautifulsoup4
+
+# ===============================
+# Mistral AI (Document OCR — primary)
+# ===============================
+mistralai
 
 # ===============================
 # Optional: OpenAI client (NOT used for embeddings here).
