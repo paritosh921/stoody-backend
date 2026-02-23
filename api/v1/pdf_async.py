@@ -46,8 +46,15 @@ limiter = Limiter(key_func=get_remote_address)
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_OCR_MODEL = os.getenv("MISTRAL_OCR_MODEL", "mistral-ocr-latest")
 
+# Groq API configuration (primary for question extraction — fast + cheap)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
 # Sarvam AI Document Intelligence configuration (disabled — kept for reference)
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
+
+# OpenAI GPT — used as fallback for question extraction if Groq unavailable,
+# and as primary for GPT Vision OCR fallback
 OCR_FALLBACK_MODEL = os.getenv("OCR_FALLBACK_MODEL", "gpt-5-mini")
 
 # IMPORTANT: Grade/Standard matching uses EXACT string matching
@@ -929,7 +936,8 @@ async def extract_questions_with_gpt(
     skip_option_extraction: bool = False
 ) -> List[ExtractedQuestion]:
     """
-    Use GPT to extract structured questions from OCR text.
+    Use LLM to extract structured questions from OCR text.
+    Uses Groq (GPT-OSS 120B) as primary, falls back to OpenAI GPT-5-mini.
     Works with ANY question paper format — no hardcoded regex patterns.
     """
     import json as _json
@@ -939,20 +947,36 @@ async def extract_questions_with_gpt(
     if not pages:
         return []
 
-    # Build full text with page markers so GPT can report which page each question is on
+    # Build full text with page markers so LLM can report which page each question is on
     full_text = ""
     for page in pages:
         pidx = page.get("index", 0)
         md = page.get("markdown", "")
         full_text += f"\n=== PAGE {pidx} ===\n{md}"
 
-    print(f"[GPT-EXTRACT] Sending {len(full_text)} chars from {len(pages)} pages for question extraction", flush=True)
+    # Select LLM provider: Groq (primary) or OpenAI (fallback)
+    # Groq API is OpenAI-compatible — same AsyncOpenAI client, different base_url
+    if GROQ_API_KEY:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        extract_model = GROQ_MODEL
+        provider_name = "Groq"
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY configured — cannot extract questions")
+        client = AsyncOpenAI(api_key=openai_key)
+        extract_model = OCR_FALLBACK_MODEL
+        provider_name = "OpenAI"
 
-    openai_key = os.getenv("OPENAI_API_KEY", "")
-    if not openai_key:
-        raise Exception("OPENAI_API_KEY not configured — cannot extract questions")
+    # --- To switch back to OpenAI GPT-5-mini, comment out the Groq block above
+    # --- and uncomment these two lines:
+    # client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+    # extract_model = OCR_FALLBACK_MODEL
 
-    client = AsyncOpenAI(api_key=openai_key)
+    print(f"[Q-EXTRACT] Sending {len(full_text)} chars from {len(pages)} pages (provider: {provider_name}, model: {extract_model})", flush=True)
 
     extraction_prompt = (
         "You are a question paper parser. Extract ONLY the questions from the text below.\n\n"
@@ -983,24 +1007,24 @@ async def extract_questions_with_gpt(
     for attempt in range(1, max_retries + 1):
         try:
             response = await client.chat.completions.create(
-                model=OCR_FALLBACK_MODEL,
+                model=extract_model,
                 messages=[{"role": "user", "content": extraction_prompt}],
                 max_completion_tokens=16384,
             )
             raw_response = response.choices[0].message.content or ""
-            print(f"[GPT-EXTRACT] Attempt {attempt}: got {len(raw_response)} chars", flush=True)
+            print(f"[Q-EXTRACT] Attempt {attempt}: got {len(raw_response)} chars", flush=True)
             if raw_response.strip():
                 break
             if attempt < max_retries:
-                print(f"[GPT-EXTRACT] Empty response, retrying...", flush=True)
+                print(f"[Q-EXTRACT] Empty response, retrying...", flush=True)
         except Exception as e:
-            print(f"[GPT-EXTRACT] Attempt {attempt} failed: {e}", flush=True)
+            print(f"[Q-EXTRACT] Attempt {attempt} failed: {e}", flush=True)
             if attempt >= max_retries:
-                logger.error(f"GPT question extraction failed after {max_retries} attempts: {e}")
+                logger.error(f"Question extraction failed after {max_retries} attempts: {e}")
                 return []
 
     if not raw_response.strip():
-        print(f"[GPT-EXTRACT] All {max_retries} attempts returned empty response", flush=True)
+        print(f"[Q-EXTRACT] All {max_retries} attempts returned empty response", flush=True)
         return []
 
     # Parse JSON — handle markdown fences, then fix LaTeX backslash issues
@@ -1082,15 +1106,15 @@ async def extract_questions_with_gpt(
         try:
             fixed = _fix_json_backslashes(raw_response)
             data = _json.loads(fixed)
-            print(f"[GPT-EXTRACT] Fixed LaTeX backslashes in JSON response", flush=True)
+            print(f"[Q-EXTRACT] Fixed LaTeX backslashes in JSON response", flush=True)
         except _json.JSONDecodeError as e2:
             logger.error(f"Failed to parse GPT extraction response as JSON: {e2}")
-            print(f"[GPT-EXTRACT] JSON parse failed even after backslash fix: {e2}", flush=True)
-            print(f"[GPT-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
+            print(f"[Q-EXTRACT] JSON parse failed even after backslash fix: {e2}", flush=True)
+            print(f"[Q-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
             return []
 
     raw_questions = data.get("questions", [])
-    print(f"[GPT-EXTRACT] Parsed {len(raw_questions)} questions from GPT response", flush=True)
+    print(f"[Q-EXTRACT] Parsed {len(raw_questions)} questions from GPT response", flush=True)
 
     # Build page → image IDs map from OCR result so we can associate real image IDs
     page_image_ids: Dict[int, List[str]] = {}
@@ -1100,7 +1124,7 @@ async def extract_questions_with_gpt(
         if img_ids:
             page_image_ids[pidx] = img_ids
     if page_image_ids:
-        print(f"[GPT-EXTRACT] Page image map: {page_image_ids}", flush=True)
+        print(f"[Q-EXTRACT] Page image map: {page_image_ids}", flush=True)
 
     # Build page text lookup for targeted retries
     page_texts: Dict[int, str] = {}
@@ -1119,7 +1143,7 @@ async def extract_questions_with_gpt(
 
     if failed_questions:
         print(
-            f"[GPT-EXTRACT] {len(failed_questions)} questions have empty text — "
+            f"[Q-EXTRACT] {len(failed_questions)} questions have empty text — "
             f"retrying: {[q.get('number', '?') for q in failed_questions]}",
             flush=True,
         )
@@ -1157,7 +1181,7 @@ async def extract_questions_with_gpt(
 
             try:
                 retry_response = await client.chat.completions.create(
-                    model=OCR_FALLBACK_MODEL,
+                    model=extract_model,
                     messages=[{"role": "user", "content": retry_prompt}],
                     max_completion_tokens=4096,
                 )
@@ -1182,18 +1206,18 @@ async def extract_questions_with_gpt(
                         if fnum in retry_by_num:
                             good_questions.append(retry_by_num[fnum])
                             recovered += 1
-                            print(f"[GPT-EXTRACT] Recovered Q#{fnum} via retry", flush=True)
+                            print(f"[Q-EXTRACT] Recovered Q#{fnum} via retry", flush=True)
                         else:
                             # Still failed — add as empty placeholder so numbering is preserved
                             good_questions.append(fq)
-                            print(f"[GPT-EXTRACT] Q#{fnum} still empty after retry", flush=True)
+                            print(f"[Q-EXTRACT] Q#{fnum} still empty after retry", flush=True)
 
-                    print(f"[GPT-EXTRACT] Retry recovered {recovered}/{len(failed_questions)} questions", flush=True)
+                    print(f"[Q-EXTRACT] Retry recovered {recovered}/{len(failed_questions)} questions", flush=True)
                 else:
-                    print(f"[GPT-EXTRACT] Retry returned empty — keeping original results", flush=True)
+                    print(f"[Q-EXTRACT] Retry returned empty — keeping original results", flush=True)
                     good_questions.extend(failed_questions)
             except Exception as retry_err:
-                print(f"[GPT-EXTRACT] Retry failed: {retry_err} — keeping original results", flush=True)
+                print(f"[Q-EXTRACT] Retry failed: {retry_err} — keeping original results", flush=True)
                 good_questions.extend(failed_questions)
 
     # Sort by question number to restore original order
@@ -1262,13 +1286,13 @@ async def extract_questions_with_gpt(
 
         q_preview = q_text[:80].replace('\n', ' | ')
         fig_flag = " [HAS_FIGURE]" if has_image else ""
-        print(f"[GPT-EXTRACT]   Q#{q_num} p{q_page}: \"{q_preview}\" opts={len(options)}{fig_flag}", flush=True)
+        print(f"[Q-EXTRACT]   Q#{q_num} p{q_page}: \"{q_preview}\" opts={len(options)}{fig_flag}", flush=True)
 
     # Validation: warn if extracted count seems low for the number of pages
     expected_min = max(1, len(pages) * 2)  # heuristic: at least 2 questions per page
     if len(questions) < expected_min:
         print(
-            f"[GPT-EXTRACT] WARNING: Only {len(questions)} questions extracted from "
+            f"[Q-EXTRACT] WARNING: Only {len(questions)} questions extracted from "
             f"{len(pages)} pages (expected at least ~{expected_min}). "
             f"Response may be truncated.",
             flush=True
@@ -1278,7 +1302,7 @@ async def extract_questions_with_gpt(
             f"(expected >= {expected_min})"
         )
 
-    logger.info(f"GPT extracted {len(questions)} questions from {len(pages)} pages")
+    logger.info(f"Extracted {len(questions)} questions from {len(pages)} pages (provider: {provider_name})")
     return questions
 
 
