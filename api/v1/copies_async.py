@@ -11,10 +11,12 @@ feature in the Learning Mode of the student frontend.
 """
 
 import logging
+import os
 import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from bson import ObjectId
+import httpx
 
 from fastapi import APIRouter, HTTPException, Request, Depends, Query, status, Header
 from fastapi.responses import Response, StreamingResponse
@@ -29,6 +31,80 @@ from utils.stroke_pdf_generator import generate_copy_pdf, generate_copy_thumbnai
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copies", tags=["Student Copies"])
+
+DEFAULT_PEN_BACKEND_URL = "https://pkg5ywq5pcb5mby95dxirdffxi7oc2m7.stoody.in"
+
+
+def _resolve_pen_backend_history_url() -> Optional[str]:
+    """
+    Resolve the pen backend strokes-history endpoint.
+    Accepts either:
+    - PEN_BACKEND_URL=https://host
+    - PEN_BACKEND_URL=https://host/api/v1
+    """
+    base = (
+        os.getenv("PEN_BACKEND_URL")
+        or os.getenv("STOODY_PEN_BACKEND_URL")
+        or os.getenv("VITE_PEN_BACKEND_URL")
+        or DEFAULT_PEN_BACKEND_URL
+    )
+    if not base:
+        return None
+
+    normalized = base.rstrip("/")
+    if normalized.endswith("/api/v1"):
+        return f"{normalized}/agent/strokes/history"
+    return f"{normalized}/api/v1/agent/strokes/history"
+
+
+async def _fetch_remote_strokes(
+    authorization_header: Optional[str],
+    *,
+    pen_mac: Optional[str] = None,
+    page_number: Optional[int] = None,
+    book_type: Optional[str] = None,
+    limit: int = 2000,
+    order: str = "desc",
+) -> List[Dict[str, Any]]:
+    """
+    Fetch stroke batches from pen backend for the authenticated user.
+    Used as a fallback path when local tenant DB strokes are unavailable/empty.
+    """
+    endpoint = _resolve_pen_backend_history_url()
+    if not endpoint or not authorization_header:
+        return []
+
+    params: Dict[str, Any] = {
+        "limit": max(1, min(int(limit), 5000)),
+        "order": "asc" if order == "asc" else "desc",
+    }
+    if pen_mac:
+        params["pen_mac"] = pen_mac.upper()
+    if page_number is not None:
+        params["page_number"] = page_number
+    if book_type:
+        params["book_type"] = book_type
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                endpoint,
+                params=params,
+                headers={"Authorization": authorization_header},
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "Pen backend stroke fallback failed: %s %s",
+                    resp.status_code,
+                    resp.text[:200] if resp.text else "",
+                )
+                return []
+            data = resp.json()
+            strokes = data.get("strokes", [])
+            return strokes if isinstance(strokes, list) else []
+    except Exception as exc:
+        logger.warning("Pen backend stroke fallback error: %s", exc)
+        return []
 
 
 # Custom dependency that accepts token from query param (for image sources)
@@ -162,6 +238,7 @@ async def list_copy_pages(
     book_type: Optional[str] = Query(None, description="Filter by book type (A4, A5)"),
     limit: int = Query(50, ge=1, le=200, description="Max pages to return"),
     debug_all: bool = Query(False, description="Debug: Show all strokes without user filter"),
+    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -270,6 +347,72 @@ async def list_copy_pages(
                 "canvas_background": doc.get("canvas_background")
             })
         
+        # Fallback path: fetch from pen backend if tenant strokes are empty/missing.
+        if not pages and not debug_all:
+            remote_docs = await _fetch_remote_strokes(
+                request.headers.get("Authorization") if request else None,
+                pen_mac=pen_mac,
+                book_type=book_type,
+                limit=max(limit * 50, 2000),
+                order="desc",
+            )
+            if remote_docs:
+                grouped: Dict[tuple[str, Optional[str], int], Dict[str, Any]] = {}
+                for doc in remote_docs:
+                    page_no = doc.get("page_number")
+                    if page_no is None:
+                        continue
+                    try:
+                        page_no_int = int(page_no)
+                    except Exception:
+                        continue
+                    key_pen_mac = str(doc.get("pen_mac", "")).upper()
+                    key_book_type = doc.get("book_type")
+                    key = (key_pen_mac, key_book_type, page_no_int)
+
+                    ts = doc.get("timestamp")
+                    try:
+                        if isinstance(ts, str):
+                            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        elif isinstance(ts, datetime):
+                            ts_dt = ts
+                        else:
+                            ts_dt = datetime.utcnow()
+                    except Exception:
+                        ts_dt = datetime.utcnow()
+
+                    strokes_count = len(doc.get("strokes", []) or [])
+                    if key not in grouped:
+                        grouped[key] = {
+                            "pen_mac": key_pen_mac,
+                            "book_type": key_book_type,
+                            "page_number": page_no_int,
+                            "total_strokes": strokes_count,
+                            "first_activity": ts_dt,
+                            "last_activity": ts_dt,
+                            "canvas_background": doc.get("canvas_background"),
+                        }
+                    else:
+                        entry = grouped[key]
+                        entry["total_strokes"] += strokes_count
+                        if ts_dt < entry["first_activity"]:
+                            entry["first_activity"] = ts_dt
+                        if ts_dt > entry["last_activity"]:
+                            entry["last_activity"] = ts_dt
+                        if not entry.get("canvas_background"):
+                            entry["canvas_background"] = doc.get("canvas_background")
+
+                pages = sorted(
+                    grouped.values(),
+                    key=lambda p: p.get("last_activity") or datetime.min,
+                    reverse=True,
+                )[:limit]
+                logger.info(
+                    "Copy pages fallback via pen backend: %d pages for user %s",
+                    len(pages),
+                    user_id,
+                )
+
         logger.info(f"Found {len(pages)} copy pages for user {user_id}")
         
         return {
@@ -294,6 +437,7 @@ async def get_copy_page(
     page_number: int,
     book_type: Optional[str] = Query(None, description="Filter by book type"),
     debug_all: bool = Query(False, description="Debug: Skip user filter"),
+    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -337,6 +481,23 @@ async def get_copy_page(
             cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
             stroke_batches = await cursor.to_list(length=1000)
         
+        if not stroke_batches and not debug_all:
+            stroke_batches = await _fetch_remote_strokes(
+                request.headers.get("Authorization") if request else None,
+                pen_mac=pen_mac,
+                page_number=page_number,
+                book_type=book_type,
+                limit=5000,
+                order="asc",
+            )
+            if stroke_batches:
+                logger.info(
+                    "Copy page fallback via pen backend: pen_mac=%s page=%s user=%s",
+                    pen_mac,
+                    page_number,
+                    user_id,
+                )
+
         if not stroke_batches:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -355,10 +516,16 @@ async def get_copy_page(
             if not detected_book_type:
                 detected_book_type = batch.get("book_type")
             
+            ts_value = batch.get("timestamp")
+            if isinstance(ts_value, datetime):
+                ts_iso = ts_value.isoformat()
+            else:
+                ts_iso = str(ts_value) if ts_value else None
+
             serialized_batches.append({
-                "id": str(batch.get("_id")),
+                "id": str(batch.get("_id") or batch.get("id") or ""),
                 "session_id": batch.get("session_id"),
-                "timestamp": batch.get("timestamp").isoformat() if batch.get("timestamp") else None,
+                "timestamp": ts_iso,
                 "strokes": strokes,
                 "canvas_background": batch.get("canvas_background"),
                 "page_style": batch.get("page_style")
@@ -390,6 +557,7 @@ async def get_copy_page_svg(
     book_type: Optional[str] = Query(None, description="Book type"),
     background: str = Query("#FFFBF0", description="Background color"),
     debug_all: bool = Query(False, description="Debug: Skip user filter"),
+    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user_from_token_or_query),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -427,6 +595,22 @@ async def get_copy_page_svg(
             cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
             stroke_batches = await cursor.to_list(length=1000)
         
+        if not stroke_batches and not debug_all:
+            stroke_batches = await _fetch_remote_strokes(
+                request.headers.get("Authorization") if request else None,
+                pen_mac=pen_mac,
+                page_number=page_number,
+                book_type=book_type,
+                limit=5000,
+                order="asc",
+            )
+            if stroke_batches:
+                logger.info(
+                    "SVG fallback via pen backend: pen_mac=%s page=%s",
+                    pen_mac,
+                    page_number,
+                )
+
         if not stroke_batches:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -479,7 +663,8 @@ async def pins_options():
 
 @router.post("/pins", status_code=status.HTTP_201_CREATED)
 async def create_pin(
-    request: CreatePinRequest,
+    payload: CreatePinRequest,
+    raw_request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -492,7 +677,7 @@ async def create_pin(
         user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
         
-        logger.info(f"Creating pin for user {user_id}: pen_mac={request.pen_mac}, page={request.page_number}")
+        logger.info(f"Creating pin for user {user_id}: pen_mac={payload.pen_mac}, page={payload.page_number}")
         
         # Fetch stroke batches for this page
         # Check for user_id (str/ObjectId) OR username
@@ -503,11 +688,11 @@ async def create_pin(
 
         query = {
             "user_id": {"$in": user_identifiers},
-            "pen_mac": request.pen_mac.upper(),
-            "page_number": request.page_number
+            "pen_mac": payload.pen_mac.upper(),
+            "page_number": payload.page_number
         }
-        if request.book_type:
-            query["book_type"] = request.book_type
+        if payload.book_type:
+            query["book_type"] = payload.book_type
         
         if is_b2c:
             cursor = db.b2c_db["strokes"].find(query).sort("timestamp", 1)
@@ -516,7 +701,24 @@ async def create_pin(
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
             stroke_batches = await cursor.to_list(length=1000)
-        
+
+        if not stroke_batches:
+            stroke_batches = await _fetch_remote_strokes(
+                raw_request.headers.get("Authorization"),
+                pen_mac=payload.pen_mac,
+                page_number=payload.page_number,
+                book_type=payload.book_type,
+                limit=5000,
+                order="asc",
+            )
+            if stroke_batches:
+                logger.info(
+                    "Pin creation fallback via pen backend: pen_mac=%s page=%s user=%s",
+                    payload.pen_mac,
+                    payload.page_number,
+                    user_id,
+                )
+
         if not stroke_batches:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -526,7 +728,7 @@ async def create_pin(
         # Generate PDF
         pdf_bytes = await generate_copy_pdf(
             stroke_batches,
-            book_type=request.book_type
+            book_type=payload.book_type
         )
         
         if not pdf_bytes:
@@ -538,7 +740,7 @@ async def create_pin(
         # Generate thumbnail (optional, may fail if cairosvg not available)
         thumbnail_bytes = await generate_copy_thumbnail(
             stroke_batches,
-            book_type=request.book_type,
+            book_type=payload.book_type,
             scale=0.15
         )
         
@@ -571,21 +773,21 @@ async def create_pin(
             )
         
         # Create pin record
-        auto_title = request.title or f"Copy Page {request.page_number}"
-        if request.linked_document_id:
+        auto_title = payload.title or f"Copy Page {payload.page_number}"
+        if payload.linked_document_id:
             auto_title = f"{auto_title} - Learning Notes"
         
         pin_doc = {
             "_id": pin_id,
             "user_id": user_id,
-            "pen_mac": request.pen_mac.upper(),
-            "book_type": request.book_type,
-            "page_number": request.page_number,
+            "pen_mac": payload.pen_mac.upper(),
+            "book_type": payload.book_type,
+            "page_number": payload.page_number,
             "title": auto_title,
             "pdf_path": pdf_storage_path,
             "thumbnail_path": thumbnail_storage_path,
-            "linked_document_id": request.linked_document_id,
-            "linked_page": request.linked_page,
+            "linked_document_id": payload.linked_document_id,
+            "linked_page": payload.linked_page,
             "stroke_count": sum(len(b.get("strokes", [])) for b in stroke_batches),
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()

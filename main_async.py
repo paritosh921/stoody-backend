@@ -195,15 +195,6 @@ except Exception as e:
     _notes_available = False
     logging.warning(f"Notes routes disabled: {str(e)}")
 
-# Pen Notes routes (student handwritten pen notes — read-only, data written by pen server)
-try:
-    from api.v1.pen_notes_async import router as pen_notes_router
-    _pen_notes_available = True
-except Exception as e:
-    pen_notes_router = None
-    _pen_notes_available = False
-    logging.warning(f"Pen Notes routes disabled: {str(e)}")
-
 # OCR routes (handwriting recognition)
 try:
     from api.v1.ocr import router as ocr_router
@@ -984,17 +975,6 @@ if _notes_available and notes_router:
     logger.info("✅ Notes routes enabled")
 else:
     logger.warning("⚠️ Notes routes disabled")
-
-# Pen Notes routes (student handwritten pen notes)
-if _pen_notes_available and pen_notes_router:
-    app.include_router(
-        pen_notes_router,
-        prefix=f"{API_V1_PREFIX}",
-        tags=["Pen Notes"]
-    )
-    logger.info("✅ Pen Notes routes enabled")
-else:
-    logger.warning("⚠️ Pen Notes routes disabled")
 
 # OCR routes (handwriting recognition)
 if _ocr_available and ocr_router:
