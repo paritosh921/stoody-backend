@@ -11,12 +11,34 @@ from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+
+
+# ---------------------------------------------------------------------------
+# Global fix: make jsonable_encoder emit UTC-aware ISO strings for datetimes.
+#
+# The backend uses datetime.utcnow() everywhere, producing timezone-naive
+# objects.  FastAPI's jsonable_encoder converts them to ISO strings WITHOUT
+# a "Z" suffix (e.g. "2024-12-25T14:30:00").  The frontend's new Date()
+# then interprets them as local time, so timestamps appear wrong.
+#
+# We patch the ENCODERS_BY_TYPE dict that jsonable_encoder consults, so
+# ALL datetime objects are serialised with explicit UTC timezone info.
+# This is a single-point fix that covers every endpoint automatically.
+# ---------------------------------------------------------------------------
+from fastapi.encoders import ENCODERS_BY_TYPE
+
+def _datetime_to_utc_iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+    return dt.isoformat()
+
+ENCODERS_BY_TYPE[datetime] = _datetime_to_utc_iso
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -552,7 +574,7 @@ app = FastAPI(
     version="2.0.0",
     docs_url="/docs" if DEBUG_MODE else None,
     redoc_url="/redoc" if DEBUG_MODE else None,
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # Add rate limiting
