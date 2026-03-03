@@ -6,10 +6,13 @@ JWT-based authentication with rate limiting and caching
 import base64
 import logging
 import mimetypes
+import os
 import re
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from bson import ObjectId
+
+import jwt as pyjwt
 
 from fastapi import APIRouter, Request, HTTPException, Depends, status, Form, UploadFile, File, Query
 from fastapi.responses import JSONResponse, Response as RawResponse
@@ -43,7 +46,7 @@ from core.security import (
 from core.email_service import get_email_service
 from core.cookie_auth import get_current_user_dual_auth, cookie_auth_manager
 from core.observability import record_auth_login
-from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES, JWT_SECRET_KEY, JWT_ALGORITHM
 
 # Security logger for audit trail
 security_logger = get_security_logger()
@@ -2216,6 +2219,64 @@ async def logout(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Logout failed"
         )
+
+@router.post("/remote-logout")
+async def remote_logout(
+    request: Request,
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    """
+    Cross-client logout endpoint for the desktop agent.
+
+    The agent's user token is signed with USER_JWT_SECRET (pen backend),
+    which differs from the main backend's JWT_SECRET_KEY.  The normal
+    /logout endpoint rejects it because get_current_user cannot decode it.
+
+    This endpoint tries both secrets so the agent can trigger user-level
+    revocation that forces the web portal out on the next /verify poll.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token",
+        )
+
+    token = auth_header.split(" ", 1)[1]
+
+    # Try decoding with each known secret (main backend, then agent)
+    user_id: Optional[str] = None
+    secrets = [
+        JWT_SECRET_KEY,
+        os.getenv("USER_JWT_SECRET", ""),
+    ]
+    for secret in secrets:
+        if not secret:
+            continue
+        try:
+            payload = pyjwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+            user_id = payload.get("user_id") or payload.get("sub")
+            if user_id:
+                break
+        except pyjwt.InvalidTokenError:
+            continue
+
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate token with any known secret",
+        )
+
+    from core.token_blacklist import token_blacklist
+
+    # Token-level + user-level revocation
+    token_blacklist.revoke(token, expiry_seconds=86400)
+    token_blacklist.revoke_user(user_id)
+    await auth_manager.invalidate_user_session(user_id)
+
+    logger.info(f"Remote logout: user {user_id} revoked (token + user-level)")
+    return {"success": True, "message": "Successfully logged out"}
+
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_info(
