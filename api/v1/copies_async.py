@@ -57,6 +57,25 @@ def _resolve_pen_backend_history_url() -> Optional[str]:
     return f"{normalized}/api/v1/agent/strokes/history"
 
 
+def _resolve_forward_auth_header(request: Optional[Request]) -> Optional[str]:
+    """
+    Resolve a bearer token to forward to pen backend fallback APIs.
+    Prefers Authorization header; falls back to cookie-auth token.
+    """
+    if request is None:
+        return None
+
+    auth_header = request.headers.get("Authorization")
+    if auth_header:
+        return auth_header
+
+    cookie_token = request.cookies.get("stoody_auth_token")
+    if cookie_token:
+        return f"Bearer {cookie_token}"
+
+    return None
+
+
 async def _fetch_remote_strokes(
     authorization_header: Optional[str],
     *,
@@ -234,11 +253,11 @@ class PinnedCopyListResponse(BaseModel):
 
 @router.get("", response_model=CopyPageListResponse)
 async def list_copy_pages(
+    request: Request,
     pen_mac: Optional[str] = Query(None, description="Filter by pen MAC address"),
     book_type: Optional[str] = Query(None, description="Filter by book type (A4, A5)"),
     limit: int = Query(50, ge=1, le=200, description="Max pages to return"),
     debug_all: bool = Query(False, description="Debug: Show all strokes without user filter"),
-    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -350,7 +369,7 @@ async def list_copy_pages(
         # Fallback path: fetch from pen backend if tenant strokes are empty/missing.
         if not pages and not debug_all:
             remote_docs = await _fetch_remote_strokes(
-                request.headers.get("Authorization") if request else None,
+                _resolve_forward_auth_header(request),
                 pen_mac=pen_mac,
                 book_type=book_type,
                 limit=max(limit * 50, 2000),
@@ -433,11 +452,11 @@ async def list_copy_pages(
 
 @router.get("/{pen_mac}/{page_number}")
 async def get_copy_page(
+    request: Request,
     pen_mac: str,
     page_number: int,
     book_type: Optional[str] = Query(None, description="Filter by book type"),
     debug_all: bool = Query(False, description="Debug: Skip user filter"),
-    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -483,7 +502,7 @@ async def get_copy_page(
         
         if not stroke_batches and not debug_all:
             stroke_batches = await _fetch_remote_strokes(
-                request.headers.get("Authorization") if request else None,
+                _resolve_forward_auth_header(request),
                 pen_mac=pen_mac,
                 page_number=page_number,
                 book_type=book_type,
@@ -552,12 +571,12 @@ async def get_copy_page(
 
 @router.get("/{pen_mac}/{page_number}/svg")
 async def get_copy_page_svg(
+    request: Request,
     pen_mac: str,
     page_number: int,
     book_type: Optional[str] = Query(None, description="Book type"),
     background: str = Query("#FFFBF0", description="Background color"),
     debug_all: bool = Query(False, description="Debug: Skip user filter"),
-    request: Request = None,
     current_user: Dict[str, Any] = Depends(get_current_user_from_token_or_query),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -597,7 +616,7 @@ async def get_copy_page_svg(
         
         if not stroke_batches and not debug_all:
             stroke_batches = await _fetch_remote_strokes(
-                request.headers.get("Authorization") if request else None,
+                _resolve_forward_auth_header(request),
                 pen_mac=pen_mac,
                 page_number=page_number,
                 book_type=book_type,
@@ -704,7 +723,7 @@ async def create_pin(
 
         if not stroke_batches:
             stroke_batches = await _fetch_remote_strokes(
-                raw_request.headers.get("Authorization"),
+                _resolve_forward_auth_header(raw_request),
                 pen_mac=payload.pen_mac,
                 page_number=payload.page_number,
                 book_type=payload.book_type,
