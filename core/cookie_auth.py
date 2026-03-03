@@ -113,29 +113,41 @@ class CookieAuthManager:
     ) -> Optional[Dict[str, Any]]:
         """
         Get current user from cookie token
-        
+
         Args:
             request: FastAPI Request object
             auth_manager: AuthManager instance for token verification
-            
+
         Returns:
             User data dict or None if invalid/missing token
         """
         token = self.get_token_from_cookie(request)
-        
+
         if not token:
             return None
-            
+
+        # Check token-level blacklist (same check as Bearer path)
+        from core.token_blacklist import token_blacklist
+        if token_blacklist.is_revoked(token):
+            logger.info("Cookie token is revoked (token-level)")
+            return None
+
         # Verify token and get user data
         try:
             user_data = await auth_manager.verify_token_and_get_user(token)
-            
+
             if not user_data:
                 logger.warning("Invalid token in cookie")
                 return None
-                
+
+            # Check user-level revocation (cross-client logout)
+            user_id = user_data.get("user_id")
+            if user_id and token_blacklist.is_user_revoked(user_id):
+                logger.info(f"Cookie token rejected: user {user_id} revoked (user-level)")
+                return None
+
             return user_data
-            
+
         except Exception as e:
             logger.error(f"Cookie auth error: {str(e)}")
             return None
@@ -195,16 +207,25 @@ async def get_current_user_dual_auth(
     
     # Verify token
     user_data = await auth_manager.verify_token_and_get_user(token)
-    
+
     if not user_data:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-        
+
+    # Check user-level revocation (cross-client logout)
+    user_id = user_data.get("user_id")
+    if user_id and token_blacklist.is_user_revoked(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Session has been revoked. Please log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     logger.warning("Authenticated via header (deprecated). Migrate to cookie auth.")
-    
+
     return user_data
 
 

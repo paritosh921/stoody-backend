@@ -243,6 +243,10 @@ async def b2c_google_login(
 
         session_data = await auth_manager.create_user_session(user_data)
 
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(user_id)
+
         # Log login activity in B2C database
         try:
             await db.b2c_insert_one("user_activity_log", {
@@ -404,7 +408,11 @@ async def b2c_google_callback(
         }
         session_data = await auth_manager.create_user_session(user_data)
         access_token = session_data["access_token"]
-        
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(user_id)
+
         # Redirect back to Agent with token (URL-encode to handle special chars)
         import urllib.parse
         encoded_token = urllib.parse.quote(access_token, safe='')
@@ -477,6 +485,10 @@ async def b2c_logout(
             })
         except Exception as e:
             logger.warning(f"Failed to log B2C logout: {str(e)}")
+
+        # User-level revocation: invalidate ALL tokens for this user
+        from core.token_blacklist import token_blacklist
+        token_blacklist.revoke_user(user_id)
 
         # Invalidate session
         await auth_manager.invalidate_user_session(user_id)
@@ -648,7 +660,11 @@ async def b2c_admin_login(
         }
         
         session_data = await auth_manager.create_user_session(user_data)
-        
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(admin_id)
+
         # Log admin activity
         try:
             await db.b2c_insert_one("admin_activity_log", {

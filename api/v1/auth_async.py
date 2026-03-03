@@ -253,6 +253,15 @@ async def get_current_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
+        # Check user-level revocation (cross-client logout)
+        uid = user_data.get("user_id")
+        if uid and token_blacklist.is_user_revoked(uid):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been revoked. Please log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
         # Validate tenant claims against request context (if available)
         subdomain = _get_request_subdomain(request)
         token_subdomain = user_data.get("subdomain")
@@ -352,6 +361,10 @@ async def admin_login(
         session_data = await auth_manager.create_user_session(admin_data)
         record_auth_login("admin", True)
         login_recorded = True
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(str(admin_doc["_id"]))
 
         response_data = {
             "success": True,
@@ -459,6 +472,10 @@ async def student_login(
         session_data = await auth_manager.create_user_session(student_data)
         record_auth_login("student", True)
         login_recorded = True
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(str(student["_id"]))
 
         pen_token = None
         pen_token_expires_at = None
@@ -583,6 +600,10 @@ async def tutor_login(
         session_data = await auth_manager.create_user_session(tutor_data)
         record_auth_login("tutor", True)
         login_recorded = True
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import token_blacklist
+        token_blacklist.clear_user_revocation(tutor_data.get("user_id", ""))
 
         response_data = {
             "success": True,
@@ -2146,7 +2167,11 @@ async def logout(
         from core.token_blacklist import token_blacklist
         token = credentials.credentials
         token_blacklist.revoke(token, expiry_seconds=86400)  # Keep in blacklist for 24 hours
-        logger.info(f"Token revoked for user {user_id}")
+
+        # User-level revocation: invalidate ALL tokens for this user
+        # so that other clients (portal, other browsers) are forced out
+        token_blacklist.revoke_user(user_id)
+        logger.info(f"Token + user-level revocation for user {user_id}")
 
         # For students, track session end
         if user_type == "student":

@@ -523,10 +523,13 @@ async def cookie_logout(
         token = cookie_auth_manager.get_token_from_cookie(request)
         
         # Revoke token in blacklist
+        from core.token_blacklist import token_blacklist
         if token:
-            from core.token_blacklist import token_blacklist
             token_blacklist.revoke(token, expiry_seconds=86400)
-            logger.info(f"Token revoked for user {user_id}")
+
+        # User-level revocation: invalidate ALL tokens for this user
+        token_blacklist.revoke_user(user_id)
+        logger.info(f"Token + user-level revocation for user {user_id}")
         
         # For students, update status
         if user_type == "student":
