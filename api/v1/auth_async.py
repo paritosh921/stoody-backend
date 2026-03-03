@@ -2228,6 +2228,7 @@ async def logout(
 async def remote_logout(
     request: Request,
     auth_manager: AuthManager = Depends(get_auth_manager),
+    db: DatabaseManager = Depends(get_database),
 ):
     """
     Cross-client logout endpoint for the desktop agent.
@@ -2238,6 +2239,12 @@ async def remote_logout(
 
     This endpoint tries both secrets so the agent can trigger user-level
     revocation that forces the web portal out on the next /verify poll.
+
+    IMPORTANT: The pen backend stores the student's *username* as user_id
+    in its tokens (because _auth_user prefers username over ObjectId).
+    The main backend uses the MongoDB ObjectId as user_id.  We must
+    resolve the username → ObjectId so the Redis revocation key matches
+    what the /verify path checks.
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -2249,12 +2256,13 @@ async def remote_logout(
     token = auth_header.split(" ", 1)[1]
 
     # Try decoding with each known secret (main backend, then agent)
+    payload: Optional[Dict[str, Any]] = None
     user_id: Optional[str] = None
-    secrets = [
+    jwt_secrets = [
         JWT_SECRET_KEY,
         os.getenv("USER_JWT_SECRET", ""),
     ]
-    for secret in secrets:
+    for secret in jwt_secrets:
         if not secret:
             continue
         try:
@@ -2265,7 +2273,7 @@ async def remote_logout(
         except pyjwt.InvalidTokenError:
             continue
 
-    if not user_id:
+    if not user_id or not payload:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Could not validate token with any known secret",
@@ -2273,12 +2281,62 @@ async def remote_logout(
 
     from core.token_blacklist import token_blacklist, revoke_user_session
 
-    # Token-level (in-memory) + user-level (Redis) revocation
+    # Token-level (in-memory) revocation
     token_blacklist.revoke(token, expiry_seconds=86400)
-    await revoke_user_session(auth_manager.cache_manager, user_id)
-    await auth_manager.invalidate_user_session(user_id)
 
-    logger.info(f"Remote logout: user {user_id} revoked (token + user-level via Redis)")
+    # Collect all user_id variants to revoke.
+    # The pen backend may store the username as user_id, while the main
+    # backend uses the MongoDB ObjectId.  We revoke ALL known identifiers
+    # so the /verify check (which uses ObjectId) always finds the flag.
+    ids_to_revoke = set()
+    ids_to_revoke.add(user_id)
+
+    # Also grab username from the token if different from user_id
+    token_username = payload.get("username")
+    if token_username:
+        ids_to_revoke.add(token_username)
+
+    # Resolve username → MongoDB ObjectId via tenant DB lookup
+    db_name = payload.get("db_name")
+    if db_name:
+        try:
+            tenant_db = await db.get_tenant_db(db_name)
+            if tenant_db is not None:
+                # Try to find student by username (case-insensitive)
+                student = await tenant_db["students"].find_one(
+                    {"username_lower": user_id.lower()},
+                    {"_id": 1}
+                )
+                if not student:
+                    # Fallback: try exact username match
+                    student = await tenant_db["students"].find_one(
+                        {"username": user_id},
+                        {"_id": 1}
+                    )
+                if student:
+                    ids_to_revoke.add(str(student["_id"]))
+                    logger.info(f"Remote logout: resolved username '{user_id}' → ObjectId '{student['_id']}'")
+
+                # Also check if user_id is already an ObjectId (try admins/tutors too)
+                if not student:
+                    try:
+                        oid = ObjectId(user_id)
+                        for coll_name in ("students", "admins", "tutors"):
+                            doc = await tenant_db[coll_name].find_one({"_id": oid}, {"_id": 1})
+                            if doc:
+                                ids_to_revoke.add(str(doc["_id"]))
+                                break
+                    except Exception:
+                        pass  # user_id is not a valid ObjectId, that's fine
+        except Exception as e:
+            logger.warning(f"Remote logout: tenant DB lookup failed: {e}")
+
+    # User-level (Redis) revocation for ALL known identifiers
+    for uid in ids_to_revoke:
+        await revoke_user_session(auth_manager.cache_manager, uid)
+        await auth_manager.invalidate_user_session(uid)
+
+    logger.info(f"Remote logout: revoked identifiers {ids_to_revoke}")
     return {"success": True, "message": "Successfully logged out"}
 
 
