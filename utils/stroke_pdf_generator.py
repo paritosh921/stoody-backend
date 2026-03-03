@@ -64,6 +64,18 @@ DEFAULT_STROKE_COLOR = "#1a1a1a"
 DEFAULT_STROKE_WIDTH = 2.0
 
 
+def _is_closed_outline_path(path_data: str) -> bool:
+    """
+    Detect whether an SVG path is a closed outline (intended for fill rendering).
+
+    Agent-generated perfect-freehand paths are closed and end with `Z`.
+    """
+    if not path_data:
+        return False
+    normalized = path_data.strip().lower()
+    return normalized.endswith("z")
+
+
 def get_canvas_dimensions(book_type: Optional[str]) -> Tuple[int, int]:
     """Get canvas dimensions for a book type."""
     if book_type and book_type.upper() in BOOK_DIMENSIONS:
@@ -209,7 +221,7 @@ def build_svg_from_strokes(
     
     # Add styles
     svg_parts.append('  <style>')
-    svg_parts.append('    path { fill: none; stroke-linecap: round; stroke-linejoin: round; }')
+    svg_parts.append('    path { stroke-linecap: round; stroke-linejoin: round; }')
     svg_parts.append('  </style>')
     
     # Process each stroke batch
@@ -228,15 +240,27 @@ def build_svg_from_strokes(
             
             # Try to get pre-rendered SVG path first (V2 format)
             svg_path = stroke.get('svgPath', '')
-            
-            if not svg_path:
-                # Fall back to building path from points
-                points = stroke.get('points', [])
-                svg_path = build_svg_path_from_points(points)
-            
+
+            if svg_path:
+                # Agent V2 paths are closed outlines from perfect-freehand.
+                # They must be filled (not stroked) to avoid zig-zag artifacts.
+                if _is_closed_outline_path(svg_path):
+                    svg_parts.append(
+                        f'  <path d="{svg_path}" fill="{color}" stroke="none"/>'
+                    )
+                else:
+                    # Legacy/non-outline path: render as centerline stroke.
+                    svg_parts.append(
+                        f'  <path d="{svg_path}" fill="none" stroke="{color}" stroke-width="{adjusted_width:.1f}"/>'
+                    )
+                continue
+
+            # Fall back to building centerline path from points
+            points = stroke.get('points', [])
+            svg_path = build_svg_path_from_points(points)
             if svg_path:
                 svg_parts.append(
-                    f'  <path d="{svg_path}" stroke="{color}" stroke-width="{adjusted_width:.1f}"/>'
+                    f'  <path d="{svg_path}" fill="none" stroke="{color}" stroke-width="{adjusted_width:.1f}"/>'
                 )
     
     # Close SVG document
