@@ -140,9 +140,12 @@ class CookieAuthManager:
                 logger.warning("Invalid token in cookie")
                 return None
 
-            # Check user-level revocation (cross-client logout)
+            # Check user-level revocation in Redis (cross-client logout)
+            from core.token_blacklist import is_user_session_revoked
             user_id = user_data.get("user_id")
-            if user_id and token_blacklist.is_user_revoked(user_id):
+            if user_id and await is_user_session_revoked(
+                auth_manager.cache_manager, user_id
+            ):
                 logger.info(f"Cookie token rejected: user {user_id} revoked (user-level)")
                 return None
 
@@ -215,9 +218,12 @@ async def get_current_user_dual_auth(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Check user-level revocation (cross-client logout)
+    # Check user-level revocation in Redis (cross-client logout)
+    from core.token_blacklist import is_user_session_revoked
     user_id = user_data.get("user_id")
-    if user_id and token_blacklist.is_user_revoked(user_id):
+    if user_id and await is_user_session_revoked(
+        auth_manager.cache_manager, user_id
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Session has been revoked. Please log in again.",

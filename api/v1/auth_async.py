@@ -256,9 +256,12 @@ async def get_current_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
 
-        # Check user-level revocation (cross-client logout)
+        # Check user-level revocation in Redis (cross-client logout)
+        from core.token_blacklist import is_user_session_revoked
         uid = user_data.get("user_id")
-        if uid and token_blacklist.is_user_revoked(uid):
+        if uid and await is_user_session_revoked(
+            auth_manager.cache_manager, uid
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Session has been revoked. Please log in again.",
@@ -366,8 +369,8 @@ async def admin_login(
         login_recorded = True
 
         # Clear any user-level revocation so the new token is accepted
-        from core.token_blacklist import token_blacklist
-        token_blacklist.clear_user_revocation(str(admin_doc["_id"]))
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, str(admin_doc["_id"]))
 
         response_data = {
             "success": True,
@@ -477,8 +480,8 @@ async def student_login(
         login_recorded = True
 
         # Clear any user-level revocation so the new token is accepted
-        from core.token_blacklist import token_blacklist
-        token_blacklist.clear_user_revocation(str(student["_id"]))
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, str(student["_id"]))
 
         pen_token = None
         pen_token_expires_at = None
@@ -605,8 +608,8 @@ async def tutor_login(
         login_recorded = True
 
         # Clear any user-level revocation so the new token is accepted
-        from core.token_blacklist import token_blacklist
-        token_blacklist.clear_user_revocation(tutor_data.get("user_id", ""))
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, tutor_data.get("user_id", ""))
 
         response_data = {
             "success": True,
@@ -2171,9 +2174,10 @@ async def logout(
         token = credentials.credentials
         token_blacklist.revoke(token, expiry_seconds=86400)  # Keep in blacklist for 24 hours
 
-        # User-level revocation: invalidate ALL tokens for this user
+        # User-level revocation (Redis): invalidate ALL tokens for this user
         # so that other clients (portal, other browsers) are forced out
-        token_blacklist.revoke_user(user_id)
+        from core.token_blacklist import revoke_user_session
+        await revoke_user_session(auth_manager.cache_manager, user_id)
         logger.info(f"Token + user-level revocation for user {user_id}")
 
         # For students, track session end
@@ -2267,14 +2271,14 @@ async def remote_logout(
             detail="Could not validate token with any known secret",
         )
 
-    from core.token_blacklist import token_blacklist
+    from core.token_blacklist import token_blacklist, revoke_user_session
 
-    # Token-level + user-level revocation
+    # Token-level (in-memory) + user-level (Redis) revocation
     token_blacklist.revoke(token, expiry_seconds=86400)
-    token_blacklist.revoke_user(user_id)
+    await revoke_user_session(auth_manager.cache_manager, user_id)
     await auth_manager.invalidate_user_session(user_id)
 
-    logger.info(f"Remote logout: user {user_id} revoked (token + user-level)")
+    logger.info(f"Remote logout: user {user_id} revoked (token + user-level via Redis)")
     return {"success": True, "message": "Successfully logged out"}
 
 

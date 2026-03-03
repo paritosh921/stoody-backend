@@ -527,8 +527,9 @@ async def cookie_logout(
         if token:
             token_blacklist.revoke(token, expiry_seconds=86400)
 
-        # User-level revocation: invalidate ALL tokens for this user
-        token_blacklist.revoke_user(user_id)
+        # User-level revocation (Redis): invalidate ALL tokens for this user
+        from core.token_blacklist import revoke_user_session
+        await revoke_user_session(auth_manager.cache_manager, user_id)
         logger.info(f"Token + user-level revocation for user {user_id}")
         
         # For students, update status
