@@ -253,10 +253,12 @@ READING GUIDELINES:
 If canvas appears empty or you cannot read anything, set confidence to 0."""
 
         try:
+            # Allow longer completions for dense handwritten or essay-style submissions.
+            ocr_max_tokens = 1400 if question_context and len(question_context) > 300 else 1000
             response = await self.ai_service.analyze_image_async(
                 image,
                 prompt,
-                max_tokens=800
+                max_tokens=ocr_max_tokens
             )
             
             if response.get("success") and response.get("response"):
@@ -267,16 +269,25 @@ If canvas appears empty or you cannot read anything, set confidence to 0."""
                     transcribed = parsed.get("transcribed_text", "").strip()
                     final_answer = parsed.get("final_answer", "").strip()
                     confidence = float(parsed.get("confidence", 0.5))
-                    
-                    # Prefer final_answer if available, otherwise use transcribed
-                    extracted = final_answer or transcribed
+
+                    # For general extraction, preserve full transcription first.
+                    # If a distinct final answer is detected, append it as structured metadata.
+                    if transcribed and final_answer:
+                        if final_answer.lower() in transcribed.lower():
+                            extracted = transcribed
+                        else:
+                            extracted = f"{transcribed}\n[Detected final answer]: {final_answer}"
+                    elif transcribed:
+                        extracted = transcribed
+                    else:
+                        extracted = final_answer
                     
                     return ExtractionResult(
                         extracted_text=extracted,
                         confidence=confidence,
                         method="general_ocr",
                         raw_response=raw,
-                        is_likely_answer=bool(final_answer)
+                        is_likely_answer=bool(final_answer or transcribed)
                     )
                 
                 # Could not parse, try raw extraction

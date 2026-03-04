@@ -4,6 +4,7 @@ Practice session management endpoints with analytics
 """
 
 import logging
+import aiofiles
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from bson import ObjectId
@@ -209,6 +210,24 @@ def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
         logger.warning(f"Partial extraction failed: {e}")
     
     return None
+
+
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    """Trim large text blocks for prompt safety while preserving useful content."""
+    if not text:
+        return ""
+    clean = str(text).strip()
+    if len(clean) <= max_chars:
+        return clean
+    omitted = len(clean) - max_chars
+    return f"{clean[:max_chars]}\n...[truncated {omitted} chars]"
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 router = APIRouter()
@@ -419,15 +438,15 @@ async def _figure_images_base64(q: Dict[str, Any], db: DatabaseManager = None, i
                 elif img_doc.get("file_path"):
                     file_path = img_doc["file_path"]
                     if os.path.exists(file_path):
-                        with open(file_path, "rb") as f:
-                            image_bytes = f.read()
-                            base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
-                            content_type = img_doc.get("content_type", "image/jpeg")
-                            if not content_type.startswith("image/"):
-                                content_type = "image/jpeg"
-                            b64 = f"data:{content_type};base64,{base64_encoded}"
-                            logger.info(f"Loaded image from disk for {img_id}: {len(b64)} bytes")
-                            return b64
+                        async with aiofiles.open(file_path, "rb") as f:
+                            image_bytes = await f.read()
+                        base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                        content_type = img_doc.get("content_type", "image/jpeg")
+                        if not content_type.startswith("image/"):
+                            content_type = "image/jpeg"
+                        b64 = f"data:{content_type};base64,{base64_encoded}"
+                        logger.info(f"Loaded image from disk for {img_id}: {len(b64)} bytes")
+                        return b64
         except Exception as e:
             logger.error(f"Failed to load image {img_id}: {e}")
         return None
@@ -534,11 +553,11 @@ async def _option_images_base64(q: Dict[str, Any], db: DatabaseManager = None, i
                 elif img_doc.get("file_path"):
                     file_path = img_doc["file_path"]
                     if os.path.exists(file_path):
-                        with open(file_path, "rb") as f:
-                            image_bytes = f.read()
-                            base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
-                            content_type = img_doc.get("content_type", "image/jpeg")
-                            return f"data:{content_type};base64,{base64_encoded}"
+                        async with aiofiles.open(file_path, "rb") as f:
+                            image_bytes = await f.read()
+                        base64_encoded = base64_module.b64encode(image_bytes).decode('utf-8')
+                        content_type = img_doc.get("content_type", "image/jpeg")
+                        return f"data:{content_type};base64,{base64_encoded}"
         except Exception as e:
             logger.error(f"Failed to load option image {img_id}: {e}")
         return None
@@ -648,9 +667,22 @@ async def get_next_practice_question(
         # Get questions from MongoDB (Practice Sets)
         fetched_ids = []
         metadatas = []
+
+        admin_id = current_user.get("admin_id")
+        admin_id_str = str(admin_id).strip() if admin_id is not None else ""
+
+        def _apply_admin_scope(query_filter: Dict[str, Any]) -> None:
+            """Attach admin isolation filter when available."""
+            if not admin_id_str:
+                return
+            try:
+                query_filter["admin_id"] = ObjectId(admin_id_str)
+            except Exception:
+                query_filter["admin_id"] = admin_id_str
         
         # Build filter for Practice Sets
         mongo_filter: Dict[str, Any] = {"document_type": "Practice Sets"}
+        _apply_admin_scope(mongo_filter)
         if subject:
             mongo_filter["subject"] = subject
         if difficulty:
@@ -673,11 +705,7 @@ async def get_next_practice_question(
         # Additional MongoDB fallback if no results
         if not fetched_ids:
             mongo_filter = {"metadata.document_type": "Practice Sets"}
-            # Scope by admin
-            try:
-                mongo_filter["admin_id"] = ObjectId(admin_id)
-            except Exception:
-                mongo_filter["admin_id"] = admin_id
+            _apply_admin_scope(mongo_filter)
             if subject:
                 mongo_filter["subject"] = subject
             if difficulty:
@@ -782,16 +810,16 @@ async def get_next_practice_question(
                             file_path = img_doc["file_path"]
                             if os.path.exists(file_path):
                                 try:
-                                    with open(file_path, "rb") as f:
-                                        image_bytes = f.read()
-                                        base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
-                                        # Determine content type from file extension or stored content_type
-                                        content_type = img_doc.get("content_type", "image/jpeg")
-                                        if not content_type.startswith("image/"):
-                                            # Default to jpeg if content type is not an image
-                                            content_type = "image/jpeg"
-                                        base64_data = f"data:{content_type};base64,{base64_encoded}"
-                                        logger.info(f"✅ Loaded and converted image {fig_id} from file: {len(base64_data)} bytes")
+                                    async with aiofiles.open(file_path, "rb") as f:
+                                        image_bytes = await f.read()
+                                    base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
+                                    # Determine content type from file extension or stored content_type
+                                    content_type = img_doc.get("content_type", "image/jpeg")
+                                    if not content_type.startswith("image/"):
+                                        # Default to jpeg if content type is not an image
+                                        content_type = "image/jpeg"
+                                    base64_data = f"data:{content_type};base64,{base64_encoded}"
+                                    logger.info(f"✅ Loaded and converted image {fig_id} from file: {len(base64_data)} bytes")
                                 except Exception as file_err:
                                     logger.error(f"❌ Failed to read image file {file_path}: {file_err}")
                             else:
@@ -1060,21 +1088,18 @@ async def evaluate_submission(
                 except Exception as doc_err:
                     logger.warning(f"Failed to extract text from {doc.name}: {doc_err}")
         
-        # === STAGE 1: CANVAS OCR EXTRACTION (New Enhanced Pipeline) ===
-        ocr_extracted_text = ""
-        ocr_confidence = 0.0
+        # === STAGE 1: IMAGE ENHANCEMENT ===
+        # Enhance canvas images for better LLM vision analysis.
+        # No intermediate OCR model is used — the raw (enhanced) images go directly
+        # to the unbiased extraction (Stage 2A) and final evaluation (Stage 2B)
+        # so that GPT-5.1's own vision reads the handwriting without being biased
+        # by a potentially wrong OCR transcript.
         
         if student_images_raw:
             logger.info(f"🖼️ Processing {len(student_images_raw)} student images...")
             try:
-                from services.canvas_ocr_service import get_canvas_ocr_service
-                from utils.image_processor import (
-                    enhance_canvas_images_batch,
-                    merge_canvas_pages_vertical,
-                    is_canvas_empty
-                )
+                from utils.image_processor import enhance_canvas_images_batch
                 
-                # Enhance canvas images for better OCR
                 logger.info(f"🖼️ Enhancing {len(student_images_raw)} student images...")
                 try:
                     enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
@@ -1085,44 +1110,22 @@ async def evaluate_submission(
                     logger.warning(f"⚠️ Image enhancement failed: {enhance_err}. Using raw images.")
                     enhanced_student_images = student_images_raw
                 
-                # Run dedicated OCR extraction
-                try:
-                    ocr_service = get_canvas_ocr_service()
-                    ocr_result = await ocr_service.extract_text_from_canvas(
-                        canvas_pages=enhanced_student_images,
-                        question_context=question_text,
-                        options_context=options_text if is_mcq else None,
-                        is_mcq=is_mcq
-                    )
-                    
-                    ocr_extracted_text = ocr_result.extracted_text
-                    ocr_confidence = ocr_result.confidence
-                    
-                    logger.info(f"📖 OCR Extraction: '{ocr_extracted_text}' (confidence: {ocr_confidence:.2f}, method: {ocr_result.method})")
-                except Exception as ocr_inner_err:
-                    logger.warning(f"⚠️ OCR extraction failed: {ocr_inner_err}. Continuing without OCR.")
-                
                 # Use enhanced images for subsequent LLM evaluation
                 student_images = enhanced_student_images
                 
             except ImportError as ie:
-                logger.warning(f"Canvas OCR service not available: {ie}. Using raw images.")
+                logger.warning(f"Image processor not available: {ie}. Using raw images.")
                 student_images = student_images_raw
-            except Exception as ocr_err:
-                logger.error(f"Image processing failed: {ocr_err}. Continuing with raw images.")
+            except Exception as img_err:
+                logger.error(f"Image processing failed: {img_err}. Continuing with raw images.")
                 student_images = student_images_raw
         else:
             student_images = []
             logger.info("📷 No student images to process")
         
         # === STAGE 2: COMBINED EVALUATION WITH ENHANCED PROMPT ===
-        # Combine typed answer with OCR-extracted text and uploaded document text
+        # Combine typed answer with uploaded document text (no intermediate OCR injection)
         combined_answer = answer_text
-        if ocr_extracted_text and ocr_confidence > 0.3:
-            if answer_text:
-                combined_answer = f"{answer_text} (Canvas OCR: {ocr_extracted_text})"
-            else:
-                combined_answer = ocr_extracted_text
         
         # Add uploaded document text to combined answer
         if uploaded_doc_text:
@@ -1159,6 +1162,111 @@ async def evaluate_submission(
         detected_language = detect_language(question_text)
         language_instruction = get_language_instruction(detected_language)
         logger.info(f"🌐 Language detection: question='{detected_language}' for Q:{qid}")
+
+        # Detect if this is an essay/descriptive question (common in commerce, humanities)
+        is_essay_question = (
+            not is_mcq and
+            any(keyword in question_text.lower() for keyword in [
+                'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
+                'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
+                'what are', 'what is', 'how does', 'why is', 'state', 'mention',
+                'differentiate', 'illustrate', 'comment', 'evaluate', 'justify'
+            ])
+        )
+
+        # === STAGE 2A: UNBIASED EXTRACTION (no correct answer shown) ===
+        unbiased_extracted_answer = ""
+        unbiased_transcribed_text = ""
+        unbiased_extraction_confidence = 0.0
+        unbiased_extraction_source = "none"
+
+        if answer_text:
+            unbiased_extracted_answer = answer_text
+            unbiased_extraction_confidence = 1.0
+            unbiased_extraction_source = "typed_answer"
+
+        if num_s_images > 0:
+            extraction_prompt = (
+                "Extract ONLY what the student wrote from the handwritten submission.\n"
+                "Do NOT solve the question and do NOT infer the likely correct option.\n"
+                "Return strict JSON:\n"
+                "{\n"
+                '  "final_answer": "student final answer if visible, else empty",\n'
+                '  "transcribed_text": "readable transcription of student content",\n'
+                '  "confidence": 0.0,\n'
+                '  "notes": "short extraction notes"\n'
+                "}\n\n"
+                "Question context (for symbol interpretation only):\n"
+                f"{_truncate_for_prompt(question_text, 1200)}\n\n"
+            )
+            if options_text:
+                extraction_prompt += (
+                    "Options context (for letter mapping only; do not infer):\n"
+                    f"{_truncate_for_prompt(options_text, 1200)}\n\n"
+                )
+            extraction_prompt += "Analyze only what is visibly present in student handwriting."
+
+            extraction_system_prompt = (
+                "You are a strict OCR extractor. Never hallucinate and never guess based on expected correctness."
+            )
+
+            try:
+                extraction_resp = await ai.analyze_images_and_text_async(
+                    student_images,
+                    extraction_prompt,
+                    max_tokens=1200 if is_essay_question else 500,
+                    system_prompt=extraction_system_prompt
+                )
+                extraction_raw = (extraction_resp.get("response") or "").strip()
+                extraction_parsed = robust_json_parse(extraction_raw) or {}
+                if isinstance(extraction_parsed, dict):
+                    extracted_final = str(
+                        extraction_parsed.get("final_answer")
+                        or extraction_parsed.get("extracted_answer")
+                        or extraction_parsed.get("selected_option")
+                        or extraction_parsed.get("detected_text")
+                        or ""
+                    ).strip()
+                    transcribed = str(
+                        extraction_parsed.get("transcribed_text")
+                        or extraction_parsed.get("work_shown")
+                        or extraction_parsed.get("notes")
+                        or ""
+                    ).strip()
+                    parsed_conf = _coerce_float(
+                        extraction_parsed.get("confidence", extraction_parsed.get("ocr_confidence")),
+                        default=0.0
+                    )
+
+                    if transcribed:
+                        unbiased_transcribed_text = transcribed
+                    if extracted_final and not unbiased_extracted_answer:
+                        unbiased_extracted_answer = extracted_final
+                        unbiased_extraction_source = "vision_extraction"
+                        unbiased_extraction_confidence = max(unbiased_extraction_confidence, parsed_conf)
+                    elif not unbiased_extracted_answer and transcribed and is_essay_question:
+                        unbiased_extracted_answer = transcribed
+                        unbiased_extraction_source = "vision_transcription"
+                        unbiased_extraction_confidence = max(unbiased_extraction_confidence, parsed_conf)
+            except Exception as extraction_err:
+                logger.warning(f"⚠️ Unbiased extraction failed: {extraction_err}")
+
+
+        if not unbiased_extracted_answer and combined_answer:
+            unbiased_extracted_answer = _truncate_for_prompt(combined_answer, 2000)
+            unbiased_extraction_source = "combined_text"
+            unbiased_extraction_confidence = max(unbiased_extraction_confidence, 0.3)
+
+        # Backward-compatible OCR fields are derived from the unbiased extraction stage.
+        # This keeps downstream response contracts stable without reintroducing a biased OCR pass.
+        ocr_extracted_text = (unbiased_transcribed_text or unbiased_extracted_answer or "").strip()
+        ocr_confidence = float(unbiased_extraction_confidence or 0.0)
+        has_extracted_content = bool(
+            (unbiased_extracted_answer and unbiased_extracted_answer.strip())
+            or (unbiased_transcribed_text and unbiased_transcribed_text.strip())
+        )
+
+        uploaded_doc_excerpt = _truncate_for_prompt(uploaded_doc_text, 12000)
         
         # Construct IMPROVED Prompt with clearer structure and explicit instructions
         prompt = (
@@ -1196,15 +1304,33 @@ async def evaluate_submission(
             prompt += "📋 OPTIONS:\n"
             prompt += f"{options_text}\n\n"
         
-        # Correct answer section - CRITICAL for evaluation
+        # Student's input section
         prompt += "═══════════════════════════════════════\n"
-        prompt += "✅ CORRECT ANSWER:\n"
+        prompt += "✍️ STUDENT'S SUBMISSION:\n"
         prompt += "═══════════════════════════════════════\n"
         
+        if answer_text:
+            prompt += f"Typed Answer: {answer_text}\n"
+        if unbiased_extracted_answer:
+            prompt += f"Unbiased Extracted Answer: {unbiased_extracted_answer}\n"
+        if unbiased_transcribed_text:
+            prompt += f"Unbiased Transcription: {_truncate_for_prompt(unbiased_transcribed_text, 3000)}\n"
+
+        if uploaded_doc_excerpt:
+            prompt += f"Uploaded Document Content:\n{uploaded_doc_excerpt}\n"
+        if num_s_images > 0:
+            prompt += f"Handwritten Canvas: {num_s_images} page(s) submitted - EXAMINE CAREFULLY.\n"
+        if not answer_text and not has_extracted_content and not uploaded_doc_excerpt and num_s_images == 0:
+            prompt += "(No answer submitted)\n"
+        prompt += "\n"
+
+        # Correct answer section after student extraction context to reduce anchoring bias.
+        prompt += "═══════════════════════════════════════\n"
+        prompt += "✅ REFERENCE ANSWER FOR EVALUATION:\n"
+        prompt += "═══════════════════════════════════════\n"
         if has_correct_answer:
             prompt += f"{correct_answer}\n\n"
         else:
-            # IMPORTANT: When no answer is provided, LLM must solve it
             prompt += "⚠️ NO CORRECT ANSWER PROVIDED BY ADMIN\n\n"
             prompt += "🧠 YOU MUST SOLVE THIS QUESTION YOURSELF:\n"
             if is_mcq:
@@ -1216,33 +1342,6 @@ async def evaluate_submission(
                 prompt += "2. Solve it step-by-step to find the correct answer.\n"
                 prompt += "3. Use your solution as the reference to evaluate the student's answer.\n\n"
             logger.warning(f"⚠️ Question {qid} has no correct_answer stored! LLM must solve it.")
-        
-        # Student's input section
-        prompt += "═══════════════════════════════════════\n"
-        prompt += "✍️ STUDENT'S SUBMISSION:\n"
-        prompt += "═══════════════════════════════════════\n"
-        
-        if answer_text:
-            prompt += f"Typed Answer: {answer_text}\n"
-        if ocr_extracted_text:
-            conf_label = "HIGH" if ocr_confidence > 0.7 else ("MEDIUM" if ocr_confidence > 0.4 else "LOW")
-            prompt += f"OCR Detected Text ({conf_label} confidence): {ocr_extracted_text}\n"
-        if num_s_images > 0:
-            prompt += f"Handwritten Canvas: {num_s_images} page(s) submitted - EXAMINE CAREFULLY.\n"
-        if not answer_text and not ocr_extracted_text and num_s_images == 0:
-            prompt += "(No answer submitted)\n"
-        prompt += "\n"
-        
-        # Detect if this is an essay/descriptive question (common in commerce, humanities)
-        is_essay_question = (
-            not is_mcq and
-            any(keyword in question_text.lower() for keyword in [
-                'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
-                'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
-                'what are', 'what is', 'how does', 'why is', 'state', 'mention',
-                'differentiate', 'illustrate', 'comment', 'evaluate', 'justify'
-            ])
-        )
 
         # Specific evaluation instructions based on question type AND whether answer is provided
         if is_mcq:
@@ -1360,7 +1459,12 @@ async def evaluate_submission(
         prompt += "3. Boolean values are true/false (lowercase, no quotes)\n"
         prompt += "4. Escape special characters in strings: \\\" for quotes, \\\\ for backslash\n\n"
         
-        logger.info(f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} ({num_s_images} student + {num_q_images} question). OCR: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'")
+        logger.info(
+            f"📤 Sending evaluation to LLM for Q:{qid}. Images: {len(all_images)} "
+            f"({num_s_images} student + {num_q_images} question). "
+            f"Extracted: '{unbiased_extracted_answer[:80] if unbiased_extracted_answer else ''}'. "
+            f"Transcribed: '{ocr_extracted_text}'. Correct: '{correct_answer[:50] if correct_answer else 'NONE'}'"
+        )
         
         # Call LLM with enhanced system prompt - varies based on whether we have a correct answer
         # Include language instruction in system prompt for stronger enforcement
@@ -1382,10 +1486,9 @@ async def evaluate_submission(
                 f"{language_system_instruction}"
                 f"{latex_instruction}"
                 "You are an expert answer evaluator specializing in reading handwritten student work. "
-                "CRITICAL: Your ONLY job is to determine if the student's answer is CORRECT or INCORRECT. "
-                "You MUST compare the student's answer to the CORRECT ANSWER provided. "
-                "For MCQ, a single letter (A/B/C/D) is the answer - focus on identifying that letter. "
-                "For subjective questions, compare the content/value of their answer. "
+                "CRITICAL: Determine if the student's answer is CORRECT or INCORRECT using all provided evidence. "
+                "The student's answer extraction was generated in a separate unbiased stage; use it as a primary signal. "
+                "Compare against the provided reference answer while still validating with the student's work. "
                 "Always output ONLY valid JSON without markdown code blocks. "
                 "Be generous in interpreting messy handwriting but strict in evaluating correctness."
             )
@@ -1398,7 +1501,7 @@ async def evaluate_submission(
                     "You are an expert tutor evaluating ESSAY/DESCRIPTIVE answers. "
                     "CRITICAL: Since NO MODEL ANSWER was provided, you MUST: "
                     "1. First, determine the KEY POINTS that should be in a good answer. "
-                    "2. Read and transcribe the student's handwritten essay/answer. "
+                    "2. Use extracted student evidence and handwritten work together. "
                     "3. Evaluate based on: content accuracy, completeness, and clarity. "
                     "4. Include 'solved_answer' with the KEY POINTS (2-4 bullet points). "
                     "SCORING GUIDELINES for essays: "
@@ -1417,10 +1520,10 @@ async def evaluate_submission(
                     "You are an expert tutor who can both SOLVE questions AND evaluate student answers. "
                     "CRITICAL: Since NO CORRECT ANSWER was provided, you MUST first SOLVE the question yourself. "
                     "1. First, solve the question to determine the correct answer. "
-                    "2. Then, read and interpret the student's handwritten work. "
+                    "2. Then, interpret the student's extracted evidence and handwritten work together. "
                     "3. Compare the student's answer to YOUR solution. "
                     "4. Include your 'solved_answer' in the JSON response. "
-                    "For MCQ, determine which letter (A/B/C/D) is correct, then check if the student wrote that letter. "
+                    "For MCQ, determine which letter (A/B/C/D) is correct, then verify if the student wrote that letter. "
                     "For subjective questions, solve it step-by-step, then compare to the student's work. "
                     "Always output ONLY valid JSON without markdown code blocks. "
                     "Be generous in interpreting messy handwriting but strict in evaluating correctness."
@@ -1452,13 +1555,15 @@ async def evaluate_submission(
         evaluation_data = {
             "correct": False,
             "score": 0.0,
-            "extractedAnswer": "",
+            "extractedAnswer": unbiased_extracted_answer,
             "feedback": "",
             "reasoning": "",
-            "answerSource": "ai_eval",
+            "answerSource": unbiased_extraction_source if unbiased_extracted_answer else "ai_eval",
+            "extractionConfidence": unbiased_extraction_confidence,
             "ocrConfidence": ocr_confidence,
             "ocrExtractedText": ocr_extracted_text,
-            "correctAnswer": correct_answer  # Include for frontend display
+            "correctAnswer": correct_answer,  # Include for frontend display
+            "correctAnswerSource": "admin_provided" if has_correct_answer else "unknown",
         }
         
         try:
@@ -1510,7 +1615,7 @@ async def evaluate_submission(
                         evaluation_data["feedback"] = raw_response[:1500]  # Use raw response as feedback
                         evaluation_data["reasoning"] = "Evaluation completed but JSON parsing failed. See feedback for details."
                         # For essay questions, give partial credit by default if student wrote something
-                        if ocr_extracted_text or num_s_images > 0:
+                        if has_extracted_content or num_s_images > 0:
                             evaluation_data["score"] = 0.5  # Partial credit for attempted essay
                             evaluation_data["correct"] = False  # Can't verify without proper parsing
                         evaluation_data["answerSource"] = "text_extraction_fallback"
@@ -1536,7 +1641,10 @@ async def evaluate_submission(
                 else:
                     evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
                 
-                evaluation_data["extractedAnswer"] = str(parsed.get("extracted_answer", "")).strip()
+                parsed_extracted_answer = str(parsed.get("extracted_answer", "")).strip()
+                if parsed_extracted_answer and not evaluation_data["extractedAnswer"]:
+                    evaluation_data["extractedAnswer"] = parsed_extracted_answer
+                    evaluation_data["answerSource"] = "llm_extraction"
                 evaluation_data["feedback"] = str(parsed.get("feedback", "")).strip()
                 evaluation_data["reasoning"] = str(parsed.get("reasoning", "")).strip()
                 
@@ -1560,7 +1668,7 @@ async def evaluate_submission(
                 if has_correct_answer:
                     # Admin provided answer - use that as the source of truth
                     evaluation_data["correctAnswer"] = correct_answer
-                    evaluation_data["answerSource"] = "admin_provided"
+                    evaluation_data["correctAnswerSource"] = "admin_provided"
                     
                     # Validate: If LLM solved it differently, log a warning
                     if solved_answer and solved_answer.strip().upper() != correct_answer.strip().upper():
@@ -1568,18 +1676,18 @@ async def evaluate_submission(
                 elif solved_answer:
                     # LLM solved the question - use its answer
                     evaluation_data["correctAnswer"] = str(solved_answer).strip()
-                    evaluation_data["answerSource"] = "llm_solved"
+                    evaluation_data["correctAnswerSource"] = "llm_solved"
                     logger.info(f"🧠 LLM solved the question. Correct answer: '{solved_answer}'")
                 else:
                     # No answer available - keep empty
                     evaluation_data["correctAnswer"] = ""
-                    evaluation_data["answerSource"] = "unknown"
+                    evaluation_data["correctAnswerSource"] = "unknown"
                     logger.warning(f"⚠️ No correct answer available for Q:{qid}")
                 
-                # If LLM didn't extract an answer but OCR did, use OCR result
+                # If LLM didn't extract an answer but unbiased extraction did, use that result
                 if not evaluation_data["extractedAnswer"] and ocr_extracted_text:
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
-                    evaluation_data["answerSource"] = "ocr_extraction"
+                    evaluation_data["answerSource"] = "vision_extraction_fallback"
                 
                 # Validation: Check for contradictions in the analysis
                 extracted = evaluation_data["extractedAnswer"].strip().upper() if evaluation_data["extractedAnswer"] else ""
@@ -1602,7 +1710,7 @@ async def evaluate_submission(
                 evaluation_data["reasoning"] = "Evaluation completed but structured response parsing failed."
 
                 # For essay questions, give partial credit if student attempted an answer
-                if is_essay_question and (ocr_extracted_text or num_s_images > 0):
+                if is_essay_question and (has_extracted_content or num_s_images > 0):
                     evaluation_data["score"] = 0.5  # Partial credit for attempted essay
                     evaluation_data["correct"] = False
                     evaluation_data["answerSource"] = "essay_fallback"
@@ -1615,10 +1723,10 @@ async def evaluate_submission(
                         elif any(word in raw_lower for word in ['incorrect', 'wrong', 'missing', 'incomplete', 'needs improvement']):
                             evaluation_data["score"] = 0.3
                     logger.info(f"📝 Essay fallback: Assigned partial score {evaluation_data['score']} based on attempt")
-                # Still use OCR extraction if available
+                # Still use extraction output if available
                 elif ocr_extracted_text:
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
-                    evaluation_data["answerSource"] = "ocr_fallback"
+                    evaluation_data["answerSource"] = "vision_fallback"
                 
         except Exception as parse_err:
             logger.error(f"❌ Failed to parse LLM evaluation JSON: {parse_err}")
@@ -1626,7 +1734,7 @@ async def evaluate_submission(
             evaluation_data["reasoning"] = f"JSON parse error: {parse_err}"
             if ocr_extracted_text:
                 evaluation_data["extractedAnswer"] = ocr_extracted_text
-                evaluation_data["answerSource"] = "ocr_fallback"
+                evaluation_data["answerSource"] = "vision_fallback"
 
         # If feedback is empty (parsing failed completely), use raw response
         if not evaluation_data["feedback"]:
@@ -2146,261 +2254,27 @@ async def get_practice_stats(
 async def grade_submission(
     request: Request,
     payload: EvaluateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    """Comprehensive evaluation of student submissions using LLM analysis.
+    """Backward-compatible alias for the canonical /evaluate pipeline."""
+    return await evaluate_submission(
+        request=request,
+        payload=payload,
+        current_user=current_user,
+        db=db
+    )
 
-    Supports:
-    - Multiple choice questions
-    - Written solutions and explanations
-    - Mathematical derivations
-    - Diagrams and visual solutions
-    - Definitions and conceptual answers
-
-    Returns detailed feedback comparing student work with expected solution.
-    """
-    try:
-        from services.async_openai_service import AsyncOpenAIService
-        ai = AsyncOpenAIService()
-
-        qid = payload.questionId
-        answer_text = (payload.answerText or "").strip()
-        canvas_data = payload.canvasData
-        if canvas_data and not canvas_data.startswith("data:image"):
-            canvas_data = f"data:image/png;base64,{canvas_data}"
-
-        # Get question from MongoDB
-        q = await db.mongo_find_one("questions", {"id": qid})
-        
-        if not q:
-            # Try searching by _id as well
-            try:
-                from bson import ObjectId
-                q = await db.mongo_find_one("questions", {"_id": ObjectId(qid)})
-            except Exception:
-                pass
-                
-        if not q:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
-
-        ca_primary = q.get("correctAnswer")
-        ca_alt = q.get("correct_answer")
-        correct_answer = str((ca_primary if ca_primary is not None else (ca_alt if ca_alt is not None else ""))).strip()
-
-        # Comprehensive evaluation system prompt
-        system_prompt = """You are an expert academic evaluator. Your job is to comprehensively analyze student solutions.
-
-CRITICAL: Return ONLY a single line of valid JSON with NO extra text, NO newlines, NO formatting.
-
-ANALYSIS CAPABILITIES:
-- Understand handwritten equations, formulas, and mathematical expressions
-- Read handwritten text, definitions, and explanations (including "I don't know", "not sure", etc.)
-- Analyze diagrams, graphs, and visual problem-solving steps
-- Recognize scientific notation, chemical formulas, and technical symbols
-- Understand multi-step solutions and problem-solving approaches
-- Detect when students are asking for help or indicating uncertainty
-
-EVALUATION PROCESS:
-1. First, solve the given question yourself to determine the correct answer
-2. Extract and interpret ALL content from the student's canvas submission
-3. Distinguish between:
-   - MCQ answers: Single letter choices (A, B, C, D, etc.)
-   - Written explanations: Phrases like "I don't know", "not sure", "help me"
-   - Solution attempts: Diagrams, equations, calculations, definitions
-4. Evaluate the student's approach, calculations, and final answer
-5. Provide detailed feedback comparing what they wrote vs. what they should have written
-6. Give constructive guidance on areas for improvement
-
-HANDWRITING RECOGNITION:
-- Be generous in interpreting unclear handwriting
-- Look for mathematical symbols: +, -, ×, ÷, =, ≠, ≈, ∫, Σ, √, π, ∞, etc.
-- Recognize scientific notation: 2.5 × 10³, 6.02 × 10²³, etc.
-- Identify equation structures: variables, constants, operations
-- Understand chemical formulas: H₂O, CO₂, CH₄, etc.
-- Read definitions and explanatory text (word-for-word)
-- Interpret diagrams and their labels
-- Detect help requests: "I don't know", "help", "not sure", "unclear", "confused", "stuck"
-
-FEEDBACK FORMAT:
-- "What you wrote": Describe student's work clearly and accurately
-- "What is expected": Explain the correct approach/answer
-- "Suggestions": Provide specific improvement guidance
-
-REQUIRED JSON FORMAT (single line):
-{"correct":false,"score":0.0,"extractedAnswer":"I don't know the answer","feedback":"What you wrote: 'I don't know the answer'. This is okay - it's better to ask for help than guess! What is expected: For this magnetic field question, option C shows the correct field lines. Suggestions: Try to recall that magnetic field lines always form closed loops from North to South pole.","reasoning":"Student expressed uncertainty rather than attempting to answer"}
-
-IMPORTANT DISTINCTION:
-- If student writes a SINGLE LETTER (A/B/C/D): extractedAnswer should be just that letter
-- If student writes TEXT/PHRASE: extractedAnswer should be the FULL TEXT (e.g., "I don't know the answer")
-- If student draws DIAGRAM: extractedAnswer should describe what they drew
-
-For multiple choice:
-  - If single letter written: {"extractedAnswer": "A"}
-  - If explanation written: {"extractedAnswer": "I don't know"} or {"extractedAnswer": "The answer should be C because..."}
-
-Return ONLY the JSON line. No other text."""
-
-        # Build comprehensive evaluation context
-        question_text = str(q.get("text", ""))
-        subject = q.get("subject", "Unknown")
-        difficulty = q.get("difficulty", "medium")
-
-        context_parts = [
-            f"Question: {question_text}",
-            f"Subject: {subject}",
-            f"Difficulty: {difficulty}",
-        ]
-
-        # Add options if available
-        options_list = _options_text_from_question(q)
-        if options_list:
-            context_parts.append(f"\nOptions:\n{options_list}")
-
-        # Add student submission info
-        context_parts.append("\n=== STUDENT SUBMISSION ===")
-        if answer_text and canvas_data:
-            context_parts.append(f"TYPED TEXT: {answer_text}")
-            context_parts.append("CANVAS: See image below - contains student's handwritten work")
-        elif answer_text:
-            context_parts.append(f"TYPED TEXT: {answer_text}")
-            context_parts.append("CANVAS: None provided")
-        elif canvas_data:
-            context_parts.append("TYPED TEXT: None")
-            context_parts.append("CANVAS: See image below - contains all student work")
-        else:
-            context_parts.append("TYPED TEXT: None")
-            context_parts.append("CANVAS: None")
-
-        context_parts.append("\n=== EVALUATION TASK ===")
-        context_parts.append("1. Solve the question yourself to determine the correct answer")
-        context_parts.append("2. Analyze ALL student content (typed + canvas)")
-        context_parts.append("3. Extract equations, formulas, calculations, diagrams, and explanations")
-        context_parts.append("4. Evaluate correctness of approach, calculations, and final answer")
-        context_parts.append("5. Provide detailed feedback: 'What you wrote: X. What is expected: Y. Suggestions: Z'")
-
-        prompt_text = "\n".join(context_parts)
-
-        # Collect images for context (question figures first, then all student pages)
-        images_for_eval: list[str] = []
-        figures = await _figure_images_base64(q, db)
-        for fig in figures[:2]:
-            if fig:
-                images_for_eval.append(fig)
-        student_pages = payload.canvasPages or ([] if not canvas_data else [canvas_data])
-        images_for_eval.extend(student_pages)
-
-        logger.info(f"📤 Comprehensive evaluation request:")
-        logger.info(f"   - Question ID: {qid}")
-        logger.info(f"   - Subject: {subject}")
-        logger.info(f"   - Total images: {len(images_for_eval)} (question figures + student canvas)")
-        logger.info(f"   - Has typed text: {bool(answer_text)}")
-        logger.info(f"   - Has canvas: {bool(canvas_data)}")
-
-        # Call LLM for comprehensive evaluation
-        if images_for_eval:
-            res = await ai.analyze_images_and_text_async(
-                images_for_eval,
-                prompt_text,
-                max_tokens=800,
-                system_prompt=system_prompt
-            )
-        else:
-            # Text-only evaluation (no images)
-            res = await ai.evaluate_answer_async(
-                question=question_text,
-                student_answer=answer_text,
-                correct_answer=correct_answer
-            )
-
-        raw_response = (res.get("response") or "").strip()
-        logger.info(f"📥 LLM evaluation response: {raw_response[:500]}...")
-
-        # Parse JSON response
-        import re as _re, json as _json
-
-        evaluation = None
-        # Try to extract JSON from response
-        json_match = _re.search(r'\{.*\}', raw_response, _re.DOTALL)
-        if json_match:
-            try:
-                parsed = _json.loads(json_match.group(0))
-                evaluation = {
-                    "correct": bool(parsed.get("correct", False)),
-                    "score": float(parsed.get("score", 0.0)),
-                    "extractedAnswer": str(parsed.get("extractedAnswer", "Not found")),
-                    "feedback": str(parsed.get("feedback", "No feedback provided")),
-                    "reasoning": str(parsed.get("reasoning", "No reasoning provided"))
-                }
-                logger.info(f"✅ Successfully parsed LLM evaluation: correct={evaluation['correct']}, score={evaluation['score']}")
-            except Exception as parse_error:
-                logger.warning(f"⚠️ JSON parse failed: {parse_error}")
-
-        # Fallback: construct evaluation from raw response if JSON parsing failed
-        if not evaluation:
-            logger.warning("Using fallback evaluation construction")
-            evaluation = {
-                "correct": False,
-                "score": 0.5,  # Partial credit for attempting
-                "extractedAnswer": answer_text or "See canvas",
-                "feedback": raw_response[:500] if raw_response else "Unable to evaluate submission. Please try again.",
-                "reasoning": "Comprehensive analysis attempted but response format needs review."
-            }
-
-        # Validate against known correct answer ONLY for clear MCQ submissions
-        # Trust LLM evaluation for all other cases (written explanations, diagrams, etc.)
-        if correct_answer:
-            extracted = evaluation.get("extractedAnswer", "").strip().upper()
-            expected = correct_answer.strip().upper()
-
-            # Only apply MCQ validation if:
-            # 1. Expected answer is a single letter (MCQ)
-            # 2. Extracted answer is EXACTLY one letter (not part of a phrase)
-            # 3. LLM marked it as an MCQ response (not a written explanation)
-            is_expected_mcq = len(expected) == 1 and expected.isalpha()
-            is_extracted_single_letter = len(extracted) == 1 and extracted.isalpha()
-
-            # Check if LLM detected this as a written explanation vs MCQ answer
-            feedback_lower = evaluation.get("feedback", "").lower()
-            is_written_explanation = any(phrase in feedback_lower for phrase in [
-                "you wrote", "you explained", "you described", "you stated",
-                "your explanation", "your description", "don't know", "dont know",
-                "unclear", "not sure", "confused", "help", "stuck"
-            ])
-
-            if is_expected_mcq and is_extracted_single_letter and not is_written_explanation:
-                # This is a genuine MCQ answer - validate it
-                is_match = (extracted == expected)
-                if is_match and not evaluation["correct"]:
-                    logger.info(f"Correcting evaluation: MCQ answer matches (student: {extracted}, expected: {expected})")
-                    evaluation["correct"] = True
-                    evaluation["score"] = 1.0
-                    evaluation["feedback"] = f"Excellent! You correctly chose option {expected}. " + evaluation.get("feedback", "")
-                elif not is_match and evaluation["correct"]:
-                    logger.info(f"Correcting evaluation: MCQ answer doesn't match (student: {extracted}, expected: {expected})")
-                    evaluation["correct"] = False
-                    evaluation["score"] = 0.0
-                    evaluation["feedback"] = f"Not quite. You chose {extracted}, but the correct answer is {expected}. " + evaluation.get("feedback", "")
-            else:
-                # Trust LLM's comprehensive evaluation for written work
-                logger.info(f"Trusting LLM evaluation for written/explanation content (extracted: '{extracted[:50]}...', is_mcq: {is_expected_mcq})")
-
-        return EvaluateResponse(success=True, evaluation=evaluation)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Grade submission error: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to grade submission")
-
-# Backward compatibility: legacy route alias
-@router.post("/evaluate", response_model=EvaluateResponse)
+# Backward compatibility endpoint for older clients that used legacy evaluator wiring.
+@router.post("/evaluate-compat", response_model=EvaluateResponse)
 @limiter.limit("120/minute")
 async def evaluate_submission_compat(
     request: Request,
     payload: EvaluateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    return await grade_submission(request, payload, db)
+    return await grade_submission(request, payload, current_user, db)
 
 
 # =============================================================================
