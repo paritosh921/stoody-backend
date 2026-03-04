@@ -562,15 +562,40 @@ async def backfill_classifications(
 ):
     """Queue all existing stroke pages for classification (one-time backfill)."""
     db_name = current_user.get("db_name")
-    tenant_db = await db.get_tenant_db(db_name)
-    if tenant_db is None:
+    is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+
+    # Resolve the correct database (same logic as copies_async.py)
+    if is_b2c:
+        strokes_db = db.b2c_db
+        if not db_name:
+            try:
+                from config_async import MONGODB_DB_STOODY
+                db_name = MONGODB_DB_STOODY
+            except ImportError:
+                db_name = "STOODY-b2c"
+    else:
+        strokes_db = await db.get_tenant_db(db_name)
+
+    if strokes_db is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
 
+    # Build user_id match the same way copies_async.py does (strokes store
+    # user_id in varying formats: str, ObjectId, or username).
+    user_identifiers: list = [user_id, str(user_id)]
+    username = current_user.get("username")
+    if username:
+        user_identifiers.append(username)
+    try:
+        if ObjectId.is_valid(user_id):
+            user_identifiers.append(ObjectId(user_id))
+    except Exception:
+        pass
+
     # Find all distinct pages this user has strokes for
     pipeline = [
-        {"$match": {"user_id": user_id}},
+        {"$match": {"user_id": {"$in": user_identifiers}}},
         {"$group": {
             "_id": {
                 "pen_mac": "$pen_mac",
@@ -579,11 +604,12 @@ async def backfill_classifications(
             },
         }},
     ]
-    distinct_pages = await tenant_db["strokes"].aggregate(pipeline).to_list(5000)
+    distinct_pages = await strokes_db["strokes"].aggregate(pipeline).to_list(5000)
 
-    # Check which are already classified
+    # Check which are already classified (note_classifications uses canonical str user_id)
+    classify_db = strokes_db if is_b2c else await db.get_tenant_db(db_name)
     already = set()
-    async for doc in tenant_db["note_classifications"].find(
+    async for doc in classify_db["note_classifications"].find(
         {"user_id": user_id},
         {"pen_mac": 1, "book_type": 1, "page_number": 1},
     ):

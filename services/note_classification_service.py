@@ -177,11 +177,25 @@ async def process_page(
 # Stroke fetching
 # ---------------------------------------------------------------------------
 
+def _build_user_id_match(user_id: str) -> dict:
+    """Build a user_id match clause that handles all storage formats
+    (string, ObjectId, username). Mirrors copies_async.py logic."""
+    from bson import ObjectId as _OID
+
+    identifiers: list = [user_id, str(user_id)]
+    try:
+        if _OID.is_valid(user_id):
+            identifiers.append(_OID(user_id))
+    except Exception:
+        pass
+    return {"$in": identifiers}
+
+
 async def _count_strokes(
     tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int
 ) -> int:
     query = {
-        "user_id": user_id,
+        "user_id": _build_user_id_match(user_id),
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
         "book_type": book_type,
         "page_number": page_number,
@@ -197,7 +211,7 @@ async def _fetch_page_strokes(
     tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int
 ) -> List[Dict[str, Any]]:
     query = {
-        "user_id": user_id,
+        "user_id": _build_user_id_match(user_id),
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
         "book_type": book_type,
         "page_number": page_number,
