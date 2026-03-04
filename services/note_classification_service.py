@@ -135,6 +135,12 @@ async def process_page(
         )
         return
 
+    # Extract session info from stroke batches
+    latest_session_id = strokes[-1].get("session_id") if strokes else None
+    timestamps = [s.get("timestamp") for s in strokes if s.get("timestamp")]
+    first_activity = min(timestamps) if timestamps else None
+    last_activity = max(timestamps) if timestamps else None
+
     from utils.stroke_pdf_generator import build_svg_from_strokes, svg_to_png_bytes
 
     svg = build_svg_from_strokes(strokes, book_type=book_type)
@@ -169,7 +175,10 @@ async def process_page(
     # 6. Upsert into note_classifications
     await _save_classification(
         tenant_db, page_key, subject, topic, confidence,
-        ocr_text, thumbnail_url, current_strokes, existing
+        ocr_text, thumbnail_url, current_strokes, existing,
+        session_id=latest_session_id,
+        first_activity=first_activity,
+        last_activity=last_activity,
     )
 
 
@@ -480,6 +489,10 @@ async def _save_classification(
     thumbnail_url: Optional[str],
     stroke_count: int,
     existing: Optional[Dict[str, Any]] = None,
+    *,
+    session_id: Optional[str] = None,
+    first_activity: Optional[Any] = None,
+    last_activity: Optional[Any] = None,
 ):
     """Upsert into note_classifications."""
     now = datetime.utcnow()
@@ -502,6 +515,12 @@ async def _save_classification(
 
     if thumbnail_url:
         update_doc["$set"]["thumbnail_url"] = thumbnail_url
+    if session_id is not None:
+        update_doc["$set"]["session_id"] = session_id
+    if first_activity is not None:
+        update_doc["$set"]["first_activity"] = first_activity
+    if last_activity is not None:
+        update_doc["$set"]["last_activity"] = last_activity
 
     await tenant_db["note_classifications"].update_one(
         page_key, update_doc, upsert=True

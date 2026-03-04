@@ -183,6 +183,7 @@ async def get_subject_pages(
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
             "topic": 1, "created_at": 1, "updated_at": 1,
+            "session_id": 1, "first_activity": 1, "last_activity": 1,
         },
     ).sort("updated_at", -1)
 
@@ -200,7 +201,13 @@ async def get_subject_pages(
             "topic": doc.get("topic"),
             "created_at": doc.get("created_at"),
             "updated_at": doc.get("updated_at"),
+            "session_id": doc.get("session_id"),
+            "first_activity": doc.get("first_activity"),
+            "last_activity": doc.get("last_activity"),
         })
+
+    # Batch-enrich pages missing session info from strokes
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
 
     return {"success": True, "subject": subject, "pages": pages}
 
@@ -230,6 +237,7 @@ async def get_topic_pages(
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
             "created_at": 1, "updated_at": 1,
+            "session_id": 1, "first_activity": 1, "last_activity": 1,
         },
     ).sort("page_number", 1)
 
@@ -246,7 +254,13 @@ async def get_topic_pages(
             "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
             "created_at": doc.get("created_at"),
             "updated_at": doc.get("updated_at"),
+            "session_id": doc.get("session_id"),
+            "first_activity": doc.get("first_activity"),
+            "last_activity": doc.get("last_activity"),
         })
+
+    # Batch-enrich pages missing session info from strokes
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
 
     return {"success": True, "subject": subject, "topic": topic, "pages": pages}
 
@@ -693,3 +707,38 @@ def _get_user_id(current_user: Dict[str, Any]) -> str:
     if isinstance(uid, ObjectId):
         return str(uid)
     return str(uid) if uid else ""
+
+
+async def _enrich_pages_with_session_info(
+    tenant_db, user_id: str, pages: List[Dict[str, Any]]
+) -> None:
+    """Batch-enrich pages missing session_id by looking up strokes."""
+    pages_needing_session = [p for p in pages if not p.get("session_id")]
+    if not pages_needing_session:
+        return
+
+    page_conditions = [
+        {"pen_mac": p["pen_mac"], "book_type": p["book_type"], "page_number": p["page_number"]}
+        for p in pages_needing_session
+    ]
+    pipeline = [
+        {"$match": {"user_id": {"$in": [user_id, str(user_id)]}, "$or": page_conditions}},
+        {"$sort": {"timestamp": -1}},
+        {"$group": {
+            "_id": {"pen_mac": "$pen_mac", "book_type": "$book_type", "page_number": "$page_number"},
+            "session_id": {"$first": "$session_id"},
+            "first_activity": {"$min": "$timestamp"},
+            "last_activity": {"$max": "$timestamp"},
+        }},
+    ]
+    session_map: Dict[tuple, Dict[str, Any]] = {}
+    async for doc in tenant_db["strokes"].aggregate(pipeline):
+        key = (doc["_id"]["pen_mac"], doc["_id"]["book_type"], doc["_id"]["page_number"])
+        session_map[key] = doc
+
+    for p in pages_needing_session:
+        info = session_map.get((p["pen_mac"], p["book_type"], p["page_number"]))
+        if info:
+            p["session_id"] = info.get("session_id")
+            p["first_activity"] = info.get("first_activity")
+            p["last_activity"] = info.get("last_activity")
