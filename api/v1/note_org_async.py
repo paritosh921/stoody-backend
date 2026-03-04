@@ -160,6 +160,52 @@ async def get_topics(
 
 
 # ---------------------------------------------------------------------------
+# GET /subjects/{subject}/pages
+# ---------------------------------------------------------------------------
+
+@router.get("/subjects/{subject}/pages")
+async def get_subject_pages(
+    subject: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Get all pages for a subject (regardless of topic), sorted by updated_at DESC."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    cursor = tenant_db["note_classifications"].find(
+        {"user_id": user_id, "subject": subject},
+        {
+            "pen_mac": 1, "book_type": 1, "page_number": 1,
+            "thumbnail_url": 1, "confidence": 1,
+            "classification_source": 1, "ocr_text": 1,
+            "topic": 1, "created_at": 1, "updated_at": 1,
+        },
+    ).sort("updated_at", -1)
+
+    pages = []
+    async for doc in cursor:
+        pages.append({
+            "id": str(doc["_id"]),
+            "pen_mac": doc.get("pen_mac"),
+            "book_type": doc.get("book_type"),
+            "page_number": doc.get("page_number"),
+            "thumbnail_url": doc.get("thumbnail_url"),
+            "confidence": doc.get("confidence"),
+            "classification_source": doc.get("classification_source"),
+            "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
+            "topic": doc.get("topic"),
+            "created_at": doc.get("created_at"),
+            "updated_at": doc.get("updated_at"),
+        })
+
+    return {"success": True, "subject": subject, "pages": pages}
+
+
+# ---------------------------------------------------------------------------
 # GET /subjects/{subject}/topics/{topic}/pages
 # ---------------------------------------------------------------------------
 
