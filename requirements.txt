@@ -20,6 +20,7 @@ aiocache==0.12.2
 # ===============================
 Pillow==10.1.0
 aiofiles==23.2.1
+cairosvg>=2.7.0                         # SVG→PNG rendering (requires system libcairo2-dev)
 
 # ===============================
 # AWS S3 Storage (optional, enable via USE_S3_STORAGE=true)

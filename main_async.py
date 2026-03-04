@@ -217,6 +217,15 @@ except Exception as e:
     _notes_available = False
     logging.warning(f"Notes routes disabled: {str(e)}")
 
+# Note Organisation routes (AI-powered student note classification)
+try:
+    from api.v1.note_org_async import router as note_org_router
+    _note_org_available = True
+except Exception as e:
+    note_org_router = None
+    _note_org_available = False
+    logging.warning(f"Note Organisation routes disabled: {str(e)}")
+
 # OCR routes (handwriting recognition)
 try:
     from api.v1.ocr import router as ocr_router
@@ -418,6 +427,15 @@ async def lifespan(app: FastAPI):
         session_timeout_task = asyncio.create_task(check_inactive_sessions())
         logger.info("✅ Session timeout monitor started")
 
+        # Start background task for note classification worker
+        classification_task = None
+        try:
+            from services.classification_worker import classification_worker_loop
+            classification_task = asyncio.create_task(classification_worker_loop(db_manager))
+            logger.info("✅ Note classification worker started")
+        except Exception as cls_err:
+            logger.warning(f"⚠️ Note classification worker disabled: {cls_err}")
+
         logger.info("✅ All services initialized successfully")
 
         yield
@@ -429,7 +447,7 @@ async def lifespan(app: FastAPI):
         # Cleanup
         logger.info("🛑 Shutting down services...")
 
-        # Cancel background task
+        # Cancel background tasks
         if session_timeout_task:
             session_timeout_task.cancel()
             try:
@@ -437,6 +455,14 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             logger.info("✅ Session timeout monitor stopped")
+
+        if classification_task:
+            classification_task.cancel()
+            try:
+                await classification_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("✅ Note classification worker stopped")
 
         if cache_manager:
             await cache_manager.close()
@@ -997,6 +1023,17 @@ if _notes_available and notes_router:
     logger.info("✅ Notes routes enabled")
 else:
     logger.warning("⚠️ Notes routes disabled")
+
+# Note Organisation routes (AI-powered student note classification)
+if _note_org_available and note_org_router:
+    app.include_router(
+        note_org_router,
+        prefix=f"{API_V1_PREFIX}/note-org",
+        tags=["Note Organisation"]
+    )
+    logger.info("✅ Note Organisation routes enabled")
+else:
+    logger.warning("⚠️ Note Organisation routes disabled")
 
 # OCR routes (handwriting recognition)
 if _ocr_available and ocr_router:

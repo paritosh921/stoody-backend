@@ -49,7 +49,9 @@ sudo apt update && sudo apt upgrade -y
 
 # Install required system packages
 print_status "Installing system dependencies..."
-sudo apt install -y python3.9 python3.9-venv python3-pip nginx supervisor redis-server git curl htop
+sudo apt install -y python3.9 python3.9-venv python3-pip nginx supervisor redis-server git curl htop \
+    libcairo2-dev libpango1.0-dev libgdk-pixbuf2.0-dev libffi-dev \
+    poppler-utils tesseract-ocr libgl1
 
 # Configure Redis
 print_status "Configuring Redis..."
@@ -122,6 +124,12 @@ OPENAI_MAX_TOKENS=1000
 OPENAI_TEMPERATURE=0.7
 OPENAI_CONCURRENCY_LIMIT=200
 OCR_CONCURRENCY_LIMIT=8
+
+# Mistral AI (OCR — primary, cheaper for handwriting)
+MISTRAL_API_KEY=your-mistral-api-key-here
+
+# Groq (text classification — near-free)
+GROQ_API_KEY=your-groq-api-key-here
 
 # Rate Limiting
 RATE_LIMIT_DEFAULT=600/minute

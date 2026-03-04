@@ -6,6 +6,7 @@ Also provides canvas page persistence endpoints for server-side stroke storage.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -214,6 +215,18 @@ async def ingest_strokes(
     }
 
     await tenant_db["strokes"].insert_one(stroke_doc)
+
+    # Fire-and-forget: queue page for AI classification (60s debounce)
+    try:
+        from services.note_classification_service import queue_classification
+        asyncio.create_task(
+            queue_classification(
+                db, db_name, token_data.get("sub"),
+                payload.pen_mac, payload.book_type, payload.page_number,
+            )
+        )
+    except Exception:
+        pass  # classification is best-effort, never block stroke ingestion
 
     return {"success": True}
 
