@@ -337,7 +337,6 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
         "/api/v1/dashboard",
         "/api/v1/hub",
         "/api/v1/notes",
-        "/api/v1/note-org",
         "/api/v1/ocr",
         "/api/v1/question-attempts",
     ),
