@@ -300,6 +300,56 @@ class DatabaseManager:
                 name="uniq_tutors_tutor_id"
             )
 
+            # Note classification indexes
+            note_cls = db["note_classifications"]
+            await self._ensure_index_with_spec_check(
+                note_cls,
+                [("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1)],
+                unique=True,
+                name="uniq_note_page"
+            )
+            await self._ensure_index_with_spec_check(
+                note_cls,
+                [("user_id", 1), ("subject", 1)],
+                name="idx_note_user_subject"
+            )
+            await self._ensure_index_with_spec_check(
+                note_cls,
+                [("user_id", 1), ("subject", 1), ("topic", 1)],
+                name="idx_note_user_subject_topic"
+            )
+
+            note_fc = db["note_flashcards"]
+            await self._ensure_index_with_spec_check(
+                note_fc,
+                [("user_id", 1), ("subject", 1), ("topic", 1)],
+                unique=True,
+                name="uniq_flashcard_topic"
+            )
+
+            note_ps = db["note_practice_sets"]
+            await self._ensure_index_with_spec_check(
+                note_ps,
+                [("user_id", 1), ("subject", 1), ("topic", 1)],
+                unique=True,
+                name="uniq_practice_topic"
+            )
+
+            cls_queue = db["classification_queue"]
+            await self._ensure_index_with_spec_check(
+                cls_queue,
+                [("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)],
+                unique=True,
+                name="uniq_cls_queue_page"
+            )
+            # TTL index: auto-cleanup completed/failed jobs after 24h
+            try:
+                await cls_queue.create_index(
+                    "created_at", expireAfterSeconds=86400, name="ttl_cls_queue"
+                )
+            except OperationFailure:
+                pass  # index may already exist with different options
+
             self._indexed_dbs.add(db_name)
             logger.info(f"Ensured indexes on database: {db_name}")
         except OperationFailure as e:

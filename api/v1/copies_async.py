@@ -10,6 +10,7 @@ This integrates with the BLE agent's stroke storage to provide a "My Copy"
 feature in the Learning Mode of the student frontend.
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -820,7 +821,23 @@ async def create_pin(
             await tenant_db["pinned_copies"].insert_one(pin_doc)
         
         logger.info(f"Created pin {pin_id} for user {user_id}")
-        
+
+        # Queue note classification for this page (best-effort)
+        try:
+            from services.note_classification_service import queue_classification
+            cls_db_name = current_user.get("db_name")
+            if not cls_db_name and is_b2c:
+                from config_async import MONGODB_DB_STOODY
+                cls_db_name = MONGODB_DB_STOODY
+            asyncio.create_task(
+                queue_classification(
+                    db, cls_db_name, user_id,
+                    payload.pen_mac, payload.book_type, payload.page_number,
+                )
+            )
+        except Exception:
+            pass
+
         return {
             "success": True,
             "pin_id": pin_id,
