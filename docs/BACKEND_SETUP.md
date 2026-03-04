@@ -4,9 +4,34 @@ This guide will help you set up and run the SkillBot backend server.
 
 ## Prerequisites
 
-- Python 3.9 or higher
+- Python 3.9 or higher (3.11 recommended — 3.12 has TLS issues with MongoDB Atlas)
 - pip (Python package manager)
 - Git (optional, for cloning the repository)
+
+### System Dependencies (Linux/Ubuntu)
+
+These must be installed **before** `pip install -r requirements.txt`:
+
+```bash
+# Required for cairosvg (SVG→PNG rendering for note thumbnails and copy PDFs)
+sudo apt-get install -y libcairo2-dev libpango1.0-dev libgdk-pixbuf2.0-dev libffi-dev
+
+# Required for pdf2image / poppler
+sudo apt-get install -y poppler-utils
+
+# Required for pytesseract OCR
+sudo apt-get install -y tesseract-ocr
+
+# Required for opencv-python-headless
+sudo apt-get install -y libgl1
+```
+
+**macOS** (via Homebrew):
+```bash
+brew install cairo pango gdk-pixbuf libffi poppler tesseract
+```
+
+**Windows**: `cairosvg` uses the GTK+ runtime. Install from https://github.com/nicehash/NiceHashQuickMiner/releases or use `conda install cairosvg` which bundles the native libs.
 
 ## Quick Start (Windows)
 
@@ -113,10 +138,18 @@ HOST=0.0.0.0
 PORT=5001
 NODE_ENV=development
 
-# AI Provider
+# AI Provider (primary)
 AI_PROVIDER=openai
 OPENAI_API_KEY=your-api-key
 OPENAI_MODEL=gpt-5.1
+
+# Mistral AI (OCR — primary, cheaper for handwriting)
+MISTRAL_API_KEY=your-mistral-key
+
+# Groq (text classification — near-free, used by note classification)
+# Get a free key at https://console.groq.com
+GROQ_API_KEY=your-groq-key
+GROQ_CLASSIFY_MODEL=llama-3.1-8b-instant  # default if not set
 
 # Database
 MONGODB_URI=your-mongodb-uri
@@ -128,6 +161,13 @@ JWT_ACCESS_TOKEN_EXPIRE_MINUTES=1440
 
 # Redis Cache
 REDIS_URL=redis://localhost:6379/0
+
+# S3 Storage (optional, for note thumbnails and copy PDFs)
+USE_S3_STORAGE=true
+AWS_ACCESS_KEY_ID=your-key
+AWS_SECRET_ACCESS_KEY=your-secret
+S3_BUCKET_NAME=your-bucket
+AWS_REGION=ap-south-1
 ```
 
 ## Troubleshooting
@@ -199,6 +239,8 @@ Main API routes:
 - `/api/v1/debugger` - Code debugging (optional)
 - `/api/v1/learning` - Learning content
 - `/api/v1/pdf` - PDF processing
+- `/api/v1/strokes` - Pen stroke data ingestion
+- `/api/v1/note-org` - AI-powered note classification, flashcards, practice generation
 
 ## Support
 
