@@ -555,6 +555,63 @@ async def get_stats(
     }
 
 
+@router.post("/backfill")
+async def backfill_classifications(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Queue all existing stroke pages for classification (one-time backfill)."""
+    db_name = current_user.get("db_name")
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    # Find all distinct pages this user has strokes for
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": {
+                "pen_mac": "$pen_mac",
+                "book_type": "$book_type",
+                "page_number": "$page_number",
+            },
+        }},
+    ]
+    distinct_pages = await tenant_db["strokes"].aggregate(pipeline).to_list(5000)
+
+    # Check which are already classified
+    already = set()
+    async for doc in tenant_db["note_classifications"].find(
+        {"user_id": user_id},
+        {"pen_mac": 1, "book_type": 1, "page_number": 1},
+    ):
+        already.add((doc.get("pen_mac", ""), doc.get("book_type", ""), doc.get("page_number", 0)))
+
+    from services.note_classification_service import queue_classification
+
+    queued = 0
+    for page in distinct_pages:
+        key = page["_id"]
+        pen_mac = key.get("pen_mac", "")
+        book_type = key.get("book_type", "A5")
+        page_number = key.get("page_number", 0)
+
+        if (pen_mac.upper(), book_type, page_number) in already:
+            continue
+
+        await queue_classification(db, db_name, user_id, pen_mac, book_type, page_number)
+        queued += 1
+
+    return {
+        "success": True,
+        "total_stroke_pages": len(distinct_pages),
+        "already_classified": len(already),
+        "queued_for_classification": queued,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
