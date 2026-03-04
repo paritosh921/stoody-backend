@@ -300,6 +300,25 @@ class DatabaseManager:
                 name="uniq_tutors_tutor_id"
             )
 
+            # canvas_pages — server-side stroke persistence (one doc per user+bookType+page)
+            canvas_pages = db["canvas_pages"]
+            await self._ensure_index_with_spec_check(
+                canvas_pages,
+                [("user_id", 1), ("book_type", 1), ("page_number", 1)],
+                unique=True,
+                name="uniq_canvas_pages_user_book_page"
+            )
+            await self._ensure_index_with_spec_check(
+                canvas_pages,
+                [("user_id", 1), ("last_modified", -1)],
+                name="idx_canvas_pages_user_modified"
+            )
+            await self._ensure_index_with_spec_check(
+                canvas_pages,
+                [("admin_id", 1), ("user_id", 1)],
+                name="idx_canvas_pages_admin_user"
+            )
+
             self._indexed_dbs.add(db_name)
             logger.info(f"Ensured indexes on database: {db_name}")
         except OperationFailure as e:

@@ -535,8 +535,19 @@ def export_legacy_features(effective_features: Optional[Dict[str, Any]]) -> Dict
     return exported
 
 
+_FEATURE_EXEMPT_PREFIXES: Tuple[str, ...] = (
+    # Canvas page persistence is core data storage, not a gated pen-capture feature.
+    "/api/v1/strokes/pages",
+)
+
+
 def required_feature_for_path(path: str, user_type: Optional[str] = None) -> Optional[str]:
     role = (user_type or "").strip().lower()
+
+    # Exempt paths that should never be feature-gated
+    for exempt in _FEATURE_EXEMPT_PREFIXES:
+        if path.startswith(exempt):
+            return None
 
     for prefix, role_map in ROLE_AWARE_PATH_PREFIXES.items():
         if path.startswith(prefix):
