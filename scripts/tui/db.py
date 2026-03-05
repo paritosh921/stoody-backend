@@ -611,6 +611,35 @@ class DB:
         except Exception:
             return None
 
+    def _delete_storage_path(self, storage_path: str) -> bool:
+        """Delete a storage object from S3/local path (best effort)."""
+        if not storage_path:
+            return True
+        path = storage_path.strip()
+        if path.startswith("s3://"):
+            no_scheme = path.replace("s3://", "", 1)
+            if "/" not in no_scheme:
+                return False
+            bucket, key = no_scheme.split("/", 1)
+            client = self._get_s3_client()
+            if not client:
+                return False
+            try:
+                client.delete_object(Bucket=bucket, Key=key)
+                return True
+            except Exception:
+                return False
+
+        local_path = Path(path)
+        if not local_path.is_absolute():
+            local_path = self._backend_root / local_path
+        try:
+            if local_path.exists():
+                local_path.unlink()
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _safe_json_load(text: str) -> Any:
         try:
@@ -816,6 +845,8 @@ class DB:
                             "machine": 1,
                             "os_info": 1,
                             "pen_connected": 1,
+                            "attachment_count": 1,
+                            "attachment_total_bytes": 1,
                         },
                     )
                     .sort("created_at", -1)
@@ -842,6 +873,8 @@ class DB:
                         "machine": doc.get("machine", ""),
                         "os_info": doc.get("os_info", ""),
                         "pen_connected": bool(doc.get("pen_connected", False)),
+                        "attachment_count": int(doc.get("attachment_count", 0) or 0),
+                        "attachment_total_bytes": int(doc.get("attachment_total_bytes", 0) or 0),
                     }
                 )
 
@@ -869,6 +902,7 @@ class DB:
             "title": doc.get("title", ""),
             "description": doc.get("description", ""),
             "reported_at_client": doc.get("reported_at_client"),
+            "attachments": doc.get("attachments") or [],
         }
 
         pretty: List[str] = []
@@ -882,6 +916,13 @@ class DB:
         pretty.append(f"Pen Connected: {detail['pen_connected']}")
         pretty.append(f"Machine: {detail['machine']}")
         pretty.append(f"OS Info: {detail['os_info']}")
+        pretty.append(f"Attachments: {len(detail['attachments'])}")
+        for item in detail["attachments"]:
+            pretty.append(
+                f"  - {item.get('filename', '')} | {item.get('content_type', '')} | "
+                f"{int(item.get('size_bytes', 0) or 0)} bytes"
+            )
+            pretty.append(f"    storage: {item.get('storage_path', '')}")
         pretty.append("")
         pretty.append("Title:")
         pretty.append(self._truncate_text(str(detail["title"]), 1000))
@@ -891,3 +932,63 @@ class DB:
 
         detail["pretty_text"] = "\n".join(pretty)
         return detail
+
+    def delete_diagnostics_report(self, report_id: str, db_name: str) -> Dict[str, Any]:
+        """Delete one diagnostics record and its archive object."""
+        tenant_db = self.client[db_name]
+        doc = tenant_db["desktop_diagnostics"].find_one({"_id": ObjectId(report_id)})
+        if not doc:
+            return {"deleted": False, "reason": "not_found"}
+        storage_deleted = self._delete_storage_path(str(doc.get("storage_path", "")))
+        tenant_db["desktop_diagnostics"].delete_one({"_id": ObjectId(report_id)})
+        return {"deleted": True, "storage_deleted": storage_deleted}
+
+    def delete_all_diagnostics_reports(self) -> Dict[str, Any]:
+        """Delete all diagnostics records and archive objects across all tenant DBs."""
+        deleted_docs = 0
+        deleted_storage = 0
+        tenants = list(self.master["tenants"].find({"db_name": {"$exists": True, "$ne": None}}, {"db_name": 1}))
+        for tenant in tenants:
+            db_name = tenant.get("db_name")
+            if not db_name:
+                continue
+            coll = self.client[db_name]["desktop_diagnostics"]
+            docs = list(coll.find({}, {"_id": 1, "storage_path": 1}))
+            for doc in docs:
+                deleted_docs += 1
+                if self._delete_storage_path(str(doc.get("storage_path", ""))):
+                    deleted_storage += 1
+            coll.delete_many({})
+        return {"deleted_docs": deleted_docs, "deleted_storage": deleted_storage}
+
+    def delete_desktop_bug_report(self, report_id: str, db_name: str) -> Dict[str, Any]:
+        """Delete one desktop bug report and all referenced attachments."""
+        tenant_db = self.client[db_name]
+        doc = tenant_db["desktop_bug_reports"].find_one({"_id": ObjectId(report_id)})
+        if not doc:
+            return {"deleted": False, "reason": "not_found"}
+        deleted_storage = 0
+        for item in (doc.get("attachments") or []):
+            if self._delete_storage_path(str(item.get("storage_path", ""))):
+                deleted_storage += 1
+        tenant_db["desktop_bug_reports"].delete_one({"_id": ObjectId(report_id)})
+        return {"deleted": True, "deleted_storage": deleted_storage}
+
+    def delete_all_desktop_bug_reports(self) -> Dict[str, Any]:
+        """Delete all desktop bug reports and attachment objects across all tenants."""
+        deleted_docs = 0
+        deleted_storage = 0
+        tenants = list(self.master["tenants"].find({"db_name": {"$exists": True, "$ne": None}}, {"db_name": 1}))
+        for tenant in tenants:
+            db_name = tenant.get("db_name")
+            if not db_name:
+                continue
+            coll = self.client[db_name]["desktop_bug_reports"]
+            docs = list(coll.find({}, {"_id": 1, "attachments": 1}))
+            for doc in docs:
+                deleted_docs += 1
+                for item in (doc.get("attachments") or []):
+                    if self._delete_storage_path(str(item.get("storage_path", ""))):
+                        deleted_storage += 1
+            coll.delete_many({})
+        return {"deleted_docs": deleted_docs, "deleted_storage": deleted_storage}

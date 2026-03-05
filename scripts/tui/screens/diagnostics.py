@@ -10,6 +10,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Static
+from ..widgets.confirm_dialog import ConfirmDialog
 
 
 class DiagnosticsScreen(Screen):
@@ -17,6 +18,8 @@ class DiagnosticsScreen(Screen):
         ("r", "refresh", "Refresh"),
         ("enter", "inspect_selected", "Inspect"),
         ("c", "copy_details", "Copy Full Log"),
+        ("x", "delete_selected", "Delete Selected"),
+        ("X", "delete_all", "Delete All"),
         ("j", "details_down", "Details Down"),
         ("k", "details_up", "Details Up"),
         ("pagedown", "details_page_down", "Details PgDn"),
@@ -36,6 +39,8 @@ class DiagnosticsScreen(Screen):
             )
             with Horizontal(id="diag-actions"):
                 yield Button("Copy Full Log", id="diag-copy", variant="primary")
+                yield Button("Delete Selected", id="diag-delete-selected", variant="warning")
+                yield Button("Delete All", id="diag-delete-all", variant="error")
             with VerticalScroll(id="diag-details-pane"):
                 yield Static("", id="diag-details")
         yield Footer()
@@ -75,6 +80,10 @@ class DiagnosticsScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "diag-copy":
             self.action_copy_details()
+        elif event.button.id == "diag-delete-selected":
+            self.action_delete_selected()
+        elif event.button.id == "diag-delete-all":
+            self.action_delete_all()
 
     def action_copy_details(self) -> None:
         text = (self._current_detail_text or "").strip()
@@ -90,6 +99,69 @@ class DiagnosticsScreen(Screen):
             self._set_status(f"Copied full log text ({len(text)} chars) to clipboard.")
         except Exception as exc:
             self._set_status(f"Copy failed: {exc}")
+
+    def action_delete_selected(self) -> None:
+        row = self._selected_row()
+        if not row:
+            self._set_status("No report selected.")
+            return
+        ticket = row.get("ticket_id", "")
+        self.app.push_screen(
+            ConfirmDialog(
+                "Delete Selected Diagnostics",
+                f"Delete diagnostics report {ticket} and its stored archive?",
+                confirm_label="Delete",
+            ),
+            lambda ok: self._confirm_delete_selected(bool(ok)),
+        )
+
+    def _confirm_delete_selected(self, confirmed: bool) -> None:
+        if not confirmed:
+            self._set_status("Delete cancelled.")
+            return
+        row = self._selected_row()
+        if not row:
+            self._set_status("No report selected.")
+            return
+        self._delete_selected_worker(str(row.get("_id")), str(row.get("db_name")), str(row.get("ticket_id", "")))
+
+    @work(thread=True)
+    def _delete_selected_worker(self, report_id: str, db_name: str, ticket_id: str) -> None:
+        db = self.app.db  # type: ignore[attr-defined]
+        result = db.delete_diagnostics_report(report_id=report_id, db_name=db_name)
+        if result.get("deleted"):
+            self.app.call_from_thread(self._set_status, f"Deleted diagnostics {ticket_id}.")
+            self.app.call_from_thread(self.load_data)
+        else:
+            self.app.call_from_thread(self._set_status, f"Delete failed for {ticket_id}.")
+
+    def action_delete_all(self) -> None:
+        self.app.push_screen(
+            ConfirmDialog(
+                "Delete All Diagnostics",
+                "Delete ALL diagnostics reports and their stored archives across tenants?",
+                confirm_label="Delete All",
+            ),
+            lambda ok: self._confirm_delete_all(bool(ok)),
+        )
+
+    def _confirm_delete_all(self, confirmed: bool) -> None:
+        if not confirmed:
+            self._set_status("Delete all cancelled.")
+            return
+        self._delete_all_worker()
+
+    @work(thread=True)
+    def _delete_all_worker(self) -> None:
+        db = self.app.db  # type: ignore[attr-defined]
+        result = db.delete_all_diagnostics_reports()
+        docs = int(result.get("deleted_docs", 0) or 0)
+        storage = int(result.get("deleted_storage", 0) or 0)
+        self.app.call_from_thread(
+            self._set_status,
+            f"Deleted {docs} diagnostics records and {storage} stored archives.",
+        )
+        self.app.call_from_thread(self.load_data)
 
     def _scroll_details(self, amount: int) -> None:
         try:

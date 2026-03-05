@@ -253,8 +253,11 @@ DataTable {
     margin: 0 0 1 0;
 }
 
-#diag-copy {
+#diag-copy,
+#diag-delete-selected,
+#diag-delete-all {
     height: auto;
+    margin-right: 1;
 }
 
 #diag-details {
@@ -285,13 +288,42 @@ DataTable {
     padding: 0 1;
 }
 
+#bug-transfer-panel {
+    height: auto;
+    border: solid $accent;
+    padding: 1;
+    margin: 0 0 1 0;
+}
+
+.bug-transfer-row {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.bug-transfer-row > Input {
+    width: 1fr;
+    margin-right: 1;
+}
+
+#bug-transfer-actions {
+    height: auto;
+}
+
+#bug-transfer-actions > Button {
+    margin-right: 1;
+}
+
 #bug-actions {
     height: auto;
     margin: 0 0 1 0;
 }
 
-#bug-copy {
+#bug-copy,
+#bug-send-images,
+#bug-delete-selected,
+#bug-delete-all {
     height: auto;
+    margin-right: 1;
 }
 
 #bug-details {
