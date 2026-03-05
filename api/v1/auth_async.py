@@ -114,6 +114,8 @@ class AdminRegistrationStatusAuthRequest(BaseModel):
 
 class TenantLookupResponse(BaseModel):
     tenant_id: str
+    institution_name: Optional[str] = None
+    status: Optional[str] = None
 
 # Secure Password Reset Models
 class PasswordResetRequestModel(BaseModel):
