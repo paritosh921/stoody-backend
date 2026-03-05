@@ -113,6 +113,7 @@ except Exception as e:
 
 from api.v1.learning_async import router as learning_router
 from api.v1.strokes_async import router as strokes_router
+from api.v1.desktop_diagnostics_async import router as desktop_diagnostics_router
 
 # Student Copies routes (pen stroke pages and pinned PDFs)
 try:
@@ -865,6 +866,13 @@ app.include_router(
     strokes_router,
     prefix=f"{API_V1_PREFIX}",
     tags=["Strokes"]
+)
+
+# Desktop diagnostics upload (agent support bundles)
+app.include_router(
+    desktop_diagnostics_router,
+    prefix=f"{API_V1_PREFIX}",
+    tags=["Desktop Diagnostics"],
 )
 
 # Student Copies routes (pen stroke pages and pinned PDFs)
