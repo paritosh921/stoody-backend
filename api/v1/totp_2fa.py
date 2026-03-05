@@ -558,12 +558,16 @@ async def login_with_2fa(
         
         # 2FA not required and not enabled - direct login
         user_data = _build_user_token_data(user, user_id, user_type, tenant=tenant)
-        
+
         session_data = await auth_manager.create_user_session(user_data)
-        
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, user_id)
+
         # Build complete user response with role-specific fields
         user_response = _build_user_response(user, user_id, user_type, tenant=tenant)
-        
+
         return LoginResponse(
             success=True,
             next="DONE",
@@ -712,12 +716,16 @@ async def verify_2fa_setup(
         # Create access token with 6h expiry
         user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
         access_token = create_6h_access_token(auth_manager, user_data)
-        
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, user_id)
+
         # Build complete user response with role-specific fields
         user_response = _build_user_response(user, user_id, user_type, payload=payload)
-        
+
         logger.info(f"2FA enabled for {user_type} {user_id}")
-        
+
         return SetupVerifyResponse(
             success=True,
             access_token=access_token,
@@ -798,10 +806,14 @@ async def verify_otp(
         # Create access token with 6h expiry
         user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
         access_token = create_6h_access_token(auth_manager, user_data)
-        
+
+        # Clear any user-level revocation so the new token is accepted
+        from core.token_blacklist import clear_user_session_revocation
+        await clear_user_session_revocation(auth_manager.cache_manager, user_id)
+
         # Build complete user response with role-specific fields
         user_response = _build_user_response(user, user_id, user_type, payload=payload)
-        
+
         return OTPVerifyResponse(
             success=True,
             access_token=access_token,
