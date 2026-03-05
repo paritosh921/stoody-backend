@@ -401,6 +401,152 @@ def _options_text_from_question(q: Dict[str, Any]) -> str:
         return "\n".join(parts)
     return ""
 
+
+def _parse_number(s: str):
+    """Try to parse a string as a number. Returns float or None."""
+    if not s:
+        return None
+    s = s.strip().replace(',', '')
+    # Handle fractions like "1/2"
+    if '/' in s:
+        parts = s.split('/')
+        if len(parts) == 2:
+            try:
+                return float(parts[0].strip()) / float(parts[1].strip())
+            except (ValueError, ZeroDivisionError):
+                return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _answers_are_equivalent(student_answer: str, correct_answer: str) -> bool:
+    """
+    Check if two answers are semantically equivalent.
+    Handles: numeric (9 vs nine), case, whitespace, units, fractions.
+    """
+    import re as _re_equiv
+
+    if not student_answer or not correct_answer:
+        return False
+
+    s = student_answer.strip().lower()
+    c = correct_answer.strip().lower()
+
+    # Direct match (case-insensitive)
+    if s == c:
+        return True
+
+    # Word-to-number mapping
+    _word_to_num = {
+        'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4,
+        'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9,
+        'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13,
+        'fourteen': 14, 'fifteen': 15, 'sixteen': 16, 'seventeen': 17,
+        'eighteen': 18, 'nineteen': 19, 'twenty': 20, 'thirty': 30,
+        'forty': 40, 'fifty': 50, 'sixty': 60, 'seventy': 70,
+        'eighty': 80, 'ninety': 90, 'hundred': 100, 'thousand': 1000,
+        'half': 0.5, 'quarter': 0.25, 'third': 1/3,
+    }
+
+    # Try direct numeric parse
+    s_num = _parse_number(s)
+    c_num = _parse_number(c)
+    if s_num is not None and c_num is not None:
+        return abs(s_num - c_num) < 1e-6
+
+    # Try word-to-number for student answer vs numeric correct answer
+    s_word_num = _word_to_num.get(s)
+    if s_word_num is not None and c_num is not None:
+        return abs(s_word_num - c_num) < 1e-6
+
+    # Try numeric student answer vs word correct answer
+    c_word_num = _word_to_num.get(c)
+    if c_word_num is not None and s_num is not None:
+        return abs(c_word_num - s_num) < 1e-6
+
+    # Both are words
+    if s_word_num is not None and c_word_num is not None:
+        return abs(s_word_num - c_word_num) < 1e-6
+
+    # Strip common units and compare core value
+    _unit_pattern = r'\s*(days?|hours?|minutes?|mins?|seconds?|secs?|years?|months?|weeks?|meters?|metres?|centimeters?|centimetres?|cm|mm|km|m|kg|grams?|g|mg|ml|litres?|liters?|l|%|percent|rs\.?|rupees?|₹|\$|€|£|°[cfCF]?|degrees?)\.?\s*$'
+    s_stripped = _re_equiv.sub(_unit_pattern, '', s, flags=_re_equiv.IGNORECASE).strip()
+    c_stripped = _re_equiv.sub(_unit_pattern, '', c, flags=_re_equiv.IGNORECASE).strip()
+
+    if s_stripped and c_stripped and s_stripped == c_stripped:
+        return True
+
+    # Try numeric comparison after stripping units
+    s_num2 = _parse_number(s_stripped)
+    c_num2 = _parse_number(c_stripped)
+    if s_num2 is not None and c_num2 is not None:
+        return abs(s_num2 - c_num2) < 1e-6
+
+    # Word-to-number after stripping units
+    s_word2 = _word_to_num.get(s_stripped)
+    if s_word2 is not None and c_num2 is not None:
+        return abs(s_word2 - c_num2) < 1e-6
+    c_word2 = _word_to_num.get(c_stripped)
+    if c_word2 is not None and s_num2 is not None:
+        return abs(c_word2 - s_num2) < 1e-6
+
+    return False
+
+
+def _resolve_correct_answer(correct_answer: str, question_doc: dict) -> dict:
+    """
+    Resolve the correct answer into multiple representations for robust evaluation.
+
+    Returns dict with:
+        - raw: original stored value (e.g. "A")
+        - resolved_value: actual content of the option (e.g. "7" for option A)
+        - display: human-readable for summary (e.g. "A (7)")
+        - is_option_letter: True if the answer is A/B/C/D
+    """
+    result = {
+        "raw": correct_answer,
+        "resolved_value": correct_answer,
+        "display": correct_answer,
+        "is_option_letter": False,
+    }
+
+    if not correct_answer:
+        return result
+
+    ca_upper = correct_answer.strip().upper()
+
+    # Check if it's an option letter (A-J covers most MCQ ranges)
+    if len(ca_upper) == 1 and ca_upper in "ABCDEFGHIJ":
+        option_index = ord(ca_upper) - ord('A')
+
+        # Try to resolve from enhancedOptions first, then plain options
+        enhanced = question_doc.get("enhancedOptions") or []
+        opts = question_doc.get("options", []) or []
+
+        resolved_content = None
+        if enhanced and option_index < len(enhanced):
+            opt = enhanced[option_index]
+            if isinstance(opt, dict):
+                content = opt.get("content", "")
+                if content and content.strip():
+                    resolved_content = content.strip()
+        elif opts and option_index < len(opts):
+            if opts[option_index] and str(opts[option_index]).strip():
+                resolved_content = str(opts[option_index]).strip()
+
+        if resolved_content:
+            result["is_option_letter"] = True
+            result["resolved_value"] = resolved_content
+            result["display"] = f"{ca_upper} ({resolved_content})"
+        else:
+            # It looks like a letter but we couldn't resolve it — still mark as option letter
+            result["is_option_letter"] = True
+
+    return result
+
+
 async def _figure_images_base64(q: Dict[str, Any], db: DatabaseManager = None, is_b2c: bool = False) -> List[str]:
     """Extract base64 image data for question figures.
     
@@ -1029,12 +1175,34 @@ async def evaluate_submission(
         ca_alt = question_doc.get("correct_answer")
         correct_answer = str((ca_primary if ca_primary is not None else (ca_alt if ca_alt is not None else ""))).strip()
 
+        # Resolve option letter to actual value (e.g. "A" -> "7 days")
+        resolved = _resolve_correct_answer(correct_answer, question_doc)
+        correct_answer_value = resolved["resolved_value"]   # The actual answer content
+        correct_answer_display = resolved["display"]         # Human-readable: "A (7 days)"
+        is_option_letter = resolved["is_option_letter"]      # True if answer is A/B/C/D
+
         # Extract question text and options
         question_text = str(question_doc.get("text", ""))
         options_text = _options_text_from_question(question_doc)
         
-        # Determine if this is MCQ (has options)
-        is_mcq = bool(options_text)
+        # Check stored question_type (set during upload or admin edit)
+        stored_question_type = (question_doc.get("question_type") or "").lower().strip()
+
+        # Determine if this is MCQ: must have options AND not be explicitly marked subjective
+        is_mcq = bool(options_text) and stored_question_type != "subjective"
+
+        # For subjective/non-MCQ questions: if the stored correctAnswer is a single option
+        # letter (A-J) but there are no options to resolve it against, it's a meaningless
+        # OCR artifact. Clear it so the LLM solves the question itself.
+        if not is_mcq and is_option_letter and correct_answer_value == correct_answer:
+            logger.info(
+                f"Clearing bogus option-letter correctAnswer='{correct_answer}' for non-MCQ Q:{qid} "
+                f"(no options to resolve against — LLM will solve instead)."
+            )
+            correct_answer = ""
+            correct_answer_value = ""
+            correct_answer_display = ""
+            is_option_letter = False
 
         # Initialize AI service
         from services.async_openai_service import AsyncOpenAIService
@@ -1329,7 +1497,14 @@ async def evaluate_submission(
         prompt += "✅ REFERENCE ANSWER FOR EVALUATION:\n"
         prompt += "═══════════════════════════════════════\n"
         if has_correct_answer:
-            prompt += f"{correct_answer}\n\n"
+            if is_mcq and is_option_letter:
+                # For MCQ: show BOTH the letter AND the resolved option content
+                prompt += f"Correct Option Letter: {correct_answer}\n"
+                if correct_answer_value != correct_answer:
+                    prompt += f"Option {correct_answer} Content/Value: {correct_answer_value}\n"
+                prompt += "\n"
+            else:
+                prompt += f"{correct_answer}\n\n"
         else:
             prompt += "⚠️ NO CORRECT ANSWER PROVIDED BY ADMIN\n\n"
             prompt += "🧠 YOU MUST SOLVE THIS QUESTION YOURSELF:\n"
@@ -1346,17 +1521,21 @@ async def evaluate_submission(
         # Specific evaluation instructions based on question type AND whether answer is provided
         if is_mcq:
             prompt += "🎯 EVALUATION RULES (Multiple Choice Question):\n"
-            prompt += "1. Look for a LETTER (A, B, C, D, etc.) in the student's handwriting - this is their FINAL answer.\n"
-            prompt += "2. IMPORTANT: Students often show their WORK (calculations, equations, diagrams) before writing their final letter.\n"
-            prompt += "3. If you see calculations/work but NO final letter, evaluate if their work leads to the correct answer.\n"
-            prompt += "4. Common handwriting variations: curved lines may be 'C' or 'D', bumpy lines may be 'B'.\n"
+            prompt += "1. Look for a LETTER (A, B, C, D) or the VALUE/CONTENT of the correct option in the student's answer.\n"
+            prompt += "2. IMPORTANT: Students may write EITHER the option letter OR the actual answer value — BOTH ARE CORRECT.\n"
+            if has_correct_answer and is_option_letter and correct_answer_value != correct_answer:
+                prompt += f"   - Example: Writing '{correct_answer}' OR '{correct_answer_value}' are BOTH CORRECT answers.\n"
+            prompt += "3. Students often show their WORK (calculations, equations, diagrams) before writing their final answer.\n"
+            prompt += "4. If you see calculations/work but NO final letter/answer, evaluate if their work leads to the correct answer.\n"
             if has_correct_answer:
                 prompt += f"5. The student is CORRECT if:\n"
                 prompt += f"   - Their final letter matches '{correct_answer}', OR\n"
-                prompt += f"   - Their calculations/work correctly lead to option '{correct_answer}' (even if letter is missing)\n"
+                if correct_answer_value != correct_answer:
+                    prompt += f"   - Their final answer matches the value '{correct_answer_value}', OR\n"
+                prompt += f"   - Their calculations/work correctly lead to the correct option\n"
             else:
                 prompt += "5. Compare the student's letter/work to YOUR solved answer.\n"
-            prompt += "6. For numerical MCQs: Check if their calculated value matches one of the options.\n\n"
+            prompt += "6. For numerical MCQs: If the student writes the correct numerical value, mark CORRECT even without a letter.\n\n"
         elif is_essay_question:
             prompt += "🎯 EVALUATION RULES (Essay/Descriptive Question):\n"
             prompt += "1. Transcribe ALL text from the student's handwriting carefully.\n"
@@ -1382,11 +1561,20 @@ async def evaluate_submission(
             prompt += "1. Transcribe all text, numbers, and equations from the student's handwriting.\n"
             prompt += "2. Look for their FINAL answer (often boxed, circled, or underlined).\n"
             if has_correct_answer:
-                prompt += f"3. Compare their answer/solution to the correct answer: '{correct_answer[:100]}{'...' if len(correct_answer) > 100 else ''}'.\n"
+                prompt += f"3. Compare their answer to the correct answer: '{correct_answer_value[:100]}{'...' if len(correct_answer_value) > 100 else ''}'.\n"
             else:
-                prompt += "3. Compare their answer/solution to YOUR solved answer.\n"
-            prompt += "4. They are CORRECT if the answer matches or the solution approach is correct.\n"
-            prompt += "5. Partial credit (score 0.5): if they're on the right track but made a small error.\n\n"
+                prompt += "3. You MUST SOLVE this question yourself first, then compare to the student's answer.\n"
+            prompt += "4. ⚠️ SEMANTIC EQUIVALENCE RULES (CRITICAL — FOLLOW STRICTLY):\n"
+            prompt += "   - '9' and 'nine' and '9.0' and 'Nine' are ALL THE SAME → mark CORRECT\n"
+            prompt += "   - '7' and 'seven' and '7.00' are ALL THE SAME → mark CORRECT\n"
+            prompt += "   - '1/2' and '0.5' and 'half' are ALL THE SAME → mark CORRECT\n"
+            prompt += "   - '100' and 'hundred' and 'one hundred' are THE SAME → mark CORRECT\n"
+            prompt += "   - Units can differ: '7 days' and '7' are the same if the question asks for days\n"
+            prompt += "   - Case does NOT matter: 'Delhi' = 'delhi' = 'DELHI'\n"
+            prompt += "   - Minor spelling variations are acceptable if the meaning is clear\n"
+            prompt += "   - Compare the MEANING and VALUE, NOT the exact string format\n"
+            prompt += "5. They are CORRECT if the answer is mathematically or semantically equivalent.\n"
+            prompt += "6. Partial credit (score 0.5): if they're on the right track but made a small error.\n\n"
         
         
         # JSON output instructions - simplified and clearer
@@ -1666,18 +1854,27 @@ async def evaluate_submission(
                 # Handle correct answer - either from admin or LLM
                 solved_answer = parsed.get("solved_answer", "")
                 if has_correct_answer:
-                    # Admin provided answer - use that as the source of truth
-                    evaluation_data["correctAnswer"] = correct_answer
+                    # Admin provided answer — use human-readable display version
+                    evaluation_data["correctAnswer"] = correct_answer_display  # e.g. "A (7)" instead of "A"
                     evaluation_data["correctAnswerSource"] = "admin_provided"
                     
                     # Validate: If LLM solved it differently, log a warning
-                    if solved_answer and solved_answer.strip().upper() != correct_answer.strip().upper():
-                        logger.warning(f"⚠️ LLM's solved_answer '{solved_answer}' differs from admin's '{correct_answer}'")
+                    if solved_answer:
+                        sa_upper = solved_answer.strip().upper()
+                        ca_upper = correct_answer.strip().upper()
+                        # For MCQ check both letter and value
+                        if is_option_letter:
+                            if sa_upper != ca_upper and not _answers_are_equivalent(solved_answer.strip(), correct_answer_value):
+                                logger.warning(f"⚠️ LLM's solved_answer '{solved_answer}' differs from admin's '{correct_answer}' (value='{correct_answer_value}')")
+                        elif sa_upper != ca_upper:
+                            logger.warning(f"⚠️ LLM's solved_answer '{solved_answer}' differs from admin's '{correct_answer}'")
                 elif solved_answer:
-                    # LLM solved the question - use its answer
-                    evaluation_data["correctAnswer"] = str(solved_answer).strip()
+                    # LLM solved the question.
+                    # USER REQUEST: Do not display a short word/char "Correct Answer" box in the summary tab
+                    # if the LLM solved it. Just let the detailed 'correctSolution' explain it.
+                    evaluation_data["correctAnswer"] = ""
                     evaluation_data["correctAnswerSource"] = "llm_solved"
-                    logger.info(f"🧠 LLM solved the question. Correct answer: '{solved_answer}'")
+                    logger.info(f"🧠 LLM solved the question. Solved answer: '{solved_answer}' (hidden from short answer display)")
                 else:
                     # No answer available - keep empty
                     evaluation_data["correctAnswer"] = ""
@@ -1689,17 +1886,47 @@ async def evaluate_submission(
                     evaluation_data["extractedAnswer"] = ocr_extracted_text
                     evaluation_data["answerSource"] = "vision_extraction_fallback"
                 
-                # Validation: Check for contradictions in the analysis
-                extracted = evaluation_data["extractedAnswer"].strip().upper() if evaluation_data["extractedAnswer"] else ""
-                expected = evaluation_data["correctAnswer"].strip().upper() if evaluation_data["correctAnswer"] else ""
+                # ──────────────────────────────────────────────
+                # Robust post-LLM validation: catch contradictions
+                # ──────────────────────────────────────────────
+                extracted = evaluation_data["extractedAnswer"].strip() if evaluation_data["extractedAnswer"] else ""
                 
-                # For MCQ, simple letter comparison
-                if is_mcq and extracted and expected and len(extracted) == 1 and len(expected) == 1:
-                    letter_match = extracted == expected
-                    if letter_match != evaluation_data["correct"]:
-                        logger.warning(f"⚠️ Contradiction detected! Extracted='{extracted}', Expected='{expected}', is_correct={evaluation_data['correct']}. Overriding to match={letter_match}")
-                        evaluation_data["correct"] = letter_match
-                        evaluation_data["score"] = 1.0 if letter_match else 0.0
+                if is_mcq and extracted and correct_answer:
+                    # MCQ validation: accept letter match OR value match
+                    extracted_upper = extracted.upper()
+                    ca_upper = correct_answer.strip().upper()
+                    
+                    # Check letter match (student wrote "A", correct is "A")
+                    letter_match = (len(extracted_upper) == 1 and len(ca_upper) == 1 
+                                    and extracted_upper == ca_upper)
+                    # Check value match (student wrote "7", option A content is "7")
+                    value_match = False
+                    if correct_answer_value and correct_answer_value != correct_answer:
+                        value_match = _answers_are_equivalent(extracted, correct_answer_value)
+                    
+                    is_match = letter_match or value_match
+                    
+                    if is_match != evaluation_data["correct"]:
+                        logger.warning(
+                            f"⚠️ MCQ contradiction detected! Extracted='{extracted}', "
+                            f"Expected letter='{ca_upper}', value='{correct_answer_value}', "
+                            f"letter_match={letter_match}, value_match={value_match}, "
+                            f"LLM said correct={evaluation_data['correct']}. "
+                            f"Overriding to match={is_match}"
+                        )
+                        evaluation_data["correct"] = is_match
+                        evaluation_data["score"] = 1.0 if is_match else 0.0
+                        
+                elif not is_mcq and extracted and correct_answer_value:
+                    # Subjective validation: semantic/numeric equivalence safety net
+                    if _answers_are_equivalent(extracted, correct_answer_value):
+                        if not evaluation_data["correct"]:
+                            logger.warning(
+                                f"⚠️ Subjective override: student='{extracted}' ≈ correct='{correct_answer_value}'. "
+                                f"LLM incorrectly said wrong. Overriding to correct."
+                            )
+                            evaluation_data["correct"] = True
+                            evaluation_data["score"] = 1.0
                 
                 logger.info(f"✅ JSON parsed successfully. is_correct={evaluation_data['correct']}, score={evaluation_data['score']}, extracted='{evaluation_data['extractedAnswer'][:50] if evaluation_data['extractedAnswer'] else 'EMPTY'}', correctAnswer='{evaluation_data['correctAnswer'][:50] if evaluation_data['correctAnswer'] else 'EMPTY'}', has_solution={bool(correct_solution)}")
                     
