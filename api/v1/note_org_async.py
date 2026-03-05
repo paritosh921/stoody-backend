@@ -178,33 +178,13 @@ async def get_subject_pages(
 
     cursor = tenant_db["note_classifications"].find(
         {"user_id": user_id, "subject": subject},
-        {
-            "pen_mac": 1, "book_type": 1, "page_number": 1,
-            "thumbnail_url": 1, "confidence": 1,
-            "classification_source": 1, "ocr_text": 1,
-            "topic": 1, "created_at": 1, "updated_at": 1,
-            "session_id": 1, "first_activity": 1, "last_activity": 1,
-        },
     ).sort("updated_at", -1)
 
     pages = []
     async for doc in cursor:
-        pages.append({
-            "id": str(doc["_id"]),
-            "pen_mac": doc.get("pen_mac"),
-            "book_type": doc.get("book_type"),
-            "page_number": doc.get("page_number"),
-            "thumbnail_url": doc.get("thumbnail_url"),
-            "confidence": doc.get("confidence"),
-            "classification_source": doc.get("classification_source"),
-            "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
-            "topic": doc.get("topic"),
-            "created_at": doc.get("created_at"),
-            "updated_at": doc.get("updated_at"),
-            "session_id": doc.get("session_id"),
-            "first_activity": doc.get("first_activity"),
-            "last_activity": doc.get("last_activity"),
-        })
+        p = _doc_to_page(doc)
+        p["topic"] = doc.get("topic")
+        pages.append(p)
 
     # Batch-enrich pages missing session info from strokes
     await _enrich_pages_with_session_info(tenant_db, user_id, pages)
@@ -232,32 +212,11 @@ async def get_topic_pages(
 
     cursor = tenant_db["note_classifications"].find(
         {"user_id": user_id, "subject": subject, "topic": topic},
-        {
-            "pen_mac": 1, "book_type": 1, "page_number": 1,
-            "thumbnail_url": 1, "confidence": 1,
-            "classification_source": 1, "ocr_text": 1,
-            "created_at": 1, "updated_at": 1,
-            "session_id": 1, "first_activity": 1, "last_activity": 1,
-        },
     ).sort("page_number", 1)
 
     pages = []
     async for doc in cursor:
-        pages.append({
-            "id": str(doc["_id"]),
-            "pen_mac": doc.get("pen_mac"),
-            "book_type": doc.get("book_type"),
-            "page_number": doc.get("page_number"),
-            "thumbnail_url": doc.get("thumbnail_url"),
-            "confidence": doc.get("confidence"),
-            "classification_source": doc.get("classification_source"),
-            "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
-            "created_at": doc.get("created_at"),
-            "updated_at": doc.get("updated_at"),
-            "session_id": doc.get("session_id"),
-            "first_activity": doc.get("first_activity"),
-            "last_activity": doc.get("last_activity"),
-        })
+        pages.append(_doc_to_page(doc))
 
     # Batch-enrich pages missing session info from strokes
     await _enrich_pages_with_session_info(tenant_db, user_id, pages)
@@ -702,6 +661,7 @@ async def backfill_classifications(
 
 @router.get("/pages/all")
 async def get_all_pages(
+    favorites_only: bool = Query(False),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -712,13 +672,17 @@ async def get_all_pages(
 
     user_id = _get_user_id(current_user)
 
+    query: Dict[str, Any] = {"user_id": user_id}
+    if favorites_only:
+        query["is_favorite"] = True
+
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": user_id},
+        query,
         {
             "pen_mac": 1, "book_type": 1, "page_number": 1,
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
-            "subject": 1, "topic": 1,
+            "subject": 1, "topic": 1, "is_favorite": 1,
             "created_at": 1, "updated_at": 1,
             "session_id": 1, "first_activity": 1, "last_activity": 1,
         },
@@ -794,6 +758,32 @@ async def search_notes(
 # ---------------------------------------------------------------------------
 # DELETE /pages/{classification_id}
 # ---------------------------------------------------------------------------
+
+@router.patch("/pages/{classification_id}/favorite")
+async def toggle_favorite(
+    classification_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Toggle the favorite status of a note page."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
+    if not doc or doc.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Classification not found")
+
+    new_value = not doc.get("is_favorite", False)
+    await tenant_db["note_classifications"].update_one(
+        {"_id": ObjectId(classification_id)},
+        {"$set": {"is_favorite": new_value, "updated_at": datetime.utcnow()}},
+    )
+
+    return {"success": True, "is_favorite": new_value}
+
 
 @router.delete("/pages/{classification_id}")
 async def delete_page(
@@ -872,6 +862,7 @@ def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Di
         "session_id": doc.get("session_id"),
         "first_activity": doc.get("first_activity"),
         "last_activity": doc.get("last_activity"),
+        "is_favorite": doc.get("is_favorite", False),
     }
     if include_subject_topic:
         page["subject"] = doc.get("subject")
