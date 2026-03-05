@@ -114,6 +114,7 @@ except Exception as e:
 from api.v1.learning_async import router as learning_router
 from api.v1.strokes_async import router as strokes_router
 from api.v1.desktop_diagnostics_async import router as desktop_diagnostics_router
+from api.v1.desktop_bug_reports_async import router as desktop_bug_reports_router
 
 # Student Copies routes (pen stroke pages and pinned PDFs)
 try:
@@ -873,6 +874,13 @@ app.include_router(
     desktop_diagnostics_router,
     prefix=f"{API_V1_PREFIX}",
     tags=["Desktop Diagnostics"],
+)
+
+# Desktop Help-tab bug reports (agent user messages)
+app.include_router(
+    desktop_bug_reports_router,
+    prefix=f"{API_V1_PREFIX}",
+    tags=["Desktop Bug Reports"],
 )
 
 # Student Copies routes (pen stroke pages and pinned PDFs)

@@ -777,3 +777,117 @@ class DB:
 
         detail["pretty_text"] = "\n".join(pretty)
         return detail
+
+    def list_desktop_bug_reports(self, limit: int = 400) -> List[Dict[str, Any]]:
+        """List desktop Help-tab bug reports across all tenant DBs."""
+        tenants = list(
+            self.master["tenants"].find(
+                {"db_name": {"$exists": True, "$ne": None}},
+                {
+                    "db_name": 1,
+                    "tenant_id": 1,
+                    "institution_name": 1,
+                    "organization": 1,
+                },
+            )
+        )
+
+        rows: List[Dict[str, Any]] = []
+        for tenant in tenants:
+            db_name = tenant.get("db_name")
+            if not db_name:
+                continue
+            tenant_id = tenant.get("tenant_id")
+            tenant_name = tenant.get("institution_name") or tenant.get("organization") or ""
+            try:
+                docs = list(
+                    self.client[db_name]["desktop_bug_reports"]
+                    .find(
+                        {},
+                        {
+                            "ticket_id": 1,
+                            "title": 1,
+                            "description": 1,
+                            "user_id": 1,
+                            "username": 1,
+                            "created_at": 1,
+                            "app_version": 1,
+                            "pen_mac": 1,
+                            "machine": 1,
+                            "os_info": 1,
+                            "pen_connected": 1,
+                        },
+                    )
+                    .sort("created_at", -1)
+                    .limit(300)
+                )
+            except Exception:
+                continue
+
+            for doc in docs:
+                rows.append(
+                    {
+                        "_id": str(doc.get("_id")),
+                        "db_name": db_name,
+                        "tenant_id": tenant_id,
+                        "tenant_name": tenant_name,
+                        "ticket_id": doc.get("ticket_id", ""),
+                        "title": doc.get("title", ""),
+                        "description": doc.get("description", ""),
+                        "user_id": doc.get("user_id", ""),
+                        "username": doc.get("username", ""),
+                        "created_at": doc.get("created_at"),
+                        "app_version": doc.get("app_version", ""),
+                        "pen_mac": doc.get("pen_mac", ""),
+                        "machine": doc.get("machine", ""),
+                        "os_info": doc.get("os_info", ""),
+                        "pen_connected": bool(doc.get("pen_connected", False)),
+                    }
+                )
+
+        rows.sort(key=lambda r: r.get("created_at") or datetime.min, reverse=True)
+        return rows[: max(1, int(limit))]
+
+    def get_desktop_bug_report_details(self, report_id: str, db_name: str) -> Dict[str, Any]:
+        """Fetch one desktop bug report document and format readable details."""
+        tenant_db = self.client[db_name]
+        doc = tenant_db["desktop_bug_reports"].find_one({"_id": ObjectId(report_id)})
+        if not doc:
+            raise ValueError("Desktop bug report not found")
+
+        detail: Dict[str, Any] = {
+            "ticket_id": doc.get("ticket_id", ""),
+            "db_name": db_name,
+            "user_id": doc.get("user_id", ""),
+            "username": doc.get("username", ""),
+            "created_at": doc.get("created_at"),
+            "app_version": doc.get("app_version", ""),
+            "pen_mac": doc.get("pen_mac", ""),
+            "pen_connected": bool(doc.get("pen_connected", False)),
+            "machine": doc.get("machine", ""),
+            "os_info": doc.get("os_info", ""),
+            "title": doc.get("title", ""),
+            "description": doc.get("description", ""),
+            "reported_at_client": doc.get("reported_at_client"),
+        }
+
+        pretty: List[str] = []
+        pretty.append(f"Ticket: {detail['ticket_id']}")
+        pretty.append(f"DB: {detail['db_name']}")
+        pretty.append(f"User: {detail['user_id']} ({detail['username']})")
+        pretty.append(f"Created At: {detail['created_at']}")
+        pretty.append(f"Reported At (Client): {detail.get('reported_at_client')}")
+        pretty.append(f"App Version: {detail['app_version']}")
+        pretty.append(f"Pen MAC: {detail['pen_mac']}")
+        pretty.append(f"Pen Connected: {detail['pen_connected']}")
+        pretty.append(f"Machine: {detail['machine']}")
+        pretty.append(f"OS Info: {detail['os_info']}")
+        pretty.append("")
+        pretty.append("Title:")
+        pretty.append(self._truncate_text(str(detail["title"]), 1000))
+        pretty.append("")
+        pretty.append("Description:")
+        pretty.append(self._truncate_text(str(detail["description"]), 12000))
+
+        detail["pretty_text"] = "\n".join(pretty)
+        return detail

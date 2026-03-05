@@ -267,3 +267,40 @@ DataTable {
     padding: 1;
     overflow-y: auto;
 }
+
+/* ---- Desktop Messages screen ---- */
+
+#bug-reports-container {
+    padding: 1;
+}
+
+#bug-table {
+    height: 11;
+}
+
+#bug-status-bar {
+    height: auto;
+    background: $boost;
+    color: $text;
+    padding: 0 1;
+}
+
+#bug-actions {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#bug-copy {
+    height: auto;
+}
+
+#bug-details {
+    height: auto;
+}
+
+#bug-details-pane {
+    height: 1fr;
+    border: solid $accent;
+    padding: 1;
+    overflow-y: auto;
+}

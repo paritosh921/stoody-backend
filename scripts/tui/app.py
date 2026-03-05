@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header
 
 from .db import DB
 from .screens.billing import BillingScreen
+from .screens.bug_reports import BugReportsScreen
 from .screens.dashboard import DashboardScreen
 from .screens.diagnostics import DiagnosticsScreen
 from .screens.pricing import PricingScreen
@@ -32,7 +33,7 @@ class SkillerTUI(App):
     """Skiller Platform Management TUI."""
 
     TITLE = "Skiller Platform Manager"
-    SUB_TITLE = "d=Dashboard  s=Super-Admins  p=Pricing  t=Tenants  a=Stats  b=Billing  i=Diagnostics  q=Quit"
+    SUB_TITLE = "d=Dashboard  s=Super-Admins  p=Pricing  t=Tenants  a=Stats  b=Billing  i=Diagnostics  m=Messages  q=Quit"
     CSS_PATH = CSS_PATH
 
     BINDINGS = [
@@ -43,6 +44,7 @@ class SkillerTUI(App):
         ("a", "switch_screen('stats')", "Stats"),
         ("b", "switch_screen('billing')", "Billing"),
         ("i", "switch_screen('diagnostics')", "Diagnostics"),
+        ("m", "switch_screen('bug_reports')", "Messages"),
         ("q", "quit", "Quit"),
     ]
 
@@ -54,6 +56,7 @@ class SkillerTUI(App):
         "stats": StatsScreen,
         "billing": BillingScreen,
         "diagnostics": DiagnosticsScreen,
+        "bug_reports": BugReportsScreen,
     }
 
     def __init__(self) -> None:
