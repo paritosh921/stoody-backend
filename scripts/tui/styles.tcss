@@ -230,3 +230,27 @@ StatCard {
 DataTable {
     height: 1fr;
 }
+
+/* ---- Diagnostics screen ---- */
+
+#diagnostics-container {
+    padding: 1;
+}
+
+#diag-table {
+    height: 1fr;
+}
+
+#diag-status-bar {
+    height: auto;
+    background: $boost;
+    color: $text;
+    padding: 0 1;
+}
+
+#diag-details {
+    height: 16;
+    border: solid $accent;
+    padding: 1;
+    overflow-y: auto;
+}

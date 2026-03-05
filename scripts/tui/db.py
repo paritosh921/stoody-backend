@@ -4,8 +4,12 @@ All methods use pymongo (sync) and are called from Textual @work(thread=True) wo
 """
 
 import calendar
+import io
+import json
 import os
+import zipfile
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
@@ -115,6 +119,8 @@ class DB:
         self.mongo_uri = mongo_uri or os.getenv("MONGODB_URI", "")
         self.master_db_name = master_db_name or os.getenv("MONGODB_DB_MASTER", "skb_master")
         self._client: Optional[MongoClient] = None
+        self._s3_client = None
+        self._backend_root = Path(__file__).resolve().parents[2]
 
     @property
     def client(self) -> MongoClient:
@@ -134,6 +140,7 @@ class DB:
         if self._client:
             self._client.close()
             self._client = None
+        self._s3_client = None
 
     # ---- Super-admins ----
 
@@ -544,3 +551,229 @@ class DB:
             "total_students": total_students,
             "total_tutors": total_tutors,
         }
+
+    # ---- Desktop diagnostics (agent upload bundles) ----
+
+    def _get_s3_client(self):
+        if self._s3_client is not None:
+            return self._s3_client
+
+        use_s3 = os.getenv("USE_S3_STORAGE", "false").lower() == "true"
+        if not use_s3:
+            return None
+
+        bucket = os.getenv("S3_BUCKET_NAME", "")
+        key_id = os.getenv("AWS_ACCESS_KEY_ID", "")
+        key_secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        region = os.getenv("AWS_REGION", "ap-south-1")
+        if not bucket or not key_id or not key_secret:
+            return None
+
+        try:
+            import boto3  # type: ignore
+
+            self._s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=key_id,
+                aws_secret_access_key=key_secret,
+                region_name=region,
+            )
+        except Exception:
+            self._s3_client = None
+        return self._s3_client
+
+    def _download_storage_bytes(self, storage_path: str) -> Optional[bytes]:
+        if not storage_path:
+            return None
+        path = storage_path.strip()
+        if path.startswith("s3://"):
+            # Format: s3://bucket/key
+            no_scheme = path.replace("s3://", "", 1)
+            if "/" not in no_scheme:
+                return None
+            bucket, key = no_scheme.split("/", 1)
+            client = self._get_s3_client()
+            if not client:
+                return None
+            try:
+                obj = client.get_object(Bucket=bucket, Key=key)
+                return obj["Body"].read()
+            except Exception:
+                return None
+
+        local_path = Path(path)
+        if not local_path.is_absolute():
+            local_path = self._backend_root / local_path
+        if not local_path.exists():
+            return None
+        try:
+            return local_path.read_bytes()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_json_load(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            return text
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int = 5000) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n... [truncated]"
+
+    def list_diagnostics_reports(self, limit: int = 300) -> List[Dict[str, Any]]:
+        """List diagnostics reports across all tenant DBs."""
+        tenants = list(
+            self.master["tenants"].find(
+                {"db_name": {"$exists": True, "$ne": None}},
+                {
+                    "db_name": 1,
+                    "tenant_id": 1,
+                    "institution_name": 1,
+                    "organization": 1,
+                },
+            )
+        )
+
+        rows: List[Dict[str, Any]] = []
+        for tenant in tenants:
+            db_name = tenant.get("db_name")
+            if not db_name:
+                continue
+            tenant_id = tenant.get("tenant_id")
+            tenant_name = tenant.get("institution_name") or tenant.get("organization") or ""
+            try:
+                docs = list(
+                    self.client[db_name]["desktop_diagnostics"]
+                    .find(
+                        {},
+                        {
+                            "ticket_id": 1,
+                            "package_id": 1,
+                            "user_id": 1,
+                            "username": 1,
+                            "uploaded_at": 1,
+                            "size_bytes": 1,
+                            "app_version": 1,
+                            "pen_mac": 1,
+                            "storage_path": 1,
+                        },
+                    )
+                    .sort("uploaded_at", -1)
+                    .limit(200)
+                )
+            except Exception:
+                continue
+
+            for doc in docs:
+                rows.append(
+                    {
+                        "_id": str(doc.get("_id")),
+                        "db_name": db_name,
+                        "tenant_id": tenant_id,
+                        "tenant_name": tenant_name,
+                        "ticket_id": doc.get("ticket_id", ""),
+                        "package_id": doc.get("package_id", ""),
+                        "user_id": doc.get("user_id", ""),
+                        "username": doc.get("username", ""),
+                        "uploaded_at": doc.get("uploaded_at"),
+                        "size_bytes": int(doc.get("size_bytes", 0) or 0),
+                        "app_version": doc.get("app_version", ""),
+                        "pen_mac": doc.get("pen_mac", ""),
+                        "storage_path": doc.get("storage_path", ""),
+                    }
+                )
+
+        rows.sort(key=lambda r: r.get("uploaded_at") or datetime.min, reverse=True)
+        return rows[: max(1, int(limit))]
+
+    def get_diagnostics_report_details(self, report_id: str, db_name: str) -> Dict[str, Any]:
+        """Fetch report metadata and inspect ZIP contents in-memory only."""
+        tenant_db = self.client[db_name]
+        doc = tenant_db["desktop_diagnostics"].find_one({"_id": ObjectId(report_id)})
+        if not doc:
+            raise ValueError("Diagnostics report not found")
+
+        storage_path = doc.get("storage_path", "")
+        raw = self._download_storage_bytes(storage_path)
+        if not raw:
+            raise ValueError("Unable to load diagnostics archive from storage path")
+
+        detail: Dict[str, Any] = {
+            "ticket_id": doc.get("ticket_id", ""),
+            "package_id": doc.get("package_id", ""),
+            "db_name": db_name,
+            "tenant_user": doc.get("user_id", ""),
+            "username": doc.get("username", ""),
+            "uploaded_at": doc.get("uploaded_at"),
+            "size_bytes": int(doc.get("size_bytes", 0) or 0),
+            "storage_path": storage_path,
+            "zip_size_bytes": len(raw),
+            "entries": [],
+            "manifest": {},
+            "system": {},
+            "runtime_state": {},
+            "errors_summary": {},
+            "user_note": {},
+        }
+
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            names = sorted(zf.namelist())
+            detail["entries"] = names
+
+            def _read_json(name: str) -> Any:
+                if name not in names:
+                    return {}
+                text = zf.read(name).decode("utf-8", errors="ignore")
+                return self._safe_json_load(text)
+
+            detail["manifest"] = _read_json("manifest.json")
+            detail["system"] = _read_json("system.json")
+            detail["runtime_state"] = _read_json("runtime_state.json")
+            detail["errors_summary"] = _read_json("errors_summary.json")
+            detail["user_note"] = _read_json("user_note.json")
+
+            # Keep console trace compact for TUI readability.
+            trace = _read_json("console_trace.json")
+            if isinstance(trace, list):
+                detail["console_trace_tail"] = trace[-40:]
+            else:
+                detail["console_trace_tail"] = trace
+
+        pretty = []
+        pretty.append(f"Ticket: {detail['ticket_id']}")
+        pretty.append(f"Package: {detail['package_id']}")
+        pretty.append(f"DB: {detail['db_name']}")
+        pretty.append(f"User: {detail['tenant_user']} ({detail['username']})")
+        pretty.append(f"Uploaded At: {detail['uploaded_at']}")
+        pretty.append(f"Reported Size: {detail['size_bytes']} bytes")
+        pretty.append(f"Archive Size: {detail['zip_size_bytes']} bytes")
+        pretty.append(f"Storage: {detail['storage_path']}")
+        pretty.append("")
+        pretty.append(f"Archive Entries ({len(detail['entries'])}):")
+        for name in detail["entries"]:
+            pretty.append(f"  - {name}")
+        pretty.append("")
+        pretty.append("User Note:")
+        pretty.append(self._truncate_text(json.dumps(detail.get("user_note", {}), indent=2, default=str), 1500))
+        pretty.append("")
+        pretty.append("Manifest:")
+        pretty.append(self._truncate_text(json.dumps(detail.get("manifest", {}), indent=2, default=str), 3000))
+        pretty.append("")
+        pretty.append("System:")
+        pretty.append(self._truncate_text(json.dumps(detail.get("system", {}), indent=2, default=str), 3000))
+        pretty.append("")
+        pretty.append("Runtime State:")
+        pretty.append(self._truncate_text(json.dumps(detail.get("runtime_state", {}), indent=2, default=str), 5000))
+        pretty.append("")
+        pretty.append("Errors Summary:")
+        pretty.append(self._truncate_text(json.dumps(detail.get("errors_summary", {}), indent=2, default=str), 5000))
+        pretty.append("")
+        pretty.append("Console Trace (tail):")
+        pretty.append(self._truncate_text(json.dumps(detail.get("console_trace_tail", {}), indent=2, default=str), 5000))
+
+        detail["pretty_text"] = "\n".join(pretty)
+        return detail
