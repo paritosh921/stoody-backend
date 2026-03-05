@@ -238,7 +238,7 @@ DataTable {
 }
 
 #diag-table {
-    height: 1fr;
+    height: 11;
 }
 
 #diag-status-bar {
@@ -248,12 +248,21 @@ DataTable {
     padding: 0 1;
 }
 
+#diag-actions {
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#diag-copy {
+    height: auto;
+}
+
 #diag-details {
     height: auto;
 }
 
 #diag-details-pane {
-    height: 16;
+    height: 1fr;
     border: solid $accent;
     padding: 1;
     overflow-y: auto;

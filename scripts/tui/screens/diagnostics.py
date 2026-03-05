@@ -7,15 +7,16 @@ from datetime import datetime
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import Button, DataTable, Footer, Header, Static
 
 
 class DiagnosticsScreen(Screen):
     BINDINGS = [
         ("r", "refresh", "Refresh"),
         ("enter", "inspect_selected", "Inspect"),
+        ("c", "copy_details", "Copy Full Log"),
         ("j", "details_down", "Details Down"),
         ("k", "details_up", "Details Up"),
         ("pagedown", "details_page_down", "Details PgDn"),
@@ -33,6 +34,8 @@ class DiagnosticsScreen(Screen):
                 " Select row + Enter to inspect. Scroll details with mouse wheel or j/k/PgUp/PgDn/Home/End.",
                 id="diag-status-bar",
             )
+            with Horizontal(id="diag-actions"):
+                yield Button("Copy Full Log", id="diag-copy", variant="primary")
             with VerticalScroll(id="diag-details-pane"):
                 yield Static("", id="diag-details")
         yield Footer()
@@ -53,6 +56,7 @@ class DiagnosticsScreen(Screen):
         self._rows: list[dict] = []
         self._detail_cache: dict[str, str] = {}
         self._loading_key: str | None = None
+        self._current_detail_text: str = ""
         self.load_data()
 
     def _set_status(self, message: str) -> None:
@@ -60,12 +64,32 @@ class DiagnosticsScreen(Screen):
 
     def _set_details(self, text: str) -> None:
         # Render raw diagnostic text as plain text (no Rich markup parsing).
+        self._current_detail_text = text
         self.query_one("#diag-details", Static).update(Text(text))
         # Always jump to top when new details are loaded.
         try:
             self.query_one("#diag-details-pane", VerticalScroll).scroll_home(animate=False)
         except Exception:
             pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "diag-copy":
+            self.action_copy_details()
+
+    def action_copy_details(self) -> None:
+        text = (self._current_detail_text or "").strip()
+        if not text:
+            self._set_status("No log details loaded to copy.")
+            return
+        copy_fn = getattr(self.app, "copy_to_clipboard", None)
+        if not callable(copy_fn):
+            self._set_status("Clipboard copy not supported in this terminal.")
+            return
+        try:
+            copy_fn(text)
+            self._set_status(f"Copied full log text ({len(text)} chars) to clipboard.")
+        except Exception as exc:
+            self._set_status(f"Copy failed: {exc}")
 
     def _scroll_details(self, amount: int) -> None:
         try:
