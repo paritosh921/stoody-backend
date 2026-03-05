@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -47,6 +48,10 @@ class DiagnosticsScreen(Screen):
     def _set_status(self, message: str) -> None:
         self.query_one("#diag-status-bar", Static).update(f" {message}")
 
+    def _set_details(self, text: str) -> None:
+        # Render raw diagnostic text as plain text (no Rich markup parsing).
+        self.query_one("#diag-details", Static).update(Text(text))
+
     def action_refresh(self) -> None:
         self.load_data()
 
@@ -82,7 +87,7 @@ class DiagnosticsScreen(Screen):
             self.action_inspect_selected()
         else:
             self._set_status("No diagnostics reports found.")
-            self.query_one("#diag-details", Static).update(" No diagnostics reports available.")
+            self._set_details(" No diagnostics reports available.")
 
     def _selected_row(self) -> dict | None:
         table = self.query_one("#diag-table", DataTable)
@@ -99,13 +104,13 @@ class DiagnosticsScreen(Screen):
             return
         key = f"{row.get('db_name')}::{row.get('_id')}"
         if key in self._detail_cache:
-            self.query_one("#diag-details", Static).update(self._detail_cache[key])
+            self._set_details(self._detail_cache[key])
             self._set_status(f"Showing cached details for {row.get('ticket_id', '')}.")
             return
         if self._loading_key == key:
             return
         self._loading_key = key
-        self.query_one("#diag-details", Static).update(" Loading report details...")
+        self._set_details(" Loading report details...")
         self._set_status(f"Inspecting {row.get('ticket_id', '')} ...")
         self._load_details(row)
 
@@ -128,5 +133,5 @@ class DiagnosticsScreen(Screen):
     def _apply_details(self, key: str, text: str, status: str) -> None:
         self._loading_key = None
         self._detail_cache[key] = text
-        self.query_one("#diag-details", Static).update(text)
+        self._set_details(text)
         self._set_status(status)
