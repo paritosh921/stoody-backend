@@ -249,6 +249,10 @@ DataTable {
 }
 
 #diag-details {
+    height: auto;
+}
+
+#diag-details-pane {
     height: 16;
     border: solid $accent;
     padding: 1;

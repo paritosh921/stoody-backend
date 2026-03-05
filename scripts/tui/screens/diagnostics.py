@@ -7,7 +7,7 @@ from datetime import datetime
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
@@ -16,6 +16,12 @@ class DiagnosticsScreen(Screen):
     BINDINGS = [
         ("r", "refresh", "Refresh"),
         ("enter", "inspect_selected", "Inspect"),
+        ("j", "details_down", "Details Down"),
+        ("k", "details_up", "Details Up"),
+        ("pagedown", "details_page_down", "Details PgDn"),
+        ("pageup", "details_page_up", "Details PgUp"),
+        ("home", "details_home", "Details Top"),
+        ("end", "details_end", "Details End"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -23,8 +29,12 @@ class DiagnosticsScreen(Screen):
         with Vertical(id="diagnostics-container"):
             yield Static(" Desktop Diagnostics ", classes="screen-title")
             yield DataTable(id="diag-table")
-            yield Static(" Select a row and press Enter to inspect archive details.", id="diag-status-bar")
-            yield Static("", id="diag-details")
+            yield Static(
+                " Select row + Enter to inspect. Scroll details with mouse wheel or j/k/PgUp/PgDn/Home/End.",
+                id="diag-status-bar",
+            )
+            with VerticalScroll(id="diag-details-pane"):
+                yield Static("", id="diag-details")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -51,6 +61,42 @@ class DiagnosticsScreen(Screen):
     def _set_details(self, text: str) -> None:
         # Render raw diagnostic text as plain text (no Rich markup parsing).
         self.query_one("#diag-details", Static).update(Text(text))
+        # Always jump to top when new details are loaded.
+        try:
+            self.query_one("#diag-details-pane", VerticalScroll).scroll_home(animate=False)
+        except Exception:
+            pass
+
+    def _scroll_details(self, amount: int) -> None:
+        try:
+            pane = self.query_one("#diag-details-pane", VerticalScroll)
+            pane.scroll_relative(y=amount, animate=False)
+        except Exception:
+            pass
+
+    def action_details_down(self) -> None:
+        self._scroll_details(3)
+
+    def action_details_up(self) -> None:
+        self._scroll_details(-3)
+
+    def action_details_page_down(self) -> None:
+        self._scroll_details(18)
+
+    def action_details_page_up(self) -> None:
+        self._scroll_details(-18)
+
+    def action_details_home(self) -> None:
+        try:
+            self.query_one("#diag-details-pane", VerticalScroll).scroll_home(animate=False)
+        except Exception:
+            pass
+
+    def action_details_end(self) -> None:
+        try:
+            self.query_one("#diag-details-pane", VerticalScroll).scroll_end(animate=False)
+        except Exception:
+            pass
 
     def action_refresh(self) -> None:
         self.load_data()
