@@ -3,8 +3,6 @@ Desktop diagnostics upload API.
 Accepts diagnostics zip bundles from Stoody desktop agent for support triage.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import re
