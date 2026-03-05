@@ -36,7 +36,7 @@ GROQ_CLASSIFY_MODEL = os.getenv("GROQ_CLASSIFY_MODEL", "llama-3.1-8b-instant")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 VISION_CLASSIFY_MODEL = os.getenv("VISION_CLASSIFY_MODEL", "gpt-4o-mini")
 
-VALID_SUBJECTS = [
+DEFAULT_SUBJECTS = [
     "Physics", "Chemistry", "Mathematics", "Language",
     "History", "Hindi", "Unorganised",
 ]
@@ -159,17 +159,21 @@ async def process_page(
 
     # 5. Classify
     existing_topics = await _get_existing_topics(tenant_db, user_id)
+    # Build allowed subjects: defaults + any user-created ones from DB
+    all_subjects = set(DEFAULT_SUBJECTS)
+    for et in existing_topics:
+        all_subjects.add(et["subject"])
 
     if len(ocr_text.strip()) > 50:
-        result = await _text_classify(ocr_text, existing_topics)
+        result = await _text_classify(ocr_text, existing_topics, all_subjects)
     else:
-        result = await _vision_classify(png_bytes, existing_topics, openai_client)
+        result = await _vision_classify(png_bytes, existing_topics, openai_client, all_subjects)
 
     subject = result.get("subject", "Unorganised")
     topic = result.get("topic", "General")
     confidence = result.get("confidence", 0.5)
 
-    if subject not in VALID_SUBJECTS:
+    if subject not in all_subjects:
         subject = "Unorganised"
 
     # 6. Upsert into note_classifications
@@ -305,7 +309,8 @@ async def _mistral_ocr_image(png_bytes: bytes) -> str:
 # Classification
 # ---------------------------------------------------------------------------
 
-def _build_text_classify_prompt(ocr_text: str, existing_topics: List[Dict[str, str]]) -> str:
+def _build_text_classify_prompt(ocr_text: str, existing_topics: List[Dict[str, str]], all_subjects: set | None = None) -> str:
+    subjects_list = ", ".join(sorted(all_subjects)) if all_subjects else ", ".join(DEFAULT_SUBJECTS)
     topics_ctx = ""
     if existing_topics:
         by_subj: Dict[str, List[str]] = defaultdict(list)
@@ -316,7 +321,7 @@ def _build_text_classify_prompt(ocr_text: str, existing_topics: List[Dict[str, s
             topics_ctx += f"- {s}: {', '.join(ts[:5])}\n"
 
     return f"""Classify this handwritten note content.
-Subjects: Physics, Chemistry, Mathematics, Language, History, Hindi, Unorganised
+Subjects: {subjects_list}
 {topics_ctx}
 Content: {ocr_text[:1000]}
 
@@ -327,9 +332,10 @@ Use "Unorganised" if unclear."""
 async def _text_classify(
     ocr_text: str,
     existing_topics: List[Dict[str, str]],
+    all_subjects: set | None = None,
 ) -> Dict[str, Any]:
     """Classify text-heavy page via Groq (primary) or OpenAI (fallback)."""
-    prompt = _build_text_classify_prompt(ocr_text, existing_topics)
+    prompt = _build_text_classify_prompt(ocr_text, existing_topics, all_subjects)
 
     # Try Groq first
     if GROQ_API_KEY:
@@ -369,11 +375,13 @@ async def _vision_classify(
     png_bytes: bytes,
     existing_topics: List[Dict[str, str]],
     openai_client: Optional[AsyncOpenAI] = None,
+    all_subjects: set | None = None,
 ) -> Dict[str, Any]:
     """Classify diagram/equation-heavy page via GPT-4o-mini Vision."""
     if not OPENAI_API_KEY and not openai_client:
         return {"subject": "Unorganised", "topic": "General", "confidence": 0.3}
 
+    subjects_list = ", ".join(sorted(all_subjects)) if all_subjects else ", ".join(DEFAULT_SUBJECTS)
     b64 = base64.b64encode(png_bytes).decode()
     data_url = f"data:image/png;base64,{b64}"
 
@@ -387,7 +395,7 @@ async def _vision_classify(
             topics_ctx += f"- {s}: {', '.join(ts[:5])}\n"
 
     prompt = f"""Classify this handwritten note page (may contain diagrams, equations, or drawings).
-Subjects: Physics, Chemistry, Mathematics, Language, History, Hindi, Unorganised
+Subjects: {subjects_list}
 {topics_ctx}
 Respond JSON only: {{"subject": "...", "topic": "2-4 word topic name", "confidence": 0.0-1.0}}
 Use "Unorganised" if unclear."""
@@ -425,8 +433,6 @@ def _parse_classification_json(text: str) -> Dict[str, Any]:
         subject = data.get("subject", "Unorganised")
         topic = data.get("topic", "General")
         confidence = float(data.get("confidence", 0.5))
-        if subject not in VALID_SUBJECTS:
-            subject = "Unorganised"
         return {"subject": subject, "topic": topic[:50], "confidence": min(max(confidence, 0), 1)}
     except (json.JSONDecodeError, ValueError):
         logger.warning(f"Failed to parse classification JSON: {text[:200]}")

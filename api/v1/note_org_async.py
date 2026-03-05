@@ -320,9 +320,8 @@ async def reclassify_page(
 
     user_id = _get_user_id(current_user)
 
-    from services.note_classification_service import VALID_SUBJECTS
-    if body.subject not in VALID_SUBJECTS:
-        raise HTTPException(status_code=400, detail=f"Invalid subject. Must be one of: {VALID_SUBJECTS}")
+    if not body.subject.strip() or not body.topic.strip():
+        raise HTTPException(status_code=400, detail="Subject and topic must not be empty")
 
     doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
     if not doc or doc.get("user_id") != user_id:
@@ -366,9 +365,8 @@ async def batch_reclassify(
 
     user_id = _get_user_id(current_user)
 
-    from services.note_classification_service import VALID_SUBJECTS
-    if body.subject not in VALID_SUBJECTS:
-        raise HTTPException(status_code=400, detail=f"Invalid subject")
+    if not body.subject.strip() or not body.topic.strip():
+        raise HTTPException(status_code=400, detail="Subject and topic must not be empty")
 
     ids = [ObjectId(cid) for cid in body.classification_ids]
     now = datetime.utcnow()
@@ -699,8 +697,187 @@ async def backfill_classifications(
 
 
 # ---------------------------------------------------------------------------
+# GET /pages/all
+# ---------------------------------------------------------------------------
+
+@router.get("/pages/all")
+async def get_all_pages(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Get all classified pages across all subjects, sorted by updated_at DESC."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    cursor = tenant_db["note_classifications"].find(
+        {"user_id": user_id},
+        {
+            "pen_mac": 1, "book_type": 1, "page_number": 1,
+            "thumbnail_url": 1, "confidence": 1,
+            "classification_source": 1, "ocr_text": 1,
+            "subject": 1, "topic": 1,
+            "created_at": 1, "updated_at": 1,
+            "session_id": 1, "first_activity": 1, "last_activity": 1,
+        },
+    ).sort("updated_at", -1)
+
+    pages = []
+    async for doc in cursor:
+        pages.append(_doc_to_page(doc, include_subject_topic=True))
+
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+
+    return {"success": True, "pages": pages}
+
+
+# ---------------------------------------------------------------------------
+# GET /search
+# ---------------------------------------------------------------------------
+
+@router.get("/search")
+async def search_notes(
+    q: str = Query(..., min_length=1, max_length=200),
+    scope: str = Query("all", pattern="^(subject|topic|text|all)$"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Search notes by subject, topic, OCR text, or all fields."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    import re as _re
+    safe_q = _re.escape(q)
+    regex = {"$regex": safe_q, "$options": "i"}
+
+    base_match: Dict[str, Any] = {"user_id": user_id}
+
+    if scope == "subject":
+        base_match["subject"] = regex
+    elif scope == "topic":
+        base_match["topic"] = regex
+    elif scope == "text":
+        base_match["ocr_text"] = regex
+    else:  # all
+        base_match["$or"] = [
+            {"subject": regex},
+            {"topic": regex},
+            {"ocr_text": regex},
+        ]
+
+    cursor = tenant_db["note_classifications"].find(
+        base_match,
+        {
+            "pen_mac": 1, "book_type": 1, "page_number": 1,
+            "thumbnail_url": 1, "confidence": 1,
+            "classification_source": 1, "ocr_text": 1,
+            "subject": 1, "topic": 1,
+            "created_at": 1, "updated_at": 1,
+            "session_id": 1, "first_activity": 1, "last_activity": 1,
+        },
+    ).sort("updated_at", -1).limit(200)
+
+    pages = []
+    async for doc in cursor:
+        pages.append(_doc_to_page(doc, include_subject_topic=True))
+
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+
+    return {"success": True, "query": q, "scope": scope, "pages": pages}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /pages/{classification_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/pages/{classification_id}")
+async def delete_page(
+    classification_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Delete a note page: classification doc, S3 thumbnail, and strokes."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
+    if not doc or doc.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Classification not found")
+
+    pen_mac = doc.get("pen_mac", "")
+    book_type = doc.get("book_type", "A5")
+    page_number = doc.get("page_number")
+    thumbnail_url = doc.get("thumbnail_url")
+
+    # 1. Delete S3 thumbnail
+    if thumbnail_url:
+        try:
+            from utils.s3_storage import delete_file
+            await delete_file(thumbnail_url)
+        except Exception as e:
+            logger.warning(f"Failed to delete S3 thumbnail {thumbnail_url}: {e}")
+
+    # 2. Delete strokes for this page
+    from services.note_classification_service import _build_user_id_match
+    user_match = _build_user_id_match(user_id)
+    stroke_result = await tenant_db["strokes"].delete_many({
+        "user_id": user_match,
+        "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
+        "book_type": book_type,
+        "page_number": page_number,
+    })
+
+    # 3. Delete classification queue entry if exists
+    await tenant_db["classification_queue"].delete_many({
+        "user_id": user_id,
+        "pen_mac": pen_mac.upper(),
+        "book_type": book_type,
+        "page_number": page_number,
+    })
+
+    # 4. Delete the classification doc itself
+    await tenant_db["note_classifications"].delete_one({"_id": ObjectId(classification_id)})
+
+    return {
+        "success": True,
+        "deleted_strokes": stroke_result.deleted_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Dict[str, Any]:
+    """Convert a MongoDB note_classifications document to a page dict."""
+    page: Dict[str, Any] = {
+        "id": str(doc["_id"]),
+        "pen_mac": doc.get("pen_mac"),
+        "book_type": doc.get("book_type"),
+        "page_number": doc.get("page_number"),
+        "thumbnail_url": doc.get("thumbnail_url"),
+        "confidence": doc.get("confidence"),
+        "classification_source": doc.get("classification_source"),
+        "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
+        "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at"),
+        "session_id": doc.get("session_id"),
+        "first_activity": doc.get("first_activity"),
+        "last_activity": doc.get("last_activity"),
+    }
+    if include_subject_topic:
+        page["subject"] = doc.get("subject")
+        page["topic"] = doc.get("topic")
+    return page
+
 
 def _get_user_id(current_user: Dict[str, Any]) -> str:
     uid = current_user.get("user_id") or current_user.get("_id")
