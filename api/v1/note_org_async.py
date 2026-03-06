@@ -39,6 +39,15 @@ class BatchReclassifyRequest(BaseModel):
     topic: str
 
 
+class ArchiveRequest(BaseModel):
+    archived: bool = True
+
+
+class BatchArchiveRequest(BaseModel):
+    classification_ids: List[str]
+    archived: bool = True
+
+
 class GenerateRequest(BaseModel):
     force: bool = False  # Force regeneration even if cached
 
@@ -66,7 +75,7 @@ async def get_subjects(
         user_id = str(user_id)
 
     pipeline = [
-        {"$match": {"user_id": user_id}},
+        {"$match": {"user_id": user_id, "is_archived": {"$ne": True}}},
         {"$group": {
             "_id": "$subject",
             "topic_count": {"$addToSet": "$topic"},
@@ -105,7 +114,7 @@ async def get_topics(
     user_id = _get_user_id(current_user)
 
     pipeline = [
-        {"$match": {"user_id": user_id, "subject": subject}},
+        {"$match": {"user_id": user_id, "subject": subject, "is_archived": {"$ne": True}}},
         {"$group": {
             "_id": "$topic",
             "page_count": {"$sum": 1},
@@ -177,7 +186,7 @@ async def get_subject_pages(
     user_id = _get_user_id(current_user)
 
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject},
+        {"user_id": user_id, "subject": subject, "is_archived": {"$ne": True}},
     ).sort("updated_at", -1)
 
     pages = []
@@ -211,7 +220,7 @@ async def get_topic_pages(
     user_id = _get_user_id(current_user)
 
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject, "topic": topic},
+        {"user_id": user_id, "subject": subject, "topic": topic, "is_archived": {"$ne": True}},
     ).sort("page_number", 1)
 
     pages = []
@@ -662,6 +671,7 @@ async def backfill_classifications(
 @router.get("/pages/all")
 async def get_all_pages(
     favorites_only: bool = Query(False),
+    archived_only: bool = Query(False),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -673,6 +683,7 @@ async def get_all_pages(
     user_id = _get_user_id(current_user)
 
     query: Dict[str, Any] = {"user_id": user_id}
+    query["is_archived"] = True if archived_only else {"$ne": True}
     if favorites_only:
         query["is_favorite"] = True
 
@@ -683,6 +694,7 @@ async def get_all_pages(
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
             "subject": 1, "topic": 1, "is_favorite": 1,
+            "is_archived": 1,
             "created_at": 1, "updated_at": 1,
             "session_id": 1, "first_activity": 1, "last_activity": 1,
         },
@@ -720,6 +732,7 @@ async def search_notes(
     regex = {"$regex": safe_q, "$options": "i"}
 
     base_match: Dict[str, Any] = {"user_id": user_id}
+    base_match["is_archived"] = {"$ne": True}
 
     if scope == "subject":
         base_match["subject"] = regex
@@ -741,6 +754,7 @@ async def search_notes(
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
             "subject": 1, "topic": 1,
+            "is_archived": 1,
             "created_at": 1, "updated_at": 1,
             "session_id": 1, "first_activity": 1, "last_activity": 1,
         },
@@ -783,6 +797,54 @@ async def toggle_favorite(
     )
 
     return {"success": True, "is_favorite": new_value}
+
+
+@router.patch("/pages/{classification_id}/archive")
+async def set_archive_status(
+    classification_id: str,
+    body: ArchiveRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Archive or unarchive a note page."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+
+    doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
+    if not doc or doc.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Classification not found")
+
+    await tenant_db["note_classifications"].update_one(
+        {"_id": ObjectId(classification_id)},
+        {"$set": {"is_archived": body.archived, "updated_at": datetime.utcnow()}},
+    )
+
+    return {"success": True, "is_archived": body.archived}
+
+
+@router.patch("/pages/batch-archive")
+async def batch_archive(
+    body: BatchArchiveRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Archive or unarchive multiple pages at once."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+    ids = [ObjectId(cid) for cid in body.classification_ids]
+
+    result = await tenant_db["note_classifications"].update_many(
+        {"_id": {"$in": ids}, "user_id": user_id},
+        {"$set": {"is_archived": body.archived, "updated_at": datetime.utcnow()}},
+    )
+
+    return {"success": True, "modified_count": result.modified_count, "is_archived": body.archived}
 
 
 @router.delete("/pages/{classification_id}")
@@ -863,6 +925,7 @@ def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Di
         "first_activity": doc.get("first_activity"),
         "last_activity": doc.get("last_activity"),
         "is_favorite": doc.get("is_favorite", False),
+        "is_archived": doc.get("is_archived", False),
     }
     if include_subject_topic:
         page["subject"] = doc.get("subject")

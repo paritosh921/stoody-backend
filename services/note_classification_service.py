@@ -16,7 +16,7 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
@@ -501,7 +501,7 @@ async def _save_classification(
     last_activity: Optional[Any] = None,
 ):
     """Upsert into note_classifications."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     update_doc: Dict[str, Any] = {
         "$set": {
             "subject": subject,
