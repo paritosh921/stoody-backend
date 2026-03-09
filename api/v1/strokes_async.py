@@ -351,19 +351,10 @@ async def _upsert_notes_canvas_classification(
     if page.source != "notes_canvas":
         return
 
-    pen_mac = (page.pen_mac or "").upper()
-    if not pen_mac:
-        logger.warning(
-            "Skipping notes_canvas classification upsert for user=%s book_type=%s page=%s because pen_mac is missing",
-            user_id,
-            page.book_type,
-            page.page_number,
-        )
-        return
+    pen_mac = (page.pen_mac or "").upper() or None
 
     page_key = {
         "user_id": user_id,
-        "pen_mac": pen_mac,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
@@ -385,6 +376,7 @@ async def _upsert_notes_canvas_classification(
                 "original_topic": None,
             },
             "$set": {
+                "pen_mac": pen_mac,
                 "stroke_count_at_classification": stroke_count,
                 "updated_at": now,
                 "last_activity": now,
