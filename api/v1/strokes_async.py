@@ -262,6 +262,9 @@ class CanvasPageUpsert(BaseModel):
     source: Optional[str] = None
     client_last_modified: Optional[float] = None
     version: Optional[int] = None
+    session_id: Optional[str] = None
+    first_activity: Optional[float] = None
+    last_activity: Optional[float] = None
 
     @field_validator("stroke_count", mode="before")
     @classmethod
@@ -324,7 +327,7 @@ async def _get_canvas_collection(
 
 def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now: datetime) -> Dict[str, Any]:
     """Build the MongoDB document for a canvas page upsert."""
-    return {
+    doc: Dict[str, Any] = {
         "user_id": user_id,
         "admin_id": admin_id,
         "book_type": page.book_type.upper(),
@@ -339,6 +342,13 @@ def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now
         "client_last_modified": page.client_last_modified,
         "version": (page.version or 0) + 1,
     }
+    if page.session_id:
+        doc["session_id"] = page.session_id
+    if page.first_activity is not None:
+        doc["first_activity"] = page.first_activity
+    if page.last_activity is not None:
+        doc["last_activity"] = page.last_activity
+    return doc
 
 
 async def _upsert_notes_canvas_classification(
@@ -359,28 +369,36 @@ async def _upsert_notes_canvas_classification(
         "page_number": page.page_number,
     }
     stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
+    set_fields: Dict[str, Any] = {
+        "pen_mac": pen_mac,
+        "stroke_count_at_classification": stroke_count,
+        "updated_at": now,
+        "last_activity": page.last_activity if page.last_activity is not None else now,
+    }
+    if page.session_id:
+        set_fields["session_id"] = page.session_id
+    if page.first_activity is not None:
+        set_fields["first_activity"] = page.first_activity
+
+    set_on_insert: Dict[str, Any] = {
+        "subject": "Unorganised",
+        "topic": "General",
+        "classification_source": "system",
+        "confidence": 0.0,
+        "ocr_text": "",
+        "thumbnail_url": None,
+        "is_favorite": False,
+        "is_archived": False,
+        "created_at": now,
+        "original_subject": None,
+        "original_topic": None,
+    }
+
     await classification_collection.update_one(
         page_key,
         {
-            "$setOnInsert": {
-                "subject": "Unorganised",
-                "topic": "General",
-                "classification_source": "system",
-                "confidence": 0.0,
-                "ocr_text": "",
-                "thumbnail_url": None,
-                "is_favorite": False,
-                "is_archived": False,
-                "created_at": now,
-                "original_subject": None,
-                "original_topic": None,
-            },
-            "$set": {
-                "pen_mac": pen_mac,
-                "stroke_count_at_classification": stroke_count,
-                "updated_at": now,
-                "last_activity": now,
-            },
+            "$setOnInsert": set_on_insert,
+            "$set": set_fields,
         },
         upsert=True,
     )
@@ -509,14 +527,21 @@ async def list_canvas_pages(
 
     pages = []
     for d in docs:
-        pages.append({
+        page_meta: Dict[str, Any] = {
             "book_type": d.get("book_type"),
             "page_number": d.get("page_number"),
             "stroke_count": d.get("stroke_count", 0),
             "last_modified": d.get("last_modified", "").isoformat() if d.get("last_modified") else None,
             "client_last_modified": d.get("client_last_modified"),
             "version": d.get("version", 1),
-        })
+        }
+        if d.get("session_id"):
+            page_meta["session_id"] = d["session_id"]
+        if d.get("first_activity") is not None:
+            page_meta["first_activity"] = d["first_activity"]
+        if d.get("last_activity") is not None:
+            page_meta["last_activity"] = d["last_activity"]
+        pages.append(page_meta)
 
     return {"count": len(pages), "pages": pages}
 
