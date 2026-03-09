@@ -358,9 +358,6 @@ async def _upsert_notes_canvas_classification(
     page: CanvasPageUpsert,
     now: datetime,
 ) -> None:
-    if page.source != "notes_canvas":
-        return
-
     pen_mac = (page.pen_mac or "").upper() or None
 
     page_key = {
@@ -464,7 +461,6 @@ async def batch_upsert_canvas_pages(
 
     now = datetime.now(timezone.utc)
     ops = []
-    notes_canvas_pages: List[CanvasPageUpsert] = []
     for page in body.pages:
         filt = {
             "user_id": user_id,
@@ -473,12 +469,10 @@ async def batch_upsert_canvas_pages(
         }
         doc = _page_doc(user_id, admin_id, page, now)
         ops.append(ReplaceOne(filt, doc, upsert=True))
-        if page.source == "notes_canvas":
-            notes_canvas_pages.append(page)
 
     if ops:
         result = await collection.bulk_write(ops, ordered=False)
-        for page in notes_canvas_pages:
+        for page in body.pages:
             await _upsert_notes_canvas_classification(
                 classification_collection,
                 user_id=user_id,
