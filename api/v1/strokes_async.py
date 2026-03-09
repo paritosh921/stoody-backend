@@ -243,6 +243,12 @@ class CanvasPageStroke(BaseModel):
     tool: str = "pen"
     timestamp: Optional[float] = None
     svgPath: Optional[str] = None
+    baseWidthMm: Optional[float] = None
+    sourceMode: Optional[str] = None
+    startedAt: Optional[float] = None
+    endedAt: Optional[float] = None
+    pageNumber: Optional[int] = None
+    bookType: Optional[str] = None
 
 
 class CanvasPageUpsert(BaseModel):
@@ -253,6 +259,7 @@ class CanvasPageUpsert(BaseModel):
     canvas_background: Optional[str] = None
     stroke_count: Optional[int] = None
     pen_mac: Optional[str] = None
+    source: Optional[str] = None
     client_last_modified: Optional[float] = None
     version: Optional[int] = None
 
@@ -327,10 +334,64 @@ def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now
         "canvas_background": page.canvas_background,
         "stroke_count": page.stroke_count,
         "pen_mac": page.pen_mac,
+        "source": page.source,
         "last_modified": now,
         "client_last_modified": page.client_last_modified,
         "version": (page.version or 0) + 1,
     }
+
+
+async def _upsert_notes_canvas_classification(
+    classification_collection,
+    *,
+    user_id: str,
+    page: CanvasPageUpsert,
+    now: datetime,
+) -> None:
+    if page.source != "notes_canvas":
+        return
+
+    pen_mac = (page.pen_mac or "").upper()
+    if not pen_mac:
+        logger.warning(
+            "Skipping notes_canvas classification upsert for user=%s book_type=%s page=%s because pen_mac is missing",
+            user_id,
+            page.book_type,
+            page.page_number,
+        )
+        return
+
+    page_key = {
+        "user_id": user_id,
+        "pen_mac": pen_mac,
+        "book_type": page.book_type.upper(),
+        "page_number": page.page_number,
+    }
+    stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
+    await classification_collection.update_one(
+        page_key,
+        {
+            "$setOnInsert": {
+                "subject": "Unorganised",
+                "topic": "General",
+                "classification_source": "system",
+                "confidence": 0.0,
+                "ocr_text": "",
+                "thumbnail_url": None,
+                "is_favorite": False,
+                "is_archived": False,
+                "created_at": now,
+                "original_subject": None,
+                "original_topic": None,
+            },
+            "$set": {
+                "stroke_count_at_classification": stroke_count,
+                "updated_at": now,
+                "last_activity": now,
+            },
+        },
+        upsert=True,
+    )
 
 
 @router.put("/pages")
@@ -343,6 +404,7 @@ async def upsert_canvas_page(
     user_id = current_user["user_id"]
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
+    classification_collection = collection.database["note_classifications"]
 
     now = datetime.now(timezone.utc)
     filt = {
@@ -364,6 +426,13 @@ async def upsert_canvas_page(
             detail="Version conflict — page was modified by another session",
         )
 
+    await _upsert_notes_canvas_classification(
+        classification_collection,
+        user_id=user_id,
+        page=page,
+        now=now,
+    )
+
     return {
         "success": True,
         "version": doc["version"],
@@ -381,9 +450,11 @@ async def batch_upsert_canvas_pages(
     user_id = current_user["user_id"]
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
+    classification_collection = collection.database["note_classifications"]
 
     now = datetime.now(timezone.utc)
     ops = []
+    notes_canvas_pages: List[CanvasPageUpsert] = []
     for page in body.pages:
         filt = {
             "user_id": user_id,
@@ -392,9 +463,18 @@ async def batch_upsert_canvas_pages(
         }
         doc = _page_doc(user_id, admin_id, page, now)
         ops.append(ReplaceOne(filt, doc, upsert=True))
+        if page.source == "notes_canvas":
+            notes_canvas_pages.append(page)
 
     if ops:
         result = await collection.bulk_write(ops, ordered=False)
+        for page in notes_canvas_pages:
+            await _upsert_notes_canvas_classification(
+                classification_collection,
+                user_id=user_id,
+                page=page,
+                now=now,
+            )
         return {
             "success": True,
             "upserted": result.upserted_count,

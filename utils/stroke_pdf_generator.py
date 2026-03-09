@@ -10,7 +10,8 @@ Stroke Format (from BLE Agent):
   - points: List of {x, y, pressure} or [[x, y, pressure], ...]
   - svgPath: Pre-rendered SVG path string (V2 format from agent)
   - color: Stroke color (hex or named)
-  - strokeWidth: Width of the stroke
+  - strokeWidth: Width of the stroke in legacy canvas pixels
+  - baseWidthMm: Optional canonical base width in page millimeters
 
 Canvas Dimensions (from StoodyPenCanvas):
 - A5: 592 x 840
@@ -52,6 +53,7 @@ BOOK_DIMENSIONS_MM = {
 }
 
 PIXELS_PER_MM = 4
+DEFAULT_BASE_WIDTH_MM = 0.325
 
 BOOK_DIMENSIONS = {
     key: (round(width_mm * PIXELS_PER_MM), round(height_mm * PIXELS_PER_MM))
@@ -231,8 +233,14 @@ def build_svg_from_strokes(
         for stroke in strokes:
             # Get stroke styling
             color = stroke.get('color', DEFAULT_STROKE_COLOR)
-            stroke_width = stroke.get('strokeWidth', DEFAULT_STROKE_WIDTH)
-            
+            stroke_width = stroke.get('strokeWidth')
+            if stroke_width is None:
+                base_width_mm = stroke.get('baseWidthMm')
+                if isinstance(base_width_mm, (int, float)):
+                    stroke_width = float(base_width_mm) * PIXELS_PER_MM
+                else:
+                    stroke_width = DEFAULT_BASE_WIDTH_MM * PIXELS_PER_MM
+
             # Scale stroke width proportionally
             # For large coordinate spaces, we need thicker strokes
             scale_factor = max(view_width, view_height) / 800
