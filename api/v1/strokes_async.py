@@ -848,7 +848,23 @@ async def list_canvas_pages(
     )
     sliced = pages[offset: offset + limit]
 
-    return {"count": len(sliced), "pages": sliced}
+    # Temporary debug info — inspect via browser network tab on GET /strokes/pages
+    debug: Dict[str, Any] = {
+        "resolved_user_ids": [str(u) for u in user_ids],
+        "canvas_pages_found": len(docs),
+        "legacy_strokes_col_available": strokes_col is not None,
+    }
+    if strokes_col is not None:
+        try:
+            debug["strokes_total_docs"] = await strokes_col.count_documents({})
+            debug["strokes_matched_docs"] = await strokes_col.count_documents({"user_id": {"$in": user_ids}})
+            debug["strokes_distinct_user_ids"] = [
+                str(u) for u in await strokes_col.distinct("user_id")
+            ][:20]
+        except Exception:
+            pass
+
+    return {"count": len(sliced), "pages": sliced, "_debug": debug}
 
 
 @router.get("/pages/{book_type}/{page_number}")
@@ -943,64 +959,5 @@ async def bulk_load_canvas_pages(
     return {"pages": pages}
 
 
-@router.get("/debug-user-ids")
-async def debug_user_ids(
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    db: DatabaseManager = Depends(get_database),
-):
-    """Temporary debug endpoint — shows user_id variants vs what's in DB."""
-    user_ids = _resolve_canvas_user_ids(current_user)
 
-    result: Dict[str, Any] = {
-        "current_user_fields": {
-            "user_id": str(current_user.get("user_id")),
-            "username": current_user.get("username"),
-            "user_type": current_user.get("user_type"),
-            "db_name": current_user.get("db_name"),
-        },
-        "resolved_user_ids": [str(u) for u in user_ids],
-    }
-
-    # Sample strokes collection
-    strokes_col = await _get_legacy_strokes_collection(current_user, db)
-    if strokes_col is not None:
-        total_strokes = await strokes_col.count_documents({})
-        matched_strokes = await strokes_col.count_documents({"user_id": {"$in": user_ids}})
-
-        # Get distinct user_ids in strokes (sample up to 20)
-        distinct_uids = await strokes_col.distinct("user_id")
-        # Get a few sample docs
-        sample_cursor = strokes_col.find({}, {"user_id": 1, "pen_mac": 1, "book_type": 1, "page_number": 1, "_id": 0}).limit(5)
-        samples = await sample_cursor.to_list(length=5)
-
-        result["strokes_collection"] = {
-            "total_docs": total_strokes,
-            "matched_by_user_ids": matched_strokes,
-            "distinct_user_ids_in_collection": [str(u) for u in distinct_uids[:20]],
-            "sample_docs": samples,
-        }
-    else:
-        result["strokes_collection"] = "NOT FOUND"
-
-    # Sample canvas_pages collection
-    try:
-        canvas_col = await _get_canvas_collection(current_user, db)
-        total_canvas = await canvas_col.count_documents({})
-        matched_canvas = await canvas_col.count_documents({"user_id": {"$in": user_ids}})
-
-        distinct_canvas_uids = await canvas_col.distinct("user_id")
-        sample_canvas = await canvas_col.find(
-            {}, {"user_id": 1, "book_type": 1, "page_number": 1, "stroke_count": 1, "_id": 0}
-        ).limit(5).to_list(length=5)
-
-        result["canvas_pages_collection"] = {
-            "total_docs": total_canvas,
-            "matched_by_user_ids": matched_canvas,
-            "distinct_user_ids_in_collection": [str(u) for u in distinct_canvas_uids[:20]],
-            "sample_docs": sample_canvas,
-        }
-    except Exception as exc:
-        result["canvas_pages_collection"] = f"ERROR: {exc}"
-
-    return result
 
