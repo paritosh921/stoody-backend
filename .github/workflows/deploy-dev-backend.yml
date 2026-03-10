@@ -1,0 +1,121 @@
+name: Deploy Dev Backend
+
+on:
+  push:
+    branches:
+      - dev
+      - development
+    paths:
+      - "api/**"
+      - "core/**"
+      - "services/**"
+      - "middleware/**"
+      - "models/**"
+      - "utils/**"
+      - "main_async.py"
+      - "config_async.py"
+      - "requirements.txt"
+      - "ops/remote_deploy_python_service.sh"
+      - ".github/workflows/deploy-dev-backend.yml"
+  workflow_dispatch:
+    inputs:
+      deploy_main_backend:
+        description: "Deploy stoody-backend"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-dev-backend
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEPLOY_BRANCH: ${{ github.ref_name }}
+      DEV_DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.DEV_DEPLOY_SSH_PRIVATE_KEY }}
+      DEV_MAIN_BACKEND_HOST: ${{ vars.DEV_MAIN_BACKEND_HOST }}
+      DEV_MAIN_BACKEND_USER: ${{ vars.DEV_MAIN_BACKEND_USER }}
+      DEV_MAIN_BACKEND_PATH: ${{ vars.DEV_MAIN_BACKEND_PATH }}
+      DEV_MAIN_BACKEND_VENV_PATH: ${{ vars.DEV_MAIN_BACKEND_VENV_PATH }}
+      DEV_MAIN_BACKEND_SERVICE_MANAGER: ${{ vars.DEV_MAIN_BACKEND_SERVICE_MANAGER }}
+      DEV_MAIN_BACKEND_SERVICE_NAME: ${{ vars.DEV_MAIN_BACKEND_SERVICE_NAME }}
+      DEV_MAIN_BACKEND_HEALTHCHECK_URL: ${{ vars.DEV_MAIN_BACKEND_HEALTHCHECK_URL }}
+    steps:
+      - name: Guard branch
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev|development) ;;
+            *)
+              echo "This workflow only deploys the dev environment."
+              exit 1
+              ;;
+          esac
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax-check Python code
+        shell: bash
+        run: python -m compileall .
+
+      - name: Validate backend deploy settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$DEV_DEPLOY_SSH_PRIVATE_KEY" ]]; then
+            echo "Missing required GitHub secret: DEV_DEPLOY_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+
+          required=(
+            "DEV_MAIN_BACKEND_HOST"
+            "DEV_MAIN_BACKEND_USER"
+            "DEV_MAIN_BACKEND_PATH"
+            "DEV_MAIN_BACKEND_SERVICE_MANAGER"
+            "DEV_MAIN_BACKEND_SERVICE_NAME"
+            "DEV_MAIN_BACKEND_HEALTHCHECK_URL"
+          )
+
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub variable: $name"
+              exit 1
+            fi
+          done
+
+      - name: Configure SSH access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEV_DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/dev_deploy_key
+          chmod 600 ~/.ssh/dev_deploy_key
+
+          ssh-keyscan -H "$DEV_MAIN_BACKEND_HOST" > ~/.ssh/known_hosts
+
+      - name: Deploy backend to dev
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scp -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
+            ops/remote_deploy_python_service.sh \
+            "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}:/tmp/remote_deploy_python_service.sh"
+
+          ssh -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
+            "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}" \
+            "chmod +x /tmp/remote_deploy_python_service.sh && bash /tmp/remote_deploy_python_service.sh \
+            '${DEV_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${DEV_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${DEV_MAIN_BACKEND_SERVICE_MANAGER}' '${DEV_MAIN_BACKEND_SERVICE_NAME}' '${DEV_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
