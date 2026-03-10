@@ -237,7 +237,7 @@ async def ingest_strokes(
 
 class CanvasPageStroke(BaseModel):
     id: str
-    points: List[List[float]]
+    points: List[Any]  # Accept both [[x,y,p,...]] arrays and [{x,y,pressure}] dicts
     strokeWidth: float = 1.3
     color: str = "#000000"
     tool: str = "pen"
@@ -249,6 +249,29 @@ class CanvasPageStroke(BaseModel):
     endedAt: Optional[float] = None
     pageNumber: Optional[int] = None
     bookType: Optional[str] = None
+
+    @field_validator("points", mode="before")
+    @classmethod
+    def _normalise_points(cls, v: Any) -> list:
+        """Accept both [{x,y,pressure}] dicts and [[x,y,p]] arrays."""
+        if not isinstance(v, list):
+            return v
+        out = []
+        for pt in v:
+            if isinstance(pt, dict):
+                # Convert {x, y, pressure, ...} → [x, y, pressure, ...]
+                x = pt.get("x", 0)
+                y = pt.get("y", 0)
+                p = pt.get("pressure", 0.5)
+                arr = [x, y, p]
+                # Preserve extra fields if present (tiltX, tiltY, timestamp)
+                for extra in ("tiltX", "tiltY", "timestamp"):
+                    if extra in pt:
+                        arr.append(pt[extra])
+                out.append(arr)
+            else:
+                out.append(pt)
+        return out
 
 
 class CanvasPageUpsert(BaseModel):
@@ -408,6 +431,13 @@ async def _fallback_page_from_strokes(
             if sid in seen_ids:
                 continue
             seen_ids.add(sid)
+            # Normalise points from {x,y,pressure} dicts to [x,y,p] arrays
+            raw_pts = s.get("points", [])
+            if raw_pts and isinstance(raw_pts[0], dict):
+                s["points"] = [
+                    [pt.get("x", 0), pt.get("y", 0), pt.get("pressure", 0.5)]
+                    for pt in raw_pts
+                ]
             merged_strokes.append(s)
 
     now_iso = datetime.now(timezone.utc).isoformat()
