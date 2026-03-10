@@ -639,7 +639,8 @@ async def batch_upsert_canvas_pages(
 async def list_canvas_pages(
     book_type: Optional[str] = Query(None, description="Filter by book type"),
     since: Optional[str] = Query(None, description="ISO datetime — only pages modified after this"),
-    limit: int = Query(2000, ge=1, le=5000),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -664,12 +665,13 @@ async def list_canvas_pages(
     projection = {
         "strokes": 0,  # Exclude the heavy strokes array
     }
+    fetch_window = min(max(limit + offset, limit), 5000)
     cursor = (
         collection.find(query, projection)
         .sort("last_modified", -1)
-        .limit(limit)
+        .limit(fetch_window)
     )
-    docs = await cursor.to_list(length=limit)
+    docs = await cursor.to_list(length=fetch_window)
 
     pages = []
     seen_keys: set = set()
@@ -722,7 +724,7 @@ async def list_canvas_pages(
                     "last_ts": {"$max": "$timestamp"},
                 }},
                 {"$sort": {"last_ts": -1}},
-                {"$limit": limit},
+                {"$limit": fetch_window},
             ]
             stroke_cursor = strokes_col.aggregate(pipeline)
             async for sdoc in stroke_cursor:
@@ -753,7 +755,17 @@ async def list_canvas_pages(
     except Exception as exc:
         logger.warning("Strokes fallback for page list failed: %s", exc)
 
-    return {"count": len(pages), "pages": pages}
+    pages.sort(
+        key=lambda p: (
+            p.get("last_activity")
+            or p.get("client_last_modified")
+            or 0
+        ),
+        reverse=True,
+    )
+    sliced = pages[offset: offset + limit]
+
+    return {"count": len(sliced), "pages": sliced}
 
 
 @router.get("/pages/{book_type}/{page_number}")
