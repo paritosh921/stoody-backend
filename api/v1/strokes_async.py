@@ -765,8 +765,8 @@ async def get_canvas_page(
 ):
     """Load a single canvas page with full strokes.
 
-    Falls back to the legacy `strokes` collection (pen batches) if no
-    canvas_pages document exists for the requested page.
+    Always merges strokes from the legacy `strokes` collection (pen batches)
+    with the `canvas_pages` document so that old pen data is never lost.
     """
     user_id = current_user["user_id"]
     collection = await _get_canvas_collection(current_user, db)
@@ -777,22 +777,48 @@ async def get_canvas_page(
         "page_number": page_number,
     })
 
-    if not doc:
-        # Fallback: reconstruct from pen-batch strokes collection
-        fallback = await _fallback_page_from_strokes(
-            current_user, db, book_type, page_number,
-        )
-        if fallback is not None:
-            logger.info(
-                "Canvas page %s/%s served from strokes fallback for user %s",
-                book_type, page_number, user_id,
-            )
-            return fallback
+    # Always try to load old pen batches and merge them in
+    legacy = await _fallback_page_from_strokes(
+        current_user, db, book_type, page_number,
+    )
+
+    if not doc and not legacy:
         raise HTTPException(status_code=404, detail="Page not found")
+
+    if not doc:
+        # Only legacy data exists
+        logger.info(
+            "Canvas page %s/%s served from strokes-only for user %s",
+            book_type, page_number, user_id,
+        )
+        return legacy
 
     doc.pop("_id", None)
     if isinstance(doc.get("last_modified"), datetime):
         doc["last_modified"] = doc["last_modified"].isoformat()
+
+    if legacy and legacy.get("strokes"):
+        # Merge: prepend legacy strokes that aren't already in canvas_pages
+        existing_ids: set = set()
+        for s in doc.get("strokes", []):
+            sid = s.get("id") or s.get("strokeId")
+            if sid:
+                existing_ids.add(sid)
+
+        new_from_legacy = []
+        for s in legacy["strokes"]:
+            sid = s.get("id") or s.get("strokeId")
+            if sid and sid not in existing_ids:
+                new_from_legacy.append(s)
+
+        if new_from_legacy:
+            doc["strokes"] = new_from_legacy + doc.get("strokes", [])
+            doc["stroke_count"] = len(doc["strokes"])
+            logger.info(
+                "Canvas page %s/%s merged %d legacy strokes for user %s",
+                book_type, page_number, len(new_from_legacy), user_id,
+            )
+
     return doc
 
 
