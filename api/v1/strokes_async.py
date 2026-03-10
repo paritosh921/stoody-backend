@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 from pymongo import ReplaceOne
+from pymongo.errors import DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
@@ -422,11 +423,11 @@ async def _upsert_notes_canvas_classification(
     stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
     identity_fields: Dict[str, Any] = {
         "user_id": user_id,
+        "pen_mac": pen_mac,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
     mutable_fields: Dict[str, Any] = {
-        "pen_mac": pen_mac,
         "stroke_count_at_classification": stroke_count,
         "updated_at": now,
         "last_activity": page.last_activity if page.last_activity is not None else now,
@@ -451,29 +452,37 @@ async def _upsert_notes_canvas_classification(
         "original_topic": None,
     }
 
-    # Find existing with $in (legacy user_id compat), upsert with canonical user_id
-    existing = await classification_collection.find_one(
-        {
-            "user_id": {"$in": user_ids},
-            "book_type": page.book_type.upper(),
-            "page_number": page.page_number,
-        },
-        {"_id": 1},
-    )
+    # Find existing with $in (legacy user_id compat) + pen_mac to match unique index
+    find_query: Dict[str, Any] = {
+        "user_id": {"$in": user_ids},
+        "book_type": page.book_type.upper(),
+        "page_number": page.page_number,
+    }
+    if pen_mac:
+        find_query["pen_mac"] = pen_mac
+
+    existing = await classification_collection.find_one(find_query, {"_id": 1})
     if existing:
         await classification_collection.update_one(
             {"_id": existing["_id"]},
             {"$set": {**identity_fields, **mutable_fields}},
         )
     else:
-        await classification_collection.update_one(
-            identity_fields,
-            {
-                "$setOnInsert": set_on_insert,
-                "$set": mutable_fields,
-            },
-            upsert=True,
-        )
+        try:
+            await classification_collection.update_one(
+                identity_fields,
+                {
+                    "$setOnInsert": set_on_insert,
+                    "$set": mutable_fields,
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            # Race condition — doc was inserted between find and upsert
+            await classification_collection.update_one(
+                identity_fields,
+                {"$set": {**identity_fields, **mutable_fields}},
+            )
 
 
 @router.put("/pages")
