@@ -16,8 +16,9 @@ What it does:
   strokes by id
 
 Environment:
-- `MONGODB_URI`         Mongo connection string
+- `MONGODB_URI`         Main backend Mongo connection string
 - `MONGO_DB`            Main backend DB name
+- `PEN_MONGODB_URI`     Pen backend Mongo connection string (optional; defaults to `MONGODB_URI`)
 - `PEN_MONGO_DB_NAME`   Pen backend DB name
 
 Usage:
@@ -42,8 +43,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
-MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MAIN_MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MAIN_DB_NAME = os.getenv("MONGO_DB", "skillbot_db")
+PEN_MONGO_URI = os.getenv("PEN_MONGODB_URI", MAIN_MONGO_URI)
 PEN_DB_NAME = os.getenv("PEN_MONGO_DB_NAME", MAIN_DB_NAME)
 
 
@@ -103,17 +105,19 @@ def _merge_unique(existing: Iterable[Dict[str, Any]], incoming: Iterable[Dict[st
 
 
 async def migrate(apply_changes: bool) -> None:
-    client = AsyncIOMotorClient(MONGO_URI)
-    main_db = client[MAIN_DB_NAME]
-    pen_db = client[PEN_DB_NAME]
+    main_client = AsyncIOMotorClient(MAIN_MONGO_URI)
+    pen_client = main_client if PEN_MONGO_URI == MAIN_MONGO_URI else AsyncIOMotorClient(PEN_MONGO_URI)
+    main_db = main_client[MAIN_DB_NAME]
+    pen_db = pen_client[PEN_DB_NAME]
 
     pen_strokes = pen_db["strokes"]
     canvas_pages = main_db["canvas_pages"]
 
     groups: Dict[Tuple[str, str, int], List[Dict[str, Any]]] = defaultdict(list)
 
-    print(f"Mongo URI: {MONGO_URI}")
+    print(f"Main Mongo URI: {MAIN_MONGO_URI}")
     print(f"Main DB:   {MAIN_DB_NAME}")
+    print(f"Pen Mongo URI:  {PEN_MONGO_URI}")
     print(f"Pen DB:    {PEN_DB_NAME}")
     print()
 
@@ -218,7 +222,9 @@ async def migrate(apply_changes: bool) -> None:
     print(f"Migrated groups: {migrated}")
     print(f"Skipped groups:  {skipped}")
 
-    client.close()
+    main_client.close()
+    if pen_client is not main_client:
+        pen_client.close()
 
 
 def main() -> None:
