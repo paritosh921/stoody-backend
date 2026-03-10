@@ -419,30 +419,25 @@ async def _upsert_notes_canvas_classification(
 ) -> None:
     pen_mac = (page.pen_mac or "").upper() or None
 
-    page_key = {
-        "user_id": {"$in": user_ids},
+    stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
+    identity_fields: Dict[str, Any] = {
+        "user_id": user_id,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
-    stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
-    set_fields: Dict[str, Any] = {
-        "user_id": user_id,
+    mutable_fields: Dict[str, Any] = {
         "pen_mac": pen_mac,
-        "book_type": page.book_type.upper(),
-        "page_number": page.page_number,
         "stroke_count_at_classification": stroke_count,
         "updated_at": now,
         "last_activity": page.last_activity if page.last_activity is not None else now,
     }
     if page.session_id:
-        set_fields["session_id"] = page.session_id
+        mutable_fields["session_id"] = page.session_id
     if page.first_activity is not None:
-        set_fields["first_activity"] = page.first_activity
+        mutable_fields["first_activity"] = page.first_activity
 
     set_on_insert: Dict[str, Any] = {
-        "user_id": user_id,
-        "book_type": page.book_type.upper(),
-        "page_number": page.page_number,
+        **identity_fields,
         "subject": "Unorganised",
         "topic": "General",
         "classification_source": "system",
@@ -456,14 +451,29 @@ async def _upsert_notes_canvas_classification(
         "original_topic": None,
     }
 
-    await classification_collection.update_one(
-        page_key,
+    # Find existing with $in (legacy user_id compat), upsert with canonical user_id
+    existing = await classification_collection.find_one(
         {
-            "$setOnInsert": set_on_insert,
-            "$set": set_fields,
+            "user_id": {"$in": user_ids},
+            "book_type": page.book_type.upper(),
+            "page_number": page.page_number,
         },
-        upsert=True,
+        {"_id": 1},
     )
+    if existing:
+        await classification_collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {**identity_fields, **mutable_fields}},
+        )
+    else:
+        await classification_collection.update_one(
+            identity_fields,
+            {
+                "$setOnInsert": set_on_insert,
+                "$set": mutable_fields,
+            },
+            upsert=True,
+        )
 
 
 @router.put("/pages")
@@ -480,18 +490,30 @@ async def upsert_canvas_page(
     user_ids = _resolve_canvas_user_ids(current_user)
 
     now = datetime.now(timezone.utc)
-    filt = {
+    doc = _page_doc(user_id, admin_id, page, now)
+
+    # Try to find existing doc using all user_id variants (legacy compat)
+    find_filt: Dict[str, Any] = {
         "user_id": {"$in": user_ids},
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
-    doc = _page_doc(user_id, admin_id, page, now)
-
-    # Optimistic concurrency: if client sends a version, require it to match
     if page.version is not None:
-        filt["version"] = page.version
+        find_filt["version"] = page.version
 
-    result = await collection.replace_one(filt, doc, upsert=True)
+    existing = await collection.find_one(find_filt, {"_id": 1})
+
+    if existing:
+        # Update existing doc (matched by _id to avoid $in conflict)
+        result = await collection.replace_one({"_id": existing["_id"]}, doc)
+    else:
+        # Insert new — use canonical user_id (not $in) so upsert works
+        upsert_filt: Dict[str, Any] = {
+            "user_id": user_id,
+            "book_type": page.book_type.upper(),
+            "page_number": page.page_number,
+        }
+        result = await collection.replace_one(upsert_filt, doc, upsert=True)
 
     if result.matched_count == 0 and result.upserted_id is None and page.version is not None:
         raise HTTPException(
@@ -528,15 +550,37 @@ async def batch_upsert_canvas_pages(
     user_ids = _resolve_canvas_user_ids(current_user)
 
     now = datetime.now(timezone.utc)
+
+    # Pre-fetch existing docs to handle legacy user_id variants.
+    # We need exact _id matches to avoid the $in + upsert conflict.
+    page_keys = [
+        (p.book_type.upper(), p.page_number) for p in body.pages
+    ]
+    existing_map: Dict[tuple, Any] = {}
+    if page_keys:
+        or_clauses = [
+            {"book_type": bt, "page_number": pn} for bt, pn in page_keys
+        ]
+        existing_cursor = collection.find(
+            {"user_id": {"$in": user_ids}, "$or": or_clauses},
+            {"_id": 1, "book_type": 1, "page_number": 1},
+        )
+        async for edoc in existing_cursor:
+            existing_map[(edoc["book_type"], edoc["page_number"])] = edoc["_id"]
+
     ops = []
     for page in body.pages:
-        filt = {
-            "user_id": {"$in": user_ids},
-            "book_type": page.book_type.upper(),
-            "page_number": page.page_number,
-        }
+        key = (page.book_type.upper(), page.page_number)
         doc = _page_doc(user_id, admin_id, page, now)
-        ops.append(ReplaceOne(filt, doc, upsert=True))
+        if key in existing_map:
+            ops.append(ReplaceOne({"_id": existing_map[key]}, doc))
+        else:
+            filt = {
+                "user_id": user_id,
+                "book_type": page.book_type.upper(),
+                "page_number": page.page_number,
+            }
+            ops.append(ReplaceOne(filt, doc, upsert=True))
 
     if ops:
         result = await collection.bulk_write(ops, ordered=False)
