@@ -1,0 +1,40 @@
+MONGOSH-ONLY STEPS
+==================
+
+Open mongosh with your URI first:
+mongosh 'YOUR_MONGODB_URI'
+
+From inside the mongosh prompt (for example: test>), run these JavaScript commands exactly.
+
+1) List every DB that has a non-empty strokes collection:
+db.adminCommand({listDatabases:1}).databases.forEach(d=>{const n=d.name; const x=db.getSiblingDB(n); if (x.getCollectionNames().includes("strokes")) { const c=x.strokes.countDocuments({}); if (c>0) print(n+" "+c); }})
+
+2) List only tenant DBs with non-empty strokes, excluding common system/main DBs:
+const skip=new Set(["admin","local","config","skillbot_db"]); db.adminCommand({listDatabases:1}).databases.forEach(d=>{const n=d.name; if(skip.has(n)) return; const x=db.getSiblingDB(n); if (x.getCollectionNames().includes("strokes")) { const c=x.strokes.countDocuments({}); if (c>0) print(n); }})
+
+3) Inspect one sample stroke doc from a tenant DB before migrating:
+const n="skb_indl-ciel-1001"; const x=db.getSiblingDB(n); printjson(x.strokes.findOne({}, {user_id:1, book_type:1, page_number:1, timestamp:1, pen_mac:1}))
+
+
+SHELL COMMANDS TO RUN AFTER YOU IDENTIFY THE TENANT DBs
+=======================================================
+
+Run these from:
+~/backend/scripts/migrations
+
+4) Dry-run migration for one tenant DB:
+PEN_MONGO_DB_NAME='skb_indl-ciel-1001' MONGO_DB='skillbot_db' python migrate_pen_server_strokes_to_canvas_pages.py --dry-run
+
+5) Apply migration for one tenant DB:
+PEN_MONGO_DB_NAME='skb_indl-ciel-1001' MONGO_DB='skillbot_db' python migrate_pen_server_strokes_to_canvas_pages.py --apply
+
+6) Dry-run migration for all tenant DBs with strokes:
+for DB in $(mongosh 'YOUR_MONGODB_URI' --quiet --eval 'const skip=new Set(["admin","local","config","skillbot_db"]); db.adminCommand({listDatabases:1}).databases.forEach(d=>{const n=d.name; if(skip.has(n)) return; const x=db.getSiblingDB(n); if (x.getCollectionNames().includes("strokes") && x.strokes.countDocuments({})>0) print(n); })'); do echo "=== DRY RUN: $DB ==="; PEN_MONGO_DB_NAME="$DB" MONGO_DB='skillbot_db' python migrate_pen_server_strokes_to_canvas_pages.py --dry-run; done
+
+7) Apply migration for all tenant DBs with strokes:
+for DB in $(mongosh 'YOUR_MONGODB_URI' --quiet --eval 'const skip=new Set(["admin","local","config","skillbot_db"]); db.adminCommand({listDatabases:1}).databases.forEach(d=>{const n=d.name; if(skip.has(n)) return; const x=db.getSiblingDB(n); if (x.getCollectionNames().includes("strokes") && x.strokes.countDocuments({})>0) print(n); })'); do echo "=== APPLY: $DB ==="; PEN_MONGO_DB_NAME="$DB" MONGO_DB='skillbot_db' python migrate_pen_server_strokes_to_canvas_pages.py --apply; done
+
+Notes:
+- Steps 1, 2, and 3 are for inside mongosh only.
+- Steps 4, 5, 6, and 7 are normal shell commands, not mongosh commands.
+- Replace YOUR_MONGODB_URI in step 6 and 7 before running.

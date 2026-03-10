@@ -97,7 +97,7 @@ async def list_strokes(
 
     if user_type == "student":
         # Students can only see their own strokes
-        valid_user_ids = [current_user["user_id"]]
+        valid_user_ids = _resolve_canvas_user_ids(current_user)
     else:
         # Admin/tutor: Get all student user_ids for this tenant
         cursor = tenant_db["students"].find({}, {"_id": 1})
@@ -378,18 +378,10 @@ async def _fallback_page_from_strokes(
     if strokes_col is None:
         return None
 
-    user_id = current_user["user_id"]
-    from bson import ObjectId as _ObjectId
-
-    user_ids: list = [user_id, str(user_id)]
-    username = current_user.get("username")
-    if username:
-        user_ids.append(username)
-    try:
-        if _ObjectId.is_valid(user_id):
-            user_ids.append(_ObjectId(user_id))
-    except Exception:
-        pass
+    user_id = _canonical_canvas_user_id(current_user)
+    user_ids = _resolve_canvas_user_ids(current_user)
+    if not user_ids:
+        return None
 
     query = {
         "user_id": {"$in": user_ids},
@@ -473,6 +465,41 @@ async def _fallback_page_from_strokes(
     }
 
 
+def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
+    """Return all known user-id variants used by legacy and migrated pen data."""
+    user_id = current_user["user_id"]
+    from bson import ObjectId as _ObjectId
+
+    username = current_user.get("username")
+    user_ids: list[Any] = []
+    if username:
+        user_ids.append(username)
+    user_ids.extend([user_id, str(user_id)])
+    try:
+        if _ObjectId.is_valid(user_id):
+            user_ids.append(_ObjectId(user_id))
+    except Exception:
+        pass
+
+    deduped: list[Any] = []
+    seen: set[str] = set()
+    for item in user_ids:
+        marker = f"{type(item).__name__}:{item}"
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(item)
+    return deduped
+
+
+def _canonical_canvas_user_id(current_user: Dict[str, Any]) -> str:
+    """Use username-style identity as the canonical owner id for page data."""
+    username = current_user.get("username")
+    if username:
+        return str(username)
+    return str(current_user["user_id"])
+
+
 def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now: datetime) -> Dict[str, Any]:
     """Build the MongoDB document for a canvas page upsert."""
     doc: Dict[str, Any] = {
@@ -503,19 +530,23 @@ async def _upsert_notes_canvas_classification(
     classification_collection,
     *,
     user_id: str,
+    user_ids: List[Any],
     page: CanvasPageUpsert,
     now: datetime,
 ) -> None:
     pen_mac = (page.pen_mac or "").upper() or None
 
     page_key = {
-        "user_id": user_id,
+        "user_id": {"$in": user_ids},
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
     stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
     set_fields: Dict[str, Any] = {
+        "user_id": user_id,
         "pen_mac": pen_mac,
+        "book_type": page.book_type.upper(),
+        "page_number": page.page_number,
         "stroke_count_at_classification": stroke_count,
         "updated_at": now,
         "last_activity": page.last_activity if page.last_activity is not None else now,
@@ -526,6 +557,9 @@ async def _upsert_notes_canvas_classification(
         set_fields["first_activity"] = page.first_activity
 
     set_on_insert: Dict[str, Any] = {
+        "user_id": user_id,
+        "book_type": page.book_type.upper(),
+        "page_number": page.page_number,
         "subject": "Unorganised",
         "topic": "General",
         "classification_source": "system",
@@ -556,14 +590,15 @@ async def upsert_canvas_page(
     db: DatabaseManager = Depends(get_database),
 ):
     """Upsert a single canvas page. Identity key: (user_id, book_type, page_number)."""
-    user_id = current_user["user_id"]
+    user_id = _canonical_canvas_user_id(current_user)
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
     classification_collection = collection.database["note_classifications"]
+    user_ids = _resolve_canvas_user_ids(current_user)
 
     now = datetime.now(timezone.utc)
     filt = {
-        "user_id": user_id,
+        "user_id": {"$in": user_ids},
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
@@ -584,6 +619,7 @@ async def upsert_canvas_page(
     await _upsert_notes_canvas_classification(
         classification_collection,
         user_id=user_id,
+        user_ids=user_ids,
         page=page,
         now=now,
     )
@@ -602,16 +638,17 @@ async def batch_upsert_canvas_pages(
     db: DatabaseManager = Depends(get_database),
 ):
     """Upsert up to 20 canvas pages in one request."""
-    user_id = current_user["user_id"]
+    user_id = _canonical_canvas_user_id(current_user)
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
     classification_collection = collection.database["note_classifications"]
+    user_ids = _resolve_canvas_user_ids(current_user)
 
     now = datetime.now(timezone.utc)
     ops = []
     for page in body.pages:
         filt = {
-            "user_id": user_id,
+            "user_id": {"$in": user_ids},
             "book_type": page.book_type.upper(),
             "page_number": page.page_number,
         }
@@ -624,6 +661,7 @@ async def batch_upsert_canvas_pages(
             await _upsert_notes_canvas_classification(
                 classification_collection,
                 user_id=user_id,
+                user_ids=user_ids,
                 page=page,
                 now=now,
             )
@@ -649,10 +687,10 @@ async def list_canvas_pages(
     Merges pages from both `canvas_pages` and the legacy `strokes` collection
     so that pen-batch data is discoverable during hydration.
     """
-    user_id = current_user["user_id"]
+    user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
-    query: Dict[str, Any] = {"user_id": user_id}
+    query: Dict[str, Any] = {"user_id": {"$in": user_ids}}
     if book_type:
         query["book_type"] = book_type.upper()
     if since:
@@ -699,18 +737,6 @@ async def list_canvas_pages(
     try:
         strokes_col = await _get_strokes_collection(current_user, db)
         if strokes_col is not None:
-            from bson import ObjectId as _ObjectId
-
-            user_ids: list = [user_id, str(user_id)]
-            uname = current_user.get("username")
-            if uname:
-                user_ids.append(uname)
-            try:
-                if _ObjectId.is_valid(user_id):
-                    user_ids.append(_ObjectId(user_id))
-            except Exception:
-                pass
-
             stroke_match: Dict[str, Any] = {"user_id": {"$in": user_ids}}
             if book_type:
                 stroke_match["book_type"] = book_type.upper()
@@ -781,10 +807,11 @@ async def get_canvas_page(
     with the `canvas_pages` document so that old pen data is never lost.
     """
     user_id = current_user["user_id"]
+    user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
     doc = await collection.find_one({
-        "user_id": user_id,
+        "user_id": {"$in": user_ids},
         "book_type": book_type.upper(),
         "page_number": page_number,
     })
@@ -841,7 +868,7 @@ async def bulk_load_canvas_pages(
     db: DatabaseManager = Depends(get_database),
 ):
     """Load up to 50 pages in one request (full strokes included)."""
-    user_id = current_user["user_id"]
+    user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
     or_clauses = []
@@ -854,7 +881,7 @@ async def bulk_load_canvas_pages(
     if not or_clauses:
         return {"pages": []}
 
-    query = {"user_id": user_id, "$or": or_clauses}
+    query = {"user_id": {"$in": user_ids}, "$or": or_clauses}
     cursor = collection.find(query)
     docs = await cursor.to_list(length=len(or_clauses))
 
