@@ -348,123 +348,6 @@ async def _get_canvas_collection(
     return tenant_db["canvas_pages"]
 
 
-async def _get_strokes_collection(
-    current_user: Dict[str, Any], db: DatabaseManager
-):
-    """Return the correct strokes collection (pen batch data) for tenant or B2C."""
-    is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-    if is_b2c:
-        b2c_db = await db.get_b2c_db()
-        return b2c_db["strokes"] if b2c_db is not None else None
-
-    db_name = current_user.get("db_name")
-    if not db_name:
-        return None
-    tenant_db = await db.get_tenant_db(db_name)
-    return tenant_db["strokes"] if tenant_db is not None else None
-
-
-async def _fallback_page_from_strokes(
-    current_user: Dict[str, Any],
-    db: DatabaseManager,
-    book_type: str,
-    page_number: int,
-) -> Optional[Dict[str, Any]]:
-    """
-    Load a page from the legacy `strokes` collection (pen batches) and
-    convert it to the canvas_pages document format the frontend expects.
-    """
-    strokes_col = await _get_strokes_collection(current_user, db)
-    if strokes_col is None:
-        return None
-
-    user_id = _canonical_canvas_user_id(current_user)
-    user_ids = _resolve_canvas_user_ids(current_user)
-    if not user_ids:
-        return None
-
-    query = {
-        "user_id": {"$in": user_ids},
-        "book_type": book_type.upper(),
-        "page_number": page_number,
-    }
-
-    cursor = strokes_col.find(query).sort("timestamp", 1)
-    batches = await cursor.to_list(length=2000)
-
-    # If no match with exact book_type, try without book_type filter
-    # (old strokes may be stored under a different book type for the same page)
-    if not batches:
-        fallback_query = {
-            "user_id": {"$in": user_ids},
-            "page_number": page_number,
-        }
-        cursor = strokes_col.find(fallback_query).sort("timestamp", 1)
-        batches = await cursor.to_list(length=2000)
-
-    if not batches:
-        return None
-
-    # Flatten all stroke batches into one array, dedup by id
-    seen_ids: set = set()
-    merged_strokes: list = []
-    first_ts: Optional[datetime] = None
-    last_ts: Optional[datetime] = None
-    pen_mac = None
-    canvas_bg = None
-    page_style = None
-
-    for batch in batches:
-        ts = batch.get("timestamp")
-        if isinstance(ts, datetime):
-            if first_ts is None or ts < first_ts:
-                first_ts = ts
-            if last_ts is None or ts > last_ts:
-                last_ts = ts
-
-        if not pen_mac:
-            pen_mac = batch.get("pen_mac")
-        if not canvas_bg:
-            canvas_bg = batch.get("canvas_background")
-        if not page_style:
-            page_style = batch.get("page_style")
-
-        for s in batch.get("strokes", []):
-            sid = s.get("id") or s.get("strokeId") or id(s)
-            if sid in seen_ids:
-                continue
-            seen_ids.add(sid)
-            # Normalise points from {x,y,pressure} dicts to [x,y,p] arrays
-            raw_pts = s.get("points", [])
-            if raw_pts and isinstance(raw_pts[0], dict):
-                s["points"] = [
-                    [pt.get("x", 0), pt.get("y", 0), pt.get("pressure", 0.5)]
-                    for pt in raw_pts
-                ]
-            merged_strokes.append(s)
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    return {
-        "user_id": user_id,
-        "admin_id": current_user.get("admin_id"),
-        "book_type": book_type.upper(),
-        "page_number": page_number,
-        "strokes": merged_strokes,
-        "page_style": page_style,
-        "canvas_background": canvas_bg,
-        "stroke_count": len(merged_strokes),
-        "pen_mac": pen_mac,
-        "source": "strokes_fallback",
-        "last_modified": now_iso,
-        "client_last_modified": last_ts.timestamp() * 1000 if last_ts else None,
-        "version": 1,
-        "session_id": batches[0].get("session_id") if batches else None,
-        "first_activity": first_ts.timestamp() * 1000 if first_ts else None,
-        "last_activity": last_ts.timestamp() * 1000 if last_ts else None,
-    }
-
-
 def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
     """Return all known user-id variants used by legacy and migrated pen data."""
     user_id = current_user["user_id"]
@@ -682,11 +565,7 @@ async def list_canvas_pages(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
-    """List page metadata (no strokes) for the current user.
-
-    Merges pages from both `canvas_pages` and the legacy `strokes` collection
-    so that pen-batch data is discoverable during hydration.
-    """
+    """List page metadata (no strokes) for the current user from `canvas_pages` only."""
     user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
@@ -712,10 +591,7 @@ async def list_canvas_pages(
     docs = await cursor.to_list(length=fetch_window)
 
     pages = []
-    seen_keys: set = set()
     for d in docs:
-        page_key = (str(d.get("book_type") or "").upper(), d.get("page_number"))
-        seen_keys.add(page_key)
         page_meta: Dict[str, Any] = {
             "book_type": d.get("book_type"),
             "page_number": d.get("page_number"),
@@ -731,55 +607,6 @@ async def list_canvas_pages(
         if d.get("last_activity") is not None:
             page_meta["last_activity"] = d["last_activity"]
         pages.append(page_meta)
-
-    # ── Merge pages from legacy strokes collection ──
-    # Discover pages that exist only as pen batches (not yet in canvas_pages).
-    try:
-        strokes_col = await _get_strokes_collection(current_user, db)
-        if strokes_col is not None:
-            stroke_match: Dict[str, Any] = {"user_id": {"$in": user_ids}}
-            if book_type:
-                stroke_match["book_type"] = book_type.upper()
-
-            pipeline = [
-                {"$match": stroke_match},
-                {"$group": {
-                    "_id": {"book_type": "$book_type", "page_number": "$page_number"},
-                    "stroke_count": {"$sum": {"$size": {"$ifNull": ["$strokes", []]}}},
-                    "first_ts": {"$min": "$timestamp"},
-                    "last_ts": {"$max": "$timestamp"},
-                }},
-                {"$sort": {"last_ts": -1}},
-                {"$limit": fetch_window},
-            ]
-            stroke_cursor = strokes_col.aggregate(pipeline)
-            async for sdoc in stroke_cursor:
-                sid = sdoc["_id"]
-                bt = sid.get("book_type")
-                pn = sid.get("page_number")
-                if pn is None:
-                    continue
-                key = (str(bt or "").upper(), pn)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-
-                last_ts = sdoc.get("last_ts")
-                last_mod_iso = last_ts.isoformat() if isinstance(last_ts, datetime) else None
-                first_ts = sdoc.get("first_ts")
-
-                pages.append({
-                    "book_type": bt,
-                    "page_number": pn,
-                    "stroke_count": sdoc.get("stroke_count", 0),
-                    "last_modified": last_mod_iso,
-                    "client_last_modified": last_ts.timestamp() * 1000 if isinstance(last_ts, datetime) else None,
-                    "version": 1,
-                    "first_activity": first_ts.timestamp() * 1000 if isinstance(first_ts, datetime) else None,
-                    "last_activity": last_ts.timestamp() * 1000 if isinstance(last_ts, datetime) else None,
-                })
-    except Exception as exc:
-        logger.warning("Strokes fallback for page list failed: %s", exc)
 
     pages.sort(
         key=lambda p: (
@@ -801,12 +628,7 @@ async def get_canvas_page(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
-    """Load a single canvas page with full strokes.
-
-    Always merges strokes from the legacy `strokes` collection (pen batches)
-    with the `canvas_pages` document so that old pen data is never lost.
-    """
-    user_id = current_user["user_id"]
+    """Load a single canvas page with full strokes from `canvas_pages` only."""
     user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
@@ -816,47 +638,12 @@ async def get_canvas_page(
         "page_number": page_number,
     })
 
-    # Always try to load old pen batches and merge them in
-    legacy = await _fallback_page_from_strokes(
-        current_user, db, book_type, page_number,
-    )
-
-    if not doc and not legacy:
-        raise HTTPException(status_code=404, detail="Page not found")
-
     if not doc:
-        # Only legacy data exists
-        logger.info(
-            "Canvas page %s/%s served from strokes-only for user %s",
-            book_type, page_number, user_id,
-        )
-        return legacy
+        raise HTTPException(status_code=404, detail="Page not found")
 
     doc.pop("_id", None)
     if isinstance(doc.get("last_modified"), datetime):
         doc["last_modified"] = doc["last_modified"].isoformat()
-
-    if legacy and legacy.get("strokes"):
-        # Merge: prepend legacy strokes that aren't already in canvas_pages
-        existing_ids: set = set()
-        for s in doc.get("strokes", []):
-            sid = s.get("id") or s.get("strokeId")
-            if sid:
-                existing_ids.add(sid)
-
-        new_from_legacy = []
-        for s in legacy["strokes"]:
-            sid = s.get("id") or s.get("strokeId")
-            if sid and sid not in existing_ids:
-                new_from_legacy.append(s)
-
-        if new_from_legacy:
-            doc["strokes"] = new_from_legacy + doc.get("strokes", [])
-            doc["stroke_count"] = len(doc["strokes"])
-            logger.info(
-                "Canvas page %s/%s merged %d legacy strokes for user %s",
-                book_type, page_number, len(new_from_legacy), user_id,
-            )
 
     return doc
 
