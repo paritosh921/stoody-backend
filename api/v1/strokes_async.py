@@ -453,22 +453,35 @@ async def _upsert_notes_canvas_classification(
     }
 
     # Find existing with $in (legacy user_id compat) + pen_mac to match unique index
-    find_query: Dict[str, Any] = {
-        "user_id": {"$in": user_ids},
-        "book_type": page.book_type.upper(),
-        "page_number": page.page_number,
-    }
-    if pen_mac:
-        find_query["pen_mac"] = pen_mac
+    try:
+        find_query: Dict[str, Any] = {
+            "user_id": {"$in": user_ids},
+            "book_type": page.book_type.upper(),
+            "page_number": page.page_number,
+        }
+        if pen_mac:
+            find_query["pen_mac"] = pen_mac
 
-    existing = await classification_collection.find_one(find_query, {"_id": 1})
-    if existing:
-        await classification_collection.update_one(
-            {"_id": existing["_id"]},
-            {"$set": {**identity_fields, **mutable_fields}},
-        )
-    else:
-        try:
+        existing = await classification_collection.find_one(find_query, {"_id": 1, "user_id": 1})
+        if existing:
+            if existing.get("user_id") != user_id:
+                # Old user_id variant — a canonical doc may already exist.
+                # Delete the old-variant doc and upsert on the canonical one.
+                await classification_collection.delete_one({"_id": existing["_id"]})
+                await classification_collection.update_one(
+                    identity_fields,
+                    {
+                        "$setOnInsert": set_on_insert,
+                        "$set": mutable_fields,
+                    },
+                    upsert=True,
+                )
+            else:
+                await classification_collection.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": mutable_fields},
+                )
+        else:
             await classification_collection.update_one(
                 identity_fields,
                 {
@@ -477,12 +490,18 @@ async def _upsert_notes_canvas_classification(
                 },
                 upsert=True,
             )
-        except DuplicateKeyError:
-            # Race condition — doc was inserted between find and upsert
+    except DuplicateKeyError:
+        # Race condition or leftover duplicates — just update the canonical doc
+        try:
             await classification_collection.update_one(
                 identity_fields,
-                {"$set": {**identity_fields, **mutable_fields}},
+                {"$set": mutable_fields},
             )
+        except Exception:
+            pass  # Classification is non-critical, don't crash the caller
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("note_classifications upsert failed: %s", exc)
 
 
 @router.put("/pages")
