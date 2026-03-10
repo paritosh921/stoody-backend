@@ -277,8 +277,19 @@ async def _list_canvas_pages_for_user(
     if col is None:
         return []
 
+    # Build all user_id variants for legacy compat
     user_id = current_user.get("user_id")
-    query: Dict[str, Any] = {"user_id": user_id, "stroke_count": {"$gt": 0}}
+    user_identifiers: list = [user_id, str(user_id)]
+    username = current_user.get("username")
+    if username:
+        user_identifiers.append(username)
+    try:
+        if ObjectId.is_valid(user_id):
+            user_identifiers.append(ObjectId(user_id))
+    except Exception:
+        pass
+
+    query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "stroke_count": {"$gt": 0}}
     if pen_mac:
         query["pen_mac"] = pen_mac.upper()
     if book_type:
@@ -348,8 +359,19 @@ async def _get_canvas_page_as_batches(
     if col is None:
         return []
 
+    # Build all user_id variants for legacy compat
     user_id = current_user.get("user_id")
-    query: Dict[str, Any] = {"user_id": user_id, "page_number": page_number}
+    user_identifiers: list = [user_id, str(user_id)]
+    username = current_user.get("username")
+    if username:
+        user_identifiers.append(username)
+    try:
+        if ObjectId.is_valid(user_id):
+            user_identifiers.append(ObjectId(user_id))
+    except Exception:
+        pass
+
+    query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "page_number": page_number}
     if book_type:
         query["book_type"] = book_type.upper()
 

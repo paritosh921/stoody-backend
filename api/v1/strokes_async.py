@@ -352,11 +352,12 @@ async def _get_canvas_collection(
 async def _get_legacy_strokes_collection(
     current_user: Dict[str, Any], db: DatabaseManager
 ):
-    """Return the legacy `strokes` collection (pen batch data) or None."""
+    """Return the legacy ``strokes`` collection (tenant or B2C), or *None*."""
     is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
     if is_b2c:
         b2c_db = await db.get_b2c_db()
         return b2c_db["strokes"] if b2c_db is not None else None
+
     db_name = current_user.get("db_name")
     if not db_name:
         return None
@@ -365,7 +366,7 @@ async def _get_legacy_strokes_collection(
 
 
 def _normalise_stroke_points(points: list) -> list:
-    """Convert {x,y,pressure} dicts to [x,y,p] arrays."""
+    """Convert ``{x, y, pressure}`` dicts to ``[x, y, p]`` arrays (no-op if already arrays)."""
     out = []
     for pt in points:
         if isinstance(pt, dict):
@@ -376,88 +377,105 @@ def _normalise_stroke_points(points: list) -> list:
 
 
 async def _legacy_page_summaries(
-    strokes_col, user_ids: List[Any], *, book_type: Optional[str] = None
+    strokes_col, user_ids: list, *, book_type: Optional[str] = None
 ) -> List[Dict[str, Any]]:
-    """Aggregate legacy `strokes` collection into per-page summaries."""
-    match: Dict[str, Any] = {"user_id": {"$in": user_ids}}
+    """Aggregate legacy ``strokes`` docs into per-page summary dicts."""
+    match_stage: Dict[str, Any] = {"user_id": {"$in": user_ids}}
     if book_type:
-        match["book_type"] = book_type.upper()
+        match_stage["book_type"] = book_type.upper()
 
     pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": {"book_type": "$book_type", "page_number": "$page_number"},
-            "stroke_count": {"$sum": {"$size": {"$ifNull": ["$strokes", []]}}},
-            "last_modified": {"$max": "$timestamp"},
-            "last_activity": {"$max": "$timestamp"},
-        }},
+        {"$match": match_stage},
+        {
+            "$group": {
+                "_id": {"book_type": "$book_type", "page_number": "$page_number"},
+                "stroke_count": {"$sum": {"$size": {"$ifNull": ["$strokes", []]}}},
+                "last_modified": {"$max": "$timestamp"},
+                "pen_mac": {"$first": "$pen_mac"},
+            }
+        },
     ]
-    summaries = []
+
+    pages: List[Dict[str, Any]] = []
     async for doc in strokes_col.aggregate(pipeline):
-        key = doc["_id"]
-        ts = doc.get("last_modified")
-        summaries.append({
-            "book_type": key.get("book_type"),
-            "page_number": key.get("page_number"),
-            "stroke_count": doc.get("stroke_count", 0),
-            "last_modified": ts.isoformat() if isinstance(ts, datetime) else str(ts) if ts else None,
-            "client_last_modified": None,
-            "version": 0,
-        })
-    return summaries
+        bt = doc["_id"].get("book_type")
+        pn = doc["_id"].get("page_number")
+        if bt is None or pn is None:
+            continue
+        pages.append(
+            {
+                "book_type": bt,
+                "page_number": pn,
+                "stroke_count": doc.get("stroke_count", 0),
+                "last_modified": doc["last_modified"].isoformat() if doc.get("last_modified") else None,
+                "last_activity": doc["last_modified"].isoformat() if doc.get("last_modified") else None,
+                "pen_mac": doc.get("pen_mac"),
+                "version": 0,
+                "source": "legacy_strokes",
+            }
+        )
+    return pages
 
 
 async def _legacy_page_full(
-    strokes_col, user_ids: List[Any], book_type: str, page_number: int
+    strokes_col,
+    user_ids: list,
+    book_type: str,
+    page_number: int,
 ) -> Optional[Dict[str, Any]]:
-    """Reconstruct a full canvas page doc from legacy stroke batches."""
+    """Reconstruct a full canvas-page-like dict from legacy stroke batches."""
     query: Dict[str, Any] = {
         "user_id": {"$in": user_ids},
+        "book_type": book_type.upper(),
         "page_number": page_number,
     }
-    # Try exact book_type first, then without (old data may lack book_type)
-    for bt_filter in [{"book_type": book_type.upper()}, {}]:
-        cursor = strokes_col.find({**query, **bt_filter}).sort("timestamp", 1)
-        batches = await cursor.to_list(length=500)
-        if batches:
-            break
-    else:
-        return None
+    cursor = strokes_col.find(query).sort("timestamp", 1)
+    batches = await cursor.to_list(length=500)
+
+    if not batches:
+        query_no_bt: Dict[str, Any] = {
+            "user_id": {"$in": user_ids},
+            "page_number": page_number,
+        }
+        cursor2 = strokes_col.find(query_no_bt).sort("timestamp", 1)
+        batches = await cursor2.to_list(length=500)
 
     if not batches:
         return None
 
-    all_strokes = []
     seen_ids: set = set()
+    merged_strokes: list = []
+    last_ts = None
+    pen_mac = None
+
     for batch in batches:
+        pen_mac = pen_mac or batch.get("pen_mac")
+        ts = batch.get("timestamp")
+        if ts is not None:
+            last_ts = ts
+
         for s in batch.get("strokes", []):
             sid = s.get("id") or s.get("strokeId")
-            if sid and sid in seen_ids:
-                continue
             if sid:
+                if sid in seen_ids:
+                    continue
                 seen_ids.add(sid)
-            s["points"] = _normalise_stroke_points(s.get("points", []))
-            all_strokes.append(s)
 
-    detected_bt = book_type.upper()
-    for b in batches:
-        if b.get("book_type"):
-            detected_bt = b["book_type"]
-            break
+            pts = s.get("points")
+            if pts:
+                s["points"] = _normalise_stroke_points(pts)
 
-    ts = batches[-1].get("timestamp") if batches else None
+            merged_strokes.append(s)
+
     return {
-        "user_id": str(batches[0].get("user_id", "")),
-        "admin_id": batches[0].get("admin_id"),
-        "book_type": detected_bt,
+        "book_type": book_type.upper(),
         "page_number": page_number,
-        "strokes": all_strokes,
-        "stroke_count": len(all_strokes),
-        "pen_mac": batches[0].get("pen_mac"),
-        "source": "legacy_strokes",
-        "last_modified": ts.isoformat() if isinstance(ts, datetime) else str(ts) if ts else None,
-        "client_last_modified": None,
+        "strokes": merged_strokes,
+        "stroke_count": len(merged_strokes),
+        "last_modified": last_ts.isoformat() if last_ts else None,
+        "pen_mac": pen_mac,
         "version": 0,
+        "source": "legacy_strokes",
     }
 
 
@@ -749,7 +767,7 @@ async def list_canvas_pages(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
-    """List page metadata for the current user from canvas_pages + legacy strokes."""
+    """List page metadata for the current user from canvas_pages only."""
     user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
@@ -804,15 +822,24 @@ async def list_canvas_pages(
                     pages.append(lp)
                     canvas_page_keys.add(key)
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Legacy strokes scan failed: %s", exc)
+            logger.warning("Legacy strokes scan failed: %s", exc)
+
+    def _sort_ts(val):
+        """Normalise any timestamp representation to a sortable ISO string."""
+        if val is None:
+            return ""
+        if isinstance(val, datetime):
+            return val.isoformat()
+        if isinstance(val, (int, float)):
+            try:
+                ts = val / 1000 if val > 1e12 else val
+                return datetime.utcfromtimestamp(ts).isoformat()
+            except Exception:
+                return ""
+        return str(val)
 
     pages.sort(
-        key=lambda p: (
-            p.get("last_activity")
-            or p.get("client_last_modified")
-            or 0
-        ),
+        key=lambda p: _sort_ts(p.get("last_activity") or p.get("client_last_modified")),
         reverse=True,
     )
     sliced = pages[offset: offset + limit]
@@ -844,24 +871,24 @@ async def get_canvas_page(
             legacy = await _legacy_page_full(strokes_col, user_ids, book_type, page_number)
             if legacy and legacy.get("strokes"):
                 if doc:
-                    # Merge: add legacy strokes not already in canvas_pages (by stroke id)
                     existing_ids = {
                         s.get("id") or s.get("strokeId")
                         for s in doc.get("strokes", [])
                         if s.get("id") or s.get("strokeId")
                     }
-                    new_from_legacy = [
-                        s for s in legacy["strokes"]
-                        if (s.get("id") or s.get("strokeId")) and (s.get("id") or s.get("strokeId")) not in existing_ids
-                    ]
+                    new_from_legacy = []
+                    for s in legacy["strokes"]:
+                        sid = s.get("id") or s.get("strokeId")
+                        if sid and sid in existing_ids:
+                            continue
+                        new_from_legacy.append(s)
                     if new_from_legacy:
                         doc["strokes"] = new_from_legacy + doc.get("strokes", [])
                         doc["stroke_count"] = len(doc["strokes"])
                 else:
                     doc = legacy
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("Legacy stroke merge failed: %s", exc)
+            logger.warning("Legacy stroke merge failed: %s", exc)
 
     if not doc:
         raise HTTPException(status_code=404, detail="Page not found")
