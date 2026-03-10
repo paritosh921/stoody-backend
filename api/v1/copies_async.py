@@ -261,7 +261,7 @@ async def _get_canvas_pages_collection(current_user: Dict[str, Any], db: Databas
     if not db_name:
         return None
     tenant_db = await db.get_tenant_db(db_name)
-    return tenant_db["canvas_pages"] if tenant_db else None
+    return tenant_db["canvas_pages"] if tenant_db is not None else None
 
 
 async def _list_canvas_pages_for_user(
