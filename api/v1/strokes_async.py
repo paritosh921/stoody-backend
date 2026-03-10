@@ -639,7 +639,7 @@ async def batch_upsert_canvas_pages(
 async def list_canvas_pages(
     book_type: Optional[str] = Query(None, description="Filter by book type"),
     since: Optional[str] = Query(None, description="ISO datetime — only pages modified after this"),
-    limit: int = Query(200, ge=1, le=1000),
+    limit: int = Query(2000, ge=1, le=5000),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
