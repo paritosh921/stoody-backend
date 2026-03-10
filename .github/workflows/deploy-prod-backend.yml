@@ -1,0 +1,115 @@
+name: Deploy Prod Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "api/**"
+      - "core/**"
+      - "services/**"
+      - "middleware/**"
+      - "models/**"
+      - "utils/**"
+      - "main_async.py"
+      - "config_async.py"
+      - "requirements.txt"
+      - "ops/remote_deploy_python_service.sh"
+      - ".github/workflows/deploy-prod-backend.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod-backend
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEPLOY_BRANCH: ${{ github.ref_name }}
+      PROD_DEPLOY_SSH_PRIVATE_KEY: ${{ secrets.PROD_DEPLOY_SSH_PRIVATE_KEY }}
+      PROD_MAIN_BACKEND_HOST: ${{ vars.PROD_MAIN_BACKEND_HOST }}
+      PROD_MAIN_BACKEND_USER: ${{ vars.PROD_MAIN_BACKEND_USER }}
+      PROD_MAIN_BACKEND_PATH: ${{ vars.PROD_MAIN_BACKEND_PATH }}
+      PROD_MAIN_BACKEND_VENV_PATH: ${{ vars.PROD_MAIN_BACKEND_VENV_PATH }}
+      PROD_MAIN_BACKEND_SERVICE_MANAGER: ${{ vars.PROD_MAIN_BACKEND_SERVICE_MANAGER }}
+      PROD_MAIN_BACKEND_SERVICE_NAME: ${{ vars.PROD_MAIN_BACKEND_SERVICE_NAME }}
+      PROD_MAIN_BACKEND_HEALTHCHECK_URL: ${{ vars.PROD_MAIN_BACKEND_HEALTHCHECK_URL }}
+    steps:
+      - name: Guard branch
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            main) ;;
+            *)
+              echo "This workflow only deploys from main."
+              exit 1
+              ;;
+          esac
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Syntax-check Python code
+        shell: bash
+        run: python -m compileall .
+
+      - name: Validate backend deploy settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$PROD_DEPLOY_SSH_PRIVATE_KEY" ]]; then
+            echo "Missing required GitHub secret: PROD_DEPLOY_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+
+          required=(
+            "PROD_MAIN_BACKEND_HOST"
+            "PROD_MAIN_BACKEND_USER"
+            "PROD_MAIN_BACKEND_PATH"
+            "PROD_MAIN_BACKEND_SERVICE_MANAGER"
+            "PROD_MAIN_BACKEND_SERVICE_NAME"
+            "PROD_MAIN_BACKEND_HEALTHCHECK_URL"
+          )
+
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub variable: $name"
+              exit 1
+            fi
+          done
+
+      - name: Configure SSH access
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$PROD_DEPLOY_SSH_PRIVATE_KEY" > ~/.ssh/prod_deploy_key
+          chmod 600 ~/.ssh/prod_deploy_key
+
+          ssh-keyscan -H "$PROD_MAIN_BACKEND_HOST" > ~/.ssh/known_hosts
+
+      - name: Deploy backend to prod
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          scp -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            ops/remote_deploy_python_service.sh \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}:/tmp/remote_deploy_python_service.sh"
+
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "chmod +x /tmp/remote_deploy_python_service.sh && bash /tmp/remote_deploy_python_service.sh \
+            '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
