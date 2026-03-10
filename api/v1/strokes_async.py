@@ -399,6 +399,17 @@ async def _fallback_page_from_strokes(
 
     cursor = strokes_col.find(query).sort("timestamp", 1)
     batches = await cursor.to_list(length=2000)
+
+    # If no match with exact book_type, try without book_type filter
+    # (old strokes may be stored under a different book type for the same page)
+    if not batches:
+        fallback_query = {
+            "user_id": {"$in": user_ids},
+            "page_number": page_number,
+        }
+        cursor = strokes_col.find(fallback_query).sort("timestamp", 1)
+        batches = await cursor.to_list(length=2000)
+
     if not batches:
         return None
 
