@@ -639,7 +639,7 @@ async def get_copy_page(
         if book_type:
             query["book_type"] = book_type
         
-        # Fetch stroke batches
+        # Fetch stroke batches from strokes collection
         if is_b2c:
             cursor = db.b2c_db["strokes"].find(query).sort("timestamp", 1)
             stroke_batches = await cursor.to_list(length=1000)
@@ -652,22 +652,23 @@ async def get_copy_page(
                 )
             cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
             stroke_batches = await cursor.to_list(length=1000)
-        
-        # Fallback 1: canvas_pages collection (server-side canvas sync)
-        if not stroke_batches and not debug_all:
-            stroke_batches = await _get_canvas_page_as_batches(
+
+        # Always merge canvas_pages data (has newer strokes from live canvas)
+        if not debug_all:
+            canvas_batches = await _get_canvas_page_as_batches(
                 current_user, db,
                 page_number=page_number,
                 book_type=book_type,
                 pen_mac=pen_mac,
             )
-            if stroke_batches:
-                logger.info(
-                    "Copy page from canvas_pages: pen_mac=%s page=%s user=%s",
-                    pen_mac, page_number, user_id,
-                )
+            if canvas_batches:
+                if stroke_batches:
+                    # Merge: append canvas_pages batch, dedup happens at stroke level
+                    stroke_batches = stroke_batches + canvas_batches
+                else:
+                    stroke_batches = canvas_batches
 
-        # Fallback 2: pen backend remote API
+        # Fallback: pen backend remote API
         if not stroke_batches and not debug_all:
             stroke_batches = await _fetch_remote_strokes(
                 _resolve_forward_auth_header(request),
@@ -680,9 +681,7 @@ async def get_copy_page(
             if stroke_batches:
                 logger.info(
                     "Copy page fallback via pen backend: pen_mac=%s page=%s user=%s",
-                    pen_mac,
-                    page_number,
-                    user_id,
+                    pen_mac, page_number, user_id,
                 )
 
         if not stroke_batches:
@@ -691,17 +690,32 @@ async def get_copy_page(
                 detail=f"Copy page not found: pen_mac={pen_mac}, page={page_number}"
             )
 
-        # Serialize stroke batches
+        # Serialize stroke batches, dedup strokes by id across all batches
         serialized_batches = []
         total_strokes = 0
         detected_book_type = None
+        seen_stroke_ids: set = set()
 
         for batch in stroke_batches:
-            strokes = batch.get("strokes", [])
-            total_strokes += len(strokes)
+            raw_strokes = batch.get("strokes", [])
 
             if not detected_book_type:
                 detected_book_type = batch.get("book_type")
+
+            # Dedup strokes by id across all batches
+            unique_strokes = []
+            for s in raw_strokes:
+                sid = s.get("id") or s.get("strokeId")
+                if sid and sid in seen_stroke_ids:
+                    continue
+                if sid:
+                    seen_stroke_ids.add(sid)
+                unique_strokes.append(s)
+
+            if not unique_strokes:
+                continue
+
+            total_strokes += len(unique_strokes)
 
             ts_value = batch.get("timestamp")
             if isinstance(ts_value, datetime):
@@ -713,7 +727,7 @@ async def get_copy_page(
                 "id": str(batch.get("_id") or batch.get("id") or ""),
                 "session_id": batch.get("session_id"),
                 "timestamp": ts_iso,
-                "strokes": strokes,
+                "strokes": unique_strokes,
                 "canvas_background": batch.get("canvas_background"),
                 "page_style": batch.get("page_style")
             })
@@ -779,23 +793,27 @@ async def get_copy_page_svg(
             stroke_batches = await cursor.to_list(length=1000)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-            cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
+            if tenant_db is not None:
+                cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
+                stroke_batches = await cursor.to_list(length=1000)
+            else:
+                stroke_batches = []
 
-        # Fallback 1: canvas_pages collection
-        if not stroke_batches and not debug_all:
-            stroke_batches = await _get_canvas_page_as_batches(
+        # Always merge canvas_pages data (has newer strokes from live canvas)
+        if not debug_all:
+            canvas_batches = await _get_canvas_page_as_batches(
                 current_user, db,
                 page_number=page_number,
                 book_type=book_type,
                 pen_mac=pen_mac,
             )
-            if stroke_batches:
-                logger.info(
-                    "SVG from canvas_pages: pen_mac=%s page=%s", pen_mac, page_number,
-                )
+            if canvas_batches:
+                if stroke_batches:
+                    stroke_batches = stroke_batches + canvas_batches
+                else:
+                    stroke_batches = canvas_batches
 
-        # Fallback 2: pen backend remote API
+        # Fallback: pen backend remote API
         if not stroke_batches and not debug_all:
             stroke_batches = await _fetch_remote_strokes(
                 _resolve_forward_auth_header(request),
@@ -826,9 +844,26 @@ async def get_copy_page_svg(
                     detected_book_type = batch.get("book_type")
                     break
 
+        # Dedup strokes across batches (when merging strokes + canvas_pages)
+        seen_stroke_ids: set = set()
+        deduped_batches = []
+        for batch in stroke_batches:
+            raw_strokes = batch.get("strokes", [])
+            unique = []
+            for s in raw_strokes:
+                sid = s.get("id") or s.get("strokeId")
+                if sid and sid in seen_stroke_ids:
+                    continue
+                if sid:
+                    seen_stroke_ids.add(sid)
+                unique.append(s)
+            if unique:
+                deduped_batch = {**batch, "strokes": unique}
+                deduped_batches.append(deduped_batch)
+
         # Build SVG
         svg_content = build_svg_from_strokes(
-            stroke_batches,
+            deduped_batches,
             book_type=detected_book_type,
             background_color=background
         )
@@ -900,24 +935,26 @@ async def create_pin(
             stroke_batches = await cursor.to_list(length=1000)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-            cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
+            if tenant_db is not None:
+                cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
+                stroke_batches = await cursor.to_list(length=1000)
+            else:
+                stroke_batches = []
 
-        # Fallback 1: canvas_pages collection
-        if not stroke_batches:
-            stroke_batches = await _get_canvas_page_as_batches(
-                current_user, db,
-                page_number=payload.page_number,
-                book_type=payload.book_type,
-                pen_mac=payload.pen_mac,
-            )
+        # Always merge canvas_pages data (has newer strokes from live canvas)
+        canvas_batches = await _get_canvas_page_as_batches(
+            current_user, db,
+            page_number=payload.page_number,
+            book_type=payload.book_type,
+            pen_mac=payload.pen_mac,
+        )
+        if canvas_batches:
             if stroke_batches:
-                logger.info(
-                    "Pin creation from canvas_pages: pen_mac=%s page=%s user=%s",
-                    payload.pen_mac, payload.page_number, user_id,
-                )
+                stroke_batches = stroke_batches + canvas_batches
+            else:
+                stroke_batches = canvas_batches
 
-        # Fallback 2: pen backend remote API
+        # Fallback: pen backend remote API
         if not stroke_batches:
             stroke_batches = await _fetch_remote_strokes(
                 _resolve_forward_auth_header(raw_request),
