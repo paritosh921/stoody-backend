@@ -185,31 +185,35 @@ def build_svg_from_strokes(
         SVG document as string
     """
     width, height = get_canvas_dimensions(book_type)
-    
+
     # Calculate the bounding box of all strokes
     min_x, min_y, max_x, max_y = calculate_stroke_bounds(stroke_batches)
-    
-    # Calculate content dimensions
-    content_width = max_x - min_x
-    content_height = max_y - min_y
-    
-    # Add padding (10% on each side)
-    padding_x = content_width * 0.1 if content_width > 0 else 10
-    padding_y = content_height * 0.1 if content_height > 0 else 10
-    
-    # Calculate viewBox that contains all strokes with padding
-    view_min_x = min_x - padding_x
-    view_min_y = min_y - padding_y
-    view_width = content_width + (padding_x * 2)
-    view_height = content_height + (padding_y * 2)
-    
-    # Ensure minimum viewBox size and maintain aspect ratio
-    if view_width < 100:
-        view_width = 592
+
+    # Use page dimensions as viewBox (strokes are in page-space coordinates).
+    # Only fall back to stroke bounding box when strokes clearly exceed the
+    # page area (e.g. legacy data in raw pen coordinate space).
+    strokes_within_page = (
+        min_x != float('inf')  # has strokes
+        and max_x <= width * 1.05
+        and max_y <= height * 1.05
+    )
+
+    if strokes_within_page or min_x == float('inf'):
+        # Strokes fit within (or near) the page — use page dimensions as viewBox
         view_min_x = 0
-    if view_height < 100:
-        view_height = 840
         view_min_y = 0
+        view_width = float(width)
+        view_height = float(height)
+    else:
+        # Strokes exceed page dimensions — expand viewBox to fit all content
+        content_width = max_x - min_x
+        content_height = max_y - min_y
+        padding_x = content_width * 0.05 if content_width > 0 else 10
+        padding_y = content_height * 0.05 if content_height > 0 else 10
+        view_min_x = min_x - padding_x
+        view_min_y = min_y - padding_y
+        view_width = content_width + (padding_x * 2)
+        view_height = content_height + (padding_y * 2)
     
     # Start SVG document with viewBox that fits content
     svg_parts = [
