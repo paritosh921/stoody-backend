@@ -2868,9 +2868,9 @@ async def get_student_practice_sets(
         # Filter by subject if specified in query (explicit filter from frontend dropdown)
         if subject:
             filter_query["subject"] = subject
-        # NOTE: We intentionally do NOT filter by student_subjects here - students should
-        # see ALL content uploaded by their admin. The assigned subjects are for 
-        # personalization/recommendations, not for restricting access to content.
+        elif student_subjects and len(student_subjects) > 0:
+            # If student has specific subjects assigned, only show content for those subjects
+            filter_query["subject"] = {"$in": student_subjects}
 
         # Build $and conditions array for section and teacher_ids filtering
         and_conditions = []

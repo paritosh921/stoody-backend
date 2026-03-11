@@ -623,9 +623,12 @@ async def get_test_series_list(
                 # Both student.grade and document.standard come from admin settings, so they match exactly
                 if student_grade and not standard:  # Only if not already filtered by query param
                     filter_query["standard"] = student_grade
-                # NOTE: We intentionally do NOT filter by student_subjects or student_plan_types here.
-                # Students should see ALL content uploaded by their admin. The assigned subjects/plans
-                # are for personalization/recommendations, not for restricting access to content.
+                # Filter by student's assigned subjects if set
+                if student_subjects and len(student_subjects) > 0 and not subject:
+                    filter_query["subject"] = {"$in": student_subjects}
+                # Filter by student's assigned plan types if set
+                if student_plan_types and len(student_plan_types) > 0 and not course_plan:
+                    filter_query["course_plan"] = {"$in": student_plan_types}
 
         documents = await db.mongo_find("documents", filter_query, sort=[("title", 1)])
 
