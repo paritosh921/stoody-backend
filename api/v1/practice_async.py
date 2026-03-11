@@ -2556,6 +2556,7 @@ class PracticeSetStatsResponse(BaseModel):
 async def get_practice_attempts(
     request: Request,
     document_id: Optional[str] = Query(None, description="Filter by practice set document ID"),
+    question_id: Optional[str] = Query(None, description="Filter by specific question ID"),
     subject: Optional[str] = Query(None, description="Filter by subject"),
     limit: int = Query(50, le=200, description="Maximum number of attempts to return"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
@@ -2583,6 +2584,8 @@ async def get_practice_attempts(
         filter_dict = {"student_id": str(user_id)}
         if document_id:
             filter_dict["document_id"] = document_id
+        if question_id:
+            filter_dict["question_id"] = question_id
         if subject:
             filter_dict["subject"] = subject
         
