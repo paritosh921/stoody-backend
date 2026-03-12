@@ -609,10 +609,30 @@ async def list_copy_pages(
 
         logger.info(f"Found {len(pages)} copy pages for user {user_id}")
 
+        # Temporary _debug
+        _list_debug: Dict[str, Any] = {
+            "strokes_pages": len(pages) - (len(canvas_pages) if not debug_all and canvas_pages else 0),
+            "canvas_pages_merged": len(canvas_pages) if not debug_all and canvas_pages else 0,
+        }
+        if not debug_all:
+            try:
+                col = await _get_canvas_pages_collection(current_user, db)
+                if col:
+                    _list_debug["canvas_pages_total_in_db"] = await col.count_documents({
+                        "user_id": {"$in": user_identifiers}
+                    })
+                    _list_debug["canvas_pages_with_strokes"] = await col.count_documents({
+                        "user_id": {"$in": user_identifiers},
+                        "stroke_count": {"$gt": 0},
+                    })
+            except Exception:
+                pass
+
         return {
             "success": True,
             "total": len(pages),
-            "pages": pages
+            "pages": pages,
+            "_debug": _list_debug,
         }
 
     except HTTPException:
@@ -724,9 +744,14 @@ async def get_copy_page(
             if not detected_book_type:
                 detected_book_type = batch.get("book_type")
 
-            # Dedup strokes by id across all batches
+            # Filter strokes to this page + dedup by id
             unique_strokes = []
             for s in raw_strokes:
+                # Skip strokes that belong to a different page (cross-page contamination)
+                s_pn = s.get("pageNumber") if s.get("pageNumber") is not None else s.get("pageNo")
+                if s_pn is not None and int(s_pn) != page_number:
+                    continue
+
                 sid = s.get("id") or s.get("strokeId")
                 if sid and sid in seen_stroke_ids:
                     continue
@@ -891,13 +916,18 @@ async def get_copy_page_svg(
                     detected_book_type = batch.get("book_type")
                     break
 
-        # Dedup strokes across batches (when merging strokes + canvas_pages)
+        # Filter strokes to this page + dedup across batches
         seen_stroke_ids: set = set()
         deduped_batches = []
         for batch in stroke_batches:
             raw_strokes = batch.get("strokes", [])
             unique = []
             for s in raw_strokes:
+                # Skip strokes belonging to a different page
+                s_pn = s.get("pageNumber") if s.get("pageNumber") is not None else s.get("pageNo")
+                if s_pn is not None and int(s_pn) != page_number:
+                    continue
+
                 sid = s.get("id") or s.get("strokeId")
                 if sid and sid in seen_stroke_ids:
                     continue
