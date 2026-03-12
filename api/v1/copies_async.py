@@ -404,7 +404,7 @@ async def _get_canvas_page_as_batches(
 # COPY PAGE ENDPOINTS - List and retrieve student's copy pages
 # ============================================================================
 
-@router.get("", response_model=CopyPageListResponse)
+@router.get("")
 async def list_copy_pages(
     request: Request,
     pen_mac: Optional[str] = Query(None, description="Filter by pen MAC address"),
