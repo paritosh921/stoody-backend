@@ -754,13 +754,38 @@ async def get_copy_page(
                 "page_style": batch.get("page_style")
             })
 
+        # Temporary _debug — check browser Network tab
+        _debug = {
+            "user_id_from_jwt": str(user_id),
+            "username_from_jwt": current_user.get("username"),
+            "user_identifiers_queried": [str(u) for u in (user_identifiers if not debug_all else [])],
+            "query_used": {k: str(v) for k, v in query.items()},
+            "strokes_batches_found": len(stroke_batches) if stroke_batches else 0,
+            "canvas_batches_found": len(canvas_batches) if not debug_all and canvas_batches else 0,
+        }
+        # Sample distinct user_ids in strokes for this pen_mac
+        try:
+            if not is_b2c and tenant_db is not None:
+                _debug["distinct_user_ids_for_pen"] = await tenant_db["strokes"].distinct(
+                    "user_id", {"pen_mac": pen_mac.upper()}
+                )
+                _debug["total_strokes_for_pen"] = await tenant_db["strokes"].count_documents(
+                    {"pen_mac": pen_mac.upper()}
+                )
+                _debug["total_strokes_for_pen_and_page"] = await tenant_db["strokes"].count_documents(
+                    {"pen_mac": pen_mac.upper(), "page_number": page_number}
+                )
+        except Exception:
+            pass
+
         return {
             "success": True,
             "pen_mac": pen_mac.upper(),
             "book_type": detected_book_type or book_type,
             "page_number": page_number,
             "stroke_batches": serialized_batches,
-            "total_strokes": total_strokes
+            "total_strokes": total_strokes,
+            "_debug": _debug,
         }
 
     except HTTPException:

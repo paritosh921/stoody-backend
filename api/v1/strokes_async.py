@@ -848,23 +848,7 @@ async def list_canvas_pages(
     )
     sliced = pages[offset: offset + limit]
 
-    # Temporary debug info — inspect via browser network tab on GET /strokes/pages
-    debug: Dict[str, Any] = {
-        "resolved_user_ids": [str(u) for u in user_ids],
-        "canvas_pages_found": len(docs),
-        "legacy_strokes_col_available": strokes_col is not None,
-    }
-    if strokes_col is not None:
-        try:
-            debug["strokes_total_docs"] = await strokes_col.count_documents({})
-            debug["strokes_matched_docs"] = await strokes_col.count_documents({"user_id": {"$in": user_ids}})
-            debug["strokes_distinct_user_ids"] = [
-                str(u) for u in await strokes_col.distinct("user_id")
-            ][:20]
-        except Exception:
-            pass
-
-    return {"count": len(sliced), "pages": sliced, "_debug": debug}
+    return {"count": len(sliced), "pages": sliced}
 
 
 @router.get("/pages/{book_type}/{page_number}")
@@ -921,6 +905,28 @@ async def get_canvas_page(
     doc.pop("_id", None)
     if isinstance(doc.get("last_modified"), datetime):
         doc["last_modified"] = doc["last_modified"].isoformat()
+
+    # Temporary debug — visible in browser Network tab on page load
+    debug: Dict[str, Any] = {
+        "resolved_user_ids": [str(u) for u in user_ids],
+        "canvas_pages_found": doc is not None and doc.get("source") != "legacy_strokes",
+        "legacy_merge_ran": strokes_col is not None,
+    }
+    if strokes_col is not None:
+        try:
+            debug["strokes_total_docs"] = await strokes_col.count_documents({})
+            debug["strokes_matched_docs"] = await strokes_col.count_documents(
+                {"user_id": {"$in": user_ids}, "book_type": book_type.upper(), "page_number": page_number}
+            )
+            debug["strokes_all_matched_user"] = await strokes_col.count_documents(
+                {"user_id": {"$in": user_ids}}
+            )
+            debug["strokes_distinct_user_ids"] = [
+                str(u) for u in await strokes_col.distinct("user_id")
+            ][:20]
+        except Exception:
+            pass
+    doc["_debug"] = debug
 
     return doc
 
