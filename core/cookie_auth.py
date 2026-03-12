@@ -7,9 +7,10 @@ import logging
 import secrets
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta, timezone
-from fastapi import Request, Response, HTTPException, status
+from fastapi import Depends, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
 
+from core.auth import AuthManager
 from config_async import (
     JWT_SECRET_KEY,
     JWT_ALGORITHM,
@@ -160,9 +161,14 @@ class CookieAuthManager:
 cookie_auth_manager = CookieAuthManager()
 
 
+async def _get_auth_manager(request: Request) -> AuthManager:
+    """Local dependency to retrieve AuthManager from app state (avoids circular import)."""
+    return request.app.state.auth
+
+
 async def get_current_user_dual_auth(
     request: Request,
-    auth_manager
+    auth_manager: AuthManager = Depends(_get_auth_manager)
 ) -> Dict[str, Any]:
     """
     Dual authentication: Try cookie first, then Authorization header
