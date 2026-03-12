@@ -744,12 +744,19 @@ async def get_copy_page(
             if not detected_book_type:
                 detected_book_type = batch.get("book_type")
 
-            # Filter strokes to this page + dedup by id
+            # Filter strokes to this page + matching book_type + dedup by id
+            batch_bt = (batch.get("book_type") or "").upper()
+            req_bt = (book_type or detected_book_type or "").upper()
             unique_strokes = []
             for s in raw_strokes:
-                # Skip strokes that belong to a different page (cross-page contamination)
+                # Skip strokes that belong to a different page
                 s_pn = s.get("pageNumber") if s.get("pageNumber") is not None else s.get("pageNo")
                 if s_pn is not None and int(s_pn) != page_number:
+                    continue
+
+                # Skip strokes whose book type doesn't match the request
+                s_bt = (s.get("bookType") or "").upper()
+                if s_bt and req_bt and s_bt != req_bt:
                     continue
 
                 sid = s.get("id") or s.get("strokeId")
@@ -916,7 +923,8 @@ async def get_copy_page_svg(
                     detected_book_type = batch.get("book_type")
                     break
 
-        # Filter strokes to this page + dedup across batches
+        # Filter strokes to this page + matching book_type + dedup across batches
+        req_bt = (detected_book_type or "").upper()
         seen_stroke_ids: set = set()
         deduped_batches = []
         for batch in stroke_batches:
@@ -926,6 +934,11 @@ async def get_copy_page_svg(
                 # Skip strokes belonging to a different page
                 s_pn = s.get("pageNumber") if s.get("pageNumber") is not None else s.get("pageNo")
                 if s_pn is not None and int(s_pn) != page_number:
+                    continue
+
+                # Skip strokes whose book type doesn't match
+                s_bt = (s.get("bookType") or "").upper()
+                if s_bt and req_bt and s_bt != req_bt:
                     continue
 
                 sid = s.get("id") or s.get("strokeId")
