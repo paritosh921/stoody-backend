@@ -806,7 +806,8 @@ async def update_student(
     student_id: str,
     update: UpdateStudentRequest,
     current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
-    db: DatabaseManager = Depends(get_database)
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache)
 ):
     """Update student details or status"""
     try:
@@ -861,6 +862,13 @@ async def update_student(
 
         if update_fields:
             await db.mongo_update_one("students", query, {"$set": update_fields})
+
+        # Invalidate cached students lists and dashboard stats
+        try:
+            await cache.clear_pattern("students:*", "admin")
+            await cache.delete("dashboard_stats", "admin")
+        except Exception:
+            pass
 
         # Return updated document
         updated = await db.mongo_find_one("students", query, projection={"password_hash": 0})
