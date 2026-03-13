@@ -335,6 +335,82 @@ class DatabaseManager:
                 name="uniq_practice_topic"
             )
 
+            # Canvas pages: merge-then-deduplicate before unique index
+            canvas_pages = db["canvas_pages"]
+            try:
+                pipeline = [
+                    {"$group": {
+                        "_id": {"user_id": "$user_id", "book_type": "$book_type", "page_number": "$page_number"},
+                        "doc_ids": {"$push": "$_id"},
+                        "count": {"$sum": 1}
+                    }},
+                    {"$match": {"count": {"$gt": 1}}}
+                ]
+                async for group in canvas_pages.aggregate(pipeline):
+                    doc_ids = group["doc_ids"]
+                    # Fetch full docs to merge strokes
+                    full_docs = []
+                    async for doc in canvas_pages.find({"_id": {"$in": doc_ids}}):
+                        full_docs.append(doc)
+
+                    if not full_docs:
+                        continue
+
+                    # Pick the winner: highest stroke_count, then latest last_modified
+                    full_docs.sort(
+                        key=lambda d: (d.get("stroke_count", 0), d.get("last_modified", "")),
+                        reverse=True,
+                    )
+                    winner = full_docs[0]
+                    losers = full_docs[1:]
+
+                    # Merge strokes from losers into winner (deduplicate by stroke id)
+                    winner_strokes = winner.get("strokes") or []
+                    seen_ids = {s.get("id") for s in winner_strokes if s.get("id")}
+                    merged_count = 0
+                    for loser in losers:
+                        for stroke in (loser.get("strokes") or []):
+                            sid = stroke.get("id")
+                            if sid:
+                                if sid in seen_ids:
+                                    continue
+                                seen_ids.add(sid)
+                            # No id → always keep (cannot deduplicate)
+                            winner_strokes.append(stroke)
+                            merged_count += 1
+
+                    # Update winner with merged strokes if any were added
+                    if merged_count > 0:
+                        await canvas_pages.update_one(
+                            {"_id": winner["_id"]},
+                            {"$set": {
+                                "strokes": winner_strokes,
+                                "stroke_count": len(winner_strokes),
+                            }},
+                        )
+
+                    # Delete losers
+                    loser_ids = [d["_id"] for d in losers]
+                    if loser_ids:
+                        await canvas_pages.delete_many({"_id": {"$in": loser_ids}})
+                        logger.info(
+                            "Deduped canvas_pages: merged %d strokes, removed %d docs for (%s, %s, %s)",
+                            merged_count,
+                            len(loser_ids),
+                            group["_id"]["user_id"],
+                            group["_id"]["book_type"],
+                            group["_id"]["page_number"],
+                        )
+            except Exception as e:
+                logger.warning(f"canvas_pages dedup failed (non-fatal): {e}")
+
+            await self._ensure_index_with_spec_check(
+                canvas_pages,
+                [("user_id", 1), ("book_type", 1), ("page_number", 1)],
+                unique=True,
+                name="uniq_canvas_page"
+            )
+
             cls_queue = db["classification_queue"]
             await self._ensure_index_with_spec_check(
                 cls_queue,
