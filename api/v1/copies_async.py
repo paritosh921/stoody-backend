@@ -95,6 +95,7 @@ async def get_current_user_from_token_or_query(
 
 class CopyPageSummary(BaseModel):
     """Summary of a copy page (aggregated from stroke batches)"""
+    id: Optional[str] = None
     pen_mac: str
     book_type: Optional[str] = None
     page_number: int
@@ -103,6 +104,10 @@ class CopyPageSummary(BaseModel):
     last_activity: datetime
     canvas_background: Optional[str] = None
     session_id: Optional[str] = None
+    subject: Optional[str] = None
+    topic: Optional[str] = None
+    confidence: Optional[float] = None
+    thumbnail_url: Optional[str] = None
 
 
 class CopyPageListResponse(BaseModel):
@@ -182,6 +187,18 @@ async def _get_canvas_pages_collection(current_user: Dict[str, Any], db: Databas
     return tenant_db["canvas_pages"] if tenant_db is not None else None
 
 
+async def _get_note_classifications_collection(current_user: Dict[str, Any], db: DatabaseManager):
+    """Return the note_classifications collection for the user's tenant/B2C database."""
+    is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+    if is_b2c:
+        return db.b2c_db["note_classifications"]
+    db_name = current_user.get("db_name")
+    if not db_name:
+        return None
+    tenant_db = await db.get_tenant_db(db_name)
+    return tenant_db["note_classifications"] if tenant_db is not None else None
+
+
 async def _list_canvas_pages_for_user(
     current_user: Dict[str, Any],
     db: DatabaseManager,
@@ -194,6 +211,7 @@ async def _list_canvas_pages_for_user(
     col = await _get_canvas_pages_collection(current_user, db)
     if col is None:
         return []
+    classify_col = await _get_note_classifications_collection(current_user, db)
 
     user_identifiers = _build_user_id_variants(current_user)
 
@@ -209,6 +227,25 @@ async def _list_canvas_pages_for_user(
     except Exception as exc:
         logger.warning("canvas_pages query failed: %s", exc)
         return []
+
+    classifications: Dict[tuple[str, int], Dict[str, Any]] = {}
+    if classify_col is not None and docs:
+        page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
+        book_types = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
+        class_query: Dict[str, Any] = {
+            "user_id": {"$in": user_identifiers},
+            "page_number": {"$in": page_numbers},
+            "book_type": {"$in": book_types},
+        }
+        try:
+            class_docs = await classify_col.find(class_query).to_list(length=None)
+            for doc in class_docs:
+                key = ((doc.get("book_type") or "STANDARD").upper(), int(doc.get("page_number")))
+                existing = classifications.get(key)
+                if existing is None or (doc.get("updated_at") or doc.get("created_at") or datetime.min) >= (existing.get("updated_at") or existing.get("created_at") or datetime.min):
+                    classifications[key] = doc
+        except Exception as exc:
+            logger.warning("note_classifications query failed for copies: %s", exc)
 
     grouped: Dict[tuple[str, int], Dict[str, Any]] = {}
     for d in docs:
@@ -243,7 +280,9 @@ async def _list_canvas_pages_for_user(
         key = (bt, int(pn))
         existing = grouped.get(key)
         if existing is None:
+            classification = classifications.get(key)
             grouped[key] = {
+                "id": str(classification.get("_id")) if classification and classification.get("_id") else None,
                 "pen_mac": d.get("pen_mac") or "canvas",
                 "book_type": bt,
                 "page_number": int(pn),
@@ -252,6 +291,10 @@ async def _list_canvas_pages_for_user(
                 "last_activity": last_activity,
                 "canvas_background": d.get("canvas_background"),
                 "session_id": d.get("session_id"),
+                "subject": classification.get("subject") if classification else None,
+                "topic": classification.get("topic") if classification else None,
+                "confidence": classification.get("confidence") if classification else None,
+                "thumbnail_url": classification.get("thumbnail_url") if classification else None,
             }
             continue
 
@@ -263,6 +306,14 @@ async def _list_canvas_pages_for_user(
             existing["pen_mac"] = d.get("pen_mac") or existing["pen_mac"]
             existing["canvas_background"] = d.get("canvas_background") or existing.get("canvas_background")
             existing["session_id"] = d.get("session_id") or existing.get("session_id")
+
+        classification = classifications.get(key)
+        if classification:
+            existing["id"] = existing.get("id") or (str(classification.get("_id")) if classification.get("_id") else None)
+            existing["subject"] = classification.get("subject") or existing.get("subject")
+            existing["topic"] = classification.get("topic") or existing.get("topic")
+            existing["confidence"] = classification.get("confidence") if classification.get("confidence") is not None else existing.get("confidence")
+            existing["thumbnail_url"] = classification.get("thumbnail_url") or existing.get("thumbnail_url")
 
         existing["total_strokes"] = max(existing["total_strokes"], int(d.get("stroke_count", 0) or 0))
 
