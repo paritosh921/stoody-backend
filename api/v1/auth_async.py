@@ -2269,7 +2269,11 @@ async def remote_logout(
             continue
         try:
             payload = pyjwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
-            user_id = payload.get("user_id") or payload.get("sub")
+            user_id = (
+                payload.get("sub")
+                or payload.get("user_id")
+                or payload.get("username")
+            )
             if user_id:
                 break
         except pyjwt.InvalidTokenError:
@@ -2290,13 +2294,22 @@ async def remote_logout(
     # The pen backend may store the username as user_id, while the main
     # backend uses the MongoDB ObjectId.  We revoke ALL known identifiers
     # so the /verify check (which uses ObjectId) always finds the flag.
-    ids_to_revoke = set()
-    ids_to_revoke.add(user_id)
+    ids_to_revoke = {
+        str(candidate)
+        for candidate in (
+            payload.get("sub"),
+            payload.get("user_id"),
+            payload.get("username"),
+            user_id,
+        )
+        if candidate
+    }
 
-    # Also grab username from the token if different from user_id
-    token_username = payload.get("username")
-    if token_username:
-        ids_to_revoke.add(token_username)
+    lookup_username = None
+    for candidate in (payload.get("username"), payload.get("user_id")):
+        if isinstance(candidate, str) and candidate:
+            lookup_username = candidate
+            break
 
     # Resolve username → MongoDB ObjectId via tenant DB lookup
     db_name = payload.get("db_name")
@@ -2304,33 +2317,46 @@ async def remote_logout(
         try:
             tenant_db = await db.get_tenant_db(db_name)
             if tenant_db is not None:
-                # Try to find student by username (case-insensitive)
-                student = await tenant_db["students"].find_one(
-                    {"username_lower": user_id.lower()},
-                    {"_id": 1}
-                )
-                if not student:
-                    # Fallback: try exact username match
+                student = None
+                if lookup_username:
+                    # Try to find student by username (case-insensitive)
                     student = await tenant_db["students"].find_one(
-                        {"username": user_id},
+                        {"username_lower": lookup_username.lower()},
                         {"_id": 1}
                     )
+                    if not student:
+                        # Fallback: try exact username match
+                        student = await tenant_db["students"].find_one(
+                            {"username": lookup_username},
+                            {"_id": 1}
+                        )
                 if student:
                     ids_to_revoke.add(str(student["_id"]))
-                else:
-                    logger.warning("Remote logout: could not resolve username '%s' in %s", user_id, db_name)
+                elif lookup_username:
+                    logger.warning(
+                        "Remote logout: could not resolve username '%s' in %s",
+                        lookup_username,
+                        db_name,
+                    )
 
-                # Also check if user_id is already an ObjectId (try admins/tutors too)
+                # Also check if any token identifier is already an ObjectId
+                # (students/admins/tutors). This covers tokens that already carry
+                # the canonical MongoDB id in `sub`.
                 if not student:
-                    try:
-                        oid = ObjectId(user_id)
+                    found_canonical_id = False
+                    for candidate in list(ids_to_revoke):
+                        try:
+                            oid = ObjectId(candidate)
+                        except Exception:
+                            continue
                         for coll_name in ("students", "admins", "tutors"):
                             doc = await tenant_db[coll_name].find_one({"_id": oid}, {"_id": 1})
                             if doc:
                                 ids_to_revoke.add(str(doc["_id"]))
+                                found_canonical_id = True
                                 break
-                    except Exception:
-                        pass  # user_id is not a valid ObjectId, that's fine
+                        if found_canonical_id:
+                            break
             else:
                 logger.warning("Remote logout: tenant DB '%s' not found", db_name)
         except Exception as e:
