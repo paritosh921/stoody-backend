@@ -102,6 +102,7 @@ class CopyPageSummary(BaseModel):
     first_activity: datetime
     last_activity: datetime
     canvas_background: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class CopyPageListResponse(BaseModel):
@@ -203,17 +204,18 @@ async def _list_canvas_pages_for_user(
         query["book_type"] = book_type.upper()
 
     try:
-        cursor = col.find(query, {"strokes": 0}).sort("last_modified", -1).limit(limit)
-        docs = await cursor.to_list(length=limit)
+        cursor = col.find(query, {"strokes": 0}).sort("last_modified", -1).limit(limit * 5)
+        docs = await cursor.to_list(length=limit * 5)
     except Exception as exc:
         logger.warning("canvas_pages query failed: %s", exc)
         return []
 
-    results: List[Dict[str, Any]] = []
+    grouped: Dict[tuple[str, int], Dict[str, Any]] = {}
     for d in docs:
         pn = d.get("page_number")
         if pn is None:
             continue
+        bt = (d.get("book_type") or "STANDARD").upper()
 
         last_mod = d.get("last_modified")
         if isinstance(last_mod, datetime):
@@ -238,16 +240,34 @@ async def _list_canvas_pages_for_user(
             if last_activity_ts > last_activity:
                 last_activity = last_activity_ts
 
-        results.append({
-            "pen_mac": d.get("pen_mac") or "canvas",
-            "book_type": d.get("book_type"),
-            "page_number": pn,
-            "total_strokes": d.get("stroke_count", 0),
-            "first_activity": first_activity,
-            "last_activity": last_activity,
-            "canvas_background": d.get("canvas_background"),
-        })
-    return results
+        key = (bt, int(pn))
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "pen_mac": d.get("pen_mac") or "canvas",
+                "book_type": bt,
+                "page_number": int(pn),
+                "total_strokes": int(d.get("stroke_count", 0) or 0),
+                "first_activity": first_activity,
+                "last_activity": last_activity,
+                "canvas_background": d.get("canvas_background"),
+                "session_id": d.get("session_id"),
+            }
+            continue
+
+        if first_activity < existing["first_activity"]:
+            existing["first_activity"] = first_activity
+
+        if last_activity >= existing["last_activity"]:
+            existing["last_activity"] = last_activity
+            existing["pen_mac"] = d.get("pen_mac") or existing["pen_mac"]
+            existing["canvas_background"] = d.get("canvas_background") or existing.get("canvas_background")
+            existing["session_id"] = d.get("session_id") or existing.get("session_id")
+
+        existing["total_strokes"] = max(existing["total_strokes"], int(d.get("stroke_count", 0) or 0))
+
+    results = sorted(grouped.values(), key=lambda p: p["last_activity"], reverse=True)
+    return results[:limit]
 
 
 async def _get_canvas_page_as_batches(
@@ -273,28 +293,35 @@ async def _get_canvas_page_as_batches(
         query["book_type"] = book_type.upper()
 
     try:
-        doc = await col.find_one(query)
+        docs = await col.find(query).sort("last_modified", 1).to_list(length=None)
     except Exception as exc:
         logger.warning("canvas_pages single-page query failed: %s", exc)
         return []
 
-    if not doc or not doc.get("strokes"):
+    if not docs:
         return []
 
-    last_mod = doc.get("last_modified")
-    ts: Any = last_mod if isinstance(last_mod, datetime) else datetime.utcnow()
+    batches: List[Dict[str, Any]] = []
+    for doc in docs:
+        if not doc.get("strokes"):
+            continue
 
-    return [{
-        "_id": doc.get("_id"),
-        "session_id": doc.get("session_id"),
-        "timestamp": ts,
-        "strokes": doc["strokes"],
-        "canvas_background": doc.get("canvas_background"),
-        "page_style": doc.get("page_style"),
-        "book_type": doc.get("book_type"),
-        "pen_mac": doc.get("pen_mac") or "canvas",
-        "source": "canvas_pages",
-    }]
+        last_mod = doc.get("last_modified")
+        ts: Any = last_mod if isinstance(last_mod, datetime) else datetime.utcnow()
+
+        batches.append({
+            "_id": doc.get("_id"),
+            "session_id": doc.get("session_id"),
+            "timestamp": ts,
+            "strokes": doc["strokes"],
+            "canvas_background": doc.get("canvas_background"),
+            "page_style": doc.get("page_style"),
+            "book_type": doc.get("book_type"),
+            "pen_mac": doc.get("pen_mac") or "canvas",
+            "source": "canvas_pages",
+        })
+
+    return batches
 
 
 # ============================================================================
