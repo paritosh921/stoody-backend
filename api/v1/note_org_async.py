@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
 from core.user_identity import canvas_user_id_variants
+from utils.s3_storage import get_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,7 @@ async def get_topics(
                 )
 
         thumbnails = [
-            p.get("thumbnail_url") for p in r.get("pages", [])[:5]
+            get_public_url(p["thumbnail_url"]) for p in r.get("pages", [])[:5]
             if p.get("thumbnail_url")
         ]
 
@@ -269,7 +270,6 @@ async def get_page_thumbnail(
     if not doc or not doc.get("thumbnail_url"):
         raise HTTPException(status_code=404, detail="Thumbnail not found")
 
-    from utils.s3_storage import get_public_url
     url = get_public_url(doc["thumbnail_url"])
     return {"success": True, "thumbnail_url": url}
 
@@ -938,12 +938,13 @@ async def delete_page(
 
 def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Dict[str, Any]:
     """Convert a MongoDB note_classifications document to a page dict."""
+    thumbnail_url = doc.get("thumbnail_url")
     page: Dict[str, Any] = {
         "id": str(doc["_id"]),
         "pen_mac": doc.get("pen_mac"),
         "book_type": doc.get("book_type"),
         "page_number": doc.get("page_number"),
-        "thumbnail_url": doc.get("thumbnail_url"),
+        "thumbnail_url": get_public_url(thumbnail_url) if thumbnail_url else None,
         "confidence": doc.get("confidence"),
         "classification_source": doc.get("classification_source"),
         "ocr_text_preview": (doc.get("ocr_text") or "")[:200],
