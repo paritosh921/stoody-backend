@@ -107,7 +107,7 @@ class CopyPageSummary(BaseModel):
     subject: Optional[str] = None
     topic: Optional[str] = None
     confidence: Optional[float] = None
-    thumbnail_url: Optional[str] = None
+    is_favorite: bool = False
 
 
 class CopyPageListResponse(BaseModel):
@@ -294,7 +294,7 @@ async def _list_canvas_pages_for_user(
                 "subject": classification.get("subject") if classification else None,
                 "topic": classification.get("topic") if classification else None,
                 "confidence": classification.get("confidence") if classification else None,
-                "thumbnail_url": classification.get("thumbnail_url") if classification else None,
+                "is_favorite": bool(classification.get("is_favorite")) if classification else False,
             }
             continue
 
@@ -313,7 +313,7 @@ async def _list_canvas_pages_for_user(
             existing["subject"] = classification.get("subject") or existing.get("subject")
             existing["topic"] = classification.get("topic") or existing.get("topic")
             existing["confidence"] = classification.get("confidence") if classification.get("confidence") is not None else existing.get("confidence")
-            existing["thumbnail_url"] = classification.get("thumbnail_url") or existing.get("thumbnail_url")
+            existing["is_favorite"] = bool(classification.get("is_favorite")) if classification.get("is_favorite") is not None else existing.get("is_favorite", False)
 
         existing["total_strokes"] = max(existing["total_strokes"], int(d.get("stroke_count", 0) or 0))
 
