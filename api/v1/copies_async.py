@@ -592,7 +592,8 @@ async def get_copy_page_svg(
             content=svg_content,
             media_type="image/svg+xml",
             headers={
-                "Content-Disposition": f'inline; filename="copy-page-{page_number}.svg"'
+                "Content-Disposition": f'inline; filename="copy-page-{page_number}.svg"',
+                "Cache-Control": "no-store, must-revalidate",
             }
         )
 
