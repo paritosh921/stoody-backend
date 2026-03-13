@@ -2317,7 +2317,8 @@ async def remote_logout(
                     )
                 if student:
                     ids_to_revoke.add(str(student["_id"]))
-                    logger.info(f"Remote logout: resolved username '{user_id}' → ObjectId '{student['_id']}'")
+                else:
+                    logger.warning("Remote logout: could not resolve username '%s' in %s", user_id, db_name)
 
                 # Also check if user_id is already an ObjectId (try admins/tutors too)
                 if not student:
@@ -2330,15 +2331,17 @@ async def remote_logout(
                                 break
                     except Exception:
                         pass  # user_id is not a valid ObjectId, that's fine
+            else:
+                logger.warning("Remote logout: tenant DB '%s' not found", db_name)
         except Exception as e:
-            logger.warning(f"Remote logout: tenant DB lookup failed: {e}")
+            logger.warning("Remote logout: tenant DB lookup failed: %s", e)
+    else:
+        logger.warning("Remote logout: no db_name in token for user '%s'", user_id)
 
     # User-level (Redis) revocation for ALL known identifiers
     for uid in ids_to_revoke:
         await revoke_user_session(auth_manager.cache_manager, uid)
         await auth_manager.invalidate_user_session(uid)
-
-    logger.info(f"Remote logout: revoked identifiers {ids_to_revoke}")
     return {"success": True, "message": "Successfully logged out"}
 
 

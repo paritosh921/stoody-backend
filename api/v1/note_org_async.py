@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
+from core.user_identity import canvas_user_id_variants
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +71,11 @@ async def get_subjects(
     if tenant_db is None:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    user_id = current_user.get("user_id") or current_user.get("_id")
-    if isinstance(user_id, ObjectId):
-        user_id = str(user_id)
+    user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     pipeline = [
-        {"$match": {"user_id": user_id, "is_archived": {"$ne": True}}},
+        {"$match": {"user_id": uid_match, "is_archived": {"$ne": True}}},
         {"$group": {
             "_id": "$subject",
             "topic_count": {"$addToSet": "$topic"},
@@ -112,9 +112,10 @@ async def get_topics(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     pipeline = [
-        {"$match": {"user_id": user_id, "subject": subject, "is_archived": {"$ne": True}}},
+        {"$match": {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}}},
         {"$group": {
             "_id": "$topic",
             "page_count": {"$sum": 1},
@@ -143,7 +144,7 @@ async def get_topics(
         new_pages_since_gen = 0
         for collection in ["note_flashcards", "note_practice_sets"]:
             existing = await tenant_db[collection].find_one(
-                {"user_id": user_id, "subject": subject, "topic": topic_name},
+                {"user_id": uid_match, "subject": subject, "topic": topic_name},
                 {"source_page_count": 1},
             )
             if existing:
@@ -184,9 +185,10 @@ async def get_subject_pages(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject, "is_archived": {"$ne": True}},
+        {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}},
     ).sort("updated_at", -1)
 
     pages = []
@@ -196,7 +198,7 @@ async def get_subject_pages(
         pages.append(p)
 
     # Batch-enrich pages missing session info from strokes
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
 
     return {"success": True, "subject": subject, "pages": pages}
 
@@ -218,9 +220,10 @@ async def get_topic_pages(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject, "topic": topic, "is_archived": {"$ne": True}},
+        {"user_id": uid_match, "subject": subject, "topic": topic, "is_archived": {"$ne": True}},
     ).sort("page_number", 1)
 
     pages = []
@@ -228,7 +231,7 @@ async def get_topic_pages(
         pages.append(_doc_to_page(doc))
 
     # Batch-enrich pages missing session info from strokes
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
 
     return {"success": True, "subject": subject, "topic": topic, "pages": pages}
 
@@ -251,10 +254,11 @@ async def get_page_thumbnail(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     doc = await tenant_db["note_classifications"].find_one(
         {
-            "user_id": user_id,
+            "user_id": uid_match,
             "pen_mac": pen_mac.upper(),
             "book_type": book_type,
             "page_number": page_number,
@@ -287,12 +291,13 @@ async def reclassify_page(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    variants = canvas_user_id_variants(current_user)
 
     if not body.subject.strip() or not body.topic.strip():
         raise HTTPException(status_code=400, detail="Subject and topic must not be empty")
 
     doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
-    if not doc or doc.get("user_id") != user_id:
+    if not doc or str(doc.get("user_id", "")) not in variants:
         raise HTTPException(status_code=404, detail="Classification not found")
 
     now = datetime.utcnow()
@@ -332,6 +337,7 @@ async def batch_reclassify(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     if not body.subject.strip() or not body.topic.strip():
         raise HTTPException(status_code=400, detail="Subject and topic must not be empty")
@@ -340,7 +346,7 @@ async def batch_reclassify(
     now = datetime.utcnow()
 
     result = await tenant_db["note_classifications"].update_many(
-        {"_id": {"$in": ids}, "user_id": user_id},
+        {"_id": {"$in": ids}, "user_id": uid_match},
         {"$set": {
             "subject": body.subject,
             "topic": body.topic,
@@ -373,11 +379,12 @@ async def generate_flashcards(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     # Check for cached flashcards
     if not body.force:
         existing = await tenant_db["note_flashcards"].find_one(
-            {"user_id": user_id, "subject": subject, "topic": topic}
+            {"user_id": uid_match, "subject": subject, "topic": topic}
         )
         if existing:
             existing["_id"] = str(existing["_id"])
@@ -385,7 +392,7 @@ async def generate_flashcards(
 
     # Get OCR text from classified pages
     pages = await tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject, "topic": topic},
+        {"user_id": uid_match, "subject": subject, "topic": topic},
         {"ocr_text": 1, "pen_mac": 1, "book_type": 1, "page_number": 1},
     ).to_list(50)
 
@@ -420,11 +427,12 @@ async def generate_practice(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     # Check for cached practice set
     if not body.force:
         existing = await tenant_db["note_practice_sets"].find_one(
-            {"user_id": user_id, "subject": subject, "topic": topic}
+            {"user_id": uid_match, "subject": subject, "topic": topic}
         )
         if existing:
             existing["_id"] = str(existing["_id"])
@@ -432,7 +440,7 @@ async def generate_practice(
 
     # Get OCR text from classified pages
     pages = await tenant_db["note_classifications"].find(
-        {"user_id": user_id, "subject": subject, "topic": topic},
+        {"user_id": uid_match, "subject": subject, "topic": topic},
         {"ocr_text": 1, "pen_mac": 1, "book_type": 1, "page_number": 1},
     ).to_list(50)
 
@@ -466,9 +474,10 @@ async def get_flashcards(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     doc = await tenant_db["note_flashcards"].find_one(
-        {"user_id": user_id, "subject": subject, "topic": topic}
+        {"user_id": uid_match, "subject": subject, "topic": topic}
     )
     if not doc:
         return {"success": True, "flashcards": None}
@@ -494,9 +503,10 @@ async def get_practice(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     doc = await tenant_db["note_practice_sets"].find_one(
-        {"user_id": user_id, "subject": subject, "topic": topic}
+        {"user_id": uid_match, "subject": subject, "topic": topic}
     )
     if not doc:
         return {"success": True, "practice": None}
@@ -544,11 +554,12 @@ async def get_stats(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
-    total_pages = await tenant_db["note_classifications"].count_documents({"user_id": user_id})
+    total_pages = await tenant_db["note_classifications"].count_documents({"user_id": uid_match})
 
     pipeline = [
-        {"$match": {"user_id": user_id}},
+        {"$match": {"user_id": uid_match}},
         {"$group": {
             "_id": "$subject",
             "count": {"$sum": 1},
@@ -559,14 +570,14 @@ async def get_stats(
         by_subject[doc["_id"]] = doc["count"]
 
     pending_queue = await tenant_db["classification_queue"].count_documents(
-        {"user_id": user_id, "status": "pending"}
+        {"user_id": uid_match, "status": "pending"}
     )
     failed_queue = await tenant_db["classification_queue"].count_documents(
-        {"user_id": user_id, "status": "failed"}
+        {"user_id": uid_match, "status": "failed"}
     )
 
-    flashcard_sets = await tenant_db["note_flashcards"].count_documents({"user_id": user_id})
-    practice_sets = await tenant_db["note_practice_sets"].count_documents({"user_id": user_id})
+    flashcard_sets = await tenant_db["note_flashcards"].count_documents({"user_id": uid_match})
+    practice_sets = await tenant_db["note_practice_sets"].count_documents({"user_id": uid_match})
 
     return {
         "success": True,
@@ -606,13 +617,10 @@ async def backfill_classifications(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
-    # Build user_id match the same way copies_async.py does (strokes store
-    # user_id in varying formats: str, ObjectId, or username).
-    user_identifiers: list = [user_id, str(user_id)]
-    username = current_user.get("username")
-    if username:
-        user_identifiers.append(username)
+    # Build user_id match covering ObjectId variant for strokes collection
+    user_identifiers = canvas_user_id_variants(current_user)
     try:
         if ObjectId.is_valid(user_id):
             user_identifiers.append(ObjectId(user_id))
@@ -636,7 +644,7 @@ async def backfill_classifications(
     classify_db = strokes_db if is_b2c else await db.get_tenant_db(db_name)
     already = set()
     async for doc in classify_db["note_classifications"].find(
-        {"user_id": user_id},
+        {"user_id": uid_match},
         {"pen_mac": 1, "book_type": 1, "page_number": 1},
     ):
         already.add((doc.get("pen_mac", ""), doc.get("book_type", ""), doc.get("page_number", 0)))
@@ -681,8 +689,9 @@ async def get_all_pages(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
-    query: Dict[str, Any] = {"user_id": user_id}
+    query: Dict[str, Any] = {"user_id": uid_match}
     query["is_archived"] = True if archived_only else {"$ne": True}
     if favorites_only:
         query["is_favorite"] = True
@@ -704,7 +713,7 @@ async def get_all_pages(
     async for doc in cursor:
         pages.append(_doc_to_page(doc, include_subject_topic=True))
 
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
 
     return {"success": True, "pages": pages}
 
@@ -726,12 +735,13 @@ async def search_notes(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
 
     import re as _re
     safe_q = _re.escape(q)
     regex = {"$regex": safe_q, "$options": "i"}
 
-    base_match: Dict[str, Any] = {"user_id": user_id}
+    base_match: Dict[str, Any] = {"user_id": uid_match}
     base_match["is_archived"] = {"$ne": True}
 
     if scope == "subject":
@@ -764,7 +774,7 @@ async def search_notes(
     async for doc in cursor:
         pages.append(_doc_to_page(doc, include_subject_topic=True))
 
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages)
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
 
     return {"success": True, "query": q, "scope": scope, "pages": pages}
 
@@ -785,9 +795,10 @@ async def toggle_favorite(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    variants = canvas_user_id_variants(current_user)
 
     doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
-    if not doc or doc.get("user_id") != user_id:
+    if not doc or str(doc.get("user_id", "")) not in variants:
         raise HTTPException(status_code=404, detail="Classification not found")
 
     new_value = not doc.get("is_favorite", False)
@@ -812,9 +823,10 @@ async def set_archive_status(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    variants = canvas_user_id_variants(current_user)
 
     doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
-    if not doc or doc.get("user_id") != user_id:
+    if not doc or str(doc.get("user_id", "")) not in variants:
         raise HTTPException(status_code=404, detail="Classification not found")
 
     await tenant_db["note_classifications"].update_one(
@@ -837,10 +849,11 @@ async def batch_archive(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
     ids = [ObjectId(cid) for cid in body.classification_ids]
 
     result = await tenant_db["note_classifications"].update_many(
-        {"_id": {"$in": ids}, "user_id": user_id},
+        {"_id": {"$in": ids}, "user_id": uid_match},
         {"$set": {"is_archived": body.archived, "updated_at": datetime.utcnow()}},
     )
 
@@ -859,9 +872,10 @@ async def delete_page(
         raise HTTPException(status_code=503, detail="Database not available")
 
     user_id = _get_user_id(current_user)
+    variants = canvas_user_id_variants(current_user)
 
     doc = await tenant_db["note_classifications"].find_one({"_id": ObjectId(classification_id)})
-    if not doc or doc.get("user_id") != user_id:
+    if not doc or str(doc.get("user_id", "")) not in variants:
         raise HTTPException(status_code=404, detail="Classification not found")
 
     pen_mac = doc.get("pen_mac", "")
@@ -887,20 +901,34 @@ async def delete_page(
         "page_number": page_number,
     })
 
-    # 3. Delete classification queue entry if exists
+    # 3. Delete canvas_pages document for this page
+    canvas_pages_deleted = 0
+    try:
+        cp_result = await tenant_db["canvas_pages"].delete_many({
+            "user_id": {"$in": variants},
+            "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
+            "book_type": book_type,
+            "page_number": page_number,
+        })
+        canvas_pages_deleted = cp_result.deleted_count
+    except Exception as e:
+        logger.warning(f"Failed to delete canvas_pages for page {page_number}: {e}")
+
+    # 4. Delete classification queue entry if exists
     await tenant_db["classification_queue"].delete_many({
-        "user_id": user_id,
+        "user_id": {"$in": variants},
         "pen_mac": pen_mac.upper(),
         "book_type": book_type,
         "page_number": page_number,
     })
 
-    # 4. Delete the classification doc itself
+    # 5. Delete the classification doc itself
     await tenant_db["note_classifications"].delete_one({"_id": ObjectId(classification_id)})
 
     return {
         "success": True,
         "deleted_strokes": stroke_result.deleted_count,
+        "deleted_canvas_pages": canvas_pages_deleted,
     }
 
 
@@ -940,20 +968,29 @@ def _get_user_id(current_user: Dict[str, Any]) -> str:
     return str(uid) if uid else ""
 
 
+def _user_id_match(current_user: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a ``{"$in": [...]}`` clause covering all known user_id variants."""
+    return {"$in": canvas_user_id_variants(current_user)}
+
+
 async def _enrich_pages_with_session_info(
-    tenant_db, user_id: str, pages: List[Dict[str, Any]]
+    tenant_db, user_id: str, pages: List[Dict[str, Any]],
+    user_id_variants: Optional[List[str]] = None,
 ) -> None:
     """Batch-enrich pages missing session_id by looking up strokes."""
     pages_needing_session = [p for p in pages if not p.get("session_id")]
     if not pages_needing_session:
         return
 
+    # Use full variant set if provided, otherwise fall back to ObjectId pair
+    uid_list: list = list(user_id_variants) if user_id_variants else [user_id, str(user_id)]
+
     page_conditions = [
         {"pen_mac": p["pen_mac"], "book_type": p["book_type"], "page_number": p["page_number"]}
         for p in pages_needing_session
     ]
     pipeline = [
-        {"$match": {"user_id": {"$in": [user_id, str(user_id)]}, "$or": page_conditions}},
+        {"$match": {"user_id": {"$in": uid_list}, "$or": page_conditions}},
         {"$sort": {"timestamp": -1}},
         {"$group": {
             "_id": {"pen_mac": "$pen_mac", "book_type": "$book_type", "page_number": "$page_number"},

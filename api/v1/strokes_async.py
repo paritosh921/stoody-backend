@@ -20,6 +20,7 @@ from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
 from core.permissions import has_permission
 from core.pen_tokens import decode_pen_token
+from core.user_identity import canonical_canvas_user_id
 
 logger = logging.getLogger(__name__)
 
@@ -382,12 +383,7 @@ def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
     return deduped
 
 
-def _canonical_canvas_user_id(current_user: Dict[str, Any]) -> str:
-    """Use username-style identity as the canonical owner id for page data."""
-    username = current_user.get("username")
-    if username:
-        return str(username)
-    return str(current_user["user_id"])
+_canonical_canvas_user_id = canonical_canvas_user_id  # back-compat alias
 
 
 def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now: datetime) -> Dict[str, Any]:

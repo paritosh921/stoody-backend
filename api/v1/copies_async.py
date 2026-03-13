@@ -6,24 +6,22 @@ Provides endpoints for:
 2. Retrieving strokes for a specific copy page
 3. Creating/managing pinned copies (PDF snapshots)
 
-This integrates with the BLE agent's stroke storage to provide a "My Copy" 
-feature in the Learning Mode of the student frontend.
+Data source: ``canvas_pages`` collection (single source of truth).
 """
 
 import asyncio
 import logging
-import os
 import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from bson import ObjectId
-import httpx
 
 from fastapi import APIRouter, HTTPException, Request, Depends, Query, status, Header
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
+from core.user_identity import canonical_canvas_user_id, canvas_user_id_variants
 from api.v1.auth_async import get_current_user, get_database, get_auth_manager
 from core.auth import AuthManager
 from utils.s3_storage import upload_file, download_file as s3_download_file, get_public_url
@@ -32,99 +30,6 @@ from utils.stroke_pdf_generator import generate_copy_pdf, generate_copy_thumbnai
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copies", tags=["Student Copies"])
-
-DEFAULT_PEN_BACKEND_URL = "https://pkg5ywq5pcb5mby95dxirdffxi7oc2m7.stoody.in"
-
-
-def _resolve_pen_backend_history_url() -> Optional[str]:
-    """
-    Resolve the pen backend strokes-history endpoint.
-    Accepts either:
-    - PEN_BACKEND_URL=https://host
-    - PEN_BACKEND_URL=https://host/api/v1
-    """
-    base = (
-        os.getenv("PEN_BACKEND_URL")
-        or os.getenv("STOODY_PEN_BACKEND_URL")
-        or os.getenv("VITE_PEN_BACKEND_URL")
-        or DEFAULT_PEN_BACKEND_URL
-    )
-    if not base:
-        return None
-
-    normalized = base.rstrip("/")
-    if normalized.endswith("/api/v1"):
-        return f"{normalized}/agent/strokes/history"
-    return f"{normalized}/api/v1/agent/strokes/history"
-
-
-def _resolve_forward_auth_header(request: Optional[Request]) -> Optional[str]:
-    """
-    Resolve a bearer token to forward to pen backend fallback APIs.
-    Prefers Authorization header; falls back to cookie-auth token.
-    """
-    if request is None:
-        return None
-
-    auth_header = request.headers.get("Authorization")
-    if auth_header:
-        return auth_header
-
-    cookie_token = request.cookies.get("stoody_auth_token")
-    if cookie_token:
-        return f"Bearer {cookie_token}"
-
-    return None
-
-
-async def _fetch_remote_strokes(
-    authorization_header: Optional[str],
-    *,
-    pen_mac: Optional[str] = None,
-    page_number: Optional[int] = None,
-    book_type: Optional[str] = None,
-    limit: int = 2000,
-    order: str = "desc",
-) -> List[Dict[str, Any]]:
-    """
-    Fetch stroke batches from pen backend for the authenticated user.
-    Used as a fallback path when local tenant DB strokes are unavailable/empty.
-    """
-    endpoint = _resolve_pen_backend_history_url()
-    if not endpoint or not authorization_header:
-        return []
-
-    params: Dict[str, Any] = {
-        "limit": max(1, min(int(limit), 5000)),
-        "order": "asc" if order == "asc" else "desc",
-    }
-    if pen_mac:
-        params["pen_mac"] = pen_mac.upper()
-    if page_number is not None:
-        params["page_number"] = page_number
-    if book_type:
-        params["book_type"] = book_type
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(
-                endpoint,
-                params=params,
-                headers={"Authorization": authorization_header},
-            )
-            if resp.status_code >= 400:
-                logger.warning(
-                    "Pen backend stroke fallback failed: %s %s",
-                    resp.status_code,
-                    resp.text[:200] if resp.text else "",
-                )
-                return []
-            data = resp.json()
-            strokes = data.get("strokes", [])
-            return strokes if isinstance(strokes, list) else []
-    except Exception as exc:
-        logger.warning("Pen backend stroke fallback error: %s", exc)
-        return []
 
 
 # Custom dependency that accepts token from query param (for image sources)
@@ -144,14 +49,14 @@ async def get_current_user_from_token_or_query(
         jwt_token = authorization[7:]
     elif token:
         jwt_token = token
-    
+
     if not jwt_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
     try:
         # Check if token is revoked
         from core.token_blacklist import token_blacklist
@@ -161,18 +66,18 @@ async def get_current_user_from_token_or_query(
                 detail="Token has been revoked",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
+
         user_data = await auth_manager.verify_token_and_get_user(jwt_token)
-        
+
         if not user_data:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication credentials",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
+
         return user_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -197,7 +102,7 @@ class CopyPageSummary(BaseModel):
     first_activity: datetime
     last_activity: datetime
     canvas_background: Optional[str] = None
-    
+
 
 class CopyPageListResponse(BaseModel):
     """Response for listing copy pages"""
@@ -249,8 +154,20 @@ class PinnedCopyListResponse(BaseModel):
 
 
 # ============================================================================
-# Helpers — canvas_pages fallback (server-side canvas sync collection)
+# Helpers — canvas_pages (single source of truth)
 # ============================================================================
+
+def _build_user_id_variants(current_user: Dict[str, Any]) -> list:
+    """Build all user_id variants including ObjectId for canvas_pages queries."""
+    variants: list = list(canvas_user_id_variants(current_user))
+    uid = current_user.get("user_id")
+    try:
+        if uid and ObjectId.is_valid(uid):
+            variants.append(ObjectId(uid))
+    except Exception:
+        pass
+    return variants
+
 
 async def _get_canvas_pages_collection(current_user: Dict[str, Any], db: DatabaseManager):
     """Return the canvas_pages collection for the user's tenant/B2C database."""
@@ -277,17 +194,7 @@ async def _list_canvas_pages_for_user(
     if col is None:
         return []
 
-    # Build all user_id variants for legacy compat
-    user_id = current_user.get("user_id")
-    user_identifiers: list = [user_id, str(user_id)]
-    username = current_user.get("username")
-    if username:
-        user_identifiers.append(username)
-    try:
-        if ObjectId.is_valid(user_id):
-            user_identifiers.append(ObjectId(user_id))
-    except Exception:
-        pass
+    user_identifiers = _build_user_id_variants(current_user)
 
     query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "stroke_count": {"$gt": 0}}
     if pen_mac:
@@ -359,17 +266,7 @@ async def _get_canvas_page_as_batches(
     if col is None:
         return []
 
-    # Build all user_id variants for legacy compat
-    user_id = current_user.get("user_id")
-    user_identifiers: list = [user_id, str(user_id)]
-    username = current_user.get("username")
-    if username:
-        user_identifiers.append(username)
-    try:
-        if ObjectId.is_valid(user_id):
-            user_identifiers.append(ObjectId(user_id))
-    except Exception:
-        pass
+    user_identifiers = _build_user_id_variants(current_user)
 
     query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "page_number": page_number}
     if book_type:
@@ -410,229 +307,24 @@ async def list_copy_pages(
     pen_mac: Optional[str] = Query(None, description="Filter by pen MAC address"),
     book_type: Optional[str] = Query(None, description="Filter by book type (A4, A5)"),
     limit: int = Query(50, ge=1, le=200, description="Max pages to return"),
-    debug_all: bool = Query(False, description="Debug: Show all strokes without user filter"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
     """
     List copy pages for the authenticated student.
 
-    Returns a summary of all pages written with the smart pen or live canvas,
+    Returns a summary of all pages from the ``canvas_pages`` collection,
     grouped by (pen_mac, book_type, page_number) with stroke counts.
-    Merges data from both `strokes` (pen batches) and `canvas_pages` (canvas sync).
     """
     try:
-        user_id = current_user.get("user_id")
-        db_name = current_user.get("db_name")
-        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-
-        logger.info(f"Listing copy pages for user_id={user_id}, db_name={db_name}, is_b2c={is_b2c}, debug_all={debug_all}")
-
-        # Build match stage for aggregation
-        if debug_all:
-            # DEBUG MODE: Show all strokes to diagnose user_id matching issues
-            match_stage = {}
-            logger.warning(f"DEBUG MODE: Showing all strokes without user filter")
-        else:
-            # Normal mode: filter by user_id or username
-            # Strokes might be keyed by user_id (str/ObjectId) OR username
-            user_identifiers = [user_id, str(user_id)]
-
-            # Add username if available
-            username = current_user.get("username")
-            if username:
-                user_identifiers.append(username)
-
-            # Also try ObjectId format
-            try:
-                if ObjectId.is_valid(user_id):
-                    user_identifiers.append(ObjectId(user_id))
-            except:
-                pass
-
-            match_stage = {"user_id": {"$in": user_identifiers}}
-        if pen_mac:
-            match_stage["pen_mac"] = pen_mac.upper()
-        if book_type:
-            match_stage["book_type"] = book_type
-
-        # Aggregation pipeline to group strokes by page
-        pipeline = [
-            {"$match": match_stage},
-            {"$group": {
-                "_id": {
-                    "pen_mac": "$pen_mac",
-                    "book_type": "$book_type",
-                    "page_number": "$page_number"
-                },
-                "total_strokes": {"$sum": {"$size": {"$ifNull": ["$strokes", []]}}},
-                "first_activity": {"$min": "$timestamp"},
-                "last_activity": {"$max": "$timestamp"},
-                "canvas_background": {"$first": "$canvas_background"}
-            }},
-            {"$sort": {"last_activity": -1}},
-            {"$limit": limit}
-        ]
-
-        # Execute aggregation on strokes collection
-        if is_b2c:
-            cursor = db.b2c_db["strokes"].aggregate(pipeline)
-        else:
-            tenant_db = await db.get_tenant_db(db_name)
-            if tenant_db is None:
-                logger.error(f"Tenant database not available: {db_name}")
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Tenant database not available"
-                )
-            cursor = tenant_db["strokes"].aggregate(pipeline)
-
-        # Process results from strokes collection
-        pages = []
-        async for doc in cursor:
-            page_id = doc["_id"]
-            # Skip pages without a page number
-            if page_id.get("page_number") is None:
-                continue
-
-            pages.append({
-                "pen_mac": page_id.get("pen_mac", ""),
-                "book_type": page_id.get("book_type"),
-                "page_number": page_id.get("page_number", 0),
-                "total_strokes": doc.get("total_strokes", 0),
-                "first_activity": doc.get("first_activity"),
-                "last_activity": doc.get("last_activity"),
-                "canvas_background": doc.get("canvas_background")
-            })
-
-        # ── Merge canvas_pages (server-side canvas sync) ──
-        if not debug_all:
-            canvas_pages = await _list_canvas_pages_for_user(
-                current_user, db, pen_mac=pen_mac, book_type=book_type, limit=limit,
-            )
-            if canvas_pages:
-                # Build a lookup of existing pages from strokes collection
-                existing: Dict[tuple, int] = {}
-                for idx, p in enumerate(pages):
-                    key = (str(p.get("book_type") or "").upper(), p.get("page_number"))
-                    existing[key] = idx
-
-                for cp in canvas_pages:
-                    key = (str(cp.get("book_type") or "").upper(), cp.get("page_number"))
-                    if key in existing:
-                        # Merge: keep the entry with more strokes, update activity times
-                        idx = existing[key]
-                        old = pages[idx]
-                        if cp["total_strokes"] > old.get("total_strokes", 0):
-                            pages[idx] = cp
-                        else:
-                            # Update activity bounds from canvas_pages
-                            cp_last = cp.get("last_activity")
-                            old_last = old.get("last_activity")
-                            if cp_last and old_last and cp_last > old_last:
-                                old["last_activity"] = cp_last
-                    else:
-                        pages.append(cp)
-
-                # Re-sort by last_activity descending and trim to limit
-                pages.sort(
-                    key=lambda p: p.get("last_activity") or datetime.min,
-                    reverse=True,
-                )
-                pages = pages[:limit]
-
-        # Fallback path: fetch from pen backend if tenant strokes are empty/missing.
-        if not pages and not debug_all:
-            remote_docs = await _fetch_remote_strokes(
-                _resolve_forward_auth_header(request),
-                pen_mac=pen_mac,
-                book_type=book_type,
-                limit=max(limit * 50, 2000),
-                order="desc",
-            )
-            if remote_docs:
-                grouped: Dict[tuple[str, Optional[str], int], Dict[str, Any]] = {}
-                for doc in remote_docs:
-                    page_no = doc.get("page_number")
-                    if page_no is None:
-                        continue
-                    try:
-                        page_no_int = int(page_no)
-                    except Exception:
-                        continue
-                    key_pen_mac = str(doc.get("pen_mac", "")).upper()
-                    key_book_type = doc.get("book_type")
-                    key = (key_pen_mac, key_book_type, page_no_int)
-
-                    ts = doc.get("timestamp")
-                    try:
-                        if isinstance(ts, str):
-                            ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        elif isinstance(ts, datetime):
-                            ts_dt = ts
-                        else:
-                            ts_dt = datetime.utcnow()
-                    except Exception:
-                        ts_dt = datetime.utcnow()
-
-                    strokes_count = len(doc.get("strokes", []) or [])
-                    if key not in grouped:
-                        grouped[key] = {
-                            "pen_mac": key_pen_mac,
-                            "book_type": key_book_type,
-                            "page_number": page_no_int,
-                            "total_strokes": strokes_count,
-                            "first_activity": ts_dt,
-                            "last_activity": ts_dt,
-                            "canvas_background": doc.get("canvas_background"),
-                        }
-                    else:
-                        entry = grouped[key]
-                        entry["total_strokes"] += strokes_count
-                        if ts_dt < entry["first_activity"]:
-                            entry["first_activity"] = ts_dt
-                        if ts_dt > entry["last_activity"]:
-                            entry["last_activity"] = ts_dt
-                        if not entry.get("canvas_background"):
-                            entry["canvas_background"] = doc.get("canvas_background")
-
-                pages = sorted(
-                    grouped.values(),
-                    key=lambda p: p.get("last_activity") or datetime.min,
-                    reverse=True,
-                )[:limit]
-                logger.info(
-                    "Copy pages fallback via pen backend: %d pages for user %s",
-                    len(pages),
-                    user_id,
-                )
-
-        logger.info(f"Found {len(pages)} copy pages for user {user_id}")
-
-        # Temporary _debug
-        _list_debug: Dict[str, Any] = {
-            "strokes_pages": len(pages) - (len(canvas_pages) if not debug_all and canvas_pages else 0),
-            "canvas_pages_merged": len(canvas_pages) if not debug_all and canvas_pages else 0,
-        }
-        if not debug_all:
-            try:
-                col = await _get_canvas_pages_collection(current_user, db)
-                if col:
-                    _list_debug["canvas_pages_total_in_db"] = await col.count_documents({
-                        "user_id": {"$in": user_identifiers}
-                    })
-                    _list_debug["canvas_pages_with_strokes"] = await col.count_documents({
-                        "user_id": {"$in": user_identifiers},
-                        "stroke_count": {"$gt": 0},
-                    })
-            except Exception:
-                pass
+        pages = await _list_canvas_pages_for_user(
+            current_user, db, pen_mac=pen_mac, book_type=book_type, limit=limit,
+        )
 
         return {
             "success": True,
             "total": len(pages),
             "pages": pages,
-            "_debug": _list_debug,
         }
 
     except HTTPException:
@@ -651,80 +343,21 @@ async def get_copy_page(
     pen_mac: str,
     page_number: int,
     book_type: Optional[str] = Query(None, description="Filter by book type"),
-    debug_all: bool = Query(False, description="Debug: Skip user filter"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
     """
     Get all strokes for a specific copy page.
-    
+
     Returns all stroke batches for the given pen_mac + page_number combination.
     """
     try:
-        user_id = current_user.get("user_id")
-        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        logger.info(f"Getting copy page: pen_mac={pen_mac}, page={page_number} for user {user_id}, debug_all={debug_all}")
-        
-        query = {
-            "pen_mac": pen_mac.upper(),
-            "page_number": page_number
-        }
-        if not debug_all:
-            # Check for user_id (str/ObjectId) OR username
-            user_identifiers = [user_id, str(user_id)]
-            username = current_user.get("username")
-            if username:
-                user_identifiers.append(username)
-                
-            query["user_id"] = {"$in": user_identifiers}
-        if book_type:
-            query["book_type"] = book_type
-        
-        # Fetch stroke batches from strokes collection
-        if is_b2c:
-            cursor = db.b2c_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
-        else:
-            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-            if tenant_db is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Tenant database not available"
-                )
-            cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
-
-        # Always merge canvas_pages data (has newer strokes from live canvas)
-        if not debug_all:
-            canvas_batches = await _get_canvas_page_as_batches(
-                current_user, db,
-                page_number=page_number,
-                book_type=book_type,
-                pen_mac=pen_mac,
-            )
-            if canvas_batches:
-                if stroke_batches:
-                    # Merge: append canvas_pages batch, dedup happens at stroke level
-                    stroke_batches = stroke_batches + canvas_batches
-                else:
-                    stroke_batches = canvas_batches
-
-        # Fallback: pen backend remote API
-        if not stroke_batches and not debug_all:
-            stroke_batches = await _fetch_remote_strokes(
-                _resolve_forward_auth_header(request),
-                pen_mac=pen_mac,
-                page_number=page_number,
-                book_type=book_type,
-                limit=5000,
-                order="asc",
-            )
-            if stroke_batches:
-                logger.info(
-                    "Copy page fallback via pen backend: pen_mac=%s page=%s user=%s",
-                    pen_mac, page_number, user_id,
-                )
+        stroke_batches = await _get_canvas_page_as_batches(
+            current_user, db,
+            page_number=page_number,
+            book_type=book_type,
+            pen_mac=pen_mac,
+        )
 
         if not stroke_batches:
             raise HTTPException(
@@ -786,30 +419,6 @@ async def get_copy_page(
                 "page_style": batch.get("page_style")
             })
 
-        # Temporary _debug — check browser Network tab
-        _debug = {
-            "user_id_from_jwt": str(user_id),
-            "username_from_jwt": current_user.get("username"),
-            "user_identifiers_queried": [str(u) for u in (user_identifiers if not debug_all else [])],
-            "query_used": {k: str(v) for k, v in query.items()},
-            "strokes_batches_found": len(stroke_batches) if stroke_batches else 0,
-            "canvas_batches_found": len(canvas_batches) if not debug_all and canvas_batches else 0,
-        }
-        # Sample distinct user_ids in strokes for this pen_mac
-        try:
-            if not is_b2c and tenant_db is not None:
-                _debug["distinct_user_ids_for_pen"] = await tenant_db["strokes"].distinct(
-                    "user_id", {"pen_mac": pen_mac.upper()}
-                )
-                _debug["total_strokes_for_pen"] = await tenant_db["strokes"].count_documents(
-                    {"pen_mac": pen_mac.upper()}
-                )
-                _debug["total_strokes_for_pen_and_page"] = await tenant_db["strokes"].count_documents(
-                    {"pen_mac": pen_mac.upper(), "page_number": page_number}
-                )
-        except Exception:
-            pass
-
         return {
             "success": True,
             "pen_mac": pen_mac.upper(),
@@ -817,7 +426,6 @@ async def get_copy_page(
             "page_number": page_number,
             "stroke_batches": serialized_batches,
             "total_strokes": total_strokes,
-            "_debug": _debug,
         }
 
     except HTTPException:
@@ -837,77 +445,21 @@ async def get_copy_page_svg(
     page_number: int,
     book_type: Optional[str] = Query(None, description="Book type"),
     background: str = Query("#FFFBF0", description="Background color"),
-    debug_all: bool = Query(False, description="Debug: Skip user filter"),
     current_user: Dict[str, Any] = Depends(get_current_user_from_token_or_query),
     db: DatabaseManager = Depends(get_database)
 ):
     """
     Get the copy page rendered as an SVG.
-    
+
     Useful for previews and client-side rendering.
     """
     try:
-        user_id = current_user.get("user_id")
-        is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        # Build query (skip user_id filter in debug mode)
-        query = {
-            "pen_mac": pen_mac.upper(),
-            "page_number": page_number
-        }
-        if not debug_all:
-            # Check for user_id (str/ObjectId) OR username
-            user_identifiers = [user_id, str(user_id)]
-            username = current_user.get("username")
-            if username:
-                user_identifiers.append(username)
-                
-            query["user_id"] = {"$in": user_identifiers}
-        if book_type:
-            query["book_type"] = book_type
-        
-        # Fetch stroke batches from strokes collection
-        if is_b2c:
-            cursor = db.b2c_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
-        else:
-            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-            if tenant_db is not None:
-                cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
-                stroke_batches = await cursor.to_list(length=1000)
-            else:
-                stroke_batches = []
-
-        # Always merge canvas_pages data (has newer strokes from live canvas)
-        if not debug_all:
-            canvas_batches = await _get_canvas_page_as_batches(
-                current_user, db,
-                page_number=page_number,
-                book_type=book_type,
-                pen_mac=pen_mac,
-            )
-            if canvas_batches:
-                if stroke_batches:
-                    stroke_batches = stroke_batches + canvas_batches
-                else:
-                    stroke_batches = canvas_batches
-
-        # Fallback: pen backend remote API
-        if not stroke_batches and not debug_all:
-            stroke_batches = await _fetch_remote_strokes(
-                _resolve_forward_auth_header(request),
-                pen_mac=pen_mac,
-                page_number=page_number,
-                book_type=book_type,
-                limit=5000,
-                order="asc",
-            )
-            if stroke_batches:
-                logger.info(
-                    "SVG fallback via pen backend: pen_mac=%s page=%s",
-                    pen_mac,
-                    page_number,
-                )
+        stroke_batches = await _get_canvas_page_as_batches(
+            current_user, db,
+            page_number=page_number,
+            book_type=book_type,
+            pen_mac=pen_mac,
+        )
 
         if not stroke_batches:
             raise HTTPException(
@@ -996,116 +548,67 @@ async def create_pin(
 ):
     """
     Pin a copy page as a PDF.
-    
+
     This creates a PDF snapshot of the copy page and stores it for later access.
     """
     try:
-        user_id = current_user.get("user_id")
+        user_id = canonical_canvas_user_id(current_user)
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
+
         logger.info(f"Creating pin for user {user_id}: pen_mac={payload.pen_mac}, page={payload.page_number}")
-        
-        # Fetch stroke batches for this page
-        # Check for user_id (str/ObjectId) OR username
-        user_identifiers = [user_id, str(user_id)]
-        username = current_user.get("username")
-        if username:
-            user_identifiers.append(username)
 
-        query = {
-            "user_id": {"$in": user_identifiers},
-            "pen_mac": payload.pen_mac.upper(),
-            "page_number": payload.page_number
-        }
-        if payload.book_type:
-            query["book_type"] = payload.book_type
-        
-        if is_b2c:
-            cursor = db.b2c_db["strokes"].find(query).sort("timestamp", 1)
-            stroke_batches = await cursor.to_list(length=1000)
-        else:
-            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-            if tenant_db is not None:
-                cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
-                stroke_batches = await cursor.to_list(length=1000)
-            else:
-                stroke_batches = []
-
-        # Always merge canvas_pages data (has newer strokes from live canvas)
-        canvas_batches = await _get_canvas_page_as_batches(
+        # Fetch stroke batches from canvas_pages
+        stroke_batches = await _get_canvas_page_as_batches(
             current_user, db,
             page_number=payload.page_number,
             book_type=payload.book_type,
             pen_mac=payload.pen_mac,
         )
-        if canvas_batches:
-            if stroke_batches:
-                stroke_batches = stroke_batches + canvas_batches
-            else:
-                stroke_batches = canvas_batches
-
-        # Fallback: pen backend remote API
-        if not stroke_batches:
-            stroke_batches = await _fetch_remote_strokes(
-                _resolve_forward_auth_header(raw_request),
-                pen_mac=payload.pen_mac,
-                page_number=payload.page_number,
-                book_type=payload.book_type,
-                limit=5000,
-                order="asc",
-            )
-            if stroke_batches:
-                logger.info(
-                    "Pin creation fallback via pen backend: pen_mac=%s page=%s user=%s",
-                    payload.pen_mac,
-                    payload.page_number,
-                    user_id,
-                )
 
         if not stroke_batches:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Copy page not found - no strokes available to pin"
             )
-        
+
         # Generate PDF
         pdf_bytes = await generate_copy_pdf(
             stroke_batches,
             book_type=payload.book_type
         )
-        
+
         if not pdf_bytes:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to generate PDF - please ensure svglib and reportlab are installed"
             )
-        
+
         # Generate thumbnail (optional, may fail if cairosvg not available)
         thumbnail_bytes = await generate_copy_thumbnail(
             stroke_batches,
             book_type=payload.book_type,
             scale=0.15
         )
-        
+
         # Generate unique ID and paths
         pin_id = str(uuid.uuid4())
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         pdf_local_path = f"uploads/pinned_copies/{user_id}/{pin_id}_{timestamp}.pdf"
         thumbnail_local_path = f"uploads/pinned_copies/{user_id}/{pin_id}_{timestamp}_thumb.png" if thumbnail_bytes else None
-        
+
         # Upload PDF to storage
         success, pdf_storage_path = await upload_file(
             pdf_bytes,
             pdf_local_path,
             content_type="application/pdf"
         )
-        
+
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to store PDF"
             )
-        
+
         # Upload thumbnail if available
         thumbnail_storage_path = None
         if thumbnail_bytes and thumbnail_local_path:
@@ -1114,12 +617,12 @@ async def create_pin(
                 thumbnail_local_path,
                 content_type="image/png"
             )
-        
-        # Create pin record
+
+        # Create pin record — use canonical (username-style) user_id
         auto_title = payload.title or f"Copy Page {payload.page_number}"
         if payload.linked_document_id:
             auto_title = f"{auto_title} - Learning Notes"
-        
+
         pin_doc = {
             "_id": pin_id,
             "user_id": user_id,
@@ -1135,14 +638,14 @@ async def create_pin(
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
-        
+
         # Insert into database
         if is_b2c:
             await db.b2c_insert_one("pinned_copies", pin_doc)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             await tenant_db["pinned_copies"].insert_one(pin_doc)
-        
+
         logger.info(f"Created pin {pin_id} for user {user_id}")
 
         # Queue note classification for this page (best-effort)
@@ -1169,7 +672,7 @@ async def create_pin(
             "thumbnail_path": thumbnail_storage_path,
             "message": "Copy page pinned successfully"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1190,13 +693,11 @@ async def list_pins(
     List all pinned copies for the authenticated student.
     """
     try:
-        user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        logger.info(f"Listing pins for user {user_id}")
-        
-        query = {"user_id": user_id}
-        
+        uid_match = {"$in": canvas_user_id_variants(current_user)}
+
+        query = {"user_id": uid_match}
+
         if is_b2c:
             cursor = db.b2c_db["pinned_copies"].find(query).sort("created_at", -1).limit(limit)
             pins = await cursor.to_list(length=limit)
@@ -1204,7 +705,7 @@ async def list_pins(
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             cursor = tenant_db["pinned_copies"].find(query).sort("created_at", -1).limit(limit)
             pins = await cursor.to_list(length=limit)
-        
+
         # Serialize pins
         serialized_pins = []
         for pin in pins:
@@ -1222,13 +723,13 @@ async def list_pins(
                 "stroke_count": pin.get("stroke_count", 0),
                 "created_at": pin.get("created_at").isoformat() if pin.get("created_at") else None
             })
-        
+
         return {
             "success": True,
             "total": len(serialized_pins),
             "pins": serialized_pins
         }
-        
+
     except Exception as e:
         logger.error(f"Failed to list pins: {e}")
         raise HTTPException(
@@ -1247,23 +748,23 @@ async def get_pin(
     Get details of a specific pinned copy.
     """
     try:
-        user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        query = {"_id": pin_id, "user_id": user_id}
-        
+        uid_match = {"$in": canvas_user_id_variants(current_user)}
+
+        query = {"_id": pin_id, "user_id": uid_match}
+
         if is_b2c:
             pin = await db.b2c_find_one("pinned_copies", query)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             pin = await tenant_db["pinned_copies"].find_one(query)
-        
+
         if not pin:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pinned copy not found"
             )
-        
+
         return {
             "success": True,
             "pin": {
@@ -1281,7 +782,7 @@ async def get_pin(
                 "created_at": pin.get("created_at").isoformat() if pin.get("created_at") else None
             }
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1302,39 +803,39 @@ async def get_pin_file(
     Stream the PDF file for a pinned copy.
     """
     try:
-        user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        query = {"_id": pin_id, "user_id": user_id}
-        
+        uid_match = {"$in": canvas_user_id_variants(current_user)}
+
+        query = {"_id": pin_id, "user_id": uid_match}
+
         if is_b2c:
             pin = await db.b2c_find_one("pinned_copies", query)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             pin = await tenant_db["pinned_copies"].find_one(query)
-        
+
         if not pin:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pinned copy not found"
             )
-        
+
         pdf_path = pin.get("pdf_path")
         if not pdf_path:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDF file not found"
             )
-        
+
         # Download from storage
         pdf_bytes = await s3_download_file(pdf_path)
-        
+
         if not pdf_bytes:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="PDF file not found in storage"
             )
-        
+
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
@@ -1343,7 +844,7 @@ async def get_pin_file(
                 "Content-Length": str(len(pdf_bytes))
             }
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1364,31 +865,28 @@ async def delete_pin(
     Delete a pinned copy.
     """
     try:
-        user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
-        query = {"_id": pin_id, "user_id": user_id}
-        
+        uid_match = {"$in": canvas_user_id_variants(current_user)}
+
+        query = {"_id": pin_id, "user_id": uid_match}
+
         if is_b2c:
             result = await db.b2c_delete_one("pinned_copies", query)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             result = await tenant_db["pinned_copies"].delete_one(query)
-        
+
         if result.deleted_count == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pinned copy not found"
             )
-        
-        # Note: We don't delete the PDF from storage to allow for potential recovery
-        # A cleanup job could be added later to remove orphaned files
-        
+
         return {
             "success": True,
             "message": "Pinned copy deleted successfully"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1410,38 +908,38 @@ async def update_pin(
     Update a pinned copy's title.
     """
     try:
-        user_id = current_user.get("user_id")
         is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
-        
+        uid_match = {"$in": canvas_user_id_variants(current_user)}
+
         body = await request.json()
         new_title = body.get("title")
-        
+
         if not new_title:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Title is required"
             )
-        
-        query = {"_id": pin_id, "user_id": user_id}
+
+        query = {"_id": pin_id, "user_id": uid_match}
         update = {"$set": {"title": new_title, "updated_at": datetime.utcnow()}}
-        
+
         if is_b2c:
             result = await db.b2c_update_one("pinned_copies", query, update)
         else:
             tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             result = await tenant_db["pinned_copies"].update_one(query, update)
-        
+
         if result.modified_count == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pinned copy not found"
             )
-        
+
         return {
             "success": True,
-            "message": "Pinned copy updated successfully"
+            "message": "Pin updated successfully"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
