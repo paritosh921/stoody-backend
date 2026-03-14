@@ -23,6 +23,12 @@ from config_async import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# In-memory cache for min_token_issued_at (avoids DB hit on every request)
+# ---------------------------------------------------------------------------
+_min_iat_cache: Dict[str, Any] = {"value": None, "fetched_at": 0.0}
+_MIN_IAT_CACHE_TTL = 60  # seconds
+
 # bcrypt 72-byte password limit
 BCRYPT_MAX_BYTES = 72
 
@@ -50,6 +56,45 @@ class AuthManager:
     def set_cache_manager(self, cache_manager):
         """Set cache manager for session caching"""
         self.cache_manager = cache_manager
+
+    def set_db_manager(self, db_manager):
+        """Set database manager (needed for deploy-time session invalidation)"""
+        self.db_manager = db_manager
+
+    async def _get_min_token_issued_at(self) -> Optional[float]:
+        """
+        Return the min_token_issued_at timestamp (epoch seconds).
+        Cached in-memory for 60s to avoid a DB round-trip on every request.
+        """
+        global _min_iat_cache
+        now = time.time()
+        if (
+            _min_iat_cache["value"] is not None
+            and now - _min_iat_cache["fetched_at"] < _MIN_IAT_CACHE_TTL
+        ):
+            return _min_iat_cache["value"]
+
+        db_manager = getattr(self, "db_manager", None)
+        if db_manager is None:
+            return _min_iat_cache["value"]  # stale is better than crash
+
+        try:
+            master_db = await db_manager.get_master_db()
+            if master_db is None:
+                return _min_iat_cache["value"]
+            doc = await master_db["system_config"].find_one(
+                {"key": "min_token_issued_at"}
+            )
+            if doc and doc.get("value") is not None:
+                _min_iat_cache["value"] = doc["value"]
+            else:
+                _min_iat_cache["value"] = None
+            _min_iat_cache["fetched_at"] = now
+        except Exception as e:
+            logger.warning("Failed to fetch min_token_issued_at: %s", e)
+            # Keep stale value; don't block auth on DB hiccup
+
+        return _min_iat_cache["value"]
 
     # Password utilities
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
@@ -257,6 +302,19 @@ class AuthManager:
             user_id = payload.get("sub")
             if not user_id:
                 return None
+
+            # ── Deploy-time session invalidation ──
+            # If a min_token_issued_at timestamp exists in skb_master.system_config,
+            # reject any JWT whose iat predates it.
+            token_iat = payload.get("iat")
+            if token_iat is not None:
+                min_iat = await self._get_min_token_issued_at()
+                if min_iat is not None and token_iat < min_iat:
+                    logger.info(
+                        "Token rejected: iat %s < min_token_issued_at %s",
+                        token_iat, min_iat,
+                    )
+                    return None
 
             # Check cached session first
             if self.cache_manager:

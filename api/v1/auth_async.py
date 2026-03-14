@@ -2371,6 +2371,51 @@ async def remote_logout(
     return {"success": True, "message": "Successfully logged out"}
 
 
+@router.post("/invalidate-all-sessions")
+async def invalidate_all_sessions(
+    request: Request,
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Invalidate all existing JWT sessions by setting a minimum issued-at
+    timestamp.  Called by the deploy pipeline after a frontend release so
+    every user is forced to re-login and pick up the new JS bundles.
+
+    Requires X-Deploy-Secret header matching DEPLOY_SESSION_SECRET env var.
+    """
+    deploy_secret = os.environ.get("DEPLOY_SESSION_SECRET", "")
+    if not deploy_secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session invalidation not configured",
+        )
+
+    provided = request.headers.get("X-Deploy-Secret", "")
+    if not provided or provided != deploy_secret:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid deploy secret",
+        )
+
+    master_db = await db.get_master_db()
+    if master_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        )
+
+    import time as _time
+    now_epoch = _time.time()
+    await master_db["system_config"].update_one(
+        {"key": "min_token_issued_at"},
+        {"$set": {"key": "min_token_issued_at", "value": now_epoch}},
+        upsert=True,
+    )
+
+    logger.info("All sessions invalidated at epoch=%s by deploy pipeline", now_epoch)
+    return {"success": True, "min_token_issued_at": now_epoch}
+
+
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_info(
     current_user: Dict[str, Any] = Depends(get_current_user)

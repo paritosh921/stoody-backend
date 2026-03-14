@@ -418,6 +418,9 @@ async def lifespan(app: FastAPI):
         if cache_manager:
             auth_manager.set_cache_manager(cache_manager)
 
+        # Inject DB manager for deploy-time session invalidation (iat check)
+        auth_manager.set_db_manager(db_manager)
+
         # Store in app state
         app.state.db = db_manager
         app.state.cache = cache_manager
