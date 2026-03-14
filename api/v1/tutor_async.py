@@ -799,13 +799,12 @@ async def get_tutor_analytics_overview(
         )
 
         # ------------------------------------------------------------------
-        # Practice attempts aggregation (last 30 days)
+        # Practice attempts aggregation (all-time to match other stats)
         # ------------------------------------------------------------------
         practice_summary_pipeline = [
             {
                 "$match": {
                     "student_id": {"$in": student_oid_strings},
-                    "created_at": {"$gte": thirty_days_ago},
                 }
             },
             {
@@ -1427,9 +1426,15 @@ async def get_tutor_document_analytics(
         admin_id = current_user.get("admin_id")
 
         # ----- Build document filter with tutor scoping -----
+        try:
+            admin_oid = ObjectId(admin_id)
+            admin_matches = [admin_oid, str(admin_id)]
+        except Exception:
+            admin_matches = [admin_id]
+
         doc_filter: Dict[str, Any] = {
             "$and": [
-                {"admin_id": ObjectId(admin_id)},
+                {"admin_id": {"$in": admin_matches}},
                 {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
                 {
                     "$or": [
@@ -1464,7 +1469,11 @@ async def get_tutor_document_analytics(
         total_visible_students = len(visible_student_ids)
 
         # Collect all document_ids
-        doc_ids = [d.get("document_id") for d in documents if d.get("document_id")]
+        doc_ids = []
+        for d in documents:
+            did = d.get("document_id") or str(d.get("_id", ""))
+            if did:
+                doc_ids.append(did)
 
         # ----- Aggregate practice_attempts per document -----
         practice_pipeline = [
@@ -1517,7 +1526,7 @@ async def get_tutor_document_analytics(
         # ----- Merge document metadata with attempt stats -----
         result_docs = []
         for doc in documents:
-            did = doc.get("document_id")
+            did = doc.get("document_id") or str(doc.get("_id", ""))
             if not did:
                 continue
 
@@ -1630,11 +1639,17 @@ async def get_tutor_document_detail_analytics(
         tutor_id = current_user.get("tutor_id")
         admin_id = current_user.get("admin_id")
 
+        try:
+            admin_oid = ObjectId(admin_id)
+            admin_matches = [admin_oid, str(admin_id)]
+        except Exception:
+            admin_matches = [admin_id]
+
         # ----- Fetch and verify document access -----
         doc_filter: Dict[str, Any] = {
             "$and": [
                 {"document_id": document_id},
-                {"admin_id": ObjectId(admin_id)},
+                {"admin_id": {"$in": admin_matches}},
                 {
                     "$or": [
                         {"teacher_ids": {"$in": [tutor_id]}},
@@ -1949,9 +1964,17 @@ async def get_tutor_document_detail_analytics(
                         continue
                     if qid not in question_stats:
                         question_stats[qid] = {"total_attempts": 0, "correct_count": 0}
-                    question_stats[qid]["total_attempts"] += 1
-                    if qr.get("is_correct"):
-                        question_stats[qid]["correct_count"] += 1
+                    
+                    # Ensure we only count actual attempts for accuracy
+                    is_attempted = qr.get("is_attempted", True)
+                    student_ans = str(qr.get("student_answer", "")).strip().upper()
+                    if not student_ans or student_ans == "SKIPPED":
+                        is_attempted = False
+                        
+                    if is_attempted:
+                        question_stats[qid]["total_attempts"] += 1
+                        if qr.get("is_correct"):
+                            question_stats[qid]["correct_count"] += 1
 
             for qid, qs in question_stats.items():
                 q_meta = question_map.get(qid, {})

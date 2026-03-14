@@ -28,5 +28,3 @@ logs/
 .vscode/
 *.pem
 
-# Tests
-tests/
