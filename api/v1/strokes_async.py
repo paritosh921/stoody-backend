@@ -412,6 +412,105 @@ def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now
     return doc
 
 
+def _incoming_stroke_docs(page: CanvasPageUpsert) -> List[Dict[str, Any]]:
+    return [s.model_dump() for s in page.strokes]
+
+
+def _merge_stroke_docs(
+    existing_strokes: List[Dict[str, Any]],
+    incoming_strokes: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    seen_ids = {
+        str(stroke.get("id") or "")
+        for stroke in existing_strokes
+        if stroke.get("id")
+    }
+    merged = list(existing_strokes)
+    added = 0
+    for stroke in incoming_strokes:
+        stroke_id = str(stroke.get("id") or "")
+        if stroke_id and stroke_id in seen_ids:
+            continue
+        if stroke_id:
+            seen_ids.add(stroke_id)
+        merged.append(stroke)
+        added += 1
+    return merged, added
+
+
+def _is_stale_canvas_page_update(existing_doc: Dict[str, Any], page: CanvasPageUpsert) -> bool:
+    existing_version = int(existing_doc.get("version", 0) or 0)
+    if page.version is not None:
+        return existing_version > page.version
+
+    existing_last_modified = existing_doc.get("client_last_modified")
+    incoming_last_modified = page.client_last_modified
+    if existing_last_modified is not None and incoming_last_modified is not None:
+        return float(existing_last_modified) > float(incoming_last_modified)
+
+    # Versionless writes are treated as stale/merge-only by default when a page already exists.
+    return True
+
+
+def _build_merged_page_doc(
+    *,
+    existing_doc: Dict[str, Any],
+    user_id: str,
+    admin_id: Optional[str],
+    page: CanvasPageUpsert,
+    now: datetime,
+) -> tuple[Dict[str, Any], int]:
+    incoming_strokes = _incoming_stroke_docs(page)
+    merged_strokes, added_count = _merge_stroke_docs(
+        list(existing_doc.get("strokes") or []),
+        incoming_strokes,
+    )
+
+    first_activity_candidates = [
+        value for value in (existing_doc.get("first_activity"), page.first_activity)
+        if value is not None
+    ]
+    last_activity_candidates = [
+        value for value in (existing_doc.get("last_activity"), page.last_activity)
+        if value is not None
+    ]
+    client_last_modified_candidates = [
+        value for value in (existing_doc.get("client_last_modified"), page.client_last_modified)
+        if value is not None
+    ]
+
+    merged_doc: Dict[str, Any] = {
+        "user_id": user_id,
+        "admin_id": admin_id,
+        "book_type": page.book_type.upper(),
+        "page_number": page.page_number,
+        "strokes": merged_strokes,
+        "page_style": page.page_style if page.page_style is not None else existing_doc.get("page_style"),
+        "canvas_background": (
+            page.canvas_background
+            if page.canvas_background is not None
+            else existing_doc.get("canvas_background")
+        ),
+        "stroke_count": len(merged_strokes),
+        "pen_mac": page.pen_mac or existing_doc.get("pen_mac"),
+        "source": page.source or existing_doc.get("source"),
+        "last_modified": now,
+        "client_last_modified": (
+            max(client_last_modified_candidates)
+            if client_last_modified_candidates else None
+        ),
+        "version": int(existing_doc.get("version", 0) or 0) + 1,
+    }
+    session_id = page.session_id or existing_doc.get("session_id")
+    if session_id:
+        merged_doc["session_id"] = session_id
+    if first_activity_candidates:
+        merged_doc["first_activity"] = min(first_activity_candidates)
+    if last_activity_candidates:
+        merged_doc["last_activity"] = max(last_activity_candidates)
+    return merged_doc, added_count
+
+
 async def _upsert_notes_canvas_classification(
     classification_collection,
     *,
@@ -520,36 +619,49 @@ async def upsert_canvas_page(
     user_ids = _resolve_canvas_user_ids(current_user)
 
     now = datetime.now(timezone.utc)
-    doc = _page_doc(user_id, admin_id, page, now)
-
-    # Try to find existing doc using all user_id variants (legacy compat)
-    find_filt: Dict[str, Any] = {
+    page_filter: Dict[str, Any] = {
         "user_id": {"$in": user_ids},
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
-    if page.version is not None:
-        find_filt["version"] = page.version
+    existing = await collection.find_one(page_filter)
 
-    existing = await collection.find_one(find_filt, {"_id": 1})
-
-    if existing:
-        # Update existing doc (matched by _id to avoid $in conflict)
-        result = await collection.replace_one({"_id": existing["_id"]}, doc)
-    else:
-        # Insert new — use canonical user_id (not $in) so upsert works
+    if existing is None:
+        doc = _page_doc(user_id, admin_id, page, now)
         upsert_filt: Dict[str, Any] = {
             "user_id": user_id,
             "book_type": page.book_type.upper(),
             "page_number": page.page_number,
         }
         result = await collection.replace_one(upsert_filt, doc, upsert=True)
-
-    if result.matched_count == 0 and result.upserted_id is None and page.version is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Version conflict — page was modified by another session",
+    elif _is_stale_canvas_page_update(existing, page):
+        doc, added_count = _build_merged_page_doc(
+            existing_doc=existing,
+            user_id=user_id,
+            admin_id=admin_id,
+            page=page,
+            now=now,
         )
+        if added_count == 0:
+            existing_last_modified = existing.get("last_modified")
+            return {
+                "success": True,
+                "version": int(existing.get("version", 1) or 1),
+                "last_modified": (
+                    existing_last_modified.isoformat()
+                    if isinstance(existing_last_modified, datetime)
+                    else now.isoformat()
+                ),
+            }
+        result = await collection.replace_one({"_id": existing["_id"]}, doc)
+    else:
+        if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Version conflict — page was modified by another session",
+            )
+        doc = _page_doc(user_id, admin_id, page, now)
+        result = await collection.replace_one({"_id": existing["_id"]}, doc)
 
     await _upsert_notes_canvas_classification(
         classification_collection,
@@ -582,7 +694,6 @@ async def batch_upsert_canvas_pages(
     now = datetime.now(timezone.utc)
 
     # Pre-fetch existing docs to handle legacy user_id variants.
-    # We need exact _id matches to avoid the $in + upsert conflict.
     page_keys = [
         (p.book_type.upper(), p.page_number) for p in body.pages
     ]
@@ -593,28 +704,64 @@ async def batch_upsert_canvas_pages(
         ]
         existing_cursor = collection.find(
             {"user_id": {"$in": user_ids}, "$or": or_clauses},
-            {"_id": 1, "book_type": 1, "page_number": 1},
+            {
+                "_id": 1,
+                "book_type": 1,
+                "page_number": 1,
+                "strokes": 1,
+                "version": 1,
+                "client_last_modified": 1,
+                "page_style": 1,
+                "canvas_background": 1,
+                "pen_mac": 1,
+                "source": 1,
+                "session_id": 1,
+                "first_activity": 1,
+                "last_activity": 1,
+            },
         )
         async for edoc in existing_cursor:
-            existing_map[(edoc["book_type"], edoc["page_number"])] = edoc["_id"]
+            existing_map[(edoc["book_type"], edoc["page_number"])] = edoc
 
     ops = []
+    changed_pages: List[CanvasPageUpsert] = []
     for page in body.pages:
         key = (page.book_type.upper(), page.page_number)
-        doc = _page_doc(user_id, admin_id, page, now)
-        if key in existing_map:
-            ops.append(ReplaceOne({"_id": existing_map[key]}, doc))
-        else:
+        existing = existing_map.get(key)
+        if existing is None:
+            doc = _page_doc(user_id, admin_id, page, now)
             filt = {
                 "user_id": user_id,
                 "book_type": page.book_type.upper(),
                 "page_number": page.page_number,
             }
             ops.append(ReplaceOne(filt, doc, upsert=True))
+            changed_pages.append(page)
+        elif _is_stale_canvas_page_update(existing, page):
+            doc, added_count = _build_merged_page_doc(
+                existing_doc=existing,
+                user_id=user_id,
+                admin_id=admin_id,
+                page=page,
+                now=now,
+            )
+            if added_count == 0:
+                continue
+            ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
+            changed_pages.append(page)
+        else:
+            if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Version conflict — page was modified by another session",
+                )
+            doc = _page_doc(user_id, admin_id, page, now)
+            ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
+            changed_pages.append(page)
 
     if ops:
         result = await collection.bulk_write(ops, ordered=False)
-        for page in body.pages:
+        for page in changed_pages:
             await _upsert_notes_canvas_classification(
                 classification_collection,
                 user_id=user_id,
