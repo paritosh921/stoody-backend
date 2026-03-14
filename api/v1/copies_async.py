@@ -11,6 +11,7 @@ Data source: ``canvas_pages`` collection (single source of truth).
 
 import asyncio
 import logging
+import re
 import uuid
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -219,7 +220,8 @@ async def _list_canvas_pages_for_user(
     if pen_mac:
         query["pen_mac"] = pen_mac.upper()
     if book_type:
-        query["book_type"] = book_type.upper()
+        bt_val = book_type.upper()
+        query["book_type"] = {"$in": [bt_val, None]} if bt_val == "STANDARD" else bt_val
 
     try:
         cursor = col.find(query, {"strokes": 0}).sort("last_modified", -1).limit(limit * 5)
@@ -228,10 +230,12 @@ async def _list_canvas_pages_for_user(
         logger.warning("canvas_pages query failed: %s", exc)
         return []
 
-    classifications: Dict[tuple[str, int], Dict[str, Any]] = {}
+    classifications: Dict[tuple[str, str, int], Dict[str, Any]] = {}
     if classify_col is not None and docs:
         page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
-        book_types = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
+        book_types: list = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
+        if "STANDARD" in book_types:
+            book_types.append(None)  # also match null/missing book_type
         class_query: Dict[str, Any] = {
             "user_id": {"$in": user_identifiers},
             "page_number": {"$in": page_numbers},
@@ -240,14 +244,14 @@ async def _list_canvas_pages_for_user(
         try:
             class_docs = await classify_col.find(class_query).to_list(length=None)
             for doc in class_docs:
-                key = ((doc.get("book_type") or "STANDARD").upper(), int(doc.get("page_number")))
+                key = ((doc.get("pen_mac") or "canvas").upper(), (doc.get("book_type") or "STANDARD").upper(), int(doc.get("page_number")))
                 existing = classifications.get(key)
                 if existing is None or (doc.get("updated_at") or doc.get("created_at") or datetime.min) >= (existing.get("updated_at") or existing.get("created_at") or datetime.min):
                     classifications[key] = doc
         except Exception as exc:
             logger.warning("note_classifications query failed for copies: %s", exc)
 
-    grouped: Dict[tuple[str, int], Dict[str, Any]] = {}
+    grouped: Dict[tuple[str, str, int], Dict[str, Any]] = {}
     for d in docs:
         pn = d.get("page_number")
         if pn is None:
@@ -277,7 +281,8 @@ async def _list_canvas_pages_for_user(
             if last_activity_ts > last_activity:
                 last_activity = last_activity_ts
 
-        key = (bt, int(pn))
+        pm = (d.get("pen_mac") or "canvas").upper()
+        key = (pm, bt, int(pn))
         existing = grouped.get(key)
         if existing is None:
             classification = classifications.get(key)
@@ -341,7 +346,10 @@ async def _get_canvas_page_as_batches(
 
     query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "page_number": page_number}
     if book_type:
-        query["book_type"] = book_type.upper()
+        bt_val = book_type.upper()
+        query["book_type"] = {"$in": [bt_val, None]} if bt_val == "STANDARD" else bt_val
+    if pen_mac:
+        query["pen_mac"] = {"$regex": f"^{re.escape(pen_mac)}$", "$options": "i"}
 
     try:
         docs = await col.find(query).sort("last_modified", 1).to_list(length=None)

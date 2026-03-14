@@ -7,9 +7,20 @@ note_classifications record exists.
 """
 
 import logging
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+def _book_type_match(book_type: str) -> Any:
+    """Return a MongoDB match expression for book_type.
+
+    ``STANDARD`` is the normalised fallback for missing / null book_type,
+    so we must also match documents where the field is absent or None.
+    """
+    if book_type == "STANDARD":
+        return {"$in": ["STANDARD", None]}
+    return book_type
 
 
 async def delete_page_by_identity(
@@ -43,7 +54,7 @@ async def delete_page_by_identity(
     cls_query = {
         "user_id": {"$in": user_id_variants},
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
-        "book_type": book_type,
+        "book_type": _book_type_match(book_type),
         "page_number": page_number,
     }
     cls_doc = await tenant_db["note_classifications"].find_one(cls_query)
@@ -64,7 +75,7 @@ async def delete_page_by_identity(
     stroke_result = await tenant_db["strokes"].delete_many({
         "user_id": user_match,
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
-        "book_type": book_type,
+        "book_type": _book_type_match(book_type),
         "page_number": page_number,
     })
 
@@ -74,7 +85,7 @@ async def delete_page_by_identity(
         cp_result = await tenant_db["canvas_pages"].delete_many({
             "user_id": {"$in": user_id_variants},
             "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
-            "book_type": book_type,
+            "book_type": _book_type_match(book_type),
             "page_number": page_number,
         })
         canvas_pages_deleted = cp_result.deleted_count
@@ -85,7 +96,7 @@ async def delete_page_by_identity(
     await tenant_db["classification_queue"].delete_many({
         "user_id": {"$in": user_id_variants},
         "pen_mac": pen_mac_upper,
-        "book_type": book_type,
+        "book_type": _book_type_match(book_type),
         "page_number": page_number,
     })
 
