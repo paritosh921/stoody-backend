@@ -115,10 +115,14 @@ def build_svg_path_from_points(points: List[Any]) -> str:
     return " ".join(path_parts) if path_parts else ""
 
 
-def calculate_stroke_bounds(stroke_batches: List[Dict[str, Any]]) -> Tuple[float, float, float, float]:
+def calculate_stroke_bounds(
+    stroke_batches: List[Dict[str, Any]],
+    book_type: Optional[str] = None,
+) -> Tuple[float, float, float, float]:
     """
     Calculate the bounding box of all strokes.
     Returns (min_x, min_y, max_x, max_y).
+    When no strokes are found, falls back to mm-space page dimensions.
     """
     min_x = float('inf')
     min_y = float('inf')
@@ -157,9 +161,12 @@ def calculate_stroke_bounds(stroke_batches: List[Dict[str, Any]]) -> Tuple[float
                     max_x = max(max_x, x)
                     max_y = max(max_y, y)
     
-    # If no valid bounds found, return defaults
+    # If no valid bounds found, return mm-space defaults for the page
     if min_x == float('inf'):
-        return (0, 0, 592, 840)
+        width_mm, height_mm = BOOK_DIMENSIONS_MM.get(
+            (book_type or '').upper(), (148, 210)
+        )
+        return (0, 0, width_mm, height_mm)
     
     return (min_x, min_y, max_x, max_y)
 
@@ -184,26 +191,31 @@ def build_svg_from_strokes(
     Returns:
         SVG document as string
     """
-    width, height = get_canvas_dimensions(book_type)
+    # Pixel dimensions (for display size of the SVG element)
+    px_w, px_h = get_canvas_dimensions(book_type)
+    # Millimetre dimensions (for the SVG viewBox — strokes are stored in mm space)
+    width_mm, height_mm = BOOK_DIMENSIONS_MM.get(
+        (book_type or '').upper(), (148, 210)
+    )
 
     # Calculate the bounding box of all strokes
-    min_x, min_y, max_x, max_y = calculate_stroke_bounds(stroke_batches)
+    min_x, min_y, max_x, max_y = calculate_stroke_bounds(stroke_batches, book_type)
 
-    # Use page dimensions as viewBox (strokes are in page-space coordinates).
+    # Use mm page dimensions as viewBox.
     # Only fall back to stroke bounding box when strokes clearly exceed the
     # page area (e.g. legacy data in raw pen coordinate space).
     strokes_within_page = (
         min_x != float('inf')  # has strokes
-        and max_x <= width * 1.05
-        and max_y <= height * 1.05
+        and max_x <= width_mm * 1.05
+        and max_y <= height_mm * 1.05
     )
 
     if strokes_within_page or min_x == float('inf'):
-        # Strokes fit within (or near) the page — use page dimensions as viewBox
+        # Strokes fit within (or near) the page — use mm page dims as viewBox
         view_min_x = 0
         view_min_y = 0
-        view_width = float(width)
-        view_height = float(height)
+        view_width = float(width_mm)
+        view_height = float(height_mm)
     else:
         # Strokes exceed page dimensions — expand viewBox to fit all content
         content_width = max_x - min_x
@@ -214,11 +226,11 @@ def build_svg_from_strokes(
         view_min_y = min_y - padding_y
         view_width = content_width + (padding_x * 2)
         view_height = content_height + (padding_y * 2)
-    
-    # Start SVG document with viewBox that fits content
+
+    # Start SVG document — display size in pixels, coordinates in mm
     svg_parts = [
         f'<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="{view_min_x:.2f} {view_min_y:.2f} {view_width:.2f} {view_height:.2f}" preserveAspectRatio="xMidYMid meet">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{px_w}" height="{px_h}" viewBox="{view_min_x:.2f} {view_min_y:.2f} {view_width:.2f} {view_height:.2f}" preserveAspectRatio="xMidYMid meet">',
     ]
     
     # Add background if requested
@@ -235,20 +247,22 @@ def build_svg_from_strokes(
         strokes = batch.get('strokes', [])
         
         for stroke in strokes:
-            # Get stroke styling
+            # Get stroke styling — viewBox is in mm-space, so use mm widths directly
             color = stroke.get('color', DEFAULT_STROKE_COLOR)
-            stroke_width = stroke.get('strokeWidth')
-            if stroke_width is None:
-                base_width_mm = stroke.get('baseWidthMm')
-                if isinstance(base_width_mm, (int, float)):
-                    stroke_width = float(base_width_mm) * PIXELS_PER_MM
-                else:
-                    stroke_width = DEFAULT_BASE_WIDTH_MM * PIXELS_PER_MM
+            base_width_mm = stroke.get('baseWidthMm')
+            legacy_stroke_width = stroke.get('strokeWidth')
+            if isinstance(base_width_mm, (int, float)):
+                stroke_width_mm = float(base_width_mm)
+            elif isinstance(legacy_stroke_width, (int, float)):
+                # Legacy strokes store width in canvas-pixel space; convert to mm
+                stroke_width_mm = float(legacy_stroke_width) / PIXELS_PER_MM
+            else:
+                stroke_width_mm = DEFAULT_BASE_WIDTH_MM
 
-            # Scale stroke width proportionally
-            # For large coordinate spaces, we need thicker strokes
-            scale_factor = max(view_width, view_height) / 800
-            adjusted_width = stroke_width * max(1, scale_factor)
+            # Scale stroke width for coordinate spaces that exceed the
+            # normal mm page area (legacy data in raw pen coordinates)
+            scale_factor = max(view_width, view_height) / max(width_mm, height_mm)
+            adjusted_width = stroke_width_mm * max(1, scale_factor)
             
             # Try to get pre-rendered SVG path first (V2 format)
             svg_path = stroke.get('svgPath', '')
