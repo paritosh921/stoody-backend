@@ -881,54 +881,21 @@ async def delete_page(
     pen_mac = doc.get("pen_mac", "")
     book_type = doc.get("book_type", "A5")
     page_number = doc.get("page_number")
-    thumbnail_url = doc.get("thumbnail_url")
 
-    # 1. Delete S3 thumbnail
-    if thumbnail_url:
-        try:
-            from utils.s3_storage import delete_file
-            await delete_file(thumbnail_url)
-        except Exception as e:
-            logger.warning(f"Failed to delete S3 thumbnail {thumbnail_url}: {e}")
-
-    # 2. Delete strokes for this page
-    from services.note_classification_service import _build_user_id_match
-    user_match = _build_user_id_match(user_id)
-    stroke_result = await tenant_db["strokes"].delete_many({
-        "user_id": user_match,
-        "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
-        "book_type": book_type,
-        "page_number": page_number,
-    })
-
-    # 3. Delete canvas_pages document for this page
-    canvas_pages_deleted = 0
-    try:
-        cp_result = await tenant_db["canvas_pages"].delete_many({
-            "user_id": {"$in": variants},
-            "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
-            "book_type": book_type,
-            "page_number": page_number,
-        })
-        canvas_pages_deleted = cp_result.deleted_count
-    except Exception as e:
-        logger.warning(f"Failed to delete canvas_pages for page {page_number}: {e}")
-
-    # 4. Delete classification queue entry if exists
-    await tenant_db["classification_queue"].delete_many({
-        "user_id": {"$in": variants},
-        "pen_mac": pen_mac.upper(),
-        "book_type": book_type,
-        "page_number": page_number,
-    })
-
-    # 5. Delete the classification doc itself
-    await tenant_db["note_classifications"].delete_one({"_id": ObjectId(classification_id)})
+    from utils.page_delete import delete_page_by_identity
+    result = await delete_page_by_identity(
+        tenant_db,
+        pen_mac=pen_mac,
+        book_type=book_type,
+        page_number=page_number,
+        user_id=user_id,
+        user_id_variants=variants,
+    )
 
     return {
         "success": True,
-        "deleted_strokes": stroke_result.deleted_count,
-        "deleted_canvas_pages": canvas_pages_deleted,
+        "deleted_strokes": result["deleted_strokes"],
+        "deleted_canvas_pages": result["deleted_canvas_pages"],
     }
 
 

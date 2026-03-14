@@ -608,6 +608,86 @@ async def get_copy_page_svg(
 
 
 # ============================================================================
+# BULK DELETE ENDPOINT - Delete copy pages by identity
+# ============================================================================
+
+class CopyPageIdentity(BaseModel):
+    pen_mac: str
+    book_type: str = "A5"
+    page_number: int
+
+
+class BulkDeleteCopyPagesRequest(BaseModel):
+    pages: List[CopyPageIdentity] = Field(..., max_length=100)
+
+
+@router.post("/bulk-delete")
+async def bulk_delete_copy_pages(
+    body: BulkDeleteCopyPagesRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Delete copy pages by identity (pen_mac, book_type, page_number).
+
+    Works for both classified and unclassified pages — does not require a
+    classification_id.
+    """
+    from core.user_identity import canonical_canvas_user_id
+    from utils.page_delete import delete_page_by_identity
+
+    is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+    if is_b2c:
+        tenant_db = db.b2c_db
+    else:
+        tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = canonical_canvas_user_id(current_user)
+    variants = _build_user_id_variants(current_user)
+
+    # Deduplicate by (pen_mac, book_type, page_number)
+    seen: set = set()
+    unique_pages: list = []
+    for p in body.pages:
+        key = (p.pen_mac.upper(), p.book_type.upper(), p.page_number)
+        if key not in seen:
+            seen.add(key)
+            unique_pages.append(p)
+
+    deleted_count = 0
+    failed: list = []
+    for p in unique_pages:
+        try:
+            result = await delete_page_by_identity(
+                tenant_db,
+                pen_mac=p.pen_mac,
+                book_type=p.book_type,
+                page_number=p.page_number,
+                user_id=user_id,
+                user_id_variants=variants,
+            )
+            if result["had_data"]:
+                deleted_count += 1
+        except Exception as e:
+            logger.error(f"Failed to delete copy page {p.pen_mac}/{p.book_type}/{p.page_number}: {e}")
+            failed.append({
+                "pen_mac": p.pen_mac,
+                "book_type": p.book_type,
+                "page_number": p.page_number,
+                "error": str(e),
+            })
+
+    return {
+        "success": len(failed) == 0,
+        "deleted_count": deleted_count,
+        "failed": failed,
+    }
+
+
+# ============================================================================
 # PIN ENDPOINTS - Create and manage pinned copies (PDF snapshots)
 # ============================================================================
 
