@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
-from pymongo import ReplaceOne
+from pymongo import ReplaceOne, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
@@ -290,6 +290,7 @@ class CanvasPageUpsert(BaseModel):
     session_id: Optional[str] = None
     first_activity: Optional[float] = None
     last_activity: Optional[float] = None
+    device_id: Optional[str] = None
 
     @field_validator("stroke_count", mode="before")
     @classmethod
@@ -409,6 +410,8 @@ def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now
         doc["first_activity"] = page.first_activity
     if page.last_activity is not None:
         doc["last_activity"] = page.last_activity
+    if page.device_id:
+        doc["device_id"] = page.device_id
     return doc
 
 
@@ -508,7 +511,41 @@ def _build_merged_page_doc(
         merged_doc["first_activity"] = min(first_activity_candidates)
     if last_activity_candidates:
         merged_doc["last_activity"] = max(last_activity_candidates)
+    device_id = page.device_id or existing_doc.get("device_id")
+    if device_id:
+        merged_doc["device_id"] = device_id
     return merged_doc, added_count
+
+
+def _build_metadata_refresh(
+    existing_doc: Dict[str, Any],
+    page: CanvasPageUpsert,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Build a $set dict for audit/activity fields when no new strokes were added.
+
+    Returns an empty dict if nothing needs updating.
+    """
+    updates: Dict[str, Any] = {"last_modified": now}
+
+    if page.device_id and page.device_id != existing_doc.get("device_id"):
+        updates["device_id"] = page.device_id
+    if page.session_id and page.session_id != existing_doc.get("session_id"):
+        updates["session_id"] = page.session_id
+    if page.first_activity is not None:
+        existing_first = existing_doc.get("first_activity")
+        if existing_first is None or page.first_activity < existing_first:
+            updates["first_activity"] = page.first_activity
+    if page.last_activity is not None:
+        existing_last = existing_doc.get("last_activity")
+        if existing_last is None or page.last_activity > existing_last:
+            updates["last_activity"] = page.last_activity
+    if page.client_last_modified is not None:
+        existing_clm = existing_doc.get("client_last_modified")
+        if existing_clm is None or page.client_last_modified > existing_clm:
+            updates["client_last_modified"] = page.client_last_modified
+
+    return updates
 
 
 async def _upsert_notes_canvas_classification(
@@ -643,15 +680,21 @@ async def upsert_canvas_page(
             now=now,
         )
         if added_count == 0:
-            existing_last_modified = existing.get("last_modified")
+            # No new strokes, but still refresh audit/activity metadata
+            metadata_update = _build_metadata_refresh(existing, page, now)
+            if metadata_update:
+                await collection.update_one({"_id": existing["_id"]}, {"$set": metadata_update})
+            await _upsert_notes_canvas_classification(
+                classification_collection,
+                user_id=user_id,
+                user_ids=user_ids,
+                page=page,
+                now=now,
+            )
             return {
                 "success": True,
                 "version": int(existing.get("version", 1) or 1),
-                "last_modified": (
-                    existing_last_modified.isoformat()
-                    if isinstance(existing_last_modified, datetime)
-                    else now.isoformat()
-                ),
+                "last_modified": now.isoformat(),
             }
         result = await collection.replace_one({"_id": existing["_id"]}, doc)
     else:
@@ -718,6 +761,7 @@ async def batch_upsert_canvas_pages(
                 "session_id": 1,
                 "first_activity": 1,
                 "last_activity": 1,
+                "device_id": 1,
             },
         )
         async for edoc in existing_cursor:
@@ -746,6 +790,11 @@ async def batch_upsert_canvas_pages(
                 now=now,
             )
             if added_count == 0:
+                # No new strokes — still refresh audit/activity metadata
+                metadata_update = _build_metadata_refresh(existing, page, now)
+                if metadata_update:
+                    ops.append(UpdateOne({"_id": existing["_id"]}, {"$set": metadata_update}))
+                changed_pages.append(page)
                 continue
             ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
             changed_pages.append(page)
