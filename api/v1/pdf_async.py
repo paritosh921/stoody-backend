@@ -2563,21 +2563,27 @@ async def get_documents(
         uploader_ids = list(set(doc.get("uploaded_by") for doc in documents if doc.get("uploaded_by")))
         uploader_names = {}
 
-        # Look up uploader names from users collection
+        # Look up uploader names from users, admins, or tutors collections
         if uploader_ids:
             try:
                 for uid in uploader_ids:
-                    # Try to find user in the database
-                    user = await db.mongo_find_one("users", {"_id": BsonObjectId(uid)})
-                    if user:
-                        user_type = user.get("user_type", "")
-                        if user_type == "admin":
-                            uploader_names[uid] = "Admin"
+                    if is_b2c:
+                        user = await db.b2c_find_one("users", {"_id": BsonObjectId(uid)})
+                        if user:
+                            uploader_names[uid] = user.get("full_name") or user.get("username") or "B2C User"
                         else:
-                            # For teachers/tutors, use username or full_name
-                            uploader_names[uid] = user.get("username") or user.get("full_name") or "Teacher"
+                            admin = await db.b2c_find_one("admins", {"_id": BsonObjectId(uid)})
+                            uploader_names[uid] = admin.get("name") or "Admin" if admin else "Admin"
                     else:
-                        uploader_names[uid] = "Admin"  # Default to Admin if user not found
+                        admin = await db.mongo_find_one("admins", {"_id": BsonObjectId(uid)})
+                        if admin:
+                            uploader_names[uid] = admin.get("name") or admin.get("full_name") or "Admin"
+                        else:
+                            tutor = await db.mongo_find_one("tutors", {"_id": BsonObjectId(uid)})
+                            if tutor:
+                                uploader_names[uid] = tutor.get("name") or tutor.get("full_name") or tutor.get("username") or "Teacher"
+                            else:
+                                uploader_names[uid] = "Admin"
             except Exception as e:
                 logger.warning(f"Could not look up uploader names: {e}")
 
@@ -2599,6 +2605,8 @@ async def get_documents(
                 difficulty=doc["difficulty"],
                 course_plan=doc.get("course_plan"),
                 standard=doc.get("standard"),
+                section=doc.get("section"),
+                teacher_ids=doc.get("teacher_ids"),
                 file_path=doc["file_path"],
                 filename=doc["filename"],
                 uploaded_by=doc["uploaded_by"],
