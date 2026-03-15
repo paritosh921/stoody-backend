@@ -3,7 +3,7 @@ Tutor Management API Endpoints (Async)
 Handles tutor CRUD operations, authentication, and student assignments
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field, EmailStr, ValidationError
@@ -752,6 +752,7 @@ async def _get_tutor_visible_students(
 @limiter.limit("15/minute")
 async def get_tutor_analytics_overview(
     request: Request,
+    class_group: Optional[str] = Query(None, description="Filter by class (e.g. '10-A' or '10')"),
     current_user: Dict[str, Any] = Depends(require_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -762,6 +763,34 @@ async def get_tutor_analytics_overview(
     """
     try:
         students = await _get_tutor_visible_students(current_user, db)
+
+        # Extract available classes from unfiltered visible students
+        available_classes_set = set()
+        for s in students:
+            g = s.get("grade")
+            sec = s.get("section")
+            if g:
+                if sec:
+                    available_classes_set.add(f"{g}-{sec}")
+                else:
+                    available_classes_set.add(g)
+        available_classes = sorted(list(available_classes_set))
+
+        # Filter students if class_group is provided
+        if class_group:
+            parts = class_group.split("-", 1)
+            filter_grade = parts[0]
+            filter_section = parts[1] if len(parts) > 1 else None
+            
+            filtered = []
+            for s in students:
+                sg = s.get("grade")
+                ss = s.get("section")
+                if sg == filter_grade:
+                    # If section is provided in filter, it must match. Otherwise, just grade needs to match.
+                    if not filter_section or ss == filter_section:
+                        filtered.append(s)
+            students = filtered
 
         if not students:
             return {
@@ -775,6 +804,7 @@ async def get_tutor_analytics_overview(
                         "overall_practice_accuracy": 0.0,
                         "overall_test_avg_score": 0.0,
                         "avg_time_per_question": 0.0,
+                        "available_classes": available_classes,
                     },
                     "subject_performance": [],
                     "daily_activity": [],
@@ -1064,6 +1094,7 @@ async def get_tutor_analytics_overview(
                     "overall_practice_accuracy": overall_practice_accuracy,
                     "overall_test_avg_score": overall_test_avg,
                     "avg_time_per_question": avg_time_per_question,
+                    "available_classes": available_classes,
                 },
                 "subject_performance": subject_performance,
                 "daily_activity": daily_activity,
@@ -1812,14 +1843,32 @@ async def get_tutor_document_detail_analytics(
                 },
                 {
                     "$group": {
-                        "_id": "$question_id",
-                        "total_attempts": {"$sum": 1},
-                        "correct_count": {
+                        "_id": {
+                            "question_id": "$question_id",
+                            "student_id": "$student_id"
+                        },
+                        "attempts": {"$sum": 1},
+                        "correct": {
                             "$sum": {"$cond": [{"$eq": ["$is_correct", True]}, 1, 0]}
                         },
-                        "avg_time": {"$avg": {"$ifNull": ["$time_spent", 0]}},
+                        "time_spent": {"$sum": {"$ifNull": ["$time_spent", 0]}},
                     }
                 },
+                {
+                    "$group": {
+                        "_id": "$_id.question_id",
+                        "total_attempts": {"$sum": "$attempts"},
+                        "correct_count": {"$sum": "$correct"},
+                        "avg_time": {"$avg": {"$ifNull": ["$time_spent", 0]}},
+                        "students": {
+                            "$push": {
+                                "student_id": "$_id.student_id",
+                                "attempts": "$attempts",
+                                "correct": "$correct"
+                            }
+                        }
+                    }
+                }
             ]
             question_agg = await db.mongo_aggregate(
                 "practice_attempts", question_pipeline
@@ -1832,6 +1881,24 @@ async def get_tutor_document_detail_analytics(
                 q_meta = question_map.get(qid, {})
                 q_total = qa["total_attempts"]
                 q_correct = qa["correct_count"]
+                
+                # Format student attempts
+                student_attempts = []
+                for s in qa.get("students", []):
+                    sid = s.get("student_id")
+                    if sid:
+                        s_info = student_map.get(sid, {})
+                        s_name = s_info.get("name") or s_info.get("full_name", "Unknown Student")
+                        s_acc = round((s["correct"] / s["attempts"] * 100) if s["attempts"] > 0 else 0, 1)
+                        student_attempts.append({
+                            "student_id": sid,
+                            "name": s_name,
+                            "attempts": s["attempts"],
+                            "correct": s["correct"],
+                            "accuracy": s_acc
+                        })
+                student_attempts.sort(key=lambda x: x["accuracy"], reverse=True)
+
                 question_analysis.append(
                     {
                         "question_id": qid,
@@ -1843,6 +1910,7 @@ async def get_tutor_document_detail_analytics(
                             (q_correct / q_total * 100) if q_total > 0 else 0.0, 1
                         ),
                         "avg_time": round(qa.get("avg_time", 0) or 0, 1),
+                        "students": student_attempts,
                     }
                 )
 
@@ -1912,6 +1980,7 @@ async def get_tutor_document_detail_analytics(
                         ),
                         "section": s_info.get("section", ""),
                         "attempts": num_attempts,
+                        "total_questions": total_questions,
                         "correct": total_correct,
                         "accuracy": round(
                             (total_correct / total_questions * 100)
@@ -1963,7 +2032,7 @@ async def get_tutor_document_detail_analytics(
                     if not qid:
                         continue
                     if qid not in question_stats:
-                        question_stats[qid] = {"total_attempts": 0, "correct_count": 0}
+                        question_stats[qid] = {"total_attempts": 0, "correct_count": 0, "students_map": {}}
                     
                     # Ensure we only count actual attempts for accuracy
                     is_attempted = qr.get("is_attempted", True)
@@ -1975,11 +2044,35 @@ async def get_tutor_document_detail_analytics(
                         question_stats[qid]["total_attempts"] += 1
                         if qr.get("is_correct"):
                             question_stats[qid]["correct_count"] += 1
+                        
+                        # Populate student metrics
+                        sid = ta.get("student_id", "")
+                        if sid:
+                            if sid not in question_stats[qid]["students_map"]:
+                                question_stats[qid]["students_map"][sid] = {"attempts": 0, "correct": 0}
+                            question_stats[qid]["students_map"][sid]["attempts"] += 1
+                            if qr.get("is_correct"):
+                                question_stats[qid]["students_map"][sid]["correct"] += 1
 
             for qid, qs in question_stats.items():
                 q_meta = question_map.get(qid, {})
                 q_total = qs["total_attempts"]
                 q_correct = qs["correct_count"]
+                
+                # Format student attempts
+                student_attempts = []
+                for sid, s_stats in qs.get("students_map", {}).items():
+                    s_info = student_map.get(sid, {})
+                    s_name = s_info.get("name") or s_info.get("full_name", "Unknown Student")
+                    student_attempts.append({
+                        "student_id": sid,
+                        "name": s_name,
+                        "attempts": s_stats["attempts"],
+                        "correct": s_stats["correct"],
+                        "accuracy": round((s_stats["correct"] / s_stats["attempts"] * 100) if s_stats["attempts"] > 0 else 0, 1)
+                    })
+                student_attempts.sort(key=lambda x: x["accuracy"], reverse=True)
+
                 question_analysis.append(
                     {
                         "question_id": qid,
@@ -1991,6 +2084,7 @@ async def get_tutor_document_detail_analytics(
                             (q_correct / q_total * 100) if q_total > 0 else 0.0, 1
                         ),
                         "avg_time": 0,
+                        "students": student_attempts,
                     }
                 )
 
