@@ -400,6 +400,12 @@ async def update_tutor(
             set(subjects_from_updates + list(assignment_subjects))
         )
 
+    # Keep name and full_name in sync (frontend may send either)
+    if "name" in updates:
+        updates["full_name"] = updates["name"]
+    elif "full_name" in updates:
+        updates["name"] = updates["full_name"]
+
     # Update tutor
     await db.mongo_update_one("tutors", {"tutor_id": tutor_id}, {"$set": updates})
 
@@ -553,34 +559,12 @@ async def get_tutor_students(
         )
         students_union.extend(teacher_mapped)
 
-    # 3) Criteria-based matching within same admin (OR across grade/section/subjects/plan_types)
-    criteria = {}
-    or_filters = []
-    if admin_oid:
-        criteria = {"admin_id": admin_oid}
-    if tutor.get("standards"):
-        or_filters.append({"grade": {"$in": tutor.get("standards")}})
-    if tutor.get("sections"):
-        or_filters.append({"section": {"$in": tutor.get("sections")}})
-    if tutor.get("subjects"):
-        or_filters.append({"subjects": {"$in": tutor.get("subjects")}})
-    if tutor.get("plan_types"):
-        or_filters.append({"plan_types": {"$in": tutor.get("plan_types")}})
-    if or_filters:
-        if criteria:
-            criteria = {"$and": [criteria, {"$or": or_filters}]}
-        else:
-            criteria = {"$or": or_filters}
-
-    if criteria:
-        if admin_oid:
-            criteria = {"$and": [{"admin_id": admin_oid}, criteria]}
-        criteria_students = await db.mongo_find("students", criteria)
-        students_union.extend(criteria_students)
+    # ONLY show explicitly assigned students - no criteria-based matching
+    # Teachers should only see students they are explicitly assigned to
 
     # Deduplicate by _id
-    seen = set()
-    students = []
+    seen: set = set()
+    students: List[Dict[str, Any]] = []
     for s in students_union:
         sid = str(s.get("_id"))
         if sid not in seen:
@@ -711,30 +695,9 @@ async def _get_tutor_visible_students(
         )
         students_union.extend(teacher_mapped)
 
-    # 3) Criteria-based matching within same admin
-    criteria: Dict[str, Any] = {}
-    or_filters: List[Dict[str, Any]] = []
-    if admin_oid:
-        criteria = {"admin_id": admin_oid}
-    if tutor.get("standards"):
-        or_filters.append({"grade": {"$in": tutor.get("standards")}})
-    if tutor.get("sections"):
-        or_filters.append({"section": {"$in": tutor.get("sections")}})
-    if tutor.get("subjects"):
-        or_filters.append({"subjects": {"$in": tutor.get("subjects")}})
-    if tutor.get("plan_types"):
-        or_filters.append({"plan_types": {"$in": tutor.get("plan_types")}})
-    if or_filters:
-        if criteria:
-            criteria = {"$and": [criteria, {"$or": or_filters}]}
-        else:
-            criteria = {"$or": or_filters}
-
-    if criteria:
-        if admin_oid:
-            criteria = {"$and": [{"admin_id": admin_oid}, criteria]}
-        criteria_students = await db.mongo_find("students", criteria)
-        students_union.extend(criteria_students)
+    # ONLY show explicitly assigned students - no criteria-based matching
+    # Teachers should only see students they are explicitly assigned to
+    # (via assigned_student_ids or teacher_ids), not all students in their subjects/grades
 
     # Deduplicate by _id
     seen: set = set()
@@ -752,7 +715,9 @@ async def _get_tutor_visible_students(
 @limiter.limit("15/minute")
 async def get_tutor_analytics_overview(
     request: Request,
-    class_group: Optional[str] = Query(None, description="Filter by class (e.g. '10-A' or '10')"),
+    class_group: Optional[str] = Query(
+        None, description="Filter by class (e.g. '10-A' or '10')"
+    ),
     current_user: Dict[str, Any] = Depends(require_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -781,7 +746,7 @@ async def get_tutor_analytics_overview(
             parts = class_group.split("-", 1)
             filter_grade = parts[0]
             filter_section = parts[1] if len(parts) > 1 else None
-            
+
             filtered = []
             for s in students:
                 sg = s.get("grade")
@@ -1845,7 +1810,7 @@ async def get_tutor_document_detail_analytics(
                     "$group": {
                         "_id": {
                             "question_id": "$question_id",
-                            "student_id": "$student_id"
+                            "student_id": "$student_id",
                         },
                         "attempts": {"$sum": 1},
                         "correct": {
@@ -1864,11 +1829,11 @@ async def get_tutor_document_detail_analytics(
                             "$push": {
                                 "student_id": "$_id.student_id",
                                 "attempts": "$attempts",
-                                "correct": "$correct"
+                                "correct": "$correct",
                             }
-                        }
+                        },
                     }
-                }
+                },
             ]
             question_agg = await db.mongo_aggregate(
                 "practice_attempts", question_pipeline
@@ -1881,22 +1846,31 @@ async def get_tutor_document_detail_analytics(
                 q_meta = question_map.get(qid, {})
                 q_total = qa["total_attempts"]
                 q_correct = qa["correct_count"]
-                
+
                 # Format student attempts
                 student_attempts = []
                 for s in qa.get("students", []):
                     sid = s.get("student_id")
                     if sid:
                         s_info = student_map.get(sid, {})
-                        s_name = s_info.get("name") or s_info.get("full_name", "Unknown Student")
-                        s_acc = round((s["correct"] / s["attempts"] * 100) if s["attempts"] > 0 else 0, 1)
-                        student_attempts.append({
-                            "student_id": sid,
-                            "name": s_name,
-                            "attempts": s["attempts"],
-                            "correct": s["correct"],
-                            "accuracy": s_acc
-                        })
+                        s_name = s_info.get("name") or s_info.get(
+                            "full_name", "Unknown Student"
+                        )
+                        s_acc = round(
+                            (s["correct"] / s["attempts"] * 100)
+                            if s["attempts"] > 0
+                            else 0,
+                            1,
+                        )
+                        student_attempts.append(
+                            {
+                                "student_id": sid,
+                                "name": s_name,
+                                "attempts": s["attempts"],
+                                "correct": s["correct"],
+                                "accuracy": s_acc,
+                            }
+                        )
                 student_attempts.sort(key=lambda x: x["accuracy"], reverse=True)
 
                 question_analysis.append(
@@ -2032,24 +2006,31 @@ async def get_tutor_document_detail_analytics(
                     if not qid:
                         continue
                     if qid not in question_stats:
-                        question_stats[qid] = {"total_attempts": 0, "correct_count": 0, "students_map": {}}
-                    
+                        question_stats[qid] = {
+                            "total_attempts": 0,
+                            "correct_count": 0,
+                            "students_map": {},
+                        }
+
                     # Ensure we only count actual attempts for accuracy
                     is_attempted = qr.get("is_attempted", True)
                     student_ans = str(qr.get("student_answer", "")).strip().upper()
                     if not student_ans or student_ans == "SKIPPED":
                         is_attempted = False
-                        
+
                     if is_attempted:
                         question_stats[qid]["total_attempts"] += 1
                         if qr.get("is_correct"):
                             question_stats[qid]["correct_count"] += 1
-                        
+
                         # Populate student metrics
                         sid = ta.get("student_id", "")
                         if sid:
                             if sid not in question_stats[qid]["students_map"]:
-                                question_stats[qid]["students_map"][sid] = {"attempts": 0, "correct": 0}
+                                question_stats[qid]["students_map"][sid] = {
+                                    "attempts": 0,
+                                    "correct": 0,
+                                }
                             question_stats[qid]["students_map"][sid]["attempts"] += 1
                             if qr.get("is_correct"):
                                 question_stats[qid]["students_map"][sid]["correct"] += 1
@@ -2058,19 +2039,28 @@ async def get_tutor_document_detail_analytics(
                 q_meta = question_map.get(qid, {})
                 q_total = qs["total_attempts"]
                 q_correct = qs["correct_count"]
-                
+
                 # Format student attempts
                 student_attempts = []
                 for sid, s_stats in qs.get("students_map", {}).items():
                     s_info = student_map.get(sid, {})
-                    s_name = s_info.get("name") or s_info.get("full_name", "Unknown Student")
-                    student_attempts.append({
-                        "student_id": sid,
-                        "name": s_name,
-                        "attempts": s_stats["attempts"],
-                        "correct": s_stats["correct"],
-                        "accuracy": round((s_stats["correct"] / s_stats["attempts"] * 100) if s_stats["attempts"] > 0 else 0, 1)
-                    })
+                    s_name = s_info.get("name") or s_info.get(
+                        "full_name", "Unknown Student"
+                    )
+                    student_attempts.append(
+                        {
+                            "student_id": sid,
+                            "name": s_name,
+                            "attempts": s_stats["attempts"],
+                            "correct": s_stats["correct"],
+                            "accuracy": round(
+                                (s_stats["correct"] / s_stats["attempts"] * 100)
+                                if s_stats["attempts"] > 0
+                                else 0,
+                                1,
+                            ),
+                        }
+                    )
                 student_attempts.sort(key=lambda x: x["accuracy"], reverse=True)
 
                 question_analysis.append(
