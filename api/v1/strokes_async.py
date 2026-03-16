@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator
 from pymongo import ReplaceOne, UpdateOne
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
 from api.v1.copy_sets_async import resolve_copy_id as _resolve_copy_id
@@ -391,6 +391,55 @@ def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
 _canonical_canvas_user_id = canonical_canvas_user_id  # back-compat alias
 
 
+def _extract_duplicate_index_details(exc: Exception) -> tuple[Optional[str], Optional[dict]]:
+    """Return duplicate-index name and key values without leaking the full failed op."""
+    if isinstance(exc, DuplicateKeyError):
+        details = getattr(exc, "details", {}) or {}
+        errmsg = str(details.get("errmsg") or exc)
+        index_name = None
+        if " index: " in errmsg:
+            index_name = errmsg.split(" index: ", 1)[1].split(" dup key:", 1)[0].strip()
+        return index_name, details.get("keyValue")
+
+    if isinstance(exc, BulkWriteError):
+        details = getattr(exc, "details", {}) or {}
+        write_errors = details.get("writeErrors") or []
+        if write_errors:
+            first = write_errors[0] or {}
+            errmsg = str(first.get("errmsg") or exc)
+            index_name = None
+            if " index: " in errmsg:
+                index_name = errmsg.split(" index: ", 1)[1].split(" dup key:", 1)[0].strip()
+            return index_name, first.get("keyValue")
+
+    return None, None
+
+
+def _raise_sanitized_canvas_write_error(exc: Exception) -> None:
+    """Map duplicate-key write failures to a concise HTTP error without logging stroke payloads."""
+    index_name, key_value = _extract_duplicate_index_details(exc)
+    if index_name:
+        logger.warning(
+            "Canvas page write failed due to duplicate index conflict on %s with key=%s",
+            index_name,
+            key_value,
+        )
+        if index_name in {"uniq_canvas_page", "uniq_canvas_pages_user_book_page"}:
+            detail = (
+                "Canvas page write blocked by legacy Mongo index without copy_id. "
+                "Run the copy-set migration and drop the legacy canvas_pages unique index."
+            )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+
+    if isinstance(exc, (DuplicateKeyError, BulkWriteError)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Canvas page write failed due to a duplicate key conflict.",
+        ) from exc
+
+    raise exc
+
+
 def _page_doc(
     user_id: str,
     admin_id: Optional[str],
@@ -696,7 +745,10 @@ async def upsert_canvas_page(
             "book_type": page.book_type.upper(),
             "page_number": page.page_number,
         }
-        result = await collection.replace_one(upsert_filt, doc, upsert=True)
+        try:
+            result = await collection.replace_one(upsert_filt, doc, upsert=True)
+        except DuplicateKeyError as exc:
+            _raise_sanitized_canvas_write_error(exc)
     elif _is_stale_canvas_page_update(existing, page):
         doc, added_count = _build_merged_page_doc(
             existing_doc=existing,
@@ -724,7 +776,10 @@ async def upsert_canvas_page(
                 "version": int(existing.get("version", 1) or 1),
                 "last_modified": now.isoformat(),
             }
-        result = await collection.replace_one({"_id": existing["_id"]}, doc)
+        try:
+            result = await collection.replace_one({"_id": existing["_id"]}, doc)
+        except DuplicateKeyError as exc:
+            _raise_sanitized_canvas_write_error(exc)
     else:
         if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
             raise HTTPException(
@@ -732,7 +787,10 @@ async def upsert_canvas_page(
                 detail="Version conflict — page was modified by another session",
             )
         doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
-        result = await collection.replace_one({"_id": existing["_id"]}, doc)
+        try:
+            result = await collection.replace_one({"_id": existing["_id"]}, doc)
+        except DuplicateKeyError as exc:
+            _raise_sanitized_canvas_write_error(exc)
 
     await _upsert_notes_canvas_classification(
         classification_collection,
@@ -852,7 +910,10 @@ async def batch_upsert_canvas_pages(
             changed_pages.append((page, copy_id))
 
     if ops:
-        result = await collection.bulk_write(ops, ordered=False)
+        try:
+            result = await collection.bulk_write(ops, ordered=False)
+        except BulkWriteError as exc:
+            _raise_sanitized_canvas_write_error(exc)
         for page, page_copy_id in changed_pages:
             await _upsert_notes_canvas_classification(
                 classification_collection,

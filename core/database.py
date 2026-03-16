@@ -258,6 +258,42 @@ class DatabaseManager:
             create_kwargs["sparse"] = True
         await collection.create_index(keys, **create_kwargs)
 
+    async def _drop_matching_indexes(
+        self,
+        collection,
+        *,
+        key_specs: List[List[Tuple[str, int]]],
+        names: Optional[List[str]] = None,
+        unique: Optional[bool] = None,
+    ) -> int:
+        """Drop indexes matching any provided name or normalized key spec."""
+        index_info = await collection.index_information()
+        target_specs = {self._normalize_index_keys(spec) for spec in key_specs}
+        dropped = 0
+
+        for existing_name, existing_def in index_info.items():
+            if existing_name == "_id_":
+                continue
+
+            existing_keys = self._normalize_index_keys(existing_def.get("key", []))
+            name_match = bool(names and existing_name in names)
+            spec_match = existing_keys in target_specs if target_specs else False
+            unique_match = unique is None or bool(existing_def.get("unique", False)) == unique
+
+            if (name_match or spec_match) and unique_match:
+                try:
+                    await collection.drop_index(existing_name)
+                    dropped += 1
+                    logger.info("Dropped legacy index %s on %s", existing_name, collection.full_name)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to drop legacy index %s on %s: %s",
+                        existing_name,
+                        collection.full_name,
+                        exc,
+                    )
+        return dropped
+
     async def ensure_indexes_for_db(self, db: AsyncIOMotorDatabase) -> None:
         """Create necessary indexes on the given database (idempotent)."""
         db_name = db.name
@@ -404,12 +440,21 @@ class DatabaseManager:
             except Exception as e:
                 logger.warning(f"canvas_pages dedup failed (non-fatal): {e}")
 
-            # Target index includes copy_id.  The migration script
-            # (backfill_copy_sets.py) must run first to populate copy_id
-            # and drop the legacy 3-field index.  If migration hasn't run
-            # yet the new index creation will be skipped (OperationFailure)
-            # and the old index continues to work.
+            # Target index includes copy_id.  Once copy_id has been backfilled,
+            # proactively drop any legacy unique 3-field canvas_pages index
+            # regardless of its historical name.
             try:
+                missing_copy_id = await canvas_pages.count_documents(
+                    {"copy_id": {"$exists": False}},
+                    limit=1,
+                )
+                if missing_copy_id == 0:
+                    await self._drop_matching_indexes(
+                        canvas_pages,
+                        key_specs=[[("user_id", 1), ("book_type", 1), ("page_number", 1)]],
+                        names=["uniq_canvas_page", "uniq_canvas_pages_user_book_page"],
+                        unique=True,
+                    )
                 await self._ensure_index_with_spec_check(
                     canvas_pages,
                     [("user_id", 1), ("copy_id", 1), ("book_type", 1), ("page_number", 1)],

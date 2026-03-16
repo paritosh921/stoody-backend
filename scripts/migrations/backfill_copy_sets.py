@@ -64,6 +64,38 @@ MONGODB_DB_MASTER = os.getenv("MONGODB_DB_MASTER", "skb_master")
 MONGODB_DB_B2C = os.getenv("MONGODB_DB_STOODY", "STOODY-b2c")
 
 
+async def drop_matching_indexes(
+    collection,
+    *,
+    key_specs: list[list[tuple[str, int]]],
+    names: list[str] | None = None,
+    unique: bool | None = None,
+) -> int:
+    """Drop legacy indexes by name or exact key spec."""
+    index_info = await collection.index_information()
+    target_specs = {tuple((str(k), int(v)) for k, v in spec) for spec in key_specs}
+    dropped = 0
+
+    for existing_name, existing_def in index_info.items():
+        if existing_name == "_id_":
+            continue
+        existing_keys = tuple((str(k), int(v)) for k, v in existing_def.get("key", []))
+        name_match = bool(names and existing_name in names)
+        spec_match = existing_keys in target_specs if target_specs else False
+        unique_match = unique is None or bool(existing_def.get("unique", False)) == unique
+        if not ((name_match or spec_match) and unique_match):
+            continue
+
+        try:
+            await collection.drop_index(existing_name)
+            dropped += 1
+            logger.info("Dropped legacy index %s on %s", existing_name, collection.full_name)
+        except OperationFailure:
+            pass
+
+    return dropped
+
+
 class MigrationStats:
     def __init__(self):
         self.copy_sets_created = 0
@@ -266,13 +298,13 @@ async def migrate_database(
     if not dry_run:
         logger.info("[%s] Step 4: Updating indexes...", db_name)
 
-        # canvas_pages: drop old, create new
-        try:
-            await canvas_pages.drop_index("uniq_canvas_page")
-            stats.indexes_dropped += 1
-            logger.info("[%s]   Dropped old uniq_canvas_page index", db_name)
-        except OperationFailure:
-            pass  # index may not exist
+        # canvas_pages: drop any legacy 3-field unique index, then create new
+        stats.indexes_dropped += await drop_matching_indexes(
+            canvas_pages,
+            key_specs=[[("user_id", 1), ("book_type", 1), ("page_number", 1)]],
+            names=["uniq_canvas_page", "uniq_canvas_pages_user_book_page"],
+            unique=True,
+        )
 
         try:
             await canvas_pages.create_index(
