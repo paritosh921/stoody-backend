@@ -753,7 +753,7 @@ async def upsert_canvas_page(
             result = await collection.replace_one(upsert_filt, doc, upsert=True)
         except DuplicateKeyError as exc:
             _raise_sanitized_canvas_write_error(exc)
-    elif _is_stale_canvas_page_update(existing, page):
+    else:
         doc, added_count = _build_merged_page_doc(
             existing_doc=existing,
             user_id=user_id,
@@ -780,17 +780,6 @@ async def upsert_canvas_page(
                 "version": int(existing.get("version", 1) or 1),
                 "last_modified": now.isoformat(),
             }
-        try:
-            result = await collection.replace_one({"_id": existing["_id"]}, doc)
-        except DuplicateKeyError as exc:
-            _raise_sanitized_canvas_write_error(exc)
-    else:
-        if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Version conflict — page was modified by another session",
-            )
-        doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
         try:
             result = await collection.replace_one({"_id": existing["_id"]}, doc)
         except DuplicateKeyError as exc:
@@ -885,7 +874,7 @@ async def batch_upsert_canvas_pages(
             }
             ops.append(ReplaceOne(filt, doc, upsert=True))
             changed_pages.append((page, copy_id))
-        elif _is_stale_canvas_page_update(existing, page):
+        else:
             doc, added_count = _build_merged_page_doc(
                 existing_doc=existing,
                 user_id=user_id,
@@ -901,15 +890,6 @@ async def batch_upsert_canvas_pages(
                     ops.append(UpdateOne({"_id": existing["_id"]}, {"$set": metadata_update}))
                 changed_pages.append((page, copy_id))
                 continue
-            ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
-            changed_pages.append((page, copy_id))
-        else:
-            if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Version conflict — page was modified by another session",
-                )
-            doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
             ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
             changed_pages.append((page, copy_id))
 
