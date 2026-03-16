@@ -64,6 +64,7 @@ class RegenerateRequest(BaseModel):
 
 @router.get("/subjects")
 async def get_subjects(
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -75,8 +76,12 @@ async def get_subjects(
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
 
+    match_query: Dict[str, Any] = {"user_id": uid_match, "is_archived": {"$ne": True}}
+    if copy_id:
+        match_query["copy_id"] = copy_id
+
     pipeline = [
-        {"$match": {"user_id": uid_match, "is_archived": {"$ne": True}}},
+        {"$match": match_query},
         {"$group": {
             "_id": "$subject",
             "topic_count": {"$addToSet": "$topic"},
@@ -104,6 +109,7 @@ async def get_subjects(
 @router.get("/subjects/{subject}/topics")
 async def get_topics(
     subject: str,
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -115,8 +121,12 @@ async def get_topics(
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
 
+    match_query: Dict[str, Any] = {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}}
+    if copy_id:
+        match_query["copy_id"] = copy_id
+
     pipeline = [
-        {"$match": {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}}},
+        {"$match": match_query},
         {"$group": {
             "_id": "$topic",
             "page_count": {"$sum": 1},
