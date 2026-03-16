@@ -2590,39 +2590,14 @@ async def get_class_section_monitoring_stats(
                         projection={"password_hash": 0},
                     )
 
-            # 3) Criteria-based: same admin with matching standards/sections/subjects
-            criteria_matches = []
-            if tutor_doc and admin_id is not None:
-                base = {"admin_id": admin_id}
-                or_filters = []
-                standards = tutor_doc.get("standards") or []
-                if standards:
-                    or_filters.append({"grade": {"$in": standards}})
-                sections = tutor_doc.get("sections") or []
-                if sections:
-                    or_filters.append({"section": {"$in": sections}})
-                subjects = tutor_doc.get("subjects") or []
-                if subjects:
-                    or_filters.append({"subjects": {"$in": subjects}})
-                plans = tutor_doc.get("plan_types") or []
-                if plans:
-                    or_filters.append({"plan_types": {"$in": plans}})
-
-                # If no profile filters are set, tutor sees only explicitly assigned students
-                # Do NOT default to all admin students - this would be a security issue
-                if not or_filters:
-                    criteria_matches = []
-                else:
-                    criteria_matches = await db.mongo_find(
-                        "students",
-                        {"$and": [base, {"$or": or_filters}]},
-                        projection={"password_hash": 0},
-                    )
+            # ONLY show explicitly assigned students - no criteria-based matching
+            # Teachers should only see students they are explicitly assigned to
+            # (via teacher_ids or assigned_student_ids), not all students in their subjects/grades
 
             # Deduplicate by _id
             seen = set()
             admin_students = []
-            for s in mapped + assigned + criteria_matches:
+            for s in mapped + assigned:
                 sid = str(s.get("_id"))
                 if sid not in seen:
                     seen.add(sid)
@@ -2861,34 +2836,8 @@ async def get_student_progress(
                         projection={"password_hash": 0},
                     )
 
-            # 3) Criteria-based: same admin, OR overlap on standards/sections/subjects/plan_types
-            criteria_matches = []
-            if tutor_doc and admin_oid is not None:
-                base = {"admin_id": admin_oid}
-                or_filters = []
-                standards = tutor_doc.get("standards") or []
-                if standards:
-                    or_filters.append({"grade": {"$in": standards}})
-                sections = tutor_doc.get("sections") or []
-                if sections:
-                    or_filters.append({"section": {"$in": sections}})
-                subjects = tutor_doc.get("subjects") or []
-                if subjects:
-                    or_filters.append({"subjects": {"$in": subjects}})
-                plans = tutor_doc.get("plan_types") or []
-                if plans:
-                    or_filters.append({"plan_types": {"$in": plans}})
-
-                # If no profile filters are set, tutor sees only explicitly assigned students
-                # Do NOT default to all admin students - this would be a security issue
-                if not or_filters:
-                    criteria_matches = []
-                else:
-                    criteria_matches = await db.mongo_find(
-                        "students",
-                        {"$and": [base, {"$or": or_filters}]},
-                        projection={"password_hash": 0},
-                    )
+            # ONLY show explicitly assigned students - no criteria-based matching
+            # Teachers should only see students they are explicitly assigned to
 
             # Union and deduplicate by _id
             def _uniq(stus):
@@ -2901,7 +2850,7 @@ async def get_student_progress(
                         out.append(s)
                 return out
 
-            students = _uniq(mapped + assigned + criteria_matches)
+            students = _uniq(mapped + assigned)
 
         progress_data = []
         for student in students:
@@ -3029,37 +2978,12 @@ async def get_recent_activities(
                         projection={"_id": 1},
                     )
 
-            # criteria matching (OR across attributes, scoped to admin)
-            criteria_ids = []
-            if tutor_doc and admin_oid is not None:
-                base = {"admin_id": admin_oid}
-                or_filters = []
-                if tutor_doc.get("standards"):
-                    or_filters.append({"grade": {"$in": tutor_doc.get("standards")}})
-                if tutor_doc.get("sections"):
-                    or_filters.append({"section": {"$in": tutor_doc.get("sections")}})
-                if tutor_doc.get("subjects"):
-                    or_filters.append({"subjects": {"$in": tutor_doc.get("subjects")}})
-                if tutor_doc.get("plan_types"):
-                    or_filters.append(
-                        {"plan_types": {"$in": tutor_doc.get("plan_types")}}
-                    )
-                # If no profile filters are set, tutor sees only explicitly assigned students
-                # Do NOT default to all admin students - this would be a security issue
-                if not or_filters:
-                    crit_students = []
-                else:
-                    crit_students = await db.mongo_find(
-                        "students",
-                        {"$and": [base, {"$or": or_filters}]},
-                        projection={"_id": 1},
-                    )
-                criteria_ids = [s["_id"] for s in crit_students]
+            # ONLY show explicitly assigned students - no criteria-based matching
+            # Teachers should only see students they are explicitly assigned to
 
             id_set = set(
                 [str(s["_id"]) for s in tutor_students]
                 + [str(s["_id"]) for s in assigned]
-                + [str(x) for x in criteria_ids]
             )
             scoped_student_ids = [ObjectId(x) for x in id_set]
 

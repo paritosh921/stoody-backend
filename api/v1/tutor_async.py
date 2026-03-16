@@ -559,34 +559,12 @@ async def get_tutor_students(
         )
         students_union.extend(teacher_mapped)
 
-    # 3) Criteria-based matching within same admin (OR across grade/section/subjects/plan_types)
-    criteria = {}
-    or_filters = []
-    if admin_oid:
-        criteria = {"admin_id": admin_oid}
-    if tutor.get("standards"):
-        or_filters.append({"grade": {"$in": tutor.get("standards")}})
-    if tutor.get("sections"):
-        or_filters.append({"section": {"$in": tutor.get("sections")}})
-    if tutor.get("subjects"):
-        or_filters.append({"subjects": {"$in": tutor.get("subjects")}})
-    if tutor.get("plan_types"):
-        or_filters.append({"plan_types": {"$in": tutor.get("plan_types")}})
-    if or_filters:
-        if criteria:
-            criteria = {"$and": [criteria, {"$or": or_filters}]}
-        else:
-            criteria = {"$or": or_filters}
-
-    if criteria:
-        if admin_oid:
-            criteria = {"$and": [{"admin_id": admin_oid}, criteria]}
-        criteria_students = await db.mongo_find("students", criteria)
-        students_union.extend(criteria_students)
+    # ONLY show explicitly assigned students - no criteria-based matching
+    # Teachers should only see students they are explicitly assigned to
 
     # Deduplicate by _id
-    seen = set()
-    students = []
+    seen: set = set()
+    students: List[Dict[str, Any]] = []
     for s in students_union:
         sid = str(s.get("_id"))
         if sid not in seen:
@@ -717,30 +695,9 @@ async def _get_tutor_visible_students(
         )
         students_union.extend(teacher_mapped)
 
-    # 3) Criteria-based matching within same admin
-    criteria: Dict[str, Any] = {}
-    or_filters: List[Dict[str, Any]] = []
-    if admin_oid:
-        criteria = {"admin_id": admin_oid}
-    if tutor.get("standards"):
-        or_filters.append({"grade": {"$in": tutor.get("standards")}})
-    if tutor.get("sections"):
-        or_filters.append({"section": {"$in": tutor.get("sections")}})
-    if tutor.get("subjects"):
-        or_filters.append({"subjects": {"$in": tutor.get("subjects")}})
-    if tutor.get("plan_types"):
-        or_filters.append({"plan_types": {"$in": tutor.get("plan_types")}})
-    if or_filters:
-        if criteria:
-            criteria = {"$and": [criteria, {"$or": or_filters}]}
-        else:
-            criteria = {"$or": or_filters}
-
-    if criteria:
-        if admin_oid:
-            criteria = {"$and": [{"admin_id": admin_oid}, criteria]}
-        criteria_students = await db.mongo_find("students", criteria)
-        students_union.extend(criteria_students)
+    # ONLY show explicitly assigned students - no criteria-based matching
+    # Teachers should only see students they are explicitly assigned to
+    # (via assigned_student_ids or teacher_ids), not all students in their subjects/grades
 
     # Deduplicate by _id
     seen: set = set()
