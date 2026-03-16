@@ -24,6 +24,7 @@ from core.user_identity import canonical_canvas_user_id
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copy-sets", tags=["Copy Sets"])
+COPY_SET_TITLE_MAX_LENGTH = 11
 
 
 # ============================================================================
@@ -31,11 +32,11 @@ router = APIRouter(prefix="/copy-sets", tags=["Copy Sets"])
 # ============================================================================
 
 class CopySetCreate(BaseModel):
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=COPY_SET_TITLE_MAX_LENGTH)
 
 
 class CopySetUpdate(BaseModel):
-    title: str = Field(..., min_length=1, max_length=100)
+    title: str = Field(..., min_length=1, max_length=COPY_SET_TITLE_MAX_LENGTH)
 
 
 class CopySetResponse(BaseModel):
@@ -322,7 +323,7 @@ async def create_copy_set(
     title = body.title
     if not title:
         number = await _next_copy_number(col, user_id)
-        title = f"Copy {number}"
+        title = f"Copy {number}"[:COPY_SET_TITLE_MAX_LENGTH]
 
     doc: Dict[str, Any] = {
         "user_id": user_id,
