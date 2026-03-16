@@ -901,6 +901,7 @@ async def delete_page(
         page_number=page_number,
         user_id=user_id,
         user_id_variants=variants,
+        copy_id=doc.get("copy_id"),
     )
 
     return {

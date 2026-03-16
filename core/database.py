@@ -376,7 +376,12 @@ class DatabaseManager:
             try:
                 pipeline = [
                     {"$group": {
-                        "_id": {"user_id": "$user_id", "book_type": "$book_type", "page_number": "$page_number"},
+                        "_id": {
+                            "user_id": "$user_id",
+                            "copy_id": "$copy_id",
+                            "book_type": "$book_type",
+                            "page_number": "$page_number",
+                        },
                         "doc_ids": {"$push": "$_id"},
                         "count": {"$sum": 1}
                     }},
@@ -430,10 +435,11 @@ class DatabaseManager:
                     if loser_ids:
                         await canvas_pages.delete_many({"_id": {"$in": loser_ids}})
                         logger.info(
-                            "Deduped canvas_pages: merged %d strokes, removed %d docs for (%s, %s, %s)",
+                            "Deduped canvas_pages: merged %d strokes, removed %d docs for (%s, %s, %s, %s)",
                             merged_count,
                             len(loser_ids),
                             group["_id"]["user_id"],
+                            group["_id"].get("copy_id"),
                             group["_id"]["book_type"],
                             group["_id"]["page_number"],
                         )

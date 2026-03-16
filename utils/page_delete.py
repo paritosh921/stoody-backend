@@ -30,6 +30,7 @@ async def delete_page_by_identity(
     page_number: int,
     user_id: str,
     user_id_variants: List[str],
+    copy_id: str | None = None,
 ) -> Dict[str, Any]:
     """
     Delete all data for a single page identified by (pen_mac, book_type, page_number).
@@ -57,6 +58,8 @@ async def delete_page_by_identity(
         "book_type": _book_type_match(book_type),
         "page_number": page_number,
     }
+    if copy_id:
+        cls_query["copy_id"] = copy_id
     cls_doc = await tenant_db["note_classifications"].find_one(cls_query)
     if cls_doc:
         thumbnail_url = cls_doc.get("thumbnail_url")
@@ -84,7 +87,7 @@ async def delete_page_by_identity(
     try:
         cp_result = await tenant_db["canvas_pages"].delete_many({
             "user_id": {"$in": user_id_variants},
-            "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
+            "copy_id": copy_id,
             "book_type": _book_type_match(book_type),
             "page_number": page_number,
         })
@@ -93,12 +96,15 @@ async def delete_page_by_identity(
         logger.warning(f"Failed to delete canvas_pages for page {page_number}: {e}")
 
     # 5. Delete classification queue entry if exists
-    await tenant_db["classification_queue"].delete_many({
+    queue_query = {
         "user_id": {"$in": user_id_variants},
         "pen_mac": pen_mac_upper,
         "book_type": _book_type_match(book_type),
         "page_number": page_number,
-    })
+    }
+    if copy_id:
+        queue_query["copy_id"] = copy_id
+    await tenant_db["classification_queue"].delete_many(queue_query)
 
     # 6. Delete the classification doc itself last (safe: leaf data already gone)
     deleted_classification = False
