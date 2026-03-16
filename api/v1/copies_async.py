@@ -27,6 +27,7 @@ from api.v1.auth_async import get_current_user, get_database, get_auth_manager
 from core.auth import AuthManager
 from utils.s3_storage import upload_file, download_file as s3_download_file, get_public_url
 from utils.stroke_pdf_generator import generate_copy_pdf, generate_copy_thumbnail, build_svg_from_strokes
+from api.v1.copy_sets_async import resolve_copy_id as _resolve_copy_id
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ async def get_current_user_from_token_or_query(
 class CopyPageSummary(BaseModel):
     """Summary of a copy page (aggregated from stroke batches)"""
     id: Optional[str] = None
+    copy_id: Optional[str] = None
     pen_mac: str
     book_type: Optional[str] = None
     page_number: int
@@ -121,6 +123,7 @@ class CopyPageListResponse(BaseModel):
 class CopyPageDetailResponse(BaseModel):
     """Response for a single copy page with strokes"""
     success: bool = True
+    copy_id: Optional[str] = None
     pen_mac: str
     book_type: Optional[str] = None
     page_number: int
@@ -131,6 +134,7 @@ class CopyPageDetailResponse(BaseModel):
 class CreatePinRequest(BaseModel):
     """Request to pin a copy page"""
     pen_mac: str
+    copy_id: Optional[str] = None
     book_type: Optional[str] = "A5"
     page_number: int
     title: Optional[str] = None
@@ -206,6 +210,7 @@ async def _list_canvas_pages_for_user(
     *,
     pen_mac: Optional[str] = None,
     book_type: Optional[str] = None,
+    copy_id: Optional[str] = None,
     limit: int = 200,
 ) -> List[Dict[str, Any]]:
     """Query canvas_pages collection and return summaries compatible with CopyPageSummary."""
@@ -217,6 +222,8 @@ async def _list_canvas_pages_for_user(
     user_identifiers = _build_user_id_variants(current_user)
 
     query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "stroke_count": {"$gt": 0}}
+    if copy_id:
+        query["copy_id"] = copy_id
     if pen_mac:
         query["pen_mac"] = pen_mac.upper()
     if book_type:
@@ -288,6 +295,7 @@ async def _list_canvas_pages_for_user(
             classification = classifications.get(key)
             grouped[key] = {
                 "id": str(classification.get("_id")) if classification and classification.get("_id") else None,
+                "copy_id": d.get("copy_id"),
                 "pen_mac": d.get("pen_mac") or "canvas",
                 "book_type": bt,
                 "page_number": int(pn),
@@ -333,6 +341,7 @@ async def _get_canvas_page_as_batches(
     page_number: int,
     book_type: Optional[str] = None,
     pen_mac: Optional[str] = None,
+    copy_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load a single canvas page from canvas_pages and wrap it as a list of
@@ -345,6 +354,8 @@ async def _get_canvas_page_as_batches(
     user_identifiers = _build_user_id_variants(current_user)
 
     query: Dict[str, Any] = {"user_id": {"$in": user_identifiers}, "page_number": page_number}
+    if copy_id:
+        query["copy_id"] = copy_id
     if book_type:
         bt_val = book_type.upper()
         query["book_type"] = {"$in": [bt_val, None]} if bt_val == "STANDARD" else bt_val
@@ -392,6 +403,7 @@ async def list_copy_pages(
     request: Request,
     pen_mac: Optional[str] = Query(None, description="Filter by pen MAC address"),
     book_type: Optional[str] = Query(None, description="Filter by book type (A4, A5)"),
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     limit: int = Query(50, ge=1, le=200, description="Max pages to return"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
@@ -404,7 +416,7 @@ async def list_copy_pages(
     """
     try:
         pages = await _list_canvas_pages_for_user(
-            current_user, db, pen_mac=pen_mac, book_type=book_type, limit=limit,
+            current_user, db, pen_mac=pen_mac, book_type=book_type, copy_id=copy_id, limit=limit,
         )
 
         return {
@@ -429,6 +441,7 @@ async def get_copy_page(
     pen_mac: str,
     page_number: int,
     book_type: Optional[str] = Query(None, description="Filter by book type"),
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -443,6 +456,7 @@ async def get_copy_page(
             page_number=page_number,
             book_type=book_type,
             pen_mac=pen_mac,
+            copy_id=copy_id,
         )
 
         if not stroke_batches:
@@ -507,6 +521,7 @@ async def get_copy_page(
 
         return {
             "success": True,
+            "copy_id": copy_id,
             "pen_mac": pen_mac.upper(),
             "book_type": detected_book_type or book_type,
             "page_number": page_number,
@@ -530,6 +545,7 @@ async def get_copy_page_svg(
     pen_mac: str,
     page_number: int,
     book_type: Optional[str] = Query(None, description="Book type"),
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     background: str = Query("#FFFBF0", description="Background color"),
     current_user: Dict[str, Any] = Depends(get_current_user_from_token_or_query),
     db: DatabaseManager = Depends(get_database)
@@ -545,6 +561,7 @@ async def get_copy_page_svg(
             page_number=page_number,
             book_type=book_type,
             pen_mac=pen_mac,
+            copy_id=copy_id,
         )
 
         if not stroke_batches:
@@ -621,6 +638,7 @@ async def get_copy_page_svg(
 
 class CopyPageIdentity(BaseModel):
     pen_mac: str
+    copy_id: Optional[str] = None
     book_type: str = "A5"
     page_number: int
 
@@ -656,11 +674,11 @@ async def bulk_delete_copy_pages(
     user_id = canonical_canvas_user_id(current_user)
     variants = _build_user_id_variants(current_user)
 
-    # Deduplicate by (pen_mac, book_type, page_number)
+    # Deduplicate by (pen_mac, copy_id, book_type, page_number)
     seen: set = set()
     unique_pages: list = []
     for p in body.pages:
-        key = (p.pen_mac.upper(), p.book_type.upper(), p.page_number)
+        key = (p.pen_mac.upper(), p.copy_id, p.book_type.upper(), p.page_number)
         if key not in seen:
             seen.add(key)
             unique_pages.append(p)
@@ -676,6 +694,7 @@ async def bulk_delete_copy_pages(
                 page_number=p.page_number,
                 user_id=user_id,
                 user_id_variants=variants,
+                copy_id=p.copy_id,
             )
             if result["had_data"]:
                 deleted_count += 1
@@ -730,6 +749,7 @@ async def create_pin(
             page_number=payload.page_number,
             book_type=payload.book_type,
             pen_mac=payload.pen_mac,
+            copy_id=payload.copy_id,
         )
 
         if not stroke_batches:
@@ -794,6 +814,7 @@ async def create_pin(
             "_id": pin_id,
             "user_id": user_id,
             "pen_mac": payload.pen_mac.upper(),
+            "copy_id": payload.copy_id,
             "book_type": payload.book_type,
             "page_number": payload.page_number,
             "title": auto_title,

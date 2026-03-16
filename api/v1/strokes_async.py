@@ -17,6 +17,7 @@ from pymongo import ReplaceOne, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
+from api.v1.copy_sets_async import resolve_copy_id as _resolve_copy_id
 from core.database import DatabaseManager
 from core.permissions import has_permission
 from core.pen_tokens import decode_pen_token
@@ -280,6 +281,7 @@ class CanvasPageUpsert(BaseModel):
     book_type: str = Field(..., min_length=1, max_length=10)
     page_number: int = Field(..., ge=0)
     strokes: List[CanvasPageStroke]
+    copy_id: Optional[str] = None
     page_style: Optional[str] = None
     canvas_background: Optional[str] = None
     stroke_count: Optional[int] = None
@@ -315,13 +317,15 @@ class BulkLoadRequest(BaseModel):
     pages: List[Dict[str, Any]] = Field(
         ...,
         max_length=50,
-        description="List of {book_type, page_number} dicts",
+        description="List of {book_type, page_number, copy_id?} dicts",
     )
+    copy_id: Optional[str] = None
 
 
 class CanvasPageMeta(BaseModel):
     book_type: str
     page_number: int
+    copy_id: Optional[str] = None
     stroke_count: int = 0
     last_modified: Optional[str] = None
     client_last_modified: Optional[float] = None
@@ -387,11 +391,19 @@ def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
 _canonical_canvas_user_id = canonical_canvas_user_id  # back-compat alias
 
 
-def _page_doc(user_id: str, admin_id: Optional[str], page: CanvasPageUpsert, now: datetime) -> Dict[str, Any]:
+def _page_doc(
+    user_id: str,
+    admin_id: Optional[str],
+    page: CanvasPageUpsert,
+    now: datetime,
+    *,
+    copy_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Build the MongoDB document for a canvas page upsert."""
     doc: Dict[str, Any] = {
         "user_id": user_id,
         "admin_id": admin_id,
+        "copy_id": copy_id or page.copy_id,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
         "strokes": [s.model_dump() for s in page.strokes],
@@ -462,6 +474,7 @@ def _build_merged_page_doc(
     admin_id: Optional[str],
     page: CanvasPageUpsert,
     now: datetime,
+    copy_id: Optional[str] = None,
 ) -> tuple[Dict[str, Any], int]:
     incoming_strokes = _incoming_stroke_docs(page)
     merged_strokes, added_count = _merge_stroke_docs(
@@ -482,9 +495,11 @@ def _build_merged_page_doc(
         if value is not None
     ]
 
+    resolved_copy_id = copy_id or page.copy_id or existing_doc.get("copy_id")
     merged_doc: Dict[str, Any] = {
         "user_id": user_id,
         "admin_id": admin_id,
+        "copy_id": resolved_copy_id,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
         "strokes": merged_strokes,
@@ -555,8 +570,10 @@ async def _upsert_notes_canvas_classification(
     user_ids: List[Any],
     page: CanvasPageUpsert,
     now: datetime,
+    copy_id: Optional[str] = None,
 ) -> None:
     pen_mac = (page.pen_mac or "").upper() or None
+    resolved_copy_id = copy_id or page.copy_id
 
     stroke_count = page.stroke_count if page.stroke_count is not None else len(page.strokes or [])
     identity_fields: Dict[str, Any] = {
@@ -565,6 +582,8 @@ async def _upsert_notes_canvas_classification(
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
+    if resolved_copy_id:
+        identity_fields["copy_id"] = resolved_copy_id
     mutable_fields: Dict[str, Any] = {
         "stroke_count_at_classification": stroke_count,
         "updated_at": now,
@@ -597,6 +616,8 @@ async def _upsert_notes_canvas_classification(
             "book_type": page.book_type.upper(),
             "page_number": page.page_number,
         }
+        if resolved_copy_id:
+            find_query["copy_id"] = resolved_copy_id
         if pen_mac:
             find_query["pen_mac"] = pen_mac
 
@@ -648,25 +669,30 @@ async def upsert_canvas_page(
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
-    """Upsert a single canvas page. Identity key: (user_id, book_type, page_number)."""
+    """Upsert a single canvas page. Identity key: (user_id, copy_id, book_type, page_number)."""
     user_id = _canonical_canvas_user_id(current_user)
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
     classification_collection = collection.database["note_classifications"]
     user_ids = _resolve_canvas_user_ids(current_user)
 
+    # Resolve copy_id: explicit in payload → user's active copy → auto-create default
+    copy_id = await _resolve_copy_id(page.copy_id, current_user, db)
+
     now = datetime.now(timezone.utc)
     page_filter: Dict[str, Any] = {
         "user_id": {"$in": user_ids},
+        "copy_id": copy_id,
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
     existing = await collection.find_one(page_filter)
 
     if existing is None:
-        doc = _page_doc(user_id, admin_id, page, now)
+        doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
         upsert_filt: Dict[str, Any] = {
             "user_id": user_id,
+            "copy_id": copy_id,
             "book_type": page.book_type.upper(),
             "page_number": page.page_number,
         }
@@ -678,6 +704,7 @@ async def upsert_canvas_page(
             admin_id=admin_id,
             page=page,
             now=now,
+            copy_id=copy_id,
         )
         if added_count == 0:
             # No new strokes, but still refresh audit/activity metadata
@@ -690,6 +717,7 @@ async def upsert_canvas_page(
                 user_ids=user_ids,
                 page=page,
                 now=now,
+                copy_id=copy_id,
             )
             return {
                 "success": True,
@@ -703,7 +731,7 @@ async def upsert_canvas_page(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Version conflict — page was modified by another session",
             )
-        doc = _page_doc(user_id, admin_id, page, now)
+        doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
         result = await collection.replace_one({"_id": existing["_id"]}, doc)
 
     await _upsert_notes_canvas_classification(
@@ -712,12 +740,14 @@ async def upsert_canvas_page(
         user_ids=user_ids,
         page=page,
         now=now,
+        copy_id=copy_id,
     )
 
     return {
         "success": True,
         "version": doc["version"],
         "last_modified": now.isoformat(),
+        "copy_id": copy_id,
     }
 
 
@@ -734,21 +764,31 @@ async def batch_upsert_canvas_pages(
     classification_collection = collection.database["note_classifications"]
     user_ids = _resolve_canvas_user_ids(current_user)
 
+    # Resolve copy_id once for the entire batch.  Individual pages may
+    # carry their own copy_id but when absent the batch defaults to the
+    # user's active copy.
+    batch_copy_id = await _resolve_copy_id(
+        body.pages[0].copy_id if body.pages else None,
+        current_user,
+        db,
+    )
+
     now = datetime.now(timezone.utc)
 
     # Pre-fetch existing docs to handle legacy user_id variants.
     page_keys = [
-        (p.book_type.upper(), p.page_number) for p in body.pages
+        (p.copy_id or batch_copy_id, p.book_type.upper(), p.page_number) for p in body.pages
     ]
     existing_map: Dict[tuple, Any] = {}
     if page_keys:
         or_clauses = [
-            {"book_type": bt, "page_number": pn} for bt, pn in page_keys
+            {"copy_id": cid, "book_type": bt, "page_number": pn} for cid, bt, pn in page_keys
         ]
         existing_cursor = collection.find(
             {"user_id": {"$in": user_ids}, "$or": or_clauses},
             {
                 "_id": 1,
+                "copy_id": 1,
                 "book_type": 1,
                 "page_number": 1,
                 "strokes": 1,
@@ -765,22 +805,24 @@ async def batch_upsert_canvas_pages(
             },
         )
         async for edoc in existing_cursor:
-            existing_map[(edoc["book_type"], edoc["page_number"])] = edoc
+            existing_map[(edoc.get("copy_id"), edoc["book_type"], edoc["page_number"])] = edoc
 
     ops = []
-    changed_pages: List[CanvasPageUpsert] = []
+    changed_pages: List[tuple[CanvasPageUpsert, str]] = []  # (page, resolved_copy_id)
     for page in body.pages:
-        key = (page.book_type.upper(), page.page_number)
+        copy_id = page.copy_id or batch_copy_id
+        key = (copy_id, page.book_type.upper(), page.page_number)
         existing = existing_map.get(key)
         if existing is None:
-            doc = _page_doc(user_id, admin_id, page, now)
+            doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
             filt = {
                 "user_id": user_id,
+                "copy_id": copy_id,
                 "book_type": page.book_type.upper(),
                 "page_number": page.page_number,
             }
             ops.append(ReplaceOne(filt, doc, upsert=True))
-            changed_pages.append(page)
+            changed_pages.append((page, copy_id))
         elif _is_stale_canvas_page_update(existing, page):
             doc, added_count = _build_merged_page_doc(
                 existing_doc=existing,
@@ -788,35 +830,37 @@ async def batch_upsert_canvas_pages(
                 admin_id=admin_id,
                 page=page,
                 now=now,
+                copy_id=copy_id,
             )
             if added_count == 0:
                 # No new strokes — still refresh audit/activity metadata
                 metadata_update = _build_metadata_refresh(existing, page, now)
                 if metadata_update:
                     ops.append(UpdateOne({"_id": existing["_id"]}, {"$set": metadata_update}))
-                changed_pages.append(page)
+                changed_pages.append((page, copy_id))
                 continue
             ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
-            changed_pages.append(page)
+            changed_pages.append((page, copy_id))
         else:
             if page.version is not None and int(existing.get("version", 0) or 0) != page.version:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Version conflict — page was modified by another session",
                 )
-            doc = _page_doc(user_id, admin_id, page, now)
+            doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
             ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
-            changed_pages.append(page)
+            changed_pages.append((page, copy_id))
 
     if ops:
         result = await collection.bulk_write(ops, ordered=False)
-        for page in changed_pages:
+        for page, page_copy_id in changed_pages:
             await _upsert_notes_canvas_classification(
                 classification_collection,
                 user_id=user_id,
                 user_ids=user_ids,
                 page=page,
                 now=now,
+                copy_id=page_copy_id,
             )
         return {
             "success": True,
@@ -828,6 +872,7 @@ async def batch_upsert_canvas_pages(
 
 @router.get("/pages")
 async def list_canvas_pages(
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     book_type: Optional[str] = Query(None, description="Filter by book type"),
     since: Optional[str] = Query(None, description="ISO datetime — only pages modified after this"),
     limit: int = Query(200, ge=1, le=1000),
@@ -840,6 +885,8 @@ async def list_canvas_pages(
     collection = await _get_canvas_collection(current_user, db)
 
     query: Dict[str, Any] = {"user_id": {"$in": user_ids}}
+    if copy_id:
+        query["copy_id"] = copy_id
     if book_type:
         query["book_type"] = book_type.upper()
     if since:
@@ -863,6 +910,7 @@ async def list_canvas_pages(
     pages = []
     for d in docs:
         page_meta: Dict[str, Any] = {
+            "copy_id": d.get("copy_id"),
             "book_type": d.get("book_type"),
             "page_number": d.get("page_number"),
             "stroke_count": d.get("stroke_count", 0),
@@ -892,6 +940,7 @@ async def list_canvas_pages(
 async def get_canvas_page(
     book_type: str,
     page_number: int,
+    copy_id: Optional[str] = Query(None, description="Copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -899,11 +948,14 @@ async def get_canvas_page(
     user_ids = _resolve_canvas_user_ids(current_user)
     collection = await _get_canvas_collection(current_user, db)
 
-    doc = await collection.find_one({
+    page_filter: Dict[str, Any] = {
         "user_id": {"$in": user_ids},
         "book_type": book_type.upper(),
         "page_number": page_number,
-    })
+    }
+    if copy_id:
+        page_filter["copy_id"] = copy_id
+    doc = await collection.find_one(page_filter)
 
     if not doc:
         raise HTTPException(status_code=404, detail="Page not found")
@@ -930,12 +982,16 @@ async def bulk_load_canvas_pages(
         bt = p.get("book_type")
         pn = p.get("page_number")
         if bt is not None and pn is not None:
-            or_clauses.append({"book_type": str(bt).upper(), "page_number": int(pn)})
+            clause: Dict[str, Any] = {"book_type": str(bt).upper(), "page_number": int(pn)}
+            cid = p.get("copy_id") or body.copy_id
+            if cid:
+                clause["copy_id"] = cid
+            or_clauses.append(clause)
 
     if not or_clauses:
         return {"pages": []}
 
-    query = {"user_id": {"$in": user_ids}, "$or": or_clauses}
+    query: Dict[str, Any] = {"user_id": {"$in": user_ids}, "$or": or_clauses}
     cursor = collection.find(query)
     docs = await cursor.to_list(length=len(or_clauses))
 

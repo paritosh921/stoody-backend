@@ -125,6 +125,15 @@ except Exception as e:
     _copies_available = False
     logging.warning(f"Copies routes disabled: {str(e)}")
 
+# Copy Sets management routes
+try:
+    from api.v1.copy_sets_async import router as copy_sets_router
+    _copy_sets_available = True
+except Exception as e:
+    copy_sets_router = None
+    _copy_sets_available = False
+    logging.warning(f"Copy Sets routes disabled: {str(e)}")
+
 # Optional debugger routes (require LangChain stack). Gate import to avoid hard dependency.
 try:
     from api.v1.debugger_async import router as debugger_router  # type: ignore
@@ -896,6 +905,17 @@ if _copies_available and copies_router:
     logger.info("✅ Student Copies routes enabled")
 else:
     logger.warning("⚠️ Student Copies routes disabled")
+
+# Copy Sets management (create/rename/archive/activate copy sets)
+if _copy_sets_available and copy_sets_router:
+    app.include_router(
+        copy_sets_router,
+        prefix=f"{API_V1_PREFIX}/learning",
+        tags=["Copy Sets"]
+    )
+    logger.info("✅ Copy Sets routes enabled")
+else:
+    logger.warning("⚠️ Copy Sets routes disabled")
 
 # Also include learning routes at /api/learning for frontend compatibility
 app.include_router(

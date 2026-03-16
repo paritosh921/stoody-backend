@@ -177,6 +177,7 @@ async def get_topics(
 @router.get("/subjects/{subject}/pages")
 async def get_subject_pages(
     subject: str,
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -188,8 +189,11 @@ async def get_subject_pages(
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
 
+    subject_query: Dict[str, Any] = {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}}
+    if copy_id:
+        subject_query["copy_id"] = copy_id
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": uid_match, "subject": subject, "is_archived": {"$ne": True}},
+        subject_query,
     ).sort("updated_at", -1)
 
     pages = []
@@ -212,6 +216,7 @@ async def get_subject_pages(
 async def get_topic_pages(
     subject: str,
     topic: str,
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -223,8 +228,11 @@ async def get_topic_pages(
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
 
+    topic_query: Dict[str, Any] = {"user_id": uid_match, "subject": subject, "topic": topic, "is_archived": {"$ne": True}}
+    if copy_id:
+        topic_query["copy_id"] = copy_id
     cursor = tenant_db["note_classifications"].find(
-        {"user_id": uid_match, "subject": subject, "topic": topic, "is_archived": {"$ne": True}},
+        topic_query,
     ).sort("page_number", 1)
 
     pages = []
@@ -680,6 +688,7 @@ async def backfill_classifications(
 async def get_all_pages(
     favorites_only: bool = Query(False),
     archived_only: bool = Query(False),
+    copy_id: Optional[str] = Query(None, description="Filter by copy set ID"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -692,6 +701,8 @@ async def get_all_pages(
     uid_match = _user_id_match(current_user)
 
     query: Dict[str, Any] = {"user_id": uid_match}
+    if copy_id:
+        query["copy_id"] = copy_id
     query["is_archived"] = True if archived_only else {"$ne": True}
     if favorites_only:
         query["is_favorite"] = True
@@ -908,6 +919,7 @@ def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Di
     thumbnail_url = doc.get("thumbnail_url")
     page: Dict[str, Any] = {
         "id": str(doc["_id"]),
+        "copy_id": doc.get("copy_id"),
         "pen_mac": doc.get("pen_mac"),
         "book_type": doc.get("book_type"),
         "page_number": doc.get("page_number"),

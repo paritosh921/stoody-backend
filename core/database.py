@@ -404,12 +404,45 @@ class DatabaseManager:
             except Exception as e:
                 logger.warning(f"canvas_pages dedup failed (non-fatal): {e}")
 
+            # Target index includes copy_id.  The migration script
+            # (backfill_copy_sets.py) must run first to populate copy_id
+            # and drop the legacy 3-field index.  If migration hasn't run
+            # yet the new index creation will be skipped (OperationFailure)
+            # and the old index continues to work.
+            try:
+                await self._ensure_index_with_spec_check(
+                    canvas_pages,
+                    [("user_id", 1), ("copy_id", 1), ("book_type", 1), ("page_number", 1)],
+                    unique=True,
+                    name="uniq_canvas_page_v2"
+                )
+            except Exception:
+                # Fallback: keep legacy index if copy_id migration hasn't run
+                await self._ensure_index_with_spec_check(
+                    canvas_pages,
+                    [("user_id", 1), ("book_type", 1), ("page_number", 1)],
+                    unique=True,
+                    name="uniq_canvas_page"
+                )
+
+            # copy_sets collection
+            copy_sets = db["copy_sets"]
             await self._ensure_index_with_spec_check(
-                canvas_pages,
-                [("user_id", 1), ("book_type", 1), ("page_number", 1)],
-                unique=True,
-                name="uniq_canvas_page"
+                copy_sets,
+                [("user_id", 1), ("is_archived", 1), ("created_at", 1)],
+                name="idx_copy_sets_user"
             )
+
+            # note_classifications: target index includes copy_id
+            try:
+                await self._ensure_index_with_spec_check(
+                    note_cls,
+                    [("user_id", 1), ("copy_id", 1), ("book_type", 1), ("page_number", 1)],
+                    unique=True,
+                    name="uniq_note_page_v2"
+                )
+            except Exception:
+                pass  # legacy index still in place
 
             cls_queue = db["classification_queue"]
             await self._ensure_index_with_spec_check(
