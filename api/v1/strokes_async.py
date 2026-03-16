@@ -505,7 +505,11 @@ def _merge_stroke_docs(
 def _is_stale_canvas_page_update(existing_doc: Dict[str, Any], page: CanvasPageUpsert) -> bool:
     existing_version = int(existing_doc.get("version", 0) or 0)
     if page.version is not None:
-        return existing_version > page.version
+        # Canvas page writes are additive. Equal-version writes are still
+        # conflict-prone because the client may have loaded only a subset of
+        # strokes for that page. Merge on >= so same-version saves do not
+        # replace older strokes that were already present on the server.
+        return existing_version >= page.version
 
     existing_last_modified = existing_doc.get("client_last_modified")
     incoming_last_modified = page.client_last_modified
