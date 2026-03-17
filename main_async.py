@@ -146,6 +146,7 @@ from api.v1.pdf_async import router as pdf_router
 from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
 from api.v1.totp_2fa import router as totp_2fa_router
+from api.v1.pen_settings import router as pen_settings_router
 
 # B2C Authentication routes (Google OAuth for B2C users using stoody-b2c database)
 try:
@@ -845,6 +846,12 @@ app.include_router(
     tags=["Teacher Bulk Upload"]
 )
 logger.info("✅ Teacher Bulk Upload routes enabled")
+
+app.include_router(
+    pen_settings_router,
+    prefix=f"{API_V1_PREFIX}/pen-settings",
+    tags=["Pen Settings"]
+)
 
 app.include_router(
     pdf_router,
