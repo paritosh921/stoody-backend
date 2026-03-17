@@ -10,6 +10,7 @@ import logging
 from typing import Any, Dict, List
 
 from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,16 @@ def _normalize_role(user_type: str) -> str:
     )
 
 
+def _parse_user_object_id(user_id: Any) -> ObjectId:
+    try:
+        return ObjectId(str(user_id))
+    except (InvalidId, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid session",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -82,22 +93,28 @@ async def get_pen_settings(
     user_id = current_user.get("user_id")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+    user_oid = _parse_user_object_id(user_id)
 
     # B2C users live in the dedicated B2C database, not a tenant DB
     if role == "b2c_user":
         doc = await db.b2c_find_one(
             "users",
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             {"pen_settings": 1},
         )
     else:
         db_name = current_user.get("db_name")
         if not db_name:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
-        tenant_db = db.client[db_name]
+        tenant_db = await db.get_tenant_db(db_name)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Tenant database unavailable",
+            )
         collection_name = "tutors" if role == "tutor" else "students"
         doc = await tenant_db[collection_name].find_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             {"pen_settings": 1},
         )
 
@@ -121,6 +138,7 @@ async def update_pen_settings(
     user_id = current_user.get("user_id")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+    user_oid = _parse_user_object_id(user_id)
 
     allowed = ROLE_ALLOWED_ACTIONS.get(role, set())
     invalid = [a for a in body.fn_actions if a not in allowed]
@@ -150,7 +168,7 @@ async def update_pen_settings(
                 detail="B2C database unavailable",
             )
         result = await b2c_collection.update_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             update_op,
         )
         if result.matched_count == 0:
@@ -162,10 +180,15 @@ async def update_pen_settings(
         db_name = current_user.get("db_name")
         if not db_name:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
-        tenant_db = db.client[db_name]
+        tenant_db = await db.get_tenant_db(db_name)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Tenant database unavailable",
+            )
         collection_name = "tutors" if role == "tutor" else "students"
         result = await tenant_db[collection_name].update_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": user_oid},
             update_op,
         )
         if result.matched_count == 0:
