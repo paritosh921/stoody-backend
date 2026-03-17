@@ -53,6 +53,22 @@ class SSOExchangeRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
 
 
+async def _get_current_user_dual_auth_optional(
+    request: Request,
+    auth_manager: AuthManager = Depends(get_auth_manager),
+) -> Dict[str, Any] | None:
+    """
+    Best-effort auth resolver for idempotent logout.
+
+    Cookie logout is called defensively during login/logout cleanup, so lack of a
+    current session should not turn into a 401 that pollutes the browser console.
+    """
+    try:
+        return await get_current_user_dual_auth(request, auth_manager)
+    except HTTPException:
+        return None
+
+
 @router.get("/csrf-token")
 async def get_csrf_token(request: Request):
     """
@@ -505,7 +521,7 @@ async def sso_token_exchange(
 @router.post("/cookie-logout")
 async def cookie_logout(
     request: Request,
-    current_user: Dict[str, Any] = Depends(get_current_user_dual_auth),
+    current_user: Dict[str, Any] | None = Depends(_get_current_user_dual_auth_optional),
     db: DatabaseManager = Depends(get_database),
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
@@ -516,8 +532,8 @@ async def cookie_logout(
         JSON response with success status
     """
     try:
-        user_id = current_user.get("user_id")
-        user_type = current_user.get("user_type")
+        user_id = current_user.get("user_id") if current_user else None
+        user_type = current_user.get("user_type") if current_user else None
         
         # Get token from cookie for blacklisting
         token = cookie_auth_manager.get_token_from_cookie(request)
@@ -529,8 +545,9 @@ async def cookie_logout(
 
         # User-level revocation (Redis): invalidate ALL tokens for this user
         from core.token_blacklist import revoke_user_session
-        await revoke_user_session(auth_manager.cache_manager, user_id)
-        logger.info(f"Token + user-level revocation for user {user_id}")
+        if user_id:
+            await revoke_user_session(auth_manager.cache_manager, user_id)
+            logger.info(f"Token + user-level revocation for user {user_id}")
         
         # For students, update status
         if user_type == "student":
@@ -565,7 +582,8 @@ async def cookie_logout(
                 logger.warning(f"Failed to track student logout: {str(e)}")
         
         # Invalidate session
-        await auth_manager.invalidate_user_session(user_id)
+        if user_id:
+            await auth_manager.invalidate_user_session(user_id)
         
         # Create response
         response_data = {
@@ -585,7 +603,10 @@ async def cookie_logout(
             domain=None
         )
         
-        logger.info(f"User logged out via cookie: {user_id}")
+        if user_id:
+            logger.info(f"User logged out via cookie: {user_id}")
+        else:
+            logger.debug("Cookie logout called without an active authenticated session")
         
         return response
         

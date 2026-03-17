@@ -13,8 +13,8 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from api.v1.auth_async import get_current_user
 from core.database import DatabaseManager
+from core.cookie_auth import get_current_user_dual_auth
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class PenSettingsUpdate(BaseModel):
 
 @router.get("", response_model=PenSettingsResponse)
 async def get_pen_settings(
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_dual_auth),
     db: DatabaseManager = Depends(get_database),
 ):
     user_type = current_user.get("user_type", "")
@@ -101,8 +101,10 @@ async def get_pen_settings(
             {"pen_settings": 1},
         )
 
-    if doc and doc.get("pen_settings", {}).get("fn_actions"):
-        return PenSettingsResponse(fn_actions=doc["pen_settings"]["fn_actions"])
+    pen_settings = (doc or {}).get("pen_settings") or {}
+    fn_actions = pen_settings.get("fn_actions")
+    if fn_actions:
+        return PenSettingsResponse(fn_actions=fn_actions)
 
     # Return defaults for this role
     return PenSettingsResponse(fn_actions=DEFAULT_FN_ACTIONS.get(role, DEFAULT_FN_ACTIONS["student"]))
@@ -111,7 +113,7 @@ async def get_pen_settings(
 @router.put("", response_model=PenSettingsResponse)
 async def update_pen_settings(
     body: PenSettingsUpdate,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_dual_auth),
     db: DatabaseManager = Depends(get_database),
 ):
     user_type = current_user.get("user_type", "")
