@@ -10,11 +10,11 @@ import logging
 from typing import Any, Dict, List
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from api.v1.auth_async import get_current_user
-from core.database import get_database
+from core.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,10 @@ DEFAULT_FN_ACTIONS: Dict[str, List[str]] = {
     "b2c_user": ["CYCLE_COLOR", "TOGGLE_ERASER", "TOGGLE_RULED", "SHARE_SCREEN"],
     "tutor": ["CYCLE_COLOR", "TOGGLE_ERASER", "TOGGLE_RULED", "LOCK_QUESTION", "SHARE_SCREEN"],
 }
+
+
+async def get_database(request: Request) -> DatabaseManager:
+    return request.app.state.db
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -71,7 +75,7 @@ class PenSettingsUpdate(BaseModel):
 @router.get("", response_model=PenSettingsResponse)
 async def get_pen_settings(
     current_user: Dict[str, Any] = Depends(get_current_user),
-    db=Depends(get_database),
+    db: DatabaseManager = Depends(get_database),
 ):
     user_type = current_user.get("user_type", "")
     role = _normalize_role(user_type)
@@ -108,7 +112,7 @@ async def get_pen_settings(
 async def update_pen_settings(
     body: PenSettingsUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    db=Depends(get_database),
+    db: DatabaseManager = Depends(get_database),
 ):
     user_type = current_user.get("user_type", "")
     role = _normalize_role(user_type)
