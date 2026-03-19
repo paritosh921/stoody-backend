@@ -133,6 +133,71 @@ stop_existing_mentor_ai() {
   rm -f "$pid_file"
 }
 
+show_mentor_ai_logs() {
+  local mentor_log_file="$1"
+
+  if [[ -f "$mentor_log_file" ]]; then
+    echo "Last 200 lines from MentorAI log:" >&2
+    tail -n 200 "$mentor_log_file" >&2 || true
+  else
+    echo "MentorAI log file not found: $mentor_log_file" >&2
+  fi
+}
+
+start_mentor_ai_process() {
+  local mentor_host="$1"
+  local mentor_port="$2"
+  local mentor_base_path="$3"
+  local mentor_log_file="$4"
+
+  if [[ -f ".next/standalone/server.js" ]]; then
+    echo "Starting MentorAI with standalone output"
+    env \
+      NODE_ENV=production \
+      HOSTNAME="$mentor_host" \
+      PORT="$mentor_port" \
+      NEXT_PUBLIC_BASE_PATH="$mentor_base_path" \
+      nohup node .next/standalone/server.js >"$mentor_log_file" 2>&1 </dev/null &
+  else
+    echo "Standalone output not found; starting MentorAI with next start"
+    env \
+      NODE_ENV=production \
+      HOSTNAME="$mentor_host" \
+      PORT="$mentor_port" \
+      NEXT_PUBLIC_BASE_PATH="$mentor_base_path" \
+      nohup pnpm exec next start --hostname "$mentor_host" --port "$mentor_port" >"$mentor_log_file" 2>&1 </dev/null &
+  fi
+}
+
+wait_for_mentor_ai_health() {
+  local mentor_pid="$1"
+  local mentor_healthcheck_url="$2"
+  local mentor_log_file="$3"
+
+  local attempts=0
+  local max_attempts=30
+
+  while [[ "$attempts" -lt "$max_attempts" ]]; do
+    if curl --fail --silent "$mentor_healthcheck_url" >/dev/null 2>&1; then
+      echo "MentorAI health check passed"
+      return 0
+    fi
+
+    if ! kill -0 "$mentor_pid" >/dev/null 2>&1; then
+      echo "MentorAI process exited before becoming healthy" >&2
+      show_mentor_ai_logs "$mentor_log_file"
+      return 1
+    fi
+
+    attempts=$((attempts + 1))
+    sleep 2
+  done
+
+  echo "MentorAI health check did not pass after $((max_attempts * 2)) seconds: $mentor_healthcheck_url" >&2
+  show_mentor_ai_logs "$mentor_log_file"
+  return 1
+}
+
 deploy_mentor_ai() {
   local mentor_enabled="${MENTOR_AI_ENABLED:-true}"
   mentor_enabled="$(printf '%s' "$mentor_enabled" | tr '[:upper:]' '[:lower:]')"
@@ -176,20 +241,13 @@ deploy_mentor_ai() {
   stop_existing_mentor_ai "$mentor_pid_file"
 
   echo "Starting MentorAI on $mentor_host:$mentor_port"
-  env \
-    NODE_ENV=production \
-    HOSTNAME="$mentor_host" \
-    PORT="$mentor_port" \
-    NEXT_PUBLIC_BASE_PATH="$mentor_base_path" \
-    nohup node .next/standalone/server.js >"$mentor_log_file" 2>&1 </dev/null &
+  start_mentor_ai_process "$mentor_host" "$mentor_port" "$mentor_base_path" "$mentor_log_file"
 
   local mentor_pid=$!
   echo "$mentor_pid" > "$mentor_pid_file"
 
-  sleep 5
-
   echo "Running MentorAI health check: $mentor_healthcheck_url"
-  curl --fail --silent --show-error "$mentor_healthcheck_url" >/dev/null
+  wait_for_mentor_ai_health "$mentor_pid" "$mentor_healthcheck_url" "$mentor_log_file"
 }
 
 reload_nginx_if_config_provided() {
