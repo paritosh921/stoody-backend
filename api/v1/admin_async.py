@@ -2550,7 +2550,9 @@ async def get_class_section_monitoring_stats(
                 return cached_stats
             admin_students = await db.mongo_find("students", {"admin_id": admin_id})
         else:
-            # Tutor scoping: same logic as get_student_progress
+            # Tutor scoping: assigned + teacher_ids + class/section matching
+            from utils.tutor_scoping import get_tutor_scoped_students
+
             tutor_id = current_user.get("tutor_id")
             admin_id_str = current_user.get("admin_id")
             try:
@@ -2563,45 +2565,12 @@ async def get_class_section_monitoring_stats(
             if cached_stats:
                 return cached_stats
 
-            # 1) Students explicitly mapped via teacher_ids
-            # IMPORTANT: Must include admin_id filter for data isolation
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
-            mapped = []
-            if admin_id is not None:
-                mapped = await db.mongo_find(
-                    "students",
-                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_id},
-                    projection={"password_hash": 0},
-                )
-
-            # 2) Students listed in tutor.assigned_student_ids
-            # IMPORTANT: Must include admin_id filter for data isolation
-            assigned = []
-            if (
-                tutor_doc
-                and tutor_doc.get("assigned_student_ids")
-                and admin_id is not None
-            ):
-                assigned_ids = tutor_doc.get("assigned_student_ids", [])
-                if assigned_ids:
-                    assigned = await db.mongo_find(
-                        "students",
-                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_id},
-                        projection={"password_hash": 0},
-                    )
-
-            # ONLY show explicitly assigned students - no criteria-based matching
-            # Teachers should only see students they are explicitly assigned to
-            # (via teacher_ids or assigned_student_ids), not all students in their subjects/grades
-
-            # Deduplicate by _id
-            seen = set()
-            admin_students = []
-            for s in mapped + assigned:
-                sid = str(s.get("_id"))
-                if sid not in seen:
-                    seen.add(sid)
-                    admin_students.append(s)
+            admin_students = await get_tutor_scoped_students(
+                tutor_id=tutor_id,
+                admin_oid=admin_id,
+                db=db,
+                projection={"password_hash": 0},
+            )
 
         # Get all documents for this admin (tutors see documents for their admin)
         admin_documents = []
@@ -2800,7 +2769,9 @@ async def get_student_progress(
                 "students", {"admin_id": admin_id}, projection={"password_hash": 0}
             )
         else:
-            # Tutor scoping: assigned + teacher_ids + criteria-based match
+            # Tutor scoping: assigned + teacher_ids + class/section matching
+            from utils.tutor_scoping import get_tutor_scoped_students
+
             tutor_id = current_user.get("tutor_id")
             admin_id_str = current_user.get("admin_id")
             admin_oid = None
@@ -2809,48 +2780,12 @@ async def get_student_progress(
             except Exception:
                 admin_oid = None
 
-            # 1) Students explicitly mapped via teacher_ids
-            # IMPORTANT: Must include admin_id filter for data isolation
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
-            mapped = []
-            if admin_oid is not None:
-                mapped = await db.mongo_find(
-                    "students",
-                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid},
-                    projection={"password_hash": 0},
-                )
-
-            # 2) Students listed in tutor.assigned_student_ids (business student_id)
-            # IMPORTANT: Must include admin_id filter for data isolation
-            assigned = []
-            if (
-                tutor_doc
-                and tutor_doc.get("assigned_student_ids")
-                and admin_oid is not None
-            ):
-                assigned_ids = tutor_doc.get("assigned_student_ids", [])
-                if assigned_ids:
-                    assigned = await db.mongo_find(
-                        "students",
-                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_oid},
-                        projection={"password_hash": 0},
-                    )
-
-            # ONLY show explicitly assigned students - no criteria-based matching
-            # Teachers should only see students they are explicitly assigned to
-
-            # Union and deduplicate by _id
-            def _uniq(stus):
-                seen = set()
-                out = []
-                for s in stus:
-                    sid = str(s.get("_id"))
-                    if sid not in seen:
-                        seen.add(sid)
-                        out.append(s)
-                return out
-
-            students = _uniq(mapped + assigned)
+            students = await get_tutor_scoped_students(
+                tutor_id=tutor_id,
+                admin_oid=admin_oid,
+                db=db,
+                projection={"password_hash": 0},
+            )
 
         progress_data = []
         for student in students:
@@ -2943,6 +2878,9 @@ async def get_recent_activities(
             )
             scoped_student_ids = [s["_id"] for s in admin_students]
         else:
+            # Tutor scoping: assigned + teacher_ids + class/section matching
+            from utils.tutor_scoping import get_tutor_scoped_students
+
             tutor_id = current_user.get("tutor_id")
             admin_id_str = current_user.get("admin_id")
             admin_oid = None
@@ -2951,41 +2889,13 @@ async def get_recent_activities(
             except Exception:
                 admin_oid = None
 
-            # teacher_ids mapping
-            # IMPORTANT: Must include admin_id filter for data isolation
-            tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
-            tutor_students = []
-            if admin_oid is not None:
-                tutor_students = await db.mongo_find(
-                    "students",
-                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid},
-                    projection={"_id": 1},
-                )
-
-            # assigned_student_ids mapping
-            # IMPORTANT: Must include admin_id filter for data isolation
-            assigned = []
-            if (
-                tutor_doc
-                and tutor_doc.get("assigned_student_ids")
-                and admin_oid is not None
-            ):
-                assigned_ids = tutor_doc.get("assigned_student_ids", [])
-                if assigned_ids:
-                    assigned = await db.mongo_find(
-                        "students",
-                        {"student_id": {"$in": assigned_ids}, "admin_id": admin_oid},
-                        projection={"_id": 1},
-                    )
-
-            # ONLY show explicitly assigned students - no criteria-based matching
-            # Teachers should only see students they are explicitly assigned to
-
-            id_set = set(
-                [str(s["_id"]) for s in tutor_students]
-                + [str(s["_id"]) for s in assigned]
+            scoped_students = await get_tutor_scoped_students(
+                tutor_id=tutor_id,
+                admin_oid=admin_oid,
+                db=db,
+                projection={"_id": 1},
             )
-            scoped_student_ids = [ObjectId(x) for x in id_set]
+            scoped_student_ids = [s["_id"] for s in scoped_students]
 
         # Get recent activities for scoped students
         recent_activity_logs = await db.mongo_find(
@@ -3268,6 +3178,9 @@ async def get_all_test_attempts(
             )
             student_ids = [str(s["_id"]) for s in admin_students]
         else:
+            # Tutor scoping: assigned + teacher_ids + class/section matching
+            from utils.tutor_scoping import get_tutor_scoped_students
+
             tutor_id = current_user.get("tutor_id")
             admin_id_str = current_user.get("admin_id")
             admin_oid = None
@@ -3275,15 +3188,14 @@ async def get_all_test_attempts(
                 admin_oid = ObjectId(admin_id_str) if admin_id_str else None
             except Exception:
                 admin_oid = None
-            # IMPORTANT: Must include admin_id filter for data isolation
-            tutor_students = []
-            if admin_oid is not None:
-                tutor_students = await db.mongo_find(
-                    "students",
-                    {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid},
-                    projection={"_id": 1},
-                )
-            student_ids = [str(s["_id"]) for s in tutor_students]
+
+            scoped_students = await get_tutor_scoped_students(
+                tutor_id=tutor_id,
+                admin_oid=admin_oid,
+                db=db,
+                projection={"_id": 1},
+            )
+            student_ids = [str(s["_id"]) for s in scoped_students]
 
         attempts = await db.mongo_find(
             "student_test_attempts",
