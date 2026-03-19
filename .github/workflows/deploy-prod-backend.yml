@@ -13,7 +13,9 @@ on:
       - "utils/**"
       - "main_async.py"
       - "config_async.py"
+      - "mentorAI/**"
       - "requirements.txt"
+      - "skillbot_nginx_alb.conf"
       - "ops/remote_deploy_python_service.sh"
       - ".github/workflows/deploy-prod-backend.yml"
   workflow_dispatch:
@@ -39,6 +41,9 @@ jobs:
       PROD_MAIN_BACKEND_SERVICE_MANAGER: ${{ vars.PROD_MAIN_BACKEND_SERVICE_MANAGER }}
       PROD_MAIN_BACKEND_SERVICE_NAME: ${{ vars.PROD_MAIN_BACKEND_SERVICE_NAME }}
       PROD_MAIN_BACKEND_HEALTHCHECK_URL: ${{ vars.PROD_MAIN_BACKEND_HEALTHCHECK_URL }}
+      PROD_MENTOR_AI_PORT: ${{ vars.PROD_MENTOR_AI_PORT }}
+      PROD_MENTOR_AI_BASE_PATH: ${{ vars.PROD_MENTOR_AI_BASE_PATH }}
+      PROD_NGINX_SITE_PATH: ${{ vars.PROD_NGINX_SITE_PATH }}
     steps:
       - name: Guard branch
         run: |
@@ -109,7 +114,15 @@ jobs:
             ops/remote_deploy_python_service.sh \
             "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}:/tmp/remote_deploy_python_service.sh"
 
+          scp -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            skillbot_nginx_alb.conf \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}:/tmp/skillbot_nginx_alb.conf"
+
           ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
             "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
-            "chmod +x /tmp/remote_deploy_python_service.sh && bash /tmp/remote_deploy_python_service.sh \
+            "chmod +x /tmp/remote_deploy_python_service.sh && \
+            MENTOR_AI_PORT='${PROD_MENTOR_AI_PORT}' \
+            MENTOR_AI_BASE_PATH='${PROD_MENTOR_AI_BASE_PATH}' \
+            NGINX_SITE_PATH='${PROD_NGINX_SITE_PATH}' \
+            bash /tmp/remote_deploy_python_service.sh \
             '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"

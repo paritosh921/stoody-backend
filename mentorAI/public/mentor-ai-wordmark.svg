@@ -1,0 +1,19 @@
+<svg width="720" height="180" viewBox="0 0 720 180" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="mentorGradient" x1="60" y1="40" x2="160" y2="140" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F172A"/>
+      <stop offset="1" stop-color="#0EA5A4"/>
+    </linearGradient>
+    <linearGradient id="mentorAccent" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="132" height="132" rx="36" fill="#E2E8F0"/>
+  <rect x="32" y="32" width="116" height="116" rx="32" fill="url(#mentorGradient)"/>
+  <path d="M63 112V67H79L95 93L111 67H127V112H114V86L99 109H91L76 86V112H63Z" fill="white"/>
+  <circle cx="130" cy="54" r="10" fill="url(#mentorAccent)"/>
+  <text x="190" y="96" fill="#0F172A" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="64" font-weight="700" letter-spacing="-1.5">
+    Mentor<tspan fill="#0F766E">AI</tspan>
+  </text>
+</svg>

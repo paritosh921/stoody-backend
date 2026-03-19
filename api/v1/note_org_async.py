@@ -1435,7 +1435,6 @@ async def delete_page(
 def _page_identity_query(uid_match: Dict[str, Any], page: BatchPageIdentity) -> Dict[str, Any]:
     query: Dict[str, Any] = {
         "user_id": uid_match,
-        "pen_mac": (page.pen_mac or "").upper(),
         "book_type": page.book_type or "A5",
         "page_number": page.page_number,
     }
@@ -1447,7 +1446,6 @@ def _page_identity_query(uid_match: Dict[str, Any], page: BatchPageIdentity) -> 
 def _insertable_page_identity(user_id: str, page: BatchPageIdentity) -> Dict[str, Any]:
     query: Dict[str, Any] = {
         "user_id": user_id,
-        "pen_mac": (page.pen_mac or "").upper(),
         "book_type": page.book_type or "A5",
         "page_number": page.page_number,
     }
@@ -1463,16 +1461,23 @@ async def _find_note_classification_by_page(
     projection: Optional[Dict[str, int]] = None,
 ):
     exact_query = _page_identity_query(uid_match, page)
-    doc = await tenant_db["note_classifications"].find_one(exact_query, projection)
+    doc = await tenant_db["note_classifications"].find_one(
+        exact_query,
+        projection,
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
     if doc is not None or not page.copy_id:
         return doc
     legacy_query = {
         "user_id": uid_match,
-        "pen_mac": (page.pen_mac or "").upper(),
         "book_type": page.book_type or "A5",
         "page_number": page.page_number,
     }
-    return await tenant_db["note_classifications"].find_one(legacy_query, projection)
+    return await tenant_db["note_classifications"].find_one(
+        legacy_query,
+        projection,
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
 
 
 async def _ensure_canvas_page_exists(
@@ -1486,7 +1491,6 @@ async def _ensure_canvas_page_exists(
         user_variants.append(ObjectId(user_id))
     page_query: Dict[str, Any] = {
         "user_id": {"$in": user_variants},
-        "pen_mac": (page.pen_mac or "").upper(),
         "book_type": page.book_type or "A5",
         "page_number": page.page_number,
         "stroke_count": {"$gt": 0},

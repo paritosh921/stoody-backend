@@ -258,8 +258,9 @@ async def _list_canvas_pages_for_user(
         logger.warning("canvas_pages query failed: %s", exc)
         return []
 
-    # Classification lookup keyed by (copy_id, pen_mac, book_type, page_number)
-    classifications: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+    # Classification lookup keyed by (copy_id, book_type, page_number).
+    # pen_mac is metadata, not page identity.
+    classifications: Dict[tuple[str, str, int], Dict[str, Any]] = {}
     if classify_col is not None and docs:
         page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
         book_types: list = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
@@ -277,7 +278,6 @@ async def _list_canvas_pages_for_user(
             for doc in class_docs:
                 key = (
                     str(doc.get("copy_id") or "default"),
-                    (doc.get("pen_mac") or "canvas").upper(),
                     (doc.get("book_type") or "STANDARD").upper(),
                     int(doc.get("page_number")),
                 )
@@ -287,7 +287,7 @@ async def _list_canvas_pages_for_user(
         except Exception as exc:
             logger.warning("note_classifications query failed for copies: %s", exc)
 
-    queue_state: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+    queue_state: Dict[tuple[str, str, int], Dict[str, Any]] = {}
     if queue_col is not None and docs:
         page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
         book_types = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
@@ -304,7 +304,6 @@ async def _list_canvas_pages_for_user(
             for doc in queue_docs:
                 key = (
                     str(doc.get("copy_id") or "default"),
-                    (doc.get("pen_mac") or "canvas").upper(),
                     (doc.get("book_type") or "STANDARD").upper(),
                     int(doc.get("page_number")),
                 )
@@ -314,8 +313,8 @@ async def _list_canvas_pages_for_user(
         except Exception as exc:
             logger.warning("classification_queue query failed for copies: %s", exc)
 
-    # Grouping keyed by (copy_id, pen_mac, book_type, page_number)
-    grouped: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+    # Grouping keyed by (copy_id, book_type, page_number)
+    grouped: Dict[tuple[str, str, int], Dict[str, Any]] = {}
     for d in docs:
         pn = d.get("page_number")
         if pn is None:
@@ -345,9 +344,8 @@ async def _list_canvas_pages_for_user(
             if last_activity_ts > last_activity:
                 last_activity = last_activity_ts
 
-        pm = (d.get("pen_mac") or "canvas").upper()
         cid = str(d.get("copy_id") or "default")
-        key = (cid, pm, bt, int(pn))
+        key = (cid, bt, int(pn))
         existing = grouped.get(key)
         if existing is None:
             classification = classifications.get(key)

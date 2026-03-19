@@ -14,7 +14,9 @@ on:
       - "utils/**"
       - "main_async.py"
       - "config_async.py"
+      - "mentorAI/**"
       - "requirements.txt"
+      - "skillbot_nginx_alb.conf"
       - "ops/remote_deploy_python_service.sh"
       - ".github/workflows/deploy-dev-backend.yml"
   workflow_dispatch:
@@ -45,6 +47,9 @@ jobs:
       DEV_MAIN_BACKEND_SERVICE_MANAGER: ${{ vars.DEV_MAIN_BACKEND_SERVICE_MANAGER }}
       DEV_MAIN_BACKEND_SERVICE_NAME: ${{ vars.DEV_MAIN_BACKEND_SERVICE_NAME }}
       DEV_MAIN_BACKEND_HEALTHCHECK_URL: ${{ vars.DEV_MAIN_BACKEND_HEALTHCHECK_URL }}
+      DEV_MENTOR_AI_PORT: ${{ vars.DEV_MENTOR_AI_PORT }}
+      DEV_MENTOR_AI_BASE_PATH: ${{ vars.DEV_MENTOR_AI_BASE_PATH }}
+      DEV_NGINX_SITE_PATH: ${{ vars.DEV_NGINX_SITE_PATH }}
     steps:
       - name: Guard branch
         run: |
@@ -115,7 +120,15 @@ jobs:
             ops/remote_deploy_python_service.sh \
             "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}:/tmp/remote_deploy_python_service.sh"
 
+          scp -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
+            skillbot_nginx_alb.conf \
+            "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}:/tmp/skillbot_nginx_alb.conf"
+
           ssh -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
             "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}" \
-            "chmod +x /tmp/remote_deploy_python_service.sh && bash /tmp/remote_deploy_python_service.sh \
+            "chmod +x /tmp/remote_deploy_python_service.sh && \
+            MENTOR_AI_PORT='${DEV_MENTOR_AI_PORT}' \
+            MENTOR_AI_BASE_PATH='${DEV_MENTOR_AI_BASE_PATH}' \
+            NGINX_SITE_PATH='${DEV_NGINX_SITE_PATH}' \
+            bash /tmp/remote_deploy_python_service.sh \
             '${DEV_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${DEV_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${DEV_MAIN_BACKEND_SERVICE_MANAGER}' '${DEV_MAIN_BACKEND_SERVICE_NAME}' '${DEV_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"

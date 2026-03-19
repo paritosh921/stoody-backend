@@ -167,7 +167,6 @@ async def process_page(
 
     page_key: Dict[str, Any] = {
         "user_id": user_id,
-        "pen_mac": pen_mac,
         "book_type": book_type,
         "page_number": page_number,
     }
@@ -710,7 +709,11 @@ async def _save_classification(
         )
     except DuplicateKeyError as exc:
         legacy_key = {k: v for k, v in page_key.items() if k != "copy_id"}
-        legacy_doc = await tenant_db["note_classifications"].find_one(legacy_key, {"_id": 1, "copy_id": 1})
+        legacy_doc = await tenant_db["note_classifications"].find_one(
+            legacy_key,
+            {"_id": 1, "copy_id": 1},
+            sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+        )
         if not legacy_doc:
             raise
         fallback_update = dict(update_doc)
@@ -745,22 +748,26 @@ async def _find_existing_note_classification(
 ):
     exact_key: Dict[str, Any] = {
         "user_id": user_id,
-        "pen_mac": (pen_mac or "").upper(),
         "book_type": book_type or "A5",
         "page_number": page_number,
     }
     if copy_id:
         exact_key["copy_id"] = copy_id
-    doc = await tenant_db["note_classifications"].find_one(exact_key)
+    doc = await tenant_db["note_classifications"].find_one(
+        exact_key,
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
     if doc is not None or not copy_id:
         return doc
     legacy_key = {
         "user_id": user_id,
-        "pen_mac": (pen_mac or "").upper(),
         "book_type": book_type or "A5",
         "page_number": page_number,
     }
-    return await tenant_db["note_classifications"].find_one(legacy_key)
+    return await tenant_db["note_classifications"].find_one(
+        legacy_key,
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
 
 
 async def clear_pending_ai_state(
@@ -775,14 +782,16 @@ async def clear_pending_ai_state(
     """Clear a pending AI placeholder or restore the prior classification source."""
     page_key: Dict[str, Any] = {
         "user_id": user_id,
-        "pen_mac": (pen_mac or "").upper(),
         "book_type": book_type or "A5",
         "page_number": page_number,
     }
     if copy_id:
         page_key["copy_id"] = copy_id
 
-    existing = await tenant_db["note_classifications"].find_one(page_key)
+    existing = await tenant_db["note_classifications"].find_one(
+        page_key,
+        sort=[("updated_at", -1), ("created_at", -1), ("_id", -1)],
+    )
     if not existing or existing.get("classification_source") != "pending_ai":
         return False
 
