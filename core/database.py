@@ -486,6 +486,17 @@ class DatabaseManager:
 
             # note_classifications: target index includes copy_id
             try:
+                missing_cls_copy_id = await note_cls.count_documents(
+                    {"copy_id": {"$exists": False}},
+                    limit=1,
+                )
+                if missing_cls_copy_id == 0:
+                    await self._drop_matching_indexes(
+                        note_cls,
+                        key_specs=[[("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1)]],
+                        names=["uniq_note_page"],
+                        unique=True,
+                    )
                 await self._ensure_index_with_spec_check(
                     note_cls,
                     [("user_id", 1), ("copy_id", 1), ("book_type", 1), ("page_number", 1)],
@@ -496,12 +507,31 @@ class DatabaseManager:
                 pass  # legacy index still in place
 
             cls_queue = db["classification_queue"]
-            await self._ensure_index_with_spec_check(
-                cls_queue,
-                [("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)],
-                unique=True,
-                name="uniq_cls_queue_page"
-            )
+            try:
+                missing_queue_copy_id = await cls_queue.count_documents(
+                    {"copy_id": {"$exists": False}},
+                    limit=1,
+                )
+                if missing_queue_copy_id == 0:
+                    await self._drop_matching_indexes(
+                        cls_queue,
+                        key_specs=[[("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)]],
+                        names=["uniq_cls_queue_page"],
+                        unique=True,
+                    )
+                await self._ensure_index_with_spec_check(
+                    cls_queue,
+                    [("user_id", 1), ("copy_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)],
+                    unique=True,
+                    name="uniq_cls_queue_page_v2"
+                )
+            except Exception:
+                await self._ensure_index_with_spec_check(
+                    cls_queue,
+                    [("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)],
+                    unique=True,
+                    name="uniq_cls_queue_page"
+                )
             # TTL index: auto-cleanup completed/failed jobs after 24h
             try:
                 await cls_queue.create_index(
