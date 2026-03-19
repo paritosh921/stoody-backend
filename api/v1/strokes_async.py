@@ -220,6 +220,8 @@ async def ingest_strokes(
     await tenant_db["strokes"].insert_one(stroke_doc)
 
     # Fire-and-forget: queue page for AI classification (60s debounce)
+    # Legacy ingest path uses pen token auth — copy_id not available here.
+    # The canvas_pages upsert path (which is the primary flow) passes copy_id.
     try:
         from services.note_classification_service import queue_classification
         asyncio.create_task(

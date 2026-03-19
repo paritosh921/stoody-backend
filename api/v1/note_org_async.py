@@ -47,6 +47,17 @@ class ArchiveRequest(BaseModel):
 
 class BatchArchiveRequest(BaseModel):
     classification_ids: List[str]
+
+
+class BatchAIClassifyPage(BaseModel):
+    pen_mac: str
+    book_type: str = "A5"
+    page_number: int
+    copy_id: Optional[str] = None
+
+
+class BatchAIClassifyRequest(BaseModel):
+    pages: List[BatchAIClassifyPage]
     archived: bool = True
 
 
@@ -212,8 +223,8 @@ async def get_subject_pages(
         p["topic"] = doc.get("topic")
         pages.append(p)
 
-    # Batch-enrich pages missing session info from strokes
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
+    # Batch-enrich pages missing session info from canvas_pages
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user), copy_id=copy_id)
 
     return {"success": True, "subject": subject, "pages": pages}
 
@@ -249,8 +260,8 @@ async def get_topic_pages(
     async for doc in cursor:
         pages.append(_doc_to_page(doc))
 
-    # Batch-enrich pages missing session info from strokes
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
+    # Batch-enrich pages missing session info from canvas_pages
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user), copy_id=copy_id)
 
     return {"success": True, "subject": subject, "topic": topic, "pages": pages}
 
@@ -264,6 +275,7 @@ async def get_page_thumbnail(
     pen_mac: str,
     page_number: int,
     book_type: str = Query("A5"),
+    copy_id: Optional[str] = Query(None),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -275,13 +287,16 @@ async def get_page_thumbnail(
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
 
+    thumb_query: Dict[str, Any] = {
+        "user_id": uid_match,
+        "pen_mac": pen_mac.upper(),
+        "book_type": book_type,
+        "page_number": page_number,
+    }
+    if copy_id:
+        thumb_query["copy_id"] = copy_id
     doc = await tenant_db["note_classifications"].find_one(
-        {
-            "user_id": uid_match,
-            "pen_mac": pen_mac.upper(),
-            "book_type": book_type,
-            "page_number": page_number,
-        },
+        thumb_query,
         {"thumbnail_url": 1},
     )
 
@@ -645,41 +660,66 @@ async def backfill_classifications(
     except Exception:
         pass
 
-    # Find all distinct pages this user has strokes for
+    # Find all distinct pages from canvas_pages (copy-aware source of truth)
     pipeline = [
-        {"$match": {"user_id": {"$in": user_identifiers}}},
+        {"$match": {"user_id": {"$in": user_identifiers}, "stroke_count": {"$gt": 0}}},
         {"$group": {
             "_id": {
+                "copy_id": {"$ifNull": ["$copy_id", "default"]},
                 "pen_mac": "$pen_mac",
                 "book_type": "$book_type",
                 "page_number": "$page_number",
             },
         }},
     ]
-    distinct_pages = await strokes_db["strokes"].aggregate(pipeline).to_list(5000)
+    distinct_pages = await strokes_db["canvas_pages"].aggregate(pipeline).to_list(5000)
+
+    # Fallback: also check legacy strokes if canvas_pages yielded nothing
+    if not distinct_pages:
+        legacy_pipeline = [
+            {"$match": {"user_id": {"$in": user_identifiers}}},
+            {"$group": {
+                "_id": {
+                    "copy_id": {"$literal": "default"},
+                    "pen_mac": "$pen_mac",
+                    "book_type": "$book_type",
+                    "page_number": "$page_number",
+                },
+            }},
+        ]
+        distinct_pages = await strokes_db["strokes"].aggregate(legacy_pipeline).to_list(5000)
 
     # Check which are already classified (note_classifications uses canonical str user_id)
     classify_db = strokes_db if is_b2c else await db.get_tenant_db(db_name)
-    already = set()
+    already: set[tuple[str, str, str, int]] = set()
     async for doc in classify_db["note_classifications"].find(
         {"user_id": uid_match},
-        {"pen_mac": 1, "book_type": 1, "page_number": 1},
+        {"copy_id": 1, "pen_mac": 1, "book_type": 1, "page_number": 1},
     ):
-        already.add((doc.get("pen_mac", ""), doc.get("book_type", ""), doc.get("page_number", 0)))
+        already.add((
+            str(doc.get("copy_id") or "default"),
+            (doc.get("pen_mac", "") or "").upper(),
+            doc.get("book_type", ""),
+            doc.get("page_number", 0),
+        ))
 
     from services.note_classification_service import queue_classification
 
     queued = 0
     for page in distinct_pages:
         key = page["_id"]
+        copy_id = str(key.get("copy_id") or "default")
         pen_mac = key.get("pen_mac", "")
         book_type = key.get("book_type", "A5")
         page_number = key.get("page_number", 0)
 
-        if (pen_mac.upper(), book_type, page_number) in already:
+        if (copy_id, pen_mac.upper(), book_type, page_number) in already:
             continue
 
-        await queue_classification(db, db_name, user_id, pen_mac, book_type, page_number)
+        await queue_classification(
+            db, db_name, user_id, pen_mac, book_type, page_number,
+            copy_id=copy_id if copy_id != "default" else None,
+        )
         queued += 1
 
     return {
@@ -687,6 +727,66 @@ async def backfill_classifications(
         "total_stroke_pages": len(distinct_pages),
         "already_classified": len(already),
         "queued_for_classification": queued,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /pages/batch-ai-classify
+# ---------------------------------------------------------------------------
+
+@router.post("/pages/batch-ai-classify")
+async def batch_ai_classify(
+    body: BatchAIClassifyRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Queue specific pages for AI classification. Preserves manual classifications."""
+    db_name = current_user.get("db_name")
+    user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    from services.note_classification_service import queue_classification
+
+    queued = 0
+    skipped_manual = 0
+    for page in body.pages:
+        pen_mac = (page.pen_mac or "").upper()
+        book_type = page.book_type or "A5"
+        page_number = page.page_number
+        copy_id = page.copy_id
+
+        # Check if page has manual classification — preserve it
+        class_query: Dict[str, Any] = {
+            "user_id": uid_match,
+            "pen_mac": pen_mac,
+            "book_type": book_type,
+            "page_number": page_number,
+        }
+        if copy_id:
+            class_query["copy_id"] = copy_id
+        existing = await tenant_db["note_classifications"].find_one(class_query)
+        if existing and existing.get("classification_source") == "manual":
+            skipped_manual += 1
+            continue
+
+        # Reset source so AI pipeline will process it
+        if existing:
+            await tenant_db["note_classifications"].update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"classification_source": "pending_ai"}},
+            )
+
+        await queue_classification(db, db_name, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
+        queued += 1
+
+    return {
+        "success": True,
+        "queued_count": queued,
+        "skipped_manual": skipped_manual,
     }
 
 
@@ -734,7 +834,7 @@ async def get_all_pages(
     async for doc in cursor:
         pages.append(_doc_to_page(doc, include_subject_topic=True))
 
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user), copy_id=copy_id)
 
     return {"success": True, "pages": pages}
 
@@ -747,6 +847,7 @@ async def get_all_pages(
 async def search_notes(
     q: str = Query(..., min_length=1, max_length=200),
     scope: str = Query("all", pattern="^(subject|topic|text|all)$"),
+    copy_id: Optional[str] = Query(None),
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -764,6 +865,8 @@ async def search_notes(
 
     base_match: Dict[str, Any] = {"user_id": uid_match}
     base_match["is_archived"] = {"$ne": True}
+    if copy_id:
+        base_match["copy_id"] = copy_id
 
     if scope == "subject":
         base_match["subject"] = regex
@@ -772,16 +875,25 @@ async def search_notes(
     elif scope == "text":
         base_match["ocr_text"] = regex
     else:  # all
-        base_match["$or"] = [
+        or_conditions = [
             {"subject": regex},
             {"topic": regex},
             {"ocr_text": regex},
         ]
+        # Also match page number (UI displays 1-indexed, DB stores 0-indexed)
+        try:
+            page_num = int(q) - 1
+            if page_num >= 0:
+                or_conditions.append({"page_number": page_num})
+        except ValueError:
+            pass
+        base_match["$or"] = or_conditions
 
     cursor = tenant_db["note_classifications"].find(
         base_match,
         {
             "pen_mac": 1, "book_type": 1, "page_number": 1,
+            "copy_id": 1,
             "thumbnail_url": 1, "confidence": 1,
             "classification_source": 1, "ocr_text": 1,
             "subject": 1, "topic": 1,
@@ -795,7 +907,7 @@ async def search_notes(
     async for doc in cursor:
         pages.append(_doc_to_page(doc, include_subject_topic=True))
 
-    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user))
+    await _enrich_pages_with_session_info(tenant_db, user_id, pages, canvas_user_id_variants(current_user), copy_id=copy_id)
 
     return {"success": True, "query": q, "scope": scope, "pages": pages}
 
@@ -967,8 +1079,10 @@ def _user_id_match(current_user: Dict[str, Any]) -> Dict[str, Any]:
 async def _enrich_pages_with_session_info(
     tenant_db, user_id: str, pages: List[Dict[str, Any]],
     user_id_variants: Optional[List[str]] = None,
+    *,
+    copy_id: Optional[str] = None,
 ) -> None:
-    """Batch-enrich pages missing session_id by looking up strokes."""
+    """Batch-enrich pages missing session_id from canvas_pages (copy-scoped)."""
     pages_needing_session = [p for p in pages if not p.get("session_id")]
     if not pages_needing_session:
         return
@@ -976,28 +1090,51 @@ async def _enrich_pages_with_session_info(
     # Use full variant set if provided, otherwise fall back to ObjectId pair
     uid_list: list = list(user_id_variants) if user_id_variants else [user_id, str(user_id)]
 
-    page_conditions = [
-        {"pen_mac": p["pen_mac"], "book_type": p["book_type"], "page_number": p["page_number"]}
-        for p in pages_needing_session
-    ]
+    page_conditions = []
+    for p in pages_needing_session:
+        cond: Dict[str, Any] = {"book_type": p["book_type"], "page_number": p["page_number"]}
+        # Use per-page copy_id if available, otherwise the caller-level copy_id
+        page_cid = p.get("copy_id") or copy_id
+        if page_cid:
+            cond["copy_id"] = page_cid
+        page_conditions.append(cond)
+
+    match_stage: Dict[str, Any] = {"user_id": {"$in": uid_list}, "$or": page_conditions}
+    if copy_id:
+        match_stage["copy_id"] = copy_id
+
     pipeline = [
-        {"$match": {"user_id": {"$in": uid_list}, "$or": page_conditions}},
-        {"$sort": {"timestamp": -1}},
+        {"$match": match_stage},
+        {"$sort": {"last_modified": -1}},
         {"$group": {
-            "_id": {"pen_mac": "$pen_mac", "book_type": "$book_type", "page_number": "$page_number"},
+            "_id": {"copy_id": {"$ifNull": ["$copy_id", "default"]}, "book_type": "$book_type", "page_number": "$page_number"},
             "session_id": {"$first": "$session_id"},
-            "first_activity": {"$min": "$timestamp"},
-            "last_activity": {"$max": "$timestamp"},
+            "first_activity": {"$first": "$first_activity"},
+            "last_activity": {"$first": "$last_activity"},
+            "last_modified": {"$first": "$last_modified"},
         }},
     ]
     session_map: Dict[tuple, Dict[str, Any]] = {}
-    async for doc in tenant_db["strokes"].aggregate(pipeline):
-        key = (doc["_id"]["pen_mac"], doc["_id"]["book_type"], doc["_id"]["page_number"])
-        session_map[key] = doc
+    try:
+        async for doc in tenant_db["canvas_pages"].aggregate(pipeline):
+            key = (
+                str(doc["_id"].get("copy_id") or "default"),
+                doc["_id"]["book_type"],
+                doc["_id"]["page_number"],
+            )
+            session_map[key] = doc
+    except Exception as exc:
+        logger.warning("canvas_pages enrichment query failed: %s", exc)
+        return
 
     for p in pages_needing_session:
-        info = session_map.get((p["pen_mac"], p["book_type"], p["page_number"]))
+        page_cid = str(p.get("copy_id") or copy_id or "default")
+        info = session_map.get((page_cid, p["book_type"], p["page_number"]))
         if info:
             p["session_id"] = info.get("session_id")
-            p["first_activity"] = info.get("first_activity")
-            p["last_activity"] = info.get("last_activity")
+            if info.get("first_activity"):
+                p["first_activity"] = info["first_activity"]
+            if info.get("last_activity"):
+                p["last_activity"] = info["last_activity"]
+            elif info.get("last_modified"):
+                p["last_activity"] = info["last_modified"]

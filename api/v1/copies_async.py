@@ -237,7 +237,8 @@ async def _list_canvas_pages_for_user(
         logger.warning("canvas_pages query failed: %s", exc)
         return []
 
-    classifications: Dict[tuple[str, str, int], Dict[str, Any]] = {}
+    # Classification lookup keyed by (copy_id, pen_mac, book_type, page_number)
+    classifications: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
     if classify_col is not None and docs:
         page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
         book_types: list = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
@@ -248,17 +249,25 @@ async def _list_canvas_pages_for_user(
             "page_number": {"$in": page_numbers},
             "book_type": {"$in": book_types},
         }
+        if copy_id:
+            class_query["copy_id"] = copy_id
         try:
             class_docs = await classify_col.find(class_query).to_list(length=None)
             for doc in class_docs:
-                key = ((doc.get("pen_mac") or "canvas").upper(), (doc.get("book_type") or "STANDARD").upper(), int(doc.get("page_number")))
+                key = (
+                    str(doc.get("copy_id") or "default"),
+                    (doc.get("pen_mac") or "canvas").upper(),
+                    (doc.get("book_type") or "STANDARD").upper(),
+                    int(doc.get("page_number")),
+                )
                 existing = classifications.get(key)
                 if existing is None or (doc.get("updated_at") or doc.get("created_at") or datetime.min) >= (existing.get("updated_at") or existing.get("created_at") or datetime.min):
                     classifications[key] = doc
         except Exception as exc:
             logger.warning("note_classifications query failed for copies: %s", exc)
 
-    grouped: Dict[tuple[str, str, int], Dict[str, Any]] = {}
+    # Grouping keyed by (copy_id, pen_mac, book_type, page_number)
+    grouped: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
     for d in docs:
         pn = d.get("page_number")
         if pn is None:
@@ -289,7 +298,8 @@ async def _list_canvas_pages_for_user(
                 last_activity = last_activity_ts
 
         pm = (d.get("pen_mac") or "canvas").upper()
-        key = (pm, bt, int(pn))
+        cid = str(d.get("copy_id") or "default")
+        key = (cid, pm, bt, int(pn))
         existing = grouped.get(key)
         if existing is None:
             classification = classifications.get(key)

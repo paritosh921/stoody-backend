@@ -59,6 +59,7 @@ async def queue_classification(
     pen_mac: str,
     book_type: Optional[str],
     page_number: Optional[int],
+    copy_id: Optional[str] = None,
 ):
     """Upsert into classification_queue with 60s debounce."""
     if not db_name or not user_id or page_number is None:
@@ -68,14 +69,17 @@ async def queue_classification(
         if tenant_db is None:
             return
         now = datetime.utcnow()
+        queue_key: Dict[str, Any] = {
+            "user_id": user_id,
+            "pen_mac": (pen_mac or "").upper(),
+            "book_type": book_type or "A5",
+            "page_number": page_number,
+            "db_name": db_name,
+        }
+        if copy_id:
+            queue_key["copy_id"] = copy_id
         await tenant_db["classification_queue"].update_one(
-            {
-                "user_id": user_id,
-                "pen_mac": (pen_mac or "").upper(),
-                "book_type": book_type or "A5",
-                "page_number": page_number,
-                "db_name": db_name,
-            },
+            queue_key,
             {
                 "$set": {
                     "status": "pending",
@@ -110,25 +114,28 @@ async def process_page(
     pen_mac = job.get("pen_mac", "")
     book_type = job.get("book_type", "A5")
     page_number = job.get("page_number")
+    copy_id = job.get("copy_id")
 
-    page_key = {
+    page_key: Dict[str, Any] = {
         "user_id": user_id,
         "pen_mac": pen_mac,
         "book_type": book_type,
         "page_number": page_number,
     }
+    if copy_id:
+        page_key["copy_id"] = copy_id
 
     # 1. Check reclassification threshold
     existing = await tenant_db["note_classifications"].find_one(page_key)
     if existing and existing.get("classification_source") == "manual":
         return  # never override manual classification
 
-    current_strokes = await _count_strokes(tenant_db, user_id, pen_mac, book_type, page_number)
+    current_strokes = await _count_strokes(tenant_db, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
     if existing and not _should_reclassify(existing, current_strokes):
         return
 
     # 2. Fetch strokes → render SVG → PNG
-    strokes = await _fetch_page_strokes(tenant_db, user_id, pen_mac, book_type, page_number)
+    strokes = await _fetch_page_strokes(tenant_db, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
     if not strokes:
         await _save_classification(
             tenant_db, page_key, "Unorganised", "Empty Page", 0.5, "", None, 0
@@ -152,13 +159,13 @@ async def process_page(
         return
 
     # 3. Upload thumbnail to S3
-    thumbnail_url = await _upload_thumbnail(png_bytes, user_id, pen_mac, book_type, page_number)
+    thumbnail_url = await _upload_thumbnail(png_bytes, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
 
     # 4. OCR (Mistral primary, OpenAI fallback)
     ocr_text = await _ocr_page(png_bytes, openai_client)
 
     # 5. Classify
-    existing_topics = await _get_existing_topics(tenant_db, user_id)
+    existing_topics = await _get_existing_topics(tenant_db, user_id, copy_id=copy_id)
     # Build allowed subjects: defaults + any user-created ones from DB
     all_subjects = set(DEFAULT_SUBJECTS)
     for et in existing_topics:
@@ -205,15 +212,36 @@ def _build_user_id_match(user_id: str) -> dict:
 
 
 async def _count_strokes(
-    tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int
+    tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int,
+    *, copy_id: Optional[str] = None,
 ) -> int:
-    query = {
+    # Prefer canvas_pages (copy-scoped) over legacy strokes
+    cp_query: Dict[str, Any] = {
+        "user_id": _build_user_id_match(user_id),
+        "page_number": page_number,
+        "book_type": book_type,
+    }
+    if copy_id:
+        cp_query["copy_id"] = copy_id
+    count = 0
+    cursor = tenant_db["canvas_pages"].find(cp_query, {"stroke_count": 1, "strokes": 1})
+    async for doc in cursor:
+        sc = doc.get("stroke_count")
+        if sc and isinstance(sc, int):
+            count += sc
+        elif doc.get("strokes"):
+            count += len(doc["strokes"])
+    if count > 0:
+        return count
+    # Fallback to legacy strokes collection
+    query: Dict[str, Any] = {
         "user_id": _build_user_id_match(user_id),
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
         "book_type": book_type,
         "page_number": page_number,
     }
-    count = 0
+    if copy_id:
+        query["copy_id"] = copy_id
     cursor = tenant_db["strokes"].find(query, {"strokes": 1})
     async for doc in cursor:
         count += len(doc.get("strokes", []))
@@ -221,14 +249,37 @@ async def _count_strokes(
 
 
 async def _fetch_page_strokes(
-    tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int
+    tenant_db, user_id: str, pen_mac: str, book_type: str, page_number: int,
+    *, copy_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    query = {
+    # Prefer canvas_pages (copy-scoped) over legacy strokes
+    cp_query: Dict[str, Any] = {
+        "user_id": _build_user_id_match(user_id),
+        "page_number": page_number,
+        "book_type": book_type,
+    }
+    if copy_id:
+        cp_query["copy_id"] = copy_id
+    cp_docs = await tenant_db["canvas_pages"].find(cp_query).sort("last_modified", 1).to_list(length=100)
+    if cp_docs:
+        all_strokes: List[Dict[str, Any]] = []
+        for doc in cp_docs:
+            for s in (doc.get("strokes") or []):
+                s_copy = dict(s)
+                if "session_id" not in s_copy and doc.get("session_id"):
+                    s_copy["session_id"] = doc["session_id"]
+                all_strokes.append(s_copy)
+        if all_strokes:
+            return all_strokes
+    # Fallback to legacy strokes collection
+    query: Dict[str, Any] = {
         "user_id": _build_user_id_match(user_id),
         "pen_mac": {"$regex": f"^{pen_mac}$", "$options": "i"},
         "book_type": book_type,
         "page_number": page_number,
     }
+    if copy_id:
+        query["copy_id"] = copy_id
     cursor = tenant_db["strokes"].find(query).sort("timestamp", 1)
     return await cursor.to_list(length=1000)
 
@@ -444,11 +495,14 @@ def _parse_classification_json(text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def _get_existing_topics(
-    tenant_db, user_id: str
+    tenant_db, user_id: str, copy_id: Optional[str] = None,
 ) -> List[Dict[str, str]]:
-    """Get existing subject+topic pairs for deduplication."""
+    """Get existing subject+topic pairs for deduplication (copy-scoped)."""
+    match_stage: Dict[str, Any] = {"user_id": user_id}
+    if copy_id:
+        match_stage["copy_id"] = copy_id
     pipeline = [
-        {"$match": {"user_id": user_id}},
+        {"$match": match_stage},
         {"$group": {"_id": {"subject": "$subject", "topic": "$topic"}}},
         {"$limit": 50},
     ]
@@ -467,13 +521,15 @@ async def _upload_thumbnail(
     pen_mac: str,
     book_type: str,
     page_number: int,
+    copy_id: Optional[str] = None,
 ) -> Optional[str]:
     """Upload PNG thumbnail to S3/local storage."""
     try:
         from utils.s3_storage import upload_file
 
         safe_mac = pen_mac.replace(":", "")
-        path = f"note_thumbnails/{user_id}/{safe_mac}_{book_type}_p{page_number}.png"
+        cid_segment = f"_{copy_id}" if copy_id else ""
+        path = f"note_thumbnails/{user_id}/{safe_mac}_{book_type}_p{page_number}{cid_segment}.png"
         success, storage_path = await upload_file(
             png_bytes, path, content_type="image/png"
         )
