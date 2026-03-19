@@ -115,6 +115,10 @@ class CopyPageSummary(BaseModel):
     classification_source: Optional[str] = None
     classification_status: str = "unclassified"
     classification_error: Optional[str] = None
+    queue_status: Optional[str] = None
+    queue_attempts: Optional[int] = None
+    queue_process_after: Optional[datetime] = None
+    queue_updated_at: Optional[datetime] = None
 
 
 class CopyPageListResponse(BaseModel):
@@ -291,7 +295,7 @@ async def _list_canvas_pages_for_user(
             "user_id": current_user.get("user_id"),
             "page_number": {"$in": page_numbers},
             "book_type": {"$in": book_types},
-            "status": {"$in": ["pending", "processing", "failed"]},
+            "status": {"$in": ["pending", "processing", "failed", "completed", "cancelled", "cancelling"]},
         }
         if copy_id:
             queue_query["copy_id"] = copy_id
@@ -353,13 +357,25 @@ async def _list_canvas_pages_for_user(
             classification_status = "unclassified"
             classification_error = None
             classification_source = classification.get("classification_source") if classification else None
-            if queue_doc and queue_doc.get("status") in {"pending", "processing"}:
+            queue_status = queue_doc.get("status") if queue_doc else None
+            queue_attempts = int(queue_doc.get("attempts", 0)) if queue_doc else None
+            queue_process_after = queue_doc.get("process_after") if queue_doc else None
+            queue_updated_at = queue_doc.get("updated_at") if queue_doc else None
+            if queue_status in {"pending", "processing", "cancelling"}:
                 classification_status = "pending"
-            elif queue_doc and queue_doc.get("status") == "failed":
+            elif queue_status == "failed":
                 classification_status = "failed"
                 classification_error = queue_doc.get("error")
+            elif classification_source == "pending_ai":
+                classification_status = "failed"
+                if queue_status == "completed":
+                    classification_error = "AI job completed but the page classification was not saved."
+                elif queue_status == "cancelled":
+                    classification_error = "AI classification was cancelled."
+                else:
+                    classification_error = "AI classification is stuck. Retry or cancel to continue."
             elif classification:
-                classification_status = "pending" if classification_source == "pending_ai" else "classified"
+                classification_status = "classified"
             grouped[key] = {
                 "id": str(classification.get("_id")) if classification and classification.get("_id") else None,
                 "copy_id": d.get("copy_id"),
@@ -379,6 +395,10 @@ async def _list_canvas_pages_for_user(
                 "classification_source": classification_source,
                 "classification_status": classification_status,
                 "classification_error": classification_error,
+                "queue_status": queue_status,
+                "queue_attempts": queue_attempts,
+                "queue_process_after": queue_process_after,
+                "queue_updated_at": queue_updated_at,
             }
             continue
 
@@ -404,14 +424,28 @@ async def _list_canvas_pages_for_user(
             existing["is_archived"] = bool(classification.get("is_archived"))
             existing["classification_source"] = classification.get("classification_source") or existing.get("classification_source")
 
-        if queue_doc and queue_doc.get("status") in {"pending", "processing"}:
+        queue_status = queue_doc.get("status") if queue_doc else None
+        existing["queue_status"] = queue_status
+        existing["queue_attempts"] = int(queue_doc.get("attempts", 0)) if queue_doc else None
+        existing["queue_process_after"] = queue_doc.get("process_after") if queue_doc else None
+        existing["queue_updated_at"] = queue_doc.get("updated_at") if queue_doc else None
+
+        if queue_status in {"pending", "processing", "cancelling"}:
             existing["classification_status"] = "pending"
             existing["classification_error"] = None
-        elif queue_doc and queue_doc.get("status") == "failed":
+        elif queue_status == "failed":
             existing["classification_status"] = "failed"
             existing["classification_error"] = queue_doc.get("error")
+        elif existing.get("classification_source") == "pending_ai":
+            existing["classification_status"] = "failed"
+            if queue_status == "completed":
+                existing["classification_error"] = "AI job completed but the page classification was not saved."
+            elif queue_status == "cancelled":
+                existing["classification_error"] = "AI classification was cancelled."
+            else:
+                existing["classification_error"] = "AI classification is stuck. Retry or cancel to continue."
         elif classification:
-            existing["classification_status"] = "pending" if existing.get("classification_source") == "pending_ai" else "classified"
+            existing["classification_status"] = "classified"
             existing["classification_error"] = None
 
         existing["total_strokes"] = max(existing["total_strokes"], int(d.get("stroke_count", 0) or 0))

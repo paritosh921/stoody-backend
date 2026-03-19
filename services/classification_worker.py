@@ -86,34 +86,129 @@ async def _process_single_job(
     openai_client: Optional[AsyncOpenAI],
 ) -> None:
     """Process a single classification job with error handling."""
-    from services.note_classification_service import process_page
+    from services.note_classification_service import clear_pending_ai_state, process_page
 
     job_id = job["_id"]
     user_id = job.get("user_id", "")
     attempts = job.get("attempts", 0)
+    pen_mac = job.get("pen_mac", "")
+    book_type = job.get("book_type", "A5")
+    page_number = job.get("page_number")
+    copy_id = job.get("copy_id")
+
+    async def should_cancel() -> bool:
+        current = await tenant_db["classification_queue"].find_one(
+            {"_id": job_id},
+            {"status": 1, "cancel_requested": 1},
+        )
+        if not current:
+            return True
+        return bool(current.get("cancel_requested")) or current.get("status") in {"cancelled", "cancelling"}
 
     # Mark as processing
     await tenant_db["classification_queue"].update_one(
         {"_id": job_id},
-        {"$set": {"status": "processing"}, "$inc": {"attempts": 1}},
+        {
+            "$set": {
+                "status": "processing",
+                "started_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "error": None,
+            },
+            "$inc": {"attempts": 1},
+        },
     )
 
     try:
-        await process_page(tenant_db, user_id, job, openai_client)
+        await process_page(tenant_db, user_id, job, openai_client, should_cancel=should_cancel)
+
+        if await should_cancel():
+            await clear_pending_ai_state(
+                tenant_db,
+                user_id,
+                pen_mac,
+                book_type,
+                page_number,
+                copy_id=copy_id,
+            )
+            await tenant_db["classification_queue"].update_one(
+                {"_id": job_id},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "cancelled_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    },
+                    "$unset": {
+                        "cancel_requested": "",
+                    },
+                },
+            )
+            logger.info(
+                "Classification job cancelled for user=%s page=%s copy=%s",
+                user_id,
+                page_number,
+                copy_id or "default",
+            )
+            return
 
         # Mark completed
         await tenant_db["classification_queue"].update_one(
             {"_id": job_id},
-            {"$set": {"status": "completed", "completed_at": datetime.utcnow()}},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                },
+                "$unset": {
+                    "cancel_requested": "",
+                },
+            },
         )
         logger.debug(
             f"Classified page {job.get('page_number')} for user {user_id}"
         )
     except Exception as e:
+        if await should_cancel():
+            await clear_pending_ai_state(
+                tenant_db,
+                user_id,
+                pen_mac,
+                book_type,
+                page_number,
+                copy_id=copy_id,
+            )
+            await tenant_db["classification_queue"].update_one(
+                {"_id": job_id},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "cancelled_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    },
+                    "$unset": {
+                        "cancel_requested": "",
+                    },
+                },
+            )
+            logger.info(
+                "Classification job cancelled during processing for user=%s page=%s copy=%s",
+                user_id,
+                page_number,
+                copy_id or "default",
+            )
+            return
         new_status = "failed" if attempts + 1 >= MAX_ATTEMPTS else "pending"
         await tenant_db["classification_queue"].update_one(
             {"_id": job_id},
-            {"$set": {"status": new_status, "error": str(e)[:500]}},
+            {
+                "$set": {
+                    "status": new_status,
+                    "error": str(e)[:500],
+                    "updated_at": datetime.utcnow(),
+                }
+            },
         )
         logger.warning(
             f"Classification job {job_id} {'failed permanently' if new_status == 'failed' else 'will retry'}: {e}"

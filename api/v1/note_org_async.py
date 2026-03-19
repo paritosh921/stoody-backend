@@ -67,6 +67,10 @@ class BatchAIClassifyRequest(BaseModel):
     pages: List[BatchAIClassifyPage]
 
 
+class BatchAIOperationRequest(BaseModel):
+    pages: List[BatchPageIdentity]
+
+
 class BatchFavoriteRequest(BaseModel):
     classification_ids: List[str] = Field(default_factory=list)
     pages: List[BatchPageIdentity] = Field(default_factory=list)
@@ -834,7 +838,15 @@ async def batch_ai_classify(
         if existing:
             await tenant_db["note_classifications"].update_one(
                 {"_id": existing["_id"]},
-                {"$set": {"classification_source": "pending_ai", "updated_at": now}},
+                {
+                    "$set": {
+                        "classification_source": "pending_ai",
+                        "updated_at": now,
+                        "pending_ai_previous_source": existing.get("pending_ai_previous_source")
+                            or existing.get("classification_source")
+                            or "system",
+                    }
+                },
             )
         else:
             await _ensure_canvas_page_exists(tenant_db, current_user, page)
@@ -847,6 +859,7 @@ async def batch_ai_classify(
                         "pen_mac": pen_mac,
                         "book_type": book_type,
                         "page_number": page_number,
+                        "pending_ai_previous_source": None,
                     },
                     "$setOnInsert": {
                         "user_id": user_id,
@@ -873,6 +886,172 @@ async def batch_ai_classify(
     return {
         "success": True,
         "queued_count": queued,
+        "skipped_manual": skipped_manual,
+    }
+
+
+@router.patch("/pages/batch-ai-cancel")
+async def batch_ai_cancel(
+    body: BatchAIOperationRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Cancel queued or in-flight AI classification jobs for specific pages."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    from services.note_classification_service import clear_pending_ai_state
+
+    user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
+    cancelled_count = 0
+    skipped_count = 0
+    now = datetime.utcnow()
+
+    for page in body.pages:
+        queue_query = _page_identity_query(uid_match, page)
+        queue_doc = await tenant_db["classification_queue"].find_one(
+            queue_query,
+            {"_id": 1, "status": 1},
+        )
+
+        if queue_doc:
+            next_status = "cancelling" if queue_doc.get("status") == "processing" else "cancelled"
+            await tenant_db["classification_queue"].update_one(
+                {"_id": queue_doc["_id"]},
+                {
+                    "$set": {
+                        "status": next_status,
+                        "cancel_requested": True,
+                        "cancelled_at": now,
+                        "updated_at": now,
+                    }
+                },
+            )
+
+        cleared = await clear_pending_ai_state(
+            tenant_db,
+            user_id,
+            page.pen_mac,
+            page.book_type or "A5",
+            page.page_number,
+            copy_id=page.copy_id,
+        )
+
+        if queue_doc or cleared:
+            cancelled_count += 1
+            logger.info(
+                "AI classification cancel requested for user=%s page=%s book=%s copy=%s",
+                user_id,
+                page.page_number,
+                page.book_type or "A5",
+                page.copy_id or "default",
+            )
+        else:
+            skipped_count += 1
+
+    return {
+        "success": True,
+        "cancelled_count": cancelled_count,
+        "skipped_count": skipped_count,
+    }
+
+
+@router.post("/pages/batch-ai-retry")
+async def batch_ai_retry(
+    body: BatchAIOperationRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Retry AI classification for specific pages."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    db_name = current_user.get("db_name")
+    user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
+
+    from services.note_classification_service import queue_classification
+
+    queued_count = 0
+    skipped_manual = 0
+    now = datetime.utcnow()
+
+    for page in body.pages:
+        existing = await _find_note_classification_by_page(tenant_db, uid_match, page)
+        if existing and existing.get("classification_source") == "manual":
+            skipped_manual += 1
+            continue
+
+        await _ensure_canvas_page_exists(tenant_db, current_user, page)
+
+        if existing:
+            await tenant_db["note_classifications"].update_one(
+                {"_id": existing["_id"]},
+                {
+                    "$set": {
+                        "classification_source": "pending_ai",
+                        "updated_at": now,
+                        "pending_ai_previous_source": existing.get("pending_ai_previous_source")
+                            or existing.get("classification_source")
+                            or "system",
+                    }
+                },
+            )
+        else:
+            await tenant_db["note_classifications"].update_one(
+                _insertable_page_identity(user_id, page),
+                {
+                    "$set": {
+                        "classification_source": "pending_ai",
+                        "updated_at": now,
+                        "pen_mac": (page.pen_mac or "").upper(),
+                        "book_type": page.book_type or "A5",
+                        "page_number": page.page_number,
+                        "pending_ai_previous_source": None,
+                    },
+                    "$setOnInsert": {
+                        "user_id": user_id,
+                        "copy_id": page.copy_id,
+                        "created_at": now,
+                        "subject": "Unorganised",
+                        "topic": "",
+                        "confidence": None,
+                        "is_favorite": False,
+                        "is_archived": False,
+                        "ocr_text": "",
+                        "stroke_count_at_classification": 0,
+                        "thumbnail_url": None,
+                        "original_subject": None,
+                        "original_topic": None,
+                    },
+                },
+                upsert=True,
+            )
+
+        await queue_classification(
+            db,
+            db_name,
+            user_id,
+            (page.pen_mac or "").upper(),
+            page.book_type or "A5",
+            page.page_number,
+            copy_id=page.copy_id,
+        )
+        queued_count += 1
+        logger.info(
+            "AI classification retry queued for user=%s page=%s book=%s copy=%s",
+            user_id,
+            page.page_number,
+            page.book_type or "A5",
+            page.copy_id or "default",
+        )
+
+    return {
+        "success": True,
+        "queued_count": queued_count,
         "skipped_manual": skipped_manual,
     }
 

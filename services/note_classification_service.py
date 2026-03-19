@@ -17,7 +17,7 @@ import os
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -85,11 +85,17 @@ async def queue_classification(
                     "status": "pending",
                     "process_after": now + timedelta(seconds=DEBOUNCE_SECONDS),
                     "updated_at": now,
+                    "attempts": 0,
+                    "error": None,
+                    "cancel_requested": False,
+                },
+                "$unset": {
+                    "started_at": "",
+                    "completed_at": "",
+                    "cancelled_at": "",
                 },
                 "$setOnInsert": {
                     "queued_at": now,
-                    "attempts": 0,
-                    "error": None,
                     "created_at": now,
                 },
             },
@@ -108,6 +114,7 @@ async def process_page(
     user_id: str,
     job: Dict[str, Any],
     openai_client: Optional[AsyncOpenAI] = None,
+    should_cancel: Optional[Callable[[], Awaitable[bool]]] = None,
 ):
     """Full pipeline: render → OCR → classify → store."""
 
@@ -125,18 +132,27 @@ async def process_page(
     if copy_id:
         page_key["copy_id"] = copy_id
 
+    async def _cancelled() -> bool:
+        return bool(should_cancel and await should_cancel())
+
     # 1. Check reclassification threshold
     existing = await tenant_db["note_classifications"].find_one(page_key)
     if existing and existing.get("classification_source") == "manual":
         return  # never override manual classification
+    if await _cancelled():
+        return
 
     current_strokes = await _count_strokes(tenant_db, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
     if existing and not _should_reclassify(existing, current_strokes):
+        return
+    if await _cancelled():
         return
 
     # 2. Fetch strokes → render SVG → PNG
     strokes = await _fetch_page_strokes(tenant_db, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
     if not strokes:
+        if await _cancelled():
+            return
         await _save_classification(
             tenant_db, page_key, "Unorganised", "Empty Page", 0.5, "", None, 0
         )
@@ -153,9 +169,13 @@ async def process_page(
     svg = build_svg_from_strokes(strokes, book_type=book_type)
     png_bytes = svg_to_png_bytes(svg, scale=0.5)
     if not png_bytes:
+        if await _cancelled():
+            return
         await _save_classification(
             tenant_db, page_key, "Unorganised", "Render Failed", 0.3, "", None, current_strokes
         )
+        return
+    if await _cancelled():
         return
 
     # 3. Upload thumbnail to S3
@@ -163,6 +183,8 @@ async def process_page(
 
     # 4. OCR (Mistral primary, OpenAI fallback)
     ocr_text = await _ocr_page(png_bytes, openai_client)
+    if await _cancelled():
+        return
 
     # 5. Classify
     existing_topics = await _get_existing_topics(tenant_db, user_id, copy_id=copy_id)
@@ -184,6 +206,8 @@ async def process_page(
         subject = "Unorganised"
 
     # 6. Upsert into note_classifications
+    if await _cancelled():
+        return
     await _save_classification(
         tenant_db, page_key, subject, topic, confidence,
         ocr_text, thumbnail_url, current_strokes, existing,
@@ -573,6 +597,9 @@ async def _save_classification(
             "original_subject": None,
             "original_topic": None,
         },
+        "$unset": {
+            "pending_ai_previous_source": "",
+        },
     }
 
     if thumbnail_url:
@@ -587,3 +614,73 @@ async def _save_classification(
     await tenant_db["note_classifications"].update_one(
         page_key, update_doc, upsert=True
     )
+
+
+async def clear_pending_ai_state(
+    tenant_db,
+    user_id: str,
+    pen_mac: str,
+    book_type: str,
+    page_number: int,
+    *,
+    copy_id: Optional[str] = None,
+) -> bool:
+    """Clear a pending AI placeholder or restore the prior classification source."""
+    page_key: Dict[str, Any] = {
+        "user_id": user_id,
+        "pen_mac": (pen_mac or "").upper(),
+        "book_type": book_type or "A5",
+        "page_number": page_number,
+    }
+    if copy_id:
+        page_key["copy_id"] = copy_id
+
+    existing = await tenant_db["note_classifications"].find_one(page_key)
+    if not existing or existing.get("classification_source") != "pending_ai":
+        return False
+
+    now = datetime.now(timezone.utc)
+    previous_source = existing.get("pending_ai_previous_source")
+    if previous_source:
+        await tenant_db["note_classifications"].update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "classification_source": previous_source,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "pending_ai_previous_source": "",
+                },
+            },
+        )
+        return True
+
+    is_placeholder = (
+        (existing.get("subject") in (None, "", "Unorganised"))
+        and (existing.get("topic") in (None, ""))
+        and not bool(existing.get("is_favorite"))
+        and not bool(existing.get("is_archived"))
+        and not existing.get("thumbnail_url")
+        and not (existing.get("ocr_text") or "").strip()
+        and (existing.get("stroke_count_at_classification") in (None, 0))
+        and existing.get("confidence") in (None, 0)
+    )
+
+    if is_placeholder:
+        await tenant_db["note_classifications"].delete_one({"_id": existing["_id"]})
+        return True
+
+    await tenant_db["note_classifications"].update_one(
+        {"_id": existing["_id"]},
+        {
+            "$set": {
+                "classification_source": "system",
+                "updated_at": now,
+            },
+            "$unset": {
+                "pending_ai_previous_source": "",
+            },
+        },
+    )
+    return True
