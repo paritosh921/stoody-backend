@@ -529,47 +529,22 @@ async def get_tutor_students(
     if not tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
 
-    assigned_student_ids = tutor.get("assigned_student_ids", []) or []
+    from bson import ObjectId
+    from utils.tutor_scoping import get_tutor_scoped_students
 
     # Get admin_id for data isolation
     admin_id = tutor.get("created_by")
     try:
-        from bson import ObjectId
-
         admin_oid = ObjectId(admin_id) if admin_id else None
     except Exception:
         admin_oid = None
 
-    students_union: List[Dict[str, Any]] = []
-
-    # 1) Students explicitly assigned by id
-    # IMPORTANT: Must include admin_id filter for data isolation
-    if assigned_student_ids and admin_oid is not None:
-        assigned_students = await db.mongo_find(
-            "students",
-            {"student_id": {"$in": assigned_student_ids}, "admin_id": admin_oid},
-        )
-        students_union.extend(assigned_students)
-
-    # 2) Students mapped via teacher_ids
-    # IMPORTANT: Must include admin_id filter for data isolation
-    if admin_oid is not None:
-        teacher_mapped = await db.mongo_find(
-            "students", {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid}
-        )
-        students_union.extend(teacher_mapped)
-
-    # ONLY show explicitly assigned students - no criteria-based matching
-    # Teachers should only see students they are explicitly assigned to
-
-    # Deduplicate by _id
-    seen: set = set()
-    students: List[Dict[str, Any]] = []
-    for s in students_union:
-        sid = str(s.get("_id"))
-        if sid not in seen:
-            seen.add(sid)
-            students.append(s)
+    students = await get_tutor_scoped_students(
+        tutor_id=tutor_id,
+        admin_oid=admin_oid,
+        db=db,
+        tutor_doc=tutor,
+    )
 
     return [
         {
@@ -659,17 +634,18 @@ async def _get_tutor_visible_students(
 ) -> List[Dict[str, Any]]:
     """
     Reusable helper that returns the deduplicated list of student documents
-    visible to the current tutor.  Mirrors the scoping logic in
-    ``get_tutor_students``.
+    visible to the current tutor.  Combines:
+      1. Students explicitly assigned  (assigned_student_ids)
+      2. Students mapped via teacher_ids
+      3. Students matching the tutor's teaching assignments (class/section)
     """
     from bson import ObjectId
+    from utils.tutor_scoping import get_tutor_scoped_students
 
     tutor_id = current_user.get("tutor_id")
     tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
     if not tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
-
-    assigned_student_ids = tutor.get("assigned_student_ids", []) or []
 
     # Get admin_id for data isolation
     admin_id = tutor.get("created_by")
@@ -678,37 +654,12 @@ async def _get_tutor_visible_students(
     except Exception:
         admin_oid = None
 
-    students_union: List[Dict[str, Any]] = []
-
-    # 1) Students explicitly assigned by id
-    if assigned_student_ids and admin_oid is not None:
-        assigned_students = await db.mongo_find(
-            "students",
-            {"student_id": {"$in": assigned_student_ids}, "admin_id": admin_oid},
-        )
-        students_union.extend(assigned_students)
-
-    # 2) Students mapped via teacher_ids
-    if admin_oid is not None:
-        teacher_mapped = await db.mongo_find(
-            "students", {"teacher_ids": {"$in": [tutor_id]}, "admin_id": admin_oid}
-        )
-        students_union.extend(teacher_mapped)
-
-    # ONLY show explicitly assigned students - no criteria-based matching
-    # Teachers should only see students they are explicitly assigned to
-    # (via assigned_student_ids or teacher_ids), not all students in their subjects/grades
-
-    # Deduplicate by _id
-    seen: set = set()
-    students: List[Dict[str, Any]] = []
-    for s in students_union:
-        sid = str(s.get("_id"))
-        if sid not in seen:
-            seen.add(sid)
-            students.append(s)
-
-    return students
+    return await get_tutor_scoped_students(
+        tutor_id=tutor_id,
+        admin_oid=admin_oid,
+        db=db,
+        tutor_doc=tutor,
+    )
 
 
 @router.get("/tutors/analytics/overview")
@@ -728,6 +679,11 @@ async def get_tutor_analytics_overview(
     """
     try:
         students = await _get_tutor_visible_students(current_user, db)
+
+        # Get the tutor's own subjects for filtering subject performance
+        tutor_id = current_user.get("tutor_id")
+        tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+        tutor_subjects = set(s for s in (tutor_doc.get("subjects") or []) if s) if tutor_doc else set()
 
         # Extract available classes from unfiltered visible students
         available_classes_set = set()
@@ -858,10 +814,16 @@ async def get_tutor_analytics_overview(
         overall_test_avg = round(test_summary["avg_score"] or 0.0, 1)
 
         # ------------------------------------------------------------------
-        # Subject performance
+        # Subject performance (filtered to subjects the teacher teaches)
         # ------------------------------------------------------------------
+        practice_match: Dict[str, Any] = {
+            "student_id": {"$in": student_oid_strings},
+        }
+        if tutor_subjects:
+            practice_match["subject"] = {"$in": list(tutor_subjects)}
+
         subject_practice_pipeline = [
-            {"$match": {"student_id": {"$in": student_oid_strings}}},
+            {"$match": practice_match},
             {
                 "$group": {
                     "_id": "$subject",
@@ -877,8 +839,14 @@ async def get_tutor_analytics_overview(
             "practice_attempts", subject_practice_pipeline
         )
 
+        test_match: Dict[str, Any] = {
+            "student_id": {"$in": student_oid_strings},
+        }
+        if tutor_subjects:
+            test_match["subject"] = {"$in": list(tutor_subjects)}
+
         subject_test_pipeline = [
-            {"$match": {"student_id": {"$in": student_oid_strings}}},
+            {"$match": test_match},
             {
                 "$group": {
                     "_id": "$subject",
@@ -1399,6 +1367,271 @@ async def get_tutor_student_analytics(
             f"Error fetching student analytics for {student_id}: {e}", exc_info=True
         )
         raise HTTPException(status_code=500, detail="Failed to fetch student analytics")
+
+
+@router.get("/tutors/analytics/attempt/{attempt_id}")
+@limiter.limit("30/minute")
+async def get_tutor_attempt_detail(
+    request: Request,
+    attempt_id: str,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Full detail of a single practice attempt, including submission images
+    and AI evaluation feedback.  Used by teachers to view student work.
+    """
+    try:
+        from bson import ObjectId
+        from utils.s3_storage import get_public_url
+
+        # Fetch the attempt
+        try:
+            attempt_oid = ObjectId(attempt_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid attempt ID")
+
+        attempt = await db.mongo_find_one(
+            "practice_attempts", {"_id": attempt_oid}
+        )
+        if not attempt:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        # Verify the student belongs to this tutor's visible students
+        visible_students = await _get_tutor_visible_students(current_user, db)
+        attempt_student_id = attempt.get("student_id", "")
+        student_visible = False
+        for s in visible_students:
+            sid = str(s.get("_id", ""))
+            if sid == attempt_student_id or s.get("student_id") == attempt_student_id:
+                student_visible = True
+                break
+
+        if not student_visible:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have access to this student's data",
+            )
+
+        # Convert submission image storage paths to presigned URLs
+        image_urls: list = []
+        for path in attempt.get("submission_images") or []:
+            try:
+                url = get_public_url(path, expires_in=3600)
+                if url:
+                    image_urls.append(url)
+            except Exception:
+                pass  # Skip broken paths gracefully
+
+        return {
+            "success": True,
+            "data": {
+                "id": str(attempt["_id"]),
+                "question_text": attempt.get("question_text", ""),
+                "question_type": attempt.get("question_type", ""),
+                "subject": attempt.get("subject", ""),
+                "difficulty": attempt.get("difficulty", ""),
+                "student_answer": attempt.get("student_answer", ""),
+                "correct_answer": attempt.get("correct_answer", ""),
+                "is_correct": attempt.get("is_correct", False),
+                "score": attempt.get("score", 0),
+                "evaluation_feedback": attempt.get("evaluation_feedback", ""),
+                "evaluation_reasoning": attempt.get("evaluation_reasoning", ""),
+                "work_shown": attempt.get("work_shown", ""),
+                "what_went_wrong": attempt.get("what_went_wrong", ""),
+                "correct_solution": attempt.get("correct_solution", ""),
+                "submission_image_urls": image_urls,
+                "time_spent": attempt.get("time_spent", 0),
+                "hints_used": attempt.get("hints_used", 0),
+                "created_at": attempt["created_at"].isoformat()
+                if attempt.get("created_at")
+                else None,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(
+            f"Error fetching attempt detail {attempt_id}: {e}", exc_info=True
+        )
+        raise HTTPException(status_code=500, detail="Failed to fetch attempt detail")
+
+
+@router.get("/tutors/analytics/document/{document_id}/student/{student_id}/attempts")
+@limiter.limit("20/minute")
+async def get_student_document_attempts(
+    request: Request,
+    document_id: str,
+    student_id: str,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    All practice attempts by a specific student for a specific document/paper,
+    ordered by question sequence.  Each attempt includes submission image URLs
+    so the teacher can review the student's handwritten work question by question.
+    """
+    try:
+        from bson import ObjectId
+
+        # Verify the student is visible to this tutor
+        visible_students = await _get_tutor_visible_students(current_user, db)
+        target_student = None
+        for s in visible_students:
+            if s.get("student_id") == student_id:
+                target_student = s
+                break
+        if not target_student:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have access to this student's data",
+            )
+
+        oid_str = str(target_student["_id"])
+
+        # Fetch all attempts for this student + document, ordered by creation.
+        # Keep only the LAST attempt per question_id (most recent submission).
+        all_attempts = await db.mongo_find(
+            "practice_attempts",
+            {"student_id": oid_str, "document_id": document_id},
+            sort=[("created_at", 1)],
+        )
+        last_by_question: Dict[str, Dict[str, Any]] = {}
+        for a in all_attempts:
+            qid_key = a.get("question_id", "")
+            last_by_question[qid_key] = a  # later entries overwrite earlier
+        raw_attempts = list(last_by_question.values())
+
+        # Resolve canvas_pages collection for stroke lookup
+        canvas_col = None
+        try:
+            db_name = current_user.get("db_name")
+            if db_name:
+                tenant_db = await db.get_tenant_db(db_name)
+                if tenant_db is not None:
+                    canvas_col = tenant_db["canvas_pages"]
+        except Exception:
+            pass
+
+        # Build user_id variants for canvas_pages lookup (stores username)
+        student_user_ids: list = []
+        stu_username = target_student.get("username")
+        if stu_username:
+            student_user_ids.append(stu_username)
+        student_user_ids.append(oid_str)
+        try:
+            student_user_ids.append(ObjectId(oid_str))
+        except Exception:
+            pass
+
+        attempts = []
+        for r in raw_attempts:
+            # Fetch per-question strokes if question_page_refs exist
+            question_strokes: list = []
+            qpr = r.get("question_page_refs")
+            if qpr and canvas_col is not None:
+                active_pages = qpr.get("active_pages") or []
+                book_type = qpr.get("book_type", "LS")
+                copy_id_ref = qpr.get("copy_id")
+                time_intervals = qpr.get("time_intervals") or []
+
+                if active_pages:
+                    try:
+                        page_query: Dict[str, Any] = {
+                            "user_id": {"$in": student_user_ids},
+                            "page_number": {"$in": active_pages},
+                            "book_type": book_type.upper(),
+                        }
+                        if copy_id_ref:
+                            page_query["copy_id"] = copy_id_ref
+
+                        cursor = canvas_col.find(page_query).sort(
+                            "page_number", 1
+                        )
+                        raw_pages = await cursor.to_list(length=20)
+
+                        for pg in raw_pages:
+                            raw_strokes = pg.get("strokes") or []
+
+                            # Filter strokes by time intervals
+                            if time_intervals:
+                                filtered = []
+                                for s in raw_strokes:
+                                    s_start = s.get("startedAt") or s.get("timestamp")
+                                    if s_start is None:
+                                        filtered.append(s)
+                                        continue
+                                    for iv in time_intervals:
+                                        iv_start = iv.get("startTs") or iv.get("start_ts", 0)
+                                        iv_end = iv.get("endTs") or iv.get("end_ts") or float("inf")
+                                        tolerance = 2000  # 2s tolerance
+                                        if (s_start >= iv_start - tolerance
+                                                and s_start <= iv_end + tolerance):
+                                            filtered.append(s)
+                                            break
+                                raw_strokes = filtered
+
+                            if raw_strokes:
+                                question_strokes.append({
+                                    "page_number": pg.get("page_number", 0),
+                                    "book_type": pg.get("book_type", ""),
+                                    "strokes": raw_strokes,
+                                })
+                    except Exception as fetch_err:
+                        _logger.warning(
+                            f"Failed to fetch canvas pages for attempt: {fetch_err}"
+                        )
+
+            attempts.append({
+                "id": str(r.get("_id", "")),
+                "question_id": r.get("question_id", ""),
+                "question_text": r.get("question_text", ""),
+                "question_type": r.get("question_type", ""),
+                "subject": r.get("subject", ""),
+                "difficulty": r.get("difficulty", ""),
+                "student_answer": r.get("student_answer", ""),
+                "correct_answer": r.get("correct_answer", ""),
+                "is_correct": r.get("is_correct", False),
+                "score": r.get("score", 0),
+                "evaluation_feedback": r.get("evaluation_feedback", ""),
+                "what_went_wrong": r.get("what_went_wrong", ""),
+                "correct_solution": r.get("correct_solution", ""),
+                "question_strokes": question_strokes,
+                "time_spent": r.get("time_spent", 0),
+                "hints_used": r.get("hints_used", 0),
+                "created_at": r["created_at"].isoformat()
+                if r.get("created_at")
+                else None,
+            })
+
+        return {
+            "success": True,
+            "data": {
+                "student": {
+                    "student_id": target_student.get("student_id"),
+                    "name": target_student.get("name")
+                    or target_student.get("full_name", ""),
+                    "grade": target_student.get("grade", ""),
+                    "section": target_student.get("section", ""),
+                },
+                "document_id": document_id,
+                "total_attempts": len(attempts),
+                "attempts": attempts,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(
+            f"Error fetching student document attempts "
+            f"doc={document_id} student={student_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail="Failed to fetch student attempts"
+        )
 
 
 @router.get("/tutors/analytics/documents")

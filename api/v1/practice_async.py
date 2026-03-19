@@ -1042,6 +1042,14 @@ class UploadedDocumentFile(BaseModel):
     type: str  # 'pdf' or 'docx'
 
 
+class QuestionPageRefsModel(BaseModel):
+    """Per-question page mapping from the Stoody Pen QuestionSession."""
+    activePages: Optional[List[int]] = None        # Physical notebook page numbers
+    bookType: Optional[str] = None                 # e.g. "LS", "MS"
+    copyId: Optional[str] = None                   # Copy set ID
+    timeIntervals: Optional[List[Dict[str, Any]]] = None  # [{startTs, endTs}]
+
+
 class EvaluateRequest(BaseModel):
     questionId: str
     answerText: Optional[str] = None
@@ -1055,6 +1063,8 @@ class EvaluateRequest(BaseModel):
     sessionId: Optional[str] = None   # Practice session ID
     timeSpent: Optional[int] = None   # Time spent in seconds
     hintsUsed: Optional[int] = 0      # Number of hints used
+    # Per-question page mapping from Stoody Pen (which pages + time intervals)
+    questionPageRefs: Optional[QuestionPageRefsModel] = None
 
     # Be flexible: accept pages as strings or objects with common keys; normalize to data URLs
     @validator('canvasData', pre=True)
@@ -1111,7 +1121,8 @@ class EvaluateRequest(BaseModel):
             'document_id': 'documentId',
             'session_id': 'sessionId',
             'time_spent': 'timeSpent',
-            'hints_used': 'hintsUsed'
+            'hints_used': 'hintsUsed',
+            'question_page_refs': 'questionPageRefs',
         }
         for src, dst in mapping.items():
             if src in values and dst not in values:
@@ -1981,14 +1992,26 @@ async def evaluate_submission(
                 doc_id = meta.get("document_id") or meta.get("documentId") or question_doc.get("document_id")
             
             # Prepare attempt record
-            # Determine question type for storage
             q_type = "mcq" if is_mcq else ("essay" if is_essay_question else "numerical")
+
+            # Build question_page_refs from the Stoody Pen QuestionSession
+            question_page_refs = None
+            if payload.questionPageRefs:
+                qpr = payload.questionPageRefs
+                if qpr.activePages:
+                    question_page_refs = {
+                        "active_pages": qpr.activePages,
+                        "book_type": qpr.bookType,
+                        "copy_id": qpr.copyId,
+                        "time_intervals": qpr.timeIntervals or [],
+                    }
+
             practice_attempt = {
                 "student_id": str(user_id),
                 "session_id": payload.sessionId,
                 "document_id": doc_id,
                 "question_id": qid,
-                "question_text": question_text[:2000] if question_text else "",  # Truncate for storage
+                "question_text": question_text[:2000] if question_text else "",
                 "question_type": q_type,
                 "options": question_doc.get("options"),
                 "student_answer": evaluation_data.get("extractedAnswer", ""),
@@ -2002,6 +2025,7 @@ async def evaluate_submission(
                 "work_shown": evaluation_data.get("workShown", ""),
                 "what_went_wrong": evaluation_data.get("whatWentWrong", ""),
                 "correct_solution": evaluation_data.get("correctSolution", ""),
+                "question_page_refs": question_page_refs,
                 "created_at": datetime.utcnow(),
                 "subject": question_doc.get("subject", ""),
                 "difficulty": question_doc.get("difficulty", ""),
