@@ -440,13 +440,14 @@ async def batch_reclassify(
                 "ocr_text": "",
                 "stroke_count_at_classification": 0,
                 "thumbnail_url": None,
-                "original_subject": None,
-                "original_topic": None,
             },
         }
         if existing and existing.get("classification_source") != "manual":
             update_doc["$set"]["original_subject"] = existing.get("subject")
             update_doc["$set"]["original_topic"] = existing.get("topic")
+        else:
+            update_doc["$setOnInsert"]["original_subject"] = None
+            update_doc["$setOnInsert"]["original_topic"] = None
 
         result = await tenant_db["note_classifications"].update_one(
             page_key,

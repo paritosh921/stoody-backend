@@ -74,7 +74,7 @@ async def _process_pending_classifications(
 
 async def _claim_next_job(tenant_db) -> Optional[Dict[str, Any]]:
     now = datetime.utcnow()
-    return await tenant_db["classification_queue"].find_one_and_update(
+    job = await tenant_db["classification_queue"].find_one_and_update(
         {
             "status": "pending",
             "process_after": {"$lte": now},
@@ -93,6 +93,18 @@ async def _claim_next_job(tenant_db) -> Optional[Dict[str, Any]]:
         sort=[("process_after", 1), ("updated_at", 1), ("queued_at", 1), ("_id", 1)],
         return_document=ReturnDocument.AFTER,
     )
+    if job is not None:
+        logger.info(
+            "Claimed AI classification job id=%s user=%s pen=%s book=%s page=%s copy=%s attempt=%s",
+            job.get("_id"),
+            job.get("user_id"),
+            job.get("pen_mac"),
+            job.get("book_type"),
+            job.get("page_number"),
+            job.get("copy_id") or "default",
+            job.get("attempts"),
+        )
+    return job
 
 
 async def _process_single_job(
@@ -167,8 +179,14 @@ async def _process_single_job(
                 },
             },
         )
-        logger.debug(
-            f"Classified page {job.get('page_number')} for user {user_id}"
+        logger.info(
+            "Completed AI classification job id=%s user=%s pen=%s book=%s page=%s copy=%s",
+            job_id,
+            user_id,
+            pen_mac,
+            book_type,
+            page_number,
+            copy_id or "default",
         )
     except Exception as e:
         if await should_cancel():
@@ -211,9 +229,30 @@ async def _process_single_job(
                 }
             },
         )
-        logger.warning(
-            f"Classification job {job_id} {'failed permanently' if new_status == 'failed' else 'will retry'}: {e}"
-        )
+        if new_status == "failed":
+            logger.error(
+                "AI classification job failed permanently id=%s user=%s pen=%s book=%s page=%s copy=%s attempts=%s error=%s",
+                job_id,
+                user_id,
+                pen_mac,
+                book_type,
+                page_number,
+                copy_id or "default",
+                attempts,
+                e,
+            )
+        else:
+            logger.warning(
+                "AI classification job will retry id=%s user=%s pen=%s book=%s page=%s copy=%s attempts=%s error=%s",
+                job_id,
+                user_id,
+                pen_mac,
+                book_type,
+                page_number,
+                copy_id or "default",
+                attempts,
+                e,
+            )
 
 
 async def _get_active_tenant_dbs(db_manager) -> list:

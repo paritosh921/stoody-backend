@@ -104,6 +104,15 @@ async def queue_classification(
                 queue_update,
                 upsert=True,
             )
+            logger.info(
+                "Queued AI classification for user=%s pen=%s book=%s page=%s copy=%s process_after=%s",
+                user_id,
+                (pen_mac or "").upper(),
+                book_type or "A5",
+                page_number,
+                copy_id or "default",
+                (now + timedelta(seconds=DEBOUNCE_SECONDS)).isoformat(),
+            )
         except DuplicateKeyError as exc:
             legacy_key = {
                 "user_id": user_id,
@@ -178,12 +187,29 @@ async def process_page(
         copy_id=copy_id,
     )
     if existing and existing.get("classification_source") == "manual":
+        logger.info(
+            "Skipping AI classification for manual page user=%s pen=%s book=%s page=%s copy=%s",
+            user_id,
+            (pen_mac or "").upper(),
+            book_type or "A5",
+            page_number,
+            copy_id or "default",
+        )
         return  # never override manual classification
     if await _cancelled():
         return
 
     current_strokes = await _count_strokes(tenant_db, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
     if existing and not _should_reclassify(existing, current_strokes):
+        logger.info(
+            "Skipping AI reclassification below threshold for user=%s pen=%s book=%s page=%s copy=%s strokes=%s",
+            user_id,
+            (pen_mac or "").upper(),
+            book_type or "A5",
+            page_number,
+            copy_id or "default",
+            current_strokes,
+        )
         return
     if await _cancelled():
         return
@@ -195,6 +221,14 @@ async def process_page(
             return
         await _save_classification(
             tenant_db, page_key, "Unorganised", "Empty Page", 0.5, "", None, 0
+        )
+        logger.info(
+            "AI classification saved empty-page fallback for user=%s pen=%s book=%s page=%s copy=%s",
+            user_id,
+            (pen_mac or "").upper(),
+            book_type or "A5",
+            page_number,
+            copy_id or "default",
         )
         return
 
@@ -213,6 +247,14 @@ async def process_page(
             return
         await _save_classification(
             tenant_db, page_key, "Unorganised", "Render Failed", 0.3, "", None, current_strokes
+        )
+        logger.warning(
+            "AI classification render failed fallback for user=%s pen=%s book=%s page=%s copy=%s",
+            user_id,
+            (pen_mac or "").upper(),
+            book_type or "A5",
+            page_number,
+            copy_id or "default",
         )
         return
     if await _cancelled():
@@ -254,6 +296,17 @@ async def process_page(
         session_id=latest_session_id,
         first_activity=first_activity,
         last_activity=last_activity,
+    )
+    logger.info(
+        "AI classification saved for user=%s pen=%s book=%s page=%s copy=%s subject=%s topic=%s confidence=%.2f",
+        user_id,
+        (pen_mac or "").upper(),
+        book_type or "A5",
+        page_number,
+        copy_id or "default",
+        subject,
+        topic,
+        float(confidence or 0.0),
     )
 
 
