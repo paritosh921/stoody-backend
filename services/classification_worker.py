@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
+from pymongo import ReturnDocument
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,6 @@ async def _process_pending_classifications(
     openai_client: Optional[AsyncOpenAI],
 ) -> None:
     """Poll all tenant DBs for pending classification jobs."""
-    from services.note_classification_service import process_page
-
-    now = datetime.utcnow()
-
     # Get all active tenant DB names from master
     tenant_db_names = await _get_active_tenant_dbs(db_manager)
 
@@ -65,19 +62,37 @@ async def _process_pending_classifications(
             if tenant_db is None:
                 continue
 
-            jobs = await tenant_db["classification_queue"].find(
-                {
-                    "status": "pending",
-                    "process_after": {"$lte": now},
-                    "attempts": {"$lt": MAX_ATTEMPTS},
-                }
-            ).limit(BATCH_SIZE).to_list(BATCH_SIZE)
-
-            for job in jobs:
+            for _ in range(BATCH_SIZE):
+                job = await _claim_next_job(tenant_db)
+                if job is None:
+                    break
                 await _process_single_job(tenant_db, job, openai_client)
 
         except Exception as e:
             logger.error(f"Error processing tenant {db_name}: {e}")
+
+
+async def _claim_next_job(tenant_db) -> Optional[Dict[str, Any]]:
+    now = datetime.utcnow()
+    return await tenant_db["classification_queue"].find_one_and_update(
+        {
+            "status": "pending",
+            "process_after": {"$lte": now},
+            "attempts": {"$lt": MAX_ATTEMPTS},
+            "cancel_requested": {"$ne": True},
+        },
+        {
+            "$set": {
+                "status": "processing",
+                "started_at": now,
+                "updated_at": now,
+                "error": None,
+            },
+            "$inc": {"attempts": 1},
+        },
+        sort=[("process_after", 1), ("updated_at", 1), ("queued_at", 1), ("_id", 1)],
+        return_document=ReturnDocument.AFTER,
+    )
 
 
 async def _process_single_job(
@@ -104,20 +119,6 @@ async def _process_single_job(
         if not current:
             return True
         return bool(current.get("cancel_requested")) or current.get("status") in {"cancelled", "cancelling"}
-
-    # Mark as processing
-    await tenant_db["classification_queue"].update_one(
-        {"_id": job_id},
-        {
-            "$set": {
-                "status": "processing",
-                "started_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
-                "error": None,
-            },
-            "$inc": {"attempts": 1},
-        },
-    )
 
     try:
         await process_page(tenant_db, user_id, job, openai_client, should_cancel=should_cancel)

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
 
@@ -78,29 +79,61 @@ async def queue_classification(
         }
         if copy_id:
             queue_key["copy_id"] = copy_id
-        await tenant_db["classification_queue"].update_one(
-            queue_key,
-            {
-                "$set": {
-                    "status": "pending",
-                    "process_after": now + timedelta(seconds=DEBOUNCE_SECONDS),
-                    "updated_at": now,
-                    "attempts": 0,
-                    "error": None,
-                    "cancel_requested": False,
-                },
-                "$unset": {
-                    "started_at": "",
-                    "completed_at": "",
-                    "cancelled_at": "",
-                },
-                "$setOnInsert": {
-                    "queued_at": now,
-                    "created_at": now,
-                },
+        queue_update = {
+            "$set": {
+                "status": "pending",
+                "process_after": now + timedelta(seconds=DEBOUNCE_SECONDS),
+                "updated_at": now,
+                "attempts": 0,
+                "error": None,
+                "cancel_requested": False,
             },
-            upsert=True,
-        )
+            "$unset": {
+                "started_at": "",
+                "completed_at": "",
+                "cancelled_at": "",
+            },
+            "$setOnInsert": {
+                "queued_at": now,
+                "created_at": now,
+            },
+        }
+        try:
+            await tenant_db["classification_queue"].update_one(
+                queue_key,
+                queue_update,
+                upsert=True,
+            )
+        except DuplicateKeyError as exc:
+            legacy_key = {
+                "user_id": user_id,
+                "pen_mac": (pen_mac or "").upper(),
+                "book_type": book_type or "A5",
+                "page_number": page_number,
+                "db_name": db_name,
+            }
+            legacy_doc = await tenant_db["classification_queue"].find_one(legacy_key, {"_id": 1, "copy_id": 1})
+            if not legacy_doc:
+                raise
+            fallback_update = dict(queue_update)
+            fallback_set = dict(fallback_update.get("$set", {}))
+            if copy_id and not legacy_doc.get("copy_id"):
+                fallback_set["copy_id"] = copy_id
+            fallback_update["$set"] = fallback_set
+            await tenant_db["classification_queue"].update_one(
+                {"_id": legacy_doc["_id"]},
+                fallback_update,
+                upsert=False,
+            )
+            logger.warning(
+                "Recovered classification queue upsert via legacy identity fallback for user=%s pen=%s book=%s page=%s copy=%s: %s",
+                user_id,
+                (pen_mac or "").upper(),
+                book_type or "A5",
+                page_number,
+                copy_id,
+                exc,
+            )
     except Exception as e:
         logger.warning(f"Failed to queue classification: {e}")
 
@@ -136,7 +169,14 @@ async def process_page(
         return bool(should_cancel and await should_cancel())
 
     # 1. Check reclassification threshold
-    existing = await tenant_db["note_classifications"].find_one(page_key)
+    existing = await _find_existing_note_classification(
+        tenant_db,
+        user_id,
+        pen_mac,
+        book_type,
+        page_number,
+        copy_id=copy_id,
+    )
     if existing and existing.get("classification_source") == "manual":
         return  # never override manual classification
     if await _cancelled():
@@ -611,9 +651,63 @@ async def _save_classification(
     if last_activity is not None:
         update_doc["$set"]["last_activity"] = last_activity
 
-    await tenant_db["note_classifications"].update_one(
-        page_key, update_doc, upsert=True
-    )
+    try:
+        await tenant_db["note_classifications"].update_one(
+            page_key, update_doc, upsert=True
+        )
+    except DuplicateKeyError as exc:
+        legacy_key = {k: v for k, v in page_key.items() if k != "copy_id"}
+        legacy_doc = await tenant_db["note_classifications"].find_one(legacy_key, {"_id": 1, "copy_id": 1})
+        if not legacy_doc:
+            raise
+        fallback_update = dict(update_doc)
+        fallback_set = dict(fallback_update.get("$set", {}))
+        if page_key.get("copy_id") and not legacy_doc.get("copy_id"):
+            fallback_set["copy_id"] = page_key["copy_id"]
+        fallback_update["$set"] = fallback_set
+        await tenant_db["note_classifications"].update_one(
+            {"_id": legacy_doc["_id"]},
+            fallback_update,
+            upsert=False,
+        )
+        logger.warning(
+            "Recovered note classification write via legacy identity fallback for user=%s pen=%s book=%s page=%s copy=%s: %s",
+            page_key.get("user_id"),
+            page_key.get("pen_mac"),
+            page_key.get("book_type"),
+            page_key.get("page_number"),
+            page_key.get("copy_id"),
+            exc,
+        )
+
+
+async def _find_existing_note_classification(
+    tenant_db,
+    user_id: str,
+    pen_mac: str,
+    book_type: str,
+    page_number: int,
+    *,
+    copy_id: Optional[str] = None,
+):
+    exact_key: Dict[str, Any] = {
+        "user_id": user_id,
+        "pen_mac": (pen_mac or "").upper(),
+        "book_type": book_type or "A5",
+        "page_number": page_number,
+    }
+    if copy_id:
+        exact_key["copy_id"] = copy_id
+    doc = await tenant_db["note_classifications"].find_one(exact_key)
+    if doc is not None or not copy_id:
+        return doc
+    legacy_key = {
+        "user_id": user_id,
+        "pen_mac": (pen_mac or "").upper(),
+        "book_type": book_type or "A5",
+        "page_number": page_number,
+    }
+    return await tenant_db["note_classifications"].find_one(legacy_key)
 
 
 async def clear_pending_ai_state(

@@ -338,6 +338,25 @@ async def migrate_database(
             stats.errors.append(f"uniq_note_page_v2 creation failed: {e}")
             logger.warning("[%s]   Failed to create uniq_note_page_v2: %s", db_name, e)
 
+        try:
+            await cls_queue.drop_index("uniq_cls_queue_page")
+            stats.indexes_dropped += 1
+            logger.info("[%s]   Dropped old uniq_cls_queue_page index", db_name)
+        except OperationFailure:
+            pass
+
+        try:
+            await cls_queue.create_index(
+                [("user_id", 1), ("copy_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1), ("db_name", 1)],
+                unique=True,
+                name="uniq_cls_queue_page_v2",
+            )
+            stats.indexes_created += 1
+            logger.info("[%s]   Created uniq_cls_queue_page_v2 index", db_name)
+        except OperationFailure as e:
+            stats.errors.append(f"uniq_cls_queue_page_v2 creation failed: {e}")
+            logger.warning("[%s]   Failed to create uniq_cls_queue_page_v2: %s", db_name, e)
+
         # copy_sets: user index
         try:
             await copy_sets.create_index(

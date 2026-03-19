@@ -1448,10 +1448,17 @@ async def _find_note_classification_by_page(
     page: BatchPageIdentity,
     projection: Optional[Dict[str, int]] = None,
 ):
-    return await tenant_db["note_classifications"].find_one(
-        _page_identity_query(uid_match, page),
-        projection,
-    )
+    exact_query = _page_identity_query(uid_match, page)
+    doc = await tenant_db["note_classifications"].find_one(exact_query, projection)
+    if doc is not None or not page.copy_id:
+        return doc
+    legacy_query = {
+        "user_id": uid_match,
+        "pen_mac": (page.pen_mac or "").upper(),
+        "book_type": page.book_type or "A5",
+        "page_number": page.page_number,
+    }
+    return await tenant_db["note_classifications"].find_one(legacy_query, projection)
 
 
 async def _ensure_canvas_page_exists(
