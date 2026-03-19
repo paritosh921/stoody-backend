@@ -728,12 +728,30 @@ async def backfill_classifications(
     except Exception:
         pass
 
-    # Find all distinct pages from canvas_pages (copy-aware source of truth)
+    # Resolve the user's active copy_id for pages that lack one
+    from api.v1.copy_sets_async import resolve_copy_id as _resolve_copy_id
+    try:
+        active_copy_id = await _resolve_copy_id(None, current_user, db)
+    except Exception:
+        active_copy_id = None
+
+    # Stamp copy_id on any canvas_pages documents that are missing it
+    if active_copy_id:
+        await strokes_db["canvas_pages"].update_many(
+            {
+                "user_id": {"$in": user_identifiers},
+                "stroke_count": {"$gt": 0},
+                "copy_id": {"$in": [None, ""]},
+            },
+            {"$set": {"copy_id": active_copy_id}},
+        )
+
+    # Find all distinct pages from canvas_pages (source of truth, always copy-scoped)
     pipeline = [
         {"$match": {"user_id": {"$in": user_identifiers}, "stroke_count": {"$gt": 0}}},
         {"$group": {
             "_id": {
-                "copy_id": {"$ifNull": ["$copy_id", "default"]},
+                "copy_id": "$copy_id",
                 "pen_mac": "$pen_mac",
                 "book_type": "$book_type",
                 "page_number": "$page_number",
@@ -742,30 +760,25 @@ async def backfill_classifications(
     ]
     distinct_pages = await strokes_db["canvas_pages"].aggregate(pipeline).to_list(5000)
 
-    # Fallback: also check legacy strokes if canvas_pages yielded nothing
-    if not distinct_pages:
-        legacy_pipeline = [
-            {"$match": {"user_id": {"$in": user_identifiers}}},
-            {"$group": {
-                "_id": {
-                    "copy_id": {"$literal": "default"},
-                    "pen_mac": "$pen_mac",
-                    "book_type": "$book_type",
-                    "page_number": "$page_number",
-                },
-            }},
-        ]
-        distinct_pages = await strokes_db["strokes"].aggregate(legacy_pipeline).to_list(5000)
-
-    # Check which are already classified (note_classifications uses canonical str user_id)
+    # Also stamp copy_id on any note_classifications documents that are missing it
     classify_db = strokes_db if is_b2c else await db.get_tenant_db(db_name)
+    if active_copy_id:
+        await classify_db["note_classifications"].update_many(
+            {
+                "user_id": uid_match,
+                "copy_id": {"$in": [None, ""]},
+            },
+            {"$set": {"copy_id": active_copy_id}},
+        )
+
+    # Check which are already classified
     already: set[tuple[str, str, str, int]] = set()
     async for doc in classify_db["note_classifications"].find(
         {"user_id": uid_match},
         {"copy_id": 1, "pen_mac": 1, "book_type": 1, "page_number": 1},
     ):
         already.add((
-            str(doc.get("copy_id") or "default"),
+            str(doc.get("copy_id") or ""),
             (doc.get("pen_mac", "") or "").upper(),
             doc.get("book_type", ""),
             doc.get("page_number", 0),
@@ -776,7 +789,7 @@ async def backfill_classifications(
     queued = 0
     for page in distinct_pages:
         key = page["_id"]
-        copy_id = str(key.get("copy_id") or "default")
+        copy_id = str(key.get("copy_id") or "")
         pen_mac = key.get("pen_mac", "")
         book_type = key.get("book_type", "A5")
         page_number = key.get("page_number", 0)
@@ -786,7 +799,7 @@ async def backfill_classifications(
 
         await queue_classification(
             db, db_name, user_id, pen_mac, book_type, page_number,
-            copy_id=copy_id if copy_id != "default" else None,
+            copy_id=copy_id or None,
         )
         queued += 1
 
