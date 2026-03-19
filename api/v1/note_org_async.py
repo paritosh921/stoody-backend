@@ -35,8 +35,16 @@ class ReclassifyRequest(BaseModel):
     topic: str
 
 
+class BatchPageIdentity(BaseModel):
+    pen_mac: str
+    book_type: str = "A5"
+    page_number: int
+    copy_id: Optional[str] = None
+
+
 class BatchReclassifyRequest(BaseModel):
-    classification_ids: List[str]
+    classification_ids: List[str] = Field(default_factory=list)
+    pages: List[BatchPageIdentity] = Field(default_factory=list)
     subject: str
     topic: str
 
@@ -46,19 +54,23 @@ class ArchiveRequest(BaseModel):
 
 
 class BatchArchiveRequest(BaseModel):
-    classification_ids: List[str]
+    classification_ids: List[str] = Field(default_factory=list)
+    pages: List[BatchPageIdentity] = Field(default_factory=list)
+    archived: bool = True
 
 
-class BatchAIClassifyPage(BaseModel):
-    pen_mac: str
-    book_type: str = "A5"
-    page_number: int
-    copy_id: Optional[str] = None
+class BatchAIClassifyPage(BatchPageIdentity):
+    pass
 
 
 class BatchAIClassifyRequest(BaseModel):
     pages: List[BatchAIClassifyPage]
-    archived: bool = True
+
+
+class BatchFavoriteRequest(BaseModel):
+    classification_ids: List[str] = Field(default_factory=list)
+    pages: List[BatchPageIdentity] = Field(default_factory=list)
+    favorite: bool
 
 
 class GenerateRequest(BaseModel):
@@ -375,22 +387,74 @@ async def batch_reclassify(
     if not body.subject.strip() or not body.topic.strip():
         raise HTTPException(status_code=400, detail="Subject and topic must not be empty")
 
-    ids = [ObjectId(cid) for cid in body.classification_ids]
     now = datetime.utcnow()
+    modified_count = 0
 
-    result = await tenant_db["note_classifications"].update_many(
-        {"_id": {"$in": ids}, "user_id": uid_match},
-        {"$set": {
-            "subject": body.subject,
-            "topic": body.topic,
-            "classification_source": "manual",
-            "updated_at": now,
-        }},
-    )
+    valid_ids = [ObjectId(cid) for cid in body.classification_ids if ObjectId.is_valid(cid)]
+    if valid_ids:
+        result = await tenant_db["note_classifications"].update_many(
+            {"_id": {"$in": valid_ids}, "user_id": uid_match},
+            {"$set": {
+                "subject": body.subject,
+                "topic": body.topic,
+                "classification_source": "manual",
+                "updated_at": now,
+            }},
+        )
+        modified_count += result.modified_count
+
+    for page in body.pages:
+        existing = await _find_note_classification_by_page(
+            tenant_db,
+            uid_match,
+            page,
+            projection={"subject": 1, "topic": 1, "classification_source": 1},
+        )
+        if existing is None:
+            await _ensure_canvas_page_exists(tenant_db, current_user, page)
+            page_key = _insertable_page_identity(user_id, page)
+        else:
+            page_key = {"_id": existing["_id"]}
+
+        update_doc: Dict[str, Any] = {
+            "$set": {
+                "subject": body.subject,
+                "topic": body.topic,
+                "classification_source": "manual",
+                "updated_at": now,
+                "pen_mac": (page.pen_mac or "").upper(),
+                "book_type": page.book_type or "A5",
+                "page_number": page.page_number,
+            },
+            "$setOnInsert": {
+                "user_id": user_id,
+                "copy_id": page.copy_id,
+                "created_at": now,
+                "confidence": 1.0,
+                "is_favorite": False,
+                "is_archived": False,
+                "ocr_text": "",
+                "stroke_count_at_classification": 0,
+                "thumbnail_url": None,
+                "original_subject": None,
+                "original_topic": None,
+            },
+        }
+        if existing and existing.get("classification_source") != "manual":
+            update_doc["$set"]["original_subject"] = existing.get("subject")
+            update_doc["$set"]["original_topic"] = existing.get("topic")
+
+        result = await tenant_db["note_classifications"].update_one(
+            page_key,
+            update_doc,
+            upsert=True,
+        )
+        if result.matched_count or result.upserted_id is not None:
+            modified_count += 1
 
     return {
         "success": True,
-        "modified_count": result.modified_count,
+        "modified_count": modified_count,
     }
 
 
@@ -758,26 +822,49 @@ async def batch_ai_classify(
         book_type = page.book_type or "A5"
         page_number = page.page_number
         copy_id = page.copy_id
+        now = datetime.utcnow()
 
         # Check if page has manual classification — preserve it
-        class_query: Dict[str, Any] = {
-            "user_id": uid_match,
-            "pen_mac": pen_mac,
-            "book_type": book_type,
-            "page_number": page_number,
-        }
-        if copy_id:
-            class_query["copy_id"] = copy_id
-        existing = await tenant_db["note_classifications"].find_one(class_query)
+        existing = await _find_note_classification_by_page(tenant_db, uid_match, page)
         if existing and existing.get("classification_source") == "manual":
             skipped_manual += 1
             continue
 
-        # Reset source so AI pipeline will process it
+        # Ensure pending metadata exists so My Copy can show a processing state immediately.
         if existing:
             await tenant_db["note_classifications"].update_one(
                 {"_id": existing["_id"]},
-                {"$set": {"classification_source": "pending_ai"}},
+                {"$set": {"classification_source": "pending_ai", "updated_at": now}},
+            )
+        else:
+            await _ensure_canvas_page_exists(tenant_db, current_user, page)
+            await tenant_db["note_classifications"].update_one(
+                _insertable_page_identity(user_id, page),
+                {
+                    "$set": {
+                        "classification_source": "pending_ai",
+                        "updated_at": now,
+                        "pen_mac": pen_mac,
+                        "book_type": book_type,
+                        "page_number": page_number,
+                    },
+                    "$setOnInsert": {
+                        "user_id": user_id,
+                        "copy_id": copy_id,
+                        "created_at": now,
+                        "subject": "Unorganised",
+                        "topic": "",
+                        "confidence": None,
+                        "is_favorite": False,
+                        "is_archived": False,
+                        "ocr_text": "",
+                        "stroke_count_at_classification": 0,
+                        "thumbnail_url": None,
+                        "original_subject": None,
+                        "original_topic": None,
+                    },
+                },
+                upsert=True,
             )
 
         await queue_classification(db, db_name, user_id, pen_mac, book_type, page_number, copy_id=copy_id)
@@ -983,14 +1070,129 @@ async def batch_archive(
 
     user_id = _get_user_id(current_user)
     uid_match = _user_id_match(current_user)
-    ids = [ObjectId(cid) for cid in body.classification_ids]
+    ids = [ObjectId(cid) for cid in body.classification_ids if ObjectId.is_valid(cid)]
+    modified_count = 0
 
-    result = await tenant_db["note_classifications"].update_many(
-        {"_id": {"$in": ids}, "user_id": uid_match},
-        {"$set": {"is_archived": body.archived, "updated_at": datetime.utcnow()}},
-    )
+    if ids:
+        result = await tenant_db["note_classifications"].update_many(
+            {"_id": {"$in": ids}, "user_id": uid_match},
+            {"$set": {"is_archived": body.archived, "updated_at": datetime.utcnow()}},
+        )
+        modified_count += result.matched_count
 
-    return {"success": True, "modified_count": result.modified_count, "is_archived": body.archived}
+    for page in body.pages:
+        now = datetime.utcnow()
+        existing = await _find_note_classification_by_page(tenant_db, uid_match, page)
+        if existing:
+            result = await tenant_db["note_classifications"].update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"is_archived": body.archived, "updated_at": now}},
+            )
+            if result.matched_count:
+                modified_count += 1
+            continue
+
+        await _ensure_canvas_page_exists(tenant_db, current_user, page)
+        await tenant_db["note_classifications"].update_one(
+            _insertable_page_identity(user_id, page),
+            {
+                "$set": {
+                    "is_archived": body.archived,
+                    "updated_at": now,
+                    "pen_mac": (page.pen_mac or "").upper(),
+                    "book_type": page.book_type or "A5",
+                    "page_number": page.page_number,
+                },
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "copy_id": page.copy_id,
+                    "created_at": now,
+                    "subject": "Unorganised",
+                    "topic": "",
+                    "classification_source": "system",
+                    "confidence": None,
+                    "is_favorite": False,
+                    "ocr_text": "",
+                    "stroke_count_at_classification": 0,
+                    "thumbnail_url": None,
+                    "original_subject": None,
+                    "original_topic": None,
+                },
+            },
+            upsert=True,
+        )
+        modified_count += 1
+
+    return {"success": True, "modified_count": modified_count, "is_archived": body.archived}
+
+
+@router.patch("/pages/batch-favorite")
+async def batch_favorite(
+    body: BatchFavoriteRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Favorite or unfavorite pages by classification id or page identity."""
+    tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user_id = _get_user_id(current_user)
+    uid_match = _user_id_match(current_user)
+    ids = [ObjectId(cid) for cid in body.classification_ids if ObjectId.is_valid(cid)]
+    modified_count = 0
+
+    if ids:
+        result = await tenant_db["note_classifications"].update_many(
+            {"_id": {"$in": ids}, "user_id": uid_match},
+            {"$set": {"is_favorite": body.favorite, "updated_at": datetime.utcnow()}},
+        )
+        modified_count += result.matched_count
+
+    for page in body.pages:
+        now = datetime.utcnow()
+        existing = await _find_note_classification_by_page(tenant_db, uid_match, page)
+        if existing:
+            result = await tenant_db["note_classifications"].update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"is_favorite": body.favorite, "updated_at": now}},
+            )
+            if result.matched_count:
+                modified_count += 1
+            continue
+
+        await _ensure_canvas_page_exists(tenant_db, current_user, page)
+        await tenant_db["note_classifications"].update_one(
+            _insertable_page_identity(user_id, page),
+            {
+                "$set": {
+                    "is_favorite": body.favorite,
+                    "updated_at": now,
+                    "pen_mac": (page.pen_mac or "").upper(),
+                    "book_type": page.book_type or "A5",
+                    "page_number": page.page_number,
+                },
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "copy_id": page.copy_id,
+                    "created_at": now,
+                    "subject": "Unorganised",
+                    "topic": "",
+                    "classification_source": "system",
+                    "confidence": None,
+                    "is_archived": False,
+                    "ocr_text": "",
+                    "stroke_count_at_classification": 0,
+                    "thumbnail_url": None,
+                    "original_subject": None,
+                    "original_topic": None,
+                },
+            },
+            upsert=True,
+        )
+        modified_count += 1
+
+    return {"success": True, "modified_count": modified_count, "is_favorite": body.favorite}
 
 
 @router.delete("/pages/{classification_id}")
@@ -1036,6 +1238,65 @@ async def delete_page(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _page_identity_query(uid_match: Dict[str, Any], page: BatchPageIdentity) -> Dict[str, Any]:
+    query: Dict[str, Any] = {
+        "user_id": uid_match,
+        "pen_mac": (page.pen_mac or "").upper(),
+        "book_type": page.book_type or "A5",
+        "page_number": page.page_number,
+    }
+    if page.copy_id:
+        query["copy_id"] = page.copy_id
+    return query
+
+
+def _insertable_page_identity(user_id: str, page: BatchPageIdentity) -> Dict[str, Any]:
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "pen_mac": (page.pen_mac or "").upper(),
+        "book_type": page.book_type or "A5",
+        "page_number": page.page_number,
+    }
+    if page.copy_id:
+        query["copy_id"] = page.copy_id
+    return query
+
+
+async def _find_note_classification_by_page(
+    tenant_db,
+    uid_match: Dict[str, Any],
+    page: BatchPageIdentity,
+    projection: Optional[Dict[str, int]] = None,
+):
+    return await tenant_db["note_classifications"].find_one(
+        _page_identity_query(uid_match, page),
+        projection,
+    )
+
+
+async def _ensure_canvas_page_exists(
+    tenant_db,
+    current_user: Dict[str, Any],
+    page: BatchPageIdentity,
+) -> None:
+    user_variants: List[Any] = list(canvas_user_id_variants(current_user))
+    user_id = _get_user_id(current_user)
+    if ObjectId.is_valid(user_id):
+        user_variants.append(ObjectId(user_id))
+    page_query: Dict[str, Any] = {
+        "user_id": {"$in": user_variants},
+        "pen_mac": (page.pen_mac or "").upper(),
+        "book_type": page.book_type or "A5",
+        "page_number": page.page_number,
+        "stroke_count": {"$gt": 0},
+    }
+    if page.copy_id:
+        page_query["copy_id"] = page.copy_id
+    exists = await tenant_db["canvas_pages"].find_one(page_query, {"_id": 1})
+    if exists:
+        return
+    raise HTTPException(status_code=404, detail="Canvas page not found")
 
 def _doc_to_page(doc: Dict[str, Any], include_subject_topic: bool = False) -> Dict[str, Any]:
     """Convert a MongoDB note_classifications document to a page dict."""

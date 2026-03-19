@@ -111,6 +111,10 @@ class CopyPageSummary(BaseModel):
     topic: Optional[str] = None
     confidence: Optional[float] = None
     is_favorite: bool = False
+    is_archived: bool = False
+    classification_source: Optional[str] = None
+    classification_status: str = "unclassified"
+    classification_error: Optional[str] = None
 
 
 class CopyPageListResponse(BaseModel):
@@ -204,6 +208,18 @@ async def _get_note_classifications_collection(current_user: Dict[str, Any], db:
     return tenant_db["note_classifications"] if tenant_db is not None else None
 
 
+async def _get_classification_queue_collection(current_user: Dict[str, Any], db: DatabaseManager):
+    """Return the classification_queue collection for the user's tenant/B2C database."""
+    is_b2c = current_user.get("is_b2c", False) or current_user.get("user_type") == "b2c_user"
+    if is_b2c:
+        return db.b2c_db["classification_queue"]
+    db_name = current_user.get("db_name")
+    if not db_name:
+        return None
+    tenant_db = await db.get_tenant_db(db_name)
+    return tenant_db["classification_queue"] if tenant_db is not None else None
+
+
 async def _list_canvas_pages_for_user(
     current_user: Dict[str, Any],
     db: DatabaseManager,
@@ -218,6 +234,7 @@ async def _list_canvas_pages_for_user(
     if col is None:
         return []
     classify_col = await _get_note_classifications_collection(current_user, db)
+    queue_col = await _get_classification_queue_collection(current_user, db)
 
     user_identifiers = _build_user_id_variants(current_user)
 
@@ -266,6 +283,33 @@ async def _list_canvas_pages_for_user(
         except Exception as exc:
             logger.warning("note_classifications query failed for copies: %s", exc)
 
+    queue_state: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+    if queue_col is not None and docs:
+        page_numbers = sorted({int(d.get("page_number")) for d in docs if d.get("page_number") is not None})
+        book_types = sorted({str(d.get("book_type") or "STANDARD").upper() for d in docs if d.get("page_number") is not None})
+        queue_query: Dict[str, Any] = {
+            "user_id": current_user.get("user_id"),
+            "page_number": {"$in": page_numbers},
+            "book_type": {"$in": book_types},
+            "status": {"$in": ["pending", "processing", "failed"]},
+        }
+        if copy_id:
+            queue_query["copy_id"] = copy_id
+        try:
+            queue_docs = await queue_col.find(queue_query).to_list(length=None)
+            for doc in queue_docs:
+                key = (
+                    str(doc.get("copy_id") or "default"),
+                    (doc.get("pen_mac") or "canvas").upper(),
+                    (doc.get("book_type") or "STANDARD").upper(),
+                    int(doc.get("page_number")),
+                )
+                existing = queue_state.get(key)
+                if existing is None or (doc.get("updated_at") or doc.get("queued_at") or datetime.min) >= (existing.get("updated_at") or existing.get("queued_at") or datetime.min):
+                    queue_state[key] = doc
+        except Exception as exc:
+            logger.warning("classification_queue query failed for copies: %s", exc)
+
     # Grouping keyed by (copy_id, pen_mac, book_type, page_number)
     grouped: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
     for d in docs:
@@ -303,6 +347,19 @@ async def _list_canvas_pages_for_user(
         existing = grouped.get(key)
         if existing is None:
             classification = classifications.get(key)
+            queue_doc = queue_state.get(key)
+            if classification and classification.get("is_archived"):
+                continue
+            classification_status = "unclassified"
+            classification_error = None
+            classification_source = classification.get("classification_source") if classification else None
+            if queue_doc and queue_doc.get("status") in {"pending", "processing"}:
+                classification_status = "pending"
+            elif queue_doc and queue_doc.get("status") == "failed":
+                classification_status = "failed"
+                classification_error = queue_doc.get("error")
+            elif classification:
+                classification_status = "pending" if classification_source == "pending_ai" else "classified"
             grouped[key] = {
                 "id": str(classification.get("_id")) if classification and classification.get("_id") else None,
                 "copy_id": d.get("copy_id"),
@@ -318,6 +375,10 @@ async def _list_canvas_pages_for_user(
                 "topic": classification.get("topic") if classification else None,
                 "confidence": classification.get("confidence") if classification else None,
                 "is_favorite": bool(classification.get("is_favorite")) if classification else False,
+                "is_archived": bool(classification.get("is_archived")) if classification else False,
+                "classification_source": classification_source,
+                "classification_status": classification_status,
+                "classification_error": classification_error,
             }
             continue
 
@@ -331,16 +392,35 @@ async def _list_canvas_pages_for_user(
             existing["session_id"] = d.get("session_id") or existing.get("session_id")
 
         classification = classifications.get(key)
+        queue_doc = queue_state.get(key)
         if classification:
+            if classification.get("is_archived"):
+                continue
             existing["id"] = existing.get("id") or (str(classification.get("_id")) if classification.get("_id") else None)
             existing["subject"] = classification.get("subject") or existing.get("subject")
             existing["topic"] = classification.get("topic") or existing.get("topic")
             existing["confidence"] = classification.get("confidence") if classification.get("confidence") is not None else existing.get("confidence")
             existing["is_favorite"] = bool(classification.get("is_favorite")) if classification.get("is_favorite") is not None else existing.get("is_favorite", False)
+            existing["is_archived"] = bool(classification.get("is_archived"))
+            existing["classification_source"] = classification.get("classification_source") or existing.get("classification_source")
+
+        if queue_doc and queue_doc.get("status") in {"pending", "processing"}:
+            existing["classification_status"] = "pending"
+            existing["classification_error"] = None
+        elif queue_doc and queue_doc.get("status") == "failed":
+            existing["classification_status"] = "failed"
+            existing["classification_error"] = queue_doc.get("error")
+        elif classification:
+            existing["classification_status"] = "pending" if existing.get("classification_source") == "pending_ai" else "classified"
+            existing["classification_error"] = None
 
         existing["total_strokes"] = max(existing["total_strokes"], int(d.get("stroke_count", 0) or 0))
 
-    results = sorted(grouped.values(), key=lambda p: p["last_activity"], reverse=True)
+    results = sorted(
+        [page for page in grouped.values() if not page.get("is_archived")],
+        key=lambda p: p["last_activity"],
+        reverse=True,
+    )
     return results[:limit]
 
 
