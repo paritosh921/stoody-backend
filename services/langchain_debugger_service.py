@@ -17,8 +17,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Use HuggingFaceEmbeddings for FREE local embeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# Use HuggingFaceEmbeddings for FREE local embeddings.
+# Prefer the non-deprecated package, but keep a rollout-safe fallback so
+# older environments do not hard-fail before dependencies are refreshed.
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+except ImportError:  # pragma: no cover - fallback for partially upgraded envs
+    from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # Local imports - Using MongoDB client for storage
 from models.chat_mongodb_client import get_chat_mongodb_client, ChatMongoDBClient

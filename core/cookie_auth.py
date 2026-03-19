@@ -138,7 +138,7 @@ class CookieAuthManager:
             user_data = await auth_manager.verify_token_and_get_user(token)
 
             if not user_data:
-                logger.warning("Invalid token in cookie")
+                logger.info("Ignoring invalid token in cookie")
                 return None
 
             # Check user-level revocation in Redis (cross-client logout)

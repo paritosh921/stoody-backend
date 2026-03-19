@@ -62,6 +62,7 @@ langchain==0.3.10
 langchain-core==0.3.23
 langchain-openai==0.2.12
 langchain-community==0.3.10
+langchain-huggingface>=0.1.2,<1
 langchain-text-splitters==0.3.2
 
 # ===============================
