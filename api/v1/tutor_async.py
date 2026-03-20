@@ -1556,8 +1556,11 @@ async def get_student_document_attempts(
                         for pg in raw_pages:
                             raw_strokes = pg.get("strokes") or []
 
-                            # Filter strokes by time intervals
-                            if time_intervals:
+                            # Try filtering strokes by time intervals.
+                            # If no strokes survive the filter, show all
+                            # strokes on the page (the page was tracked
+                            # as active, so the student wrote there).
+                            if time_intervals and raw_strokes:
                                 filtered = []
                                 for s in raw_strokes:
                                     s_start = s.get("startedAt") or s.get("timestamp")
@@ -1567,12 +1570,14 @@ async def get_student_document_attempts(
                                     for iv in time_intervals:
                                         iv_start = iv.get("startTs") or iv.get("start_ts", 0)
                                         iv_end = iv.get("endTs") or iv.get("end_ts") or float("inf")
-                                        tolerance = 2000  # 2s tolerance
+                                        tolerance = 5000  # 5s tolerance
                                         if (s_start >= iv_start - tolerance
                                                 and s_start <= iv_end + tolerance):
                                             filtered.append(s)
                                             break
-                                raw_strokes = filtered
+                                # Only apply filter if it keeps some strokes
+                                if filtered:
+                                    raw_strokes = filtered
 
                             if raw_strokes:
                                 question_strokes.append({
