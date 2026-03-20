@@ -1556,10 +1556,9 @@ async def get_student_document_attempts(
                         for pg in raw_pages:
                             raw_strokes = pg.get("strokes") or []
 
-                            # Try filtering strokes by time intervals.
-                            # If no strokes survive the filter, show all
-                            # strokes on the page (the page was tracked
-                            # as active, so the student wrote there).
+                            # Filter strokes by time intervals — only
+                            # include strokes written while this question
+                            # was active
                             if time_intervals and raw_strokes:
                                 filtered = []
                                 for s in raw_strokes:
@@ -1575,9 +1574,7 @@ async def get_student_document_attempts(
                                                 and s_start <= iv_end + tolerance):
                                             filtered.append(s)
                                             break
-                                # Only apply filter if it keeps some strokes
-                                if filtered:
-                                    raw_strokes = filtered
+                                raw_strokes = filtered
 
                             if raw_strokes:
                                 question_strokes.append({
