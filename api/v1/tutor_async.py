@@ -1543,7 +1543,9 @@ async def get_student_document_attempts(
                             "page_number": {"$in": active_pages},
                             "book_type": book_type.upper(),
                         }
-                        if copy_id_ref:
+                        # Only filter by copy_id if it's a real ID
+                        # (not "default" which is a frontend placeholder)
+                        if copy_id_ref and copy_id_ref != "default":
                             page_query["copy_id"] = copy_id_ref
 
                         cursor = canvas_col.find(page_query).sort(
