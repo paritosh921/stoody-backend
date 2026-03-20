@@ -1930,12 +1930,16 @@ async def get_tutor_document_detail_analytics(
             else None,
         }
 
-        # ----- Fetch question metadata -----
-        questions = await db.mongo_find("questions", {"document_id": document_id})
+        # ----- Fetch question metadata (preserve original document order) -----
+        questions = await db.mongo_find(
+            "questions", {"document_id": document_id}, sort=[("_id", 1)]
+        )
         question_map: Dict[str, Dict[str, Any]] = {}
-        for q in questions:
+        question_order: Dict[str, int] = {}  # question_id → 1-based index
+        for idx, q in enumerate(questions):
             qid = q.get("id") or str(q.get("_id", ""))
             question_map[qid] = q
+            question_order[qid] = idx + 1
 
         # ----- Branch by document type -----
         student_results: List[Dict[str, Any]] = []
@@ -2113,6 +2117,7 @@ async def get_tutor_document_detail_analytics(
                 question_analysis.append(
                     {
                         "question_id": qid,
+                        "question_number": question_order.get(qid, 0),
                         "question_text": q_meta.get("text", ""),
                         "difficulty": q_meta.get("difficulty", ""),
                         "total_attempts": q_total,
@@ -2125,7 +2130,7 @@ async def get_tutor_document_detail_analytics(
                     }
                 )
 
-            # Sort by accuracy ascending (hardest first)
+            # Sort by accuracy ascending (hardest first) for the chart
             question_analysis.sort(key=lambda x: x["accuracy"])
 
         elif dtype == "Test Series":
@@ -2303,6 +2308,7 @@ async def get_tutor_document_detail_analytics(
                 question_analysis.append(
                     {
                         "question_id": qid,
+                        "question_number": question_order.get(qid, 0),
                         "question_text": q_meta.get("text", ""),
                         "difficulty": q_meta.get("difficulty", ""),
                         "total_attempts": q_total,
@@ -2315,7 +2321,7 @@ async def get_tutor_document_detail_analytics(
                     }
                 )
 
-            # Sort by accuracy ascending (hardest first)
+            # Sort by accuracy ascending (hardest first) for the chart
             question_analysis.sort(key=lambda x: x["accuracy"])
 
         return {
