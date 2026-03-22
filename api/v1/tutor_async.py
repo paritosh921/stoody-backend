@@ -412,6 +412,63 @@ async def update_tutor(
     return {"message": "Tutor updated successfully"}
 
 
+class TutorSelfUpdateRequest(BaseModel):
+    """Fields a tutor can update on their own profile."""
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, max_length=20)
+
+
+@router.put("/tutors/me/profile")
+@limiter.limit("10/minute")
+async def update_tutor_self_profile(
+    request: Request,
+    profile_data: TutorSelfUpdateRequest,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Tutor updates their own profile (name, email, phone only).
+    Admin-controlled fields (teaching_assignments, standards, sections, subjects,
+    can_edit_students, username, tutor_id) cannot be changed here.
+    """
+    from bson import ObjectId
+
+    tutor_id = ObjectId(current_user["user_id"])
+    tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+    if not tutor:
+        raise HTTPException(status_code=404, detail="Tutor not found")
+
+    # Build update dict from non-None fields only
+    updates: Dict[str, Any] = {}
+    if profile_data.name is not None:
+        updates["name"] = profile_data.name.strip()
+        updates["full_name"] = profile_data.name.strip()
+    if profile_data.email is not None:
+        updates["email"] = profile_data.email.strip().lower()
+    if profile_data.phone is not None:
+        updates["phone"] = profile_data.phone.strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    await db.mongo_update_one("tutors", {"_id": tutor_id}, {"$set": updates})
+
+    _logger.info(f"Tutor {tutor.get('username')} updated their profile")
+
+    # Return updated profile data so frontend can refresh
+    updated_tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+    return {
+        "success": True,
+        "message": "Profile updated successfully",
+        "user": {
+            "name": updated_tutor.get("name") or updated_tutor.get("full_name"),
+            "email": updated_tutor.get("email"),
+            "phone": updated_tutor.get("phone"),
+        },
+    }
+
+
 @router.delete("/tutors/{tutor_id}")
 @limiter.limit("10/minute")
 async def delete_tutor(
