@@ -1904,6 +1904,7 @@ async def upload_pdf(
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
+    instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
@@ -2075,6 +2076,7 @@ async def upload_pdf(
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
             "question_type": question_type if question_type in ["mcq", "subjective"] else "mcq",  # Default question type for extracted questions
+            "instructions": instructions.strip() if instructions else None,  # Paper instructions
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled()  # Track storage location
         }
@@ -2756,9 +2758,10 @@ async def get_student_practice_sets(
                     "extracted_questions_count": doc.get("extracted_questions_count", 0),
                     "completed": completed,
                     "attempted": has_attempted,
+                    "instructions": doc.get("instructions"),
                     "session_count": len(sessions)
                 })
-            
+
             return {
                 "success": True,
                 "data": {
@@ -2817,6 +2820,7 @@ async def get_student_practice_sets(
                     "course_plan": doc.get("course_plan"),
                     "standard": doc.get("standard"),
                     "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                    "instructions": doc.get("instructions"),
                     "completed": completed,
                     "attempted": has_attempted,
                     "session_count": len(sessions)
@@ -2976,6 +2980,7 @@ async def get_student_practice_sets(
                 "course_plan": doc.get("course_plan"),
                 "standard": doc.get("standard"),
                 "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                "instructions": doc.get("instructions"),
                 "completed": completed,
                 "attempted": has_attempted,
                 "session_count": len(sessions),
@@ -3294,6 +3299,11 @@ async def update_document_metadata(
                 value = str(metadata[field]).strip()
                 if value:  # Only update if non-empty
                     update_data[field] = value
+
+        # Instructions field (allow clearing with empty string)
+        if "instructions" in metadata:
+            value = str(metadata["instructions"]).strip() if metadata["instructions"] else ""
+            update_data["instructions"] = value if value else None
 
         # Document type with validation
         if "document_type" in metadata:
