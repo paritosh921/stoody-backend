@@ -2067,7 +2067,7 @@ async def upload_pdf(
             "uploaded_by": current_user.get("user_id"),
             "admin_id": admin_oid,
             "uploaded_at": datetime.utcnow(),
-            "ocr_status": "not_processed",
+            "ocr_status": "completed" if document_type == "Chapter Notes" else "not_processed",
             "ocr_job_id": None,
             "extracted_questions_count": 0,
             "extracted_images_count": 0,
