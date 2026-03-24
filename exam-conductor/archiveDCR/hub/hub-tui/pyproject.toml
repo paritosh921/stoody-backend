@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hub-tui"
+version = "0.1.0"
+description = "ExamPen Hub TUI — Textual-based terminal interface for Raspberry Pi hub"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=0.47",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "textual-dev>=1.0",
+]
+
+[project.scripts]
+hub-tui = "src.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

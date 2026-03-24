@@ -1,0 +1,29 @@
+# ============================================================================
+# fstab.append — ExamPen Mount Entries
+#
+# Appended to: /etc/fstab
+#
+# 1. ExamPen data partition (partition 3) at /var/lib/exampen.
+#    This is the primary data store for exam data, stroke caches,
+#    logs, and configuration on the SD card.
+#
+# 2. USB backup thumb drive at /mnt/exampen-backup.
+#    Independent failure domain for pen stroke data
+#    (dual-write: SD primary + USB secondary).
+#
+# Key flags:
+#   nofail  — Hub MUST boot even if USB drive is missing or unplugged.
+#             hub-store module detects missing secondary and logs a
+#             warning to TUI + invigilator app.
+#   noatime — Reduces write amplification on flash storage.
+#   nosuid,nodev,noexec — Security hardening for removable media.
+#
+# The USB drive must be pre-formatted as ext4 with label "exampen-backup".
+# Format with:  mkfs.ext4 -L exampen-backup /dev/sdX1
+# ============================================================================
+
+# ExamPen data partition (partition 3)
+LABEL=exampen-data  /var/lib/exampen  ext4  defaults,noatime  0  2
+
+# USB backup drive
+LABEL=exampen-backup  /mnt/exampen-backup  ext4  defaults,nofail,noatime,nosuid,nodev,noexec  0  2

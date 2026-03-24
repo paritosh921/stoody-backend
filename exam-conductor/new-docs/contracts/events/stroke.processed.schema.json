@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/stroke.processed",
+  "title": "stroke.processed event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "pen_mac",
+    "normalized_stroke_uri",
+    "page_assignments"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "stroke.processed" },
+    "event_version": { "const": "1.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string", "format": "uuid" },
+    "pen_mac": { "type": "string" },
+    "student_id": { "type": "string" },
+    "normalized_stroke_uri": { "type": "string", "format": "uri" },
+    "page_assignments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["page_number", "question_id", "point_count"],
+        "properties": {
+          "page_number": { "type": "integer" },
+          "question_id": { "type": "string" },
+          "point_count": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

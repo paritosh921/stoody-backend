@@ -1,0 +1,44 @@
+name: exampen_mobile
+description: ExamPen mobile app — hub control, teacher score management, student score view.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+  flutter: '>=3.16.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # BLE
+  flutter_blue_plus: ^1.31.0
+
+  # Camera
+  camera: ^0.11.0
+
+  # Networking
+  http: ^1.2.0
+
+  # Secure storage
+  flutter_secure_storage: ^9.2.0
+
+  # State management
+  provider: ^6.1.0
+
+  # Routing
+  go_router: ^14.0.0
+
+  # Charts
+  fl_chart: ^0.68.0
+
+  # Utilities
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

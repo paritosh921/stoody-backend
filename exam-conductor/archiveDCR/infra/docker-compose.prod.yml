@@ -1,0 +1,137 @@
+# ExamPen — Production Infrastructure
+# Usage: docker compose -f docker-compose.prod.yml \
+#   -f docker-compose.prod-services.yml -f docker-compose.secrets.yml up -d
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "25m", max-file: "5" }
+
+x-hc: &hc
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+secrets:
+  postgres_password: { external: true }
+  redis_password: { external: true }
+  minio_root_password: { external: true }
+  nats_password: { external: true }
+  jwt_signing_key: { external: true }
+
+services:
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: exampen
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: exampen_auth
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./backup/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    command: >
+      postgres -c ssl=on
+        -c ssl_cert_file=/var/lib/postgresql/data/server.crt
+        -c ssl_key_file=/var/lib/postgresql/data/server.key
+        -c max_connections=200 -c shared_buffers=1GB
+        -c work_mem=16MB -c wal_level=replica -c archive_mode=on
+        -c archive_command='pgbackrest --stanza=exampen archive-push %p'
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 4G }
+        reservations: { cpus: "1.0", memory: 2G }
+    healthcheck: { <<: *hc, test: ["CMD-SHELL", "pg_isready -U exampen"] }
+    networks: [exampen-net]
+
+  nats:
+    image: nats:2-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: >
+      --jetstream --store_dir /data --http_port 8222
+      --tls --tlscert=/certs/nats.crt --tlskey=/certs/nats.key
+      --max_payload 1048576 --max_connections 1024
+    volumes:
+      - natsdata:/data
+      - ./certs/nats:/certs:ro
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 2G }
+        reservations: { cpus: "0.5", memory: 512M }
+    healthcheck: { <<: *hc, test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"] }
+    networks: [exampen-net]
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    logging: *logging
+    command: server /data --console-address ":9001" --certs-dir /certs
+    environment:
+      MINIO_ROOT_USER: exampen
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_root_password
+      MINIO_LIFECYCLE_EXPIRY_DAYS: "90"
+    secrets: [minio_root_password]
+    volumes:
+      - miniodata:/data
+      - ./certs/minio:/certs:ro
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 2G }
+        reservations: { cpus: "0.5", memory: 512M }
+    healthcheck: { <<: *hc, test: ["CMD", "mc", "ready", "local"] }
+    networks: [exampen-net]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: >
+      redis-server --requirepass /run/secrets/redis_password
+      --tls-port 6379 --port 0
+      --tls-cert-file /certs/redis.crt --tls-key-file /certs/redis.key
+      --maxmemory 512mb --maxmemory-policy allkeys-lru
+      --save 900 1 --save 300 10
+    secrets: [redis_password]
+    volumes:
+      - redisdata:/data
+      - ./certs/redis:/certs:ro
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 768M }
+        reservations: { cpus: "0.25", memory: 256M }
+    healthcheck: { <<: *hc, test: ["CMD", "redis-cli", "--tls", "ping"] }
+    networks: [exampen-net]
+
+  traefik:
+    image: traefik:v3
+    restart: unless-stopped
+    logging: *logging
+    ports: ["80:80", "443:443"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik-prod.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic-prod.yml:/etc/traefik/dynamic.yml:ro
+      - traefik-certs:/letsencrypt
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+        reservations: { cpus: "0.25", memory: 128M }
+    healthcheck: { <<: *hc, test: ["CMD", "traefik", "healthcheck"] }
+    networks: [exampen-net]
+
+volumes:
+  pgdata:
+  natsdata:
+  miniodata:
+  redisdata:
+  traefik-certs:
+
+networks:
+  exampen-net:
+    driver: bridge
+    driver_opts: { encrypted: "true" }

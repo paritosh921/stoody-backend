@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "exampen-proto"
+version = "0.1.0"
+description = "Shared Pydantic v2 type definitions for the ExamPen system"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "pyright>=1.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["exampen_proto"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.12"

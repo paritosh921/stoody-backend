@@ -1,0 +1,47 @@
+[
+  {
+    "id": "2a45c2ab-8cbf-edb0-f264-accc79ac1b1e",
+    "stoody_user_id": "tut_0001",
+    "first_name": "Dr. Anita",
+    "last_name": "Sharma",
+    "full_name": "Dr. Anita Sharma",
+    "subject": "Mathematics",
+    "email": "dranita.sharma@school.example.com"
+  },
+  {
+    "id": "9b49bd26-df57-c59a-8715-a10343dac043",
+    "stoody_user_id": "tut_0002",
+    "first_name": "Prof. Rajesh",
+    "last_name": "Kumar",
+    "full_name": "Prof. Rajesh Kumar",
+    "subject": "Physics",
+    "email": "profrajesh.kumar@school.example.com"
+  },
+  {
+    "id": "edcd465e-3638-6821-f6e0-7cc06c52c49f",
+    "stoody_user_id": "tut_0003",
+    "first_name": "Ms. Priya",
+    "last_name": "Iyer",
+    "full_name": "Ms. Priya Iyer",
+    "subject": "Chemistry",
+    "email": "mspriya.iyer@school.example.com"
+  },
+  {
+    "id": "b09b2a5c-badc-c32a-c159-0f538a0f4efb",
+    "stoody_user_id": "tut_0004",
+    "first_name": "Mr. Vikram",
+    "last_name": "Joshi",
+    "full_name": "Mr. Vikram Joshi",
+    "subject": "Biology",
+    "email": "mrvikram.joshi@school.example.com"
+  },
+  {
+    "id": "66245bfa-4fcc-a39a-b683-d2e6337ea2df",
+    "stoody_user_id": "tut_0005",
+    "first_name": "Dr. Sunita",
+    "last_name": "Patel",
+    "full_name": "Dr. Sunita Patel",
+    "subject": "English",
+    "email": "drsunita.patel@school.example.com"
+  }
+]

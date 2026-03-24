@@ -1,0 +1,106 @@
+# =============================================================
+# ExamPen — Data Retention & Backup Cron Jobs
+# Ref: FAILURE_MITIGATION_REGISTER.md A8.2 (DPDPA), A8.5
+# Deploy as K8s CronJob or host-level crontab entries.
+# =============================================================
+
+# --- pgBackRest Backup Schedule ---
+backup:
+  full:
+    schedule: "0 2 * * *"        # Daily at 02:00 UTC
+    command: >
+      pgbackrest --stanza=exampen --type=full backup
+    timeout: 3600
+
+  differential:
+    schedule: "0 8,14,20 * * *"  # Every 6 hours (skip 02:00)
+    command: >
+      pgbackrest --stanza=exampen --type=diff backup
+    timeout: 1800
+
+  verify:
+    schedule: "0 5 * * 0"        # Weekly Sunday 05:00 UTC
+    command: >
+      pgbackrest --stanza=exampen verify
+    timeout: 7200
+
+# --- DPDPA Data Retention (per-tenant configurable) ---
+retention:
+  stroke_data:
+    description: "Delete raw stroke data past retention period"
+    schedule: "0 3 * * *"        # Daily at 03:00 UTC
+    default_retention_days: 730   # 2 years
+    per_tenant_override: true     # Tenants may set shorter periods
+    command: >
+      psql -h postgres -U exampen -d exampen_stroke -c "
+        DELETE FROM strokes
+        WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days'
+          AND tenant_id = '${TENANT_ID}';
+      "
+
+  ai_results:
+    description: "Archive old AI recognition results, then purge"
+    schedule: "30 3 * * *"       # Daily at 03:30 UTC
+    archive_after_days: 365       # Move to cold storage after 1 year
+    purge_after_days: 1095        # Delete after 3 years
+    command: >
+      psql -h postgres -U exampen -d exampen_exam -c "
+        WITH archived AS (
+          DELETE FROM ai_results
+          WHERE created_at < NOW() - INTERVAL '${PURGE_DAYS} days'
+            AND archived = true
+          RETURNING id
+        )
+        SELECT count(*) AS purged FROM archived;
+      "
+
+  score_events:
+    description: "Archive finalized score event logs"
+    schedule: "0 4 * * *"        # Daily at 04:00 UTC
+    archive_after_days: 730       # 2 years
+    command: >
+      psql -h postgres -U exampen -d exampen_score -c "
+        UPDATE score_events SET archived = true
+        WHERE created_at < NOW() - INTERVAL '${ARCHIVE_DAYS} days'
+          AND state = 'locked';
+      "
+
+  chat_messages:
+    description: "Purge chat messages past retention"
+    schedule: "0 4 30 * *"       # Monthly, 30th at 04:00 UTC
+    default_retention_days: 365
+    command: >
+      psql -h postgres -U exampen -d exampen_chat -c "
+        DELETE FROM messages
+        WHERE created_at < NOW() - INTERVAL '${RETENTION_DAYS} days';
+      "
+
+# --- MinIO Lifecycle (garbage collection) ---
+minio_lifecycle:
+  temp_uploads:
+    description: "Delete incomplete multipart uploads"
+    schedule: "0 1 * * *"        # Daily at 01:00 UTC
+    command: >
+      mc rm --incomplete --recursive --older-than 7d ep/exampen-pages &&
+      mc rm --incomplete --recursive --older-than 7d ep/exampen-copies
+
+# --- TimescaleDB Compression & Retention ---
+timescaledb:
+  compress:
+    description: "Compress hypertable chunks older than 7 days"
+    schedule: "0 2 * * 0"        # Weekly Sunday 02:00 UTC
+    command: >
+      psql -h postgres -U exampen -d exampen_stroke -c "
+        SELECT compress_chunk(c)
+        FROM show_chunks('strokes', older_than => INTERVAL '7 days') c
+        WHERE NOT is_compressed;
+      "
+
+  drop_old_chunks:
+    description: "Drop compressed chunks past retention"
+    schedule: "0 3 1 * *"        # Monthly, 1st at 03:00 UTC
+    command: >
+      psql -h postgres -U exampen -d exampen_stroke -c "
+        SELECT drop_chunks('strokes',
+          older_than => INTERVAL '${RETENTION_DAYS} days');
+      "

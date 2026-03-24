@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/ai.result",
+  "title": "ai.result event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "student_id",
+    "model_version",
+    "question_results"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "ai.result" },
+    "event_version": { "const": "1.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string", "format": "uuid" },
+    "student_id": { "type": "string" },
+    "model_version": { "type": "string" },
+    "source_type": {
+      "type": "string",
+      "enum": ["strokes", "copy_image"]
+    },
+    "question_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question_id", "recognized_text", "confidence"],
+        "properties": {
+          "question_id": { "type": "string" },
+          "recognized_text": { "type": "string" },
+          "confidence": { "type": "number" },
+          "step_breakdown": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

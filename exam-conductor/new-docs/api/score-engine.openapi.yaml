@@ -1,0 +1,242 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Score Engine API
+  version: "1.0.0"
+  description: |
+    Authoritative scoring API. Finalization means evaluator review is complete and the
+    score set is locked for publication prep. Publication makes results visible to
+    students and parents, opens the objection window, and triggers Stoody webhook delivery.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/scores/{exam_id}/students/{student_id}:
+    get:
+      summary: Get the current score projection for one student
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+        - $ref: "#/components/parameters/StudentId"
+      responses:
+        "200":
+          description: Student score projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudentScoreDetail"
+  /api/v1/scores/{exam_id}/students/{student_id}/questions/{question_id}:
+    patch:
+      summary: Apply a teacher override to one question score
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+        - $ref: "#/components/parameters/StudentId"
+        - $ref: "#/components/parameters/QuestionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScoreOverrideRequest"
+      responses:
+        "200":
+          description: Override appended to event store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuestionScore"
+  /api/v1/scores/{exam_id}/students/{student_id}/history:
+    get:
+      summary: Return score event history and audit projection
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+        - $ref: "#/components/parameters/StudentId"
+      responses:
+        "200":
+          description: Score audit history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ScoreHistoryItem"
+  /api/v1/scores/{exam_id}/finalize:
+    post:
+      summary: Finalize reviewed scores for an exam
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinalizeRequest"
+      responses:
+        "200":
+          description: Finalization result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowStateResponse"
+  /api/v1/scores/{exam_id}/publish:
+    post:
+      summary: Publish finalized scores and open the objection window
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishRequest"
+      responses:
+        "200":
+          description: Publication result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowStateResponse"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ExamId:
+      name: exam_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    StudentId:
+      name: student_id
+      in: path
+      required: true
+      schema:
+        type: string
+    QuestionId:
+      name: question_id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    StudentScoreDetail:
+      type: object
+      required: [exam_id, student_id, total_score, lifecycle_state, questions]
+      properties:
+        exam_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        total_score:
+          type: number
+        max_score:
+          type: number
+        lifecycle_state:
+          type: string
+          enum: [ai_draft, teacher_reviewed, finalized, published, objection_window, locked]
+        published_at:
+          type: string
+          format: date-time
+        objection_window_closes_at:
+          type: string
+          format: date-time
+        questions:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuestionScore"
+    QuestionScore:
+      type: object
+      required: [question_id, ai_score, current_score, max_score, confidence]
+      properties:
+        question_id:
+          type: string
+        ai_score:
+          type: number
+        current_score:
+          type: number
+        max_score:
+          type: number
+        confidence:
+          type: number
+        override_reason:
+          type: string
+        step_scores:
+          type: array
+          items:
+            $ref: "#/components/schemas/StepScore"
+    StepScore:
+      type: object
+      required: [label, awarded, max]
+      properties:
+        label:
+          type: string
+        awarded:
+          type: number
+        max:
+          type: number
+    ScoreOverrideRequest:
+      type: object
+      required: [teacher_id, new_score, reason]
+      properties:
+        teacher_id:
+          type: string
+        new_score:
+          type: number
+        reason:
+          type: string
+          minLength: 5
+    ScoreHistoryItem:
+      type: object
+      required: [event_id, event_type, old_value, new_value, actor_id, created_at]
+      properties:
+        event_id:
+          type: string
+        event_type:
+          type: string
+          enum: [ai_draft_created, override_applied, finalized, published, objection_rescored]
+        old_value:
+          type: number
+        new_value:
+          type: number
+        actor_id:
+          type: string
+        reason:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    FinalizeRequest:
+      type: object
+      required: [actor_id]
+      properties:
+        actor_id:
+          type: string
+    PublishRequest:
+      type: object
+      required: [actor_id, objection_window_days]
+      properties:
+        actor_id:
+          type: string
+        objection_window_days:
+          type: integer
+    WorkflowStateResponse:
+      type: object
+      required: [exam_id, lifecycle_state, changed_at]
+      properties:
+        exam_id:
+          type: string
+          format: uuid
+        lifecycle_state:
+          type: string
+          enum: [finalized, published, objection_window, locked]
+        changed_at:
+          type: string
+          format: date-time

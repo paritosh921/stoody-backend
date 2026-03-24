@@ -1,0 +1,32 @@
+# ============================================================================
+# exampen-supervisor.service — ExamPen Hub Supervisor
+#
+# Main process manager for the ExamPen hub. Manages all child services:
+#   exampen-ble-mgr, exampen-pen-sync, exampen-timer, exampen-store,
+#   exampen-uplink, exampen-invig-ble, exampen-tui
+#
+# Matches HUB_DEPLOYMENT_SPEC §6 exactly.
+#
+# The supervisor uses sd_notify(3) to signal readiness and pets the
+# systemd watchdog every WatchdogSec/2 seconds. If the supervisor fails
+# to pet within 30 seconds, systemd will restart it.
+# ============================================================================
+
+[Unit]
+Description=ExamPen Hub Supervisor
+After=network-online.target bluetooth.target
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=notify
+ExecStart=/opt/exampen/bin/hub-supervisor
+Restart=always
+RestartSec=5
+WatchdogSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=EXAMPEN_DATA=/var/lib/exampen
+Environment=EXAMPEN_BACKUP=/mnt/exampen-backup
+
+[Install]
+WantedBy=multi-user.target

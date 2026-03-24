@@ -1,0 +1,111 @@
+# =============================================================
+# Prometheus — Scrape Configuration
+# =============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []   # Add alertmanager:9093 when ready
+
+scrape_configs:
+  # --- Infrastructure ---
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8080"]
+
+  - job_name: nats
+    static_configs:
+      - targets: ["nats:8222"]
+    metrics_path: /varz
+
+  # --- Backend services (uncomment as deployed) ---
+  - job_name: svc-auth
+    static_configs:
+      - targets: ["svc-auth:8000"]
+    metrics_path: /metrics
+
+  - job_name: svc-exam-orch
+    static_configs:
+      - targets: ["svc-exam-orch:8001"]
+    metrics_path: /metrics
+
+  - job_name: svc-stroke-ingest
+    static_configs:
+      - targets: ["svc-stroke-ingest:8002"]
+    metrics_path: /metrics
+
+  - job_name: svc-stroke-proc
+    static_configs:
+      - targets: ["svc-stroke-proc:8003"]
+    metrics_path: /metrics
+
+  - job_name: svc-doc-assembly
+    static_configs:
+      - targets: ["svc-doc-assembly:8004"]
+    metrics_path: /metrics
+
+  - job_name: svc-ai-pipeline
+    static_configs:
+      - targets: ["svc-ai-pipeline:8005"]
+    metrics_path: /metrics
+
+  - job_name: svc-score-engine
+    static_configs:
+      - targets: ["svc-score-engine:8006"]
+    metrics_path: /metrics
+
+  - job_name: svc-review
+    static_configs:
+      - targets: ["svc-review:8007"]
+    metrics_path: /metrics
+
+  - job_name: svc-analytics
+    static_configs:
+      - targets: ["svc-analytics:8008"]
+    metrics_path: /metrics
+
+  - job_name: svc-plagiarism
+    static_configs:
+      - targets: ["svc-plagiarism:8009"]
+    metrics_path: /metrics
+
+  - job_name: svc-chat
+    static_configs:
+      - targets: ["svc-chat:8010"]
+    metrics_path: /metrics
+
+  - job_name: svc-notify
+    static_configs:
+      - targets: ["svc-notify:8011"]
+    metrics_path: /metrics
+
+  - job_name: svc-copy-upload
+    static_configs:
+      - targets: ["svc-copy-upload:8012"]
+    metrics_path: /metrics
+
+  - job_name: svc-teacher-bff
+    static_configs:
+      - targets: ["svc-teacher-bff:8013"]
+    metrics_path: /metrics
+
+  - job_name: svc-student-bff
+    static_configs:
+      - targets: ["svc-student-bff:8014"]
+    metrics_path: /metrics
+
+  - job_name: svc-invig-console
+    static_configs:
+      - targets: ["svc-invig-console:8015"]
+    metrics_path: /metrics

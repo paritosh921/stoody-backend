@@ -1,0 +1,146 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Invigilator Console API
+  version: "1.0.0"
+  description: |
+    Read-oriented backend for the web invigilator console. Mobile hub control remains
+    BLE-driven; this API exposes delayed backend-relayed status and the WebSocket contract.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/invigilator/exams/{exam_id}/session:
+    get:
+      summary: Get the current backend view of an exam session
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSummary"
+  /api/v1/invigilator/exams/{exam_id}/sync:
+    get:
+      summary: Get per-pen sync progress for the exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Pen sync rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PenSyncRow"
+  /api/v1/invigilator/exams/{exam_id}/dongles:
+    get:
+      summary: Get dongle health and capacity state
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Dongle rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DongleRow"
+  /api/v1/invigilator/ws:
+    get:
+      summary: WebSocket endpoint for live status updates
+      responses:
+        "101":
+          description: Switches protocols to WebSocket
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebSocketEnvelope"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SessionSummary:
+      type: object
+      required: [exam_id, state, timer_remaining_sec, upload_status]
+      properties:
+        exam_id:
+          type: string
+          format: uuid
+        state:
+          type: string
+        timer_remaining_sec:
+          type: integer
+        upload_status:
+          type: string
+          enum: [pending, in_progress, complete, partial]
+        backend_seen_at:
+          type: string
+          format: date-time
+    PenSyncRow:
+      type: object
+      required: [pen_mac, sync_status]
+      properties:
+        pen_mac:
+          type: string
+        student_id:
+          type: string
+        sync_status:
+          type: string
+          enum: [pending, connecting, syncing, complete, failed, timeout]
+        bytes_received:
+          type: integer
+        total_chunks:
+          type: integer
+    DongleRow:
+      type: object
+      required: [dongle_mac, status, connected_pens]
+      properties:
+        dongle_mac:
+          type: string
+        status:
+          type: string
+          enum: [healthy, degraded, failed]
+        connected_pens:
+          type: integer
+        capacity:
+          type: integer
+    WebSocketEnvelope:
+      type: object
+      required: [event_type, payload]
+      properties:
+        event_type:
+          type: string
+          enum: [session.snapshot, sync.progress, dongle.health, upload.progress]
+        payload:
+          type: object

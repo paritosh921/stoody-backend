@@ -1,0 +1,67 @@
+[
+  {
+    "id": "28c8a7a6-d7f3-a4d8-07ef-5effc55d0529",
+    "score_id": "1b18b67e-c9c4-f104-ff11-cd7337de24db",
+    "student_id": "142c3fe8-60e7-a113-ec1b-8ca1f91e1d4c",
+    "exam_id": "dd59ba71-36b8-2481-7b3a-4e3e7c52fa17",
+    "question_number": 5,
+    "reason": "I believe step 2 deserves partial credit",
+    "state": "filed",
+    "filed_at": "2026-03-15T17:49:09+00:00",
+    "assigned_to": null,
+    "resolution": null,
+    "resolved_at": null
+  },
+  {
+    "id": "e68ec4b8-31fd-0756-a05e-54c3de332547",
+    "score_id": "568310d4-48f0-7d6a-2c97-aa1af50a4503",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "dd59ba71-36b8-2481-7b3a-4e3e7c52fa17",
+    "question_number": 4,
+    "reason": "AI did not recognize my diagram correctly",
+    "state": "reviewing",
+    "filed_at": "2026-03-15T17:49:09+00:00",
+    "assigned_to": "tut_0004",
+    "resolution": null,
+    "resolved_at": null
+  },
+  {
+    "id": "fe565b24-3c22-2fc9-3f7d-48e1bc72cfce",
+    "score_id": "b73c73af-0bc0-ea90-45e3-aa16d623080f",
+    "student_id": "0bbb2599-11ce-5dd2-b45e-d1f03139d32c",
+    "exam_id": "dd59ba71-36b8-2481-7b3a-4e3e7c52fa17",
+    "question_number": 2,
+    "reason": "My answer matches the rubric criteria for full marks",
+    "state": "resolved",
+    "filed_at": "2026-03-15T17:49:09+00:00",
+    "assigned_to": "tut_0003",
+    "resolution": null,
+    "resolved_at": null
+  },
+  {
+    "id": "bf92b11a-9754-1dba-2061-a4f2db4e0eda",
+    "score_id": "52ff8369-0636-8851-af93-757138031668",
+    "student_id": "654821d0-7fcd-9eb1-a7ca-d415366eb16f",
+    "exam_id": "693dffbc-6c6f-a611-5ab3-3edf6e595ed3",
+    "question_number": 8,
+    "reason": "My answer matches the rubric criteria for full marks",
+    "state": "resolved",
+    "filed_at": "2026-03-15T17:49:09+00:00",
+    "assigned_to": "tut_0004",
+    "resolution": "Original AI score confirmed after manual review",
+    "resolved_at": "2026-03-17T17:49:09+00:00"
+  },
+  {
+    "id": "d4d57b6e-b783-cba2-cd66-82e15624ae87",
+    "score_id": "68f3f64a-3883-5fcd-663c-f155c3fa25d9",
+    "student_id": "988c24c9-61b1-cd22-6280-1c4510435a10",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "reason": "The handwriting recognition missed key terms",
+    "state": "filed",
+    "filed_at": "2026-03-15T17:49:09+00:00",
+    "assigned_to": null,
+    "resolution": null,
+    "resolved_at": null
+  }
+]

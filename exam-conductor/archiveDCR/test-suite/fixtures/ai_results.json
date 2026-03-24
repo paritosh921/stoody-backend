@@ -1,0 +1,1732 @@
+[
+  {
+    "id": "0be386f6-8831-68b9-dbe6-9d895a681bb3",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 1,
+    "confidence": 0.802,
+    "recognized_text": "[Simulated HWR output for Q1]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.602,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.843,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.611,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.904,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.836,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "b10c049c-1dc3-d3d0-7c5d-859cfa4427e4",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 2,
+    "confidence": 0.823,
+    "recognized_text": "[Simulated HWR output for Q2]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.754,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.676,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "51f068f5-be19-6f3b-2484-8d38fcc3876c",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 3,
+    "confidence": 0.79,
+    "recognized_text": "[Simulated HWR output for Q3]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.75,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.742,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.943,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.607,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.624,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "54d9f635-d0c4-e984-ab4e-90fcc54f6dc9",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 4,
+    "confidence": 0.923,
+    "recognized_text": "[Simulated HWR output for Q4]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.945,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "a6b299ef-b39e-21fd-d670-1e4d61592f89",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 5,
+    "confidence": 0.761,
+    "recognized_text": "[Simulated HWR output for Q5]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.79,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "4f2e6d66-1c8c-5a69-d638-cf6581247fa8",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 6,
+    "confidence": 0.767,
+    "recognized_text": "[Simulated HWR output for Q6]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.707,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.605,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "9d8c8153-6598-f8a3-9a56-e5ec7a13f0f3",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 7,
+    "confidence": 0.946,
+    "recognized_text": "[Simulated HWR output for Q7]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 3,
+        "confidence": 0.64,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 2,
+        "ai_score": 2,
+        "confidence": 0.683,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 5,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "655b43a9-f771-b4f9-b0e2-b2da27d0cd10",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "confidence": 0.661,
+    "recognized_text": "[Simulated HWR output for Q8]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 0,
+        "confidence": 0.863,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.788,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.827,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 4,
+        "ai_score": 4,
+        "confidence": 0.754,
+        "recognized_text": "Step 4 recognized text"
+      }
+    ],
+    "total_ai_score": 4,
+    "max_marks": 10,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "719196a5-cea5-a792-82c4-65e0be1b37b4",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 9,
+    "confidence": 0.739,
+    "recognized_text": "[Simulated HWR output for Q9]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.713,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.956,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.707,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.942,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.832,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "d9424eeb-6c38-cbec-2928-2a17331650fb",
+    "student_id": "3eb13b90-4668-5257-bdd6-40fb06671ad1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 10,
+    "confidence": 0.853,
+    "recognized_text": "[Simulated HWR output for Q10]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 1,
+        "confidence": 0.948,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "22838649-afee-d041-bd81-29bb0879c5f2",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 1,
+    "confidence": 0.723,
+    "recognized_text": "[Simulated HWR output for Q1]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.618,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.651,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.949,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.922,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.832,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "ee110420-1261-2fe8-f4a9-e93f1363c872",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 2,
+    "confidence": 0.801,
+    "recognized_text": "[Simulated HWR output for Q2]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.927,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.637,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "8614f987-244b-0c32-52ca-48c168bc888e",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 3,
+    "confidence": 0.905,
+    "recognized_text": "[Simulated HWR output for Q3]",
+    "is_diagram": true,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.905,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.891,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.633,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.889,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.972,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "881b8034-5f17-4bd2-6678-cfafd8d36b0b",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 4,
+    "confidence": 0.722,
+    "recognized_text": "[Simulated HWR output for Q4]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.643,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "2ed81200-1587-fd32-efe1-eebdce5944ad",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 5,
+    "confidence": 0.787,
+    "recognized_text": "[Simulated HWR output for Q5]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.75,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "fcdb568c-dae8-cc53-017b-1318f19064e2",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 6,
+    "confidence": 0.927,
+    "recognized_text": "[Simulated HWR output for Q6]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.71,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.869,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "7eacbf0c-c602-3311-509c-7e3de1655c72",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 7,
+    "confidence": 0.922,
+    "recognized_text": "[Simulated HWR output for Q7]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.728,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 2,
+        "ai_score": 2,
+        "confidence": 0.948,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 4,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "5f16d16a-e2a9-1347-262c-09684e847071",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "confidence": 0.898,
+    "recognized_text": "[Simulated HWR output for Q8]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 3,
+        "confidence": 0.983,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.977,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 2,
+        "ai_score": 2,
+        "confidence": 0.842,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 4,
+        "ai_score": 2,
+        "confidence": 0.706,
+        "recognized_text": "Step 4 recognized text"
+      }
+    ],
+    "total_ai_score": 7,
+    "max_marks": 10,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "50bd6b6a-1168-efde-09ce-7aa8ae2d3332",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 9,
+    "confidence": 0.775,
+    "recognized_text": "[Simulated HWR output for Q9]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.857,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.9,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.932,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.861,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.831,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "46b201e8-915d-3845-68ad-00ead22364eb",
+    "student_id": "bd9c66b3-ad3c-2d6d-1a3d-1fa7bc8960a9",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 10,
+    "confidence": 0.838,
+    "recognized_text": "[Simulated HWR output for Q10]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 1,
+        "confidence": 0.637,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "9db17f68-1a7a-f695-7387-c8c95a806dd9",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 1,
+    "confidence": 0.653,
+    "recognized_text": "[Simulated HWR output for Q1]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.821,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.868,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.604,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.964,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.868,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "fa1c803d-094c-2e5f-6017-a393397fdc6a",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 2,
+    "confidence": 0.958,
+    "recognized_text": "[Simulated HWR output for Q2]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.976,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.924,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "dfb0ea8d-4a4f-b288-d184-a886cd105a1d",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 3,
+    "confidence": 0.882,
+    "recognized_text": "[Simulated HWR output for Q3]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.952,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.631,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.884,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.976,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.602,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 4,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "20f15c4a-8f0e-10d7-dd7f-8a80e458de40",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 4,
+    "confidence": 0.873,
+    "recognized_text": "[Simulated HWR output for Q4]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 2,
+        "ai_score": 1,
+        "confidence": 0.808,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "317bd19e-c09e-c718-bfef-ea3686faa722",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 5,
+    "confidence": 0.662,
+    "recognized_text": "[Simulated HWR output for Q5]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.931,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "7d9b9bd4-7e5d-77b0-9fed-d4d534c909fe",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 6,
+    "confidence": 0.913,
+    "recognized_text": "[Simulated HWR output for Q6]",
+    "is_diagram": true,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.859,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.916,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "c47293a0-9287-9a15-1cef-18283c789d76",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 7,
+    "confidence": 0.71,
+    "recognized_text": "[Simulated HWR output for Q7]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 3,
+        "confidence": 0.73,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.644,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "8c2b6cf8-282b-57dd-7877-aefc9e894833",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "confidence": 0.741,
+    "recognized_text": "[Simulated HWR output for Q8]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 0,
+        "confidence": 0.727,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.788,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.623,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 4,
+        "ai_score": 2,
+        "confidence": 0.883,
+        "recognized_text": "Step 4 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 10,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "993a1460-af94-b339-b98d-65f1075acb40",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 9,
+    "confidence": 0.888,
+    "recognized_text": "[Simulated HWR output for Q9]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.73,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.68,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.688,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.621,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.955,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "7b9e8b54-b9cd-a684-02d2-f16aba7ac435",
+    "student_id": "07a0ca6e-0822-e8f3-6c03-1199972a8469",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 10,
+    "confidence": 0.775,
+    "recognized_text": "[Simulated HWR output for Q10]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 3,
+        "confidence": 0.927,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "2f455812-20aa-32d6-0bcb-2cdc13cc3356",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 1,
+    "confidence": 0.734,
+    "recognized_text": "[Simulated HWR output for Q1]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.707,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.933,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.64,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.981,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.715,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 4,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "8a757121-f22f-848b-aa31-e46c71cf7380",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 2,
+    "confidence": 0.852,
+    "recognized_text": "[Simulated HWR output for Q2]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.81,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.787,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "7a8d5a53-542f-5e11-843b-b3fec59a8092",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 3,
+    "confidence": 0.707,
+    "recognized_text": "[Simulated HWR output for Q3]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.805,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.889,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.815,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.858,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.957,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 5,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "824a95dd-9229-68cd-3584-2f24dd9c850f",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 4,
+    "confidence": 0.847,
+    "recognized_text": "[Simulated HWR output for Q4]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.899,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "543a5ec6-5119-7f30-c705-b084857a9b41",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 5,
+    "confidence": 0.768,
+    "recognized_text": "[Simulated HWR output for Q5]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.939,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "80ddde4d-8959-031a-3d95-f565921f36b0",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 6,
+    "confidence": 0.777,
+    "recognized_text": "[Simulated HWR output for Q6]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.846,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.968,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "19222529-113a-ff5d-15c9-1a373d0402ed",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 7,
+    "confidence": 0.866,
+    "recognized_text": "[Simulated HWR output for Q7]",
+    "is_diagram": true,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 1,
+        "confidence": 0.68,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 2,
+        "ai_score": 1,
+        "confidence": 0.664,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "f25d8a13-4241-a56d-1275-d5ce4b6ccda1",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "confidence": 0.821,
+    "recognized_text": "[Simulated HWR output for Q8]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.753,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.772,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 2,
+        "ai_score": 1,
+        "confidence": 0.712,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 4,
+        "ai_score": 1,
+        "confidence": 0.926,
+        "recognized_text": "Step 4 recognized text"
+      }
+    ],
+    "total_ai_score": 5,
+    "max_marks": 10,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "93f656b0-3b83-399f-0880-47927870b315",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 9,
+    "confidence": 0.775,
+    "recognized_text": "[Simulated HWR output for Q9]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.926,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.926,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.715,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.881,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.751,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "95a512fc-70be-4f34-1b93-a10c36878155",
+    "student_id": "06cb0fb3-9a1d-e644-815e-f6d13b8faa18",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 10,
+    "confidence": 0.919,
+    "recognized_text": "[Simulated HWR output for Q10]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 0,
+        "confidence": 0.667,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "f7f6f828-38a8-4932-8218-ab1651a74ff5",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 1,
+    "confidence": 0.809,
+    "recognized_text": "[Simulated HWR output for Q1]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.897,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.689,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.948,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.903,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.798,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "1a92b32d-c2bc-03ef-0b63-24ff5b550213",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 2,
+    "confidence": 0.819,
+    "recognized_text": "[Simulated HWR output for Q2]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.76,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.844,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "4957f684-cb34-7864-9ece-eda7ae1e2a8d",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 3,
+    "confidence": 0.963,
+    "recognized_text": "[Simulated HWR output for Q3]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.834,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.814,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.696,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.901,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.835,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "bf5bf093-c664-b1df-da55-52ccec251903",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 4,
+    "confidence": 0.829,
+    "recognized_text": "[Simulated HWR output for Q4]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 2,
+        "ai_score": 1,
+        "confidence": 0.833,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "a35568f6-33f8-7cdf-d50d-26c1ed1b7e4d",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 5,
+    "confidence": 0.69,
+    "recognized_text": "[Simulated HWR output for Q5]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 0,
+        "confidence": 0.814,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 0,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "128f70cb-329f-44a5-43c3-0c92239eaf97",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 6,
+    "confidence": 0.923,
+    "recognized_text": "[Simulated HWR output for Q6]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.677,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.792,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 1,
+    "max_marks": 2,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "b346cb9b-a4d8-e09a-cee3-23cf680d3ac0",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 7,
+    "confidence": 0.658,
+    "recognized_text": "[Simulated HWR output for Q7]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.755,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 2,
+        "ai_score": 0,
+        "confidence": 0.652,
+        "recognized_text": "Step 2 recognized text"
+      }
+    ],
+    "total_ai_score": 2,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "00ff97e1-87d0-76e2-8538-d88307992015",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 8,
+    "confidence": 0.771,
+    "recognized_text": "[Simulated HWR output for Q8]",
+    "is_diagram": true,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 2,
+        "confidence": 0.794,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.642,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 2,
+        "ai_score": 2,
+        "confidence": 0.904,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 4,
+        "ai_score": 2,
+        "confidence": 0.968,
+        "recognized_text": "Step 4 recognized text"
+      }
+    ],
+    "total_ai_score": 6,
+    "max_marks": 10,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "57c49bfc-4c2b-9256-1c2a-b51de0103884",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 9,
+    "confidence": 0.919,
+    "recognized_text": "[Simulated HWR output for Q9]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.83,
+        "recognized_text": "Step 1 recognized text"
+      },
+      {
+        "step": 2,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.762,
+        "recognized_text": "Step 2 recognized text"
+      },
+      {
+        "step": 3,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.606,
+        "recognized_text": "Step 3 recognized text"
+      },
+      {
+        "step": 4,
+        "max_marks": 1,
+        "ai_score": 0,
+        "confidence": 0.899,
+        "recognized_text": "Step 4 recognized text"
+      },
+      {
+        "step": 5,
+        "max_marks": 1,
+        "ai_score": 1,
+        "confidence": 0.75,
+        "recognized_text": "Step 5 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 5,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  },
+  {
+    "id": "56dd89f3-a7b6-8375-e8f9-79b1f62a9766",
+    "student_id": "8b8148f6-b38a-088c-a65e-d389b74d0fb1",
+    "exam_id": "5f987c71-a65e-688e-abf3-ad39fec21bbe",
+    "question_number": 10,
+    "confidence": 0.919,
+    "recognized_text": "[Simulated HWR output for Q10]",
+    "is_diagram": false,
+    "model_version": "hwr-v0.3.1",
+    "step_results": [
+      {
+        "step": 1,
+        "max_marks": 3,
+        "ai_score": 3,
+        "confidence": 0.972,
+        "recognized_text": "Step 1 recognized text"
+      }
+    ],
+    "total_ai_score": 3,
+    "max_marks": 3,
+    "processed_at": "2026-03-13T17:49:09+00:00"
+  }
+]
