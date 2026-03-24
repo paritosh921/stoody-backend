@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "svc-invig-console"
+version = "0.1.0"
+description = "ExamPen invigilator console — real-time WebSocket dashboard backend"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "exampen-common",
+    "aiohttp>=3.9,<4",
+    "fastapi>=0.111,<1",
+    "nats-py>=2.7,<3",
+    "pydantic>=2.6,<3",
+    "uvicorn[standard]>=0.29,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "httpx>=0.27,<1",
+    "coverage>=7,<8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

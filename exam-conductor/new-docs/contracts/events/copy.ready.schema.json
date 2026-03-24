@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/copy.ready",
+  "title": "copy.ready event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "student_id",
+    "page_number",
+    "copy_image_uri"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "copy.ready" },
+    "event_version": { "const": "1.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string", "format": "uuid" },
+    "student_id": { "type": "string" },
+    "page_number": { "type": "integer" },
+    "copy_image_uri": { "type": "string", "format": "uri" },
+    "authoritative_candidate": {
+      "type": "string",
+      "enum": ["copy_image", "comparison_only"]
+    }
+  }
+}

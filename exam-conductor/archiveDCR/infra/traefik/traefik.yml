@@ -1,0 +1,41 @@
+# =============================================================
+# Traefik — Static Configuration
+# =============================================================
+
+api:
+  dashboard: true
+  insecure: true            # Dev only — dashboard on :8080
+
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+  dashboard:
+    address: ":8080"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: exampen-net
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+log:
+  level: INFO
+  format: json
+
+accessLog:
+  format: json
+  filters:
+    statusCodes:
+      - "400-599"
+
+metrics:
+  prometheus:
+    entryPoint: dashboard
+    addEntryPointsLabels: true
+    addServicesLabels: true
+    addRoutersLabels: true

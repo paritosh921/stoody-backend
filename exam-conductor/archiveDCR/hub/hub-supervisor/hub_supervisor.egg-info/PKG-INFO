@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: hub-supervisor
+Version: 0.1.0
+Summary: Process manager and FSM orchestrator for ExamPen hub (Raspberry Pi)
+Requires-Python: >=3.12
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"

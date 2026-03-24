@@ -1,0 +1,109 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Copy Upload API
+  version: "1.0.0"
+  description: Fallback image capture ingest for photographed answer copies.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/exams/{exam_id}/copies/upload:
+    post:
+      summary: Upload one photographed answer page
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [student_id, page_number, captured_at, image]
+              properties:
+                student_id:
+                  type: string
+                page_number:
+                  type: integer
+                captured_at:
+                  type: string
+                  format: date-time
+                image:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: Copy page stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CopyUploadResult"
+  /api/v1/exams/{exam_id}/copies/{student_id}:
+    get:
+      summary: List uploaded copy pages for one student
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: student_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Copy page list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CopyPage"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    CopyUploadResult:
+      type: object
+      required: [exam_id, student_id, page_number, copy_image_uri, data_source]
+      properties:
+        exam_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        page_number:
+          type: integer
+        copy_image_uri:
+          type: string
+          format: uri
+        data_source:
+          type: string
+          const: copy_image
+    CopyPage:
+      type: object
+      required: [page_number, copy_image_uri]
+      properties:
+        page_number:
+          type: integer
+        copy_image_uri:
+          type: string
+          format: uri
+        authoritative_source:
+          type: string
+          enum: [copy_image, strokes, both]

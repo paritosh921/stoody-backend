@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "svc-doc-assembly"
+version = "0.1.0"
+description = "Stroke-to-page rendering, miss indicator detection, and page image assembly for ExamPen"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "exampen-common",
+    "fastapi>=0.111,<1",
+    "uvicorn[standard]>=0.29,<1",
+    "nats-py>=2.7,<3",
+    "asyncpg>=0.29,<1",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "miniopy-async>=1.20,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "httpx>=0.27,<1",
+    "coverage>=7,<8",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: domain-only tests with zero I/O",
+    "integration: tests requiring external services (DB, NATS, MinIO)",
+]

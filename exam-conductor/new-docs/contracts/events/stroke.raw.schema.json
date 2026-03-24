@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/stroke.raw",
+  "title": "stroke.raw event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "pen_mac",
+    "chunk_index",
+    "total_chunks",
+    "payload_base64",
+    "checksum_crc32",
+    "upload_path"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "stroke.raw" },
+    "event_version": { "const": "1.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string", "format": "uuid" },
+    "pen_mac": { "type": "string" },
+    "chunk_index": { "type": "integer" },
+    "total_chunks": { "type": "integer" },
+    "payload_base64": { "type": "string" },
+    "checksum_crc32": { "type": "string" },
+    "upload_path": { "type": "string", "enum": ["wifi", "mobile"] },
+    "binding_status": {
+      "type": "string",
+      "enum": ["unknown", "provisional", "confirmed", "rejected"]
+    }
+  }
+}

@@ -1,0 +1,217 @@
+# EXEMPT: 216 lines — 13 commented-out service stubs that must
+# live together for compose -f overlay to work correctly.
+# =============================================================
+# ExamPen — Backend service placeholders (commented out)
+# Usage: docker compose -f docker-compose.yml \
+#        -f docker-compose.services.yml up
+# Uncomment a service when its Dockerfile is ready.
+# =============================================================
+version: "3.8"
+
+x-service-env: &service-env
+  DATABASE_HOST: postgres
+  DATABASE_PORT: "5432"
+  DATABASE_USER: ${POSTGRES_USER:-exampen}
+  DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-exampen_dev}
+  NATS_URL: nats://nats:4222
+  MINIO_URL: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-exampen}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-exampen_minio_dev}
+  REDIS_URL: redis://:${REDIS_PASSWORD:-exampen_redis_dev}@redis:6379/0
+  AUTH_SERVICE_URL: http://svc-auth:8000
+
+services:
+  # -- svc-auth (port 8000) --
+  # svc-auth:
+  #   build: ../services/svc-auth
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_auth
+  #   ports: ["8000:8000"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-exam-orch (port 8001) --
+  # svc-exam-orch:
+  #   build: ../services/svc-exam-orch
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_exam
+  #   ports: ["8001:8001"]
+  #   depends_on: [postgres, nats, redis, svc-auth]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-stroke-ingest (port 8002) --
+  # svc-stroke-ingest:
+  #   build: ../services/svc-stroke-ingest
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_stroke
+  #   ports: ["8002:8002"]
+  #   depends_on: [postgres, nats, minio, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-stroke-proc (port 8003) --
+  # svc-stroke-proc:
+  #   build: ../services/svc-stroke-proc
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_stroke
+  #   ports: ["8003:8003"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-doc-assembly (port 8004) --
+  # svc-doc-assembly:
+  #   build: ../services/svc-doc-assembly
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_exam
+  #   ports: ["8004:8004"]
+  #   depends_on: [postgres, nats, minio, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-ai-pipeline (port 8005) --
+  # svc-ai-pipeline:
+  #   build: ../services/svc-ai-pipeline
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_exam
+  #   ports: ["8005:8005"]
+  #   depends_on: [postgres, nats, minio, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-score-engine (port 8006) --
+  # svc-score-engine:
+  #   build: ../services/svc-score-engine
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_score
+  #   ports: ["8006:8006"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-review (port 8007) --
+  # svc-review:
+  #   build: ../services/svc-review
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_review
+  #   ports: ["8007:8007"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8007/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-analytics (port 8008) --
+  # svc-analytics:
+  #   build: ../services/svc-analytics
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_analytics
+  #   ports: ["8008:8008"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8008/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-plagiarism (port 8009) --
+  # svc-plagiarism:
+  #   build: ../services/svc-plagiarism
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_plagiarism
+  #   ports: ["8009:8009"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-chat (port 8010) --
+  # svc-chat:
+  #   build: ../services/svc-chat
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_chat
+  #   ports: ["8010:8010"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8010/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-notify (port 8011) --
+  # svc-notify:
+  #   build: ../services/svc-notify
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_notify
+  #   ports: ["8011:8011"]
+  #   depends_on: [postgres, nats, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8011/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]
+
+  # -- svc-copy-upload (port 8012) --
+  # svc-copy-upload:
+  #   build: ../services/svc-copy-upload
+  #   environment:
+  #     <<: *service-env
+  #     DATABASE_NAME: exampen_copy
+  #   ports: ["8012:8012"]
+  #   depends_on: [postgres, nats, minio, redis]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8012/health"]
+  #     interval: 10s
+  #     timeout: 3s
+  #     retries: 5
+  #   networks: [exampen-net]

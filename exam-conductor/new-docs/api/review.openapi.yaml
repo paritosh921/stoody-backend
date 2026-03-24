@@ -1,0 +1,196 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Review API
+  version: "1.0.0"
+  description: Objection intake, assignment, resolution, and escalation.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/objections:
+    get:
+      summary: List objections visible to the current actor
+      parameters:
+        - name: exam_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [filed, assigned, reviewing, resolved, escalated]
+      responses:
+        "200":
+          description: Objection list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ObjectionSummary"
+    post:
+      summary: File a new objection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateObjectionRequest"
+      responses:
+        "201":
+          description: Objection created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectionDetail"
+  /api/v1/objections/{objection_id}:
+    get:
+      summary: Get objection detail
+      parameters:
+        - name: objection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Objection detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectionDetail"
+  /api/v1/objections/{objection_id}/resolve:
+    post:
+      summary: Resolve an objection
+      parameters:
+        - name: objection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveObjectionRequest"
+      responses:
+        "200":
+          description: Resolution applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectionDetail"
+  /api/v1/objections/{objection_id}/escalate:
+    post:
+      summary: Escalate an objection to a senior reviewer
+      parameters:
+        - name: objection_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EscalateObjectionRequest"
+      responses:
+        "200":
+          description: Escalation applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ObjectionDetail"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ObjectionSummary:
+      type: object
+      required: [objection_id, exam_id, student_id, question_id, status, filed_at]
+      properties:
+        objection_id:
+          type: string
+          format: uuid
+        exam_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        question_id:
+          type: string
+        status:
+          type: string
+          enum: [filed, assigned, reviewing, resolved, escalated]
+        filed_at:
+          type: string
+          format: date-time
+    ObjectionDetail:
+      allOf:
+        - $ref: "#/components/schemas/ObjectionSummary"
+        - type: object
+          required: [objection_text]
+          properties:
+            objection_text:
+              type: string
+            assigned_to:
+              type: string
+            resolution:
+              type: string
+            resolution_reason:
+              type: string
+            score_delta:
+              type: number
+    CreateObjectionRequest:
+      type: object
+      required: [exam_id, student_id, question_id, objection_text]
+      properties:
+        exam_id:
+          type: string
+          format: uuid
+        student_id:
+          type: string
+        question_id:
+          type: string
+        objection_text:
+          type: string
+          minLength: 10
+    ResolveObjectionRequest:
+      type: object
+      required: [actor_id, resolution, reason]
+      properties:
+        actor_id:
+          type: string
+        resolution:
+          type: string
+          enum: [approved, rejected]
+        reason:
+          type: string
+          minLength: 5
+        new_score:
+          type: number
+    EscalateObjectionRequest:
+      type: object
+      required: [actor_id, escalated_to, reason]
+      properties:
+        actor_id:
+          type: string
+        escalated_to:
+          type: string
+        reason:
+          type: string

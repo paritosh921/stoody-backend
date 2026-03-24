@@ -1,0 +1,34 @@
+# ============================================================================
+# partition-layout.sfdisk — ExamPen Hub SD Card Partition Layout
+#
+# Matches HUB_DEPLOYMENT_SPEC §1.4:
+#   Partition 1: boot      512 MB   FAT32   /boot/firmware
+#   Partition 2: rootfs    8 GB     ext4    /
+#   Partition 3: data      16 GB    ext4    /var/lib/exampen (noatime)
+#   Partition 4: swap      1 GB     swap
+#
+# Usage:
+#   sfdisk /dev/sdX < partition-layout.sfdisk
+#
+# Total minimum SD card size: ~26 GB (32 GB card recommended)
+# ============================================================================
+
+label: dos
+unit: sectors
+
+# Partition 1: boot — 512 MB FAT32 (RPi bootloader + kernel)
+# Start at sector 8192 (4 MiB alignment for SD card performance)
+# Size: 512 MB = 1048576 sectors (at 512 bytes/sector)
+start=8192, size=1048576, type=c, bootable
+
+# Partition 2: rootfs — 8 GB ext4 (OS + hub software)
+# Size: 8 GB = 16777216 sectors
+start=1056768, size=16777216, type=83
+
+# Partition 3: data-primary — 16 GB ext4 noatime (pen data primary store)
+# Size: 16 GB = 33554432 sectors
+start=17833984, size=33554432, type=83
+
+# Partition 4: swap — 1 GB
+# Size: 1 GB = 2097152 sectors
+start=51388416, size=2097152, type=82

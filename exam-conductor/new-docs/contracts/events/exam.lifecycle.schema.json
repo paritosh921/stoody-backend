@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/exam.lifecycle",
+  "title": "exam.lifecycle event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "from_state",
+    "to_state",
+    "actor_id"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "exam.lifecycle" },
+    "event_version": { "const": "1.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string", "format": "uuid" },
+    "from_state": { "type": "string" },
+    "to_state": { "type": "string" },
+    "actor_id": { "type": "string" },
+    "reason": { "type": "string" }
+  }
+}

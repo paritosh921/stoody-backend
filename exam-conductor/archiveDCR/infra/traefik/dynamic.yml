@@ -1,0 +1,138 @@
+# =============================================================
+# Traefik — Dynamic Routing Rules (placeholder)
+# Each service will be auto-discovered via Docker labels.
+# This file provides fallback / override rules.
+# =============================================================
+
+http:
+  routers:
+    svc-auth:
+      rule: "PathPrefix(`/api/v1/auth`)"
+      service: svc-auth
+      entryPoints: [web]
+    svc-exam-orch:
+      rule: "PathPrefix(`/api/v1/exams`)"
+      service: svc-exam-orch
+      entryPoints: [web]
+    svc-stroke-ingest:
+      rule: "PathPrefix(`/api/v1/strokes/ingest`)"
+      service: svc-stroke-ingest
+      entryPoints: [web]
+    svc-stroke-proc:
+      rule: "PathPrefix(`/api/v1/strokes/proc`)"
+      service: svc-stroke-proc
+      entryPoints: [web]
+    svc-doc-assembly:
+      rule: "PathPrefix(`/api/v1/documents`)"
+      service: svc-doc-assembly
+      entryPoints: [web]
+    svc-ai-pipeline:
+      rule: "PathPrefix(`/api/v1/ai`)"
+      service: svc-ai-pipeline
+      entryPoints: [web]
+    svc-score-engine:
+      rule: "PathPrefix(`/api/v1/scores`)"
+      service: svc-score-engine
+      entryPoints: [web]
+    svc-review:
+      rule: "PathPrefix(`/api/v1/reviews`)"
+      service: svc-review
+      entryPoints: [web]
+    svc-analytics:
+      rule: "PathPrefix(`/api/v1/analytics`)"
+      service: svc-analytics
+      entryPoints: [web]
+    svc-plagiarism:
+      rule: "PathPrefix(`/api/v1/plagiarism`)"
+      service: svc-plagiarism
+      entryPoints: [web]
+    svc-chat:
+      rule: "PathPrefix(`/api/v1/chat`)"
+      service: svc-chat
+      entryPoints: [web]
+    svc-notify:
+      rule: "PathPrefix(`/api/v1/notifications`)"
+      service: svc-notify
+      entryPoints: [web]
+    svc-copy-upload:
+      rule: "PathPrefix(`/api/v1/copies`)"
+      service: svc-copy-upload
+      entryPoints: [web]
+    svc-teacher-bff:
+      rule: "PathPrefix(`/api/v1/teacher`)"
+      service: svc-teacher-bff
+      entryPoints: [web]
+    svc-student-bff:
+      rule: "PathPrefix(`/api/v1/student`)"
+      service: svc-student-bff
+      entryPoints: [web]
+    svc-invig-console:
+      rule: "PathPrefix(`/api/v1/invigilator`)"
+      service: svc-invig-console
+      entryPoints: [web]
+
+  services:
+    svc-auth:
+      loadBalancer:
+        servers:
+          - url: "http://svc-auth:8000"
+    svc-exam-orch:
+      loadBalancer:
+        servers:
+          - url: "http://svc-exam-orch:8001"
+    svc-stroke-ingest:
+      loadBalancer:
+        servers:
+          - url: "http://svc-stroke-ingest:8002"
+    svc-stroke-proc:
+      loadBalancer:
+        servers:
+          - url: "http://svc-stroke-proc:8003"
+    svc-doc-assembly:
+      loadBalancer:
+        servers:
+          - url: "http://svc-doc-assembly:8004"
+    svc-ai-pipeline:
+      loadBalancer:
+        servers:
+          - url: "http://svc-ai-pipeline:8005"
+    svc-score-engine:
+      loadBalancer:
+        servers:
+          - url: "http://svc-score-engine:8006"
+    svc-review:
+      loadBalancer:
+        servers:
+          - url: "http://svc-review:8007"
+    svc-analytics:
+      loadBalancer:
+        servers:
+          - url: "http://svc-analytics:8008"
+    svc-plagiarism:
+      loadBalancer:
+        servers:
+          - url: "http://svc-plagiarism:8009"
+    svc-chat:
+      loadBalancer:
+        servers:
+          - url: "http://svc-chat:8010"
+    svc-notify:
+      loadBalancer:
+        servers:
+          - url: "http://svc-notify:8011"
+    svc-copy-upload:
+      loadBalancer:
+        servers:
+          - url: "http://svc-copy-upload:8012"
+    svc-teacher-bff:
+      loadBalancer:
+        servers:
+          - url: "http://svc-teacher-bff:8013"
+    svc-student-bff:
+      loadBalancer:
+        servers:
+          - url: "http://svc-student-bff:8014"
+    svc-invig-console:
+      loadBalancer:
+        servers:
+          - url: "http://svc-invig-console:8015"

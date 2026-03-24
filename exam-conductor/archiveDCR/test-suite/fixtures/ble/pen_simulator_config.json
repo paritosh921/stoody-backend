@@ -1,0 +1,32 @@
+{
+  "description": "GATT characteristic dumps for pen simulator",
+  "pen_model": "P05",
+  "gatt_service_uuid": "0000ae30-0000-1000-8000-00805f9b34fb",
+  "characteristics": {
+    "AE10": {
+      "uuid": "0000ae10-0000-1000-8000-00805f9b34fb",
+      "properties": [
+        "write-with-response"
+      ],
+      "description": "Command write characteristic"
+    },
+    "AE02": {
+      "uuid": "0000ae02-0000-1000-8000-00805f9b34fb",
+      "properties": [
+        "notify"
+      ],
+      "description": "Response/data notify characteristic"
+    }
+  },
+  "sample_commands": [
+    {
+      "name": "get_pen_info",
+      "hex": "5A5A0000000101000100XXXX"
+    },
+    {
+      "name": "start_sync",
+      "hex": "5A5A0000000102000100XXXX"
+    }
+  ],
+  "note": "Replace XXXX with CRC-16/XMODEM (poly 0x1021, init 0x0000)"
+}
