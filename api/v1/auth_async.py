@@ -681,6 +681,15 @@ async def student_change_password(
                 detail="Current password is incorrect"
             )
 
+        # Validate new password strength
+        password_validator = get_password_validator()
+        is_valid, errors = password_validator.validate(password_data.new_password)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Password too weak: {'; '.join(errors)}"
+            )
+
         # Hash new password
         new_password_hash = auth_manager.get_password_hash(password_data.new_password)
 
@@ -694,11 +703,15 @@ async def student_change_password(
             }}
         )
 
+        # Invalidate all sessions for security (forces re-login)
+        user_id_str = str(student_id)
+        await auth_manager.invalidate_user_session(user_id_str)
+
         logger.info(f"Student {student.get('username')} changed their password")
 
         return {
             "success": True,
-            "message": "Password changed successfully"
+            "message": "Password changed successfully. Please log in again."
         }
 
     except HTTPException:
@@ -753,6 +766,15 @@ async def tutor_change_password(
                 detail="Current password is incorrect"
             )
 
+        # Validate new password strength
+        password_validator = get_password_validator()
+        is_valid, errors = password_validator.validate(password_data.new_password)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Password too weak: {'; '.join(errors)}"
+            )
+
         # Hash new password
         new_password_hash = auth_manager.get_password_hash(password_data.new_password)
 
@@ -766,11 +788,15 @@ async def tutor_change_password(
             }}
         )
 
+        # Invalidate all sessions for security (forces re-login)
+        user_id_str = str(tutor_id)
+        await auth_manager.invalidate_user_session(user_id_str)
+
         logger.info(f"Tutor {tutor.get('username')} changed their password")
 
         return {
             "success": True,
-            "message": "Password changed successfully"
+            "message": "Password changed successfully. Please log in again."
         }
 
     except HTTPException:

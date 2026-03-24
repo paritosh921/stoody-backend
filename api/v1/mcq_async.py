@@ -942,6 +942,7 @@ async def get_test_series_questions(
                     "subject": document.get("subject"),
                     "total_points": document.get("total_points", 0),
                     "total_minutes": document.get("total_minutes", 0),
+                    "instructions": document.get("instructions"),
                     "questions": questions_with_images,
                     "total": len(questions_with_images)
                 }
@@ -1094,6 +1095,7 @@ async def get_test_series_questions(
                     "subject": document.get("subject"),
                     "total_points": document.get("total_points", 0),
                     "total_minutes": document.get("total_minutes", 0),
+                    "instructions": document.get("instructions"),
                     "questions": questions_with_images,
                     "total": len(questions_with_images)
                 }

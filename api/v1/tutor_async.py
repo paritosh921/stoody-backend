@@ -412,6 +412,63 @@ async def update_tutor(
     return {"message": "Tutor updated successfully"}
 
 
+class TutorSelfUpdateRequest(BaseModel):
+    """Fields a tutor can update on their own profile."""
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, max_length=20)
+
+
+@router.put("/tutors/me/profile")
+@limiter.limit("10/minute")
+async def update_tutor_self_profile(
+    request: Request,
+    profile_data: TutorSelfUpdateRequest,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Tutor updates their own profile (name, email, phone only).
+    Admin-controlled fields (teaching_assignments, standards, sections, subjects,
+    can_edit_students, username, tutor_id) cannot be changed here.
+    """
+    from bson import ObjectId
+
+    tutor_id = ObjectId(current_user["user_id"])
+    tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+    if not tutor:
+        raise HTTPException(status_code=404, detail="Tutor not found")
+
+    # Build update dict from non-None fields only
+    updates: Dict[str, Any] = {}
+    if profile_data.name is not None:
+        updates["name"] = profile_data.name.strip()
+        updates["full_name"] = profile_data.name.strip()
+    if profile_data.email is not None:
+        updates["email"] = profile_data.email.strip().lower()
+    if profile_data.phone is not None:
+        updates["phone"] = profile_data.phone.strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    await db.mongo_update_one("tutors", {"_id": tutor_id}, {"$set": updates})
+
+    _logger.info(f"Tutor {tutor.get('username')} updated their profile")
+
+    # Return updated profile data so frontend can refresh
+    updated_tutor = await db.mongo_find_one("tutors", {"_id": tutor_id})
+    return {
+        "success": True,
+        "message": "Profile updated successfully",
+        "user": {
+            "name": updated_tutor.get("name") or updated_tutor.get("full_name"),
+            "email": updated_tutor.get("email"),
+            "phone": updated_tutor.get("phone"),
+        },
+    }
+
+
 @router.delete("/tutors/{tutor_id}")
 @limiter.limit("10/minute")
 async def delete_tutor(
@@ -1543,7 +1600,9 @@ async def get_student_document_attempts(
                             "page_number": {"$in": active_pages},
                             "book_type": book_type.upper(),
                         }
-                        if copy_id_ref:
+                        # Only filter by copy_id if it's a real ID
+                        # (not "default" which is a frontend placeholder)
+                        if copy_id_ref and copy_id_ref != "default":
                             page_query["copy_id"] = copy_id_ref
 
                         cursor = canvas_col.find(page_query).sort(
@@ -1553,24 +1612,6 @@ async def get_student_document_attempts(
 
                         for pg in raw_pages:
                             raw_strokes = pg.get("strokes") or []
-
-                            # Filter strokes by time intervals
-                            if time_intervals:
-                                filtered = []
-                                for s in raw_strokes:
-                                    s_start = s.get("startedAt") or s.get("timestamp")
-                                    if s_start is None:
-                                        filtered.append(s)
-                                        continue
-                                    for iv in time_intervals:
-                                        iv_start = iv.get("startTs") or iv.get("start_ts", 0)
-                                        iv_end = iv.get("endTs") or iv.get("end_ts") or float("inf")
-                                        tolerance = 2000  # 2s tolerance
-                                        if (s_start >= iv_start - tolerance
-                                                and s_start <= iv_end + tolerance):
-                                            filtered.append(s)
-                                            break
-                                raw_strokes = filtered
 
                             if raw_strokes:
                                 question_strokes.append({
@@ -1926,12 +1967,16 @@ async def get_tutor_document_detail_analytics(
             else None,
         }
 
-        # ----- Fetch question metadata -----
-        questions = await db.mongo_find("questions", {"document_id": document_id})
+        # ----- Fetch question metadata (preserve original document order) -----
+        questions = await db.mongo_find(
+            "questions", {"document_id": document_id}, sort=[("_id", 1)]
+        )
         question_map: Dict[str, Dict[str, Any]] = {}
-        for q in questions:
+        question_order: Dict[str, int] = {}  # question_id → 1-based index
+        for idx, q in enumerate(questions):
             qid = q.get("id") or str(q.get("_id", ""))
             question_map[qid] = q
+            question_order[qid] = idx + 1
 
         # ----- Branch by document type -----
         student_results: List[Dict[str, Any]] = []
@@ -2109,6 +2154,7 @@ async def get_tutor_document_detail_analytics(
                 question_analysis.append(
                     {
                         "question_id": qid,
+                        "question_number": question_order.get(qid, 0),
                         "question_text": q_meta.get("text", ""),
                         "difficulty": q_meta.get("difficulty", ""),
                         "total_attempts": q_total,
@@ -2121,7 +2167,7 @@ async def get_tutor_document_detail_analytics(
                     }
                 )
 
-            # Sort by accuracy ascending (hardest first)
+            # Sort by accuracy ascending (hardest first) for the chart
             question_analysis.sort(key=lambda x: x["accuracy"])
 
         elif dtype == "Test Series":
@@ -2299,6 +2345,7 @@ async def get_tutor_document_detail_analytics(
                 question_analysis.append(
                     {
                         "question_id": qid,
+                        "question_number": question_order.get(qid, 0),
                         "question_text": q_meta.get("text", ""),
                         "difficulty": q_meta.get("difficulty", ""),
                         "total_attempts": q_total,
@@ -2311,7 +2358,7 @@ async def get_tutor_document_detail_analytics(
                     }
                 )
 
-            # Sort by accuracy ascending (hardest first)
+            # Sort by accuracy ascending (hardest first) for the chart
             question_analysis.sort(key=lambda x: x["accuracy"])
 
         return {
