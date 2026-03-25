@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/eval.ocr.complete",
+  "title": "eval.ocr.complete event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "event_version", "occurred_at", "submission_id", "page_count"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "eval.ocr.complete" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "submission_id": { "type": "string" },
+    "page_count": { "type": "integer" }
+  }
+}

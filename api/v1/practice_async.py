@@ -21,6 +21,201 @@ from config_async import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# LLM Gate bridge (SWM-011)
+#
+# All LLM calls — text-only AND vision/multimodal — MUST be routed through
+# the shared gate (C4) with caller_id ``pcr_practice``.  If the gate module
+# is available, it is the exclusive path — there is NO silent fallback to a
+# direct provider.
+#
+# Vision/multimodal calls use ``gate.call(messages=...)`` which forwards the
+# pre-built messages array (text + image_url parts) to the provider.
+#
+# If the gate module is not importable (exam-conductor not deployed),
+# RuntimeError is raised — there is NO fallback to direct providers.
+# The deployment must include exam-conductor for practice to function.
+# ---------------------------------------------------------------------------
+
+_gate_module = None          # lazily imported exam-conductor.llm_gate
+_gate_import_attempted = False  # True once we have tried (success or failure)
+_gate_unavailable = False    # True when import was attempted and failed
+
+
+def _try_load_gate_module():
+    """Attempt to import the LLM gate module once.  Returns the module or None."""
+    global _gate_module, _gate_import_attempted, _gate_unavailable
+    if _gate_module is not None:
+        return _gate_module
+    if _gate_import_attempted:
+        return None
+    _gate_import_attempted = True
+    try:
+        from api.v1._exampen_imports import load_exampen
+        _gate_module = load_exampen("llm_gate")
+        logger.info("LLM gate module loaded for practice bridge (SWM-011)")
+        return _gate_module
+    except ImportError:
+        _gate_unavailable = True
+        # CRITICAL: C4 requires all LLM calls through the gate.  If the gate
+        # is not importable the deployment is non-compliant.
+        logger.critical(
+            "SWM-011 C4 VIOLATION: exam-conductor.llm_gate not importable — "
+            "practice LLM calls (text + vision) will bypass the gate.  "
+            "Deploy exam-conductor to restore compliance."
+        )
+        return None
+
+
+async def _gate_text_call(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 1000,
+    temperature: float = 0.7,
+    model_override: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Route a text-only LLM call through the shared gate.
+
+    Returns a dict shaped like ``AsyncOpenAIService.chat_completion_async``
+    output (``success``, ``response``, etc.) or ``None`` **only** when the
+    gate module was never importable (deployment issue).
+
+    If the gate *is* loaded but the call fails at runtime, the exception
+    propagates — there is no silent fallback to a direct provider.
+    """
+    gate_mod = _try_load_gate_module()
+    if gate_mod is None:
+        raise RuntimeError(
+            "SWM-011 C4: LLM gate not available — exam-conductor not deployed. "
+            "All LLM calls must go through the shared gate (C4)."
+        )
+
+    db_name = current_user.get("db_name")
+    if not db_name:
+        raise RuntimeError("SWM-011: No db_name in user context — cannot route through gate")
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise RuntimeError(f"SWM-011: Could not obtain tenant DB '{db_name}' — cannot route through gate")
+
+    gate = gate_mod.LLMGate(tenant_db)
+    await gate.initialize()
+
+    # Build the full prompt (system + user) since the gate takes a single prompt string
+    full_prompt = prompt
+    if system_prompt:
+        full_prompt = f"{system_prompt}\n\n{prompt}"
+
+    from config_async import OPENAI_MODEL
+    model_id = model_override or OPENAI_MODEL
+
+    gate_resp = await gate.call(
+        model_id=model_id,
+        prompt=full_prompt,
+        caller_id="pcr_practice",
+        max_output_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    # Map GateResponse -> dict matching AsyncOpenAIService output shape
+    return {
+        "success": True,
+        "response": gate_resp.content,
+        "model": gate_resp.usage.model,
+        "usage": {
+            "prompt_tokens": gate_resp.usage.input_tokens,
+            "completion_tokens": gate_resp.usage.output_tokens,
+            "total_tokens": gate_resp.usage.total_tokens,
+        },
+    }
+
+async def _gate_vision_call(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+    images: List[str],
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    max_tokens: int = 1000,
+    temperature: float = 0.3,
+    model_override: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Route a vision/multimodal LLM call through the shared gate.
+
+    Builds an OpenAI-style messages array with text + image_url parts and
+    forwards it via ``gate.call(messages=...)``.
+
+    Returns a dict shaped like ``AsyncOpenAIService.analyze_images_and_text_async``
+    output (``success``, ``response``, etc.) or ``None`` **only** when the gate
+    module was never importable (deployment issue).
+
+    If the gate *is* loaded but the call fails at runtime, the exception
+    propagates — there is no silent fallback to a direct provider.
+    """
+    gate_mod = _try_load_gate_module()
+    if gate_mod is None:
+        raise RuntimeError(
+            "SWM-011 C4: LLM gate not available — exam-conductor not deployed. "
+            "All LLM calls (including vision) must go through the shared gate (C4)."
+        )
+
+    db_name = current_user.get("db_name")
+    if not db_name:
+        raise RuntimeError("SWM-011: No db_name in user context — cannot route through gate")
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise RuntimeError(f"SWM-011: Could not obtain tenant DB '{db_name}' — cannot route through gate")
+
+    gate = gate_mod.LLMGate(tenant_db)
+    await gate.initialize()
+
+    # Build multimodal messages array (OpenAI format)
+    content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for img in images or []:
+        if not img:
+            continue
+        # Ensure data URI format
+        if img.startswith("data:"):
+            url = img
+        else:
+            url = f"data:image/png;base64,{img}"
+        content_parts.append({"type": "image_url", "image_url": {"url": url}})
+
+    messages: List[Dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content_parts})
+
+    from config_async import OPENAI_MODEL
+    model_id = model_override or OPENAI_MODEL
+
+    gate_resp = await gate.call(
+        model_id=model_id,
+        prompt=prompt,
+        caller_id="pcr_practice",
+        messages=messages,
+        max_output_tokens=max_tokens,
+        temperature=temperature,
+    )
+
+    # Map GateResponse -> dict matching AsyncOpenAIService output shape
+    return {
+        "success": True,
+        "response": gate_resp.content,
+        "model": gate_resp.usage.model,
+        "usage": {
+            "prompt_tokens": gate_resp.usage.input_tokens,
+            "completion_tokens": gate_resp.usage.output_tokens,
+            "total_tokens": gate_resp.usage.total_tokens,
+        },
+    }
+
+
 # Language detection utility for multilingual support
 def detect_language(text: str) -> str:
     """
@@ -1215,9 +1410,12 @@ async def evaluate_submission(
             correct_answer_display = ""
             is_option_letter = False
 
-        # Initialize AI service
+        # Initialize AI service.
+        # SWM-011: All LLM calls (text + vision) are routed through the shared
+        # gate (pcr_practice).  The direct OpenAI service is only used as a
+        # fallback when the gate module is not deployed.
         from services.async_openai_service import AsyncOpenAIService
-        ai = AsyncOpenAIService()
+        ai = AsyncOpenAIService()  # fallback only when gate is unavailable
 
         # Prepare images: Question Figures + Option Images + Student Canvas
         # 1. Question Figures (diagrams, inline images)
@@ -1390,11 +1588,12 @@ async def evaluate_submission(
             )
 
             try:
-                extraction_resp = await ai.analyze_images_and_text_async(
-                    student_images,
+                extraction_max = 1200 if is_essay_question else 500
+                extraction_resp = await _gate_vision_call(
+                    db, current_user, student_images,
                     extraction_prompt,
-                    max_tokens=1200 if is_essay_question else 500,
-                    system_prompt=extraction_system_prompt
+                    system_prompt=extraction_system_prompt,
+                    max_tokens=extraction_max,
                 )
                 extraction_raw = (extraction_resp.get("response") or "").strip()
                 extraction_parsed = robust_json_parse(extraction_raw) or {}
@@ -1732,19 +1931,19 @@ async def evaluate_submission(
         eval_max_tokens = 1500 if is_essay_question else 1200
 
         if all_images:
-            response = await ai.analyze_images_and_text_async(
-                all_images,
+            # SWM-011: Vision path — route through the shared gate (C4)
+            response = await _gate_vision_call(
+                db, current_user, all_images,
                 prompt,
+                system_prompt=system_prompt,
                 max_tokens=eval_max_tokens,
-                system_prompt=system_prompt
             )
         else:
-            response = await ai.chat_completion_async(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=eval_max_tokens
+            # SWM-011: Text-only path — route through the shared gate (C4)
+            response = await _gate_text_call(
+                db, current_user, prompt,
+                system_prompt=system_prompt,
+                max_tokens=eval_max_tokens,
             )
             
         raw_response = (response.get("response") or "").strip()
@@ -1786,19 +1985,21 @@ async def evaluate_submission(
                     )
 
                 if all_images:
-                    retry_response = await ai.analyze_images_and_text_async(
-                        all_images,
+                    # SWM-011: Vision retry — route through the shared gate (C4)
+                    retry_vision_max = 300 if is_essay_question else 200
+                    retry_response = await _gate_vision_call(
+                        db, current_user, all_images,
                         retry_prompt,
-                        max_tokens=300 if is_essay_question else 200,
-                        system_prompt="You are a JSON generator. Output ONLY valid JSON, nothing else."
+                        system_prompt="You are a JSON generator. Output ONLY valid JSON, nothing else.",
+                        max_tokens=retry_vision_max,
                     )
                 else:
-                    retry_response = await ai.chat_completion_async(
-                        messages=[
-                            {"role": "system", "content": "You are a JSON generator. Output ONLY valid JSON."},
-                            {"role": "user", "content": retry_prompt}
-                        ],
-                        max_tokens=300 if is_essay_question else 200
+                    # SWM-011: Text-only retry — route through gate (C4)
+                    retry_max = 300 if is_essay_question else 200
+                    retry_response = await _gate_text_call(
+                        db, current_user, retry_prompt,
+                        system_prompt="You are a JSON generator. Output ONLY valid JSON.",
+                        max_tokens=retry_max,
                     )
 
                 retry_raw = (retry_response.get("response") or "").strip()

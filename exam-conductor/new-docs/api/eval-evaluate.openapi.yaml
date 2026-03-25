@@ -1,0 +1,146 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen PCR Evaluation API
+  version: "2.1.0"
+  description: |
+    PCR evaluation APIs for conducted-exam single and batch evaluation.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/evalpen/evaluate:
+    post:
+      summary: Evaluate one server-side PCR response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvaluateRequest"
+      responses:
+        "202":
+          description: Evaluation accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluateAccepted"
+  /api/v1/evalpen/evaluate/batch:
+    post:
+      summary: Evaluate a batch of server-side PCR responses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchEvaluateRequest"
+      responses:
+        "202":
+          description: Batch accepted
+  /api/v1/evalpen/evaluations/{evaluation_id}:
+    get:
+      summary: Get one PCR evaluation result
+      parameters:
+        - name: evaluation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Evaluation detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationDetail"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    EvaluateRequest:
+      type: object
+      required: [response_id, question_id]
+      properties:
+        response_id:
+          type: string
+        question_id:
+          type: string
+    EvaluateAccepted:
+      type: object
+      required: [evaluation_id, status]
+      properties:
+        evaluation_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, evaluating]
+    BatchEvaluateRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvaluateRequest"
+    EvaluationDetail:
+      type: object
+      required: [evaluation_id, response_id, question_id, total_score, max_score]
+      properties:
+        evaluation_id:
+          type: string
+        response_id:
+          type: string
+        question_id:
+          type: string
+        eval_path:
+          type: string
+          enum: [cache_hit, cache_miss]
+        model_used:
+          type: string
+        content_type:
+          type: string
+          enum: [TEXT_ONLY, MIXED, DIAGRAM_HEAVY, TABLE_PRESENT]
+        total_score:
+          type: number
+        max_score:
+          type: number
+        scoreable_max:
+          type: number
+        step_marks:
+          type: array
+          items:
+            type: object
+            properties:
+              step:
+                type: string
+              marks_awarded:
+                type: number
+              marks_possible:
+                type: number
+              justification:
+                type: string
+        overall_feedback:
+          type: string
+        reference_solution:
+          type: object
+          properties:
+            text:
+              type: string
+            source:
+              type: string
+            version:
+              type: integer
+        token_usage:
+          type: object
+          properties:
+            model:
+              type: string
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            total_tokens:
+              type: integer

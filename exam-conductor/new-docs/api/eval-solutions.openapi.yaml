@@ -1,0 +1,112 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen PCR Solutions API
+  version: "2.1.0"
+  description: |
+    Reference solution and PCR question metadata APIs.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/evalpen/solutions/{question_id}:
+    get:
+      summary: Get active solution for one question
+      parameters:
+        - name: question_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Solution detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SolutionDetail"
+    put:
+      summary: Upsert versioned solution for one question
+      parameters:
+        - name: question_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertSolutionRequest"
+      responses:
+        "200":
+          description: Solution updated
+  /api/v1/evalpen/questions:
+    post:
+      summary: Register or update PCR question metadata
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuestionMetadata"
+      responses:
+        "202":
+          description: Question accepted
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SolutionDetail:
+      type: object
+      required: [question_id, version, reference_solution, solution_source]
+      properties:
+        question_id:
+          type: string
+        version:
+          type: integer
+        reference_solution:
+          type: string
+        solution_source:
+          type: string
+          enum: [teacher, llm]
+        model_used:
+          type: string
+    UpsertSolutionRequest:
+      type: object
+      required: [reference_solution, solution_source]
+      properties:
+        reference_solution:
+          type: string
+        solution_source:
+          type: string
+          enum: [teacher, llm]
+        model_used:
+          type: string
+    QuestionMetadata:
+      type: object
+      required: [question_id, exam_id, question_type, max_marks, complexity, eval_template]
+      properties:
+        question_id:
+          type: string
+        exam_id:
+          type: string
+        subject:
+          type: string
+        question_type:
+          type: string
+        complexity:
+          type: string
+          enum: [L1, L2, L3]
+        eval_template:
+          type: string
+        max_marks:
+          type: integer
+        expects_diagram:
+          type: boolean
+        diagram_weight:
+          type: number

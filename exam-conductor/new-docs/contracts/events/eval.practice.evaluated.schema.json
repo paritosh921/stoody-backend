@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/eval.practice.evaluated",
+  "title": "eval.practice.evaluated event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "question_id",
+    "total_score",
+    "max_score"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "eval.practice.evaluated" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "question_id": { "type": "string" },
+    "total_score": { "type": "number" },
+    "max_score": { "type": "number" },
+    "token_usage": {
+      "type": "object",
+      "properties": {
+        "caller": { "type": "string" },
+        "total_tokens": { "type": "integer" }
+      }
+    }
+  }
+}

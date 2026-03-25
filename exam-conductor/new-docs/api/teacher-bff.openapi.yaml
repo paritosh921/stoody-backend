@@ -1,10 +1,10 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Teacher BFF API
-  version: "1.0.0"
+  version: "2.0.0"
   description: |
-    Aggregation API for Stoody teacher surfaces and the teacher mode of the mobile app.
-    The BFF aggregates backing services but does not write directly to any database.
+    Aggregated teacher-facing APIs over exam operations, DCR/PCR results, review state, and analytics.
+    This BFF is read-oriented over backing domains and must not become a second evaluator.
 servers:
   - url: /
 security:
@@ -12,212 +12,35 @@ security:
 paths:
   /api/v1/teacher/exams:
     get:
-      summary: List exams for the authenticated teacher
-      parameters:
-        - name: subject_id
-          in: query
-          schema:
-            type: string
-        - name: class_id
-          in: query
-          schema:
-            type: string
+      summary: List exams visible to the teacher
       responses:
         "200":
-          description: Teacher exam list
+          description: Teacher exam cards
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
                 properties:
                   items:
                     type: array
                     items:
                       $ref: "#/components/schemas/TeacherExamCard"
-  /api/v1/teacher/exams/{exam_id}/scores:
+  /api/v1/teacher/exams/{exam_id}/queue:
     get:
-      summary: Class score overview for an exam
+      summary: Get teacher work queues for one exam
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         "200":
-          description: Student rows for the class score grid
+          description: Work queues
           content:
             application/json:
               schema:
                 type: object
-                required: [rows]
-                properties:
-                  rows:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ClassScoreRow"
-  /api/v1/teacher/exams/{exam_id}/scores/{student_id}:
-    get:
-      summary: Per-student drill-down
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Aggregated student score detail
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TeacherStudentDetail"
-    patch:
-      summary: Forward a score override request
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/TeacherScoreOverrideRequest"
-      responses:
-        "200":
-          description: Forwarded override result
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/TeacherStudentDetail"
-  /api/v1/teacher/exams/{exam_id}/miss-indicators:
-    get:
-      summary: Question miss grid for the class
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Student by question matrix
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MissIndicatorMatrix"
-  /api/v1/teacher/exams/{exam_id}/plagiarism:
-    get:
-      summary: Plagiarism flags aggregated for teacher review
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Flag list with evidence preview
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/PlagiarismPreview"
-  /api/v1/teacher/objections:
-    get:
-      summary: Objection inbox for the authenticated teacher
-      responses:
-        "200":
-          description: Objection summaries
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ObjectionInboxItem"
-  /api/v1/teacher/chat/{exam_id}/{student_id}:
-    get:
-      summary: Chat thread with one student
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Teacher-student thread
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Message"
-    post:
-      summary: Send a message to the student
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SendMessageRequest"
-      responses:
-        "201":
-          description: Message accepted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Message"
 components:
   securitySchemes:
     StoodyBearer:
@@ -227,175 +50,12 @@ components:
   schemas:
     TeacherExamCard:
       type: object
-      required: [exam_id, title, subject_id, scheduled_at, state]
+      required: [exam_id, title, exam_type]
       properties:
         exam_id:
           type: string
-          format: uuid
         title:
           type: string
-        subject_id:
+        exam_type:
           type: string
-        scheduled_at:
-          type: string
-          format: date-time
-        state:
-          type: string
-        class_label:
-          type: string
-    ClassScoreRow:
-      type: object
-      required: [student_id, student_name, total_score, ai_confidence]
-      properties:
-        student_id:
-          type: string
-        student_name:
-          type: string
-        total_score:
-          type: number
-        percentile:
-          type: number
-        ai_confidence:
-          type: number
-        miss_indicator_count:
-          type: integer
-        plagiarism_flag_count:
-          type: integer
-    TeacherStudentDetail:
-      type: object
-      required: [student_id, student_name, total_score, questions]
-      properties:
-        student_id:
-          type: string
-        student_name:
-          type: string
-        total_score:
-          type: number
-        answer_pages:
-          type: array
-          items:
-            type: string
-            format: uri
-        questions:
-          type: array
-          items:
-            $ref: "#/components/schemas/QuestionDetail"
-    QuestionDetail:
-      type: object
-      required: [question_id, current_score, confidence]
-      properties:
-        question_id:
-          type: string
-        current_score:
-          type: number
-        confidence:
-          type: number
-        recognized_text:
-          type: string
-        miss_indicator:
-          type: string
-        copy_image_uri:
-          type: string
-          format: uri
-    TeacherScoreOverrideRequest:
-      type: object
-      required: [question_id, new_score, reason]
-      properties:
-        question_id:
-          type: string
-        new_score:
-          type: number
-        reason:
-          type: string
-    MissIndicatorMatrix:
-      type: object
-      required: [exam_id, students, questions, cells]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        students:
-          type: array
-          items:
-            type: string
-        questions:
-          type: array
-          items:
-            type: string
-        cells:
-          type: array
-          items:
-            type: object
-            required: [student_id, question_id, state]
-            properties:
-              student_id:
-                type: string
-              question_id:
-                type: string
-              state:
-                type: string
-                enum: [answered, miss_no_strokes, miss_sync_failure, miss_pen_inactive, not_attempted_confirmed]
-    PlagiarismPreview:
-      type: object
-      required: [flag_id, student_a_id, student_b_id, question_id, composite_score, severity]
-      properties:
-        flag_id:
-          type: string
-          format: uuid
-        student_a_id:
-          type: string
-        student_b_id:
-          type: string
-        question_id:
-          type: string
-        composite_score:
-          type: number
-        severity:
-          type: string
-        teacher_verdict:
-          type: string
-    ObjectionInboxItem:
-      type: object
-      required: [objection_id, student_id, question_id, status, filed_at]
-      properties:
-        objection_id:
-          type: string
-          format: uuid
-        student_id:
-          type: string
-        question_id:
-          type: string
-        status:
-          type: string
-        filed_at:
-          type: string
-          format: date-time
-    Message:
-      type: object
-      required: [message_id, sender_id, content, sent_at]
-      properties:
-        message_id:
-          type: string
-          format: uuid
-        sender_id:
-          type: string
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
-        sent_at:
-          type: string
-          format: date-time
-        read_at:
-          type: string
-          format: date-time
-    SendMessageRequest:
-      type: object
-      required: [content]
-      properties:
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
+          enum: [dcr, pcr]

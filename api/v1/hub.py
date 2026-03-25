@@ -5,6 +5,9 @@ This module handles BLE hub registration and pen synchronization.
 Hubs (running on Raspberry Pi) register themselves with the backend,
 pushing their connected pens list. This works for both local development
 and cloud deployment (AWS).
+
+Conducted-exam artifact uploads from hubs are bridged into the shared
+ingest substrate (SWM-012) when exam metadata is present.
 """
 
 from __future__ import annotations
@@ -19,6 +22,96 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/hub", tags=["hub"])
+
+
+# ---------------------------------------------------------------------------
+# Ingest bridge helper (SWM-012) — graceful degradation if exam-conductor
+# is not available.
+# ---------------------------------------------------------------------------
+
+async def _bridge_hub_artifacts_to_ingest(
+    *,
+    exam_id: str,
+    student_id: str,
+    admin_id: str,
+    pen_mac: str,
+    pages: List[Dict[str, Any]],
+    db_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Bridge hub-uploaded conducted-exam artifacts into the shared ingest
+    substrate.
+
+    Returns the IngestResult dict on success, or None if the ingest
+    substrate is unavailable.  Failures are logged but never propagated
+    to the caller — the hub upload must succeed regardless.
+
+    Parameters
+    ----------
+    exam_id : str
+        Conducted exam identifier.
+    student_id : str
+        Student identity.
+    admin_id : str
+        Tenant admin who owns this exam context.
+    pen_mac : str
+        BLE pen MAC address.
+    pages : list[dict]
+        List of page dicts with ``page_number`` and ``raw_strokes``.
+    db_name : str
+        Tenant database name (e.g. ``skb_<tenant>``).
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+        ingest_mod = load_exampen("ingest.service")
+        IngestService = ingest_mod.IngestService
+    except (ImportError, AttributeError):
+        logger.debug(
+            "exam-conductor ingest not available — skipping hub artifact bridge"
+        )
+        return None
+
+    try:
+        from core.database import DatabaseManager
+        db_manager = DatabaseManager()
+        tenant_db = await db_manager.get_tenant_db(db_name)
+        if tenant_db is None:
+            logger.warning(
+                "Could not resolve tenant DB %s for hub ingest bridge", db_name
+            )
+            return None
+
+        service = IngestService(tenant_db)
+        await service.initialize()
+
+        result = await service.ingest_submission(
+            exam_id=exam_id,
+            student_id=student_id,
+            admin_id=admin_id,
+            source="ble_pen",
+            pen_mac=pen_mac,
+            pages=pages,
+        )
+
+        logger.info(
+            "Hub ingest bridge: submission_id=%s exam=%s student=%s "
+            "pages=%d already_existed=%s",
+            result.submission_id,
+            exam_id,
+            student_id,
+            result.page_count,
+            result.already_existed,
+        )
+        return result.model_dump()
+
+    except Exception:
+        logger.exception(
+            "Hub ingest bridge failed for exam=%s student=%s pen=%s "
+            "(non-fatal, hub upload continues)",
+            exam_id,
+            student_id,
+            pen_mac,
+        )
+        return None
 
 
 class PenInfo(BaseModel):
@@ -256,3 +349,120 @@ async def get_hub_details(
         raise HTTPException(status_code=404, detail=f"Hub {hub_id} not found")
 
     return _hub_registry[hub_id]
+
+
+# ============================================================================
+# CONDUCTED-EXAM ARTIFACT UPLOAD (SWM-012 ingest bridge)
+# ============================================================================
+
+class ExamArtifactPage(BaseModel):
+    """A single page of conducted-exam pen data uploaded by the hub."""
+    page_number: int = Field(..., ge=1, description="1-based page number")
+    raw_strokes: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Canonical stroke vectors from BLE pen",
+    )
+
+
+class HubExamUpload(BaseModel):
+    """Conducted-exam artifact upload payload from hub.
+
+    The hub sends this after post-exam pen sync is complete.
+    Only payloads with ``exam_id`` trigger the ingest bridge;
+    regular (non-exam) hub uploads continue through existing paths.
+    """
+    hub_id: str
+    exam_id: str = Field(..., description="Conducted exam identifier")
+    student_id: str = Field(..., description="Student identity")
+    admin_id: str = Field(..., description="Tenant admin identity")
+    pen_mac: str = Field(..., description="BLE pen MAC address")
+    db_name: str = Field(..., description="Tenant database name (skb_<tenant>)")
+    pages: List[ExamArtifactPage] = Field(
+        default_factory=list,
+        description="Per-page stroke data from the pen",
+    )
+
+
+class HubExamUploadResponse(BaseModel):
+    """Response from the conducted-exam artifact upload."""
+    success: bool
+    hub_id: str
+    exam_id: str
+    student_id: str
+    submission_id: Optional[str] = None
+    page_count: int = 0
+    already_existed: bool = False
+    ingest_available: bool = True
+    message: str = ""
+
+
+@router.post("/exam-upload", response_model=HubExamUploadResponse)
+async def hub_exam_upload(
+    payload: HubExamUpload,
+    token: Optional[str] = None,
+    state=Depends(get_app_state),
+):
+    """Receive conducted-exam artifacts from a hub and bridge into the
+    shared ingest substrate.
+
+    This endpoint is called by the hub's uplink module after post-exam
+    pen sync completes.  It persists the canonical pen artifacts through
+    ``IngestService.ingest_submission()`` with full provenance.
+
+    Non-exam flows should NOT call this endpoint — they continue using
+    the existing ``/hub/register`` and Stoody pen sync paths.
+    """
+    expected = state.dashboard_token
+    if expected and token != expected:
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    # Convert pages to the dict format expected by IngestService
+    page_dicts = [
+        {
+            "page_number": p.page_number,
+            "raw_strokes": p.raw_strokes,
+        }
+        for p in payload.pages
+    ]
+
+    result = await _bridge_hub_artifacts_to_ingest(
+        exam_id=payload.exam_id,
+        student_id=payload.student_id,
+        admin_id=payload.admin_id,
+        pen_mac=payload.pen_mac.upper(),
+        pages=page_dicts,
+        db_name=payload.db_name,
+    )
+
+    if result is None:
+        # Ingest substrate not available — log and return success
+        # so the hub doesn't retry needlessly.  The artifacts can be
+        # ingested later via a backfill process.
+        logger.warning(
+            "Ingest bridge unavailable for hub exam upload: "
+            "hub=%s exam=%s student=%s",
+            payload.hub_id,
+            payload.exam_id,
+            payload.student_id,
+        )
+        return HubExamUploadResponse(
+            success=True,
+            hub_id=payload.hub_id,
+            exam_id=payload.exam_id,
+            student_id=payload.student_id,
+            ingest_available=False,
+            message="Artifacts received but ingest substrate is not available. "
+                    "They will be ingested via backfill.",
+        )
+
+    return HubExamUploadResponse(
+        success=True,
+        hub_id=payload.hub_id,
+        exam_id=payload.exam_id,
+        student_id=payload.student_id,
+        submission_id=result.get("submission_id"),
+        page_count=result.get("page_count", 0),
+        already_existed=result.get("already_existed", False),
+        ingest_available=True,
+        message="Conducted-exam artifacts ingested successfully.",
+    )

@@ -1,8 +1,10 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Chat API
-  version: "1.0.0"
-  description: Append-only messaging API for teacher-student exam threads.
+  version: "2.0.0"
+  description: |
+    Supporting teacher-student communication APIs around ExamPen results and review.
+    Chat is outside the ingest substrate and outside evaluator ownership.
 servers:
   - url: /
 security:
@@ -10,14 +12,13 @@ security:
 paths:
   /api/v1/chat/threads/{exam_id}/{other_user_id}:
     get:
-      summary: Get one chat thread
+      summary: Get one exam-scoped thread
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
         - name: other_user_id
           in: path
           required: true
@@ -37,14 +38,13 @@ paths:
                     items:
                       $ref: "#/components/schemas/ChatMessage"
     post:
-      summary: Append a new message to the thread
+      summary: Append one chat message
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
         - name: other_user_id
           in: path
           required: true
@@ -55,36 +55,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SendChatMessageRequest"
+              type: object
+              required: [body]
+              properties:
+                body:
+                  type: string
       responses:
-        "201":
-          description: Message appended
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ChatMessage"
-  /api/v1/chat/threads/{exam_id}/{other_user_id}/read:
-    post:
-      summary: Mark the thread as read for the current user
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: other_user_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Read receipt persisted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ReadReceipt"
+        "202":
+          description: Message accepted
 components:
   securitySchemes:
     StoodyBearer:
@@ -94,47 +72,14 @@ components:
   schemas:
     ChatMessage:
       type: object
-      required: [message_id, sender_id, recipient_id, exam_id, content, sent_at]
+      required: [message_id, sender_id, sent_at, body]
       properties:
         message_id:
           type: string
-          format: uuid
         sender_id:
           type: string
-        recipient_id:
-          type: string
-        exam_id:
-          type: string
-          format: uuid
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
         sent_at:
           type: string
           format: date-time
-        read_at:
+        body:
           type: string
-          format: date-time
-    SendChatMessageRequest:
-      type: object
-      required: [content]
-      properties:
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
-    ReadReceipt:
-      type: object
-      required: [exam_id, other_user_id, read_at]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        other_user_id:
-          type: string
-        read_at:
-          type: string
-          format: date-time

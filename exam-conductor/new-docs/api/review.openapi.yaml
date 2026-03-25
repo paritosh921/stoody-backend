@@ -1,196 +1,703 @@
 openapi: "3.1.0"
 info:
-  title: ExamPen Review API
-  version: "1.0.0"
-  description: Objection intake, assignment, resolution, and escalation.
+  title: ExamPen Review & Flagged Queue API
+  version: "3.0.0"
+  description: |
+    Teacher-facing review, score override, publication, and flagged-response
+    queue APIs for the EvalPen subsystem.
+
+    Covers two router groups:
+      - **Review** (`/api/v1/evalpen/review`) — submission summaries, exam
+        results, score overrides, and grade publication.
+      - **Flagged** (`/api/v1/evalpen/flagged`) — teacher queue for responses
+        blocked by the Unified Flag System, with accept/reject/manual-score
+        actions and resolution statistics.
+
+    All endpoints require admin, tutor, or b2c_admin role (StoodyBearer JWT).
+    Score overrides and flag resolutions follow TAMPER_PROOF_SPEC Layer 3
+    (append-only audit trail with actor_id, reason, before/after, timestamp).
 servers:
   - url: /
 security:
   - StoodyBearer: []
+
 paths:
-  /api/v1/objections:
+  # -----------------------------------------------------------------------
+  # evalpen_review_async.py  (mounted at /api/v1/evalpen/review)
+  # -----------------------------------------------------------------------
+
+  /api/v1/evalpen/review/submissions/{submission_id}/summary:
     get:
-      summary: List objections visible to the current actor
+      operationId: getSubmissionSummary
+      summary: Get evaluation summary for a submission
+      description: |
+        Returns all detected responses with their eval_status, scores, flags,
+        and aggregate totals. This is the primary teacher review view.
+      tags: [Review]
+      parameters:
+        - $ref: "#/components/parameters/SubmissionIdPath"
+      responses:
+        "200":
+          description: Evaluation summary for the submission
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmissionSummaryReview"
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Submission not found
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/review/exams/{exam_id}/results:
+    get:
+      operationId: getExamResults
+      summary: Get aggregated results for an entire exam
+      description: |
+        Combines PCR and DCR results to provide a unified exam results view.
+        Returns per-student score summaries sorted by student_id.
+      tags: [Review]
+      parameters:
+        - $ref: "#/components/parameters/ExamIdPath"
+      responses:
+        "200":
+          description: Aggregated exam results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamResults"
+        "403":
+          description: Insufficient permissions
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/review/evaluations/{evaluation_id}/override:
+    post:
+      operationId: overrideEvaluationScore
+      summary: Override a PCR evaluation score with audit trail
+      description: |
+        Override the total_score on a PCR evaluation. TAMPER_PROOF_SPEC
+        Layer 3, Section 6 Rule 4: every override records actor_id, reason
+        (min 5 chars), before/after state, and timestamp. The previous score
+        is preserved in the evaluation's append-only audit_trail array.
+
+        new_score must not exceed the evaluation's max_score.
+      tags: [Review]
+      parameters:
+        - name: evaluation_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: ID of the evaluation to override
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScoreOverrideRequest"
+      responses:
+        "200":
+          description: Override applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScoreOverrideResponse"
+        "400":
+          description: Invalid request (reason too short, score exceeds max)
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Evaluation not found
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/review/submissions/{submission_id}/publish:
+    post:
+      operationId: publishSubmission
+      summary: Publish/finalize submission results
+      description: |
+        Marks submission results as published. All unresolved blocking flags
+        must be resolved before publication is allowed (409 otherwise).
+        Records actor_id, timestamp, and optional note.
+      tags: [Review]
+      parameters:
+        - $ref: "#/components/parameters/SubmissionIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PublishRequest"
+      responses:
+        "200":
+          description: Submission published
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublishResponse"
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Submission not found
+        "409":
+          description: Submission has unresolved blocking flags
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  # -----------------------------------------------------------------------
+  # evalpen_flagged_async.py  (mounted at /api/v1/evalpen/flagged)
+  # -----------------------------------------------------------------------
+
+  /api/v1/evalpen/flagged/queue:
+    get:
+      operationId: getFlaggedQueue
+      summary: Get all responses with unresolved blocking flags
+      description: |
+        Returns the teacher review queue: all detected responses where at
+        least one flag has severity "blocking" and has not been resolved.
+        Supports optional exam_id filtering and pagination.
+      tags: [Flagged]
       parameters:
         - name: exam_id
           in: query
+          required: false
           schema:
             type: string
-            format: uuid
-        - name: status
+          description: Filter by exam_id (joins through evalpen_submissions)
+        - name: limit
           in: query
+          required: false
           schema:
-            type: string
-            enum: [filed, assigned, reviewing, resolved, escalated]
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+        - name: skip
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
       responses:
         "200":
-          description: Objection list
+          description: Paginated list of flagged responses
           content:
             application/json:
               schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ObjectionSummary"
-    post:
-      summary: File a new objection
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateObjectionRequest"
-      responses:
-        "201":
-          description: Objection created
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ObjectionDetail"
-  /api/v1/objections/{objection_id}:
+                $ref: "#/components/schemas/FlaggedQueueResponse"
+        "403":
+          description: Insufficient permissions
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/flagged/queue/{submission_id}:
     get:
-      summary: Get objection detail
+      operationId: getFlaggedForSubmission
+      summary: Get flagged responses for a specific submission
+      description: |
+        Returns all responses that have any blocking flags (resolved or
+        unresolved) for a single submission, giving teacher review context.
+      tags: [Flagged]
       parameters:
-        - name: objection_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/SubmissionIdPath"
       responses:
         "200":
-          description: Objection detail
+          description: Flagged responses for the submission
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ObjectionDetail"
-  /api/v1/objections/{objection_id}/resolve:
+                $ref: "#/components/schemas/FlaggedSubmissionResponse"
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Submission not found
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/flagged/{response_id}/review:
     post:
-      summary: Resolve an objection
+      operationId: reviewFlaggedResponse
+      summary: Teacher reviews a flagged response
+      description: |
+        Teacher resolves blocking flags on a detected response.
+
+        Actions:
+          - **accept** — resolves all blocking flags, transitions eval_status
+            to "ready" or "ready_with_warnings", allowing auto-evaluation.
+          - **reject** — marks the response as rejected (eval_status →
+            "rejected"). No evaluation will occur.
+          - **manual_score** — teacher provides a manual score directly.
+            Creates or overrides an evaluation record. Requires manual_score
+            and manual_max_score fields.
+
+        TAMPER_PROOF_SPEC Layer 3: all review actions record actor_id,
+        reason, before/after state, and timestamp.
+      tags: [Flagged]
       parameters:
-        - name: objection_id
+        - name: response_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
+          description: ID of the detected response to review
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ResolveObjectionRequest"
+              $ref: "#/components/schemas/ReviewFlaggedRequest"
       responses:
         "200":
-          description: Resolution applied
+          description: Review action applied
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ObjectionDetail"
-  /api/v1/objections/{objection_id}/escalate:
-    post:
-      summary: Escalate an objection to a senior reviewer
+                $ref: "#/components/schemas/ReviewFlaggedResponse"
+        "400":
+          description: Invalid request (bad action, missing manual_score fields, score > max)
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Response not found
+        "409":
+          description: Response has no unresolved blocking flags to review
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+  /api/v1/evalpen/flagged/stats:
+    get:
+      operationId: getFlagStats
+      summary: Get flag resolution statistics
+      description: |
+        Returns counts of total flagged responses, blocking vs warning flags,
+        resolved vs unresolved, grouped by flag_type and severity.
+      tags: [Flagged]
       parameters:
-        - name: objection_id
-          in: path
-          required: true
+        - name: exam_id
+          in: query
+          required: false
           schema:
             type: string
-            format: uuid
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/EscalateObjectionRequest"
+          description: Filter stats by exam_id
       responses:
         "200":
-          description: Escalation applied
+          description: Flag statistics
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ObjectionDetail"
+                $ref: "#/components/schemas/FlagStats"
+        "403":
+          description: Insufficient permissions
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
+# =========================================================================
+# Components
+# =========================================================================
+
 components:
   securitySchemes:
     StoodyBearer:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: |
+        Standard Stoody JWT. Must contain user_type in
+        {admin, tutor, b2c_admin} and db_name for tenant resolution.
+
+  parameters:
+    SubmissionIdPath:
+      name: submission_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique submission identifier
+    ExamIdPath:
+      name: exam_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique exam identifier
+
   schemas:
-    ObjectionSummary:
+    # ----- Review request/response models (evalpen_review_async.py) -----
+
+    ScoreOverrideRequest:
       type: object
-      required: [objection_id, exam_id, student_id, question_id, status, filed_at]
+      required: [new_score, reason]
       properties:
-        objection_id:
-          type: string
-          format: uuid
-        exam_id:
-          type: string
-          format: uuid
-        student_id:
-          type: string
-        question_id:
-          type: string
-        status:
-          type: string
-          enum: [filed, assigned, reviewing, resolved, escalated]
-        filed_at:
-          type: string
-          format: date-time
-    ObjectionDetail:
-      allOf:
-        - $ref: "#/components/schemas/ObjectionSummary"
-        - type: object
-          required: [objection_text]
-          properties:
-            objection_text:
-              type: string
-            assigned_to:
-              type: string
-            resolution:
-              type: string
-            resolution_reason:
-              type: string
-            score_delta:
-              type: number
-    CreateObjectionRequest:
-      type: object
-      required: [exam_id, student_id, question_id, objection_text]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        student_id:
-          type: string
-        question_id:
-          type: string
-        objection_text:
-          type: string
-          minLength: 10
-    ResolveObjectionRequest:
-      type: object
-      required: [actor_id, resolution, reason]
-      properties:
-        actor_id:
-          type: string
-        resolution:
-          type: string
-          enum: [approved, rejected]
+        new_score:
+          type: number
+          minimum: 0
+          description: New total score to assign
         reason:
           type: string
           minLength: 5
+          description: Human-readable justification (min 5 chars, per TAMPER_PROOF_SPEC)
+
+    ScoreOverrideResponse:
+      type: object
+      properties:
+        evaluation_id:
+          type: string
+        previous_score:
+          type: number
         new_score:
           type: number
-    EscalateObjectionRequest:
-      type: object
-      required: [actor_id, escalated_to, reason]
-      properties:
         actor_id:
           type: string
-        escalated_to:
+        overridden_at:
+          type: string
+          format: date-time
+
+    PublishRequest:
+      type: object
+      properties:
+        note:
+          type: string
+          nullable: true
+          description: Optional note attached to the publication action
+
+    PublishResponse:
+      type: object
+      properties:
+        submission_id:
+          type: string
+        publication_status:
+          type: string
+          enum: [published]
+        published_at:
+          type: string
+          format: date-time
+        published_by:
+          type: string
+
+    ResponseSummary:
+      type: object
+      description: Summary of a single detected response within a submission review
+      properties:
+        response_id:
+          type: string
+        question_id:
+          type: string
+          nullable: true
+        content_type:
+          type: string
+          default: TEXT_ONLY
+        eval_status:
+          type: string
+          default: pending
+          description: "One of: pending, blocked, ready, ready_with_warnings, evaluated, rejected, manual_review"
+        total_score:
+          type: number
+          nullable: true
+        max_score:
+          type: number
+          nullable: true
+        overall_feedback:
+          type: string
+          nullable: true
+        flags:
+          type: array
+          nullable: true
+          items:
+            $ref: "#/components/schemas/ResponseFlagSummary"
+        has_blocking_flags:
+          type: boolean
+          default: false
+
+    ResponseFlagSummary:
+      type: object
+      description: Serialized flag within a response summary
+      properties:
+        flag_id:
+          type: string
+        source:
+          type: string
+        flag_type:
+          type: string
+        severity:
           type: string
         reason:
           type: string
+        suggested_action:
+          type: string
+          nullable: true
+        resolved:
+          type: boolean
+
+    SubmissionSummaryReview:
+      type: object
+      description: Full evaluation summary for a single submission
+      required: [submission_id, exam_id, student_id]
+      properties:
+        submission_id:
+          type: string
+        exam_id:
+          type: string
+        student_id:
+          type: string
+        source:
+          type: string
+          default: camera
+        segmentation_status:
+          type: string
+          default: pending
+        publication_status:
+          type: string
+          nullable: true
+        responses:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResponseSummary"
+        total_score:
+          type: number
+          default: 0
+        total_max_score:
+          type: number
+          default: 0
+        evaluated_count:
+          type: integer
+          default: 0
+        blocked_count:
+          type: integer
+          default: 0
+        pending_count:
+          type: integer
+          default: 0
+
+    ExamResultStudent:
+      type: object
+      description: Per-student result row for exam-level results
+      properties:
+        student_id:
+          type: string
+        submission_id:
+          type: string
+          nullable: true
+        pcr_total_score:
+          type: number
+          default: 0
+        pcr_max_score:
+          type: number
+          default: 0
+        dcr_total_score:
+          type: number
+          default: 0
+        dcr_max_score:
+          type: number
+          default: 0
+        combined_total:
+          type: number
+          default: 0
+        combined_max:
+          type: number
+          default: 0
+        publication_status:
+          type: string
+          nullable: true
+        blocked_responses:
+          type: integer
+          default: 0
+
+    ExamResults:
+      type: object
+      description: Aggregated results for an entire exam
+      required: [exam_id]
+      properties:
+        exam_id:
+          type: string
+        students:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExamResultStudent"
+        total_students:
+          type: integer
+          default: 0
+
+    # ----- Flagged request/response models (evalpen_flagged_async.py) -----
+
+    FlagDetail:
+      type: object
+      description: Detailed flag information for queue display
+      properties:
+        flag_id:
+          type: string
+        source:
+          type: string
+        flag_type:
+          type: string
+        severity:
+          type: string
+        reason:
+          type: string
+        suggested_action:
+          type: string
+          nullable: true
+        resolved:
+          type: boolean
+          default: false
+        resolution:
+          type: object
+          nullable: true
+          description: Resolution metadata (resolved_by, resolved_at, note, etc.)
+
+    FlaggedResponse:
+      type: object
+      description: A flagged response in the review queue
+      properties:
+        response_id:
+          type: string
+        submission_id:
+          type: string
+        question_id:
+          type: string
+          nullable: true
+        detected_text:
+          type: string
+          nullable: true
+        content_type:
+          type: string
+          default: TEXT_ONLY
+        eval_status:
+          type: string
+          default: blocked
+        segmentation_confidence:
+          type: number
+          nullable: true
+        ocr_confidence:
+          type: number
+          nullable: true
+        flags:
+          type: array
+          items:
+            $ref: "#/components/schemas/FlagDetail"
+        blocking_flag_count:
+          type: integer
+          default: 0
+        unresolved_blocking_count:
+          type: integer
+          default: 0
+
+    FlaggedQueueResponse:
+      type: object
+      description: Paginated flagged-response queue
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/FlaggedResponse"
+        total:
+          type: integer
+          description: Total count matching the query (before pagination)
+        limit:
+          type: integer
+        skip:
+          type: integer
+
+    FlaggedSubmissionResponse:
+      type: object
+      description: Flagged responses scoped to a single submission
+      properties:
+        submission_id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/FlaggedResponse"
+        total:
+          type: integer
+
+    ReviewFlaggedRequest:
+      type: object
+      required: [action, reason]
+      properties:
+        action:
+          type: string
+          enum: [accept, reject, manual_score]
+          description: "Review action to take"
+        reason:
+          type: string
+          minLength: 5
+          description: Justification for the review action (min 5 chars)
+        manual_score:
+          type: number
+          minimum: 0
+          nullable: true
+          description: Manual score (required when action=manual_score)
+        manual_max_score:
+          type: number
+          minimum: 0
+          nullable: true
+          description: Max score for manual scoring (required when action=manual_score)
+
+    ReviewFlaggedResponse:
+      type: object
+      description: |
+        Response shape varies slightly by action but always includes these
+        common fields. manual_score action adds evaluation_id, previous_score,
+        new_score, and max_score.
+      properties:
+        response_id:
+          type: string
+        action:
+          type: string
+          enum: [accept, reject, manual_score]
+        previous_eval_status:
+          type: string
+        new_eval_status:
+          type: string
+          description: "accept → ready|ready_with_warnings, reject → rejected, manual_score → manual_review"
+        flags_resolved:
+          type: integer
+          description: Number of blocking flags resolved (present for accept/reject)
+        evaluation_id:
+          type: string
+          description: Present only for manual_score action
+        previous_score:
+          type: number
+          nullable: true
+          description: Present only for manual_score action
+        new_score:
+          type: number
+          description: Present only for manual_score action
+        max_score:
+          type: number
+          description: Present only for manual_score action
+        reviewed_by:
+          type: string
+        reviewed_at:
+          type: string
+          format: date-time
+
+    FlagStats:
+      type: object
+      description: Flag resolution statistics
+      properties:
+        total_flagged_responses:
+          type: integer
+          default: 0
+        total_blocking_flags:
+          type: integer
+          default: 0
+        resolved_blocking_flags:
+          type: integer
+          default: 0
+        unresolved_blocking_flags:
+          type: integer
+          default: 0
+        by_flag_type:
+          type: object
+          additionalProperties:
+            type: integer
+          description: "Flag counts keyed by flag_type string"
+        by_severity:
+          type: object
+          additionalProperties:
+            type: integer
+          description: "Flag counts keyed by severity string"

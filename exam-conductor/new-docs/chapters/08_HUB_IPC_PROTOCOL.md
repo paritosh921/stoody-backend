@@ -1,52 +1,36 @@
 # Chapter 08: Hub IPC Protocol
 
 ## Status
-- **Phase:** P2a
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `hub/ipc-protocol.md`
 
 ## Overview
 
-Inter-process communication between hub modules via Unix domain sockets with
-JSON-lines encoding. Defines message types, routing, error handling, and the
-supervisor's role as the central hub orchestrator.
+Hub IPC is an internal coordination contract inside the shared ingest substrate. It exists so collection, buffering, timer, invigilator relay, and upload modules can coordinate without leaking evaluator concerns into hub code.
 
 ## Architecture Context
 
-<!-- TODO: Diagram showing hub-supervisor as central IPC router connecting
-     hub-ble-mgr, hub-pen-sync, hub-timer, hub-store, hub-uplink,
-     hub-invig-ble, hub-tui. Reference Chapter 01 and hub/ipc-protocol.md. -->
+```text
+hub BLE mgr
+     │
+     ├-> hub store
+     ├-> hub timer
+     ├-> hub uplink
+     ├-> hub invigilator relay
+     └-> hub TUI
+          │
+          ▼
+   canonical artifact upload
+```
 
-## Detailed Design
+## Alignment Rules
 
-### Socket Topology
-<!-- TODO: Unix domain socket paths, connection lifecycle. -->
+1. IPC messages may describe collection state, upload state, and local failures.
+2. IPC messages must not embed DCR or PCR scoring logic.
+3. The engine boundary starts after canonical artifact persistence.
 
-### Message Format
-<!-- TODO: JSON-lines encoding, message types, request/response correlation. -->
+## Related Docs
 
-### Supervisor Orchestration
-<!-- TODO: Process management, FSM coordination, health monitoring. -->
-
-### Error Handling
-<!-- TODO: Reconnect logic, dead module detection, graceful degradation. -->
-
-## Interfaces
-<!-- TODO: Full IPC message catalog from hub/ipc-protocol.md. -->
-
-## Configuration
-<!-- TODO: Socket paths, timeouts, retry policies. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries F4 (hub reboot),
-     S4 (SD failure). -->
-
-## Testing
-<!-- TODO: Reference hub integration test IDs. -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `hub/ipc-protocol.md`
+- `integration/HUB_DEPLOYMENT_SPEC.md`
+- `chapters/04_HUB_OPERATIONS.md`

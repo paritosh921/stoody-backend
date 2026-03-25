@@ -1,5 +1,9 @@
 # R-009 | Student Response Evaluation Engine — Consolidated Architecture Plan (Rev 3)
 
+> Status: SUPERSEDED historical reference.
+> Active authority has moved into `backend/exam-conductor/new-docs/`, especially `PCR_EVAL_ENGINE_SPEC.md`, `LLM_GATE_SPEC.md`, `TAMPER_PROOF_SPEC.md`, and `DUAL_MODE_ARCHITECTURE.md`.
+> Keep this file only for traceability while porting any missing PCR detail into the active docs.
+
 **Version:** 3.0  
 **Date:** 2026-03-24  
 **Status:** Architecture Locked  

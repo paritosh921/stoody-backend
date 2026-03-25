@@ -1,54 +1,25 @@
 # Chapter 18: Copy Image Fallback
 
 ## Status
-- **Phase:** P2i-ext
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `api/copy-upload.openapi.yaml`
 
 ## Overview
 
-Fallback answer capture via photographed answer sheets (svc-copy-upload). When
-pen data is unavailable (pen failure, data loss), the invigilator or student
-photographs answer pages. The service handles image upload, OCR processing,
-and feeds results into the scoring pipeline via the copy.ready event.
+Copy-image fallback is a camera-based conducted-exam ingest path. It feeds the shared ingest substrate and is primarily routed to PCR because PCR can normalize image pages into `PageOCR`.
 
-## Architecture Context
+```text
+camera upload -> canonical image artifact -> exam_type / source routing -> PCR engine
+```
 
-<!-- TODO: Diagram showing mobile camera -> svc-copy-upload -> MinIO storage
-     -> OCR -> score pipeline entry. Reference Chapter 01 and
-     FAILURE_MITIGATION_REGISTER.md A1.5 (pen battery death mitigation). -->
+## Alignment Rules
 
-## Detailed Design
+1. Camera fallback does not redefine hub ownership of pen-originated artifacts.
+2. Image uploads must preserve the same provenance fields as pen uploads.
+3. Fallback images do not bypass tamper-proof or review rules.
 
-### Upload Flow
-<!-- TODO: Image capture, compression, upload to svc-copy-upload REST API. -->
+## Related Docs
 
-### OCR Processing
-<!-- TODO: Image preprocessing, OCR engine, text extraction. -->
-
-### Pipeline Integration
-<!-- TODO: copy.ready event emission, score engine consumption. -->
-
-### Quality Validation
-<!-- TODO: Image quality checks, blur detection, re-upload prompting. -->
-
-## Interfaces
-<!-- TODO: REST endpoints from api/copy-upload.openapi.yaml,
-     NATS event copy.ready. -->
-
-## Configuration
-<!-- TODO: Image size limits, OCR engine settings, MinIO bucket. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries A1.5
-     (pen death -> copy fallback), S4 (dual storage failure -> copy fallback). -->
-
-## Testing
-<!-- TODO: Reference test IDs E2E-07 (copy image upload -> OCR -> score). -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `api/copy-upload.openapi.yaml`
+- `architecture/PCR_EVAL_ENGINE_SPEC.md`
+- `architecture/TAMPER_PROOF_SPEC.md`

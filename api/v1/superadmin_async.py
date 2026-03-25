@@ -7,6 +7,7 @@ import calendar
 import logging
 import os
 import re
+import secrets
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
@@ -2376,4 +2377,314 @@ async def get_billing_summary(
         "next_due_date": next_due.strftime("%Y-%m-%d"),
         "currency": pricing.get("currency", "USD"),
         "currency_symbol": pricing.get("currency_symbol", "$"),
+    }
+
+
+# ============================================================================
+# EXAMPEN HUB PROVISIONING & GATE ADMIN (Tasks 6-7)
+# ============================================================================
+
+# Public router for hub self-provisioning (no superadmin auth required)
+hub_provision_router = APIRouter()
+
+
+# ---- Pydantic models for ExamPen endpoints ----
+
+class HubProvisionCodeRequest(BaseModel):
+    institution_id: str = Field(..., min_length=9, max_length=9, pattern=r'^[A-Z]{4}-[0-9]{4}$')
+    note: Optional[str] = None
+
+
+class HubProvisionRequest(BaseModel):
+    hub_code: str = Field(..., min_length=12, max_length=12)
+    hub_mac: Optional[str] = None
+
+
+class GateConfigUpdateRequest(BaseModel):
+    daily_token_limit: Optional[int] = Field(None, ge=1)
+    weekly_token_limit: Optional[int] = Field(None, ge=1)
+    monthly_token_limit: Optional[int] = Field(None, ge=1)
+
+
+# ---- Task 6: Hub Provisioning ----
+
+@router.post("/evalpen/hubs/provision-code")
+async def generate_hub_provision_code(
+    request: HubProvisionCodeRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Generate a single-use provisioning code for a hub to register against a tenant."""
+    master_db = await get_master_db_or_503(db)
+
+    institution_id = normalize_institution_id(request.institution_id)
+
+    # Verify the tenant exists
+    tenant = await master_db["tenants"].find_one({
+        "institution_id": institution_id,
+        "status": {"$in": ["active", "approved"]},
+    })
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found or not active")
+
+    # Generate 12-char alphanumeric code
+    code = secrets.token_urlsafe(9)[:12].upper()
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+
+    await master_db["exampen_hub_provision_codes"].insert_one({
+        "code": code,
+        "institution_id": institution_id,
+        "note": request.note,
+        "created_by": admin["admin_id"],
+        "created_at": datetime.utcnow(),
+        "expires_at": expires_at,
+        "used": False,
+    })
+
+    return {
+        "code": code,
+        "expires_at": expires_at.isoformat(),
+        "institution_id": institution_id,
+    }
+
+
+@hub_provision_router.post("/api/v1/hubs/provision")
+async def provision_hub(
+    request: HubProvisionRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    """Public endpoint — hub calls this with a provisioning code to register itself."""
+    master_db = await get_master_db_or_503(db)
+
+    code_doc = await master_db["exampen_hub_provision_codes"].find_one({
+        "code": request.hub_code,
+        "used": False,
+    })
+    if not code_doc:
+        raise HTTPException(status_code=404, detail="Invalid or already-used provisioning code")
+
+    if code_doc["expires_at"] < datetime.utcnow():
+        raise HTTPException(status_code=410, detail="Provisioning code has expired")
+
+    institution_id = code_doc["institution_id"]
+
+    # Verify the tenant still exists and is active
+    tenant = await master_db["tenants"].find_one({
+        "institution_id": institution_id,
+        "status": {"$in": ["active", "approved"]},
+    })
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant associated with this code is no longer active")
+
+    # Create the hub record
+    hub_id = f"hub-{secrets.token_hex(8)}"
+    now = datetime.utcnow()
+
+    hub_doc = {
+        "hub_id": hub_id,
+        "institution_id": institution_id,
+        "hub_mac": request.hub_mac,
+        "status": "active",
+        "provisioned_at": now,
+        "last_seen_at": now,
+        "provision_code": request.hub_code,
+    }
+    await master_db["exampen_hubs"].insert_one(hub_doc)
+
+    # Mark the code as used (single-use)
+    await master_db["exampen_hub_provision_codes"].update_one(
+        {"_id": code_doc["_id"]},
+        {"$set": {"used": True, "used_at": now, "used_by_hub_id": hub_id}},
+    )
+
+    # Build backend URL from settings
+    backend_url = getattr(settings, "BACKEND_URL", "") or ""
+
+    return {
+        "hub_id": hub_id,
+        "institution_id": institution_id,
+        "backend_url": backend_url,
+        "config": {},
+    }
+
+
+@router.get("/evalpen/hubs")
+async def list_provisioned_hubs(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """List all provisioned ExamPen hubs."""
+    master_db = await get_master_db_or_503(db)
+
+    hubs_cursor = master_db["exampen_hubs"].find({}).sort("provisioned_at", -1)
+    hubs = await hubs_cursor.to_list(length=1000)
+
+    return {
+        "hubs": [
+            {
+                "hub_id": h["hub_id"],
+                "institution_id": h["institution_id"],
+                "status": h.get("status", "unknown"),
+                "last_seen_at": h["last_seen_at"].isoformat() if h.get("last_seen_at") else None,
+                "provisioned_at": h["provisioned_at"].isoformat() if h.get("provisioned_at") else None,
+            }
+            for h in hubs
+        ]
+    }
+
+
+# ---- Task 7: Super-admin Gate Admin ----
+
+async def _get_exampen_tenants(master_db) -> List[Dict[str, Any]]:
+    """Return tenants that have the exampen feature enabled via v2 overrides."""
+    tenants = await master_db["tenants"].find({
+        "status": {"$in": ["active", "approved"]},
+        "enabled_features_v2.overrides.exampen": True,
+    }).to_list(length=1000)
+    return tenants
+
+
+@router.get("/evalpen/gate/tenants")
+async def list_gate_tenants(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """List tenants with ExamPen enabled and their LLM gate config."""
+    master_db = await get_master_db_or_503(db)
+    tenants = await _get_exampen_tenants(master_db)
+
+    result = []
+    for tenant in tenants:
+        institution_id = tenant.get("institution_id", "")
+        db_name = tenant.get("db_name", "")
+
+        gate_config = None
+        if db_name:
+            try:
+                tenant_db = await db.get_tenant_db(db_name)
+                if tenant_db is not None:
+                    config_doc = await tenant_db["llm_gate_config"].find_one({"_id": "gate_config"})
+                    if config_doc:
+                        config_doc.pop("_id", None)
+                        gate_config = convert_objectids(config_doc)
+            except Exception:
+                logger.warning("Failed to fetch gate config for tenant %s", db_name)
+
+        result.append({
+            "institution_id": institution_id,
+            "db_name": db_name,
+            "gate_config": gate_config,
+        })
+
+    return {"tenants": result}
+
+
+@router.put("/evalpen/gate/tenants/{institution_id}/config")
+async def update_gate_config(
+    institution_id: str,
+    request: GateConfigUpdateRequest,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Override LLM gate config for a specific ExamPen-enabled tenant."""
+    master_db = await get_master_db_or_503(db)
+    institution_id = normalize_institution_id(institution_id)
+
+    tenant = await master_db["tenants"].find_one({
+        "institution_id": institution_id,
+        "status": {"$in": ["active", "approved"]},
+    })
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found or not active")
+
+    db_name = tenant.get("db_name")
+    if not db_name:
+        raise HTTPException(status_code=404, detail="Tenant has no database configured")
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Could not connect to tenant database")
+
+    # Build the $set payload from provided fields only
+    update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if request.daily_token_limit is not None:
+        update_fields["daily_token_limit"] = request.daily_token_limit
+    if request.weekly_token_limit is not None:
+        update_fields["weekly_token_limit"] = request.weekly_token_limit
+    if request.monthly_token_limit is not None:
+        update_fields["monthly_token_limit"] = request.monthly_token_limit
+
+    await tenant_db["llm_gate_config"].update_one(
+        {"_id": "gate_config"},
+        {"$set": update_fields},
+        upsert=True,
+    )
+
+    return {
+        "success": True,
+        "institution_id": institution_id,
+        "updated_fields": {k: v for k, v in update_fields.items() if k != "updated_at"},
+    }
+
+
+@router.get("/evalpen/gate/usage/aggregate")
+async def aggregate_gate_usage(
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Cross-tenant usage summary for all ExamPen-enabled tenants."""
+    master_db = await get_master_db_or_503(db)
+    tenants = await _get_exampen_tenants(master_db)
+
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    total_tokens_today = 0
+    total_cost_today_usd = 0.0
+    by_tenant = []
+
+    for tenant in tenants:
+        institution_id = tenant.get("institution_id", "")
+        db_name = tenant.get("db_name", "")
+
+        tenant_tokens = 0
+        tenant_cost = 0.0
+
+        if db_name:
+            try:
+                tenant_db = await db.get_tenant_db(db_name)
+                if tenant_db is not None:
+                    pipeline = [
+                        {"$match": {"called_at": {"$gte": today_start}}},
+                        {"$group": {
+                            "_id": None,
+                            "total_tokens": {"$sum": "$total_tokens"},
+                            "total_cost_usd": {"$sum": "$estimated_cost_usd"},
+                        }},
+                    ]
+                    results = await tenant_db["llm_token_usage_log"].aggregate(
+                        pipeline
+                    ).to_list(length=1)
+                    if results:
+                        tenant_tokens = int(results[0].get("total_tokens", 0))
+                        tenant_cost = float(results[0].get("total_cost_usd", 0.0))
+            except Exception:
+                logger.warning(
+                    "Failed to aggregate gate usage for tenant %s", db_name
+                )
+
+        total_tokens_today += tenant_tokens
+        total_cost_today_usd += tenant_cost
+
+        by_tenant.append({
+            "institution_id": institution_id,
+            "db_name": db_name,
+            "tokens_today": tenant_tokens,
+            "cost_today_usd": round(tenant_cost, 6),
+        })
+
+    return {
+        "total_tokens_today": total_tokens_today,
+        "total_cost_today_usd": round(total_cost_today_usd, 6),
+        "by_tenant": by_tenant,
     }

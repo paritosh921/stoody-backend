@@ -1,26 +1,35 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Analytics API
-  version: "1.0.0"
-  description: Percentiles, leaderboard, class statistics, and export metadata.
+  version: "2.0.0"
+  description: |
+    Read-only analytics APIs over finalized DCR and PCR outputs.
+    Analytics is downstream of evaluation and publication; it does not own engine state.
 servers:
   - url: /
 security:
   - StoodyBearer: []
 paths:
+  /api/v1/analytics/exams/{exam_id}/summary:
+    get:
+      summary: Get published analytics summary for one exam
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+      responses:
+        "200":
+          description: Analytics summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamAnalyticsSummary"
   /api/v1/analytics/exams/{exam_id}/leaderboard:
     get:
       summary: Get leaderboard rows for one exam
       parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/ExamId"
       responses:
         "200":
-          description: Leaderboard
+          description: Leaderboard rows
           content:
             application/json:
               schema:
@@ -31,142 +40,46 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/LeaderboardRow"
-  /api/v1/analytics/exams/{exam_id}/class-stats:
-    get:
-      summary: Get class-level statistics for one exam
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Class statistics
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ClassStats"
-  /api/v1/analytics/students/{student_id}/performance:
-    get:
-      summary: Get longitudinal performance for one student
-      parameters:
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Student trend data
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StudentPerformance"
-  /api/v1/analytics/exams/{exam_id}/export:
-    get:
-      summary: Get export metadata for a generated report
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: format
-          in: query
-          required: true
-          schema:
-            type: string
-            enum: [csv, pdf]
-      responses:
-        "200":
-          description: Export metadata
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExportResult"
 components:
   securitySchemes:
     StoodyBearer:
       type: http
       scheme: bearer
       bearerFormat: JWT
+  parameters:
+    ExamId:
+      name: exam_id
+      in: path
+      required: true
+      schema:
+        type: string
   schemas:
-    LeaderboardRow:
+    ExamAnalyticsSummary:
       type: object
-      required: [rank, student_id, score, percentile]
-      properties:
-        rank:
-          type: integer
-        student_id:
-          type: string
-        student_name:
-          type: string
-        score:
-          type: number
-        percentile:
-          type: number
-    ClassStats:
-      type: object
-      required: [mean, median, std_dev, pass_rate]
-      properties:
-        mean:
-          type: number
-        median:
-          type: number
-        std_dev:
-          type: number
-        pass_rate:
-          type: number
-        question_difficulty:
-          type: array
-          items:
-            type: object
-            required: [question_id, avg_score]
-            properties:
-              question_id:
-                type: string
-              avg_score:
-                type: number
-    StudentPerformance:
-      type: object
-      required: [student_id, history]
-      properties:
-        student_id:
-          type: string
-        history:
-          type: array
-          items:
-            type: object
-            required: [exam_id, score, percentile]
-            properties:
-              exam_id:
-                type: string
-                format: uuid
-              score:
-                type: number
-              percentile:
-                type: number
-        strengths:
-          type: array
-          items:
-            type: string
-        weaknesses:
-          type: array
-          items:
-            type: string
-    ExportResult:
-      type: object
-      required: [exam_id, format, download_uri]
+      required: [exam_id, exam_type, student_count, published_count]
       properties:
         exam_id:
           type: string
-          format: uuid
-        format:
+        exam_type:
           type: string
-          enum: [csv, pdf]
-        download_uri:
+          enum: [dcr, pcr]
+        student_count:
+          type: integer
+        published_count:
+          type: integer
+        average_score:
+          type: number
+        percentile_bands:
+          type: array
+          items:
+            type: object
+    LeaderboardRow:
+      type: object
+      required: [student_id, rank, total_score]
+      properties:
+        student_id:
           type: string
-          format: uri
+        rank:
+          type: integer
+        total_score:
+          type: number

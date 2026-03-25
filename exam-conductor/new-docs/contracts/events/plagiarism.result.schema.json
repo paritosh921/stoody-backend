@@ -15,32 +15,21 @@
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "plagiarism.result" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
     "flags": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "flag_id",
-          "student_a_id",
-          "student_b_id",
-          "question_id",
-          "composite_score",
-          "severity"
-        ],
+        "required": ["flag_id", "question_id", "severity"],
         "properties": {
-          "flag_id": { "type": "string", "format": "uuid" },
-          "student_a_id": { "type": "string" },
-          "student_b_id": { "type": "string" },
+          "flag_id": { "type": "string" },
           "question_id": { "type": "string" },
-          "composite_score": { "type": "number" },
-          "severity": {
-            "type": "string",
-            "enum": ["review_recommended", "strong_match"]
-          }
+          "severity": { "type": "string" },
+          "student_a_id": { "type": "string" },
+          "student_b_id": { "type": "string" }
         }
       }
     }

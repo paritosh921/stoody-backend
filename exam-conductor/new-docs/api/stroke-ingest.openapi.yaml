@@ -1,11 +1,10 @@
 openapi: "3.1.0"
 info:
-  title: ExamPen Stroke Ingest API
-  version: "1.0.0"
+  title: ExamPen Shared Ingest API
+  version: "2.0.0"
   description: |
-    Chunk-oriented ingest API used by the hub upload path.
-    Upload acknowledgement is per chunk. Hub marks a pen uploaded only when all chunks
-    are acknowledged.
+    Conducted-exam ingest APIs for the shared substrate.
+    The substrate persists canonical artifacts, attaches provenance, and routes by `exam_type`.
 servers:
   - url: /
 security:
@@ -13,7 +12,7 @@ security:
 paths:
   /api/v1/strokes/ingest:
     post:
-      summary: Ingest one uploaded chunk from the hub
+      summary: Ingest one uploaded pen chunk from the hub
       requestBody:
         required: true
         content:
@@ -29,21 +28,20 @@ paths:
                 $ref: "#/components/schemas/IngestAck"
   /api/v1/exams/{exam_id}/upload-status:
     get:
-      summary: Return per-pen upload progress for reconciliation
+      summary: Get upload progress and engine route for one exam
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         "200":
-          description: Upload reconciliation state
+          description: Upload progress
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExamUploadStatus"
+                type: object
 components:
   securitySchemes:
     StoodyBearer:
@@ -54,11 +52,21 @@ components:
     StrokeChunkUploadRequest:
       type: object
       required:
-        [exam_id, pen_mac, chunk_index, total_chunks, payload_base64, checksum_crc32, upload_path, idempotency_key]
+        - exam_id
+        - exam_type
+        - student_id
+        - pen_mac
+        - chunk_index
+        - total_chunks
+        - payload_base64
       properties:
         exam_id:
           type: string
-          format: uuid
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        student_id:
+          type: string
         pen_mac:
           type: string
         chunk_index:
@@ -67,58 +75,11 @@ components:
           type: integer
         payload_base64:
           type: string
-        checksum_crc32:
-          type: string
-        upload_path:
-          type: string
-          enum: [wifi, mobile]
-        idempotency_key:
-          type: string
-          description: Usually `{exam_id}:{pen_mac}:{chunk_index}`
-        binding_status:
-          type: string
-          enum: [unknown, provisional, confirmed, rejected]
     IngestAck:
       type: object
-      required: [exam_id, pen_mac, chunk_index, accepted, deduplicated, next_expected_chunk]
+      required: [artifact_id, deduplicated]
       properties:
-        exam_id:
+        artifact_id:
           type: string
-          format: uuid
-        pen_mac:
-          type: string
-        chunk_index:
-          type: integer
-        accepted:
-          type: boolean
         deduplicated:
-          type: boolean
-        next_expected_chunk:
-          type: integer
-        pen_upload_complete:
-          type: boolean
-    ExamUploadStatus:
-      type: object
-      required: [exam_id, pens]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        pens:
-          type: array
-          items:
-            $ref: "#/components/schemas/PenUploadStatus"
-    PenUploadStatus:
-      type: object
-      required: [pen_mac, acked_chunks, total_chunks, complete]
-      properties:
-        pen_mac:
-          type: string
-        acked_chunks:
-          type: array
-          items:
-            type: integer
-        total_chunks:
-          type: integer
-        complete:
           type: boolean

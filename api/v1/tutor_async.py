@@ -2381,3 +2381,436 @@ async def get_tutor_document_detail_analytics(
         raise HTTPException(
             status_code=500, detail="Failed to fetch document detail analytics"
         )
+
+
+# ---------------------------------------------------------------------------
+# ExamPen metadata sync hooks (SWM-013)
+# ---------------------------------------------------------------------------
+# These helpers optionally push question metadata to the ExamPen
+# ``evalpen_questions`` collection when a tutor creates or updates
+# exam/question-paper data.
+#
+# Graceful degradation: if the exam-conductor package is not available
+# (e.g. in deployments without ExamPen), all operations silently no-op.
+#
+# Usage from tutor or paper-builder flows:
+#
+#     from api.v1.tutor_async import sync_questions_to_exampen
+#     await sync_questions_to_exampen(tenant_db, questions, exam_id, subject)
+#
+# Constraint C5: reuses existing tutor/backend question-paper data.
+# ---------------------------------------------------------------------------
+
+
+async def sync_questions_to_exampen(
+    tenant_db,
+    questions: List[Dict[str, Any]],
+    exam_id: str,
+    default_subject: Optional[str] = None,
+) -> Optional[Dict[str, int]]:
+    """Sync question metadata to ExamPen ``evalpen_questions`` via PCR adapter.
+
+    Parameters
+    ----------
+    tenant_db
+        Motor tenant database (``skb_<tenant>``).
+    questions
+        List of question dicts from the tutor/paper-builder workflow.
+    exam_id
+        Exam/paper identifier to tag questions with.
+    default_subject
+        Fallback subject when individual questions lack one.
+
+    Returns
+    -------
+    dict or None
+        ``{"inserted": N, "updated": M}`` on success, ``None`` if the
+        exam-conductor module is not available.
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        adapter_mod = load_exampen("pcr.metadata_adapter")
+        storage_mod = load_exampen("pcr.storage")
+
+        adapt_question_to_pcr = adapter_mod.adapt_question_to_pcr
+        QuestionRepository = storage_mod.QuestionRepository
+    except ImportError:
+        _logger.debug(
+            "ExamPen modules not available; skipping evalpen_questions sync."
+        )
+        return None
+
+    try:
+        repo = QuestionRepository(tenant_db)
+
+        pcr_docs = []
+        for q in questions:
+            pcr_doc = adapt_question_to_pcr(
+                q,
+                exam_id=exam_id,
+                default_subject=default_subject,
+            )
+            if pcr_doc.get("question_id"):
+                pcr_docs.append(pcr_doc)
+
+        if not pcr_docs:
+            _logger.debug(
+                "No valid questions to sync to evalpen_questions for exam %s.",
+                exam_id,
+            )
+            return {"inserted": 0, "updated": 0}
+
+        inserted, updated = await repo.upsert_questions_bulk(pcr_docs)
+        _logger.info(
+            "ExamPen question metadata synced for exam %s: "
+            "%d inserted, %d updated.",
+            exam_id,
+            inserted,
+            updated,
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    except Exception as exc:
+        _logger.warning(
+            "Failed to sync question metadata to ExamPen for exam %s: %s",
+            exam_id,
+            exc,
+        )
+        return None
+
+
+async def sync_paper_to_exampen(
+    tenant_db,
+    paper_doc: Dict[str, Any],
+) -> Optional[Dict[str, int]]:
+    """Sync a full question-paper document to ExamPen ``evalpen_questions``.
+
+    Extracts questions from the paper's ``sections[].questions[]``
+    structure and syncs them via the PCR metadata adapter.
+
+    Parameters
+    ----------
+    tenant_db
+        Motor tenant database (``skb_<tenant>``).
+    paper_doc
+        A question-paper document from the paper-builder collection.
+
+    Returns
+    -------
+    dict or None
+        ``{"inserted": N, "updated": M}`` on success, ``None`` if the
+        exam-conductor module is not available.
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        adapter_mod = load_exampen("pcr.metadata_adapter")
+        storage_mod = load_exampen("pcr.storage")
+
+        adapt_paper_questions_to_pcr = adapter_mod.adapt_paper_questions_to_pcr
+        QuestionRepository = storage_mod.QuestionRepository
+    except ImportError:
+        _logger.debug(
+            "ExamPen modules not available; skipping paper sync."
+        )
+        return None
+
+    try:
+        repo = QuestionRepository(tenant_db)
+
+        pcr_docs = adapt_paper_questions_to_pcr(paper_doc)
+        pcr_docs = [d for d in pcr_docs if d.get("question_id")]
+
+        if not pcr_docs:
+            return {"inserted": 0, "updated": 0}
+
+        inserted, updated = await repo.upsert_questions_bulk(pcr_docs)
+        paper_id = paper_doc.get("id") or paper_doc.get("_id", "unknown")
+        _logger.info(
+            "ExamPen paper metadata synced for paper %s: "
+            "%d inserted, %d updated.",
+            paper_id,
+            inserted,
+            updated,
+        )
+        return {"inserted": inserted, "updated": updated}
+
+    except Exception as exc:
+        paper_id = paper_doc.get("id") or paper_doc.get("_id", "unknown")
+        _logger.warning(
+            "Failed to sync paper metadata to ExamPen for paper %s: %s",
+            paper_id,
+            exc,
+        )
+        return None
+
+
+async def sync_answer_keys_to_dcr(
+    questions: List[Dict[str, Any]],
+    exam_doc: Optional[Dict[str, Any]] = None,
+) -> Optional[List[Any]]:
+    """Convert question data to DCR ``AnswerKey`` objects (in-memory only).
+
+    This does NOT persist anything.  It produces the ``AnswerKey`` list
+    that DCR's ``DCRService.evaluate()`` needs via the
+    ``answer_key_loader`` callback.  The caller (typically the DCR
+    evaluation route) can pass this list directly to the service.
+
+    Parameters
+    ----------
+    questions
+        List of question dicts from the tutor/paper-builder workflow.
+    exam_doc
+        Optional exam/paper document for context.
+
+    Returns
+    -------
+    list[AnswerKey] or None
+        ``None`` if the exam-conductor module is not available.
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        adapter_mod = load_exampen("dcr.metadata_adapter")
+        adapt_exam_to_answer_keys = adapter_mod.adapt_exam_to_answer_keys
+    except ImportError:
+        _logger.debug(
+            "ExamPen DCR modules not available; skipping answer key adaptation."
+        )
+        return None
+
+    try:
+        return adapt_exam_to_answer_keys(
+            exam_doc or {},
+            questions,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "Failed to adapt answer keys for DCR: %s", exc
+        )
+        return None
+
+
+async def sync_dcr_answer_keys(
+    tenant_db,
+    questions: List[Dict[str, Any]],
+    exam_id: str,
+    exam_doc: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, int]]:
+    """Persist DCR answer keys to ``exampen_answer_keys`` collection.
+
+    Converts question dicts to DCR ``AnswerKey`` objects via the
+    DCR metadata adapter and upserts them into the tenant DB so that
+    ``evalpen_dcr_async._make_answer_key_loader()`` can read them
+    at evaluation time.
+
+    Best-effort, non-blocking — callers should wrap in try/except.
+
+    Parameters
+    ----------
+    tenant_db
+        Motor tenant database (``skb_<tenant>``).
+    questions
+        List of question dicts from the tutor/paper-builder workflow.
+    exam_id
+        Exam/paper identifier to tag answer keys with.
+    exam_doc
+        Optional exam/paper document for context (passed through to
+        ``adapt_exam_to_answer_keys``).
+
+    Returns
+    -------
+    dict or None
+        ``{"upserted": N}`` on success, ``None`` if the
+        exam-conductor DCR module is not available.
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        adapter_mod = load_exampen("dcr.metadata_adapter")
+        adapt_question_to_dcr = adapter_mod.adapt_question_to_dcr
+    except ImportError:
+        _logger.debug(
+            "ExamPen DCR modules not available; skipping exampen_answer_keys sync."
+        )
+        return None
+
+    try:
+        collection = tenant_db["exampen_answer_keys"]
+
+        upserted = 0
+        for q in questions:
+            ak = adapt_question_to_dcr(q)
+            if ak is None:
+                continue
+
+            ak_doc = ak.model_dump(mode="json")
+            ak_doc["exam_id"] = exam_id
+
+            await collection.update_one(
+                {"exam_id": exam_id, "question_id": ak_doc["question_id"]},
+                {"$set": ak_doc},
+                upsert=True,
+            )
+            upserted += 1
+
+        if upserted:
+            _logger.info(
+                "DCR answer keys synced for exam %s: %d upserted.",
+                exam_id,
+                upserted,
+            )
+        else:
+            _logger.debug(
+                "No DCR-compatible answer keys to sync for exam %s.",
+                exam_id,
+            )
+
+        # TODO: exampen_question_regions population.
+        # The DCR _make_region_loader() reads bounding-box regions from
+        # exampen_question_regions, but existing question data does not
+        # carry bbox / region info.  The stub recognizer works without
+        # regions (it processes the whole page), but the production
+        # recognizer will need them.  Wire region sync here once the
+        # exam paper template/layout provides bounding-box data.
+
+        return {"upserted": upserted}
+
+    except Exception as exc:
+        _logger.warning(
+            "Failed to sync DCR answer keys for exam %s: %s",
+            exam_id,
+            exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ExamPen evaluation status helper (SWM-014)
+# ---------------------------------------------------------------------------
+# Tutors can call this to get a quick status snapshot for their exams'
+# ExamPen evaluation progress.  Graceful no-op if exam-conductor is
+# unavailable.
+#
+# Usage from tutor flows:
+#
+#     from api.v1.tutor_async import get_exampen_eval_status
+#     status = await get_exampen_eval_status(tenant_db, exam_id)
+#
+# Constraint C5: read-only access to PCR/DCR result collections.
+# ---------------------------------------------------------------------------
+
+
+async def get_exampen_eval_status(
+    tenant_db,
+    exam_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Get ExamPen evaluation status summary for an exam.
+
+    Returns a dict with counts of submissions, evaluated responses,
+    blocked responses, and published submissions. Returns ``None`` if
+    exam-conductor is not available (graceful degradation).
+
+    Parameters
+    ----------
+    tenant_db
+        Motor tenant database (``skb_<tenant>``).
+    exam_id
+        Exam identifier to check status for.
+
+    Returns
+    -------
+    dict or None
+        Status summary on success, ``None`` if exam-conductor unavailable.
+
+        Shape::
+
+            {
+                "exam_id": str,
+                "total_submissions": int,
+                "published_submissions": int,
+                "total_responses": int,
+                "evaluated_responses": int,
+                "blocked_responses": int,
+                "pending_responses": int,
+                "pcr_available": bool,
+                "dcr_results_count": int,
+            }
+    """
+    try:
+        from api.v1._exampen_imports import load_exampen
+        load_exampen("pcr.storage")
+    except ImportError:
+        _logger.debug(
+            "ExamPen modules not available; skipping eval status check "
+            "for exam %s.",
+            exam_id,
+        )
+        return None
+
+    try:
+        # Count submissions
+        submissions_cursor = tenant_db["evalpen_submissions"].find(
+            {"exam_id": exam_id},
+            projection={"submission_id": 1, "publication_status": 1},
+        )
+        submissions = await submissions_cursor.to_list(length=1000)
+        total_submissions = len(submissions)
+        published_submissions = sum(
+            1
+            for s in submissions
+            if s.get("publication_status") == "published"
+        )
+
+        submission_ids = [s["submission_id"] for s in submissions]
+
+        # Count responses by status
+        total_responses = 0
+        evaluated_responses = 0
+        blocked_responses = 0
+        pending_responses = 0
+
+        if submission_ids:
+            response_cursor = tenant_db[
+                "evalpen_detected_responses"
+            ].find(
+                {"submission_id": {"$in": submission_ids}},
+                projection={"eval_status": 1},
+            )
+            response_docs = await response_cursor.to_list(length=5000)
+            total_responses = len(response_docs)
+
+            for r in response_docs:
+                es = r.get("eval_status", "pending")
+                if es in ("evaluated", "evaluated_with_warnings", "manual_review"):
+                    evaluated_responses += 1
+                elif es == "blocked":
+                    blocked_responses += 1
+                elif es == "pending":
+                    pending_responses += 1
+
+        # Count DCR results
+        dcr_count = await tenant_db["exampen_dcr_results"].count_documents(
+            {"exam_id": exam_id}
+        )
+
+        return {
+            "exam_id": exam_id,
+            "total_submissions": total_submissions,
+            "published_submissions": published_submissions,
+            "total_responses": total_responses,
+            "evaluated_responses": evaluated_responses,
+            "blocked_responses": blocked_responses,
+            "pending_responses": pending_responses,
+            "pcr_available": True,
+            "dcr_results_count": dcr_count,
+        }
+
+    except Exception as exc:
+        _logger.warning(
+            "Failed to get ExamPen eval status for exam %s: %s",
+            exam_id,
+            exc,
+        )
+        return None

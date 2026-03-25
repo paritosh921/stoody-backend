@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/eval.flag.resolved",
+  "title": "eval.flag.resolved event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "event_version", "occurred_at", "flag_id", "response_id", "actor_id"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "eval.flag.resolved" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "flag_id": { "type": "string" },
+    "response_id": { "type": "string" },
+    "actor_id": { "type": "string" },
+    "resolution": { "type": "string" }
+  }
+}

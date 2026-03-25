@@ -1,0 +1,67 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen PCR Practice API
+  version: "2.1.0"
+  description: |
+    Stateless live practice evaluation API.
+    This endpoint evaluates and returns; it does not create new ExamPen practice persistence.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/evalpen/practice/evaluate:
+    post:
+      summary: Evaluate one live practice response
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PracticeEvaluateRequest"
+      responses:
+        "200":
+          description: Practice evaluation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PracticeEvaluateResponse"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    PracticeEvaluateRequest:
+      type: object
+      required: [question_id, source_type]
+      properties:
+        question_id:
+          type: string
+        source_type:
+          type: string
+          enum: [canvas, camera]
+        text:
+          type: string
+        image_ref:
+          type: string
+    PracticeEvaluateResponse:
+      type: object
+      required: [question_id, total_score, max_score]
+      properties:
+        question_id:
+          type: string
+        total_score:
+          type: number
+        max_score:
+          type: number
+        feedback:
+          type: string
+        token_usage:
+          type: object
+          properties:
+            caller:
+              type: string
+            total_tokens:
+              type: integer
