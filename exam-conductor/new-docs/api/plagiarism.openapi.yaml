@@ -1,10 +1,10 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Plagiarism API
-  version: "1.0.0"
+  version: "2.0.0"
   description: |
-    Authoritative API for plagiarism flags and teacher verdict state.
-    `svc-plagiarism` owns both generated flags and verdict persistence.
+    Reviewable plagiarism flags built from DCR and PCR outputs.
+    This API exposes flags and verdicts; it does not own raw ingest or evaluator state.
 servers:
   - url: /
 security:
@@ -19,7 +19,6 @@ paths:
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         "200":
           description: Flag list
@@ -27,52 +26,34 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [items]
                 properties:
                   items:
                     type: array
                     items:
-                      $ref: "#/components/schemas/FlagSummary"
+                      $ref: "#/components/schemas/PlagiarismFlag"
   /api/v1/plagiarism/flags/{flag_id}:
-    get:
-      summary: Get detailed plagiarism evidence for one flag
-      parameters:
-        - name: flag_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Flag detail
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FlagDetail"
-  /api/v1/plagiarism/flags/{flag_id}/verdict:
     patch:
-      summary: Record teacher verdict on a plagiarism flag
+      summary: Record teacher verdict for a plagiarism flag
       parameters:
         - name: flag_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/VerdictRequest"
+              type: object
+              required: [verdict]
+              properties:
+                verdict:
+                  type: string
+                  enum: [confirmed, dismissed]
       responses:
         "200":
-          description: Verdict persisted on plagiarism flag
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/FlagDetail"
+          description: Verdict recorded
 components:
   securitySchemes:
     StoodyBearer:
@@ -80,72 +61,15 @@ components:
       scheme: bearer
       bearerFormat: JWT
   schemas:
-    FlagSummary:
+    PlagiarismFlag:
       type: object
-      required: [flag_id, exam_id, student_a_id, student_b_id, question_id, composite_score, severity]
+      required: [flag_id, exam_id, question_id, severity]
       properties:
         flag_id:
           type: string
-          format: uuid
         exam_id:
-          type: string
-          format: uuid
-        student_a_id:
-          type: string
-        student_b_id:
           type: string
         question_id:
           type: string
-        composite_score:
-          type: number
         severity:
           type: string
-          enum: [review_recommended, strong_match]
-        teacher_verdict:
-          type: string
-          enum: [pending, confirmed_plagiarism, dismissed]
-    FlagDetail:
-      allOf:
-        - $ref: "#/components/schemas/FlagSummary"
-        - type: object
-          required: [evidence]
-          properties:
-            evidence:
-              $ref: "#/components/schemas/Evidence"
-            verdict_reason:
-              type: string
-            verdict_by:
-              type: string
-            verdict_at:
-              type: string
-              format: date-time
-    VerdictRequest:
-      type: object
-      required: [teacher_id, verdict, reason]
-      properties:
-        teacher_id:
-          type: string
-        verdict:
-          type: string
-          enum: [confirmed_plagiarism, dismissed]
-        reason:
-          type: string
-          minLength: 5
-    Evidence:
-      type: object
-      required: [matching_segments]
-      properties:
-        matching_segments:
-          type: array
-          items:
-            type: object
-            required: [student_a_text, student_b_text]
-            properties:
-              student_a_text:
-                type: string
-              student_b_text:
-                type: string
-        temporal_correlation_score:
-          type: number
-        seating_proximity_score:
-          type: number

@@ -1,22 +1,17 @@
 openapi: "3.1.0"
 info:
-  title: ExamPen Exam Orchestrator API
-  version: "1.0.0"
+  title: ExamPen Exam Orchestration API
+  version: "2.0.0"
   description: |
-    Authoritative API for exam definitions, lifecycle control, invigilator assignment,
-    and server-confirmed pen bindings.
+    Exam lifecycle and metadata APIs. Exam orchestration owns exam identity and `exam_type`,
+    which route conducted-exam artifacts to the correct engine.
 servers:
   - url: /
 security:
   - StoodyBearer: []
-tags:
-  - name: exams
-  - name: bindings
-  - name: invigilators
 paths:
   /api/v1/exams:
     get:
-      tags: [exams]
       summary: List exams visible to the current actor
       responses:
         "200":
@@ -25,15 +20,13 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [items]
                 properties:
                   items:
                     type: array
                     items:
                       $ref: "#/components/schemas/ExamSummary"
     post:
-      tags: [exams]
-      summary: Create a new exam
+      summary: Create an exam with engine-routing metadata
       requestBody:
         required: true
         content:
@@ -46,145 +39,12 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExamDetail"
-  /api/v1/exams/{exam_id}:
-    get:
-      tags: [exams]
-      summary: Get detailed exam configuration
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      responses:
-        "200":
-          description: Exam detail
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExamDetail"
-    patch:
-      tags: [exams]
-      summary: Update mutable exam metadata before lock
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/PatchExamRequest"
-      responses:
-        "200":
-          description: Exam updated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExamDetail"
-  /api/v1/exams/{exam_id}/roster:
-    get:
-      tags: [exams]
-      summary: Return the Stoody-backed roster for this exam
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      responses:
-        "200":
-          description: Roster with student metadata
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [exam_id, students]
-                properties:
-                  exam_id:
-                    type: string
-                    format: uuid
-                  students:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/StudentRef"
-  /api/v1/exams/{exam_id}/transitions:
+                $ref: "#/components/schemas/ExamSummary"
+  /api/v1/exams/{exam_id}/lifecycle:
     post:
-      tags: [exams]
-      summary: Apply an authoritative exam lifecycle transition
+      summary: Move an exam through lifecycle states
       parameters:
-        - $ref: "#/components/parameters/ExamId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/LifecycleTransitionRequest"
-      responses:
-        "200":
-          description: Transition applied
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/LifecycleTransitionResult"
-  /api/v1/exams/{exam_id}/invigilators:
-    post:
-      tags: [invigilators]
-      summary: Assign invigilators and evaluators to an exam
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AssignmentRequest"
-      responses:
-        "200":
-          description: Assignment persisted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AssignmentRequest"
-  /api/v1/exams/{exam_id}/bindings:
-    get:
-      tags: [bindings]
-      summary: List pen bindings for the exam
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      responses:
-        "200":
-          description: Binding list
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [exam_id, items]
-                properties:
-                  exam_id:
-                    type: string
-                    format: uuid
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/BindingRecord"
-    post:
-      tags: [bindings]
-      summary: Create or queue a server-side pen binding request
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateBindingRequest"
-      responses:
-        "202":
-          description: Binding accepted for validation
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BindingRecord"
-  /api/v1/exams/{exam_id}/bindings/{pen_mac}/confirm:
-    post:
-      tags: [bindings]
-      summary: Confirm or reject a provisional binding
-      parameters:
-        - $ref: "#/components/parameters/ExamId"
-        - name: pen_mac
+        - name: exam_id
           in: path
           required: true
           schema:
@@ -194,212 +54,43 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/ConfirmBindingRequest"
+              type: object
+              required: [to_state]
+              properties:
+                to_state:
+                  type: string
       responses:
-        "200":
-          description: Binding decision recorded
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/BindingRecord"
+        "202":
+          description: Transition accepted
 components:
   securitySchemes:
     StoodyBearer:
       type: http
       scheme: bearer
       bearerFormat: JWT
-  parameters:
-    ExamId:
-      name: exam_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
   schemas:
-    ExamSummary:
-      type: object
-      required: [exam_id, subject_id, class_id, scheduled_at, state]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        subject_id:
-          type: string
-        class_id:
-          type: string
-        title:
-          type: string
-        scheduled_at:
-          type: string
-          format: date-time
-        duration_min:
-          type: integer
-        state:
-          type: string
-          enum: [created, armed, timer_running, sync_pending, scoring, finalized, published, locked, cancelled]
-    ExamDetail:
-      allOf:
-        - $ref: "#/components/schemas/ExamSummary"
-        - type: object
-          required: [section_id, total_marks, question_count, created_by]
-          properties:
-            section_id:
-              type: string
-            total_marks:
-              type: number
-            question_count:
-              type: integer
-            late_entry_cutoff_min:
-              type: integer
-            objection_window_days:
-              type: integer
-            variants:
-              type: array
-              items:
-                type: string
-            created_by:
-              type: string
     CreateExamRequest:
       type: object
-      required:
-        [title, subject_id, class_id, section_id, scheduled_at, duration_min, question_count, total_marks]
+      required: [title, exam_type]
       properties:
         title:
           type: string
-        subject_id:
+        exam_type:
           type: string
-        class_id:
-          type: string
-        section_id:
-          type: string
-        scheduled_at:
+          enum: [dcr, pcr]
+        schedule_at:
           type: string
           format: date-time
-        duration_min:
-          type: integer
-        question_count:
-          type: integer
-        total_marks:
-          type: number
-        negative_marking:
-          type: boolean
-        variants:
-          type: array
-          items:
-            type: string
-    PatchExamRequest:
+    ExamSummary:
       type: object
-      additionalProperties: false
-      properties:
-        scheduled_at:
-          type: string
-          format: date-time
-        duration_min:
-          type: integer
-        objection_window_days:
-          type: integer
-        late_entry_cutoff_min:
-          type: integer
-    LifecycleTransitionRequest:
-      type: object
-      required: [to_state, actor_id]
-      properties:
-        to_state:
-          type: string
-          enum: [armed, timer_running, sync_pending, scoring, finalized, published, locked, cancelled]
-        actor_id:
-          type: string
-        reason:
-          type: string
-    LifecycleTransitionResult:
-      type: object
-      required: [exam_id, from_state, to_state, changed_at]
+      required: [exam_id, title, exam_type, lifecycle_state]
       properties:
         exam_id:
           type: string
-          format: uuid
-        from_state:
+        title:
           type: string
-        to_state:
+        exam_type:
           type: string
-        changed_at:
-          type: string
-          format: date-time
-    AssignmentRequest:
-      type: object
-      required: [invigilator_ids, evaluator_ids]
-      properties:
-        invigilator_ids:
-          type: array
-          items:
-            type: string
-        evaluator_ids:
-          type: array
-          items:
-            type: string
-        double_blind:
-          type: boolean
-    CreateBindingRequest:
-      type: object
-      required: [pen_mac, student_id, source]
-      properties:
-        pen_mac:
-          type: string
-        student_id:
-          type: string
-        source:
-          type: string
-          enum: [registration_scan, manual_register, server_sync]
-        request_id:
-          type: string
-    ConfirmBindingRequest:
-      type: object
-      required: [status]
-      properties:
-        status:
-          type: string
-          enum: [confirmed, rejected]
-        rejection_reason:
-          type: string
-    BindingRecord:
-      type: object
-      required: [exam_id, pen_mac, status, source, bound_at]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        pen_mac:
-          type: string
-        student_id:
-          type: string
-        student_name:
-          type: string
-        student_roll:
-          type: string
-        status:
-          type: string
-          enum: [provisional, confirmed, rejected]
-        source:
-          type: string
-          enum: [registration_scan, manual_register, server_sync]
-        bound_at:
-          type: string
-          format: date-time
-        server_confirmed_at:
-          type: string
-          format: date-time
-        rejection_reason:
-          type: string
-    StudentRef:
-      type: object
-      required: [student_id, name]
-      properties:
-        student_id:
-          type: string
-        name:
-          type: string
-        roll:
-          type: string
-        section_id:
+          enum: [dcr, pcr]
+        lifecycle_state:
           type: string

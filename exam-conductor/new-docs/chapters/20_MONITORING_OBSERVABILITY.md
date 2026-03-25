@@ -1,56 +1,39 @@
-# Chapter 20: Monitoring & Observability
+# Chapter 20: Monitoring and Observability
 
 ## Status
-- **Phase:** P0
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
 
 ## Overview
 
-Observability stack: Grafana for dashboards, Loki for log aggregation, Tempo for
-distributed tracing, Prometheus for metrics. Covers service health monitoring,
-NATS consumer lag alerting, pipeline throughput tracking, and hub fleet status.
+Observability must track the four active architecture domains separately:
 
-## Architecture Context
+- shared ingest substrate
+- DCR engine
+- PCR engine
+- shared LLM gate
 
-<!-- TODO: Diagram showing Grafana + Loki + Tempo + Prometheus collecting from
-     all services and hub-uplink. Reference Chapter 01. -->
+```text
+ingest metrics   ─┐
+DCR metrics      ├-> dashboards / alerts / traces
+PCR metrics      ┤
+gate metrics     ┘
+```
 
-## Detailed Design
+## Key Signals
 
-### Metrics Collection
-<!-- TODO: Prometheus scrape targets, custom metrics per service. -->
+- ingest durability, backlog, duplicate rate
+- DCR throughput, confidence distribution, fallback rate
+- PCR segmentation flags, auto-eval rate, review backlog
+- gate budget headroom, token usage, refusal counts
 
-### Log Aggregation
-<!-- TODO: Loki configuration, structured logging format, log retention. -->
+## Alignment Rules
 
-### Distributed Tracing
-<!-- TODO: Tempo configuration, trace context propagation across NATS events. -->
+1. Metrics should preserve the boundary between collection and evaluation.
+2. Gate metrics must be visible independently of PCR metrics.
+3. Practice metrics must not imply a new ExamPen practice persistence model.
 
-### Dashboards
-<!-- TODO: Key Grafana dashboards: pipeline throughput, NATS lag, service health,
-     hub fleet status. -->
+## Related Docs
 
-### Alerting
-<!-- TODO: Alert rules: NATS consumer lag >10s, service down, error rate spike,
-     duplicate rate >1%. -->
-
-## Interfaces
-<!-- TODO: Grafana endpoints, Prometheus /metrics paths. -->
-
-## Configuration
-<!-- TODO: Grafana provisioning, Prometheus scrape config, Loki retention. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries A8.4 (peak load
-     monitoring), A8.6 (duplicate rate monitoring). -->
-
-## Testing
-<!-- TODO: Reference observability integration test IDs if any. -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `architecture/LLM_GATE_SPEC.md`
+- `governance/FAILURE_MITIGATION_REGISTER.md`
+- `governance/TEST_SUITE_SPEC.md`

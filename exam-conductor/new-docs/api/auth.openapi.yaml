@@ -1,209 +1,50 @@
 openapi: "3.1.0"
 info:
-  title: ExamPen Auth API
-  version: "1.0.0"
+  title: ExamPen Auth Context API
+  version: "2.0.0"
   description: |
-    Auth policy and identity-normalization API for ExamPen.
-    Stoody remains the issuer of end-user JWTs. `svc-auth` validates Stoody-issued
-    bearer tokens, normalizes claims for downstream services, resolves parent scope,
-    and manages ExamPen-side revocation state.
+    Identity normalization and actor-context APIs for ExamPen.
+    Stoody remains the source of truth for JWT issuance, user identity, and tutor/student visibility.
 servers:
   - url: /
-tags:
-  - name: auth
-  - name: revocations
 paths:
   /api/v1/auth/introspect:
     post:
-      tags: [auth]
-      summary: Validate a Stoody JWT and return normalized ExamPen claims
+      summary: Validate Stoody identity and return normalized ExamPen actor context
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/IntrospectRequest"
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
       responses:
         "200":
-          description: Token valid and normalized
+          description: Normalized actor context
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/NormalizedClaims"
+                $ref: "#/components/schemas/ActorContext"
         "401":
           description: Token invalid or expired
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-        "503":
-          description: Stoody keys unavailable and cache unusable
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-  /api/v1/auth/me:
-    get:
-      tags: [auth]
-      summary: Return normalized claims for the current bearer token
-      security:
-        - StoodyBearer: []
-      responses:
-        "200":
-          description: Current normalized actor context
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NormalizedClaims"
-        "401":
-          description: Missing or invalid bearer token
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-  /api/v1/auth/revocations:
-    post:
-      tags: [revocations]
-      summary: Revoke a normalized token/session inside ExamPen
-      security:
-        - StoodyBearer: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RevocationRequest"
-      responses:
-        "202":
-          description: Revocation accepted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RevocationStatus"
-  /api/v1/auth/revocations/{jti}:
-    get:
-      tags: [revocations]
-      summary: Check whether a token JTI is revoked in ExamPen
-      security:
-        - StoodyBearer: []
-      parameters:
-        - name: jti
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Revocation state
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/RevocationStatus"
 components:
-  securitySchemes:
-    StoodyBearer:
-      type: http
-      scheme: bearer
-      bearerFormat: JWT
   schemas:
-    IntrospectRequest:
+    ActorContext:
       type: object
-      additionalProperties: false
-      required: [token]
-      properties:
-        token:
-          type: string
-          description: Stoody-issued bearer JWT
-        expected_role:
-          type: string
-          enum: [super_admin, principal, hod, tutor, invigilator, evaluator, student, parent]
-    NormalizedClaims:
-      type: object
-      additionalProperties: false
-      required:
-        [user_id, tenant_id, stoody_role, exampen_roles, token_source, token_status, profile]
+      required: [user_id, roles, tenant_id]
       properties:
         user_id:
           type: string
         tenant_id:
           type: string
-        stoody_role:
-          type: string
-          enum: [super_admin, principal, hod, tutor, student, parent]
-        exampen_roles:
+        roles:
           type: array
           items:
             type: string
-            enum: [super_admin, principal, hod, tutor, invigilator, evaluator, reviewer, student, parent]
-        token_source:
-          type: string
-          const: stoody_jwt
-        token_status:
-          type: string
-          enum: [valid, revoked]
-        subject_ids:
+        visible_student_ids:
           type: array
           items:
             type: string
-        class_ids:
-          type: array
-          items:
-            type: string
-        child_student_ids:
-          type: array
-          items:
-            type: string
-        profile:
-          $ref: "#/components/schemas/Profile"
-    Profile:
-      type: object
-      additionalProperties: false
-      required: [display_name]
-      properties:
-        display_name:
-          type: string
-        email:
-          type: string
-          format: email
-        phone:
-          type: string
-        institute_name:
-          type: string
-    RevocationRequest:
-      type: object
-      additionalProperties: false
-      required: [jti, reason]
-      properties:
-        jti:
-          type: string
-        subject_user_id:
-          type: string
-        reason:
-          type: string
-          minLength: 5
-        expires_at:
-          type: string
-          format: date-time
-    RevocationStatus:
-      type: object
-      additionalProperties: false
-      required: [jti, revoked]
-      properties:
-        jti:
-          type: string
-        revoked:
-          type: boolean
-        revoked_at:
-          type: string
-          format: date-time
-        reason:
-          type: string
-    ErrorResponse:
-      type: object
-      additionalProperties: false
-      required: [code, message]
-      properties:
-        code:
-          type: string
-        message:
-          type: string

@@ -18,20 +18,19 @@
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "score.updated" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
     "student_id": { "type": "string" },
-    "question_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] },
     "lifecycle_state": {
       "type": "string",
-      "enum": ["ai_draft", "teacher_reviewed", "finalized", "published", "objection_window", "locked"]
+      "enum": ["draft", "reviewed", "finalized", "published", "locked"]
     },
     "total_score": { "type": "number" },
-    "previous_total_score": { "type": "number" },
     "reason": {
       "type": "string",
-      "enum": ["ai_draft_created", "override_applied", "finalized", "published", "objection_rescored"]
+      "enum": ["engine_result_created", "override_applied", "published", "rescored"]
     }
   }
 }

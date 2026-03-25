@@ -1,56 +1,25 @@
 # Chapter 13: Plagiarism Detection
 
 ## Status
-- **Phase:** P8b
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `api/plagiarism.openapi.yaml`
 
 ## Overview
 
-Multi-layer plagiarism detection (svc-plagiarism): TF-IDF cosine similarity,
-structural similarity via edit distance, temporal/proximity signals from stroke
-metadata, and question-type-aware threshold adjustment. All detections require
-teacher review before any penalty is applied.
+Plagiarism detection is downstream of DCR and PCR evaluation. It consumes scoreable outputs and supporting evidence; it does not own ingest, OCR, or engine scoring.
 
-## Architecture Context
+```text
+canonical artifacts -> DCR/PCR results -> plagiarism checks -> reviewable flags
+```
 
-<!-- TODO: Diagram showing svc-plagiarism consuming ai.result events and
-     producing plagiarism.result events. Reference Chapter 01. -->
+## Alignment Rules
 
-## Detailed Design
+1. Plagiarism signals are advisory until reviewed.
+2. Plagiarism logic reads engine outputs; it does not mutate raw canonical artifacts.
+3. A plagiarism flag must be traceable back to the engine result or evidence set that produced it.
 
-### Detection Layers
-<!-- TODO: TF-IDF text similarity, structural edit distance,
-     temporal + proximity signals. -->
+## Related Docs
 
-### Threshold Configuration
-<!-- TODO: Composite >0.75 for "review", >0.90 for "strong match".
-     Question-type adjustments (MCQ exclusion). -->
-
-### Teacher Review Workflow
-<!-- TODO: Flag presentation, verdict recording, appeal handling. -->
-
-### Scoring Integration
-<!-- TODO: How plagiarism verdicts affect score FSM. -->
-
-## Interfaces
-<!-- TODO: REST endpoints from api/plagiarism.openapi.yaml,
-     NATS events plagiarism.check and plagiarism.result. -->
-
-## Configuration
-<!-- TODO: Similarity thresholds, question-type overrides, batch size. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entry PL5
-     (false positive mitigation). -->
-
-## Testing
-<!-- TODO: Reference test IDs U-PLAG-01, U-PLAG-02, U-PLAG-03,
-     E2E-06 (plagiarism detection). -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `api/plagiarism.openapi.yaml`
+- `contracts/events/plagiarism.check.schema.json`
+- `contracts/events/plagiarism.result.schema.json`

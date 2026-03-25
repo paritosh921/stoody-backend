@@ -12,17 +12,16 @@
     "exam_id",
     "objection_id",
     "student_id",
-    "question_id",
     "action",
     "state"
   ],
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "objection" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
-    "objection_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
+    "objection_id": { "type": "string" },
     "student_id": { "type": "string" },
     "question_id": { "type": "string" },
     "action": {
@@ -33,6 +32,7 @@
       "type": "string",
       "enum": ["filed", "assigned", "reviewing", "resolved", "escalated"]
     },
-    "actor_id": { "type": "string" }
+    "actor_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] }
   }
 }

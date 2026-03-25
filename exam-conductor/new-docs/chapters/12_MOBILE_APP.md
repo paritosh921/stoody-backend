@@ -1,57 +1,27 @@
-# Chapter 12: Mobile App Architecture
+# Chapter 12: Mobile App
 
 ## Status
-- **Phase:** P2i / P9a / P10a
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `integration/STOODY_INTEGRATION_SPEC.md`
 
 ## Overview
 
-Single Flutter app (exampen-mobile) with dual-mode operation: hub control mode
-(BLE-based invigilator interactions with the RPi hub) and portal mode (teacher
-and student views consuming BFF APIs). Covers architecture, navigation, BLE
-integration, camera for copy image fallback, and offline considerations.
+The mobile app participates in ExamPen through two kinds of flows:
 
-## Architecture Context
+- invigilation and hub-adjacent operations during conducted exams
+- Stoody-facing teacher or student views outside the exam hall
 
-<!-- TODO: Diagram showing mobile app modes: hub-control (BLE <-> hub-invig-ble)
-     and portal (REST <-> svc-teacher-bff / svc-student-bff).
-     Reference Chapter 01. -->
+Where practice evaluation is exposed, the mobile app reaches it through existing Stoody backend integration. The mobile app does not create a second practice persistence model.
 
-## Detailed Design
+## Alignment Rules
 
-### Dual-Mode Architecture
-<!-- TODO: Mode switching, shared auth, role-based navigation. -->
+1. Conducted-exam collection still routes through the shared ingest substrate.
+2. Mobile practice calls must respect the stateless PCR practice endpoint boundary.
+3. Mobile flows must not bypass Stoody identity or tutor visibility rules.
 
-### Hub Control Mode
-<!-- TODO: BLE connection to hub-invig-ble, command dispatch, status display. -->
+## Related Docs
 
-### Teacher Portal Mode
-<!-- TODO: Score review, analytics, same BFF as web dashboard. -->
-
-### Student Portal Mode
-<!-- TODO: Score view, objection filing, chat. -->
-
-### Camera Integration
-<!-- TODO: Copy image capture for svc-copy-upload fallback path. -->
-
-## Interfaces
-<!-- TODO: BLE characteristics from hub/ble-gatt-spec.md, REST from
-     api/teacher-bff.openapi.yaml and api/student-bff.openapi.yaml. -->
-
-## Configuration
-<!-- TODO: App configuration, BLE scan parameters, API base URLs. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries S3 (BLE MITM),
-     U1 (BLE relay speed). -->
-
-## Testing
-<!-- TODO: Reference mobile-specific test IDs, E2E-13 for portal flows. -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `integration/STOODY_INTEGRATION_SPEC.md`
+- `api/student-bff.openapi.yaml`
+- `api/teacher-bff.openapi.yaml`
+- `api/invig-console.openapi.yaml`

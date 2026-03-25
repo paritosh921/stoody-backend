@@ -1,64 +1,36 @@
 # Chapter 23: Testing Strategy
 
 ## Status
-- **Phase:** Cross-cutting
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `governance/TEST_SUITE_SPEC.md`
 
 ## Overview
 
-Testing strategy across all validation evidence levels (L1-L7). Covers unit
-testing (L3) with pure domain logic isolation, integration testing (L4) with
-real infrastructure in Docker, E2E pipeline testing (L5), hardware-in-loop
-testing (L6), and field trial protocols (L7). 1256+ tests across the suite.
+Testing follows the active architecture boundaries instead of the older single-pipeline model.
 
-## Architecture Context
+```text
+L3 unit        -> isolated ingest / DCR / PCR / gate logic
+L4 integration -> storage, API, routing, review, usage flows
+L5 end-to-end  -> conducted exam and practice paths
+L6/L7          -> hub hardware and field validation
+```
 
-<!-- TODO: Testing pyramid diagram showing L1-L7 layers and test counts per
-     level. Reference Chapter 01 and TEST_SUITE_SPEC.md. -->
+## Required Coverage
 
-## Detailed Design
+- shared ingest substrate durability and routing
+- DCR deterministic scoring and optional fallback behavior
+- PCR segmentation, flagging, evaluation, and practice endpoint behavior
+- shared gate budget and logging behavior
+- Stoody integration and visibility boundaries
 
-### Validation Evidence Hierarchy
-<!-- TODO: L1 through L7 definitions, what each level proves. -->
+## Alignment Rules
 
-### Unit Testing (L3)
-<!-- TODO: Domain layer isolation, no I/O imports, factory fixtures. -->
+1. Use the IDs in `governance/TEST_SUITE_SPEC.md`.
+2. No test plan should assume PostgreSQL or a monolithic evaluator.
+3. Practice tests must preserve the unchanged persistence boundary.
 
-### Integration Testing (L4)
-<!-- TODO: Docker Compose test stack, real DB/NATS/S3, per-service tests. -->
+## Related Docs
 
-### E2E Pipeline Testing (L5)
-<!-- TODO: Multi-service pipeline tests, NATS event coordination,
-     test IDs E2E-01 through E2E-13. -->
-
-### Hardware-in-Loop Testing (L6)
-<!-- TODO: Hub + BLE dongle + pen simulator test setup. -->
-
-### Field Trial Protocol (L7)
-<!-- TODO: Real exam protocol, success criteria, data collection. -->
-
-### Test ID Convention
-<!-- TODO: U-{SVC}-{NN} for unit, I-{SVC}-{NN} for integration,
-     E2E-{NN} for pipeline. -->
-
-## Interfaces
-<!-- TODO: pytest markers, test runner commands, CI integration. -->
-
-## Configuration
-<!-- TODO: docker-compose.test.yml, fixture data paths, environment variables. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md — testing catches mitigations
-     for all entries. -->
-
-## Testing
-<!-- TODO: Meta — this chapter IS the testing reference.
-     Full test ID catalog in TEST_SUITE_SPEC.md. -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `governance/TEST_SUITE_SPEC.md`
+- `governance/FAILURE_MITIGATION_REGISTER.md`
+- `architecture/unifiedPlan.md`

@@ -10,21 +10,18 @@
     "event_version",
     "occurred_at",
     "exam_id",
-    "student_count",
-    "question_count",
     "trigger"
   ],
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "plagiarism.check" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
-    "student_count": { "type": "integer" },
-    "question_count": { "type": "integer" },
+    "exam_id": { "type": "string" },
     "trigger": {
       "type": "string",
-      "enum": ["all_ai_results_ready", "manual_recheck"]
-    }
+      "enum": ["evaluation_finalized", "manual_recheck"]
+    },
+    "question_count": { "type": "integer" }
   }
 }

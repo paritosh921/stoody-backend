@@ -11,35 +11,32 @@
     "occurred_at",
     "exam_id",
     "student_id",
-    "model_version",
-    "question_results"
+    "engine",
+    "results"
   ],
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "ai.result" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
     "student_id": { "type": "string" },
-    "model_version": { "type": "string" },
-    "source_type": {
-      "type": "string",
-      "enum": ["strokes", "copy_image"]
+    "engine": { "type": "string", "enum": ["dcr", "pcr"] },
+    "gate_call_refs": {
+      "type": "array",
+      "items": { "type": "string" }
     },
-    "question_results": {
+    "results": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["question_id", "recognized_text", "confidence"],
+        "required": ["question_id", "score"],
         "properties": {
           "question_id": { "type": "string" },
+          "score": { "type": "number" },
           "recognized_text": { "type": "string" },
-          "confidence": { "type": "number" },
-          "step_breakdown": {
-            "type": "array",
-            "items": { "type": "string" }
-          }
+          "feedback": { "type": "string" }
         }
       }
     }

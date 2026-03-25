@@ -1,56 +1,28 @@
-# Chapter 14: Objection & Review System
+# Chapter 14: Objection and Review
 
 ## Status
-- **Phase:** P11
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority sources:** `architecture/TAMPER_PROOF_SPEC.md`, `api/review.openapi.yaml`
 
 ## Overview
 
-Objection lifecycle management (svc-review): students file objections against
-published scores, objections are assigned to reviewers, reviewed with access to
-original strokes and AI output, and resolved with mandatory reasoning. Resolution
-may trigger re-scoring via svc-score-engine.
+Review sits above DCR and PCR outputs. It lets authorized actors inspect evidence, resolve flags, and apply audited overrides without mutating canonical raw artifacts.
 
-## Architecture Context
+## Review Inputs
 
-<!-- TODO: Diagram showing student-portal -> svc-student-bff -> svc-review,
-     and teacher-dashboard -> svc-teacher-bff -> svc-review.
-     Reference Chapter 01. -->
+- DCR recognized text and match output
+- PCR detected responses, flags, and evaluations
+- gate-linked usage or reasoning references where relevant
+- append-only history of prior actions
 
-## Detailed Design
+## Alignment Rules
 
-### Objection FSM
-<!-- TODO: filed -> assigned -> reviewing -> resolved. Transition rules
-     and authorization. -->
+1. Review requests identify server-side artifacts or evaluation records; client-submitted corrected text is not authoritative.
+2. Overrides and flag resolutions are append-only audit events.
+3. Review may change score state, but not raw conducted-exam artifacts.
 
-### Assignment Logic
-<!-- TODO: Reviewer assignment, conflict-of-interest avoidance. -->
+## Related Docs
 
-### Review Interface
-<!-- TODO: Side-by-side view of strokes, AI output, rubric, current score. -->
-
-### Resolution and Re-scoring
-<!-- TODO: Approve/reject flow, mandatory reason, score engine integration. -->
-
-## Interfaces
-<!-- TODO: REST endpoints from api/review.openapi.yaml,
-     NATS events objection.filed, objection.resolved. -->
-
-## Configuration
-<!-- TODO: Assignment rules, timeout for unresolved objections. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries relevant to
-     objection handling. -->
-
-## Testing
-<!-- TODO: Reference test IDs U-REV-01, U-REV-02,
-     E2E-05 (objection lifecycle), E2E-11 (student BFF objection). -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `architecture/TAMPER_PROOF_SPEC.md`
+- `api/review.openapi.yaml`
+- `contracts/events/objection.schema.json`

@@ -1,0 +1,497 @@
+"""
+EvalPen Student BFF (Backend-for-Frontend) API — Read-only published
+exam results for students.
+
+Provides two endpoints:
+  1. GET /exams — List published exams the student has been evaluated on
+  2. GET /exams/{exam_id}/scores — Per-question score breakdown for a
+     published exam
+
+Architecture:
+    Read-only aggregation over evalpen_submissions,
+    evalpen_evaluations, exampen_dcr_results, and evalpen_questions.
+    No writes — this module is a pure reader.
+
+Ownership Declaration (per STATE_OWNERSHIP_MAP.md):
+    - Writes:  NONE
+    - Reads from: evalpen_submissions, evalpen_evaluations,
+                  exampen_dcr_results, evalpen_questions
+    - Never writes to: any collection
+
+Hard constraints:
+    - C1: MongoDB only
+    - C5: Ownership boundaries — BFF endpoints are pure readers
+    - Read-only: no $set, $push, insert, or update operations
+    - Student can ONLY see their own results (student_id from JWT)
+    - Only published results are visible (publication_status = "published")
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from core.database import DatabaseManager
+from api.v1.auth_async import get_current_user, get_database
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Auth dependencies
+# ---------------------------------------------------------------------------
+
+def require_student(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Dependency: restrict student BFF endpoints to student users only.
+
+    Admins and tutors should use the teacher BFF instead.
+    """
+    allowed = {"student", "b2c_user"}
+    if current_user.get("user_type") not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Student access required for this endpoint",
+        )
+    return current_user
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+class StudentExamItem(BaseModel):
+    """Per-exam summary row for the student exam list."""
+
+    exam_id: str
+    title: str
+    exam_type: Optional[str] = None
+    total_score: float = 0.0
+    max_score: float = 0.0
+    published_at: Optional[str] = None
+
+
+class StudentExamListResponse(BaseModel):
+    """Response for GET /exams."""
+
+    items: List[StudentExamItem] = Field(default_factory=list)
+
+
+class QuestionScoreItem(BaseModel):
+    """Per-question score entry within an exam score breakdown."""
+
+    question_id: str
+    score: float = 0.0
+    max_score: float = 0.0
+    feedback: Optional[str] = None
+    eval_type: str = "pcr"  # "pcr" or "dcr"
+
+
+class StudentExamScoresResponse(BaseModel):
+    """Response for GET /exams/{exam_id}/scores."""
+
+    exam_id: str
+    student_id: str
+    total_score: float = 0.0
+    max_score: float = 0.0
+    questions: List[QuestionScoreItem] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Helper: resolve tenant DB
+# ---------------------------------------------------------------------------
+
+async def _get_tenant_db(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+) -> Any:
+    """Resolve the tenant database from the authenticated user's JWT claims."""
+    db_name = current_user.get("db_name")
+    if not db_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tenant context missing from authentication token",
+        )
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant database not available",
+        )
+    return tenant_db
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract student_id from JWT claims
+# ---------------------------------------------------------------------------
+
+def _get_student_id(current_user: Dict[str, Any]) -> str:
+    """Return the authenticated user's user_id as the student_id.
+
+    The student_id in evalpen collections corresponds to ``user_id``
+    from the JWT claims (which is ``str(student["_id"])`` at login
+    time).  Any authenticated user is allowed to call these endpoints,
+    but the query is always scoped to their own user_id so they can
+    only see their own data.
+    """
+    student_id = current_user.get("user_id")
+    if not student_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User identity could not be determined from token",
+        )
+    return student_id
+
+
+# ---------------------------------------------------------------------------
+# Helper: safe datetime to ISO string
+# ---------------------------------------------------------------------------
+
+def _dt_to_iso(val: Any) -> Optional[str]:
+    """Convert a datetime or string to ISO format string."""
+    if val is None:
+        return None
+    if hasattr(val, "isoformat"):
+        return val.isoformat()
+    return str(val)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/exams",
+    response_model=StudentExamListResponse,
+    summary="List published exams with scores for the authenticated student",
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Student access required"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def list_student_exams(
+    current_user: Dict[str, Any] = Depends(require_student),
+    db: DatabaseManager = Depends(get_database),
+) -> StudentExamListResponse:
+    """List all published exams where the authenticated student has results.
+
+    Queries ``evalpen_submissions`` for the student's own submissions
+    with ``publication_status = "published"``.  For each published
+    submission, aggregates PCR scores from ``evalpen_evaluations`` and
+    DCR scores from ``exampen_dcr_results``.
+
+    Exam title and type are resolved from ``evalpen_questions``
+    (first question's exam metadata) with a fallback to the raw exam_id.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    student_id = _get_student_id(current_user)
+
+    try:
+        # ----- Fetch published submissions for this student -----
+        submissions_cursor = tenant_db["evalpen_submissions"].find(
+            {
+                "student_id": student_id,
+                "publication_status": "published",
+            },
+            projection={
+                "submission_id": 1,
+                "exam_id": 1,
+                "published_at": 1,
+            },
+        )
+        submissions = await submissions_cursor.to_list(length=1000)
+
+        if not submissions:
+            return StudentExamListResponse(items=[])
+
+        # ----- Collect exam_ids and submission_ids -----
+        exam_ids: List[str] = []
+        sub_ids: List[str] = []
+        # Map exam_id -> submission metadata
+        exam_sub_map: Dict[str, Dict[str, Any]] = {}
+        for sub in submissions:
+            eid = sub.get("exam_id", "")
+            sid = sub.get("submission_id", "")
+            if eid:
+                exam_ids.append(eid)
+                sub_ids.append(sid)
+                exam_sub_map[eid] = {
+                    "submission_id": sid,
+                    "published_at": sub.get("published_at"),
+                }
+
+        # ----- PCR: aggregate evaluations per exam -----
+        from api.v1._exampen_imports import load_exampen
+
+        pcr_scores: Dict[str, Dict[str, float]] = {}
+        try:
+            _pcr_storage = load_exampen("pcr.storage")
+            DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
+            EvaluationRepository = _pcr_storage.EvaluationRepository
+
+            resp_repo = DetectedResponseRepository(tenant_db)
+            eval_repo = EvaluationRepository(tenant_db)
+
+            for eid, sub_info in exam_sub_map.items():
+                sid = sub_info["submission_id"]
+                responses = await resp_repo.get_responses_by_submission(sid)
+                pcr_total = 0.0
+                pcr_max = 0.0
+                for resp in responses:
+                    response_id = resp.get("response_id", "")
+                    ev = await eval_repo.get_evaluation_by_response(response_id)
+                    if ev:
+                        pcr_total += ev.get("total_score", 0.0)
+                        pcr_max += ev.get("max_score", 0.0)
+                pcr_scores[eid] = {
+                    "total_score": pcr_total,
+                    "max_score": pcr_max,
+                }
+        except ImportError:
+            logger.debug("PCR storage not available for student BFF aggregation")
+
+        # ----- DCR: aggregate scores per exam -----
+        dcr_scores: Dict[str, Dict[str, float]] = {}
+        try:
+            dcr_cursor = tenant_db["exampen_dcr_results"].find(
+                {
+                    "exam_id": {"$in": exam_ids},
+                    "student_id": student_id,
+                },
+                projection={"exam_id": 1, "score": 1, "max_score": 1},
+            )
+            dcr_docs = await dcr_cursor.to_list(length=5000)
+            for doc in dcr_docs:
+                eid = doc.get("exam_id", "")
+                if eid not in dcr_scores:
+                    dcr_scores[eid] = {"total_score": 0.0, "max_score": 0.0}
+                dcr_scores[eid]["total_score"] += doc.get("score", 0.0)
+                dcr_scores[eid]["max_score"] += doc.get("max_score", 0.0)
+        except Exception as exc:
+            logger.debug("DCR scores not available for student BFF: %s", exc)
+
+        # ----- Resolve exam titles from evalpen_questions -----
+        title_cursor = tenant_db["evalpen_questions"].aggregate([
+            {"$match": {"exam_id": {"$in": exam_ids}}},
+            {"$group": {
+                "_id": "$exam_id",
+                "title": {"$first": "$exam_title"},
+                "exam_type": {"$first": "$exam_type"},
+            }},
+        ])
+        title_docs = await title_cursor.to_list(length=5000)
+        title_map: Dict[str, Dict[str, Any]] = {
+            d["_id"]: d for d in title_docs
+        }
+
+        # ----- Build response items -----
+        items: List[StudentExamItem] = []
+        for eid in exam_ids:
+            pcr = pcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
+            dcr = dcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
+            combined_total = pcr["total_score"] + dcr["total_score"]
+            combined_max = pcr["max_score"] + dcr["max_score"]
+
+            title_info = title_map.get(eid, {})
+            title = title_info.get("title") or eid
+            exam_type = title_info.get("exam_type")
+
+            sub_info = exam_sub_map.get(eid, {})
+            published_at = _dt_to_iso(sub_info.get("published_at"))
+
+            items.append(
+                StudentExamItem(
+                    exam_id=eid,
+                    title=title,
+                    exam_type=exam_type,
+                    total_score=combined_total,
+                    max_score=combined_max,
+                    published_at=published_at,
+                )
+            )
+
+        # Sort by exam_id for deterministic order
+        items.sort(key=lambda x: x.exam_id)
+
+        return StudentExamListResponse(items=items)
+
+    except HTTPException:
+        raise
+    except ImportError as exc:
+        logger.error("Exam-conductor module import failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Exam evaluation engine is not available in this deployment",
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to list exams for student %s: %s",
+            student_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve exam list",
+        )
+
+
+@router.get(
+    "/exams/{exam_id}/scores",
+    response_model=StudentExamScoresResponse,
+    summary="Get per-question score breakdown for a published exam",
+    responses={
+        401: {"description": "Authentication required"},
+        403: {"description": "Student access required"},
+        404: {"description": "No published submission found for this exam"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def get_student_exam_scores(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_student),
+    db: DatabaseManager = Depends(get_database),
+) -> StudentExamScoresResponse:
+    """Get a per-question score breakdown for the authenticated student
+    on a specific exam.
+
+    Published-only guard: returns 404 if the student has no submission
+    with ``publication_status = "published"`` for the given exam.
+
+    Combines PCR evaluations (via ``evalpen_evaluations``) and DCR
+    results (via ``exampen_dcr_results``) into a unified question list.
+    Each question entry indicates its ``eval_type`` ("pcr" or "dcr").
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    student_id = _get_student_id(current_user)
+
+    try:
+        # ----- Published-only guard -----
+        submission = await tenant_db["evalpen_submissions"].find_one(
+            {
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "publication_status": "published",
+            },
+            projection={"submission_id": 1},
+        )
+        if submission is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No published results found for this exam",
+            )
+
+        submission_id = submission.get("submission_id", "")
+
+        questions: List[QuestionScoreItem] = []
+        total_score = 0.0
+        total_max = 0.0
+
+        # ----- PCR evaluations -----
+        from api.v1._exampen_imports import load_exampen
+
+        try:
+            _pcr_storage = load_exampen("pcr.storage")
+            DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
+            EvaluationRepository = _pcr_storage.EvaluationRepository
+
+            resp_repo = DetectedResponseRepository(tenant_db)
+            eval_repo = EvaluationRepository(tenant_db)
+
+            responses = await resp_repo.get_responses_by_submission(
+                submission_id
+            )
+
+            for resp in responses:
+                response_id = resp.get("response_id", "")
+                question_id = resp.get("question_id", "")
+                ev = await eval_repo.get_evaluation_by_response(response_id)
+                if ev:
+                    q_score = ev.get("total_score", 0.0)
+                    q_max = ev.get("max_score", 0.0)
+                    feedback = ev.get("overall_feedback")
+                    total_score += q_score
+                    total_max += q_max
+                    questions.append(
+                        QuestionScoreItem(
+                            question_id=question_id,
+                            score=q_score,
+                            max_score=q_max,
+                            feedback=feedback,
+                            eval_type="pcr",
+                        )
+                    )
+        except ImportError:
+            logger.debug(
+                "PCR storage not available for student score breakdown"
+            )
+
+        # ----- DCR results -----
+        try:
+            dcr_cursor = tenant_db["exampen_dcr_results"].find(
+                {
+                    "exam_id": exam_id,
+                    "student_id": student_id,
+                },
+                projection={
+                    "question_id": 1,
+                    "score": 1,
+                    "max_score": 1,
+                },
+            )
+            dcr_docs = await dcr_cursor.to_list(length=5000)
+            for doc in dcr_docs:
+                q_score = doc.get("score", 0.0)
+                q_max = doc.get("max_score", 0.0)
+                total_score += q_score
+                total_max += q_max
+                questions.append(
+                    QuestionScoreItem(
+                        question_id=doc.get("question_id", ""),
+                        score=q_score,
+                        max_score=q_max,
+                        feedback=None,
+                        eval_type="dcr",
+                    )
+                )
+        except Exception as exc:
+            logger.debug(
+                "DCR results not available for student score breakdown: %s",
+                exc,
+            )
+
+        return StudentExamScoresResponse(
+            exam_id=exam_id,
+            student_id=student_id,
+            total_score=total_score,
+            max_score=total_max,
+            questions=questions,
+        )
+
+    except HTTPException:
+        raise
+    except ImportError as exc:
+        logger.error("Exam-conductor module import failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Exam evaluation engine is not available in this deployment",
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to get exam scores for student %s exam %s: %s",
+            student_id,
+            exam_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve exam scores",
+        )

@@ -1,8 +1,10 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Copy Upload API
-  version: "1.0.0"
-  description: Fallback image capture ingest for photographed answer copies.
+  version: "2.0.0"
+  description: |
+    Camera and photographed-copy ingest API for the shared substrate.
+    This path creates canonical conducted-exam image artifacts and normally routes to PCR.
 servers:
   - url: /
 security:
@@ -10,100 +12,51 @@ security:
 paths:
   /api/v1/exams/{exam_id}/copies/upload:
     post:
-      summary: Upload one photographed answer page
+      summary: Upload one conducted-exam image artifact
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       requestBody:
         required: true
         content:
           multipart/form-data:
             schema:
               type: object
-              required: [student_id, page_number, captured_at, image]
+              required: [student_id, page_number, source, image]
               properties:
                 student_id:
                   type: string
                 page_number:
                   type: integer
-                captured_at:
+                source:
                   type: string
-                  format: date-time
+                  enum: [camera, photographed_copy]
                 image:
                   type: string
                   format: binary
       responses:
-        "201":
-          description: Copy page stored
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CopyUploadResult"
-  /api/v1/exams/{exam_id}/copies/{student_id}:
-    get:
-      summary: List uploaded copy pages for one student
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: student_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Copy page list
+        "202":
+          description: Canonical image artifact accepted
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
+                required: [artifact_id, exam_type, routed_engine]
                 properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/CopyPage"
+                  artifact_id:
+                    type: string
+                  exam_type:
+                    type: string
+                    enum: [pcr]
+                  routed_engine:
+                    type: string
+                    enum: [pcr]
 components:
   securitySchemes:
     StoodyBearer:
       type: http
       scheme: bearer
       bearerFormat: JWT
-  schemas:
-    CopyUploadResult:
-      type: object
-      required: [exam_id, student_id, page_number, copy_image_uri, data_source]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        student_id:
-          type: string
-        page_number:
-          type: integer
-        copy_image_uri:
-          type: string
-          format: uri
-        data_source:
-          type: string
-          const: copy_image
-    CopyPage:
-      type: object
-      required: [page_number, copy_image_uri]
-      properties:
-        page_number:
-          type: integer
-        copy_image_uri:
-          type: string
-          format: uri
-        authoritative_source:
-          type: string
-          enum: [copy_image, strokes, both]

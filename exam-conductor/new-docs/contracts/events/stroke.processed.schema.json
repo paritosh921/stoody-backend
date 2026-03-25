@@ -10,31 +10,21 @@
     "event_version",
     "occurred_at",
     "exam_id",
+    "exam_type",
     "pen_mac",
-    "normalized_stroke_uri",
-    "page_assignments"
+    "artifact_id"
   ],
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "stroke.processed" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] },
     "pen_mac": { "type": "string" },
     "student_id": { "type": "string" },
-    "normalized_stroke_uri": { "type": "string", "format": "uri" },
-    "page_assignments": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["page_number", "question_id", "point_count"],
-        "properties": {
-          "page_number": { "type": "integer" },
-          "question_id": { "type": "string" },
-          "point_count": { "type": "integer" }
-        }
-      }
-    }
+    "artifact_id": { "type": "string" },
+    "normalized_stroke_uri": { "type": "string" },
+    "page_count": { "type": "integer" }
   }
 }

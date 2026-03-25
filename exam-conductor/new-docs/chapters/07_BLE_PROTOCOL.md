@@ -1,55 +1,34 @@
-# Chapter 07: BLE Protocol & Pen Communication
+# Chapter 07: BLE Protocol
 
 ## Status
-- **Phase:** P2b/P2f
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `hub/ble-gatt-spec.md`
 
 ## Overview
 
-BLE GATT services for pen communication and invigilator relay. Covers the P05
-pen protocol (service 0000ae30), frame format, CRC-16/XMODEM validation,
-coordinate extraction, chunk transfer, and the invigilator BLE relay channel.
+BLE is part of the shared ingest substrate, not part of either evaluation engine.
 
-## Architecture Context
+This chapter exists to explain where BLE fits in the active architecture:
 
-<!-- TODO: Diagram showing pen -> hub-ble-mgr -> hub-pen-sync data flow.
-     Reference Chapter 01 and hub/ble-gatt-spec.md. -->
+- pens expose stroke buffers and pen metadata
+- the hub reads and acknowledges those buffers
+- the shared ingest substrate persists uploaded artifacts
+- DCR and PCR consume canonical artifacts later
 
-## Detailed Design
+```text
+BLE pen <-> hub BLE manager -> local durable store -> canonical artifact store
+                                                 │
+                                                 └-> route by exam_type
+```
 
-### GATT Service Structure
-<!-- TODO: Characteristics AE10 (write), AE02 (notify), command set. -->
+## Alignment Rules
 
-### Frame Format
-<!-- TODO: Head(2) + SerialNum(4) + ID(4) + Cmd(1) + DataFormat(1) +
-     DataLen(2) + Data(N) + CRC16(2). -->
+1. Use `hub/ble-gatt-spec.md` for UUIDs, frame structure, retries, and error codes.
+2. Do not infer DCR or PCR scoring behavior from BLE messages.
+3. BLE transport success only proves collection success, not evaluation success.
 
-### Coordinate Frame
-<!-- TODO: 14-byte coordinate format, scale (10 units/mm), Y-inversion. -->
+## Related Docs
 
-### Chunk Transfer Protocol
-<!-- TODO: Per-chunk checkpointing, resume on disconnect. -->
-
-### Invigilator BLE Relay
-<!-- TODO: hub-invig-ble rotating auth codes, command channel. -->
-
-## Interfaces
-<!-- TODO: Reference hub/ble-gatt-spec.md characteristics and commands. -->
-
-## Configuration
-<!-- TODO: Dongle count, scan intervals, connection parameters. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries A1.1, A1.5, A1.7,
-     H1, H3, H5, S3. -->
-
-## Testing
-<!-- TODO: Reference test IDs from L6 hardware-in-loop tests. -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `hub/ble-gatt-spec.md`
+- `integration/HUB_DEPLOYMENT_SPEC.md`
+- `chapters/04_HUB_OPERATIONS.md`

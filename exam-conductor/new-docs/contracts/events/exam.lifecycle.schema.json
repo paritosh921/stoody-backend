@@ -10,6 +10,7 @@
     "event_version",
     "occurred_at",
     "exam_id",
+    "exam_type",
     "from_state",
     "to_state",
     "actor_id"
@@ -17,9 +18,10 @@
   "properties": {
     "event_id": { "type": "string" },
     "event_type": { "const": "exam.lifecycle" },
-    "event_version": { "const": "1.0.0" },
+    "event_version": { "const": "2.0.0" },
     "occurred_at": { "type": "string", "format": "date-time" },
-    "exam_id": { "type": "string", "format": "uuid" },
+    "exam_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] },
     "from_state": { "type": "string" },
     "to_state": { "type": "string" },
     "actor_id": { "type": "string" },

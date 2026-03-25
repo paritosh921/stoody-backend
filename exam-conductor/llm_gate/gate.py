@@ -1,0 +1,263 @@
+"""
+LLM Gate — Core orchestrator.
+
+Implements the full gate contract:
+
+    call(model_id, prompt, caller_id, **kwargs) -> GateResponse
+
+Steps (LLM_GATE_SPEC.md §3):
+  1. Validate caller_id
+  2. Estimate prompt size
+  3. Enforce per-call limits
+  4. Enforce daily / weekly / monthly budgets
+  5. Call provider
+  6. Append token log
+  7. Return content + usage metadata
+
+Spec authority  : new-docs/architecture/LLM_GATE_SPEC.md §3-§4
+Ownership       : LLM gate (STATE_OWNERSHIP_MAP.md)
+Test IDs        : U-GATE-01 (caller validation), U-GATE-02 (per-call limits),
+                  U-GATE-03 (budget checks), U-GATE-04 (log shape),
+                  I-GATE-01 (DCR through gate), I-GATE-02 (PCR through gate)
+Failure modes   : GATE-01 (budget exhaustion), GATE-02 (caller bypass),
+                  GATE-03 (log consistency)
+Hard constraints: C1 (MongoDB only), C4 (all LLM calls through gate),
+                  C5 (gate owns token budget state only)
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from .budget import BudgetChecker
+from .models import (
+    ALLOWED_CALLER_IDS,
+    GateConfig,
+    GateResponse,
+    TokenUsage,
+    TokenUsageLogEntry,
+    UnregisteredCallerError,
+)
+from .provider import ProviderResponse, call_provider, estimate_cost, estimate_tokens, estimate_tokens_for_messages
+from .repository import GateRepository
+
+logger = logging.getLogger(__name__)
+
+
+class LLMGate:
+    """
+    Shared LLM gate for ExamPen.
+
+    Every LLM call in the system — DCR fallback, PCR evaluation, practice,
+    cache warmup — MUST go through ``gate.call()``.  No module may import
+    or invoke an LLM provider directly (C4).
+
+    Typical usage::
+
+        db = await db_manager.get_tenant_db(db_name)
+        gate = LLMGate(db)
+        await gate.initialize()
+        response = await gate.call(
+            model_id="gpt-4o",
+            prompt="Evaluate this student response...",
+            caller_id="pcr_eval_core",
+        )
+        print(response.content, response.usage.total_tokens)
+
+    Ownership declaration (STATE_OWNERSHIP_MAP.md §5):
+        Writes : llm_gate_config, llm_token_usage_log, llm_token_usage_rollup
+        Reads  : llm_gate_config, llm_token_usage_log
+        Never writes to : conducted-exam artifacts, DCR/PCR results, practice persistence
+        Transactional boundaries : provider response + append-only usage log
+    """
+
+    def __init__(self, db: AsyncIOMotorDatabase) -> None:
+        self._repo = GateRepository(db)
+        self._budget = BudgetChecker(self._repo)
+        self._initialized = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """Bootstrap indexes.  Safe to call multiple times (idempotent)."""
+        if not self._initialized:
+            await self._repo.ensure_indexes()
+            self._initialized = True
+
+    # ------------------------------------------------------------------
+    # Config access (delegated to repository)
+    # ------------------------------------------------------------------
+
+    async def get_config(self) -> GateConfig:
+        return await self._repo.get_config()
+
+    async def update_config(self, config: GateConfig) -> None:
+        await self._repo.upsert_config(config)
+
+    # ------------------------------------------------------------------
+    # Usage query (used by SWM-007 route layer)
+    # ------------------------------------------------------------------
+
+    async def current_usage(self) -> dict:
+        """Return ``CurrentUsage`` dict for the tenant."""
+        config = await self._repo.get_config()
+        return await self._budget.current_usage(config)
+
+    # ------------------------------------------------------------------
+    # Core gate contract (§4.1)
+    # ------------------------------------------------------------------
+
+    async def call(
+        self,
+        model_id: str,
+        prompt: str,
+        caller_id: str,
+        *,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        max_output_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> GateResponse:
+        """
+        Execute an LLM call through the gate.
+
+        Parameters
+        ----------
+        model_id : str
+            Provider model identifier (e.g. ``"gpt-4o"``, ``"claude-sonnet-4-20250514"``).
+        prompt : str
+            The full prompt text.  For pure vision/multimodal calls where
+            all content is in *messages*, pass an empty string.
+        caller_id : str
+            One of the six registered caller identities.
+        messages : list of dict, optional
+            Pre-built messages array for multimodal / vision calls.  When
+            provided the array is forwarded to the provider as-is and
+            *prompt* is used only for logging context (not sent to the LLM).
+            Token estimation accounts for text parts plus a conservative
+            per-image heuristic.
+        max_output_tokens : int, optional
+            Override for the max output token count.
+        temperature : float, optional
+            Temperature override (only if caller-specific override is allowed).
+        metadata : dict, optional
+            Opaque metadata forwarded to the token log.
+
+        Returns
+        -------
+        GateResponse
+            Contains ``content`` (the LLM text) and ``usage`` (full accounting).
+
+        Raises
+        ------
+        UnregisteredCallerError
+            If ``caller_id`` is not in the allow-list (GATE-02).
+        TokenLimitExceededError
+            If per-call input or output limits are breached (§9.2).
+        BudgetExhaustedError
+            If any budget period is exhausted (GATE-01, §9.1).
+        RuntimeError
+            If the provider API key is missing.
+        httpx.HTTPStatusError
+            On provider-level HTTP failures.
+        """
+
+        # ── Step 1: Validate caller_id (GATE-02 mitigation) ────────────
+        if caller_id not in ALLOWED_CALLER_IDS:
+            raise UnregisteredCallerError(caller_id)
+
+        # ── Step 2: Estimate prompt size ────────────────────────────────
+        # For multimodal calls, estimate text tokens + conservative per-image
+        # heuristic.  For text-only calls, use the simple heuristic.
+        estimated_input = estimate_tokens_for_messages(prompt, messages)
+
+        # ── Load config once ────────────────────────────────────────────
+        config = await self._repo.get_config()
+
+        # ── Step 3: Enforce per-call limits ─────────────────────────────
+        BudgetChecker.check_per_call_input(config, estimated_input)
+        BudgetChecker.check_per_call_output(config, max_output_tokens)
+
+        # Clamp max_output_tokens to config ceiling if caller didn't
+        # specify one but config has a limit.
+        effective_max_output = max_output_tokens
+        if effective_max_output is None and config.max_output_tokens is not None:
+            effective_max_output = config.max_output_tokens
+
+        # ── Step 4: Enforce period budgets ──────────────────────────────
+        await self._budget.check_budgets(config)
+
+        # ── Step 5: Call provider ───────────────────────────────────────
+        provider_resp: ProviderResponse = await call_provider(
+            model_id,
+            prompt,
+            messages=messages,
+            max_output_tokens=effective_max_output,
+            temperature=temperature,
+        )
+
+        # ── Compute usage metadata ──────────────────────────────────────
+        total_tokens = provider_resp.input_tokens + provider_resp.output_tokens
+        cost = estimate_cost(model_id, provider_resp.input_tokens, provider_resp.output_tokens)
+        now = datetime.utcnow()
+
+        usage = TokenUsage(
+            model=provider_resp.model or model_id,
+            caller=caller_id,
+            input_tokens=provider_resp.input_tokens,
+            output_tokens=provider_resp.output_tokens,
+            cache_read_tokens=provider_resp.cache_read_tokens,
+            cache_creation_tokens=provider_resp.cache_creation_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=cost,
+            timestamp=now,
+        )
+
+        # ── Step 6: Append token log (GATE-03 mitigation) ──────────────
+        log_entry = TokenUsageLogEntry(
+            model=usage.model,
+            caller=usage.caller,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_creation_tokens=usage.cache_creation_tokens,
+            total_tokens=usage.total_tokens,
+            estimated_cost_usd=usage.estimated_cost_usd,
+            called_at=now,
+            metadata=metadata,
+        )
+        try:
+            await self._repo.append_log(log_entry)
+        except Exception:
+            # Log persistence failure must not lose the LLM response that
+            # was already generated — callers still get the content.
+            # This aligns with GATE-03 mitigation: we log the failure so
+            # operators can investigate, but do not discard the response.
+            logger.exception(
+                "GATE-03: Failed to persist token usage log for caller=%s model=%s",
+                caller_id,
+                model_id,
+            )
+
+        # ── Step 7: Return content + usage metadata ─────────────────────
+        return GateResponse(content=provider_resp.content, usage=usage)
+
+    # ------------------------------------------------------------------
+    # Repository access (for rollup jobs and usage APIs)
+    # ------------------------------------------------------------------
+
+    @property
+    def repo(self) -> GateRepository:
+        """Expose repository for rollup jobs and usage API queries."""
+        return self._repo
+
+    @property
+    def budget(self) -> BudgetChecker:
+        """Expose budget checker for usage API current-usage queries."""
+        return self._budget

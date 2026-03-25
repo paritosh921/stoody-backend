@@ -221,6 +221,16 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "billing_code": "MAX_STOODY_PEN",
     },
     {
+        "key": "exampen",
+        "label": "ExamPen Evaluation",
+        "description": "Conducted-exam pen evaluation (DCR and PCR engines)",
+        "category": FEATURE_CATEGORY_MAX,
+        "audience": ["tenant_admin", "tutor"],
+        "status": STATUS_ACTIVE,
+        "default_enabled": False,
+        "billing_code": "MAX_EXAMPEN",
+    },
+    {
         "key": "smartboard_core_dummy",
         "label": "Smartboard Core (Dummy)",
         "description": "Reserved smartboard entitlement (not enforced yet)",
@@ -357,6 +367,9 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
     ),
     "tutor_portal_access": (
         "/api/v1/tutor",
+    ),
+    "exampen": (
+        "/api/v1/evalpen",
     ),
 }
 

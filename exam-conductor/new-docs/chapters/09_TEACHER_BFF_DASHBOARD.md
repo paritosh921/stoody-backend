@@ -1,52 +1,35 @@
-# Chapter 09: Teacher BFF & Dashboard
+# Chapter 09: Teacher BFF and Dashboard
 
 ## Status
-- **Phase:** P9
-- **Last updated:** 2026-03-20
-- **Updated by:** Claude Agent (W6 stub)
 - **Build status:** DRAFT
+- **Authority source:** `integration/STOODY_INTEGRATION_SPEC.md`
 
 ## Overview
 
-Read-only aggregation layer (svc-teacher-bff) and the React teacher dashboard.
-The BFF aggregates data from scoring, analytics, review, and exam orchestration
-services into dashboard-ready payloads. The frontend consumes these via REST.
+Teacher-facing surfaces read across the shared ingest substrate, DCR outputs, PCR outputs, review state, and analytics. They aggregate; they do not become a second evaluator.
 
-## Architecture Context
+```text
+Stoody teacher session
+        │
+        ▼
+   teacher BFF / dashboard
+        │
+        ├-> exam orchestration
+        ├-> ingest status
+        ├-> DCR results
+        ├-> PCR results / flags
+        └-> review + analytics
+```
 
-<!-- TODO: Diagram showing teacher-dashboard -> svc-teacher-bff -> backing
-     services. Reference Chapter 01. BFF has zero write access to any DB. -->
+## Alignment Rules
 
-## Detailed Design
+1. Teacher surfaces do not write canonical raw artifacts.
+2. Teacher surfaces do not bypass the review or gate rules.
+3. Tutor visibility follows the existing admin-owned student visibility model.
 
-### BFF Aggregation Patterns
-<!-- TODO: Fan-out queries, response composition, caching strategy. -->
+## Related Docs
 
-### Dashboard Screens
-<!-- TODO: Exam list, score review, analytics, plagiarism review, chat. -->
-
-### Score Review Workflow
-<!-- TODO: AI draft -> teacher review -> override -> finalize flow in UI. -->
-
-### Mobile Teacher View
-<!-- TODO: Flutter teacher mode, shared BFF endpoints. -->
-
-## Interfaces
-<!-- TODO: REST endpoints from api/teacher-bff.openapi.yaml. -->
-
-## Configuration
-<!-- TODO: Environment variables, backing service URLs. -->
-
-## Failure Modes & Mitigations
-<!-- TODO: Reference FAILURE_MITIGATION_REGISTER.md entries A4.6
-     (AI misrecognition flagging in UI), A5.5 (rubric version display). -->
-
-## Testing
-<!-- TODO: Reference test IDs E2E-10 (teacher BFF aggregation),
-     E2E-13 (full integration). -->
-
-## Changelog
-
-| Date | Change | By |
-|---|---|---|
-| 2026-03-20 | Stub skeleton created | Claude Agent (W6) |
+- `integration/STOODY_INTEGRATION_SPEC.md`
+- `api/teacher-bff.openapi.yaml`
+- `api/review.openapi.yaml`
+- `chapters/14_OBJECTION_REVIEW.md`

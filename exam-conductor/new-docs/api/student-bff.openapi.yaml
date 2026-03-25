@@ -1,10 +1,10 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Student BFF API
-  version: "1.0.0"
+  version: "2.0.0"
   description: |
-    Aggregation API for Stoody student and parent score-view surfaces.
-    Parent access is constrained by the child relationship resolved through `svc-auth`.
+    Read-oriented student and parent views over published ExamPen outcomes.
+    Parent scope remains derived from Stoody relationships.
 servers:
   - url: /
 security:
@@ -12,15 +12,14 @@ security:
 paths:
   /api/v1/student/exams:
     get:
-      summary: List upcoming and past exams visible to the current student or parent
+      summary: List visible exams
       responses:
         "200":
-          description: Exam list
+          description: Student exam cards
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
                 properties:
                   items:
                     type: array
@@ -28,129 +27,20 @@ paths:
                       $ref: "#/components/schemas/StudentExamCard"
   /api/v1/student/exams/{exam_id}/scores:
     get:
-      summary: Score summary and per-question breakdown
+      summary: Get published score summary
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
-            format: uuid
       responses:
         "200":
-          description: Score summary
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StudentScoreView"
-  /api/v1/student/exams/{exam_id}/answers/{question_id}:
-    get:
-      summary: Answer image and AI analysis for one question
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: question_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Question answer detail
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AnswerInsight"
-  /api/v1/student/objections:
-    get:
-      summary: List objections filed by the current student
-      responses:
-        "200":
-          description: Objection list
+          description: Published score summary
           content:
             application/json:
               schema:
                 type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/StudentObjection"
-    post:
-      summary: File a new objection
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateStudentObjectionRequest"
-      responses:
-        "201":
-          description: Objection filed
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/StudentObjection"
-  /api/v1/student/chat/{exam_id}:
-    get:
-      summary: Get the objection/support chat thread for one exam
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      responses:
-        "200":
-          description: Message thread
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [items]
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/Message"
-    post:
-      summary: Send a message to the assigned tutor
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SendMessageRequest"
-      responses:
-        "201":
-          description: Message accepted
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Message"
-  /api/v1/student/performance:
-    get:
-      summary: Historical performance and trend data
-      responses:
-        "200":
-          description: Historical analytics
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PerformanceView"
 components:
   securitySchemes:
     StoodyBearer:
@@ -160,155 +50,12 @@ components:
   schemas:
     StudentExamCard:
       type: object
-      required: [exam_id, title, scheduled_at, status]
+      required: [exam_id, title, exam_type]
       properties:
         exam_id:
           type: string
-          format: uuid
         title:
           type: string
-        subject_name:
+        exam_type:
           type: string
-        scheduled_at:
-          type: string
-          format: date-time
-        status:
-          type: string
-          enum: [upcoming, scores_pending, published, objection_window_open, locked]
-    StudentScoreView:
-      type: object
-      required: [exam_id, total_score, percentage, percentile, questions]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        total_score:
-          type: number
-        percentage:
-          type: number
-        percentile:
-          type: number
-        pass_fail:
-          type: string
-          enum: [pass, fail]
-        questions:
-          type: array
-          items:
-            type: object
-            required: [question_id, marks_obtained, max_marks]
-            properties:
-              question_id:
-                type: string
-              marks_obtained:
-                type: number
-              max_marks:
-                type: number
-              ai_confidence:
-                type: number
-              miss_indicator:
-                type: string
-    AnswerInsight:
-      type: object
-      required: [question_id, answer_image_uri, recognized_text, confidence]
-      properties:
-        question_id:
-          type: string
-        answer_image_uri:
-          type: string
-          format: uri
-        recognized_text:
-          type: string
-        confidence:
-          type: number
-        step_breakdown:
-          type: array
-          items:
-            type: string
-        feedback:
-          type: string
-    StudentObjection:
-      type: object
-      required: [objection_id, exam_id, question_id, status]
-      properties:
-        objection_id:
-          type: string
-          format: uuid
-        exam_id:
-          type: string
-          format: uuid
-        question_id:
-          type: string
-        status:
-          type: string
-          enum: [filed, assigned, reviewing, resolved, escalated]
-        objection_text:
-          type: string
-        resolution_reason:
-          type: string
-        new_score:
-          type: number
-    CreateStudentObjectionRequest:
-      type: object
-      required: [exam_id, question_id, objection_text]
-      properties:
-        exam_id:
-          type: string
-          format: uuid
-        question_id:
-          type: string
-        objection_text:
-          type: string
-    Message:
-      type: object
-      required: [message_id, sender_id, content, sent_at]
-      properties:
-        message_id:
-          type: string
-          format: uuid
-        sender_id:
-          type: string
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
-        sent_at:
-          type: string
-          format: date-time
-        read_at:
-          type: string
-          format: date-time
-    SendMessageRequest:
-      type: object
-      required: [content]
-      properties:
-        content:
-          type: string
-        attachment_uri:
-          type: string
-          format: uri
-    PerformanceView:
-      type: object
-      required: [history, strengths, weaknesses]
-      properties:
-        history:
-          type: array
-          items:
-            type: object
-            required: [exam_id, score, percentile]
-            properties:
-              exam_id:
-                type: string
-                format: uuid
-              score:
-                type: number
-              percentile:
-                type: number
-        strengths:
-          type: array
-          items:
-            type: string
-        weaknesses:
-          type: array
-          items:
-            type: string
+          enum: [dcr, pcr]
