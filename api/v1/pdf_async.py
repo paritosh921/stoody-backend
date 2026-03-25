@@ -17,7 +17,7 @@ logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.client").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.server").setLevel(logging.WARNING)
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status, UploadFile, File, Form, Query
+from fastapi import APIRouter, Request, HTTPException, Depends, status, UploadFile, File, Form, Query, Body
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
@@ -3510,16 +3510,20 @@ async def get_document_questions(
                 detail=f"Document {document_id} not found"
             )
 
-        # Verify the user has access to this document
-        # For students, check if document belongs to their admin
-        if current_user.get("user_type") == "student":
-            # Normalize types for comparison
-            student_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
-            document_admin_id = document.get("admin_id")
-            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+        # ── Access control: verify the user belongs to the same school as the document ──
+        # Each role stores the school admin reference differently:
+        #   - student  → admin_id in JWT is the school admin who created them
+        #   - tutor    → admin_id in JWT is the school admin (from created_by)
+        #   - admin    → user_id in JWT IS the school admin
+        #   - b2c_*    → no admin_id check needed (single-tenant B2C)
+        from config_async import DEBUG_MODE as _DEBUG_MODE
 
-            # In development mode, allow cross-admin access to simplify testing
-            from config_async import DEBUG_MODE as _DEBUG_MODE
+        document_admin_id = document.get("admin_id")
+        document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+
+        if user_type == "student":
+            # Students: compare their admin_id (the school they belong to) with the document owner
+            student_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
             if student_admin_id != document_admin_id_str:
                 if _DEBUG_MODE:
                     logger.warning(
@@ -3543,13 +3547,26 @@ async def get_document_questions(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="This document is not yet available"
                     )
-        elif user_type not in ["b2c_admin", "b2c_user"]:
-            # For regular admins, verify they own the document (type-safe)
-            admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
-            document_admin_id = document.get("admin_id")
-            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
 
-            from config_async import DEBUG_MODE as _DEBUG_MODE
+        elif user_type == "tutor":
+            # Tutors: compare their admin_id (the school admin who created them) with the document owner.
+            # A tutor's admin_id comes from the created_by field set during tutor creation.
+            tutor_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
+            if tutor_admin_id != document_admin_id_str:
+                if _DEBUG_MODE:
+                    logger.warning(
+                        f"DEBUG_MODE: allowing tutor {current_user.get('user_id')} with admin_id={tutor_admin_id} "
+                        f"to access document owned by admin_id={document_admin_id_str}"
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You don't have access to this document"
+                    )
+
+        elif user_type == "admin":
+            # Admins: their own user_id IS the admin_id that owns documents
+            admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
             if admin_id != document_admin_id_str:
                 if _DEBUG_MODE:
                     logger.warning(
@@ -3560,7 +3577,8 @@ async def get_document_questions(
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail="You don't have access to this document"
                     )
-        # B2C admins can access all B2C documents (no admin_id check needed)
+
+        # B2C admins/users can access all B2C documents (single-tenant, no admin_id check needed)
 
         # Get questions for this document from appropriate database
         if is_b2c:
@@ -4184,6 +4202,73 @@ async def update_question(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update question: {str(e)}"
         )
+
+@router.patch("/documents/{document_id}/questions/bulk-update")
+@limiter.limit("10/minute")
+async def bulk_update_questions(
+    request: Request,
+    document_id: str,
+    update_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Bulk update points and/or penalty for all questions in a document"""
+    try:
+        user_type = current_user.get("user_type")
+        is_b2c = user_type == "b2c_admin"
+
+        # Build the $set update
+        set_fields = {}
+        if "points" in update_data:
+            pts = update_data["points"]
+            if not isinstance(pts, (int, float)) or pts < 0:
+                raise HTTPException(status_code=400, detail="points must be >= 0")
+            set_fields["points"] = pts
+        if "penalty" in update_data:
+            pen = update_data["penalty"]
+            if not isinstance(pen, (int, float)) or pen < 0:
+                raise HTTPException(status_code=400, detail="penalty must be >= 0")
+            set_fields["penalty"] = pen
+
+        if not set_fields:
+            raise HTTPException(status_code=400, detail="Provide at least one of: points, penalty")
+
+        query = {"document_id": document_id}
+        if is_b2c:
+            # B2C has no update_many, loop through questions
+            all_qs = await db.b2c_find("questions", query)
+            modified = 0
+            for q in all_qs:
+                await db.b2c_update_one("questions", {"id": q["id"]}, {"$set": set_fields})
+                modified += 1
+        else:
+            result = await db.mongo_update_many("questions", query, {"$set": set_fields})
+            modified = result.modified_count if result else 0
+
+        # Recalculate total_points on the document if points were changed
+        if "points" in set_fields:
+            if is_b2c:
+                all_qs = await db.b2c_find("questions", query)
+            else:
+                all_qs = await db.mongo_find("questions", query)
+            total = sum(q.get("points", set_fields.get("points", 4)) for q in all_qs)
+            if is_b2c:
+                await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+            else:
+                await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+
+        return {
+            "success": True,
+            "message": f"Updated {modified} questions",
+            "modified_count": modified,
+            "updated_fields": set_fields
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bulk update questions error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to bulk update: {str(e)}")
+
 
 @router.delete("/questions/{question_id}")
 @limiter.limit("30/minute")

@@ -255,10 +255,30 @@ async def get_course_structure(
             
             documents = await db.mongo_find("documents", query)
 
+        # Get student's viewed chapters from activity log
+        viewed_doc_ids: set = set()
+        try:
+            if is_b2c:
+                view_logs = await db.b2c_find(
+                    "user_activity_log",
+                    {"user_id": ObjectId(current_user["user_id"]), "action": "chapter_viewed"}
+                )
+            else:
+                view_logs = await db.mongo_find(
+                    "student_activity_log",
+                    {"student_id": ObjectId(current_user["user_id"]), "action": "chapter_viewed"}
+                )
+            for log in view_logs:
+                doc_id = log.get("metadata", {}).get("document_id")
+                if doc_id:
+                    viewed_doc_ids.add(doc_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch chapter view logs: {str(e)}")
+
         # Organize by standard and subject
         standards_set = set()
         subjects_by_standard: Dict[str, set] = {}
-        
+
         # Organize by subject for dashboard
         dashboard_stats: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
@@ -271,19 +291,24 @@ async def get_course_structure(
                 if std not in subjects_by_standard:
                     subjects_by_standard[std] = set()
                 subjects_by_standard[std].add(subj)
-            
+
             # Add to dashboard stats
             if subj:
                 if subj not in dashboard_stats:
                     dashboard_stats[subj] = {"chapters": []}
-                
+
+                doc_id_str = str(doc["_id"])
+                doc_document_id = doc.get("document_id", "")
+                viewed = doc_id_str in viewed_doc_ids or doc_document_id in viewed_doc_ids
+
                 dashboard_stats[subj]["chapters"].append({
-                    "id": str(doc["_id"]),
+                    "id": doc_id_str,
                     "title": doc.get("title"),
                     "subject": subj,
                     "standard": std,
                     "document_type": doc.get("document_type"),
-                    "course_plan": doc.get("course_plan")
+                    "course_plan": doc.get("course_plan"),
+                    "viewed": viewed
                 })
 
         # Convert sets to sorted lists
