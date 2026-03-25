@@ -17,7 +17,7 @@ logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.client").setLevel(logging.WARNING)
 logging.getLogger("aiohttp.server").setLevel(logging.WARNING)
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status, UploadFile, File, Form, Query
+from fastapi import APIRouter, Request, HTTPException, Depends, status, UploadFile, File, Form, Query, Body
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
@@ -4184,6 +4184,73 @@ async def update_question(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update question: {str(e)}"
         )
+
+@router.patch("/documents/{document_id}/questions/bulk-update")
+@limiter.limit("10/minute")
+async def bulk_update_questions(
+    request: Request,
+    document_id: str,
+    update_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Bulk update points and/or penalty for all questions in a document"""
+    try:
+        user_type = current_user.get("user_type")
+        is_b2c = user_type == "b2c_admin"
+
+        # Build the $set update
+        set_fields = {}
+        if "points" in update_data:
+            pts = update_data["points"]
+            if not isinstance(pts, (int, float)) or pts < 0:
+                raise HTTPException(status_code=400, detail="points must be >= 0")
+            set_fields["points"] = pts
+        if "penalty" in update_data:
+            pen = update_data["penalty"]
+            if not isinstance(pen, (int, float)) or pen < 0:
+                raise HTTPException(status_code=400, detail="penalty must be >= 0")
+            set_fields["penalty"] = pen
+
+        if not set_fields:
+            raise HTTPException(status_code=400, detail="Provide at least one of: points, penalty")
+
+        query = {"document_id": document_id}
+        if is_b2c:
+            # B2C has no update_many, loop through questions
+            all_qs = await db.b2c_find("questions", query)
+            modified = 0
+            for q in all_qs:
+                await db.b2c_update_one("questions", {"id": q["id"]}, {"$set": set_fields})
+                modified += 1
+        else:
+            result = await db.mongo_update_many("questions", query, {"$set": set_fields})
+            modified = result.modified_count if result else 0
+
+        # Recalculate total_points on the document if points were changed
+        if "points" in set_fields:
+            if is_b2c:
+                all_qs = await db.b2c_find("questions", query)
+            else:
+                all_qs = await db.mongo_find("questions", query)
+            total = sum(q.get("points", set_fields.get("points", 4)) for q in all_qs)
+            if is_b2c:
+                await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+            else:
+                await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+
+        return {
+            "success": True,
+            "message": f"Updated {modified} questions",
+            "modified_count": modified,
+            "updated_fields": set_fields
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bulk update questions error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to bulk update: {str(e)}")
+
 
 @router.delete("/questions/{question_id}")
 @limiter.limit("30/minute")
