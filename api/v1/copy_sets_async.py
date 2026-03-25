@@ -31,6 +31,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copy-sets", tags=["Copy Sets"])
 COPY_SET_TITLE_MAX_LENGTH = 11
+DEFAULT_NEW_COPY_TITLE = "New Copy"
+DEFAULT_PRACTICE_COPY_TITLE = "Practice"
+DEFAULT_COPY_SET_TITLES = (
+    DEFAULT_NEW_COPY_TITLE,
+    DEFAULT_PRACTICE_COPY_TITLE,
+)
 
 
 # ============================================================================
@@ -158,6 +164,60 @@ async def _next_copy_number(col, user_id: str) -> int:
     return count + 1
 
 
+async def ensure_default_copy_sets_for_user(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> List[Dict[str, Any]]:
+    """Ensure the canonical default copy pair exists for a user.
+
+    New users should start with:
+    - ``New Copy``
+    - ``Practice``
+
+    If the user has no active copy pointer yet, ``New Copy`` becomes active.
+    Returns the created/found copy-set documents sorted by creation time.
+    """
+    col = await get_copy_sets_collection(current_user, db)
+    user_id = canonical_canvas_user_id(current_user)
+    now = datetime.now(timezone.utc)
+
+    existing_cursor = col.find(
+        {"user_id": user_id, "title": {"$in": list(DEFAULT_COPY_SET_TITLES)}}
+    )
+    existing_docs = await existing_cursor.to_list(length=10)
+    existing_by_title = {doc.get("title"): doc for doc in existing_docs}
+
+    created_docs: List[Dict[str, Any]] = []
+    for title in DEFAULT_COPY_SET_TITLES:
+        if title in existing_by_title:
+            continue
+        doc: Dict[str, Any] = {
+            "user_id": user_id,
+            "title": title,
+            "is_archived": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = await col.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        created_docs.append(doc)
+        existing_by_title[title] = doc
+
+    active_copy_id = await _get_active_copy_id_from_db(current_user, db)
+    if not active_copy_id:
+        preferred = existing_by_title.get(DEFAULT_NEW_COPY_TITLE)
+        if preferred:
+            await _set_active_copy_id(current_user, db, str(preferred["_id"]))
+
+    docs = [existing_by_title[title] for title in DEFAULT_COPY_SET_TITLES if title in existing_by_title]
+    docs.extend(created_docs)
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        if "_id" in doc:
+            deduped[str(doc["_id"])] = doc
+    return sorted(deduped.values(), key=lambda doc: doc.get("created_at") or now)
+
+
 async def _set_active_copy_id(
     current_user: Dict[str, Any],
     db: DatabaseManager,
@@ -195,7 +255,8 @@ async def ensure_active_copy(
 ) -> Dict[str, Any]:
     """Guarantee the user has an active, non-archived copy set.
 
-    Creates a default ``Copy 1`` if none exists.  Returns the copy-set
+    Creates the default ``New Copy`` + ``Practice`` pair if none exists.
+    Returns the copy-set
     document (with ``_id``).
     """
     col = await get_copy_sets_collection(current_user, db)
@@ -222,19 +283,12 @@ async def ensure_active_copy(
         await _set_active_copy_id(current_user, db, str(copy_set["_id"]))
         return copy_set
 
-    # 3. No copy sets at all — create a default.
-    now = datetime.now(timezone.utc)
-    doc: Dict[str, Any] = {
-        "user_id": user_id,
-        "title": "Copy 1",
-        "is_archived": False,
-        "created_at": now,
-        "updated_at": now,
-    }
-    result = await col.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    await _set_active_copy_id(current_user, db, str(result.inserted_id))
-    return doc
+    # 3. No copy sets at all — create the default pair and activate New Copy.
+    docs = await ensure_default_copy_sets_for_user(current_user, db)
+    for doc in docs:
+        if doc.get("title") == DEFAULT_NEW_COPY_TITLE:
+            return doc
+    return docs[0]
 
 
 async def resolve_copy_id(
