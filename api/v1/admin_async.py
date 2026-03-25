@@ -204,6 +204,7 @@ class StudentResponse(BaseModel):
     school: Optional[str] = None
     stream: Optional[str] = None
     grade: Optional[str] = None
+    section: Optional[str] = None
     phone: Optional[str] = None
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
@@ -880,6 +881,7 @@ async def get_students(
                     school=student.get("school"),
                     stream=student.get("stream"),
                     grade=student.get("grade"),
+                    section=student.get("section"),
                     phone=student.get("phone"),
                     plan_types=student.get("plan_types"),
                     subjects=student.get("subjects"),
@@ -912,6 +914,107 @@ async def get_students(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get students",
+        )
+
+
+@router.get("/students/export")
+@limiter.limit("5/minute")
+async def export_students(
+    request: Request,
+    search: Optional[str] = Query(None, max_length=100),
+    is_active: Optional[bool] = Query(None),
+    grade: Optional[str] = Query(None, max_length=20),
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Export all students (no pagination) for CSV download"""
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        collection = "users" if is_b2c else "students"
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+
+        if is_b2c:
+            filter_dict = {}
+        else:
+            filter_dict = {"admin_id": admin_id}
+
+        if search:
+            safe_search = MongoSanitizer.escape_for_like_search(search)
+            if safe_search:
+                filter_dict["$or"] = [
+                    {"student_id": {"$regex": safe_search, "$options": "i"}},
+                    {"username": {"$regex": safe_search, "$options": "i"}},
+                    {"full_name": {"$regex": safe_search, "$options": "i"}},
+                    {"name": {"$regex": safe_search, "$options": "i"}},
+                    {"email": {"$regex": safe_search, "$options": "i"}},
+                    {"phone": {"$regex": safe_search, "$options": "i"}},
+                ]
+        if is_active is not None:
+            filter_dict["is_active"] = is_active
+        if grade is not None:
+            filter_dict["grade"] = grade
+
+        if is_b2c:
+            students_data = await db.b2c_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+            )
+        else:
+            students_data = await db.mongo_find(
+                collection,
+                filter_dict,
+                projection={"password_hash": 0},
+                sort=[("created_at", -1)],
+            )
+
+        students = []
+        for student in students_data:
+            students.append(
+                StudentResponse(
+                    id=str(student.get("_id") or student.get("id")),
+                    student_id=str(
+                        student.get("student_id")
+                        or student.get("_id")
+                        or student.get("id")
+                    ),
+                    username=student.get("username", ""),
+                    full_name=(
+                        student.get("full_name")
+                        or student.get("name")
+                        or student.get("username", "")
+                    ),
+                    email=student.get("email"),
+                    date_of_birth=student.get("date_of_birth"),
+                    gender=student.get("gender"),
+                    location=student.get("location"),
+                    school=student.get("school"),
+                    stream=student.get("stream"),
+                    grade=student.get("grade"),
+                    section=student.get("section"),
+                    phone=student.get("phone"),
+                    plan_types=student.get("plan_types"),
+                    subjects=student.get("subjects"),
+                    is_active=student.get("is_active", True),
+                    requires_password_change=student.get(
+                        "requires_password_change", False
+                    ),
+                    password_reset_requested=student.get(
+                        "password_reset_requested", False
+                    ),
+                    created_at=student.get("created_at", datetime.utcnow()),
+                    last_login=student.get("last_login"),
+                ).dict()
+            )
+
+        return {"students": students, "total": len(students)}
+
+    except Exception as e:
+        logger.error(f"Export students error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to export students",
         )
 
 
