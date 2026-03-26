@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/plagiarism.check",
+  "title": "plagiarism.check event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "trigger"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "plagiarism.check" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string" },
+    "trigger": {
+      "type": "string",
+      "enum": ["evaluation_finalized", "manual_recheck"]
+    },
+    "question_count": { "type": "integer" }
+  }
+}

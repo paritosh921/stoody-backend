@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/objection",
+  "title": "objection event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "objection_id",
+    "student_id",
+    "action",
+    "state"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "objection" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string" },
+    "objection_id": { "type": "string" },
+    "student_id": { "type": "string" },
+    "question_id": { "type": "string" },
+    "action": {
+      "type": "string",
+      "enum": ["filed", "assigned", "reviewing", "resolved", "escalated"]
+    },
+    "state": {
+      "type": "string",
+      "enum": ["filed", "assigned", "reviewing", "resolved", "escalated"]
+    },
+    "actor_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] }
+  }
+}

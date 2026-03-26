@@ -1,0 +1,85 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Analytics API
+  version: "2.0.0"
+  description: |
+    Read-only analytics APIs over finalized DCR and PCR outputs.
+    Analytics is downstream of evaluation and publication; it does not own engine state.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/analytics/exams/{exam_id}/summary:
+    get:
+      summary: Get published analytics summary for one exam
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+      responses:
+        "200":
+          description: Analytics summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamAnalyticsSummary"
+  /api/v1/analytics/exams/{exam_id}/leaderboard:
+    get:
+      summary: Get leaderboard rows for one exam
+      parameters:
+        - $ref: "#/components/parameters/ExamId"
+      responses:
+        "200":
+          description: Leaderboard rows
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LeaderboardRow"
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    ExamId:
+      name: exam_id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    ExamAnalyticsSummary:
+      type: object
+      required: [exam_id, exam_type, student_count, published_count]
+      properties:
+        exam_id:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        student_count:
+          type: integer
+        published_count:
+          type: integer
+        average_score:
+          type: number
+        percentile_bands:
+          type: array
+          items:
+            type: object
+    LeaderboardRow:
+      type: object
+      required: [student_id, rank, total_score]
+      properties:
+        student_id:
+          type: string
+        rank:
+          type: integer
+        total_score:
+          type: number

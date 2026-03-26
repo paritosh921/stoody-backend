@@ -1,0 +1,195 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen PCR Submission API
+  version: "2.1.0"
+  description: |
+    PCR conducted-exam submission APIs operating on canonical server-side artifacts.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/evalpen/submissions:
+    post:
+      summary: Register or ingest a PCR conducted-exam submission
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSubmissionRequest"
+      responses:
+        "202":
+          description: Submission accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmissionAccepted"
+    get:
+      summary: List PCR submissions
+      responses:
+        "200":
+          description: Submission list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SubmissionSummary"
+  /api/v1/evalpen/submissions/{submission_id}/responses:
+    get:
+      summary: Get detected responses for one submission
+      parameters:
+        - name: submission_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Detected responses
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DetectedResponse"
+  /api/v1/evalpen/flags/{flag_id}/resolve:
+    patch:
+      summary: Resolve one PCR flag
+      parameters:
+        - name: flag_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveFlagRequest"
+      responses:
+        "200":
+          description: Flag resolved
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    CreateSubmissionRequest:
+      type: object
+      required: [exam_id, student_id, source]
+      properties:
+        exam_id:
+          type: string
+        student_id:
+          type: string
+        admin_id:
+          type: string
+        source:
+          type: string
+          enum: [ble_pen, camera]
+        page_count:
+          type: integer
+        page_refs:
+          type: array
+          items:
+            type: object
+            properties:
+              page_num:
+                type: integer
+              raw_asset_ref:
+                type: string
+    SubmissionAccepted:
+      type: object
+      required: [submission_id, segmentation_status]
+      properties:
+        submission_id:
+          type: string
+        segmentation_status:
+          type: string
+          enum: [pending, complete, failed]
+    SubmissionSummary:
+      type: object
+      required: [submission_id, exam_id, student_id, source, segmentation_status]
+      properties:
+        submission_id:
+          type: string
+        exam_id:
+          type: string
+        student_id:
+          type: string
+        source:
+          type: string
+          enum: [ble_pen, camera]
+        segmentation_status:
+          type: string
+          enum: [pending, complete, failed]
+        submitted_at:
+          type: string
+          format: date-time
+    DetectedResponse:
+      type: object
+      required: [response_id, question_id, content_type, eval_status]
+      properties:
+        response_id:
+          type: string
+        question_id:
+          type: string
+        source_pages:
+          type: array
+          items:
+            type: integer
+        detected_text:
+          type: string
+        content_type:
+          type: string
+          enum: [TEXT_ONLY, MIXED, DIAGRAM_HEAVY, TABLE_PRESENT]
+        eval_status:
+          type: string
+          enum: [pending, ready, ready_with_warnings, blocked, evaluated, manual_review]
+        segmentation_confidence:
+          type: number
+        ocr_confidence:
+          type: number
+        flags:
+          type: array
+          items:
+            $ref: "#/components/schemas/Flag"
+    Flag:
+      type: object
+      required: [flag_id, source, flag_type, severity, reason]
+      properties:
+        flag_id:
+          type: string
+        source:
+          type: string
+          enum: [segmenter, content_classifier, clubbed_detector, ocr, eval, llm_gate]
+        flag_type:
+          type: string
+        severity:
+          type: string
+          enum: [blocking, warning, info]
+        reason:
+          type: string
+        suggested_action:
+          type: string
+    ResolveFlagRequest:
+      type: object
+      required: [resolution]
+      properties:
+        resolution:
+          type: string
+        note:
+          type: string

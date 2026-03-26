@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/stroke.processed",
+  "title": "stroke.processed event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "exam_type",
+    "pen_mac",
+    "artifact_id"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "stroke.processed" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string" },
+    "exam_type": { "type": "string", "enum": ["dcr", "pcr"] },
+    "pen_mac": { "type": "string" },
+    "student_id": { "type": "string" },
+    "artifact_id": { "type": "string" },
+    "normalized_stroke_uri": { "type": "string" },
+    "page_count": { "type": "integer" }
+  }
+}

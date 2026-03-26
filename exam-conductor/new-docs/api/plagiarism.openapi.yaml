@@ -1,0 +1,75 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Plagiarism API
+  version: "2.0.0"
+  description: |
+    Reviewable plagiarism flags built from DCR and PCR outputs.
+    This API exposes flags and verdicts; it does not own raw ingest or evaluator state.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/plagiarism/exams/{exam_id}/flags:
+    get:
+      summary: List plagiarism flags for one exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Flag list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PlagiarismFlag"
+  /api/v1/plagiarism/flags/{flag_id}:
+    patch:
+      summary: Record teacher verdict for a plagiarism flag
+      parameters:
+        - name: flag_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:
+                  type: string
+                  enum: [confirmed, dismissed]
+      responses:
+        "200":
+          description: Verdict recorded
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    PlagiarismFlag:
+      type: object
+      required: [flag_id, exam_id, question_id, severity]
+      properties:
+        flag_id:
+          type: string
+        exam_id:
+          type: string
+        question_id:
+          type: string
+        severity:
+          type: string

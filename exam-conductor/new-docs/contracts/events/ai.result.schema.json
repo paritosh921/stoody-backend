@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/ai.result",
+  "title": "ai.result event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "event_type",
+    "event_version",
+    "occurred_at",
+    "exam_id",
+    "student_id",
+    "engine",
+    "results"
+  ],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "ai.result" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "exam_id": { "type": "string" },
+    "student_id": { "type": "string" },
+    "engine": { "type": "string", "enum": ["dcr", "pcr"] },
+    "gate_call_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question_id", "score"],
+        "properties": {
+          "question_id": { "type": "string" },
+          "score": { "type": "number" },
+          "recognized_text": { "type": "string" },
+          "feedback": { "type": "string" }
+        }
+      }
+    }
+  }
+}

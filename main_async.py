@@ -259,9 +259,11 @@ except Exception as e:
 # Super Admin routes (tenant management for super admins)
 try:
     from api.v1.superadmin_async import router as superadmin_router
+    from api.v1.superadmin_async import hub_provision_router
     _superadmin_available = True
 except Exception as e:
     superadmin_router = None
+    hub_provision_router = None
     _superadmin_available = False
     logging.warning(f"Super Admin routes disabled: {str(e)}")
 
@@ -284,6 +286,56 @@ except Exception as e:
     timetable_bulk_upload_router = None
     _timetable_available = False
     logging.warning(f"Timetable routes disabled: {str(e)}")
+
+# ExamPen routes (conducted-exam DCR/PCR evaluation, LLM gate usage)
+# The exam-conductor directory uses a hyphen, which is not a valid Python
+# package name.  Adding it to sys.path lets importlib.import_module() and
+# the load_exampen() helper resolve sub-packages at runtime.
+import sys as _sys
+from pathlib import Path as _Path
+_exam_conductor_dir = str(_Path(__file__).parent / "exam-conductor")
+if _exam_conductor_dir not in _sys.path:
+    _sys.path.insert(0, _exam_conductor_dir)
+
+try:
+    from api.v1.evalpen_usage_async import router as evalpen_usage_router
+    from api.v1.evalpen_dcr_async import router as evalpen_dcr_router
+    from api.v1.evalpen_submissions_async import (
+        router as evalpen_submissions_router,
+        flags_router as evalpen_flags_router,
+    )
+    from api.v1.evalpen_evaluate_async import (
+        router as evalpen_evaluate_router,
+        evaluations_router as evalpen_evaluations_router,
+    )
+    from api.v1.evalpen_solutions_async import (
+        router as evalpen_solutions_router,
+        questions_router as evalpen_questions_router,
+    )
+    from api.v1.evalpen_practice_async import router as evalpen_practice_router
+    from api.v1.evalpen_review_async import router as evalpen_review_router
+    from api.v1.evalpen_flagged_async import router as evalpen_flagged_router
+    from api.v1.evalpen_invigilator_async import router as evalpen_invigilator_router
+    from api.v1.evalpen_teacher_bff_async import router as evalpen_teacher_bff_router
+    from api.v1.evalpen_student_bff_async import router as evalpen_student_bff_router
+    _evalpen_available = True
+except Exception as e:
+    evalpen_usage_router = None
+    evalpen_dcr_router = None
+    evalpen_submissions_router = None
+    evalpen_flags_router = None
+    evalpen_evaluate_router = None
+    evalpen_evaluations_router = None
+    evalpen_solutions_router = None
+    evalpen_questions_router = None
+    evalpen_practice_router = None
+    evalpen_review_router = None
+    evalpen_flagged_router = None
+    evalpen_invigilator_router = None
+    evalpen_teacher_bff_router = None
+    evalpen_student_bff_router = None
+    _evalpen_available = False
+    logging.warning(f"ExamPen routes disabled: {str(e)}")
 
 
 # Configure logging
@@ -450,6 +502,25 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Note classification worker started")
         except Exception as cls_err:
             logger.warning(f"⚠️ Note classification worker disabled: {cls_err}")
+
+        # Initialize ExamPen indexes if the module is available
+        if _evalpen_available:
+            try:
+                from api.v1._exampen_imports import load_exampen
+                _gate_mod = load_exampen("llm_gate.gate")
+                _ingest_mod = load_exampen("ingest.service")
+
+                # Use the master DB for index creation (indexes are per-collection,
+                # not per-tenant, so any DB connection works for the TTL/unique specs).
+                _master_db = await db_manager.get_tenant_db("skb_master")
+                if _master_db is not None:
+                    gate = _gate_mod.LLMGate(_master_db)
+                    await gate.initialize()
+                    ingest_svc = _ingest_mod.IngestService(_master_db)
+                    await ingest_svc.initialize()
+                    logger.info("ExamPen indexes initialized on master DB")
+            except Exception as ep_err:
+                logger.warning(f"ExamPen index initialization skipped: {ep_err}")
 
         logger.info("✅ All services initialized successfully")
 
@@ -1108,6 +1179,11 @@ if _superadmin_available and superadmin_router:
         prefix=f"{API_V1_PREFIX}/superadmin",
         tags=["Super Admin"]
     )
+    if hub_provision_router is not None:
+        app.include_router(
+            hub_provision_router,
+            tags=["Hub Provisioning"]
+        )
     logger.info("✅ Super Admin routes enabled")
 else:
     logger.warning("⚠️ Super Admin routes disabled")
@@ -1137,6 +1213,82 @@ if _timetable_available and timetable_router:
     logger.info("✅ Timetable routes enabled")
 else:
     logger.warning("⚠️ Timetable routes disabled")
+
+# ExamPen routes (conducted-exam DCR/PCR evaluation, LLM gate usage)
+if _evalpen_available:
+    app.include_router(
+        evalpen_usage_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/usage",
+        tags=["ExamPen Usage"],
+    )
+    app.include_router(
+        evalpen_dcr_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/dcr",
+        tags=["ExamPen DCR"],
+    )
+    app.include_router(
+        evalpen_submissions_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/submissions",
+        tags=["ExamPen Submissions"],
+    )
+    app.include_router(
+        evalpen_flags_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/flags",
+        tags=["ExamPen Flags"],
+    )
+    app.include_router(
+        evalpen_evaluate_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/evaluate",
+        tags=["ExamPen Evaluate"],
+    )
+    app.include_router(
+        evalpen_evaluations_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/evaluations",
+        tags=["ExamPen Evaluations"],
+    )
+    app.include_router(
+        evalpen_solutions_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/solutions",
+        tags=["ExamPen Solutions"],
+    )
+    app.include_router(
+        evalpen_questions_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/questions",
+        tags=["ExamPen Questions"],
+    )
+    app.include_router(
+        evalpen_practice_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/practice",
+        tags=["ExamPen Practice"],
+    )
+    app.include_router(
+        evalpen_review_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/review",
+        tags=["ExamPen Review"],
+    )
+    app.include_router(
+        evalpen_flagged_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/flagged",
+        tags=["ExamPen Flagged"],
+    )
+    app.include_router(
+        evalpen_invigilator_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/invigilator",
+        tags=["evalpen-invigilator"],
+    )
+    app.include_router(
+        evalpen_teacher_bff_router,
+        prefix=f"{API_V1_PREFIX}/teacher",
+        tags=["evalpen-teacher-bff"],
+    )
+    app.include_router(
+        evalpen_student_bff_router,
+        prefix=f"{API_V1_PREFIX}/student",
+        tags=["evalpen-student-bff"],
+    )
+    logger.info("✅ ExamPen routes enabled (14 routers)")
+else:
+    logger.warning("⚠️ ExamPen routes disabled")
 
 
 # Static file serving

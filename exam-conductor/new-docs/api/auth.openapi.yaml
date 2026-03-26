@@ -1,0 +1,50 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Auth Context API
+  version: "2.0.0"
+  description: |
+    Identity normalization and actor-context APIs for ExamPen.
+    Stoody remains the source of truth for JWT issuance, user identity, and tutor/student visibility.
+servers:
+  - url: /
+paths:
+  /api/v1/auth/introspect:
+    post:
+      summary: Validate Stoody identity and return normalized ExamPen actor context
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+      responses:
+        "200":
+          description: Normalized actor context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActorContext"
+        "401":
+          description: Token invalid or expired
+components:
+  schemas:
+    ActorContext:
+      type: object
+      required: [user_id, roles, tenant_id]
+      properties:
+        user_id:
+          type: string
+        tenant_id:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+        visible_student_ids:
+          type: array
+          items:
+            type: string

@@ -1376,6 +1376,24 @@ async def create_student(
                 detail="Failed to create student",
             )
 
+        try:
+            from api.v1.copy_sets_async import ensure_default_copy_sets_for_user
+
+            await ensure_default_copy_sets_for_user(
+                {
+                    "user_id": inserted_id,
+                    "user_type": "student",
+                    "db_name": current_user.get("db_name"),
+                },
+                db,
+            )
+        except Exception as copy_error:
+            logger.warning(
+                "Created student %s but failed to bootstrap default copy sets: %s",
+                inserted_id,
+                copy_error,
+            )
+
         # Invalidate cached students lists and dashboard stats
         try:
             await cache.clear_pattern("students:*", "admin")

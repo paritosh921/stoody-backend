@@ -285,6 +285,20 @@ class DatabaseManager:
                     await collection.drop_index(existing_name)
                     dropped += 1
                     logger.info("Dropped legacy index %s on %s", existing_name, collection.full_name)
+                except OperationFailure as exc:
+                    if getattr(exc, "code", None) == 27 or "IndexNotFound" in str(exc):
+                        logger.debug(
+                            "Legacy index %s already absent on %s",
+                            existing_name,
+                            collection.full_name,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to drop legacy index %s on %s: %s",
+                            existing_name,
+                            collection.full_name,
+                            exc,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to drop legacy index %s on %s: %s",

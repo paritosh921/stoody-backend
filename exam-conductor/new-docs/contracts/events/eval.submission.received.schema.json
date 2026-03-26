@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "exampen/events/eval.submission.received",
+  "title": "eval.submission.received event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "event_version", "occurred_at", "submission_id", "exam_id", "student_id"],
+  "properties": {
+    "event_id": { "type": "string" },
+    "event_type": { "const": "eval.submission.received" },
+    "event_version": { "const": "2.0.0" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "submission_id": { "type": "string" },
+    "exam_id": { "type": "string" },
+    "student_id": { "type": "string" },
+    "source": { "type": "string", "enum": ["pen", "camera"] }
+  }
+}

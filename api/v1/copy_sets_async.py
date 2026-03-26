@@ -7,6 +7,12 @@ All canvas page writes, hydration, and list views are scoped to copy_id.
 
 The pen has no copy concept — copy_id is resolved from the user's
 active_copy_id pointer, stored on the student profile document.
+
+Conducted-exam bridge (SWM-012):
+    Copy sets that contain conducted-exam pages can be detected via
+    ``copy_set_has_exam_pages()``.  A dedicated ``/copy-sets/{copy_id}/exam-status``
+    endpoint allows callers to check whether a copy set has been ingested
+    into the shared ingest substrate.
 """
 
 import logging
@@ -25,6 +31,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copy-sets", tags=["Copy Sets"])
 COPY_SET_TITLE_MAX_LENGTH = 11
+DEFAULT_NEW_COPY_TITLE = "New Copy"
+DEFAULT_PRACTICE_COPY_TITLE = "Practice"
+DEFAULT_COPY_SET_TITLES = (
+    DEFAULT_NEW_COPY_TITLE,
+    DEFAULT_PRACTICE_COPY_TITLE,
+)
 
 
 # ============================================================================
@@ -152,6 +164,60 @@ async def _next_copy_number(col, user_id: str) -> int:
     return count + 1
 
 
+async def ensure_default_copy_sets_for_user(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> List[Dict[str, Any]]:
+    """Ensure the canonical default copy pair exists for a user.
+
+    New users should start with:
+    - ``New Copy``
+    - ``Practice``
+
+    If the user has no active copy pointer yet, ``New Copy`` becomes active.
+    Returns the created/found copy-set documents sorted by creation time.
+    """
+    col = await get_copy_sets_collection(current_user, db)
+    user_id = canonical_canvas_user_id(current_user)
+    now = datetime.now(timezone.utc)
+
+    existing_cursor = col.find(
+        {"user_id": user_id, "title": {"$in": list(DEFAULT_COPY_SET_TITLES)}}
+    )
+    existing_docs = await existing_cursor.to_list(length=10)
+    existing_by_title = {doc.get("title"): doc for doc in existing_docs}
+
+    created_docs: List[Dict[str, Any]] = []
+    for title in DEFAULT_COPY_SET_TITLES:
+        if title in existing_by_title:
+            continue
+        doc: Dict[str, Any] = {
+            "user_id": user_id,
+            "title": title,
+            "is_archived": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        result = await col.insert_one(doc)
+        doc["_id"] = result.inserted_id
+        created_docs.append(doc)
+        existing_by_title[title] = doc
+
+    active_copy_id = await _get_active_copy_id_from_db(current_user, db)
+    if not active_copy_id:
+        preferred = existing_by_title.get(DEFAULT_NEW_COPY_TITLE)
+        if preferred:
+            await _set_active_copy_id(current_user, db, str(preferred["_id"]))
+
+    docs = [existing_by_title[title] for title in DEFAULT_COPY_SET_TITLES if title in existing_by_title]
+    docs.extend(created_docs)
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        if "_id" in doc:
+            deduped[str(doc["_id"])] = doc
+    return sorted(deduped.values(), key=lambda doc: doc.get("created_at") or now)
+
+
 async def _set_active_copy_id(
     current_user: Dict[str, Any],
     db: DatabaseManager,
@@ -189,7 +255,8 @@ async def ensure_active_copy(
 ) -> Dict[str, Any]:
     """Guarantee the user has an active, non-archived copy set.
 
-    Creates a default ``Copy 1`` if none exists.  Returns the copy-set
+    Creates the default ``New Copy`` + ``Practice`` pair if none exists.
+    Returns the copy-set
     document (with ``_id``).
     """
     col = await get_copy_sets_collection(current_user, db)
@@ -216,19 +283,12 @@ async def ensure_active_copy(
         await _set_active_copy_id(current_user, db, str(copy_set["_id"]))
         return copy_set
 
-    # 3. No copy sets at all — create a default.
-    now = datetime.now(timezone.utc)
-    doc: Dict[str, Any] = {
-        "user_id": user_id,
-        "title": "Copy 1",
-        "is_archived": False,
-        "created_at": now,
-        "updated_at": now,
-    }
-    result = await col.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    await _set_active_copy_id(current_user, db, str(result.inserted_id))
-    return doc
+    # 3. No copy sets at all — create the default pair and activate New Copy.
+    docs = await ensure_default_copy_sets_for_user(current_user, db)
+    for doc in docs:
+        if doc.get("title") == DEFAULT_NEW_COPY_TITLE:
+            return doc
+    return docs[0]
 
 
 async def resolve_copy_id(
@@ -504,3 +564,157 @@ async def delete_copy_set(
         await ensure_active_copy(current_user, db)
 
     return {"success": True, "deleted_copy_id": copy_id}
+
+
+# ============================================================================
+# CONDUCTED-EXAM BRIDGE HELPERS (SWM-012)
+# ============================================================================
+
+async def copy_set_has_exam_pages(
+    copy_id: str,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> bool:
+    """Check whether any canvas page in this copy set carries conducted-exam
+    metadata (``exam_id``).
+
+    Importable by ``copies_async`` and other modules that need to know
+    whether a copy set is associated with a conducted exam.
+    """
+    is_b2c = (
+        current_user.get("is_b2c", False)
+        or current_user.get("user_type") == "b2c_user"
+    )
+    if is_b2c:
+        target_db = await db.get_b2c_db()
+    else:
+        db_name = current_user.get("db_name")
+        target_db = await db.get_tenant_db(db_name) if db_name else None
+
+    if target_db is None:
+        return False
+
+    user_id = canonical_canvas_user_id(current_user)
+    page = await target_db["canvas_pages"].find_one(
+        {
+            "user_id": user_id,
+            "copy_id": copy_id,
+            "exam_id": {"$exists": True, "$ne": None},
+        },
+        projection={"_id": 1},
+    )
+    return page is not None
+
+
+async def _get_exam_ingest_status_for_copy(
+    copy_id: str,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> Dict[str, Any]:
+    """Return ingest status for conducted-exam pages within a copy set.
+
+    Checks the ``evalpen_submissions`` collection for submissions matching
+    the exam IDs found in this copy set's pages.  Returns a summary dict.
+    """
+    is_b2c = (
+        current_user.get("is_b2c", False)
+        or current_user.get("user_type") == "b2c_user"
+    )
+    if is_b2c:
+        target_db = await db.get_b2c_db()
+    else:
+        db_name = current_user.get("db_name")
+        target_db = await db.get_tenant_db(db_name) if db_name else None
+
+    if target_db is None:
+        return {"has_exam_pages": False, "exams": []}
+
+    user_id = canonical_canvas_user_id(current_user)
+
+    # Find distinct exam_ids in this copy set's pages
+    canvas_col = target_db["canvas_pages"]
+    pipeline = [
+        {
+            "$match": {
+                "user_id": user_id,
+                "copy_id": copy_id,
+                "exam_id": {"$exists": True, "$ne": None},
+            }
+        },
+        {"$group": {"_id": "$exam_id"}},
+    ]
+    cursor = canvas_col.aggregate(pipeline)
+    exam_ids = [doc["_id"] async for doc in cursor]
+
+    if not exam_ids:
+        return {"has_exam_pages": False, "exams": []}
+
+    # Check ingest status for each exam_id (graceful if collection missing)
+    student_id = current_user.get("user_id") or current_user.get("student_id")
+    exams_status: List[Dict[str, Any]] = []
+
+    try:
+        sub_col = target_db["evalpen_submissions"]
+        for eid in exam_ids:
+            query: Dict[str, Any] = {"exam_id": eid}
+            if student_id:
+                query["student_id"] = student_id
+            sub = await sub_col.find_one(query, projection={
+                "submission_id": 1,
+                "content_hash": 1,
+                "page_count": 1,
+                "segmentation_status": 1,
+            })
+            exams_status.append({
+                "exam_id": eid,
+                "ingested": sub is not None,
+                "submission_id": sub.get("submission_id") if sub else None,
+                "page_count": sub.get("page_count", 0) if sub else 0,
+                "segmentation_status": sub.get("segmentation_status") if sub else None,
+            })
+    except Exception:
+        # Collection may not exist yet — that's fine
+        for eid in exam_ids:
+            exams_status.append({
+                "exam_id": eid,
+                "ingested": False,
+                "submission_id": None,
+                "page_count": 0,
+                "segmentation_status": None,
+            })
+
+    return {
+        "has_exam_pages": True,
+        "exams": exams_status,
+    }
+
+
+@router.get("/{copy_id}/exam-status")
+async def get_copy_set_exam_status(
+    copy_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Check whether a copy set contains conducted-exam pages and their
+    ingest status in the shared ingest substrate.
+
+    Returns ``has_exam_pages: false`` for regular (non-exam) copy sets.
+    For exam copy sets, returns per-exam ingest status including
+    ``submission_id`` and ``segmentation_status``.
+    """
+    col = await get_copy_sets_collection(current_user, db)
+    user_id = canonical_canvas_user_id(current_user)
+
+    copy_set = await col.find_one({"_id": ObjectId(copy_id), "user_id": user_id})
+    if not copy_set:
+        raise HTTPException(status_code=404, detail="Copy set not found")
+
+    status_info = await _get_exam_ingest_status_for_copy(
+        copy_id, current_user, db
+    )
+
+    return {
+        "success": True,
+        "copy_id": copy_id,
+        **status_info,
+    }

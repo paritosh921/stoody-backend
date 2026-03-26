@@ -1,0 +1,62 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Copy Upload API
+  version: "2.0.0"
+  description: |
+    Camera and photographed-copy ingest API for the shared substrate.
+    This path creates canonical conducted-exam image artifacts and normally routes to PCR.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/exams/{exam_id}/copies/upload:
+    post:
+      summary: Upload one conducted-exam image artifact
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [student_id, page_number, source, image]
+              properties:
+                student_id:
+                  type: string
+                page_number:
+                  type: integer
+                source:
+                  type: string
+                  enum: [camera, photographed_copy]
+                image:
+                  type: string
+                  format: binary
+      responses:
+        "202":
+          description: Canonical image artifact accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artifact_id, exam_type, routed_engine]
+                properties:
+                  artifact_id:
+                    type: string
+                  exam_type:
+                    type: string
+                    enum: [pcr]
+                  routed_engine:
+                    type: string
+                    enum: [pcr]
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT

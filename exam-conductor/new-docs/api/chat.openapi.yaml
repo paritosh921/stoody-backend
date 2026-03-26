@@ -1,0 +1,85 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Chat API
+  version: "2.0.0"
+  description: |
+    Supporting teacher-student communication APIs around ExamPen results and review.
+    Chat is outside the ingest substrate and outside evaluator ownership.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/chat/threads/{exam_id}/{other_user_id}:
+    get:
+      summary: Get one exam-scoped thread
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: other_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Thread messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ChatMessage"
+    post:
+      summary: Append one chat message
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: other_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body:
+                  type: string
+      responses:
+        "202":
+          description: Message accepted
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ChatMessage:
+      type: object
+      required: [message_id, sender_id, sent_at, body]
+      properties:
+        message_id:
+          type: string
+        sender_id:
+          type: string
+        sent_at:
+          type: string
+          format: date-time
+        body:
+          type: string

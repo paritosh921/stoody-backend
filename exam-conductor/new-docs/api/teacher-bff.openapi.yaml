@@ -1,0 +1,61 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Teacher BFF API
+  version: "2.0.0"
+  description: |
+    Aggregated teacher-facing APIs over exam operations, DCR/PCR results, review state, and analytics.
+    This BFF is read-oriented over backing domains and must not become a second evaluator.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/teacher/exams:
+    get:
+      summary: List exams visible to the teacher
+      responses:
+        "200":
+          description: Teacher exam cards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeacherExamCard"
+  /api/v1/teacher/exams/{exam_id}/queue:
+    get:
+      summary: Get teacher work queues for one exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Work queues
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    TeacherExamCard:
+      type: object
+      required: [exam_id, title, exam_type]
+      properties:
+        exam_id:
+          type: string
+        title:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]

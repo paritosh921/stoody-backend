@@ -1,0 +1,61 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Student BFF API
+  version: "2.0.0"
+  description: |
+    Read-oriented student and parent views over published ExamPen outcomes.
+    Parent scope remains derived from Stoody relationships.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/student/exams:
+    get:
+      summary: List visible exams
+      responses:
+        "200":
+          description: Student exam cards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/StudentExamCard"
+  /api/v1/student/exams/{exam_id}/scores:
+    get:
+      summary: Get published score summary
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Published score summary
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    StudentExamCard:
+      type: object
+      required: [exam_id, title, exam_type]
+      properties:
+        exam_id:
+          type: string
+        title:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]

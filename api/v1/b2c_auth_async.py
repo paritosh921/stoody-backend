@@ -227,6 +227,24 @@ async def b2c_google_login(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="Failed to create user account"
                 )
+
+            try:
+                from api.v1.copy_sets_async import ensure_default_copy_sets_for_user
+
+                await ensure_default_copy_sets_for_user(
+                    {
+                        "user_id": user_id,
+                        "user_type": "b2c_user",
+                        "is_b2c": True,
+                    },
+                    db,
+                )
+            except Exception as copy_error:
+                logger.warning(
+                    "Created B2C user %s but failed to bootstrap default copy sets: %s",
+                    user_id,
+                    copy_error,
+                )
             
             full_name = google_user['full_name']
             logger.info(f"New B2C user created: {email}")
@@ -395,6 +413,25 @@ async def b2c_google_callback(
                 "subdomain": None
             }
             user_id = await db.b2c_insert_one("users", new_user)
+
+            try:
+                from api.v1.copy_sets_async import ensure_default_copy_sets_for_user
+
+                await ensure_default_copy_sets_for_user(
+                    {
+                        "user_id": user_id,
+                        "user_type": "b2c_user",
+                        "is_b2c": True,
+                    },
+                    db,
+                )
+            except Exception as copy_error:
+                logger.warning(
+                    "Created B2C user %s in callback flow but failed to bootstrap default copy sets: %s",
+                    user_id,
+                    copy_error,
+                )
+
             full_name = google_user['full_name']
 
         # Create JWT session

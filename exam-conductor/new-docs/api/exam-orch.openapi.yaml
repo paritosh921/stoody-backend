@@ -1,0 +1,96 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Exam Orchestration API
+  version: "2.0.0"
+  description: |
+    Exam lifecycle and metadata APIs. Exam orchestration owns exam identity and `exam_type`,
+    which route conducted-exam artifacts to the correct engine.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/exams:
+    get:
+      summary: List exams visible to the current actor
+      responses:
+        "200":
+          description: Exam list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ExamSummary"
+    post:
+      summary: Create an exam with engine-routing metadata
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateExamRequest"
+      responses:
+        "201":
+          description: Exam created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamSummary"
+  /api/v1/exams/{exam_id}/lifecycle:
+    post:
+      summary: Move an exam through lifecycle states
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_state]
+              properties:
+                to_state:
+                  type: string
+      responses:
+        "202":
+          description: Transition accepted
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    CreateExamRequest:
+      type: object
+      required: [title, exam_type]
+      properties:
+        title:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        schedule_at:
+          type: string
+          format: date-time
+    ExamSummary:
+      type: object
+      required: [exam_id, title, exam_type, lifecycle_state]
+      properties:
+        exam_id:
+          type: string
+        title:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        lifecycle_state:
+          type: string

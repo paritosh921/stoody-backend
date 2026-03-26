@@ -1,0 +1,107 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen LLM Gate Usage API
+  version: "2.1.0"
+  description: |
+    Shared LLM gate budget and usage APIs across DCR and PCR.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/evalpen/usage/current:
+    get:
+      summary: Get current gate usage and remaining headroom
+      responses:
+        "200":
+          description: Current usage
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CurrentUsage"
+  /api/v1/evalpen/usage/history:
+    get:
+      summary: Get historical gate usage rollups
+      responses:
+        "200":
+          description: Usage history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UsageRollup"
+  /api/v1/evalpen/usage/config:
+    put:
+      summary: Update tenant gate limits
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GateConfig"
+      responses:
+        "200":
+          description: Config updated
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    CurrentUsage:
+      type: object
+      required: [daily, weekly, monthly]
+      properties:
+        daily:
+          $ref: "#/components/schemas/UsageWindow"
+        weekly:
+          $ref: "#/components/schemas/UsageWindow"
+        monthly:
+          $ref: "#/components/schemas/UsageWindow"
+    UsageWindow:
+      type: object
+      properties:
+        used_tokens:
+          type: integer
+        limit_tokens:
+          type: integer
+        remaining_tokens:
+          type: integer
+    UsageRollup:
+      type: object
+      required: [period_type, period_start, total_tokens]
+      properties:
+        period_type:
+          type: string
+          enum: [daily, weekly, monthly]
+        period_start:
+          type: string
+          format: date
+        total_tokens:
+          type: integer
+        total_cost_usd:
+          type: number
+    GateConfig:
+      type: object
+      properties:
+        max_input_tokens:
+          type: integer
+          nullable: true
+        max_output_tokens:
+          type: integer
+          nullable: true
+        daily_token_limit:
+          type: integer
+          nullable: true
+        weekly_token_limit:
+          type: integer
+          nullable: true
+        monthly_token_limit:
+          type: integer
+          nullable: true

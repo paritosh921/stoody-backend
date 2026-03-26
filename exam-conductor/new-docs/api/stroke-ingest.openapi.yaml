@@ -1,0 +1,85 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Shared Ingest API
+  version: "2.0.0"
+  description: |
+    Conducted-exam ingest APIs for the shared substrate.
+    The substrate persists canonical artifacts, attaches provenance, and routes by `exam_type`.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/strokes/ingest:
+    post:
+      summary: Ingest one uploaded pen chunk from the hub
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StrokeChunkUploadRequest"
+      responses:
+        "202":
+          description: Chunk accepted or deduplicated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestAck"
+  /api/v1/exams/{exam_id}/upload-status:
+    get:
+      summary: Get upload progress and engine route for one exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Upload progress
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    StrokeChunkUploadRequest:
+      type: object
+      required:
+        - exam_id
+        - exam_type
+        - student_id
+        - pen_mac
+        - chunk_index
+        - total_chunks
+        - payload_base64
+      properties:
+        exam_id:
+          type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        student_id:
+          type: string
+        pen_mac:
+          type: string
+        chunk_index:
+          type: integer
+        total_chunks:
+          type: integer
+        payload_base64:
+          type: string
+    IngestAck:
+      type: object
+      required: [artifact_id, deduplicated]
+      properties:
+        artifact_id:
+          type: string
+        deduplicated:
+          type: boolean

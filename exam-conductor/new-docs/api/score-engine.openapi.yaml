@@ -1,0 +1,68 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Score Publication API
+  version: "2.0.0"
+  description: |
+    Read and publication APIs over DCR and PCR evaluation outputs.
+    This layer manages projection, finalization, and publication state after engine evaluation.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/scores/{exam_id}/students/{student_id}:
+    get:
+      summary: Get current score projection for one student
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: student_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Student score projection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudentScoreProjection"
+  /api/v1/scores/{exam_id}/publish:
+    post:
+      summary: Publish finalized scores for one exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Publication accepted
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    StudentScoreProjection:
+      type: object
+      required: [exam_id, student_id, lifecycle_state, total_score]
+      properties:
+        exam_id:
+          type: string
+        student_id:
+          type: string
+        lifecycle_state:
+          type: string
+        total_score:
+          type: number
+        question_scores:
+          type: array
+          items:
+            type: object

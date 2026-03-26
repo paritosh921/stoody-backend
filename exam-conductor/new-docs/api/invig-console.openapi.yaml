@@ -1,0 +1,63 @@
+openapi: "3.1.0"
+info:
+  title: ExamPen Invigilator Console API
+  version: "2.0.0"
+  description: |
+    Read-oriented operational APIs for conducted-exam invigilation.
+    These endpoints surface shared-ingest and exam-session state, not evaluator ownership.
+servers:
+  - url: /
+security:
+  - StoodyBearer: []
+paths:
+  /api/v1/invigilator/exams/{exam_id}/session:
+    get:
+      summary: Get current exam session state
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session view
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSummary"
+  /api/v1/invigilator/exams/{exam_id}/sync:
+    get:
+      summary: Get per-pen and per-upload sync status
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sync view
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  securitySchemes:
+    StoodyBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    SessionSummary:
+      type: object
+      required: [exam_id, lifecycle_state, connected_pens]
+      properties:
+        exam_id:
+          type: string
+        lifecycle_state:
+          type: string
+        connected_pens:
+          type: integer
+        upload_completion_pct:
+          type: number

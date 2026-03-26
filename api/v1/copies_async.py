@@ -7,6 +7,12 @@ Provides endpoints for:
 3. Creating/managing pinned copies (PDF snapshots)
 
 Data source: ``canvas_pages`` collection (single source of truth).
+
+Conducted-exam bridge (SWM-012):
+    When copy pages contain conducted-exam metadata (``exam_id``), the pin
+    creation flow bridges the underlying stroke artifacts into the shared
+    ingest substrate via ``IngestService.ingest_submission()``.  Non-exam
+    copy pages are unaffected.
 """
 
 import asyncio
@@ -32,6 +38,119 @@ from api.v1.copy_sets_async import resolve_copy_id as _resolve_copy_id
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/copies", tags=["Student Copies"])
+
+
+# ---------------------------------------------------------------------------
+# Conducted-exam ingest bridge (SWM-012)
+# ---------------------------------------------------------------------------
+
+async def _maybe_bridge_to_ingest(
+    *,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    stroke_batches: List[Dict[str, Any]],
+    pen_mac: str,
+    page_number: int,
+) -> Optional[Dict[str, Any]]:
+    """Conditionally bridge copy page strokes into the shared ingest substrate.
+
+    The bridge fires only when ALL of the following are true:
+    - At least one stroke batch carries ``exam_id`` metadata
+    - ``student_id`` and ``admin_id`` can be resolved
+    - The exam-conductor ingest module is importable
+
+    Returns the IngestResult dict on success, None otherwise.
+    Failures are logged but never propagated — copy functionality is
+    unaffected.
+    """
+    # Detect conducted-exam metadata on any batch
+    exam_id: Optional[str] = None
+    admin_id: Optional[str] = None
+    collected_strokes: List[Dict[str, Any]] = []
+
+    for batch in stroke_batches:
+        batch_exam_id = batch.get("exam_id")
+        if batch_exam_id:
+            exam_id = batch_exam_id
+            admin_id = admin_id or batch.get("admin_id")
+            collected_strokes.extend(batch.get("strokes", []))
+
+    if not exam_id:
+        # Not a conducted-exam page — skip ingest entirely
+        return None
+
+    student_id = current_user.get("user_id") or current_user.get("student_id")
+    admin_id = admin_id or current_user.get("admin_id")
+
+    if not student_id or not admin_id:
+        logger.debug(
+            "Skipping ingest bridge for exam=%s: missing student_id or admin_id",
+            exam_id,
+        )
+        return None
+
+    # Attempt import — graceful degradation
+    try:
+        from api.v1._exampen_imports import load_exampen
+        ingest_mod = load_exampen("ingest.service")
+        IngestService = ingest_mod.IngestService
+    except (ImportError, AttributeError):
+        logger.debug(
+            "exam-conductor ingest not available — skipping copy ingest bridge"
+        )
+        return None
+
+    try:
+        db_name = current_user.get("db_name")
+        if not db_name:
+            return None
+
+        tenant_db = await db.get_tenant_db(db_name)
+        if tenant_db is None:
+            return None
+
+        service = IngestService(tenant_db)
+        await service.initialize()
+
+        # Determine source from pen_mac
+        source = "ble_pen" if pen_mac and pen_mac.lower() != "canvas" else "camera"
+
+        pages = [
+            {
+                "page_number": page_number,
+                "raw_strokes": collected_strokes,
+            }
+        ]
+
+        result = await service.ingest_submission(
+            exam_id=exam_id,
+            student_id=student_id,
+            admin_id=admin_id,
+            source=source,
+            pen_mac=pen_mac.upper() if source == "ble_pen" else None,
+            pages=pages,
+        )
+
+        logger.info(
+            "Copy ingest bridge: submission_id=%s exam=%s student=%s "
+            "page=%d already_existed=%s",
+            result.submission_id,
+            exam_id,
+            student_id,
+            page_number,
+            result.already_existed,
+        )
+        return result.model_dump()
+
+    except Exception:
+        logger.exception(
+            "Copy ingest bridge failed for exam=%s student=%s page=%d "
+            "(non-fatal, copy operation continues)",
+            exam_id,
+            student_id,
+            page_number,
+        )
+        return None
 
 
 # Custom dependency that accepts token from query param (for image sources)
@@ -837,6 +956,102 @@ async def bulk_delete_copy_pages(
 
 
 # ============================================================================
+# CONDUCTED-EXAM INGEST BRIDGE (SWM-012)
+# ============================================================================
+
+class CopyPageIngestRequest(BaseModel):
+    """Request to explicitly bridge a copy page into the ingest substrate."""
+    pen_mac: str
+    copy_id: Optional[str] = None
+    book_type: Optional[str] = "A5"
+    page_number: int
+    exam_id: str = Field(..., description="Conducted exam identifier")
+    admin_id: Optional[str] = Field(
+        default=None,
+        description="Admin identity (resolved from user context if omitted)",
+    )
+
+
+@router.post("/ingest-bridge", status_code=status.HTTP_200_OK)
+async def ingest_bridge_copy_page(
+    payload: CopyPageIngestRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Explicitly bridge a copy page's strokes into the conducted-exam
+    ingest substrate.
+
+    This endpoint is called when the caller knows a copy page belongs to
+    a conducted exam and wants to ensure its artifacts are persisted in
+    ``evalpen_submissions`` / ``evalpen_answer_pages``.
+
+    Idempotent: re-calling with the same (exam_id, student_id) returns
+    the existing submission without error (ING-03).
+
+    Non-exam copy pages should NOT call this endpoint.
+    """
+    student_id = current_user.get("user_id") or current_user.get("student_id")
+    admin_id = payload.admin_id or current_user.get("admin_id")
+
+    if not student_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot resolve student_id from authentication context",
+        )
+    if not admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="admin_id is required (pass explicitly or ensure it is in the auth token)",
+        )
+
+    # Fetch stroke data
+    stroke_batches = await _get_canvas_page_as_batches(
+        current_user, db,
+        page_number=payload.page_number,
+        book_type=payload.book_type,
+        pen_mac=payload.pen_mac,
+        copy_id=payload.copy_id,
+    )
+
+    if not stroke_batches:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Copy page not found — no strokes available to ingest",
+        )
+
+    # Inject exam_id into batches so the bridge helper detects it
+    for batch in stroke_batches:
+        batch["exam_id"] = payload.exam_id
+        batch["admin_id"] = admin_id
+
+    result = await _maybe_bridge_to_ingest(
+        current_user=current_user,
+        db=db,
+        stroke_batches=stroke_batches,
+        pen_mac=payload.pen_mac,
+        page_number=payload.page_number,
+    )
+
+    if result is None:
+        return {
+            "success": True,
+            "ingest_available": False,
+            "message": "Ingest substrate is not available. "
+                       "Artifacts will be ingested via backfill.",
+        }
+
+    return {
+        "success": True,
+        "ingest_available": True,
+        "submission_id": result.get("submission_id"),
+        "page_count": result.get("page_count", 0),
+        "content_hash": result.get("content_hash"),
+        "already_existed": result.get("already_existed", False),
+        "message": "Copy page artifacts ingested into conducted-exam substrate.",
+    }
+
+
+# ============================================================================
 # PIN ENDPOINTS - Create and manage pinned copies (PDF snapshots)
 # ============================================================================
 
@@ -879,6 +1094,16 @@ async def create_pin(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Copy page not found - no strokes available to pin"
             )
+
+        # SWM-012: Bridge conducted-exam artifacts to ingest substrate
+        # (best-effort, non-blocking for the pin flow)
+        await _maybe_bridge_to_ingest(
+            current_user=current_user,
+            db=db,
+            stroke_batches=stroke_batches,
+            pen_mac=payload.pen_mac,
+            page_number=payload.page_number,
+        )
 
         # Generate PDF
         pdf_bytes = await generate_copy_pdf(
