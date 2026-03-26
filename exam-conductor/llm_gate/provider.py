@@ -219,6 +219,11 @@ async def _call_openai(
             },
             json=payload,
         )
+        if resp.status_code >= 400:
+            error_body = resp.text
+            logger.error(
+                f"OpenAI API error {resp.status_code} for model={model_id}: {error_body[:500]}"
+            )
         resp.raise_for_status()
         data = resp.json()
 

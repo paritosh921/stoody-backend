@@ -2933,6 +2933,18 @@ async def get_student_practice_sets(
 
         logger.info(f"Found {len(practice_sets)} practice sets matching filter")
 
+        # Get actual question counts per document via aggregation (avoids stale extracted_questions_count)
+        doc_ids = [doc["document_id"] for doc in practice_sets]
+        question_counts: Dict[str, int] = {}
+        if doc_ids:
+            count_pipeline = [
+                {"$match": {"document_id": {"$in": doc_ids}}},
+                {"$group": {"_id": "$document_id", "count": {"$sum": 1}}}
+            ]
+            count_results = await db.mongo_aggregate("questions", count_pipeline)
+            for r in count_results:
+                question_counts[r["_id"]] = r["count"]
+
         # Format response - only include necessary fields for security
         practice_sets_list = []
         user_id = current_user["user_id"]
@@ -2975,11 +2987,11 @@ async def get_student_practice_sets(
             practice_sets_list.append({
                 "document_id": doc_id,
                 "title": doc["title"],
-                "subject": doc["subject"],
-                "difficulty": doc["difficulty"],
+                "subject": doc.get("subject", ""),
+                "difficulty": doc.get("difficulty", ""),
                 "course_plan": doc.get("course_plan"),
                 "standard": doc.get("standard"),
-                "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                "extracted_questions_count": question_counts.get(doc_id, doc.get("extracted_questions_count", 0)),
                 "instructions": doc.get("instructions"),
                 "completed": completed,
                 "attempted": has_attempted,
