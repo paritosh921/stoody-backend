@@ -1229,6 +1229,9 @@ async def extract_questions_with_gpt(
     good_questions.sort(key=_sort_key)
 
     # Build final ExtractedQuestion list
+    # Track which image has been assigned per page so each figure-question
+    # gets the NEXT unassigned image instead of ALL images on the page.
+    page_image_cursor: Dict[int, int] = {}
     questions: List[ExtractedQuestion] = []
     for q in good_questions:
         q_text = q.get("text", "").strip()
@@ -1241,8 +1244,15 @@ async def extract_questions_with_gpt(
         has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
 
         # Use real image IDs from the page if this question references a figure
+        # Assign images 1:1 in order: 1st figure-question gets 1st image, etc.
         if has_image and q_page in page_image_ids:
-            img_refs = page_image_ids[q_page]
+            cursor = page_image_cursor.get(q_page, 0)
+            all_page_imgs = page_image_ids[q_page]
+            if cursor < len(all_page_imgs):
+                img_refs = [all_page_imgs[cursor]]
+                page_image_cursor[q_page] = cursor + 1
+            else:
+                img_refs = []
         else:
             img_refs = []
 
