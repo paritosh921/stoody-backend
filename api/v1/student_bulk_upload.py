@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 
-# Valid grades for students
-VALID_GRADES = ["6", "7", "8", "9", "10", "11", "12"]
+# Fallback grades — only used if school settings are completely absent (should not happen in production)
+FALLBACK_GRADES = ["6", "7", "8", "9", "10", "11", "12"]
+FALLBACK_SECTIONS = ["A", "B", "C", "D", "E", "F"]
 
 # Template columns configuration
 TEMPLATE_COLUMNS = {
@@ -145,9 +146,22 @@ def validate_email(email: str) -> bool:
 
 
 def validate_grade(grade: str, valid_grades: List[str] = None) -> bool:
-    """Validate grade is in allowed list (from school settings or default)"""
-    allowed = valid_grades if valid_grades else VALID_GRADES
+    """Validate grade is in allowed list (from school settings or fallback)"""
+    allowed = valid_grades if valid_grades else FALLBACK_GRADES
     return str(grade).strip() in allowed
+
+
+def validate_section_for_class(section: str, grade: str, valid_sections: List[str],
+                                class_sections: Dict[str, List[str]] = None) -> bool:
+    """Validate section against the class-specific mapping if available, else the global sections list."""
+    if not section:
+        return True  # Section is optional
+    section_upper = section.strip().upper()
+    # If per-class mapping exists and has this grade, use it
+    if class_sections and grade in class_sections:
+        return section_upper in [s.upper() for s in class_sections[grade]]
+    # Otherwise fall back to global sections list
+    return section_upper in [s.upper() for s in valid_sections]
 
 
 def validate_section(section: str, valid_sections: List[str]) -> bool:
@@ -209,65 +223,75 @@ async def download_bulk_template(
     Download a template file for bulk student upload.
     Supports CSV and Excel formats.
     """
-    # Fetch school settings for dynamic dropdowns
+    # Fetch school settings — template reflects actual institution configuration
+    # admin_id stored as string in school_settings (matching settings_async.py)
     try:
         tenant_db = await get_tenant_db_or_403(db, current_user)
-        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        admin_id = current_user.get("admin_id", current_user.get("user_id"))
         settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
-        
-        # Get valid sections from settings
-        valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
-        valid_classes = settings_doc.get("classes", VALID_GRADES) if settings_doc else VALID_GRADES
+
+        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS) if settings_doc else FALLBACK_SECTIONS
+        valid_classes = settings_doc.get("classes", FALLBACK_GRADES) if settings_doc else FALLBACK_GRADES
         valid_streams = settings_doc.get("streams", ["science", "commerce", "arts", "other"]) if settings_doc else ["science", "commerce", "arts", "other"]
-        valid_plan_types = settings_doc.get("plan_types", ["CBSE", "JEE", "NEET", "CUET"]) if settings_doc else ["CBSE", "JEE", "NEET", "CUET"]
-        valid_subjects = settings_doc.get("subjects", ["Physics", "Chemistry", "Mathematics", "Biology"]) if settings_doc else ["Physics", "Chemistry", "Mathematics", "Biology"]
+        valid_plan_types = settings_doc.get("plan_types", []) if settings_doc else []
+        valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
+        school_name = settings_doc.get("school_info", {}).get("school_name", "") if settings_doc else ""
     except Exception as e:
         logger.warning(f"Could not fetch school settings: {e}")
-        valid_sections = ["A", "B", "C", "D", "E", "F"]
-        valid_classes = VALID_GRADES
-        valid_plan_types = ["CBSE", "JEE", "NEET", "CUET"]
-        valid_subjects = ["Physics", "Chemistry", "Mathematics", "Biology"]
-    
+        valid_sections = FALLBACK_SECTIONS
+        valid_classes = FALLBACK_GRADES
+        valid_plan_types = []
+        valid_subjects = []
+        school_name = ""
+
     # Get school prefix for username example
-    school_prefix = "".join(c for c in (school_name if 'school_name' in dir() else "").lower() if c.isalnum())[:4]
+    school_prefix = "".join(c for c in school_name.lower() if c.isalnum())[:4]
     if not school_prefix or len(school_prefix) < 2:
         school_prefix = "ciel"  # Example prefix
-    
-    # Create sample data with 3 example rows (stream removed, username added)
+
+    # Build sample data dynamically from school settings
+    sample_grade_1 = valid_classes[0] if len(valid_classes) > 0 else "10"
+    sample_grade_2 = valid_classes[1] if len(valid_classes) > 1 else "11"
+    sample_grade_3 = valid_classes[-1] if len(valid_classes) > 0 else "12"
+    sample_section = valid_sections[0] if valid_sections else "A"
+    sample_section_2 = valid_sections[1] if len(valid_sections) > 1 else "B"
+    sample_plans = ','.join(valid_plan_types[:2]) if valid_plan_types else ""
+    sample_subjects = ','.join(valid_subjects[:3]) if valid_subjects else ""
+
     sample_data = [
         {
             "full_name": "Rahul Sharma",
-            "username": "",  # Empty = auto-generate
-            "grade": "10",
-            "section": "A",
+            "username": "",
+            "grade": sample_grade_1,
+            "section": sample_section,
             "email": "rahul@example.com",
             "phone": "9876543210",
             "gender": "male",
             "date_of_birth": "2008-05-15",
             "school": "",
             "location": "Mumbai",
-            "plan_types": "JEE,NEET",
-            "subjects": "Physics,Chemistry,Mathematics"
+            "plan_types": sample_plans,
+            "subjects": sample_subjects
         },
         {
             "full_name": "Priya Patel",
-            "username": "",  # Empty = auto-generate
-            "grade": "11",
-            "section": "B",
+            "username": "",
+            "grade": sample_grade_2,
+            "section": sample_section_2,
             "email": "priya@example.com",
             "phone": "9876543211",
             "gender": "female",
             "date_of_birth": "2007-03-20",
             "school": "",
             "location": "Delhi",
-            "plan_types": "JEE",
-            "subjects": "Physics,Chemistry,Mathematics"
+            "plan_types": valid_plan_types[0] if valid_plan_types else "",
+            "subjects": sample_subjects
         },
         {
             "full_name": "Amit Kumar",
-            "username": "amit2025",  # Example custom username
-            "grade": "12",
-            "section": "A",
+            "username": "amit2025",
+            "grade": sample_grade_3,
+            "section": sample_section,
             "email": "",
             "phone": "9876543212",
             "gender": "male",
@@ -405,20 +429,26 @@ async def preview_bulk_upload(
             detail="File is empty. Please add student data."
         )
     
-    # Get school settings
-    try:
-        tenant_db = await get_tenant_db_or_403(db, current_user)
-        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
-        settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+    # Get school settings — these drive all validation
+    # admin_id stored as string in school_settings (matching settings_async.py)
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+    admin_id_str = current_user.get("admin_id", current_user.get("user_id"))
+    admin_id = ObjectId(admin_id_str) if admin_id_str else ObjectId(current_user["user_id"])
+    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id_str})
 
-        valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
-        valid_classes = settings_doc.get("classes", VALID_GRADES) if settings_doc else VALID_GRADES
-        valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
-    except Exception:
-        settings_doc = None
-        valid_sections = ["A", "B", "C", "D", "E", "F"]
-        valid_classes = VALID_GRADES
+    # If settings not configured, validation will produce per-row errors in preview
+    if settings_doc and settings_doc.get("classes"):
+        valid_classes = settings_doc.get("classes")
+        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS)
+        class_sections = settings_doc.get("class_sections")
+        valid_subjects = settings_doc.get("subjects", [])
+        valid_plan_types = settings_doc.get("plan_types", [])
+    else:
+        valid_classes = FALLBACK_GRADES
+        valid_sections = FALLBACK_SECTIONS
+        class_sections = None
         valid_subjects = []
+        valid_plan_types = []
 
     # Get school prefix for username generation
     school_name = ""
@@ -493,9 +523,14 @@ async def preview_bulk_upload(
             else:
                 file_usernames[custom_username.lower()] = row_num
         
-        # Validate optional fields
-        if section and not validate_section(section, valid_sections):
-            errors.append(BulkUploadError(row=row_num, field="section", value=section, message=f"Invalid section. Must be one of: {', '.join(valid_sections)}"))
+        # Validate section against class-specific mapping (if available) or global sections list
+        if section and not validate_section_for_class(section, grade, valid_sections, class_sections):
+            # Build helpful error message showing allowed sections for this class
+            if class_sections and grade in class_sections:
+                allowed = ', '.join(class_sections[grade])
+                errors.append(BulkUploadError(row=row_num, field="section", value=section, message=f"Invalid section for Class {grade}. Allowed: {allowed}"))
+            else:
+                errors.append(BulkUploadError(row=row_num, field="section", value=section, message=f"Invalid section. Must be one of: {', '.join(valid_sections)}"))
             row_valid = False
         
         if email:
@@ -513,13 +548,23 @@ async def preview_bulk_upload(
             else:
                 file_emails[email] = row_num
         
-        # Validate subjects against school settings (if provided)
+        # Validate subjects against school settings (error if invalid)
         subjects_str_val = str(row.get('subjects', '')).strip() if row.get('subjects') else ''
         if subjects_str_val and valid_subjects:
             parsed_subjects = parse_list_field(subjects_str_val)
             invalid_subjects = [s for s in parsed_subjects if s not in valid_subjects]
             if invalid_subjects:
-                warnings.append(BulkUploadError(row=row_num, field="subjects", value=', '.join(invalid_subjects), message=f"Unknown subjects. Allowed: {', '.join(valid_subjects)}"))
+                errors.append(BulkUploadError(row=row_num, field="subjects", value=', '.join(invalid_subjects), message=f"Invalid subjects. Allowed: {', '.join(valid_subjects)}"))
+                row_valid = False
+
+        # Validate plan_types against school settings (error if invalid)
+        plan_types_str_val = str(row.get('plan_types', '')).strip() if row.get('plan_types') else ''
+        if plan_types_str_val and valid_plan_types:
+            parsed_plan_types = parse_list_field(plan_types_str_val)
+            invalid_plans = [p for p in parsed_plan_types if p not in valid_plan_types]
+            if invalid_plans:
+                errors.append(BulkUploadError(row=row_num, field="plan_types", value=', '.join(invalid_plans), message=f"Invalid plan types. Allowed: {', '.join(valid_plan_types)}"))
+                row_valid = False
 
         if gender and gender not in ['male', 'female', 'other']:
             warnings.append(BulkUploadError(row=row_num, field="gender", value=gender, message="Invalid gender. Will default to empty."))
@@ -627,17 +672,23 @@ async def import_bulk_students(
 
     # Get tenant info
     tenant_db = await get_tenant_db_or_403(db, current_user)
-    admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
-    
-    # Get school settings
-    try:
-        settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
-        valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
-        valid_classes = settings_doc.get("classes", VALID_GRADES) if settings_doc else VALID_GRADES
-    except Exception:
-        settings_doc = None
-        valid_sections = ["A", "B", "C", "D", "E", "F"]
-        valid_classes = VALID_GRADES
+    admin_id_str = current_user.get("admin_id", current_user.get("user_id"))
+    admin_id = ObjectId(admin_id_str) if admin_id_str else ObjectId(current_user["user_id"])
+
+    # Get school settings — admin_id stored as string in school_settings
+    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id_str})
+    if settings_doc and settings_doc.get("classes"):
+        valid_classes = settings_doc.get("classes")
+        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS)
+        class_sections = settings_doc.get("class_sections")
+        valid_subjects = settings_doc.get("subjects", [])
+        valid_plan_types = settings_doc.get("plan_types", [])
+    else:
+        valid_classes = FALLBACK_GRADES
+        valid_sections = FALLBACK_SECTIONS
+        class_sections = None
+        valid_subjects = []
+        valid_plan_types = []
 
     # Get existing emails and usernames
     existing_students = await db.mongo_find("students", {"admin_id": admin_id}, projection={"email": 1, "username_lower": 1})
@@ -773,7 +824,8 @@ async def import_bulk_students(
             
         if gender and gender not in ['male', 'female', 'other']:
             gender = ''
-        if section and section not in [s.upper() for s in valid_sections]:
+        # Validate section against class_sections mapping or global list
+        if section and not validate_section_for_class(section, grade, valid_sections, class_sections):
             section = ''
         
         # Validate date format
