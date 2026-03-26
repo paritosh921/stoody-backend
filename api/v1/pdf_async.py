@@ -254,7 +254,7 @@ async def call_mistral_ocr(file_content: bytes) -> Dict[str, Any]:
     }
     """
     import time as _time
-    from mistralai import Mistral
+    from mistralai.client import Mistral
 
     if not MISTRAL_API_KEY:
         raise Exception("MISTRAL_API_KEY is not configured")

@@ -447,7 +447,7 @@ async def _ocr_page(png_bytes: bytes, openai_client: Optional[AsyncOpenAI] = Non
 
 async def _mistral_ocr_image(png_bytes: bytes) -> str:
     """Use Mistral OCR on a PNG image (run sync SDK in thread pool)."""
-    from mistralai import Mistral
+    from mistralai.client import Mistral
 
     client = Mistral(api_key=MISTRAL_API_KEY)
     b64 = base64.b64encode(png_bytes).decode()

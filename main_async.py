@@ -371,6 +371,9 @@ except Exception as exc:
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Suppress watchfiles "change detected" spam (caused by logs/ being inside the watched dir)
+logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
+
 # Global managers
 db_manager = None
 cache_manager = None
@@ -1536,6 +1539,7 @@ if __name__ == "__main__":
         workers=1 if DEBUG_MODE else MAX_WORKERS,
         limit_concurrency=WORKER_CONNECTIONS,
         reload=DEBUG_MODE,
+        reload_excludes=["logs/*", "*.log", "__pycache__/*", "*.pyc"] if DEBUG_MODE else None,
         access_log=DEBUG_MODE,
         log_level="info" if DEBUG_MODE else "warning"
     )

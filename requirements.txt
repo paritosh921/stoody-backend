@@ -110,7 +110,7 @@ beautifulsoup4
 # ===============================
 # Mistral AI (Document OCR — primary)
 # ===============================
-mistralai
+mistralai>=2.0.0
 
 # ===============================
 # Optional: OpenAI client (NOT used for embeddings here).
