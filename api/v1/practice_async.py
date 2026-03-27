@@ -3034,3 +3034,81 @@ async def get_practice_set_stats(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch practice set statistics"
         )
+
+
+@router.get("/teacher-feedback")
+@limiter.limit("60/minute")
+async def get_teacher_feedback_for_document(
+    request: Request,
+    document_id: str = Query(..., description="Practice set document ID"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Get all teacher feedback for the current student's attempts on a document.
+    Returns a map of question_id -> teacher_feedback so the student can view
+    feedback from their teacher on each question.
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+
+        # Detect if user is B2C
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        filter_dict = {
+            "student_id": str(user_id),
+            "document_id": document_id,
+            "teacher_feedback": {"$exists": True, "$ne": None},
+        }
+
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+            )
+        else:
+            attempts = await db.mongo_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+            )
+
+        # Build a map keyed by question_id (keep only the latest per question)
+        feedback_map: dict = {}
+        for a in attempts:
+            qid = a.get("question_id", "")
+            if qid and qid not in feedback_map:
+                tf = a.get("teacher_feedback", {})
+                created_at = tf.get("created_at")
+                updated_at = tf.get("updated_at")
+                feedback_map[qid] = {
+                    "question_id": qid,
+                    "question_text": (a.get("question_text", "")[:200]
+                                      if a.get("question_text") else ""),
+                    "teacher_feedback": {
+                        "text": tf.get("text", ""),
+                        "tutor_name": tf.get("tutor_name", ""),
+                        "created_at": created_at.isoformat()
+                        if hasattr(created_at, "isoformat") else str(created_at or ""),
+                        "updated_at": updated_at.isoformat()
+                        if hasattr(updated_at, "isoformat") else str(updated_at or ""),
+                    },
+                }
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "feedback": list(feedback_map.values()),
+            "total": len(feedback_map),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get teacher feedback error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch teacher feedback",
+        )

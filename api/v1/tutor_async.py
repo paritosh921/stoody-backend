@@ -1426,6 +1426,273 @@ async def get_tutor_student_analytics(
         raise HTTPException(status_code=500, detail="Failed to fetch student analytics")
 
 
+@router.get("/tutors/analytics/student/{student_id}/documents")
+@limiter.limit("20/minute")
+async def get_student_document_analytics(
+    request: Request,
+    student_id: str,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    List all documents (Practice Sets + Test Series) visible to the tutor
+    with per-student aggregated attempt stats.  Used for the student profile
+    "Assignments & Papers" sub-tab.
+    """
+    try:
+        from bson import ObjectId
+
+        # ----- Verify student is visible to this tutor -----
+        visible_students = await _get_tutor_visible_students(current_user, db)
+        target_student = None
+        for s in visible_students:
+            if s.get("student_id") == student_id:
+                target_student = s
+                break
+
+        if not target_student:
+            raise HTTPException(
+                status_code=404,
+                detail="Student not found or not accessible by this tutor",
+            )
+
+        oid_str = str(target_student["_id"])
+
+        # ----- Build document filter (same scoping as /analytics/documents) -----
+        tutor_id = current_user.get("tutor_id")
+        admin_id = current_user.get("admin_id")
+
+        try:
+            admin_oid = ObjectId(admin_id)
+            admin_matches = [admin_oid, str(admin_id)]
+        except Exception:
+            admin_matches = [admin_id]
+
+        doc_filter: Dict[str, Any] = {
+            "$and": [
+                {"admin_id": {"$in": admin_matches}},
+                {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
+                {
+                    "$or": [
+                        {"teacher_ids": {"$in": [tutor_id]}},
+                        {"teacher_ids": []},
+                        {"teacher_ids": None},
+                        {"teacher_ids": {"$exists": False}},
+                    ]
+                },
+            ]
+        }
+
+        documents = await db.mongo_find(
+            "documents", doc_filter, sort=[("uploaded_at", -1)]
+        )
+
+        if not documents:
+            return {
+                "success": True,
+                "data": {
+                    "student": {
+                        "student_id": target_student.get("student_id"),
+                        "name": target_student.get("name")
+                        or target_student.get("full_name", ""),
+                        "grade": target_student.get("grade", ""),
+                        "section": target_student.get("section", ""),
+                    },
+                    "documents": [],
+                    "summary": {
+                        "total_documents": 0,
+                        "documents_attempted": 0,
+                        "avg_accuracy": 0,
+                        "avg_score": None,
+                        "total_time_spent": 0,
+                    },
+                },
+            }
+
+        # Collect document IDs
+        doc_ids = []
+        doc_map: Dict[str, Dict[str, Any]] = {}
+        for d in documents:
+            did = d.get("document_id") or str(d.get("_id", ""))
+            if did:
+                doc_ids.append(did)
+                doc_map[did] = d
+
+        # ----- Aggregate practice_attempts for THIS student per document -----
+        practice_pipeline = [
+            {
+                "$match": {
+                    "document_id": {"$in": doc_ids},
+                    "student_id": oid_str,
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$document_id",
+                    "total_attempts": {"$sum": 1},
+                    "total_correct": {
+                        "$sum": {"$cond": [{"$eq": ["$is_correct", True]}, 1, 0]}
+                    },
+                    "total_time": {"$sum": {"$ifNull": ["$time_spent", 0]}},
+                    "last_attempted": {"$max": "$created_at"},
+                    "questions": {"$addToSet": "$question_id"},
+                }
+            },
+        ]
+        practice_agg = await db.mongo_aggregate("practice_attempts", practice_pipeline)
+        practice_stats: Dict[str, Dict[str, Any]] = {
+            p["_id"]: p for p in practice_agg if p.get("_id")
+        }
+
+        # ----- Aggregate student_test_attempts for THIS student per document -----
+        test_pipeline = [
+            {
+                "$match": {
+                    "document_id": {"$in": doc_ids},
+                    "student_id": oid_str,
+                }
+            },
+            {
+                "$group": {
+                    "_id": "$document_id",
+                    "total_attempts": {"$sum": 1},
+                    "avg_percentage": {"$avg": "$percentage"},
+                    "best_percentage": {"$max": "$percentage"},
+                    "total_time": {"$sum": {"$ifNull": ["$time_taken", 0]}},
+                    "last_attempted": {"$max": "$submitted_at"},
+                }
+            },
+        ]
+        test_agg = await db.mongo_aggregate("student_test_attempts", test_pipeline)
+        test_stats: Dict[str, Dict[str, Any]] = {
+            t["_id"]: t for t in test_agg if t.get("_id")
+        }
+
+        # ----- Build per-document result list -----
+        result_docs = []
+        total_accuracy_sum = 0.0
+        total_score_sum = 0.0
+        accuracy_count = 0
+        score_count = 0
+        total_time_all = 0.0
+        docs_attempted = 0
+
+        for did in doc_ids:
+            doc = doc_map[did]
+            dtype = doc.get("document_type", "")
+            total_questions = doc.get("extracted_questions_count", 0)
+
+            entry: Dict[str, Any] = {
+                "document_id": did,
+                "title": doc.get("title", ""),
+                "document_type": dtype,
+                "subject": doc.get("subject", ""),
+                "standard": doc.get("standard", ""),
+                "total_questions": total_questions,
+                "questions_attempted": 0,
+                "questions_correct": 0,
+                "accuracy": 0.0,
+                "score": None,
+                "time_spent": 0.0,
+                "last_attempted": None,
+                "status": "not_started",
+            }
+
+            if dtype == "Practice Sets":
+                stats = practice_stats.get(did)
+                if stats:
+                    docs_attempted += 1
+                    q_attempted = len(stats.get("questions", []))
+                    q_correct = stats["total_correct"]
+                    total_att = stats["total_attempts"]
+                    time_s = stats["total_time"]
+                    acc = round(
+                        (q_correct / total_att * 100) if total_att > 0 else 0.0, 1
+                    )
+
+                    entry["questions_attempted"] = q_attempted
+                    entry["questions_correct"] = q_correct
+                    entry["accuracy"] = acc
+                    entry["time_spent"] = round(time_s, 1)
+                    entry["last_attempted"] = (
+                        stats["last_attempted"].isoformat()
+                        if stats.get("last_attempted")
+                        else None
+                    )
+                    if total_questions > 0 and q_attempted >= total_questions:
+                        entry["status"] = "completed"
+                    else:
+                        entry["status"] = "in_progress"
+
+                    total_accuracy_sum += acc
+                    accuracy_count += 1
+                    total_time_all += time_s
+
+            elif dtype == "Test Series":
+                stats = test_stats.get(did)
+                if stats:
+                    docs_attempted += 1
+                    time_s = stats["total_time"]
+                    avg_pct = round(stats.get("avg_percentage", 0) or 0, 1)
+
+                    entry["questions_attempted"] = stats["total_attempts"]
+                    entry["score"] = avg_pct
+                    entry["accuracy"] = avg_pct
+                    entry["time_spent"] = round(time_s, 1)
+                    entry["last_attempted"] = (
+                        stats["last_attempted"].isoformat()
+                        if stats.get("last_attempted")
+                        else None
+                    )
+                    entry["status"] = "completed"
+
+                    total_score_sum += avg_pct
+                    score_count += 1
+                    total_time_all += time_s
+
+            result_docs.append(entry)
+
+        summary = {
+            "total_documents": len(doc_ids),
+            "documents_attempted": docs_attempted,
+            "avg_accuracy": round(
+                (total_accuracy_sum / accuracy_count) if accuracy_count > 0 else 0.0, 1
+            ),
+            "avg_score": round(
+                (total_score_sum / score_count) if score_count > 0 else 0.0, 1
+            )
+            if score_count > 0
+            else None,
+            "total_time_spent": round(total_time_all, 1),
+        }
+
+        return {
+            "success": True,
+            "data": {
+                "student": {
+                    "student_id": target_student.get("student_id"),
+                    "name": target_student.get("name")
+                    or target_student.get("full_name", ""),
+                    "grade": target_student.get("grade", ""),
+                    "section": target_student.get("section", ""),
+                },
+                "documents": result_docs,
+                "summary": summary,
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(
+            f"Error fetching student document analytics for {student_id}: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail="Failed to fetch student document analytics"
+        )
+
+
 @router.get("/tutors/analytics/attempt/{attempt_id}")
 @limiter.limit("30/minute")
 async def get_tutor_attempt_detail(
@@ -1560,6 +1827,66 @@ async def get_student_document_attempts(
             last_by_question[qid_key] = a  # later entries overwrite earlier
         raw_attempts = list(last_by_question.values())
 
+        # Batch-fetch question images from the questions collection
+        question_ids_set = set(
+            r.get("question_id", "") for r in raw_attempts if r.get("question_id")
+        )
+        question_images_map: Dict[str, Dict[str, Any]] = {}
+        if question_ids_set:
+            q_oids = []
+            for qid in question_ids_set:
+                try:
+                    q_oids.append(ObjectId(qid))
+                except Exception:
+                    pass
+            if q_oids:
+                q_docs = await db.mongo_find(
+                    "questions", {"_id": {"$in": q_oids}}
+                )
+                for qd in q_docs:
+                    qd_id = str(qd["_id"])
+                    raw_images = qd.get("images") or []
+                    raw_figures = (
+                        qd.get("question_figures")
+                        or qd.get("questionFigures")
+                        or []
+                    )
+                    # Normalise each image/figure entry for the frontend
+                    images_out = []
+                    for img in raw_images:
+                        images_out.append({
+                            "id": img.get("id") or img.get("_id", ""),
+                            "base64Data": img.get("base64Data") or "",
+                            "url": img.get("url")
+                            or img.get("path")
+                            or (
+                                f"/api/v1/images/{img.get('id') or img.get('_id', '')}"
+                                if (img.get("id") or img.get("_id"))
+                                else ""
+                            ),
+                            "description": img.get("description", ""),
+                            "type": img.get("type", ""),
+                        })
+                    figures_out = []
+                    for fig in raw_figures:
+                        figures_out.append({
+                            "id": fig.get("id") or fig.get("_id", ""),
+                            "base64Data": fig.get("base64Data") or "",
+                            "url": fig.get("url")
+                            or fig.get("path")
+                            or (
+                                f"/api/v1/images/{fig.get('id') or fig.get('_id', '')}"
+                                if (fig.get("id") or fig.get("_id"))
+                                else ""
+                            ),
+                            "description": fig.get("description", ""),
+                            "type": fig.get("type", "diagram"),
+                        })
+                    question_images_map[qd_id] = {
+                        "images": images_out,
+                        "question_figures": figures_out,
+                    }
+
         # Resolve canvas_pages collection for stroke lookup
         canvas_col = None
         try:
@@ -1624,9 +1951,11 @@ async def get_student_document_attempts(
                             f"Failed to fetch canvas pages for attempt: {fetch_err}"
                         )
 
+            qid = r.get("question_id", "")
+            q_imgs = question_images_map.get(qid, {})
             attempts.append({
                 "id": str(r.get("_id", "")),
-                "question_id": r.get("question_id", ""),
+                "question_id": qid,
                 "question_text": r.get("question_text", ""),
                 "question_type": r.get("question_type", ""),
                 "subject": r.get("subject", ""),
@@ -1639,11 +1968,14 @@ async def get_student_document_attempts(
                 "what_went_wrong": r.get("what_went_wrong", ""),
                 "correct_solution": r.get("correct_solution", ""),
                 "question_strokes": question_strokes,
+                "images": q_imgs.get("images", []),
+                "question_figures": q_imgs.get("question_figures", []),
                 "time_spent": r.get("time_spent", 0),
                 "hints_used": r.get("hints_used", 0),
                 "created_at": r["created_at"].isoformat()
                 if r.get("created_at")
                 else None,
+                "teacher_feedback": r.get("teacher_feedback", None),
             })
 
         return {
@@ -2814,3 +3146,148 @@ async def get_exampen_eval_status(
             exc,
         )
         return None
+
+
+# ── Teacher Feedback on Practice Attempts ─────────────────────────────
+
+
+class TeacherFeedbackRequest(BaseModel):
+    attempt_id: str = Field(..., min_length=1)
+    feedback_text: str = Field(..., min_length=1, max_length=5000)
+
+
+@router.post("/tutors/feedback")
+@limiter.limit("30/minute")
+async def save_teacher_feedback(
+    request: Request,
+    body: TeacherFeedbackRequest,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Save or update teacher feedback on a specific practice attempt.
+    The feedback is stored as a sub-document on the practice_attempts record.
+    """
+    try:
+        from bson import ObjectId
+
+        # Find the attempt
+        try:
+            attempt_filter = {"_id": ObjectId(body.attempt_id)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid attempt ID")
+
+        attempt = await db.mongo_find_one("practice_attempts", attempt_filter)
+        if not attempt:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        # Verify tutor has access to this student
+        student_oid = attempt.get("student_id", "")
+        visible_students = await _get_tutor_visible_students(current_user, db)
+        has_access = False
+        for s in visible_students:
+            if str(s.get("_id")) == student_oid or s.get("student_id") == student_oid:
+                has_access = True
+                break
+        if not has_access:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have access to this student's data",
+            )
+
+        # Get tutor display name
+        tutor_id = current_user.get("tutor_id", "")
+        tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+        tutor_name = ""
+        if tutor_doc:
+            tutor_name = tutor_doc.get("name") or tutor_doc.get("full_name", "")
+
+        now = datetime.utcnow()
+        existing_feedback = attempt.get("teacher_feedback")
+
+        feedback_doc = {
+            "text": body.feedback_text.strip(),
+            "tutor_id": tutor_id,
+            "tutor_name": tutor_name,
+            "created_at": existing_feedback["created_at"]
+            if existing_feedback and existing_feedback.get("created_at")
+            else now,
+            "updated_at": now,
+        }
+
+        await db.mongo_update_one(
+            "practice_attempts",
+            attempt_filter,
+            {"$set": {"teacher_feedback": feedback_doc}},
+        )
+
+        return {
+            "success": True,
+            "message": "Feedback saved successfully",
+            "data": {
+                "attempt_id": body.attempt_id,
+                "teacher_feedback": {
+                    "text": feedback_doc["text"],
+                    "tutor_id": feedback_doc["tutor_id"],
+                    "tutor_name": feedback_doc["tutor_name"],
+                    "created_at": feedback_doc["created_at"].isoformat(),
+                    "updated_at": feedback_doc["updated_at"].isoformat(),
+                },
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(f"Error saving teacher feedback: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to save feedback")
+
+
+@router.delete("/tutors/feedback/{attempt_id}")
+@limiter.limit("30/minute")
+async def delete_teacher_feedback(
+    request: Request,
+    attempt_id: str,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Remove teacher feedback from a practice attempt."""
+    try:
+        from bson import ObjectId
+
+        try:
+            attempt_filter = {"_id": ObjectId(attempt_id)}
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid attempt ID")
+
+        attempt = await db.mongo_find_one("practice_attempts", attempt_filter)
+        if not attempt:
+            raise HTTPException(status_code=404, detail="Attempt not found")
+
+        # Verify tutor has access
+        student_oid = attempt.get("student_id", "")
+        visible_students = await _get_tutor_visible_students(current_user, db)
+        has_access = False
+        for s in visible_students:
+            if str(s.get("_id")) == student_oid or s.get("student_id") == student_oid:
+                has_access = True
+                break
+        if not has_access:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have access to this student's data",
+            )
+
+        await db.mongo_update_one(
+            "practice_attempts",
+            attempt_filter,
+            {"$unset": {"teacher_feedback": ""}},
+        )
+
+        return {"success": True, "message": "Feedback removed successfully"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _logger.error(f"Error deleting teacher feedback: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete feedback")
