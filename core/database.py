@@ -554,6 +554,20 @@ class DatabaseManager:
             except OperationFailure:
                 pass  # index may already exist with different options
 
+            # Notification indexes
+            notifications = db["notifications"]
+            await self._ensure_index_with_spec_check(
+                notifications,
+                [("recipient_id", 1), ("is_read", 1), ("created_at", -1)],
+                name="idx_notif_recipient_unread"
+            )
+            try:
+                await notifications.create_index(
+                    "created_at", expireAfterSeconds=7776000, name="ttl_notifications_90d"
+                )
+            except OperationFailure:
+                pass  # index may already exist with different options
+
             self._indexed_dbs.add(db_name)
             logger.info(f"Ensured indexes on database: {db_name}")
         except OperationFailure as e:

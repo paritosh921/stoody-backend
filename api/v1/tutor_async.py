@@ -3221,6 +3221,30 @@ async def save_teacher_feedback(
             {"$set": {"teacher_feedback": feedback_doc}},
         )
 
+        # --- Notification: always notify student when teacher saves feedback ---
+        try:
+            from api.v1.notifications_async import create_single_notification
+
+            await create_single_notification(
+                db=db,
+                admin_id=current_user.get("admin_id"),
+                recipient_id=str(attempt.get("student_id", "")),
+                notif_type="feedback",
+                category="feedback",
+                title="New Teacher Feedback" if not existing_feedback else "Teacher Feedback Updated",
+                message=f"{tutor_name} left feedback on your answer",
+                metadata={
+                    "document_id": attempt.get("document_id", ""),
+                    "question_id": attempt.get("question_id", ""),
+                    "attempt_id": body.attempt_id,
+                    "subject": attempt.get("subject", ""),
+                },
+                created_by=tutor_id,
+                created_by_name=tutor_name,
+            )
+        except Exception as notif_err:
+            _logger.warning(f"Feedback notification failed: {notif_err}")
+
         return {
             "success": True,
             "message": "Feedback saved successfully",

@@ -515,7 +515,7 @@ async def get_chapters(
         documents_list = []
         for doc in documents:
             documents_list.append({
-                "document_id": str(doc["_id"]),  # MongoDB uses _id as primary key
+                "document_id": doc.get("document_id") or str(doc["_id"]),
                 "title": doc.get("title"),
                 "subject": doc.get("subject"),
                 "standard": doc.get("standard"),

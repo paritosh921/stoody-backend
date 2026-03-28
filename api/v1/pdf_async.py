@@ -3292,6 +3292,86 @@ async def recalculate_document_points(
             detail=f"Failed to recalculate points: {str(e)}"
         )
 
+async def _notify_students_content_activated(
+    db: DatabaseManager,
+    doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+) -> None:
+    """
+    When a document is activated (is_active false→true), find all matching
+    students and create a notification for each.
+    """
+    from api.v1.notifications_async import create_notifications_batch
+
+    admin_id = doc.get("admin_id")
+    if not admin_id:
+        return
+
+    # Build student filter matching the same criteria students use to see content
+    student_filter: Dict[str, Any] = {"is_active": {"$ne": False}}
+
+    doc_standard = doc.get("standard")
+    if doc_standard:
+        student_filter["grade"] = doc_standard
+
+    doc_subject = doc.get("subject")
+    if doc_subject:
+        student_filter["subjects"] = doc_subject
+
+    doc_plan = doc.get("course_plan")
+    if doc_plan:
+        student_filter["plan_types"] = doc_plan
+
+    doc_section = doc.get("section")
+    if doc_section:
+        student_filter["section"] = doc_section
+
+    # If document is restricted to specific teachers, only notify their students
+    doc_teacher_ids = doc.get("teacher_ids")
+    if doc_teacher_ids and isinstance(doc_teacher_ids, list) and len(doc_teacher_ids) > 0:
+        student_filter["teacher_ids"] = {"$in": doc_teacher_ids}
+
+    matching_students = await db.mongo_find(
+        "students", student_filter, projection={"_id": 1}, limit=5000
+    )
+    if not matching_students:
+        return
+
+    recipient_ids = [str(s["_id"]) for s in matching_students]
+
+    doc_type = doc.get("document_type", "Content")
+    title_map = {
+        "Practice Sets": "New Practice Set Available",
+        "Test Series": "New Test Assigned",
+        "Chapter Notes": "New Notes Available",
+    }
+    category_map = {
+        "Practice Sets": "practice",
+        "Test Series": "test",
+        "Chapter Notes": "notes",
+    }
+
+    creator_name = current_user.get("name") or current_user.get("full_name", "")
+
+    await create_notifications_batch(
+        db=db,
+        admin_id=admin_id,
+        recipient_ids=recipient_ids,
+        notif_type="assignment",
+        category=category_map.get(doc_type, "content"),
+        title=title_map.get(doc_type, "New Content Available"),
+        message=f"{doc.get('title', doc_type)} — {doc.get('subject', '')}",
+        metadata={
+            "document_id": doc.get("document_id", ""),
+            "document_type": doc_type,
+            "subject": doc.get("subject", ""),
+            "title": doc.get("title", ""),
+        },
+        created_by=current_user.get("user_id", ""),
+        created_by_name=creator_name,
+    )
+
+
 @router.patch("/documents/{document_id}/metadata")
 @limiter.limit("30/minute")
 async def update_document_metadata(
@@ -3395,6 +3475,16 @@ async def update_document_metadata(
         # mongo_update_one returns False if no changes or not found
         # But we already verified document exists above, so just log and continue
         logger.info(f"Update result for {document_id}: {result}")
+
+        # --- Notification: content activated (false → true) ---
+        was_inactive = not existing_doc.get("is_active", False)
+        now_active = update_data.get("is_active") is True
+        if was_inactive and now_active:
+            try:
+                await _notify_students_content_activated(db, existing_doc, current_user)
+            except Exception as notif_err:
+                # Notification failure must never block the main operation
+                logger.warning(f"Notification side-effect failed: {notif_err}")
 
         return {
             "message": "Document metadata updated successfully",
