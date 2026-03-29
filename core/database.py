@@ -568,6 +568,25 @@ class DatabaseManager:
             except OperationFailure:
                 pass  # index may already exist with different options
 
+            # Notices collection indexes
+            notices = db["notices"]
+            await self._ensure_index_with_spec_check(
+                notices,
+                [("admin_id", 1), ("created_by", 1), ("created_at", -1)],
+                name="idx_notices_sent"
+            )
+            await self._ensure_index_with_spec_check(
+                notices,
+                [("admin_id", 1), ("resolved_recipients", 1), ("created_at", -1)],
+                name="idx_notices_received"
+            )
+            try:
+                await notices.create_index(
+                    "created_at", expireAfterSeconds=15552000, name="ttl_notices_180d"
+                )
+            except OperationFailure:
+                pass
+
             self._indexed_dbs.add(db_name)
             logger.info(f"Ensured indexes on database: {db_name}")
         except OperationFailure as e:

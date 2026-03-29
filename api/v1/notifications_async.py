@@ -38,6 +38,8 @@ def _build_push_url(category: str, metadata: Dict[str, Any]) -> str:
         return f"/mcq?{hl}" if hl else "/mcq"
     elif category == "notes":
         return f"/learning?mode=notes&{hl}" if hl else "/learning?mode=notes"
+    elif category == "notice":
+        return "/dashboard"  # Notices open in modal via notification panel
     return "/dashboard"
 
 
@@ -133,9 +135,10 @@ async def create_notifications_batch(
     metadata: Dict[str, Any],
     created_by: str,
     created_by_name: str,
+    recipient_type: str = "student",
 ) -> int:
     """
-    Bulk-insert notifications for a list of students.
+    Bulk-insert notifications for a list of recipients.
 
     Returns the number of notifications inserted.
     """
@@ -155,7 +158,7 @@ async def create_notifications_batch(
         {
             "admin_id": admin_id,
             "recipient_id": rid,
-            "recipient_type": "student",
+            "recipient_type": recipient_type,
             "type": notif_type,
             "category": category,
             "title": title,

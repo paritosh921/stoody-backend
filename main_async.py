@@ -92,6 +92,7 @@ from api.v1.images_async import router as images_router
 from api.v1.practice_async import router as practice_router
 from api.v1.notifications_async import router as notifications_router
 from api.v1.push_async import router as push_router
+from api.v1.notices_async import router as notices_router
 from api.v1.mcq_async import router as mcq_router
 from api.v1.tutor_async import router as tutor_router
 
@@ -905,6 +906,12 @@ app.include_router(
     push_router,
     prefix=f"{API_V1_PREFIX}/push",
     tags=["Push Notifications"]
+)
+
+app.include_router(
+    notices_router,
+    prefix=f"{API_V1_PREFIX}/notices",
+    tags=["Notices"]
 )
 
 app.include_router(
