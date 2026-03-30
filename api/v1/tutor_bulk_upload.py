@@ -169,22 +169,32 @@ async def download_teacher_bulk_template(
     Download a template file for bulk teacher upload.
     Supports CSV and Excel formats.
     """
-    # Fetch school settings for dynamic values
+    # Fetch school settings — admin_id stored as string (matching settings_async.py)
     try:
         tenant_db = await get_tenant_db_or_403(db, current_user)
-        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
-        settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+        admin_id_str = current_user.get("admin_id", current_user.get("user_id"))
+        settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id_str})
 
-        valid_classes = settings_doc.get("classes", ["6", "7", "8", "9", "10", "11", "12"]) if settings_doc else ["6", "7", "8", "9", "10", "11", "12"]
-        valid_sections = settings_doc.get("sections", ["A", "B", "C", "D", "E", "F"]) if settings_doc else ["A", "B", "C", "D", "E", "F"]
-        valid_subjects = settings_doc.get("subjects", ["Mathematics", "Physics", "Chemistry", "Biology", "English"]) if settings_doc else ["Mathematics", "Physics", "Chemistry", "Biology", "English"]
+        valid_classes = settings_doc.get("classes", []) if settings_doc else []
+        valid_sections = settings_doc.get("sections", []) if settings_doc else []
+        valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
     except Exception as e:
         logger.warning(f"Could not fetch school settings: {e}")
-        valid_classes = ["6", "7", "8", "9", "10", "11", "12"]
-        valid_sections = ["A", "B", "C", "D", "E", "F"]
-        valid_subjects = ["Mathematics", "Physics", "Chemistry", "Biology", "English"]
+        valid_classes = []
+        valid_sections = []
+        valid_subjects = []
 
-    # Sample data with 3 example rows
+    # Build sample data dynamically from school settings
+    s_cls1 = valid_classes[0] if len(valid_classes) > 0 else "10"
+    s_cls2 = valid_classes[1] if len(valid_classes) > 1 else "11"
+    s_cls3 = valid_classes[-1] if len(valid_classes) > 0 else "12"
+    s_sub1 = valid_subjects[0] if len(valid_subjects) > 0 else "Mathematics"
+    s_sub2 = valid_subjects[1] if len(valid_subjects) > 1 else "Physics"
+    s_sub3 = valid_subjects[2] if len(valid_subjects) > 2 else "Chemistry"
+    s_sec = valid_sections[0] if valid_sections else "A"
+    s_secs = ','.join(valid_sections[:3]) if valid_sections else "A,B,C"
+    s_secs2 = ','.join(valid_sections[:2]) if valid_sections else "A,B"
+
     sample_data = [
         {
             "full_name": "Amit Sharma",
@@ -192,11 +202,11 @@ async def download_teacher_bulk_template(
             "password": "mypass123",
             "email": "amit@school.com",
             "phone": "9876543210",
-            "standard": "10",
-            "subject": "Mathematics",
-            "sections": "A,B,C",
+            "standard": s_cls1,
+            "subject": s_sub1,
+            "sections": s_secs,
             "can_edit_students": "false",
-            "class_teacher_of": "10-A",
+            "class_teacher_of": f"{s_cls1}-{s_sec}",
         },
         {
             "full_name": "Priya Gupta",
@@ -204,9 +214,9 @@ async def download_teacher_bulk_template(
             "password": "",
             "email": "priya@school.com",
             "phone": "9876543211",
-            "standard": "11",
-            "subject": "Physics",
-            "sections": "A,B",
+            "standard": s_cls2,
+            "subject": s_sub2,
+            "sections": s_secs2,
             "can_edit_students": "true",
             "class_teacher_of": "",
         },
@@ -216,9 +226,9 @@ async def download_teacher_bulk_template(
             "password": "raj@2025",
             "email": "",
             "phone": "9876543212",
-            "standard": "12",
-            "subject": "Chemistry",
-            "sections": "A",
+            "standard": s_cls3,
+            "subject": s_sub3,
+            "sections": s_sec,
             "can_edit_students": "false",
             "class_teacher_of": "",
         },
@@ -333,11 +343,33 @@ async def preview_teacher_bulk_upload(
             detail="File is empty. Please add teacher data."
         )
 
-    # Get existing usernames and emails
+    # Get existing tutors with their assignments for duplicate detection
     admin_id = current_user.get("user_id")
-    existing_tutors = await db.mongo_find("tutors", {"created_by": admin_id}, projection={"email": 1, "username_lower": 1})
+    existing_tutors = await db.mongo_find(
+        "tutors", {"created_by": admin_id},
+        projection={"email": 1, "username_lower": 1, "name": 1, "teaching_assignments": 1}
+    )
     existing_emails = {t.get("email", "").lower() for t in existing_tutors if t.get("email")}
     existing_usernames = {t.get("username_lower", "").lower() for t in existing_tutors if t.get("username_lower")}
+
+    # Build a set of existing (standard, subject) assignments with teacher name for warning
+    # Format: {("10", "Mathematics"): "Amit Sharma", ("11", "Physics"): "Priya Gupta"}
+    existing_assignments: Dict[tuple, str] = {}
+    for t in existing_tutors:
+        teacher_name = t.get("name", "Unknown")
+        for a in t.get("teaching_assignments", []):
+            key = (str(a.get("standard", "")), a.get("subject", ""))
+            existing_assignments[key] = teacher_name
+
+    # Fetch school settings — admin_id stored as string (matching settings_async.py)
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+
+    # If settings not configured, validation will flag per-row errors in preview
+    valid_classes = settings_doc.get("classes", []) if settings_doc else []
+    valid_sections = settings_doc.get("sections", []) if settings_doc else []
+    class_sections = settings_doc.get("class_sections") if settings_doc else None
+    valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
 
     errors: List[TeacherBulkUploadError] = []
     warnings: List[TeacherBulkUploadError] = []
@@ -373,10 +405,43 @@ async def preview_teacher_bulk_upload(
         if not standard:
             errors.append(TeacherBulkUploadError(row=row_num, field="standard", value=standard, message="Standard/class is required"))
             row_valid = False
+        elif valid_classes and standard not in valid_classes:
+            errors.append(TeacherBulkUploadError(row=row_num, field="standard", value=standard, message=f"Invalid class. Must be one of: {', '.join(valid_classes)}"))
+            row_valid = False
 
         if not subject:
             errors.append(TeacherBulkUploadError(row=row_num, field="subject", value=subject, message="Subject is required"))
             row_valid = False
+        elif valid_subjects and subject not in valid_subjects:
+            errors.append(TeacherBulkUploadError(row=row_num, field="subject", value=subject, message=f"Invalid subject. Must be one of: {', '.join(valid_subjects)}"))
+            row_valid = False
+
+        # Validate sections against class-specific mapping or global sections list
+        if sections_str:
+            parsed_sections = [s.strip().upper() for s in sections_str.split(',') if s.strip()]
+            if class_sections and standard in class_sections:
+                allowed_for_class = [s.upper() for s in class_sections[standard]]
+                invalid_secs = [s for s in parsed_sections if s not in allowed_for_class]
+                if invalid_secs:
+                    errors.append(TeacherBulkUploadError(row=row_num, field="sections", value=', '.join(invalid_secs), message=f"Invalid sections for Class {standard}. Allowed: {', '.join(class_sections[standard])}"))
+                    row_valid = False
+            elif valid_sections:
+                allowed_global = [s.upper() for s in valid_sections]
+                invalid_secs = [s for s in parsed_sections if s not in allowed_global]
+                if invalid_secs:
+                    errors.append(TeacherBulkUploadError(row=row_num, field="sections", value=', '.join(invalid_secs), message=f"Invalid sections. Allowed: {', '.join(valid_sections)}"))
+                    row_valid = False
+
+        # Warn if another teacher is already assigned to this class+subject
+        if standard and subject and row_valid:
+            assignment_key = (standard, subject)
+            if assignment_key in existing_assignments:
+                assigned_teacher = existing_assignments[assignment_key]
+                warnings.append(TeacherBulkUploadError(
+                    row=row_num, field="standard/subject",
+                    value=f"{subject} - Class {standard}",
+                    message=f"'{assigned_teacher}' is already assigned to {subject} for Class {standard}. You can still continue if you want multiple teachers."
+                ))
 
         # Validate custom username if provided
         if custom_username:
@@ -545,6 +610,15 @@ async def import_bulk_teachers(
     existing_emails = {t.get("email", "").lower() for t in existing_tutors if t.get("email")}
     existing_usernames = {t.get("username_lower", "").lower() for t in existing_tutors if t.get("username_lower")}
 
+    # Fetch school settings — admin_id stored as string (matching settings_async.py)
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+
+    valid_classes = settings_doc.get("classes", []) if settings_doc else []
+    valid_sections = settings_doc.get("sections", []) if settings_doc else []
+    class_sections = settings_doc.get("class_sections") if settings_doc else None
+    valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
+
     errors: List[TeacherBulkUploadError] = []
     used_usernames = set(existing_usernames)
 
@@ -573,10 +647,32 @@ async def import_bulk_teachers(
         if not standard:
             errors.append(TeacherBulkUploadError(row=row_num, field="standard", message="Standard/class is required"))
             row_valid = False
+        elif valid_classes and standard not in valid_classes:
+            errors.append(TeacherBulkUploadError(row=row_num, field="standard", message=f"Invalid class '{standard}'. Must be one of: {', '.join(valid_classes)}"))
+            row_valid = False
 
         if not subject:
             errors.append(TeacherBulkUploadError(row=row_num, field="subject", message="Subject is required"))
             row_valid = False
+        elif valid_subjects and subject not in valid_subjects:
+            errors.append(TeacherBulkUploadError(row=row_num, field="subject", message=f"Invalid subject '{subject}'. Must be one of: {', '.join(valid_subjects)}"))
+            row_valid = False
+
+        # Validate sections against class-specific mapping or global sections list
+        if sections_str and row_valid:
+            parsed_secs = [s.strip().upper() for s in sections_str.split(',') if s.strip()]
+            if class_sections and standard in class_sections:
+                allowed_for_class = [s.upper() for s in class_sections[standard]]
+                invalid_secs = [s for s in parsed_secs if s not in allowed_for_class]
+                if invalid_secs:
+                    errors.append(TeacherBulkUploadError(row=row_num, field="sections", message=f"Invalid sections {', '.join(invalid_secs)} for Class {standard}. Allowed: {', '.join(class_sections[standard])}"))
+                    row_valid = False
+            elif valid_sections:
+                allowed_global = [s.upper() for s in valid_sections]
+                invalid_secs = [s for s in parsed_secs if s not in allowed_global]
+                if invalid_secs:
+                    errors.append(TeacherBulkUploadError(row=row_num, field="sections", message=f"Invalid sections {', '.join(invalid_secs)}. Allowed: {', '.join(valid_sections)}"))
+                    row_valid = False
 
         if custom_username:
             if len(custom_username) < 3 or len(custom_username) > 50:

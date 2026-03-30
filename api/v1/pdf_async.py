@@ -254,7 +254,7 @@ async def call_mistral_ocr(file_content: bytes) -> Dict[str, Any]:
     }
     """
     import time as _time
-    from mistralai import Mistral
+    from mistralai.client import Mistral
 
     if not MISTRAL_API_KEY:
         raise Exception("MISTRAL_API_KEY is not configured")
@@ -1229,6 +1229,9 @@ async def extract_questions_with_gpt(
     good_questions.sort(key=_sort_key)
 
     # Build final ExtractedQuestion list
+    # Track which image has been assigned per page so each figure-question
+    # gets the NEXT unassigned image instead of ALL images on the page.
+    page_image_cursor: Dict[int, int] = {}
     questions: List[ExtractedQuestion] = []
     for q in good_questions:
         q_text = q.get("text", "").strip()
@@ -1241,8 +1244,15 @@ async def extract_questions_with_gpt(
         has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
 
         # Use real image IDs from the page if this question references a figure
+        # Assign images 1:1 in order: 1st figure-question gets 1st image, etc.
         if has_image and q_page in page_image_ids:
-            img_refs = page_image_ids[q_page]
+            cursor = page_image_cursor.get(q_page, 0)
+            all_page_imgs = page_image_ids[q_page]
+            if cursor < len(all_page_imgs):
+                img_refs = [all_page_imgs[cursor]]
+                page_image_cursor[q_page] = cursor + 1
+            else:
+                img_refs = []
         else:
             img_refs = []
 
@@ -2933,6 +2943,18 @@ async def get_student_practice_sets(
 
         logger.info(f"Found {len(practice_sets)} practice sets matching filter")
 
+        # Get actual question counts per document via aggregation (avoids stale extracted_questions_count)
+        doc_ids = [doc["document_id"] for doc in practice_sets]
+        question_counts: Dict[str, int] = {}
+        if doc_ids:
+            count_pipeline = [
+                {"$match": {"document_id": {"$in": doc_ids}}},
+                {"$group": {"_id": "$document_id", "count": {"$sum": 1}}}
+            ]
+            count_results = await db.mongo_aggregate("questions", count_pipeline)
+            for r in count_results:
+                question_counts[r["_id"]] = r["count"]
+
         # Format response - only include necessary fields for security
         practice_sets_list = []
         user_id = current_user["user_id"]
@@ -2975,11 +2997,11 @@ async def get_student_practice_sets(
             practice_sets_list.append({
                 "document_id": doc_id,
                 "title": doc["title"],
-                "subject": doc["subject"],
-                "difficulty": doc["difficulty"],
+                "subject": doc.get("subject", ""),
+                "difficulty": doc.get("difficulty", ""),
                 "course_plan": doc.get("course_plan"),
                 "standard": doc.get("standard"),
-                "extracted_questions_count": doc.get("extracted_questions_count", 0),
+                "extracted_questions_count": question_counts.get(doc_id, doc.get("extracted_questions_count", 0)),
                 "instructions": doc.get("instructions"),
                 "completed": completed,
                 "attempted": has_attempted,
@@ -3270,6 +3292,86 @@ async def recalculate_document_points(
             detail=f"Failed to recalculate points: {str(e)}"
         )
 
+async def _notify_students_content_activated(
+    db: DatabaseManager,
+    doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+) -> None:
+    """
+    When a document is activated (is_active false→true), find all matching
+    students and create a notification for each.
+    """
+    from api.v1.notifications_async import create_notifications_batch
+
+    admin_id = doc.get("admin_id")
+    if not admin_id:
+        return
+
+    # Build student filter matching the same criteria students use to see content
+    student_filter: Dict[str, Any] = {"is_active": {"$ne": False}}
+
+    doc_standard = doc.get("standard")
+    if doc_standard:
+        student_filter["grade"] = doc_standard
+
+    doc_subject = doc.get("subject")
+    if doc_subject:
+        student_filter["subjects"] = doc_subject
+
+    doc_plan = doc.get("course_plan")
+    if doc_plan:
+        student_filter["plan_types"] = doc_plan
+
+    doc_section = doc.get("section")
+    if doc_section:
+        student_filter["section"] = doc_section
+
+    # If document is restricted to specific teachers, only notify their students
+    doc_teacher_ids = doc.get("teacher_ids")
+    if doc_teacher_ids and isinstance(doc_teacher_ids, list) and len(doc_teacher_ids) > 0:
+        student_filter["teacher_ids"] = {"$in": doc_teacher_ids}
+
+    matching_students = await db.mongo_find(
+        "students", student_filter, projection={"_id": 1}, limit=5000
+    )
+    if not matching_students:
+        return
+
+    recipient_ids = [str(s["_id"]) for s in matching_students]
+
+    doc_type = doc.get("document_type", "Content")
+    title_map = {
+        "Practice Sets": "New Practice Set Available",
+        "Test Series": "New Test Assigned",
+        "Chapter Notes": "New Notes Available",
+    }
+    category_map = {
+        "Practice Sets": "practice",
+        "Test Series": "test",
+        "Chapter Notes": "notes",
+    }
+
+    creator_name = current_user.get("name") or current_user.get("full_name", "")
+
+    await create_notifications_batch(
+        db=db,
+        admin_id=admin_id,
+        recipient_ids=recipient_ids,
+        notif_type="assignment",
+        category=category_map.get(doc_type, "content"),
+        title=title_map.get(doc_type, "New Content Available"),
+        message=f"{doc.get('title', doc_type)} — {doc.get('subject', '')}",
+        metadata={
+            "document_id": doc.get("document_id", ""),
+            "document_type": doc_type,
+            "subject": doc.get("subject", ""),
+            "title": doc.get("title", ""),
+        },
+        created_by=current_user.get("user_id", ""),
+        created_by_name=creator_name,
+    )
+
+
 @router.patch("/documents/{document_id}/metadata")
 @limiter.limit("30/minute")
 async def update_document_metadata(
@@ -3373,6 +3475,16 @@ async def update_document_metadata(
         # mongo_update_one returns False if no changes or not found
         # But we already verified document exists above, so just log and continue
         logger.info(f"Update result for {document_id}: {result}")
+
+        # --- Notification: content activated (false → true) ---
+        was_inactive = not existing_doc.get("is_active", False)
+        now_active = update_data.get("is_active") is True
+        if was_inactive and now_active:
+            try:
+                await _notify_students_content_activated(db, existing_doc, current_user)
+            except Exception as notif_err:
+                # Notification failure must never block the main operation
+                logger.warning(f"Notification side-effect failed: {notif_err}")
 
         return {
             "message": "Document metadata updated successfully",

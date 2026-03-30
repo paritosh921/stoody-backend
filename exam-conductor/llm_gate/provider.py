@@ -203,7 +203,12 @@ async def _call_openai(
         "messages": messages if messages is not None else [{"role": "user", "content": prompt}],
     }
     if max_output_tokens is not None:
-        payload["max_tokens"] = max_output_tokens
+        # Newer OpenAI models (gpt-5.1, o1, o3, etc.) require max_completion_tokens
+        _new_api_prefixes = ("gpt-5", "o1", "o3", "o4")
+        if any(model_id.startswith(p) for p in _new_api_prefixes):
+            payload["max_completion_tokens"] = max_output_tokens
+        else:
+            payload["max_tokens"] = max_output_tokens
     if temperature is not None:
         payload["temperature"] = temperature
 
@@ -219,6 +224,11 @@ async def _call_openai(
             },
             json=payload,
         )
+        if resp.status_code >= 400:
+            error_body = resp.text
+            logger.error(
+                f"OpenAI API error {resp.status_code} for model={model_id}: {error_body[:500]}"
+            )
         resp.raise_for_status()
         data = resp.json()
 

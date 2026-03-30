@@ -90,6 +90,9 @@ from api.v1.student_async import router as student_router
 from api.v1.questions_async import router as questions_router
 from api.v1.images_async import router as images_router
 from api.v1.practice_async import router as practice_router
+from api.v1.notifications_async import router as notifications_router
+from api.v1.push_async import router as push_router
+from api.v1.notices_async import router as notices_router
 from api.v1.mcq_async import router as mcq_router
 from api.v1.tutor_async import router as tutor_router
 
@@ -370,6 +373,9 @@ except Exception as exc:
 # Suppress httpx/httpcore logging to prevent token leakage in URLs
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Suppress watchfiles "change detected" spam (caused by logs/ being inside the watched dir)
+logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
 
 # Global managers
 db_manager = None
@@ -888,6 +894,24 @@ app.include_router(
     practice_router,
     prefix=f"{API_V1_PREFIX}/practice",
     tags=["Practice"]
+)
+
+app.include_router(
+    notifications_router,
+    prefix=f"{API_V1_PREFIX}/notifications",
+    tags=["Notifications"]
+)
+
+app.include_router(
+    push_router,
+    prefix=f"{API_V1_PREFIX}/push",
+    tags=["Push Notifications"]
+)
+
+app.include_router(
+    notices_router,
+    prefix=f"{API_V1_PREFIX}/notices",
+    tags=["Notices"]
 )
 
 app.include_router(
@@ -1536,6 +1560,7 @@ if __name__ == "__main__":
         workers=1 if DEBUG_MODE else MAX_WORKERS,
         limit_concurrency=WORKER_CONNECTIONS,
         reload=DEBUG_MODE,
+        reload_excludes=["logs/*", "*.log", "__pycache__/*", "*.pyc"] if DEBUG_MODE else None,
         access_log=DEBUG_MODE,
         log_level="info" if DEBUG_MODE else "warning"
     )

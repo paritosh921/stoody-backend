@@ -241,6 +241,11 @@ class AsyncSettings(BaseSettings):
     GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
     GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
+    # Web Push (VAPID) Configuration
+    VAPID_PRIVATE_KEY: str = os.getenv("VAPID_PRIVATE_KEY", "")
+    VAPID_PUBLIC_KEY: str = os.getenv("VAPID_PUBLIC_KEY", "")
+    VAPID_CLAIMS_EMAIL: str = os.getenv("VAPID_CLAIMS_EMAIL", "")
+
     # Allow disabling MongoDB in dev, but default to enabled if URI is present
     _dev_default = "true" if os.getenv("NODE_ENV", "production") == "development" else "false"
     _default_disable = "false" if os.getenv("MONGODB_URI") else _dev_default

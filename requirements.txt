@@ -95,6 +95,10 @@ opencv-python-headless>=4.8.0
 slowapi==0.1.9
 limits==3.6.0
 
+# Web Push Notifications
+# ===============================
+pywebpush>=2.3.0
+
 # ===============================
 # Background tasks
 # ===============================
@@ -110,7 +114,7 @@ beautifulsoup4
 # ===============================
 # Mistral AI (Document OCR — primary)
 # ===============================
-mistralai
+mistralai>=2.0.0
 
 # ===============================
 # Optional: OpenAI client (NOT used for embeddings here).

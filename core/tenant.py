@@ -49,6 +49,7 @@ TENANT_SCOPED_COLLECTIONS: Set[str] = {
     "timetable_periods",    # Individual period entries
     "academic_calendar",    # Holidays, exams, events
     "pre_reads",            # Pre-read material for periods
+    "notices",              # Admin/teacher notices to students/staff
 }
 
 # Collections that are global (not tenant-scoped)

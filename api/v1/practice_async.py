@@ -1475,21 +1475,36 @@ async def evaluate_submission(
         if student_images_raw:
             logger.info(f"🖼️ Processing {len(student_images_raw)} student images...")
             try:
-                from utils.image_processor import enhance_canvas_images_batch
-                
-                logger.info(f"🖼️ Enhancing {len(student_images_raw)} student images...")
+                from utils.image_processor import enhance_canvas_images_batch, is_canvas_empty
+
+                # Filter out blank/empty canvas pages before enhancement to save tokens
+                non_empty_images = []
+                for idx, img_url in enumerate(student_images_raw):
+                    if img_url and not is_canvas_empty(img_url):
+                        non_empty_images.append(img_url)
+                    else:
+                        logger.info(f"📷 Skipping blank canvas page {idx + 1}")
+
+                if not non_empty_images:
+                    logger.warning("⚠️ All canvas pages are blank after filtering")
+                    # Keep at least the raw images so evaluation can report "no answer"
+                    non_empty_images = [img for img in student_images_raw if img]
+                else:
+                    logger.info(f"📷 {len(non_empty_images)}/{len(student_images_raw)} pages have content")
+
+                logger.info(f"🖼️ Enhancing {len(non_empty_images)} student images...")
                 try:
-                    enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
+                    enhanced_student_images = enhance_canvas_images_batch(non_empty_images, target_width=1500)
                     if not enhanced_student_images:
                         logger.warning("⚠️ Image enhancement returned empty list, using raw images")
-                        enhanced_student_images = student_images_raw
+                        enhanced_student_images = non_empty_images
                 except Exception as enhance_err:
                     logger.warning(f"⚠️ Image enhancement failed: {enhance_err}. Using raw images.")
-                    enhanced_student_images = student_images_raw
-                
+                    enhanced_student_images = non_empty_images
+
                 # Use enhanced images for subsequent LLM evaluation
                 student_images = enhanced_student_images
-                
+
             except ImportError as ie:
                 logger.warning(f"Image processor not available: {ie}. Using raw images.")
                 student_images = student_images_raw
@@ -1541,14 +1556,26 @@ async def evaluate_submission(
         logger.info(f"🌐 Language detection: question='{detected_language}' for Q:{qid}")
 
         # Detect if this is an essay/descriptive question (common in commerce, humanities)
+        _essay_keywords = [
+            'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
+            'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
+            'what are', 'what is', 'how does', 'why is', 'state', 'mention',
+            'differentiate', 'illustrate', 'comment', 'evaluate', 'justify',
+        ]
+        # Long-form math/science questions also need higher token budgets
+        _longform_math_keywords = [
+            'find', 'solve', 'integrate', 'differentiate', 'prove', 'derive',
+            'calculate', 'compute', 'show that', 'verify', 'simplify',
+            'factorise', 'factorize', 'sketch', 'draw', 'construct',
+        ]
+        _q_lower = question_text.lower()
         is_essay_question = (
             not is_mcq and
-            any(keyword in question_text.lower() for keyword in [
-                'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
-                'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
-                'what are', 'what is', 'how does', 'why is', 'state', 'mention',
-                'differentiate', 'illustrate', 'comment', 'evaluate', 'justify'
-            ])
+            any(kw in _q_lower for kw in _essay_keywords)
+        )
+        is_longform_question = is_essay_question or (
+            not is_mcq and
+            any(kw in _q_lower for kw in _longform_math_keywords)
         )
 
         # === STAGE 2A: UNBIASED EXTRACTION (no correct answer shown) ===
@@ -1927,8 +1954,19 @@ async def evaluate_submission(
                     "Be generous in interpreting messy handwriting but strict in evaluating correctness."
                 )
         
-        # Use higher max_tokens for essay questions that need more detailed responses
-        eval_max_tokens = 1500 if is_essay_question else 1200
+        # Token budget: MCQ needs ~500 (letter match), non-MCQ long-form needs 2500+
+        # because the LLM must write a full step-by-step solution in JSON.
+        if is_mcq:
+            eval_max_tokens = 800
+        elif is_longform_question:
+            eval_max_tokens = 2500
+        else:
+            eval_max_tokens = 1800
+
+        # When no correct answer is stored, the LLM must solve the question itself.
+        # Use temperature=0 for maximum determinism so repeated submissions get
+        # consistent scores instead of random variation (0.2, 0.6, 0.7 for same work).
+        eval_temperature = 0.0 if not has_correct_answer else 0.3
 
         if all_images:
             # SWM-011: Vision path — route through the shared gate (C4)
@@ -1937,6 +1975,7 @@ async def evaluate_submission(
                 prompt,
                 system_prompt=system_prompt,
                 max_tokens=eval_max_tokens,
+                temperature=eval_temperature,
             )
         else:
             # SWM-011: Text-only path — route through the shared gate (C4)
@@ -1944,6 +1983,7 @@ async def evaluate_submission(
                 db, current_user, prompt,
                 system_prompt=system_prompt,
                 max_tokens=eval_max_tokens,
+                temperature=eval_temperature,
             )
             
         raw_response = (response.get("response") or "").strip()
@@ -3033,4 +3073,82 @@ async def get_practice_set_stats(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch practice set statistics"
+        )
+
+
+@router.get("/teacher-feedback")
+@limiter.limit("60/minute")
+async def get_teacher_feedback_for_document(
+    request: Request,
+    document_id: str = Query(..., description="Practice set document ID"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Get all teacher feedback for the current student's attempts on a document.
+    Returns a map of question_id -> teacher_feedback so the student can view
+    feedback from their teacher on each question.
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+
+        # Detect if user is B2C
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        filter_dict = {
+            "student_id": str(user_id),
+            "document_id": document_id,
+            "teacher_feedback": {"$exists": True, "$ne": None},
+        }
+
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+            )
+        else:
+            attempts = await db.mongo_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+            )
+
+        # Build a map keyed by question_id (keep only the latest per question)
+        feedback_map: dict = {}
+        for a in attempts:
+            qid = a.get("question_id", "")
+            if qid and qid not in feedback_map:
+                tf = a.get("teacher_feedback", {})
+                created_at = tf.get("created_at")
+                updated_at = tf.get("updated_at")
+                feedback_map[qid] = {
+                    "question_id": qid,
+                    "question_text": (a.get("question_text", "")[:200]
+                                      if a.get("question_text") else ""),
+                    "teacher_feedback": {
+                        "text": tf.get("text", ""),
+                        "tutor_name": tf.get("tutor_name", ""),
+                        "created_at": created_at.isoformat()
+                        if hasattr(created_at, "isoformat") else str(created_at or ""),
+                        "updated_at": updated_at.isoformat()
+                        if hasattr(updated_at, "isoformat") else str(updated_at or ""),
+                    },
+                }
+
+        return {
+            "success": True,
+            "document_id": document_id,
+            "feedback": list(feedback_map.values()),
+            "total": len(feedback_map),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get teacher feedback error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch teacher feedback",
         )
