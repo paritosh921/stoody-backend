@@ -14,6 +14,7 @@ on:
       - "main_async.py"
       - "config_async.py"
       - "mentorAI/**"
+      - "scripts/run_tui.sh"
       - "requirements.txt"
       - "skillbot_nginx_alb.conf"
       - "ops/remote_deploy_python_service.sh"
