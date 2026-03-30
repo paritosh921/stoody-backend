@@ -1556,14 +1556,26 @@ async def evaluate_submission(
         logger.info(f"🌐 Language detection: question='{detected_language}' for Q:{qid}")
 
         # Detect if this is an essay/descriptive question (common in commerce, humanities)
+        _essay_keywords = [
+            'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
+            'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
+            'what are', 'what is', 'how does', 'why is', 'state', 'mention',
+            'differentiate', 'illustrate', 'comment', 'evaluate', 'justify',
+        ]
+        # Long-form math/science questions also need higher token budgets
+        _longform_math_keywords = [
+            'find', 'solve', 'integrate', 'differentiate', 'prove', 'derive',
+            'calculate', 'compute', 'show that', 'verify', 'simplify',
+            'factorise', 'factorize', 'sketch', 'draw', 'construct',
+        ]
+        _q_lower = question_text.lower()
         is_essay_question = (
             not is_mcq and
-            any(keyword in question_text.lower() for keyword in [
-                'distinguish', 'explain', 'describe', 'discuss', 'compare', 'contrast',
-                'define', 'elaborate', 'enumerate', 'critically examine', 'analyze', 'analyse',
-                'what are', 'what is', 'how does', 'why is', 'state', 'mention',
-                'differentiate', 'illustrate', 'comment', 'evaluate', 'justify'
-            ])
+            any(kw in _q_lower for kw in _essay_keywords)
+        )
+        is_longform_question = is_essay_question or (
+            not is_mcq and
+            any(kw in _q_lower for kw in _longform_math_keywords)
         )
 
         # === STAGE 2A: UNBIASED EXTRACTION (no correct answer shown) ===
@@ -1942,8 +1954,19 @@ async def evaluate_submission(
                     "Be generous in interpreting messy handwriting but strict in evaluating correctness."
                 )
         
-        # Use higher max_tokens for essay questions that need more detailed responses
-        eval_max_tokens = 1500 if is_essay_question else 1200
+        # Token budget: MCQ needs ~500 (letter match), non-MCQ long-form needs 2500+
+        # because the LLM must write a full step-by-step solution in JSON.
+        if is_mcq:
+            eval_max_tokens = 800
+        elif is_longform_question:
+            eval_max_tokens = 2500
+        else:
+            eval_max_tokens = 1800
+
+        # When no correct answer is stored, the LLM must solve the question itself.
+        # Use temperature=0 for maximum determinism so repeated submissions get
+        # consistent scores instead of random variation (0.2, 0.6, 0.7 for same work).
+        eval_temperature = 0.0 if not has_correct_answer else 0.3
 
         if all_images:
             # SWM-011: Vision path — route through the shared gate (C4)
@@ -1952,6 +1975,7 @@ async def evaluate_submission(
                 prompt,
                 system_prompt=system_prompt,
                 max_tokens=eval_max_tokens,
+                temperature=eval_temperature,
             )
         else:
             # SWM-011: Text-only path — route through the shared gate (C4)
@@ -1959,6 +1983,7 @@ async def evaluate_submission(
                 db, current_user, prompt,
                 system_prompt=system_prompt,
                 max_tokens=eval_max_tokens,
+                temperature=eval_temperature,
             )
             
         raw_response = (response.get("response") or "").strip()
