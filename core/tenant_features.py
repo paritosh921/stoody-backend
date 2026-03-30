@@ -227,7 +227,7 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["tenant_admin", "tutor"],
         "status": STATUS_ACTIVE,
-        "default_enabled": False,
+        "default_enabled": True,
         "billing_code": "MAX_EXAMPEN",
     },
     {

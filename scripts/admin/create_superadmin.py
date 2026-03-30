@@ -23,7 +23,7 @@ from pymongo.errors import DuplicateKeyError
 AUTH_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*"
 AUTH_CODE_LENGTH = 6
-DEFAULT_PASSWORD_LENGTH = 14
+DEFAULT_PASSWORD_LENGTH = 6
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 

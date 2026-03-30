@@ -205,9 +205,21 @@ class TempPasswordScreen(ModalScreen[None]):
     .temp-password-value {
         text-style: bold reverse;
         content-align: center middle;
-        width: 100%;
+        width: 1fr;
         height: 3;
+        margin: 0 1 1 0;
+    }
+
+    .temp-password-actions {
+        height: auto;
+        align: center middle;
         margin: 0 0 1 0;
+    }
+
+    .temp-password-status {
+        height: auto;
+        margin: 0 0 1 0;
+        color: $success;
     }
     """
 
@@ -225,10 +237,22 @@ class TempPasswordScreen(ModalScreen[None]):
                 "Copy it now and share it securely. The super-admin will be forced to set a new password after login.",
                 classes="temp-password-body",
             )
-            yield Static(self.temp_password, classes="temp-password-value")
+            with Horizontal(classes="temp-password-actions"):
+                yield Static(self.temp_password, classes="temp-password-value")
+                yield Button("Copy", id="btn-copy", variant="primary")
+            yield Static("", id="temp-password-status", classes="temp-password-status")
             yield Button("Close", id="btn-close", variant="success")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-copy":
+            copy_fn = getattr(self.app, "copy_to_clipboard", None)
+            status = self.query_one("#temp-password-status", Static)
+            if not callable(copy_fn):
+                status.update("Clipboard copy not supported in this terminal.")
+                return
+            copy_fn(self.temp_password)
+            status.update("Temporary password copied to clipboard.")
+            return
         if event.button.id == "btn-close":
             self.dismiss(None)
 
