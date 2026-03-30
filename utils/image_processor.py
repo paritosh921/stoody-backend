@@ -95,49 +95,21 @@ def enhance_canvas_image(data_url: str, target_width: int = 1500) -> str:
             new_height = int(original_height * upscale_factor)
             img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
         
-        # Increase contrast
+        # Mild contrast boost — GPT-5.1 reads faint strokes well, avoid over-processing
         enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(1.5)  # Increase contrast by 50%
-        
+        img = enhancer.enhance(1.2)
+
         # Apply slight sharpening
         img = img.filter(ImageFilter.SHARPEN)
-        
+
         # Increase brightness slightly to ensure white background
         enhancer = ImageEnhance.Brightness(img)
         img = enhancer.enhance(1.05)
-        
-        # Convert to grayscale for adaptive stroke analysis
-        gray = img.convert('L')
 
-        # Adapt dilation strength to actual handwriting density and scaling.
-        # This avoids over-thickening dense answers while still helping faint strokes.
-        DARK_PIXEL_THRESHOLD = 200
-        VERY_SPARSE_INK_RATIO = 0.012
-        SPARSE_INK_RATIO = 0.03
-
-        pixels = list(gray.getdata())
-        dark_pixels = sum(1 for p in pixels if p < DARK_PIXEL_THRESHOLD)
-        dark_ratio = (dark_pixels / len(pixels)) if pixels else 0.0
-
-        if dark_ratio <= VERY_SPARSE_INK_RATIO:
-            # Very faint/thin writing: stronger dilation only when source wasn't heavily upscaled.
-            dilation_kernel = 5 if upscale_factor < 1.4 else 3
-        elif dark_ratio <= SPARSE_INK_RATIO:
-            # Medium-density writing: conservative thickening.
-            dilation_kernel = 3 if upscale_factor < 2.2 else 1
-        else:
-            # Dense writing: avoid dilation to prevent character merging.
-            dilation_kernel = 1
-
-        if dilation_kernel > 1:
-            inverted = ImageOps.invert(gray)
-            dilated = inverted.filter(ImageFilter.MaxFilter(dilation_kernel))
-            processed_gray = ImageOps.invert(dilated)
-        else:
-            processed_gray = gray
-
-        # Convert back to RGB
-        img = processed_gray.convert('RGB')
+        # NOTE: Grayscale conversion and stroke dilation removed.
+        # GPT-5.1 vision reads color images and thin strokes natively.
+        # Grayscale was destroying student color-coded work (blue/red/green),
+        # and dilation was merging closely-spaced lines in detailed diagrams.
         
         # Save to bytes
         output_buffer = io.BytesIO()

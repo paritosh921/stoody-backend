@@ -1475,21 +1475,36 @@ async def evaluate_submission(
         if student_images_raw:
             logger.info(f"🖼️ Processing {len(student_images_raw)} student images...")
             try:
-                from utils.image_processor import enhance_canvas_images_batch
-                
-                logger.info(f"🖼️ Enhancing {len(student_images_raw)} student images...")
+                from utils.image_processor import enhance_canvas_images_batch, is_canvas_empty
+
+                # Filter out blank/empty canvas pages before enhancement to save tokens
+                non_empty_images = []
+                for idx, img_url in enumerate(student_images_raw):
+                    if img_url and not is_canvas_empty(img_url):
+                        non_empty_images.append(img_url)
+                    else:
+                        logger.info(f"📷 Skipping blank canvas page {idx + 1}")
+
+                if not non_empty_images:
+                    logger.warning("⚠️ All canvas pages are blank after filtering")
+                    # Keep at least the raw images so evaluation can report "no answer"
+                    non_empty_images = [img for img in student_images_raw if img]
+                else:
+                    logger.info(f"📷 {len(non_empty_images)}/{len(student_images_raw)} pages have content")
+
+                logger.info(f"🖼️ Enhancing {len(non_empty_images)} student images...")
                 try:
-                    enhanced_student_images = enhance_canvas_images_batch(student_images_raw, target_width=1500)
+                    enhanced_student_images = enhance_canvas_images_batch(non_empty_images, target_width=1500)
                     if not enhanced_student_images:
                         logger.warning("⚠️ Image enhancement returned empty list, using raw images")
-                        enhanced_student_images = student_images_raw
+                        enhanced_student_images = non_empty_images
                 except Exception as enhance_err:
                     logger.warning(f"⚠️ Image enhancement failed: {enhance_err}. Using raw images.")
-                    enhanced_student_images = student_images_raw
-                
+                    enhanced_student_images = non_empty_images
+
                 # Use enhanced images for subsequent LLM evaluation
                 student_images = enhanced_student_images
-                
+
             except ImportError as ie:
                 logger.warning(f"Image processor not available: {ie}. Using raw images.")
                 student_images = student_images_raw
