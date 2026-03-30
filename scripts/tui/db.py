@@ -156,6 +156,7 @@ class DB:
         for r in rows:
             r["_id"] = str(r["_id"])
             r["status"] = self._derive_sa_status(r)
+            r["password_reset_requested"] = bool(r.get("password_reset_requested", False))
             # count tenants assigned
             r["tenant_count"] = self.master["tenants"].count_documents(
                 {"assigned_superadmin_id": ObjectId(r["_id"])}
@@ -207,6 +208,7 @@ class DB:
             "status": "active",
             "authorization_code": auth_code,
             "requires_password_change": True,
+            "password_reset_requested": False,
             "password_changed_at": None,
             "created_at": now,
             "updated_at": now,
@@ -227,6 +229,38 @@ class DB:
             "name": name.strip(),
             "authorization_code": auth_code,
             "temporary_password": temp_password,
+        }
+
+    def reset_superadmin_password(self, sa_id: str) -> Dict[str, Any]:
+        """Issue a new temporary password and clear any pending reset request."""
+        from passlib.context import CryptContext
+
+        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        temp_password = generate_temp_password()
+        now = datetime.utcnow()
+
+        result = self.master["super_admins"].update_one(
+            {"_id": ObjectId(sa_id)},
+            {
+                "$set": {
+                    "password_hash": pwd_context.hash(temp_password),
+                    "temp_password": temp_password,
+                    "requires_password_change": True,
+                    "password_changed_at": None,
+                    "password_reset_requested": False,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "password_reset_requested_at": "",
+                },
+            },
+        )
+        if result.matched_count == 0:
+            raise ValueError("Super-admin not found.")
+
+        return {
+            "temporary_password": temp_password,
+            "requires_password_change": True,
         }
 
     # ---- Super-admin lifecycle management ----

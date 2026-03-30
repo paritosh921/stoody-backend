@@ -174,10 +174,70 @@ class CreateSuperAdminScreen(ModalScreen[dict | None]):
             self.dismiss(None)
 
 
+class TempPasswordScreen(ModalScreen[None]):
+    """Modal displaying a newly issued temporary password."""
+
+    DEFAULT_CSS = """
+    TempPasswordScreen {
+        align: center middle;
+    }
+
+    #temp-password-dialog {
+        width: 72;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    .temp-password-title {
+        text-style: bold;
+        text-align: center;
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+
+    .temp-password-body {
+        height: auto;
+        margin: 0 0 1 0;
+    }
+
+    .temp-password-value {
+        text-style: bold reverse;
+        content-align: center middle;
+        width: 100%;
+        height: 3;
+        margin: 0 0 1 0;
+    }
+    """
+
+    def __init__(self, sa_name: str, sa_email: str, temp_password: str) -> None:
+        super().__init__()
+        self.sa_name = sa_name
+        self.sa_email = sa_email
+        self.temp_password = temp_password
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="temp-password-dialog"):
+            yield Static(" Temporary Password Issued ", classes="temp-password-title")
+            yield Static(
+                f"A new temporary password was created for [cyan]{self.sa_name}[/cyan] ({self.sa_email}).\n"
+                "Copy it now and share it securely. The super-admin will be forced to set a new password after login.",
+                classes="temp-password-body",
+            )
+            yield Static(self.temp_password, classes="temp-password-value")
+            yield Button("Close", id="btn-close", variant="success")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-close":
+            self.dismiss(None)
+
+
 class SuperAdminScreen(Screen):
     BINDINGS = [
         ("n", "create_sa", "New"),
         ("r", "refresh", "Refresh"),
+        ("f", "reset_password", "Reset Password"),
         ("s", "suspend", "Suspend"),
         ("a", "activate", "Activate"),
         ("x", "deactivate", "Deactivate"),
@@ -194,7 +254,7 @@ class SuperAdminScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one("#sa-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Name", "Email", "Auth Code", "Status", "Temp Password", "Tenants", "Last Login")
+        table.add_columns("Name", "Email", "Auth Code", "Status", "Reset Req", "Temp Password", "Tenants", "Last Login")
         self._sa_rows: list = []
         self.load_data()
 
@@ -221,11 +281,13 @@ class SuperAdminScreen(Screen):
                 last_login = last_login.strftime("%Y-%m-%d %H:%M")
             sa_status = sa.get("status", "active")
             temp_pw = sa.get("temp_password", "") if sa.get("requires_password_change") else ""
+            reset_requested = "Yes" if sa.get("password_reset_requested") else ""
             table.add_row(
                 sa.get("name", ""),
                 sa.get("email", ""),
                 sa.get("authorization_code", ""),
                 STATUS_DISPLAY.get(sa_status, sa_status),
+                reset_requested,
                 temp_pw,
                 str(sa.get("tenant_count", 0)),
                 str(last_login or "Never"),
@@ -322,6 +384,18 @@ class SuperAdminScreen(Screen):
             callback=self._on_confirm,
         )
 
+    def action_reset_password(self) -> None:
+        sa = self._get_selected_sa()
+        if not sa:
+            return
+        if not sa.get("password_reset_requested"):
+            self._set_status("No password reset request is pending for this super-admin.")
+            return
+        self.app.push_screen(
+            ConfirmActionScreen("reset password", sa.get("name", ""), sa["email"], needs_reason=False),
+            callback=self._on_confirm,
+        )
+
     def _on_confirm(self, result: dict | None) -> None:
         if result is None:
             self._set_status("Cancelled.")
@@ -336,6 +410,8 @@ class SuperAdminScreen(Screen):
     @work(thread=True)
     def _execute_action(self, sa_id: str, action: str, reason: str) -> None:
         db = self.app.db  # type: ignore
+        temp_password: str | None = None
+        sa = db.get_superadmin_by_id(sa_id)
         try:
             if action == "suspend":
                 res = db.suspend_superadmin(sa_id, reason)
@@ -349,6 +425,10 @@ class SuperAdminScreen(Screen):
             elif action == "delete":
                 res = db.delete_superadmin(sa_id)
                 msg = f"Deleted. {res['tenants_orphaned']} tenant(s) orphaned."
+            elif action == "reset password":
+                res = db.reset_superadmin_password(sa_id)
+                temp_password = res["temporary_password"]
+                msg = "Temporary password issued and reset request cleared."
             else:
                 msg = f"Unknown action: {action}"
         except Exception as exc:
@@ -359,3 +439,8 @@ class SuperAdminScreen(Screen):
         db2 = self.app.db  # type: ignore
         rows = db2.list_superadmins()
         self.app.call_from_thread(self._populate, rows)
+        if temp_password and sa:
+            self.app.call_from_thread(
+                self.app.push_screen,
+                TempPasswordScreen(sa.get("name", ""), sa.get("email", ""), temp_password),
+            )

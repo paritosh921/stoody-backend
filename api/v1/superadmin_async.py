@@ -75,6 +75,15 @@ class SuperAdminPasswordChangeRequest(BaseModel):
     new_password: str = Field(..., min_length=8)
 
 
+class SuperAdminPasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class SuperAdminPasswordResetRequestResponse(BaseModel):
+    success: bool = True
+    message: str
+
+
 class TempTokenRequest(BaseModel):
     temp_token: str
 
@@ -682,6 +691,31 @@ async def superadmin_login(
     return await _complete_superadmin_login(master_db, admin)
 
 
+@router.post("/password/request-reset", response_model=SuperAdminPasswordResetRequestResponse)
+async def request_superadmin_password_reset(
+    request: SuperAdminPasswordResetRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    master_db = await get_master_db_or_503(db)
+    email = request.email.strip().lower()
+    admin = await master_db["super_admins"].find_one({"email": email})
+    if admin:
+        await master_db["super_admins"].update_one(
+            {"_id": admin["_id"]},
+            {
+                "$set": {
+                    "password_reset_requested": True,
+                    "password_reset_requested_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+
+    return SuperAdminPasswordResetRequestResponse(
+        message="If the account exists, the password reset request has been recorded for platform review."
+    )
+
+
 @router.post("/password/change", response_model=SuperAdminAuthResponse)
 async def change_superadmin_password(
     request: SuperAdminPasswordChangeRequest,
@@ -707,9 +741,11 @@ async def change_superadmin_password(
                 "requires_password_change": False,
                 "password_changed_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
+                "password_reset_requested": False,
             },
             "$unset": {
                 "temp_password": "",
+                "password_reset_requested_at": "",
             },
         }
     )
