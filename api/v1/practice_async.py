@@ -375,35 +375,44 @@ def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
     # Try to extract individual fields if full parse fails
     try:
         extracted = {}
-        
+
+        # Helper: extract a JSON string value by key name.
+        # Handles escaped quotes inside the value and stops at the
+        # first unescaped closing quote.
+        def _extract_string_field(key: str) -> Optional[str]:
+            m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', clean, re.DOTALL)
+            if m:
+                return m.group(1).replace('\\"', '"').replace('\\n', '\n')
+            return None
+
         # Extract is_correct (boolean)
         is_correct_match = re.search(r'"is_correct"\s*:\s*(true|false)', clean, re.IGNORECASE)
         if is_correct_match:
             extracted["is_correct"] = is_correct_match.group(1).lower() == "true"
-        
+
         # Extract score (number)
         score_match = re.search(r'"score"\s*:\s*([0-9.]+)', clean)
         if score_match:
             extracted["score"] = float(score_match.group(1))
-        
-        # Extract extracted_answer (string - be careful with quotes)
-        answer_match = re.search(r'"extracted_answer"\s*:\s*"([^"]*(?:\\"[^"]*)*)"', clean)
-        if answer_match:
-            extracted["extracted_answer"] = answer_match.group(1).replace('\\"', '"')
-        
-        # Extract solved_answer if present
-        solved_match = re.search(r'"solved_answer"\s*:\s*"([^"]*(?:\\"[^"]*)*)"', clean)
-        if solved_match:
-            extracted["solved_answer"] = solved_match.group(1).replace('\\"', '"')
-        
+
+        # Extract all string fields that the evaluation prompt requests
+        _string_fields = [
+            "extracted_answer", "solved_answer", "feedback", "reasoning",
+            "work_shown", "what_went_wrong", "correct_solution",
+        ]
+        for field_name in _string_fields:
+            val = _extract_string_field(field_name)
+            if val:
+                extracted[field_name] = val
+
         # If we got at least is_correct, use the extracted data
         if "is_correct" in extracted:
-            logger.info(f"📊 Partial JSON extraction succeeded: {extracted}")
+            logger.info(f"📊 Partial JSON extraction succeeded: fields={list(extracted.keys())}")
             return extracted
-            
+
     except Exception as e:
         logger.warning(f"Partial extraction failed: {e}")
-    
+
     return None
 
 
@@ -1568,15 +1577,24 @@ async def evaluate_submission(
             'calculate', 'compute', 'show that', 'verify', 'simplify',
             'factorise', 'factorize', 'sketch', 'draw', 'construct',
         ]
+        # Math symbols that indicate a computational problem (questions may
+        # contain only the symbol without a keyword like "integrate")
+        _math_symbols = ['∫', '∑', '∂', '∏', '∮', 'lim ', 'd/dx', 'd/dt']
         _q_lower = question_text.lower()
         is_essay_question = (
             not is_mcq and
             any(kw in _q_lower for kw in _essay_keywords)
         )
+        _has_math_symbol = any(sym in question_text for sym in _math_symbols)
         is_longform_question = is_essay_question or (
             not is_mcq and
-            any(kw in _q_lower for kw in _longform_math_keywords)
+            (any(kw in _q_lower for kw in _longform_math_keywords) or _has_math_symbol)
         )
+        # If the question is purely mathematical (detected via symbols), it is
+        # NOT an essay even if it happens to contain a keyword like "evaluate".
+        if _has_math_symbol and is_essay_question:
+            is_essay_question = False
+            logger.info(f"📐 Math symbol detected — overriding essay classification for Q:{qid}")
 
         # === STAGE 2A: UNBIASED EXTRACTION (no correct answer shown) ===
         unbiased_extracted_answer = ""
@@ -2021,25 +2039,28 @@ async def evaluate_submission(
                 else:
                     retry_prompt = (
                         f"Based on the student's work shown earlier, provide ONLY this JSON (no explanation):\n"
-                        f'{{"is_correct": true/false, "score": 0.0-1.0, "extracted_answer": "student answer"}}'
+                        f'{{"is_correct": true/false, "score": 0.0-1.0, "extracted_answer": "student answer", '
+                        f'"feedback": "brief encouraging feedback", "reasoning": "your evaluation logic", '
+                        f'"what_went_wrong": "explanation if wrong, else empty string", '
+                        f'"correct_solution": "step by step solution"}}'
                     )
+
+                retry_token_max = 600 if is_essay_question else 500
 
                 if all_images:
                     # SWM-011: Vision retry — route through the shared gate (C4)
-                    retry_vision_max = 300 if is_essay_question else 200
                     retry_response = await _gate_vision_call(
                         db, current_user, all_images,
                         retry_prompt,
                         system_prompt="You are a JSON generator. Output ONLY valid JSON, nothing else.",
-                        max_tokens=retry_vision_max,
+                        max_tokens=retry_token_max,
                     )
                 else:
                     # SWM-011: Text-only retry — route through gate (C4)
-                    retry_max = 300 if is_essay_question else 200
                     retry_response = await _gate_text_call(
                         db, current_user, retry_prompt,
                         system_prompt="You are a JSON generator. Output ONLY valid JSON.",
-                        max_tokens=retry_max,
+                        max_tokens=retry_token_max,
                     )
 
                 retry_raw = (retry_response.get("response") or "").strip()
@@ -2215,9 +2236,34 @@ async def evaluate_submission(
                 evaluation_data["extractedAnswer"] = ocr_extracted_text
                 evaluation_data["answerSource"] = "vision_fallback"
 
-        # If feedback is empty (parsing failed completely), use raw response
-        if not evaluation_data["feedback"]:
-             evaluation_data["feedback"] = raw_response
+        # ──────────────────────────────────────────────
+        # Post-parse: ensure feedback & reasoning are never empty when we
+        # have a valid score/correctness from the LLM.
+        # ──────────────────────────────────────────────
+        _score = evaluation_data.get("score", 0.0)
+        _is_correct = evaluation_data.get("correct", False)
+        _student_ans = evaluation_data.get("extractedAnswer", "")
+
+        if not evaluation_data.get("feedback"):
+            if _is_correct:
+                evaluation_data["feedback"] = "Great work! Your answer is correct."
+            elif _score >= 0.7:
+                evaluation_data["feedback"] = "Good attempt! Your answer is mostly correct with minor issues."
+            elif _score >= 0.4:
+                evaluation_data["feedback"] = "You're on the right track, but there are some errors in your solution. Review the steps carefully."
+            elif _student_ans:
+                evaluation_data["feedback"] = "Your answer isn't quite right. Review the approach and try to identify where the mistake occurred."
+            else:
+                evaluation_data["feedback"] = "No answer was detected. Please write your solution on the canvas and submit again."
+            logger.info(f"💬 Generated fallback feedback for Q:{qid} (score={_score})")
+
+        if not evaluation_data.get("reasoning"):
+            if _is_correct:
+                evaluation_data["reasoning"] = "The student's answer matches the expected solution."
+            elif _score > 0:
+                evaluation_data["reasoning"] = f"The student's work was partially correct (score: {_score:.0%}). Some steps or the final answer contain errors."
+            else:
+                evaluation_data["reasoning"] = "The submitted answer does not match the expected solution."
 
         logger.info(f"🎯 Evaluation complete for Q:{qid}. Correct: {evaluation_data['correct']}, Extracted: '{evaluation_data['extractedAnswer']}', Expected: '{correct_answer[:30] if correct_answer else 'N/A'}', Source: {evaluation_data['answerSource']}")
 
