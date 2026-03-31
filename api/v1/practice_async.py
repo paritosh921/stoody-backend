@@ -1829,7 +1829,12 @@ async def evaluate_submission(
             prompt += "   - Minor spelling variations are acceptable if the meaning is clear\n"
             prompt += "   - Compare the MEANING and VALUE, NOT the exact string format\n"
             prompt += "5. They are CORRECT if the answer is mathematically or semantically equivalent.\n"
-            prompt += "6. Partial credit (score 0.5): if they're on the right track but made a small error.\n\n"
+            prompt += "6. Partial credit (score 0.5): if they're on the right track but made a small error.\n"
+            prompt += "7. ⚠️ FINAL ANSWER PRIORITY (CRITICAL):\n"
+            prompt += "   - If the student's FINAL ANSWER is correct, `is_correct` MUST be `true`.\n"
+            prompt += "   - You may lower the `score` (e.g. 0.7-0.9) for sloppy intermediate steps, "
+            prompt += "but NEVER set `is_correct: false` when the final answer matches.\n"
+            prompt += "   - Use `what_went_wrong` to note process issues even when the answer is correct.\n\n"
         
         
         # JSON output instructions - simplified and clearer
@@ -2190,12 +2195,17 @@ async def evaluate_submission(
                         evaluation_data["correct"] = is_match
                         evaluation_data["score"] = 1.0 if is_match else 0.0
                         
-                elif not is_mcq and extracted and correct_answer_value:
-                    # Subjective validation: semantic/numeric equivalence safety net
-                    if _answers_are_equivalent(extracted, correct_answer_value):
+                elif not is_mcq and extracted:
+                    # Subjective validation: semantic/numeric equivalence safety net.
+                    # Use admin answer when available, otherwise fall back to the
+                    # LLM's own solved_answer so we catch contradictions where the
+                    # LLM solves correctly but still marks the student wrong.
+                    reference = correct_answer_value or (solved_answer.strip() if solved_answer else "")
+                    if reference and _answers_are_equivalent(extracted, reference):
                         if not evaluation_data["correct"]:
+                            source = "admin" if correct_answer_value else "llm_solved"
                             logger.warning(
-                                f"⚠️ Subjective override: student='{extracted}' ≈ correct='{correct_answer_value}'. "
+                                f"⚠️ Subjective override ({source}): student='{extracted}' ≈ reference='{reference}'. "
                                 f"LLM incorrectly said wrong. Overriding to correct."
                             )
                             evaluation_data["correct"] = True
