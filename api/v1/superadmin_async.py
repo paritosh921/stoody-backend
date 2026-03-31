@@ -2572,12 +2572,15 @@ async def list_provisioned_hubs(
 # ---- Task 7: Super-admin Gate Admin ----
 
 async def _get_exampen_tenants(master_db) -> List[Dict[str, Any]]:
-    """Return tenants that have the exampen feature enabled via v2 overrides."""
+    """Return tenants whose effective feature state enables ExamPen."""
     tenants = await master_db["tenants"].find({
         "status": {"$in": ["active", "approved"]},
-        "enabled_features_v2.overrides.exampen": True,
     }).to_list(length=1000)
-    return tenants
+    return [
+        tenant
+        for tenant in tenants
+        if _tenant_features_v2_from_doc(tenant).get("effective", {}).get("exampen", False)
+    ]
 
 
 @router.get("/evalpen/gate/tenants")
