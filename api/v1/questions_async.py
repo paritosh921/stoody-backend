@@ -452,38 +452,11 @@ async def save_question(
             await db.mongo_insert_one("questions", question_dict)
 
         # --- ExamPen metadata sync (SWM-013) ---
-        # Only sync when the question has a document/paper source, indicating
-        # it originates from an exam or question-paper context.
-        if question_dict.get("pdfSource"):
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_questions_to_exampen
-                        await sync_questions_to_exampen(
-                            tenant_db,
-                            [question_dict],
-                            exam_id=question_dict["pdfSource"],
-                            default_subject=question_dict.get("subject"),
-                        )
-            except Exception as e:
-                logger.warning("ExamPen metadata sync failed (non-blocking): %s", e)
-
-            # --- DCR answer key sync ---
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_dcr_answer_keys
-                        await sync_dcr_answer_keys(
-                            tenant_db,
-                            [question_dict],
-                            exam_id=question_dict["pdfSource"],
-                        )
-            except Exception as e:
-                logger.warning("DCR answer key sync failed (non-blocking): %s", e)
+        # Only sync when the parent document has exam_mode set AND is NOT
+        # finalized yet — once finalized, the explicit finalize-exam endpoint
+        # is the sole sync authority and question edits are blocked anyway.
+        # Skip auto-sync entirely for exam_mode documents; finalize handles it.
+        # For non-exam documents (no exam_mode), these syncs are irrelevant.
 
         return {
             "success": True,
@@ -547,53 +520,9 @@ async def batch_save_questions(
             )
 
         # --- ExamPen metadata sync (SWM-013) ---
-        # Group saved questions by pdfSource and sync each group.
-        if success_count > 0:
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_questions_to_exampen
-                        from collections import defaultdict
-                        by_source = defaultdict(list)
-                        for qd in question_dicts:
-                            src = qd.get("pdfSource")
-                            if src:
-                                by_source[src].append(qd)
-                        for source_id, qs in by_source.items():
-                            subjects = [q.get("subject") for q in qs if q.get("subject")]
-                            default_subject = subjects[0] if subjects else None
-                            await sync_questions_to_exampen(
-                                tenant_db,
-                                qs,
-                                exam_id=source_id,
-                                default_subject=default_subject,
-                            )
-            except Exception as e:
-                logger.warning("ExamPen batch metadata sync failed (non-blocking): %s", e)
-
-            # --- DCR answer key batch sync ---
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_dcr_answer_keys
-                        from collections import defaultdict
-                        by_source_dcr = defaultdict(list)
-                        for qd in question_dicts:
-                            src = qd.get("pdfSource")
-                            if src:
-                                by_source_dcr[src].append(qd)
-                        for source_id, qs in by_source_dcr.items():
-                            await sync_dcr_answer_keys(
-                                tenant_db,
-                                qs,
-                                exam_id=source_id,
-                            )
-            except Exception as e:
-                logger.warning("DCR answer key batch sync failed (non-blocking): %s", e)
+        # Removed: auto-sync on every question save is superseded by the
+        # explicit finalize-exam endpoint which is the sole sync authority.
+        # Pre-finalize question edits should NOT push to exampen collections.
 
         return {
             "success": True,
@@ -647,36 +576,7 @@ async def create_question(
             )
 
         # --- ExamPen metadata sync (SWM-013) ---
-        if question_doc.get("pdfSource"):
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_questions_to_exampen
-                        await sync_questions_to_exampen(
-                            tenant_db,
-                            [question_doc],
-                            exam_id=question_doc["pdfSource"],
-                            default_subject=question_doc.get("subject"),
-                        )
-            except Exception as e:
-                logger.warning("ExamPen metadata sync failed (non-blocking): %s", e)
-
-            # --- DCR answer key sync ---
-            try:
-                db_name = current_user.get("db_name")
-                if db_name:
-                    tenant_db = await db.get_tenant_db(db_name)
-                    if tenant_db is not None:
-                        from api.v1.tutor_async import sync_dcr_answer_keys
-                        await sync_dcr_answer_keys(
-                            tenant_db,
-                            [question_doc],
-                            exam_id=question_doc["pdfSource"],
-                        )
-            except Exception as e:
-                logger.warning("DCR answer key sync failed (non-blocking): %s", e)
+        # Removed: auto-sync superseded by explicit finalize-exam endpoint.
 
         return QuestionResponse(
             id=question_data.id,

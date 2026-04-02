@@ -1915,6 +1915,7 @@ async def upload_pdf(
     total_minutes: Optional[int] = Form(None),
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
     instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
+    exam_mode: Optional[str] = Form(None),  # "dcr" or "pcr" — offline exam conduction mode
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
@@ -1963,6 +1964,19 @@ async def upload_pdf(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid document type. Allowed: {', '.join(allowed_types)}"
             )
+
+        # Validate exam_mode
+        if exam_mode:
+            if exam_mode not in ("dcr", "pcr"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid exam mode. Allowed: dcr, pcr"
+                )
+            if document_type == "Chapter Notes":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Exam mode is not allowed for Chapter Notes"
+                )
 
         # Validate title length
         if len(title) > 100:
@@ -2088,7 +2102,11 @@ async def upload_pdf(
             "question_type": question_type if question_type in ["mcq", "subjective"] else "mcq",  # Default question type for extracted questions
             "instructions": instructions.strip() if instructions else None,  # Paper instructions
             "is_active": False,  # Default to inactive until admin enables
-            "is_s3": is_s3_enabled()  # Track storage location
+            "is_s3": is_s3_enabled(),  # Track storage location
+            "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
+            "exam_finalized": False,
+            "exam_finalized_at": None,
+            "exam_sync_summary": None,
         }
 
         # Save to appropriate MongoDB database (B2C or regular)
@@ -2128,6 +2146,168 @@ async def upload_pdf(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload document: {str(e)}"
         )
+
+@router.post("/documents/{document_id}/finalize-exam")
+@limiter.limit("5/minute")
+async def finalize_exam(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Finalize an offline exam document for ExamPen evaluation.
+
+    Syncs reviewed questions into ExamPen metadata collections:
+      - DCR → exampen_answer_keys (via sync_dcr_answer_keys)
+      - PCR → evalpen_questions (via sync_questions_to_exampen)
+
+    After finalization, the document and its questions become read-only
+    for exam integrity.
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+
+        # Load document
+        if is_b2c:
+            doc = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            doc = await db.mongo_find_one("documents", {"document_id": document_id})
+
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        exam_mode = doc.get("exam_mode")
+        if not exam_mode:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Document has no exam_mode set. Only DCR/PCR documents can be finalized.",
+            )
+
+        if doc.get("exam_finalized"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Document is already finalized. Cannot re-finalize.",
+            )
+
+        if doc.get("ocr_status") != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OCR must be completed before finalizing.",
+            )
+
+        # Load questions for this document
+        if is_b2c:
+            questions_cursor = db.b2c_db["questions"].find({"document_id": document_id})
+        else:
+            questions_cursor = (await db.get_tenant_db(current_user.get("db_name")))["questions"].find(
+                {"document_id": document_id}
+            )
+        questions = await questions_cursor.to_list(length=10000)
+
+        if not questions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No questions found for this document. Extract questions via OCR first.",
+            )
+
+        # Validate and sync based on exam_mode
+        sync_summary = {}
+
+        if exam_mode == "dcr":
+            # DCR: all questions must be objective with correct_answer
+            errors = []
+            for q in questions:
+                q_id = q.get("id", "?")
+                q_type = q.get("question_type", "mcq")
+                if q_type == "subjective":
+                    errors.append(f"Q {q_id}: subjective questions not allowed in DCR paper")
+                if not q.get("correct_answer"):
+                    errors.append(f"Q {q_id}: missing correct answer")
+
+            if errors:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "message": "DCR finalization failed: all questions must be objective with correct answers",
+                        "errors": errors[:20],
+                    },
+                )
+
+            # Sync to exampen_answer_keys
+            from api.v1.tutor_async import sync_dcr_answer_keys
+
+            if is_b2c:
+                tenant_db = db.b2c_db
+            else:
+                tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+
+            result = await sync_dcr_answer_keys(
+                tenant_db=tenant_db,
+                questions=questions,
+                exam_id=document_id,
+                exam_doc=doc,
+            )
+            sync_summary = {"engine": "dcr", "answer_keys_upserted": (result or {}).get("upserted", 0)}
+
+        elif exam_mode == "pcr":
+            # PCR: sync all questions to evalpen_questions
+            from api.v1.tutor_async import sync_questions_to_exampen
+
+            if is_b2c:
+                tenant_db = db.b2c_db
+            else:
+                tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+
+            result = await sync_questions_to_exampen(
+                tenant_db=tenant_db,
+                questions=questions,
+                exam_id=document_id,
+                default_subject=doc.get("subject"),
+            )
+            sync_summary = {
+                "engine": "pcr",
+                "questions_inserted": (result or {}).get("inserted", 0),
+                "questions_updated": (result or {}).get("updated", 0),
+            }
+
+        # Mark document as finalized
+        finalized_update = {
+            "$set": {
+                "exam_finalized": True,
+                "exam_finalized_at": datetime.utcnow(),
+                "exam_sync_summary": sync_summary,
+            }
+        }
+
+        if is_b2c:
+            await db.b2c_db["documents"].update_one(
+                {"document_id": document_id}, finalized_update
+            )
+        else:
+            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+            await tenant_db["documents"].update_one(
+                {"document_id": document_id}, finalized_update
+            )
+
+        logger.info(f"Document {document_id} finalized as {exam_mode}: {sync_summary}")
+
+        return {
+            "message": f"Exam finalized successfully as {exam_mode.upper()}",
+            "document_id": document_id,
+            "exam_mode": exam_mode,
+            "sync_summary": sync_summary,
+            "question_count": len(questions),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Finalize exam error for {document_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to finalize exam: {str(e)}",
+        )
+
 
 @router.post("/documents/{document_id}/process-ocr", response_model=PDFProcessingResult)
 @limiter.limit("5/minute")
@@ -3263,6 +3443,13 @@ async def recalculate_document_points(
                 detail="Only Test Series documents have total points"
             )
 
+        # Block recalculation if document is finalized for exam
+        if document.get("exam_finalized"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot recalculate points for a finalized exam document",
+            )
+
         # Get all questions for this document
         questions = await db.mongo_find("questions", {"pdf_source": document_id})
         total_points = sum(q.get("points", 4.0) for q in questions)  # Default 4 marks per question
@@ -3389,6 +3576,13 @@ async def update_document_metadata(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
+            )
+
+        # Block metadata edits if document is finalized for exam
+        if existing_doc.get("exam_finalized"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot modify metadata of a finalized exam document",
             )
 
         # Update allowed fields
@@ -3974,6 +4168,17 @@ async def create_question(
         import uuid
         import json
 
+        # Block creation if document is finalized for exam
+        if document_id:
+            is_b2c = is_b2c_admin(current_user)
+            _doc = await (db.b2c_find_one("documents", {"document_id": document_id}) if is_b2c
+                          else db.mongo_find_one("documents", {"document_id": document_id}))
+            if _doc and _doc.get("exam_finalized"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot add questions to a finalized exam document",
+                )
+
         # Generate unique question ID
         full_question_id = f"QST{question_id}"
 
@@ -4130,6 +4335,17 @@ async def update_question(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Question {question_id} not found"
             )
+
+        # Block edits if parent document is finalized for exam
+        _q_doc_id = existing_question.get("document_id")
+        if _q_doc_id:
+            _parent_doc = await (db.b2c_find_one("documents", {"document_id": _q_doc_id}) if is_b2c
+                                 else db.mongo_find_one("documents", {"document_id": _q_doc_id}))
+            if _parent_doc and _parent_doc.get("exam_finalized"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot edit questions in a finalized exam document",
+                )
 
         # Update fields
         update_data = {}
@@ -4329,6 +4545,15 @@ async def bulk_update_questions(
         user_type = current_user.get("user_type")
         is_b2c = user_type == "b2c_admin"
 
+        # Block bulk updates if document is finalized for exam
+        _parent_doc = await (db.b2c_find_one("documents", {"document_id": document_id}) if is_b2c
+                             else db.mongo_find_one("documents", {"document_id": document_id}))
+        if _parent_doc and _parent_doc.get("exam_finalized"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot modify questions in a finalized exam document",
+            )
+
         # Build the $set update
         set_fields = {}
         if "points" in update_data:
@@ -4407,6 +4632,17 @@ async def delete_question(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Question {question_id} not found"
             )
+
+        # Block deletion if parent document is finalized for exam
+        _q_doc_id = question.get("document_id")
+        if _q_doc_id:
+            _parent_doc = await (db.b2c_find_one("documents", {"document_id": _q_doc_id}) if is_b2c
+                                 else db.mongo_find_one("documents", {"document_id": _q_doc_id}))
+            if _parent_doc and _parent_doc.get("exam_finalized"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot delete questions from a finalized exam document",
+                )
 
         # Delete associated images
         deleted_images_count = 0

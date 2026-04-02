@@ -456,6 +456,40 @@ scrape_configs:
 5. **No rate limiting on super-admin login endpoint**
    - `POST /superadmin/login` should have aggressive rate limiting (e.g., 5 attempts/min)
 
+## ExamPen Offline Exam Initiation — Architectural Decisions (2026-04-02)
+
+> Temporary section. Move relevant parts into `exam-conductor/new-docs/` once stable.
+
+### Exam mode and finalization
+
+- Documents gain `exam_mode` (`"dcr"` | `"pcr"` | null) set at upload time, and `exam_finalized` (bool) set by `POST /pdf/documents/{document_id}/finalize-exam`.
+- **Finalize is a hard lock.** After finalization: question create/update/delete, bulk marking, document metadata edits, and recalculate-points are all rejected (403). No re-finalize.
+- Finalize is the **sole sync authority** for ExamPen metadata. It calls `sync_dcr_answer_keys()` (DCR) or `sync_questions_to_exampen()` (PCR) exactly once.
+
+### Auto-sync removed from question CRUD
+
+- `questions_async.py` previously auto-called `sync_questions_to_exampen()` and `sync_dcr_answer_keys()` on every single-save, batch-save, and create. This was removed because it pushed metadata pre-finalize, weakening the "review then finalize" contract. The finalize endpoint now owns all exampen collection writes.
+
+### Orphaned helpers removed
+
+- `sync_paper_to_exampen()` in `tutor_async.py` — deleted (zero callers). Was a paper-builder integration that was never wired up.
+
+### Dual practice evaluation surfaces
+
+- `/api/v1/practice/evaluate` (in `practice_async.py`) — the live student practice path. Routes through the LLM gate with `caller_id="pcr_practice"`.
+- `/api/v1/evalpen/practice/evaluate` (in `evalpen_practice_async.py`) — built during exam-conductor boundary work for future PCR-template-based practice. Not wired into frontend yet. Both exist intentionally; do not remove the evalpen one.
+
+### Teacher BFF prepared exams
+
+- `evalpen_teacher_bff_async.py` merges two sources: submission-driven exams (from `evalpen_submissions`) and finalized documents (from `documents` where `exam_finalized=true`). Prepared exams appear with `status: "prepared"` and zero submission counts.
+- Tutor scoping for prepared exams matches the existing document visibility model: `teacher_ids` contains tutor ID, OR `teacher_ids` is empty/null/missing (open to all tutors).
+- Question counts use live aggregation from `questions` collection, not `extracted_questions_count` (which drifts after edits).
+
+### Frontend exam-pen flow
+
+- Clicking a prepared exam in ExamList routes to the "Exam Setup" tab (split-pane: PDF left, questions + submission status right). Active exams route to "Review Queue".
+- DocumentDetailPanel shows a "Finalize for Exam" bar when `exam_mode` is set. After finalization all edit controls are disabled (type dropdown, answer buttons, points/penalty, add/delete, bulk marking, edit dialog).
+
 ## Known Issues
 
 - Python 3.12 incompatible with MongoDB Atlas (TLS issues)

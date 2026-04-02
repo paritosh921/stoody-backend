@@ -16,7 +16,7 @@ Ownership Declaration (per STATE_OWNERSHIP_MAP.md):
     - Writes:  NONE
     - Reads from: evalpen_submissions, evalpen_detected_responses,
                   evalpen_evaluations, evalpen_questions,
-                  exampen_dcr_results
+                  exampen_dcr_results, documents (finalized offline exams)
     - Never writes to: any collection
 
 Hard constraints:
@@ -73,6 +73,11 @@ class ExamSummaryItem(BaseModel):
     evaluated_count: int = 0
     blocked_count: int = 0
     published_count: int = 0
+    # Prepared-exam fields (from finalized documents)
+    status: str = "active"  # "prepared" | "active"
+    exam_mode: Optional[str] = None  # "dcr" | "pcr" | None
+    finalized_at: Optional[str] = None
+    question_count: int = 0
 
 
 class ExamListResponse(BaseModel):
@@ -213,6 +218,81 @@ async def list_exams(
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
 
     try:
+        # ----- Fetch prepared exams from finalized documents -----
+        # These are offline exams that have been finalized but may have
+        # no student submissions yet.  We merge them into the list so
+        # teachers can see every exam they have prepared.
+        prepared_items: List[ExamSummaryItem] = []
+        prepared_exam_ids: set = set()
+
+        doc_query: Dict[str, Any] = {"exam_finalized": True}
+        # Tutor scoping: match existing document visibility model —
+        # tutors see docs mapped to them OR docs open to all tutors
+        # (teacher_ids is empty, null, or missing).
+        if current_user.get("user_type") == "tutor":
+            tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
+            if tutor_id:
+                doc_query = {
+                    "$and": [
+                        doc_query,
+                        {"$or": [
+                            {"teacher_ids": {"$in": [str(tutor_id)]}},
+                            {"teacher_ids": []},
+                            {"teacher_ids": None},
+                            {"teacher_ids": {"$exists": False}},
+                        ]},
+                    ]
+                }
+
+        doc_cursor = tenant_db["documents"].find(
+            doc_query,
+            projection={
+                "document_id": 1,
+                "title": 1,
+                "exam_mode": 1,
+                "exam_finalized_at": 1,
+            },
+        )
+        finalized_docs = await doc_cursor.to_list(length=5000)
+
+        # Get live question counts per document_id (avoids stale
+        # extracted_questions_count which drifts after edits).
+        finalized_doc_ids = [
+            d.get("document_id", "") for d in finalized_docs if d.get("document_id")
+        ]
+        live_q_counts: Dict[str, int] = {}
+        if finalized_doc_ids:
+            qc_cursor = tenant_db["questions"].aggregate([
+                {"$match": {"document_id": {"$in": finalized_doc_ids}}},
+                {"$group": {"_id": "$document_id", "count": {"$sum": 1}}},
+            ])
+            for qc in await qc_cursor.to_list(length=5000):
+                live_q_counts[qc["_id"]] = qc["count"]
+
+        for fdoc in finalized_docs:
+            doc_id = fdoc.get("document_id", "")
+            if doc_id:
+                prepared_exam_ids.add(doc_id)
+                prepared_items.append(
+                    ExamSummaryItem(
+                        exam_id=doc_id,
+                        title=fdoc.get("title", doc_id),
+                        exam_type=(fdoc.get("exam_mode") or "").upper() or None,
+                        total_students=0,
+                        evaluated_count=0,
+                        blocked_count=0,
+                        published_count=0,
+                        status="prepared",
+                        exam_mode=fdoc.get("exam_mode"),
+                        finalized_at=(
+                            fdoc["exam_finalized_at"].isoformat()
+                            if fdoc.get("exam_finalized_at")
+                            else None
+                        ),
+                        question_count=live_q_counts.get(doc_id, 0),
+                    )
+                )
+
         # ----- Fetch submissions (tutor-scoped) -----
         sub_query: Dict[str, Any] = {}
         if scoped_ids is not None:
@@ -230,6 +310,10 @@ async def list_exams(
         submissions = await submissions_cursor.to_list(length=5000)
 
         if not submissions:
+            # Return only prepared exams (no submissions exist yet)
+            if prepared_items:
+                prepared_items.sort(key=lambda x: x.exam_id)
+                return ExamListResponse(items=prepared_items)
             return ExamListResponse(items=[])
 
         # ----- Group submissions by exam_id -----
@@ -379,6 +463,22 @@ async def list_exams(
                     published_count=published,
                 )
             )
+
+        # Merge prepared exams that have no submissions yet
+        submission_exam_ids = {item.exam_id for item in items}
+        for prep in prepared_items:
+            if prep.exam_id not in submission_exam_ids:
+                items.append(prep)
+            else:
+                # Submission-driven item exists — enrich it with prepared metadata
+                for item in items:
+                    if item.exam_id == prep.exam_id:
+                        item.exam_mode = prep.exam_mode
+                        item.finalized_at = prep.finalized_at
+                        item.question_count = prep.question_count
+                        if item.status != "active":
+                            item.status = "active"
+                        break
 
         # Sort by exam_id for deterministic order
         items.sort(key=lambda x: x.exam_id)
