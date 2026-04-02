@@ -1977,6 +1977,11 @@ async def upload_pdf(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Exam mode is not allowed for Chapter Notes"
                 )
+            if exam_mode == "dcr" and question_type == "subjective":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="DCR documents must use Objective question type",
+                )
 
         # Validate title length
         if len(title) > 100:
@@ -2099,7 +2104,11 @@ async def upload_pdf(
             "total_points": total_points if document_type == "Test Series" else None,
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
-            "question_type": question_type if question_type in ["mcq", "subjective"] else "mcq",  # Default question type for extracted questions
+            "question_type": (
+                "mcq"
+                if exam_mode == "dcr"
+                else question_type if question_type in ["mcq", "subjective"] else "mcq"
+            ),  # DCR papers are objective-only by contract
             "instructions": instructions.strip() if instructions else None,  # Paper instructions
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled(),  # Track storage location
@@ -2377,26 +2386,36 @@ async def upload_exam_template(
                 detail="Empty file",
             )
 
-        # Convert PDF to PNG (first page) if needed
+        # Convert PDF to PNG (first page) if needed.
+        # DCR overlay expects a raster template asset, so a raw PDF is not accepted.
         if ext == "pdf":
             try:
                 import io
-                from pypdf import PdfReader
-                from PIL import Image as PILImage
-
-                # Use pdf2image if available, else fall back to simple extraction
+                # Use pdf2image if available; raw PDF storage is not sufficient for DCR overlay.
                 try:
                     from pdf2image import convert_from_bytes
                     images = convert_from_bytes(file_content, first_page=1, last_page=1, dpi=200)
-                    if images:
-                        buf = io.BytesIO()
-                        images[0].save(buf, format="PNG")
-                        file_content = buf.getvalue()
-                        ext = "png"
                 except ImportError:
-                    logger.warning("pdf2image not available; storing PDF template as-is")
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="PDF answer templates require server-side PDF-to-image conversion support",
+                    )
+                if not images:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Could not extract the first page from the PDF template",
+                    )
+                buf = io.BytesIO()
+                images[0].save(buf, format="PNG")
+                file_content = buf.getvalue()
+                ext = "png"
+            except HTTPException:
+                raise
             except Exception as pdf_err:
-                logger.warning(f"PDF template conversion failed, storing as-is: {pdf_err}")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Failed to convert PDF template to image: {pdf_err}",
+                )
 
         # Save template file
         from pathlib import Path
@@ -4312,6 +4331,13 @@ async def create_question(
                     detail="Cannot add questions to a finalized exam document",
                 )
 
+        # DCR documents are objective-only.
+        if document_id and _doc and _doc.get("exam_mode") == "dcr" and question_type == "subjective":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="DCR exam documents only allow Objective questions",
+            )
+
         # Generate unique question ID
         full_question_id = f"QST{question_id}"
 
@@ -4584,6 +4610,11 @@ async def update_question(
         if question_type:
             if question_type not in ["mcq", "integer", "subjective"]:
                 question_type = "mcq"  # Default to MCQ
+            if _parent_doc and _parent_doc.get("exam_mode") == "dcr" and question_type == "subjective":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="DCR exam documents only allow Objective questions",
+                )
             update_data["question_type"] = question_type
 
         # Add updated timestamp
