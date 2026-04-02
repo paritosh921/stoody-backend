@@ -2104,6 +2104,7 @@ async def upload_pdf(
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled(),  # Track storage location
             "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
+            "exam_template_path": None,
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
@@ -2214,6 +2215,16 @@ async def finalize_exam(
         sync_summary = {}
 
         if exam_mode == "dcr":
+            # DCR: require answer template
+            if not doc.get("exam_template_path"):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "message": "DCR finalization requires an answer template. Upload one before finalizing.",
+                        "errors": ["Missing answer template (blank answer sheet for overlay)"],
+                    },
+                )
+
             # DCR: all questions must be objective with correct_answer
             errors = []
             for q in questions:
@@ -2306,6 +2317,128 @@ async def finalize_exam(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to finalize exam: {str(e)}",
+        )
+
+
+@router.post("/documents/{document_id}/upload-template")
+@limiter.limit("10/minute")
+async def upload_exam_template(
+    request: Request,
+    document_id: str,
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Upload a blank answer-sheet template for DCR overlay.
+
+    The template is the physical answer sheet layout that students write on.
+    At DCR evaluation time, student strokes are composited on top of this
+    template image before LLM Vision extraction.
+
+    Accepts PNG, JPG, or PDF. PDFs are converted to PNG (first page).
+    """
+    try:
+        is_b2c = is_b2c_admin(current_user)
+
+        # Load document
+        if is_b2c:
+            doc = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            doc = await db.mongo_find_one("documents", {"document_id": document_id})
+
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if doc.get("exam_mode") != "dcr":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Answer template upload is only applicable to DCR exam documents",
+            )
+
+        if doc.get("exam_finalized"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot modify a finalized exam document",
+            )
+
+        # Validate file type
+        filename = file.filename or ""
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in ("png", "jpg", "jpeg", "pdf"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Template must be PNG, JPG, or PDF",
+            )
+
+        file_content = await file.read()
+        if not file_content:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Empty file",
+            )
+
+        # Convert PDF to PNG (first page) if needed
+        if ext == "pdf":
+            try:
+                import io
+                from pypdf import PdfReader
+                from PIL import Image as PILImage
+
+                # Use pdf2image if available, else fall back to simple extraction
+                try:
+                    from pdf2image import convert_from_bytes
+                    images = convert_from_bytes(file_content, first_page=1, last_page=1, dpi=200)
+                    if images:
+                        buf = io.BytesIO()
+                        images[0].save(buf, format="PNG")
+                        file_content = buf.getvalue()
+                        ext = "png"
+                except ImportError:
+                    logger.warning("pdf2image not available; storing PDF template as-is")
+            except Exception as pdf_err:
+                logger.warning(f"PDF template conversion failed, storing as-is: {pdf_err}")
+
+        # Save template file
+        from pathlib import Path
+        backend_dir = Path(os.getcwd())
+        template_dir = backend_dir / "uploads" / "documents" / "templates"
+        template_dir.mkdir(parents=True, exist_ok=True)
+
+        template_filename = f"{document_id}_template.{ext}"
+        template_path = template_dir / template_filename
+        relative_path = f"uploads/documents/templates/{template_filename}"
+
+        import aiofiles
+        async with aiofiles.open(str(template_path), "wb") as f:
+            await f.write(file_content)
+
+        # Update document metadata
+        update_op = {"$set": {"exam_template_path": relative_path}}
+        if is_b2c:
+            await db.b2c_db["documents"].update_one(
+                {"document_id": document_id}, update_op
+            )
+        else:
+            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+            await tenant_db["documents"].update_one(
+                {"document_id": document_id}, update_op
+            )
+
+        logger.info(f"Answer template uploaded for {document_id}: {relative_path}")
+
+        return {
+            "message": "Answer template uploaded successfully",
+            "document_id": document_id,
+            "template_path": relative_path,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Template upload error for {document_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload template: {str(e)}",
         )
 
 
