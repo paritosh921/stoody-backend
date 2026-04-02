@@ -1902,6 +1902,7 @@ class DocumentListResponse(BaseModel):
 async def upload_pdf(
     request: Request,
     file: UploadFile = File(...),
+    exam_template: Optional[UploadFile] = File(None),
     document_id: str = Form(...),
     title: str = Form(...),
     document_type: str = Form(...),
@@ -1982,6 +1983,16 @@ async def upload_pdf(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="DCR documents must use Objective question type",
                 )
+            if exam_mode == "dcr" and exam_template is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="DCR documents require an answer template during upload",
+                )
+        elif exam_template is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Answer template upload is only allowed for DCR exam documents",
+            )
 
         # Validate title length
         if len(title) > 100:
@@ -2080,6 +2091,13 @@ async def upload_pdf(
         except Exception:
             admin_oid = None
 
+        exam_template_path = None
+        if exam_mode == "dcr" and exam_template is not None:
+            exam_template_path = await _store_exam_template_file(
+                document_id=document_id,
+                upload=exam_template,
+            )
+
         document_metadata = {
             "document_id": document_id,
             "title": title,
@@ -2113,7 +2131,7 @@ async def upload_pdf(
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": is_s3_enabled(),  # Track storage location
             "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
-            "exam_template_path": None,
+            "exam_template_path": exam_template_path,
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
@@ -2329,6 +2347,67 @@ async def finalize_exam(
         )
 
 
+async def _store_exam_template_file(document_id: str, upload: UploadFile) -> str:
+    """Persist a DCR answer template as a raster overlay asset and return its relative path."""
+    filename = upload.filename or ""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ("png", "jpg", "jpeg", "pdf"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Template must be PNG, JPG, or PDF",
+        )
+
+    file_content = await upload.read()
+    if not file_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty file",
+        )
+
+    if ext == "pdf":
+        try:
+            import io
+            try:
+                from pdf2image import convert_from_bytes
+                images = convert_from_bytes(file_content, first_page=1, last_page=1, dpi=200)
+            except ImportError:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="PDF answer templates require server-side PDF-to-image conversion support",
+                )
+            if not images:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Could not extract the first page from the PDF template",
+                )
+            buf = io.BytesIO()
+            images[0].save(buf, format="PNG")
+            file_content = buf.getvalue()
+            ext = "png"
+        except HTTPException:
+            raise
+        except Exception as pdf_err:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to convert PDF template to image: {pdf_err}",
+            )
+
+    from pathlib import Path
+    backend_dir = Path(os.getcwd())
+    template_dir = backend_dir / "uploads" / "documents" / "templates"
+    template_dir.mkdir(parents=True, exist_ok=True)
+
+    template_filename = f"{document_id}_template.{ext}"
+    template_path = template_dir / template_filename
+    relative_path = f"uploads/documents/templates/{template_filename}"
+
+    import aiofiles
+    async with aiofiles.open(str(template_path), "wb") as f:
+        await f.write(file_content)
+
+    return relative_path
+
+
 @router.post("/documents/{document_id}/upload-template")
 @limiter.limit("10/minute")
 async def upload_exam_template(
@@ -2338,18 +2417,10 @@ async def upload_exam_template(
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
-    """Upload a blank answer-sheet template for DCR overlay.
-
-    The template is the physical answer sheet layout that students write on.
-    At DCR evaluation time, student strokes are composited on top of this
-    template image before LLM Vision extraction.
-
-    Accepts PNG, JPG, or PDF. PDFs are converted to PNG (first page).
-    """
+    """Upload a blank answer-sheet template for DCR overlay."""
     try:
         is_b2c = is_b2c_admin(current_user)
 
-        # Load document
         if is_b2c:
             doc = await db.b2c_find_one("documents", {"document_id": document_id})
         else:
@@ -2370,68 +2441,8 @@ async def upload_exam_template(
                 detail="Cannot modify a finalized exam document",
             )
 
-        # Validate file type
-        filename = file.filename or ""
-        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        if ext not in ("png", "jpg", "jpeg", "pdf"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Template must be PNG, JPG, or PDF",
-            )
+        relative_path = await _store_exam_template_file(document_id=document_id, upload=file)
 
-        file_content = await file.read()
-        if not file_content:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Empty file",
-            )
-
-        # Convert PDF to PNG (first page) if needed.
-        # DCR overlay expects a raster template asset, so a raw PDF is not accepted.
-        if ext == "pdf":
-            try:
-                import io
-                # Use pdf2image if available; raw PDF storage is not sufficient for DCR overlay.
-                try:
-                    from pdf2image import convert_from_bytes
-                    images = convert_from_bytes(file_content, first_page=1, last_page=1, dpi=200)
-                except ImportError:
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="PDF answer templates require server-side PDF-to-image conversion support",
-                    )
-                if not images:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail="Could not extract the first page from the PDF template",
-                    )
-                buf = io.BytesIO()
-                images[0].save(buf, format="PNG")
-                file_content = buf.getvalue()
-                ext = "png"
-            except HTTPException:
-                raise
-            except Exception as pdf_err:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"Failed to convert PDF template to image: {pdf_err}",
-                )
-
-        # Save template file
-        from pathlib import Path
-        backend_dir = Path(os.getcwd())
-        template_dir = backend_dir / "uploads" / "documents" / "templates"
-        template_dir.mkdir(parents=True, exist_ok=True)
-
-        template_filename = f"{document_id}_template.{ext}"
-        template_path = template_dir / template_filename
-        relative_path = f"uploads/documents/templates/{template_filename}"
-
-        import aiofiles
-        async with aiofiles.open(str(template_path), "wb") as f:
-            await f.write(file_content)
-
-        # Update document metadata
         update_op = {"$set": {"exam_template_path": relative_path}}
         if is_b2c:
             await db.b2c_db["documents"].update_one(
