@@ -465,6 +465,25 @@ async def get_tenant_db_or_403(db: DatabaseManager, current_user: Dict[str, Any]
     return tenant_db
 
 
+async def get_default_section(grade: str, admin_id, db: DatabaseManager) -> str:
+    """Get the first enabled section for a grade from the school's class-section matrix.
+    Falls back to 'A' if no matrix is configured."""
+    try:
+        admin_id_str = str(admin_id)
+        settings_doc = await db.mongo_find_one(
+            "school_settings", {"admin_id": admin_id_str}
+        )
+        if not settings_doc:
+            return "A"
+        class_sections = settings_doc.get("class_sections") or {}
+        sections = class_sections.get(grade) or class_sections.get(str(grade))
+        if sections and len(sections) > 0:
+            return sorted(sections)[0]
+        return "A"
+    except Exception:
+        return "A"
+
+
 async def calculate_streak_days(student_id: ObjectId, db: DatabaseManager) -> int:
     """Calculate consecutive login days for a student"""
     try:
@@ -1352,7 +1371,7 @@ async def create_student(
             "school": student_data.school,
             "stream": None,  # Stream is removed/fluid
             "grade": student_data.grade,
-            "section": student_data.section or "A",
+            "section": student_data.section or await get_default_section(student_data.grade or "", admin_id, db),
             "phone": student_data.phone,
             "plan_types": assigned_plan_types,
             "subjects": assigned_subjects,
@@ -1442,6 +1461,56 @@ async def create_student(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create student",
+        )
+
+
+@router.post("/students/fix-unknown-sections")
+@limiter.limit("5/minute")
+async def fix_unknown_sections(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
+    db: DatabaseManager = Depends(get_database),
+):
+    """One-time fix: assign default sections to students with null/empty/Unknown sections."""
+    try:
+        admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        admin_id_str = str(admin_id)
+
+        # Find students with missing sections
+        students = await db.mongo_find(
+            "students",
+            {
+                "admin_id": admin_id,
+                "$or": [
+                    {"section": None},
+                    {"section": ""},
+                    {"section": {"$exists": False}},
+                ],
+            },
+        )
+
+        fixed_count = 0
+        for student in students:
+            grade = student.get("grade") or ""
+            default_section = await get_default_section(grade, admin_id_str, db)
+            await db.mongo_update_one(
+                "students",
+                {"_id": student["_id"]},
+                {"$set": {"section": default_section}},
+            )
+            fixed_count += 1
+
+        return {
+            "success": True,
+            "fixed_count": fixed_count,
+            "message": f"Updated {fixed_count} student(s) with default sections",
+        }
+
+    except Exception as e:
+        logger.error(f"Fix unknown sections error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fix unknown sections",
         )
 
 
@@ -2911,32 +2980,89 @@ async def get_student_progress(
         progress_data = []
         for student in students:
             student_oid = student["_id"]
+            student_id_str = str(student_oid)
 
-            # Get student's chat sessions
-            sessions = await db.mongo_find("chat_sessions", {"student_id": student_oid})
+            # --- Gather data from ALL activity collections ---
+            # Note: student_id format differs across collections:
+            #   ObjectId: chat_sessions, question_attempts
+            #   String:   practice_attempts, practice_sessions, mcq_attempts
 
-            # Get student's question attempts
-            attempts = await db.mongo_find(
+            # Chat sessions (ObjectId)
+            chat_sessions = await db.mongo_find(
+                "chat_sessions", {"student_id": student_oid}
+            )
+
+            # Question attempts (ObjectId)
+            question_attempts = await db.mongo_find(
                 "question_attempts", {"student_id": student_oid}
             )
 
-            # Calculate total time spent (in minutes)
-            total_time = (
-                sum(session.get("duration", 0) for session in sessions) / 60
-                if sessions
+            # Practice attempts (string student_id)
+            practice_attempts = await db.mongo_find(
+                "practice_attempts", {"student_id": student_id_str}
+            )
+
+            # Practice sessions (string student_id)
+            practice_sessions = await db.mongo_find(
+                "practice_sessions", {"student_id": student_id_str}
+            )
+
+            # MCQ attempts (string student_id)
+            mcq_attempts = await db.mongo_find(
+                "mcq_attempts", {"student_id": student_id_str}
+            )
+
+            # --- Calculate total sessions ---
+            total_sessions = len(chat_sessions) + len(practice_sessions)
+
+            # --- Calculate total time spent (in minutes) ---
+            chat_time = (
+                sum(s.get("duration", 0) for s in chat_sessions) / 60
+                if chat_sessions
                 else 0
             )
-
-            # Calculate average score from attempts
-            scores = [
-                attempt.get("score", 0) for attempt in attempts if "score" in attempt
-            ]
-            avg_score = sum(scores) / len(scores) if scores else 0
-
-            # Calculate problems solved (correct attempts)
-            problems_solved = sum(
-                1 for attempt in attempts if attempt.get("is_correct", False)
+            practice_time = sum(
+                s.get("time_taken", 0) / 60 for s in practice_sessions
             )
+            # Individual attempt time (seconds -> minutes)
+            attempt_time = sum(
+                a.get("time_spent", 0) / 60
+                for a in practice_attempts
+            )
+            mcq_time = sum(
+                a.get("time_spent", 0) / 60 for a in mcq_attempts
+            )
+            total_time = chat_time + practice_time + attempt_time + mcq_time
+
+            # --- Calculate problems solved (correct answers across all sources) ---
+            problems_solved = (
+                sum(1 for a in question_attempts if a.get("is_correct", False))
+                + sum(1 for a in practice_attempts if a.get("is_correct", False))
+                + sum(1 for a in mcq_attempts if a.get("is_correct", False))
+            )
+
+            # --- Calculate total attempted ---
+            total_attempted = (
+                len(question_attempts) + len(practice_attempts) + len(mcq_attempts)
+            )
+
+            # --- Calculate average score from all attempt types ---
+            all_scores = []
+            # question_attempts scores
+            all_scores.extend(
+                a.get("score", 0) for a in question_attempts if "score" in a
+            )
+            # practice_attempts scores
+            all_scores.extend(
+                a.get("score", 0) for a in practice_attempts if "score" in a
+            )
+            # practice_sessions percentage (overall session score)
+            all_scores.extend(
+                s.get("percentage", 0)
+                for s in practice_sessions
+                if "percentage" in s and s.get("percentage") is not None
+            )
+            avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
 
             # Calculate streak days
             streak_days = await calculate_streak_days(student_oid, db)
@@ -2946,16 +3072,17 @@ async def get_student_progress(
 
             progress_data.append(
                 {
-                    "student_id": str(student_oid),
+                    "student_id": student_id_str,
                     "student_name": student.get("full_name")
                     or student.get("name")
                     or "Unknown",
                     "email": student.get("email") or "",
                     "grade": student.get("grade") or "Unknown",
                     "section": student.get("section") or "Unknown",
-                    "total_sessions": len(sessions),
+                    "total_sessions": total_sessions,
                     "total_time_spent": int(total_time),
                     "problems_solved": problems_solved,
+                    "total_attempted": total_attempted,
                     "average_score": round(avg_score, 1),
                     "last_active_at": student.get(
                         "last_login", student.get("updated_at")

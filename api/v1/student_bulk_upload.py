@@ -846,7 +846,7 @@ async def import_bulk_students(
             "email": email if email else None,
             "phone": phone if phone else None,
             "grade": grade,
-            "section": section if section else "A",
+            "section": section if section else (sorted(class_sections.get(grade, []))[0] if class_sections and class_sections.get(grade) else "A"),
             "stream": None, # Force stream to None as per new policy
             "gender": gender if gender else None,
             "date_of_birth": date_of_birth if date_of_birth else None,
