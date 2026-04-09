@@ -336,6 +336,276 @@ async def call_mistral_ocr(file_content: bytes) -> Dict[str, Any]:
     return {"pages": pages_result}
 
 
+def _extract_pdf_images_with_positions(file_content: bytes) -> Dict[int, Dict[str, Any]]:
+    """
+    Deterministic image + question-position extraction using PyMuPDF.
+
+    For every page in the PDF this returns:
+      - Each embedded raster image with its bounding box (in PDF point coords)
+        and a base64-encoded PNG payload.
+      - The y-positions of every numbered question text block on the page,
+        detected by matching `<n>.` / `<n>)` markers at the start of each
+        text block via PyMuPDF's `get_text("blocks")`.
+
+    The downstream pipeline uses these to:
+      1. Populate `ocr_result["pages"][i]["images"]` when Mistral OCR returns
+         an empty list (which it does for many Word/Pages-generated PDFs even
+         when the PDF has real embedded images).
+      2. Match each image to the question whose y-range sits immediately above
+         it — fully positional, no LLM call.
+
+    Returns a dict keyed by 0-based page index. Failures are non-fatal: any
+    pages that fail individually are simply omitted from the result.
+    """
+    import fitz  # PyMuPDF
+    import re as _re
+    import io as _io
+    from PIL import Image as _PILImage
+
+    Q_NUM_RE = _re.compile(r"^\s*(\d{1,3})\s*[\.\)]\s+")
+    # Per-image minimum bounding-box dimensions (in PDF points; 1pt ≈ 1/72").
+    # 30pt ≈ 0.42 inch — anything smaller is almost certainly a decoration,
+    # bullet-icon, or alpha mask, not a real diagram.
+    MIN_IMG_DIM_PT = 30.0
+
+    def _render_image_xref_to_png(doc_obj, xref: int, smask_xref: int) -> bytes:
+        """
+        Render an embedded image XObject to a PNG byte string with its soft
+        mask correctly applied and any transparency composited over a white
+        background.
+
+        Why this exists: `fitz.Pixmap(doc, xref)` returns the raw image
+        pixels WITHOUT applying the document's soft mask. Many PDFs (e.g.
+        Word-generated chemistry diagrams with translucent backgrounds) store
+        the visible content in the soft mask, so naively dropping alpha
+        produces a fully-black image. We:
+          1. Strip the misleading alpha=1 attribute from the colour pixmap.
+          2. Combine it with the soft mask via Pixmap(color, mask) which
+             produces a true RGBA pixmap with the smask in the alpha channel.
+          3. Composite the RGBA result over white via PIL so the saved PNG
+             renders identically against any UI background colour.
+        """
+        color_pix = fitz.Pixmap(doc_obj, xref)
+        # Normalize to RGB (drop CMYK / DeviceN / Lab / etc.).
+        if color_pix.colorspace is None or color_pix.colorspace.n not in (1, 3):
+            color_pix = fitz.Pixmap(fitz.csRGB, color_pix)
+        # `Pixmap(color, mask)` requires a colour pixmap WITHOUT alpha.
+        if color_pix.alpha:
+            color_pix = fitz.Pixmap(color_pix, 0)  # 0 = strip alpha
+        # If the image has a soft mask, fold it in. The result has real alpha.
+        if smask_xref and smask_xref > 0:
+            try:
+                mask_pix = fitz.Pixmap(doc_obj, smask_xref)
+                color_pix = fitz.Pixmap(color_pix, mask_pix)
+            except Exception as mask_err:
+                logger.debug(f"[PYMUPDF] smask {smask_xref} merge failed: {mask_err}")
+        png_bytes = color_pix.tobytes("png")
+        # If the result has alpha, composite over white so transparent regions
+        # render as white instead of leaking the UI background colour.
+        if color_pix.alpha:
+            try:
+                pil = _PILImage.open(_io.BytesIO(png_bytes))
+                if pil.mode == "RGBA":
+                    bg = _PILImage.new("RGB", pil.size, (255, 255, 255))
+                    bg.paste(pil, mask=pil.split()[3])
+                    out_buf = _io.BytesIO()
+                    bg.save(out_buf, format="PNG")
+                    png_bytes = out_buf.getvalue()
+            except Exception as pil_err:
+                logger.debug(f"[PYMUPDF] PIL composite failed for xref {xref}: {pil_err}")
+        return png_bytes
+
+    result: Dict[int, Dict[str, Any]] = {}
+
+    try:
+        doc = fitz.open(stream=file_content, filetype="pdf")
+    except Exception as e:
+        logger.warning(f"[PYMUPDF] Failed to open PDF: {e}")
+        return result
+
+    try:
+        for page_idx, page in enumerate(doc):
+            page_w = float(page.rect.width)
+            page_h = float(page.rect.height)
+            page_data: Dict[str, Any] = {
+                "page_width": page_w,
+                "page_height": page_h,
+                "images": [],
+                "question_blocks": [],
+                # All text blocks on the page (used for substring search to
+                # locate LLM-extracted questions whose markers PyMuPDF couldn't
+                # detect — case studies, sub-numbered questions, etc.)
+                "text_blocks": [],
+            }
+
+            # ---------- Embedded raster images ----------
+            try:
+                image_infos = page.get_image_info(xrefs=True)
+            except Exception as e:
+                logger.warning(f"[PYMUPDF] Page {page_idx}: get_image_info failed: {e}")
+                image_infos = []
+
+            # Build xref → smask_xref lookup from get_images() since
+            # get_image_info() does not return smask information.
+            try:
+                smask_lookup: Dict[int, int] = {
+                    rec[0]: rec[1] for rec in page.get_images(full=True) if len(rec) >= 2
+                }
+            except Exception:
+                smask_lookup = {}
+
+            raw_images: List[Dict[str, Any]] = []
+            for info in image_infos:
+                xref = info.get("xref", 0)
+                if not xref:
+                    continue
+                bbox = info.get("bbox")
+                if not bbox or len(bbox) != 4:
+                    continue
+                w_pt = float(bbox[2]) - float(bbox[0])
+                h_pt = float(bbox[3]) - float(bbox[1])
+                if w_pt < MIN_IMG_DIM_PT or h_pt < MIN_IMG_DIM_PT:
+                    continue
+                try:
+                    img_bytes = _render_image_xref_to_png(
+                        doc, xref, smask_lookup.get(xref, 0)
+                    )
+                    img_b64 = base64.b64encode(img_bytes).decode("ascii")
+                    raw_images.append({
+                        "bbox": (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                        "b64": img_b64,
+                    })
+                except Exception as e:
+                    logger.warning(f"[PYMUPDF] Page {page_idx} xref {xref}: extraction failed: {e}")
+
+            # Sort images top-to-bottom by y of top-left corner so the cursor
+            # fallback in extract_questions_with_gpt assigns them in reading order.
+            raw_images.sort(key=lambda r: r["bbox"][1])
+
+            for img_idx, raw in enumerate(raw_images):
+                bx0, by0, bx1, by1 = raw["bbox"]
+                # Pydantic OCRImage requires int coordinates — round and cast.
+                # Sub-pixel precision is irrelevant for question matching since
+                # we compare against question-block y-positions that are also
+                # rounded to whole points by the PDF layout engine.
+                page_data["images"].append({
+                    "id": f"img-{page_idx}-{img_idx}",
+                    "image_base64": raw["b64"],
+                    "top_left_x": int(round(bx0)),
+                    "top_left_y": int(round(by0)),
+                    "bottom_right_x": int(round(bx1)),
+                    "bottom_right_y": int(round(by1)),
+                })
+
+            # ---------- Question text-block positions ----------
+            try:
+                blocks = page.get_text("blocks")
+            except Exception:
+                blocks = []
+
+            seen_numbers: set = set()
+            for block in blocks:
+                # block tuple: (x0, y0, x1, y1, text, block_no, block_type)
+                if len(block) < 5:
+                    continue
+                _x0, y0, _x1, y1, text = block[0], block[1], block[2], block[3], block[4]
+                if not isinstance(text, str):
+                    continue
+                # Stash every text block (normalized) for downstream substring
+                # search. We collapse whitespace so search snippets aren't
+                # tripped up by line wraps or stray spaces.
+                normalized = " ".join(text.split())
+                if normalized:
+                    page_data["text_blocks"].append({
+                        "y_start": float(y0),
+                        "y_end": float(y1),
+                        "text": normalized,
+                    })
+                m = Q_NUM_RE.match(text)
+                if not m:
+                    continue
+                try:
+                    qnum = int(m.group(1))
+                except (ValueError, TypeError):
+                    continue
+                # Sanity bounds — exam papers don't have 4-digit question numbers
+                # and number 0 is invalid. The regex already rejects "1 mark" /
+                # bare digits because it requires a `.` or `)` after the number.
+                if qnum < 1 or qnum > 999:
+                    continue
+                if qnum in seen_numbers:
+                    continue
+                seen_numbers.add(qnum)
+                page_data["question_blocks"].append({
+                    "number": qnum,
+                    "y_start": float(y0),
+                    "y_end": float(y1),
+                })
+
+            page_data["question_blocks"].sort(key=lambda b: b["y_start"])
+            result[page_idx] = page_data
+    finally:
+        doc.close()
+
+    total_imgs = sum(len(p["images"]) for p in result.values())
+    total_qblocks = sum(len(p["question_blocks"]) for p in result.values())
+    print(
+        f"[PYMUPDF] Extracted {total_imgs} images and {total_qblocks} question blocks "
+        f"from {len(result)} pages",
+        flush=True,
+    )
+    return result
+
+
+def _augment_ocr_with_pymupdf(
+    ocr_result: Dict[str, Any],
+    file_content: bytes,
+) -> None:
+    """
+    Mutate `ocr_result` in place: for any page where the upstream OCR provider
+    (Mistral) returned no images, populate `images` from PyMuPDF and stash the
+    detected question-block y-positions on the page dict so positional matching
+    can use them later.
+
+    Pages where the OCR provider DID return images are left untouched — we
+    trust the provider when it gives us something.
+    """
+    try:
+        pymupdf_pages = _extract_pdf_images_with_positions(file_content)
+    except Exception as e:
+        logger.warning(f"[PYMUPDF] Augmentation failed: {e}")
+        print(f"[PYMUPDF] Augmentation failed: {e}", flush=True)
+        return
+
+    if not pymupdf_pages:
+        return
+
+    pages = ocr_result.get("pages", [])
+    injected = 0
+    for page in pages:
+        pidx = page.get("index", 0)
+        pmu_page = pymupdf_pages.get(pidx)
+        if not pmu_page:
+            continue
+        # Always stash the question-block positions and full text blocks for
+        # the matching pass — they're useful even if Mistral DID return images,
+        # because they let us verify the position-based assignment later.
+        page["_pymupdf_question_blocks"] = pmu_page["question_blocks"]
+        page["_pymupdf_text_blocks"] = pmu_page["text_blocks"]
+        page["_pymupdf_page_width"] = pmu_page["page_width"]
+        page["_pymupdf_page_height"] = pmu_page["page_height"]
+        # Only inject images if the OCR provider returned nothing.
+        if not page.get("images") and pmu_page["images"]:
+            page["images"] = pmu_page["images"]
+            injected += len(pmu_page["images"])
+    if injected:
+        print(
+            f"[PYMUPDF] Injected {injected} embedded images into OCR result "
+            f"(Mistral returned 0 for those pages)",
+            flush=True,
+        )
+
+
 async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
     """
     Primary OCR entry point for the pipeline.
@@ -1126,6 +1396,12 @@ async def extract_questions_with_gpt(
     if page_image_ids:
         print(f"[Q-EXTRACT] Page image map: {page_image_ids}", flush=True)
 
+    # NOTE: the positional image→question map is built AFTER the LLM extraction
+    # below (we need the LLM's page numbers as a fallback anchor source for
+    # questions that PyMuPDF couldn't detect by text-block matching, like
+    # case-study headings that use "Case Study Based- 3" instead of "19.").
+    positional_image_map: Dict[int, List[str]] = {}
+
     # Build page text lookup for targeted retries
     page_texts: Dict[int, str] = {}
     for page in pages:
@@ -1228,6 +1504,127 @@ async def extract_questions_with_gpt(
             return 9999
     good_questions.sort(key=_sort_key)
 
+    # ---------- Build positional image→question map ----------
+    # Anchors are points along the PDF where a numbered question starts. For
+    # each image we walk a globally ordered list of anchors and attribute the
+    # image to the most recent anchor whose (page, y) precedes the image's
+    # (page, y). This handles single-page questions AND multi-page case
+    # studies (where follow-on figure pages have no new numbered question and
+    # so naturally inherit the case-study question from a previous page).
+    #
+    # Anchor sources (in priority order):
+    #   1. PyMuPDF text-block detection — gives us exact y-position when the
+    #      question marker is "11." / "11)" plain text.
+    #   2. LLM-reported page index — fallback when PyMuPDF couldn't detect the
+    #      question (e.g., case-study questions with non-numeric headings).
+    #      Synthetic anchor lives at (LLM page, y=0) so it dominates anything
+    #      on later pages but defers to PyMuPDF anchors on the same page.
+    def _q_num_int(q: Any) -> Optional[int]:
+        try:
+            s = str(q.get("number", "")).strip()
+            digits = ""
+            for ch in s:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            return int(digits) if digits else None
+        except (ValueError, TypeError):
+            return None
+
+    pymupdf_detected_qnums: set = set()
+    anchors: List[tuple] = []  # (page_idx, y_start, q_number)
+    for page in pages:
+        pidx = page.get("index", 0)
+        qblocks = page.get("_pymupdf_question_blocks") or []
+        for qb in sorted(qblocks, key=lambda b: b["y_start"]):
+            qnum = int(qb["number"])
+            anchors.append((pidx, float(qb["y_start"]), qnum))
+            pymupdf_detected_qnums.add(qnum)
+
+    # For LLM-extracted questions PyMuPDF missed (case studies, sub-numbered
+    # questions, etc.), search the PDF text blocks for a distinctive snippet
+    # of the question text. The first match position becomes the anchor.
+    # This handles case-study headings like "Case Study Based- 3" that don't
+    # use a standard "<num>." prefix and would otherwise be invisible to
+    # PyMuPDF's question-marker regex.
+    def _find_text_anchor(q_text: str) -> Optional[tuple]:
+        """Return (page_idx, y_start) of the earliest PyMuPDF text block that
+        contains a distinctive snippet of `q_text`, or None if not found."""
+        if not q_text:
+            return None
+        # Pull a meaningful snippet — skip leading punctuation/whitespace,
+        # take 3-6 distinctive words. Case studies start with phrases like
+        # "Case Study Based- 3 Applications of Parabolas" — the first 30
+        # chars are usually unique enough across the document.
+        snippet = " ".join(q_text.split())[:50].strip()
+        if len(snippet) < 8:
+            return None
+        # Reduce snippet length until it's likely to be a substring of a single
+        # text block (long snippets risk straddling block boundaries).
+        for needle_len in (50, 35, 20):
+            needle = snippet[:needle_len].strip()
+            if len(needle) < 8:
+                continue
+            for page in pages:
+                pidx = page.get("index", 0)
+                for tb in page.get("_pymupdf_text_blocks") or []:
+                    if needle in tb["text"]:
+                        return (pidx, float(tb["y_start"]))
+        return None
+
+    for q in good_questions:
+        qni = _q_num_int(q)
+        if qni is None or qni in pymupdf_detected_qnums:
+            continue
+        text_anchor = _find_text_anchor(q.get("text", ""))
+        if text_anchor is not None:
+            anchors.append((text_anchor[0], text_anchor[1], qni))
+            continue
+        # Last resort: use the LLM's reported page at y=0.
+        try:
+            qpage = int(q.get("page", 0))
+        except (ValueError, TypeError):
+            continue
+        anchors.append((qpage, 0.0, qni))
+
+    # Sort by (page, y) so the linear walk in the matching loop is correct.
+    anchors.sort(key=lambda a: (a[0], a[1]))
+
+    for page in pages:
+        pidx = page.get("index", 0)
+        # Only process images that have a real bbox (top_left_y > 0). Mistral
+        # OCR currently returns images with bbox=0 (no positional info), and
+        # those should fall through to the cursor matching path which doesn't
+        # rely on position. PyMuPDF-injected images always have real bboxes.
+        page_imgs = sorted(
+            [
+                img for img in page.get("images", [])
+                if img.get("image_base64") and float(img.get("top_left_y") or 0) > 0
+            ],
+            key=lambda img: float(img.get("top_left_y") or 0),
+        )
+        for img in page_imgs:
+            img_y = float(img.get("top_left_y") or 0)
+            owning_qnum: Optional[int] = None
+            for ap, ay, an in anchors:
+                if ap < pidx or (ap == pidx and ay <= img_y):
+                    owning_qnum = an
+                elif ap > pidx:
+                    break
+            if owning_qnum is None and anchors:
+                owning_qnum = anchors[0][2]
+            if owning_qnum is not None:
+                positional_image_map.setdefault(owning_qnum, []).append(img.get("id", ""))
+    if positional_image_map:
+        print(f"[Q-EXTRACT] Positional image map: {positional_image_map}", flush=True)
+
+    # Track every image ID consumed by positional matching so the cursor
+    # fallback below cannot re-assign the same image to a different question.
+    used_image_ids: set = set()
+    for refs in positional_image_map.values():
+        used_image_ids.update(refs)
+
     # Build final ExtractedQuestion list
     # Track which image has been assigned per page so each figure-question
     # gets the NEXT unassigned image instead of ALL images on the page.
@@ -1243,18 +1640,52 @@ async def extract_questions_with_gpt(
         options = q.get("options", [])
         has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
 
-        # Use real image IDs from the page if this question references a figure
-        # Assign images 1:1 in order: 1st figure-question gets 1st image, etc.
-        if has_image and q_page in page_image_ids:
-            cursor = page_image_cursor.get(q_page, 0)
+        # Image assignment: prefer the deterministic positional map (built from
+        # PyMuPDF text-block y-positions) over the cursor heuristic. The
+        # positional map is authoritative when present because it doesn't rely
+        # on the LLM correctly setting `has_figure` — it just looks at where
+        # the image actually sits on the PDF page.
+        img_refs: List[str] = []
+        q_num_int: Optional[int] = None
+        try:
+            # Question number may come back as "11", "11.", "11)", "11a", etc.
+            _num_str = str(q_num).strip()
+            _digits = ""
+            for ch in _num_str:
+                if ch.isdigit():
+                    _digits += ch
+                else:
+                    break
+            if _digits:
+                q_num_int = int(_digits)
+        except (ValueError, TypeError):
+            q_num_int = None
+
+        positional_hit = (
+            q_num_int is not None
+            and q_num_int in positional_image_map
+        )
+        if positional_hit:
+            img_refs = list(positional_image_map[q_num_int])
+            # If we found images via position, the question definitely has a
+            # figure regardless of what the LLM said.
+            has_image = True
+        elif has_image and q_page in page_image_ids:
+            # Fallback: cursor-based 1:1 assignment in reading order, skipping
+            # any image already claimed by positional matching. Used for PDFs
+            # where question-number detection failed (e.g., scanned PDFs with
+            # no recoverable text blocks) but the LLM did flag the question as
+            # having a figure.
             all_page_imgs = page_image_ids[q_page]
+            cursor = page_image_cursor.get(q_page, 0)
+            while cursor < len(all_page_imgs) and all_page_imgs[cursor] in used_image_ids:
+                cursor += 1
             if cursor < len(all_page_imgs):
                 img_refs = [all_page_imgs[cursor]]
+                used_image_ids.add(all_page_imgs[cursor])
                 page_image_cursor[q_page] = cursor + 1
             else:
-                img_refs = []
-        else:
-            img_refs = []
+                page_image_cursor[q_page] = cursor
 
         # For Practice Sets mode, inline options into the question text
         if skip_option_extraction and options:
@@ -1481,6 +1912,14 @@ async def run_document_ocr_pipeline(
         logger.info(f"Calling OCR for job {job_id}")
         ocr_result = await call_sarvam_ocr(file_content)
 
+        # Mistral OCR's image extraction is unreliable for many Word/Pages-generated
+        # PDFs (it returns 0 images even when the PDF has real embedded raster
+        # diagrams). Augment with PyMuPDF, which reads embedded Image XObjects
+        # directly. Runs in a thread pool because PyMuPDF is synchronous.
+        await asyncio.get_event_loop().run_in_executor(
+            None, _augment_ocr_with_pymupdf, ocr_result, file_content
+        )
+
         processing_result["progress"] = 60
         await cache.set(f"pdf_job:{job_id}", processing_result, 3600, "admin")
 
@@ -1583,111 +2022,116 @@ async def run_document_ocr_pipeline(
                 )
 
                 if image_refs:
+                    # Iterate ALL pages, not just the question's "home" page —
+                    # multi-page case studies (e.g. a parabola case study with
+                    # diagrams spread across two PDF pages) will have image_refs
+                    # pointing at images that live on a different page than the
+                    # question's nominal start page.
                     for page in ocr_result.get("pages", []):
-                        if page.get("index") == page_index:
-                            for ocr_img in page.get("images", []):
-                                ocr_img_id = ocr_img.get('id')
-                                base_img_id = ocr_img_id.split('.')[0] if '.' in ocr_img_id else ocr_img_id
+                        actual_page_idx = page.get("index", page_index)
+                        for ocr_img in page.get("images", []):
+                            ocr_img_id = ocr_img.get('id')
+                            base_img_id = ocr_img_id.split('.')[0] if '.' in ocr_img_id else ocr_img_id
 
-                                is_referenced = any(
+                            is_referenced = any(
+                                base_img_id in ref or ocr_img_id in ref
+                                for ref in image_refs
+                            )
+
+                            if not is_referenced:
+                                logger.debug(f"Skipping non-referenced image {ocr_img_id}")
+                                continue
+
+                            logger.info(f"Including {ocr_img_id} - referenced in question")
+
+                            # Find saved images - check for both exact match and split variants
+                            # If image was split, the IDs become img-X-A, img-X-B, etc.
+                            matching_saved_images = [
+                                img for img in all_images
+                                if img['id'] == base_img_id or img['id'].startswith(f"{base_img_id}-")
+                            ]
+
+                            img_base64_data = image_base64_map.get(ocr_img_id) or image_base64_map.get(base_img_id, {})
+
+                            if matching_saved_images and img_base64_data:
+                                is_question_figure = any(
                                     base_img_id in ref or ocr_img_id in ref
-                                    for ref in image_refs
+                                    for ref in question_image_refs
                                 )
 
-                                if not is_referenced:
-                                    logger.debug(f"Skipping non-referenced image {ocr_img_id}")
-                                    continue
+                                is_image_based_mcq = question.metadata.get("is_image_based_mcq", False)
+                                if is_image_based_mcq and not is_question_figure:
+                                    is_question_figure = False
+                                    logger.info(f"Treating {ocr_img_id} as option image for image-based MCQ")
 
-                                logger.info(f"Including {ocr_img_id} - referenced in question")
-
-                                # Find saved images - check for both exact match and split variants
-                                # If image was split, the IDs become img-X-A, img-X-B, etc.
-                                matching_saved_images = [
-                                    img for img in all_images 
-                                    if img['id'] == base_img_id or img['id'].startswith(f"{base_img_id}-")
-                                ]
-                                
-                                img_base64_data = image_base64_map.get(ocr_img_id) or image_base64_map.get(base_img_id, {})
-
-                                if matching_saved_images and img_base64_data:
-                                    is_question_figure = any(
-                                        base_img_id in ref or ocr_img_id in ref
-                                        for ref in question_image_refs
-                                    )
-
-                                    is_image_based_mcq = question.metadata.get("is_image_based_mcq", False)
-                                    if is_image_based_mcq and not is_question_figure:
-                                        is_question_figure = False
-                                        logger.info(f"Treating {ocr_img_id} as option image for image-based MCQ")
-                                    
-                                    # For question figures, use the first image (or unsplit original)
-                                    # For option images (image-based MCQ), include all split parts
-                                    if is_question_figure:
-                                        # For question diagrams, prefer the original (unsplit) image
-                                        saved_img = next(
-                                            (img for img in matching_saved_images if img.get('is_original', False)),
-                                            next(
-                                                (img for img in matching_saved_images if img['id'] == base_img_id),
-                                                matching_saved_images[0]  # Fall back to first part
-                                            )
+                                # For question figures, use the first image (or unsplit original)
+                                # For option images (image-based MCQ), include all split parts
+                                if is_question_figure:
+                                    # For question diagrams, prefer the original (unsplit) image
+                                    saved_img = next(
+                                        (img for img in matching_saved_images if img.get('is_original', False)),
+                                        next(
+                                            (img for img in matching_saved_images if img['id'] == base_img_id),
+                                            matching_saved_images[0]  # Fall back to first part
                                         )
+                                    )
+                                    image_obj = {
+                                        'id': saved_img['id'],
+                                        'filename': saved_img['filename'],
+                                        'path': saved_img['path'],
+                                        'base64Data': img_base64_data.get('image_base64', ''),
+                                        'description': '',
+                                        'type': 'diagram',
+                                        'bbox': {
+                                            'top_left_x': img_base64_data.get('top_left_x', 0),
+                                            'top_left_y': img_base64_data.get('top_left_y', 0),
+                                            'bottom_right_x': img_base64_data.get('bottom_right_x', 0),
+                                            'bottom_right_y': img_base64_data.get('bottom_right_y', 0)
+                                        },
+                                        'metadata': {
+                                            'source': 'sarvam_ocr',
+                                            'page': actual_page_idx,
+                                            'extractedAt': datetime.utcnow().isoformat()
+                                        }
+                                    }
+                                    question_figures.append(image_obj)
+                                    logger.info(f"✅ Added question figure: {saved_img['id']}")
+                                else:
+                                    # For option images, prefer split parts over original
+                                    # Filter to only use split parts if available
+                                    split_images = [img for img in matching_saved_images if not img.get('is_original', True)]
+                                    images_to_use = split_images if split_images else matching_saved_images
+
+                                    for saved_img in images_to_use:
+                                        # Get base64 data for this specific split part if available
+                                        split_base64_data = image_base64_map.get(saved_img['id'], img_base64_data)
                                         image_obj = {
                                             'id': saved_img['id'],
                                             'filename': saved_img['filename'],
                                             'path': saved_img['path'],
-                                            'base64Data': img_base64_data.get('image_base64', ''),
+                                            'base64Data': split_base64_data.get('image_base64', ''),
                                             'description': '',
                                             'type': 'diagram',
                                             'bbox': {
-                                                'top_left_x': img_base64_data.get('top_left_x', 0),
-                                                'top_left_y': img_base64_data.get('top_left_y', 0),
-                                                'bottom_right_x': img_base64_data.get('bottom_right_x', 0),
-                                                'bottom_right_y': img_base64_data.get('bottom_right_y', 0)
+                                                'top_left_x': split_base64_data.get('top_left_x', 0),
+                                                'top_left_y': split_base64_data.get('top_left_y', 0),
+                                                'bottom_right_x': split_base64_data.get('bottom_right_x', 0),
+                                                'bottom_right_y': split_base64_data.get('bottom_right_y', 0)
                                             },
                                             'metadata': {
                                                 'source': 'sarvam_ocr',
-                                                'page': page_index,
+                                                'page': actual_page_idx,
                                                 'extractedAt': datetime.utcnow().isoformat()
                                             }
                                         }
-                                        question_figures.append(image_obj)
-                                        logger.info(f"✅ Added question figure: {saved_img['id']}")
-                                    else:
-                                        # For option images, prefer split parts over original
-                                        # Filter to only use split parts if available
-                                        split_images = [img for img in matching_saved_images if not img.get('is_original', True)]
-                                        images_to_use = split_images if split_images else matching_saved_images
-                                        
-                                        for saved_img in images_to_use:
-                                            # Get base64 data for this specific split part if available
-                                            split_base64_data = image_base64_map.get(saved_img['id'], img_base64_data)
-                                            image_obj = {
-                                                'id': saved_img['id'],
-                                                'filename': saved_img['filename'],
-                                                'path': saved_img['path'],
-                                                'base64Data': split_base64_data.get('image_base64', ''),
-                                                'description': '',
-                                                'type': 'diagram',
-                                                'bbox': {
-                                                    'top_left_x': split_base64_data.get('top_left_x', 0),
-                                                    'top_left_y': split_base64_data.get('top_left_y', 0),
-                                                    'bottom_right_x': split_base64_data.get('bottom_right_x', 0),
-                                                    'bottom_right_y': split_base64_data.get('bottom_right_y', 0)
-                                                },
-                                                'metadata': {
-                                                    'source': 'sarvam_ocr',
-                                                    'page': page_index,
-                                                    'extractedAt': datetime.utcnow().isoformat()
-                                                }
-                                            }
-                                            page_images.append(image_obj)
-                                        logger.info(f"✅ Added {len(images_to_use)} option images from {base_img_id}")
-                                else:
-                                    # Log why the image wasn't matched
-                                    if not matching_saved_images:
-                                        logger.warning(f"⚠️ Image {base_img_id} not found in all_images (available: {[img['id'] for img in all_images[:10]]}...)")
-                                    if not img_base64_data:
-                                        logger.warning(f"⚠️ Image {ocr_img_id} not found in image_base64_map (keys: {list(image_base64_map.keys())[:10]}...)")
+                                        page_images.append(image_obj)
+                                    logger.info(f"✅ Added {len(images_to_use)} option images from {base_img_id}")
+                            else:
+                                # Log why the image wasn't matched
+                                if not matching_saved_images:
+                                    logger.warning(f"⚠️ Image {base_img_id} not found in all_images (available: {[img['id'] for img in all_images[:10]]}...)")
+                                if not img_base64_data:
+                                    logger.warning(f"⚠️ Image {ocr_img_id} not found in image_base64_map (keys: {list(image_base64_map.keys())[:10]}...)")
 
                 logger.info(
                     f"Associated {len(question_figures)} question figures and "
