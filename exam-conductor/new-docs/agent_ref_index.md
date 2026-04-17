@@ -11,7 +11,7 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 | 1 | Backend + exam-conductor | `backend/` (includes `backend/exam-conductor/`) | Python 3.11, FastAPI, MongoDB | Core APIs, engines, gate. **BUILT.** |
 | 2 | Frontend | `frontend/` | React 18, TS, Vite, Tailwind | Tutor/student ExamPen UI. **NOT BUILT.** |
 | 3 | Super-Admin | `super-admin/` | Electron + React | Feature flag exists; ExamPen admin surface needed. See `integration/SUPERADMIN_SPEC.md`. |
-| 4 | ExamPen Hub (edge) | `stoody-multi-pen/HUB-exam-conductor/` | Python 3.12, Textual TUI, SQLite, systemd | Dedicated Pi edge device. Partial runtime implemented (supervisor, store, timer, TUI, BLE/uplink scaffolds, provisioning cache). Production packaging and hardware validation pending. |
+| 4 | ExamPen Hub (edge) | `stoody-multi-pen/HUB-exam-conductor/` | Python 3.12, Textual TUI, SQLite, systemd | Dedicated Pi edge device. Full runtime implemented (supervisor, BLE manager, pen sync, timer, uplink with dedup/retry/reconciliation, invig BLE commands, TUI). Code-smoke validated (33/33 py_compile, all imports clean). Production packaging, systemd installation, and hardware BLE validation pending. |
 
 ### Critical Folder Boundaries
 

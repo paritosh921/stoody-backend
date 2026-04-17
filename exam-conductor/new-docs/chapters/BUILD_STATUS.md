@@ -1,6 +1,6 @@
 # Build Status
 
-Last updated: 2026-03-24
+Last updated: 2026-04-17
 
 > **This document is a progress tracker.** It reports which implementation tasks are complete, in progress, or pending. It may be stale relative to actual code state. It must **not** be used as authority for architecture decisions, API behavior, storage contracts, schema shapes, or lifecycle rules. When this document conflicts with a root architecture spec (`architecture/*.md`), an integration spec (`integration/*.md`), an OpenAPI file (`api/*.openapi.yaml`), or an event schema (`contracts/events/*.schema.json`), the other document is correct and this one must be updated.
 
@@ -17,10 +17,10 @@ Active authority:
 
 ## Current Code Reality
 
-- `backend/exam-conductor/dcr/` has no active implementation files.
-- `backend/exam-conductor/pcr/` has only `__init__.py` and the historical `eval-engine-plan-v3.md`.
-- No active `evalpen` routers are mounted yet in `backend/main_async.py`.
-- Existing AI evaluation in `backend/api/v1/practice_async.py` and `backend/core/ocr_service.py` still calls providers directly and must be routed through the shared gate.
+- `backend/exam-conductor/dcr/` has full implementation: models, repository, recognizer, matcher, service.
+- `backend/exam-conductor/pcr/` has full implementation: domain modules, storage repos, services (OCR, submission, eval core, solution cache).
+- 18 ExamPen routers mounted in `backend/main_async.py`; `_evalpen_available = True` verified on import.
+- All LLM-mediated work (DCR Vision OCR, PCR evaluation, practice eval) routes through the shared gate.
 - Conducted-exam question-paper upload already exists in the tutor/backend path and should be integrated, not rebuilt.
 
 ---

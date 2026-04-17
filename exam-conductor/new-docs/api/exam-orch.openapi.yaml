@@ -1,10 +1,13 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Exam Orchestration API
-  version: "2.0.0"
+  version: "3.0.0"
   description: |
-    Exam lifecycle and metadata APIs. Exam orchestration owns exam identity and `exam_type`,
-    which route conducted-exam artifacts to the correct engine.
+    Exam lifecycle, hub assignment, and progress APIs. Exam orchestration owns exam identity
+    and `exam_type`, which routes conducted-exam artifacts to the correct engine.
+
+    Lifecycle states (strict ordering):
+      draft -> armed -> in_progress -> collection_closed -> uploading -> ready_for_eval
 servers:
   - url: /
 security:
@@ -13,18 +16,18 @@ paths:
   /api/v1/exams:
     get:
       summary: List exams visible to the current actor
+      parameters:
+        - name: lifecycle_filter
+          in: query
+          schema:
+            type: string
       responses:
         "200":
           description: Exam list
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  items:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ExamSummary"
+                $ref: "#/components/schemas/ExamListResponse"
     post:
       summary: Create an exam with engine-routing metadata
       requestBody:
@@ -32,17 +35,34 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateExamRequest"
+              $ref: "#/components/schemas/ExamCreateRequest"
       responses:
         "201":
           description: Exam created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ExamSummary"
-  /api/v1/exams/{exam_id}/lifecycle:
-    post:
-      summary: Move an exam through lifecycle states
+                $ref: "#/components/schemas/ExamDetailResponse"
+  /api/v1/exams/{exam_id}:
+    get:
+      summary: Get exam detail
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Exam detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamDetailResponse"
+        "404":
+          description: Exam not found
+    patch:
+      summary: Update exam metadata (roster, duration, etc.)
       parameters:
         - name: exam_id
           in: path
@@ -55,13 +75,106 @@ paths:
           application/json:
             schema:
               type: object
-              required: [to_state]
               properties:
-                to_state:
+                roster:
+                  type: array
+                  items:
+                    type: string
+                duration_minutes:
+                  type: integer
+                  minimum: 1
+      responses:
+        "200":
+          description: Exam updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExamDetailResponse"
+  /api/v1/exams/{exam_id}/lifecycle:
+    patch:
+      summary: Transition exam lifecycle state
+      description: |
+        Transitions the exam to `target_state`. The transition must follow the strict
+        lifecycle ordering: draft -> armed -> in_progress -> collection_closed ->
+        uploading -> ready_for_eval. Invalid transitions return 409.
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_state]
+              properties:
+                target_state:
                   type: string
+                  enum: [armed, in_progress, collection_closed, uploading, ready_for_eval]
       responses:
         "202":
           description: Transition accepted
+        "409":
+          description: Invalid state transition
+  /api/v1/exams/{exam_id}/hubs:
+    post:
+      summary: Assign a single hub to an exam
+      description: |
+        Assigns one hub to the exam. Returns 409 if the hub is already assigned
+        to this same exam (non-fatal for mobile). Only valid when exam is in draft state.
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AssignHubRequest"
+      responses:
+        "200":
+          description: Hub assigned
+        "409":
+          description: Hub already assigned to this exam
+    delete:
+      summary: Unassign a hub from an exam
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UnassignHubRequest"
+      responses:
+        "200":
+          description: Hub unassigned
+  /api/v1/exams/{exam_id}/progress:
+    get:
+      summary: Get exam upload progress snapshot
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Upload progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadProgressResponse"
 components:
   securitySchemes:
     StoodyBearer:
@@ -69,28 +182,126 @@ components:
       scheme: bearer
       bearerFormat: JWT
   schemas:
-    CreateExamRequest:
+    HubAssignment:
       type: object
-      required: [title, exam_type]
       properties:
-        title:
+        hub_id:
           type: string
-        exam_type:
+        hub_name:
           type: string
-          enum: [dcr, pcr]
-        schedule_at:
+          nullable: true
+        assigned_at:
           type: string
-          format: date-time
-    ExamSummary:
+          nullable: true
+        session_started_at:
+          type: string
+          nullable: true
+        session_ended_at:
+          type: string
+          nullable: true
+    ExamCreateRequest:
       type: object
-      required: [exam_id, title, exam_type, lifecycle_state]
+      required: [exam_id, exam_type]
       properties:
         exam_id:
           type: string
-        title:
+          minLength: 1
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
+        prepared_document_id:
+          type: string
+          nullable: true
+        roster:
+          type: array
+          items:
+            type: string
+          default: []
+        duration_minutes:
+          type: integer
+          minimum: 1
+          nullable: true
+        hub_assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/HubAssignment"
+          default: []
+    ExamDetailResponse:
+      type: object
+      required: [exam_id, exam_type, lifecycle_state, roster, hub_assignments, created_by]
+      properties:
+        exam_id:
           type: string
         exam_type:
           type: string
           enum: [dcr, pcr]
         lifecycle_state:
           type: string
+        prepared_document_id:
+          type: string
+          nullable: true
+        roster:
+          type: array
+          items:
+            type: string
+        duration_minutes:
+          type: integer
+          nullable: true
+        hub_assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/HubAssignment"
+        created_by:
+          type: string
+        created_at:
+          type: string
+          nullable: true
+        updated_at:
+          type: string
+          nullable: true
+    ExamListResponse:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExamDetailResponse"
+        total:
+          type: integer
+    AssignHubRequest:
+      type: object
+      required: [hub_id]
+      properties:
+        hub_id:
+          type: string
+        hub_name:
+          type: string
+          nullable: true
+    UnassignHubRequest:
+      type: object
+      required: [hub_id]
+      properties:
+        hub_id:
+          type: string
+    UploadProgressResponse:
+      type: object
+      properties:
+        exam_id:
+          type: string
+        lifecycle_state:
+          type: string
+        total_expected:
+          type: integer
+        total_received:
+          type: integer
+        total_acknowledged:
+          type: integer
+        by_hub:
+          type: object
+          additionalProperties:
+            type: object
+        by_student:
+          type: object
+          additionalProperties:
+            type: object
