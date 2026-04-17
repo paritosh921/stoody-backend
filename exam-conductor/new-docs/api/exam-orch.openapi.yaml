@@ -84,12 +84,8 @@ paths:
                   type: integer
                   minimum: 1
       responses:
-        "200":
-          description: Exam updated
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ExamDetailResponse"
+        "404":
+          description: Exam not found
   /api/v1/exams/{exam_id}/lifecycle:
     patch:
       summary: Transition exam lifecycle state
