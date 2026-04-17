@@ -1,16 +1,17 @@
 openapi: "3.1.0"
 info:
   title: ExamPen Invigilator Console API
-  version: "2.0.0"
+  version: "2.1.0"
   description: |
     Read-oriented operational APIs for conducted-exam invigilation.
     These endpoints surface shared-ingest and exam-session state, not evaluator ownership.
+    All endpoints are read-only — no scoring, review, or lifecycle mutation actions.
 servers:
   - url: /
 security:
   - StoodyBearer: []
 paths:
-  /api/v1/invigilator/exams/{exam_id}/session:
+  /api/v1/invig/sessions/{exam_id}:
     get:
       summary: Get current exam session state
       parameters:
@@ -26,9 +27,9 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SessionSummary"
-  /api/v1/invigilator/exams/{exam_id}/sync:
+  /api/v1/invig/sessions/{exam_id}/hubs:
     get:
-      summary: Get per-pen and per-upload sync status
+      summary: Get per-hub connectivity and status
       parameters:
         - name: exam_id
           in: path
@@ -37,11 +38,65 @@ paths:
             type: string
       responses:
         "200":
-          description: Sync view
+          description: Hub status list
           content:
             application/json:
               schema:
-                type: object
+                type: array
+                items:
+                  $ref: "#/components/schemas/HubStatus"
+  /api/v1/invig/sessions/{exam_id}/pens:
+    get:
+      summary: Get connected pens per hub
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pen list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PenInfo"
+  /api/v1/invig/sessions/{exam_id}/sync-progress:
+    get:
+      summary: Get upload completion per hub and pen
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sync progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncProgress"
+  /api/v1/invig/sessions/{exam_id}/alerts:
+    get:
+      summary: Get operational alerts for an exam session
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Alert list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Alert"
 components:
   securitySchemes:
     StoodyBearer:
@@ -51,13 +106,128 @@ components:
   schemas:
     SessionSummary:
       type: object
-      required: [exam_id, lifecycle_state, connected_pens]
+      required: [exam_id, exam_type, lifecycle_state, roster_size, hub_count, hubs_online, total_pens_connected, upload_completion_pct]
       properties:
         exam_id:
           type: string
+        exam_type:
+          type: string
+          enum: [dcr, pcr]
         lifecycle_state:
           type: string
-        connected_pens:
+        roster_size:
+          type: integer
+        hub_count:
+          type: integer
+        hubs_online:
+          type: integer
+        total_pens_connected:
           type: integer
         upload_completion_pct:
           type: number
+        started_at:
+          type: string
+          format: date-time
+        collection_closed_at:
+          type: string
+          format: date-time
+    HubStatus:
+      type: object
+      required: [hub_id, online, connected_pens, storage_health]
+      properties:
+        hub_id:
+          type: string
+        hub_name:
+          type: string
+        online:
+          type: boolean
+        last_heartbeat:
+          type: string
+          format: date-time
+        assigned_exam_id:
+          type: string
+        connected_pens:
+          type: integer
+        storage_health:
+          type: string
+          enum: [ok, degraded, unavailable, unknown]
+        upload_received:
+          type: integer
+        upload_acknowledged:
+          type: integer
+        session_started_at:
+          type: string
+          format: date-time
+        session_ended_at:
+          type: string
+          format: date-time
+    PenInfo:
+      type: object
+      required: [pen_mac, hub_id]
+      properties:
+        pen_mac:
+          type: string
+        hub_id:
+          type: string
+        student_id:
+          type: string
+        connected:
+          type: boolean
+        sync_status:
+          type: string
+          enum: [unknown, pending, syncing, synced, uploaded, failed]
+        pages_uploaded:
+          type: integer
+    SyncProgress:
+      type: object
+      required: [exam_id, total_expected, total_received, total_acknowledged, completion_pct]
+      properties:
+        exam_id:
+          type: string
+        total_expected:
+          type: integer
+        total_received:
+          type: integer
+        total_acknowledged:
+          type: integer
+        completion_pct:
+          type: number
+        by_hub:
+          type: array
+          items:
+            type: object
+            properties:
+              hub_id:
+                type: string
+              received:
+                type: integer
+              acknowledged:
+                type: integer
+        by_pen:
+          type: array
+          items:
+            type: object
+            properties:
+              pen_mac:
+                type: string
+              received:
+                type: integer
+              acknowledged:
+                type: integer
+    Alert:
+      type: object
+      required: [alert_type, severity, message, detected_at]
+      properties:
+        alert_type:
+          type: string
+          enum: [hub_offline, heartbeat_stale, storage_degraded, upload_failed, usb_missing]
+        severity:
+          type: string
+          enum: [warning, critical]
+        hub_id:
+          type: string
+        message:
+          type: string
+        detected_at:
+          type: string
+          format: date-time

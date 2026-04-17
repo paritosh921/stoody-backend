@@ -77,7 +77,7 @@ Reply envelope rules:
 | `fsm.transition.result` | `hub-supervisor` | Caller | `{exam_id, state, persisted: true}` |
 | `fsm.transition.error` | `hub-supervisor` | Caller | `{code, message}` |
 | `fsm.snapshot.request` | `hub-tui`, `hub-invig-ble` | `hub-supervisor` | `{exam_id}` |
-| `fsm.snapshot.result` | `hub-supervisor` | Caller | `{exam_id, state, timer, dongles, storage, upload}` |
+| `fsm.snapshot.result` | `hub-supervisor` | Caller | `{exam_id, state, timer, dongles, storage, upload, bindings}` |
 
 ### 3.2 Timer
 
@@ -88,6 +88,10 @@ Reply envelope rules:
 | `timer.snapshot.request` | `hub-tui`, `hub-invig-ble` | `hub-timer` | `{exam_id}` |
 | `timer.snapshot.result` | `hub-timer` | Caller | `{exam_id, state, remaining_sec, started_at, expires_at}` |
 | `timer.expired.event` | `hub-timer` | `hub-supervisor` | `{exam_id, expired_at}` |
+
+> Current Python runtime implements timer messages in-process: `HubSupervisor` owns `ExamTimer` directly and wires `on_expired` as a method call. Future IPC bus can replace direct calls without changing payload semantics.
+
+> Current Python runtime uses supervisor-owned in-process service wiring for all managed modules. `hub_ble_mgr` is constructed with a supervisor-provided `on_pen_data` callback that forwards to `PenSyncManager.handle_pen_data`. `hub_pen_sync` and `hub_uplink` share the supervisor-owned `HubRepository` and `DualWriteStorage`. `hub_uplink` receives the supervisor-owned `ConfigStore` for backend URL, hub ID, and auth token. Module-level `run()` fallbacks still exist for standalone/dev operation but are not used when the supervisor is active.
 
 ### 3.3 BLE Manager
 
@@ -133,7 +137,18 @@ Reply envelope rules:
 | Message | Source | Target | Payload |
 |---|---|---|---|
 | `invig.auth.state.event` | `hub-invig-ble` | `hub-supervisor`, `hub-tui` | `{invig_id, connected, authenticated}` |
-| `invig.command.event` | `hub-invig-ble` | `hub-supervisor` | `{cmd_id, payload}` |
+| `invig.command.event` | `hub-invig-ble` | `hub-supervisor` | `{cmd_id, request_id, payload}` |
+| `invig.manual_register.request` | `hub-invig-ble` | `hub-supervisor` | `{exam_id, pen_mac, student_id}` |
+| `invig.manual_register.result` | `hub-supervisor` | `hub-invig-ble` | `{ok, exam_session_id, pen_mac, student_id, binding: "local"}` |
+| `invig.manual_register.error` | `hub-supervisor` | `hub-invig-ble` | `{ok: false, error: "unknown_pen"|"student_mismatch"|"no_session"}` |
+| `invig.registration_scan.request` | `hub-invig-ble` | `hub-supervisor` | `{exam_id, timeout_sec?}` |
+| `invig.registration_scan.result` | `hub-supervisor` | `hub-invig-ble` | `{ok: true, exam_session_id, scan_results: {total, known, unknown}}` |
+| `invig.registration_scan.error` | `hub-supervisor` | `hub-invig-ble` | `{ok: false, error: "no_session"|"ble_unavailable"|"scan_failed"}` |
+
+> Current runtime routes `start_exam`, `stop_exam`, `start_upload`, `request_snapshot`, `manual_register`, and `start_registration_scan` to `hub-supervisor` via `_handle_invig_command()`. `start_registration_scan` requires `exam_id`, resolves session, calls `BLEManager.scan_for_pens()` via `DongleDiscovery.scan_for_pens()`, cross-references results against cached `pen_inventory`, and returns `{known, unknown}` device lists. `start_upload` requires `exam_id`, resolves session, transitions to UPLOADING, updates session state, and returns upload ledger counts. `manual_register` validates against cached `pen_inventory` and persists to `pen_bindings` with `binding: "local"`. `request_snapshot` includes `timer`, `bindings`, `upload` (ledger counts), `storage` (health), and `dongles` (BLE summary).
+
+| Message | Source | Target | Payload |
+|---|---|---|---|
 | `ui.snapshot.request` | `hub-tui` | `hub-supervisor` | `{screen}` |
 | `ui.snapshot.result` | `hub-supervisor` | `hub-tui` | `{screen, data}` |
 
@@ -165,4 +180,8 @@ Retry rules:
 
 | Date | Change | By |
 |---|---|---|
+| 2026-04-15 | Step 13-14: wired `connected_pen_count` from BLEManager into UplinkManager heartbeat. Implemented `start_registration_scan`: calls `BLEManager.scan_for_pens()`, cross-references against cached `pen_inventory`, returns `{known, unknown}` device lists. Added `scan_for_pens()` to BLEManager. | Claude |
+| 2026-04-15 | Step 12: supervisor-owned in-process wiring for `hub_ble_mgr` → `PenSyncManager`, `hub_pen_sync` and `hub_uplink` share supervisor-owned `HubRepository`/`DualWriteStorage`/`ConfigStore`. `start_upload` requires `exam_id`, resolves session, updates state, returns upload ledger counts. `request_snapshot` includes `upload`, `storage`, `dongles`. Added in-process wiring note. | Claude |
+| 2026-04-15 | Implemented `manual_register` against cached `pen_inventory` + `pen_bindings` (local binding, no server-confirmed status). `start_registration_scan` validates `exam_id`/`exam_session_id` but hardware scan remains `not_implemented`. Added `bindings` to `fsm.snapshot.result`. Added invig register message types to catalog. | Claude |
+| 2026-04-15 | Added `request_id` to `invig.command.event` payload to match BLE GATT spec §4 frame format. Wired `start_exam`, `stop_exam`, `start_upload`, `request_snapshot` to hub-supervisor via `_handle_invig_command()`. | Claude |
 | 2026-03-18 | Added the authoritative hub IPC envelope, message catalog, and error model for P2 implementation planning. | Codex |

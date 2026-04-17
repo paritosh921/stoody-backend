@@ -28,7 +28,22 @@ If two documents disagree, the document marked authoritative here wins.
 | REST API contracts | `api/*.openapi.yaml` | Related root specs | OpenAPI owns wire format. |
 | Event contracts | `contracts/events/*.schema.json` | Related root specs | Schemas own async payload shape. |
 | Reusable process guidance | `GUIDE_RULE_DOCS/*` | — | This folder is the canonical home for generic planning/design docs. |
+| Upstream work sequencing and task packaging | `IMPLEMENTATION_PLAN.md` | — | **Status/execution doc only.** Authority limited to work-packaging and spawn ordering for the upstream ingest/hub/mobile stack. Cannot override root architecture docs (`architecture/*.md`), integration specs (`integration/*.md`), OpenAPI files (`api/*.openapi.yaml`), or event schemas (`contracts/events/*.schema.json`). If IMPLEMENTATION_PLAN.md disagrees with any of those, the other document wins. |
+| Implementation progress tracking | `chapters/BUILD_STATUS.md` | — | **Status/execution doc only.** Progress tracker for downstream engine/backend work (SWM-* tasks). Cannot override root architecture docs, integration specs, OpenAPI files, or event schemas. If BUILD_STATUS.md disagrees with any of those, the other document wins. |
 | Historical background only | `references/exampen-system-design.docx`, `architecture/unifiedPlan.md`, `../pcr/eval-engine-plan-v3.md` | — | Useful for context and rationale only. |
+
+---
+
+## Conflict Resolution FAQ
+
+**Q: If IMPLEMENTATION_PLAN.md disagrees with an OpenAPI file, which one wins?**
+A: The OpenAPI file wins. `IMPLEMENTATION_PLAN.md` is a sequencing and work-packaging document. It may describe intended API behavior for task context, but it does not own wire format. If a conflict is found, update IMPLEMENTATION_PLAN.md to match the OpenAPI contract.
+
+**Q: If BUILD_STATUS.md claims a collection or API shape that contradicts a root architecture spec?**
+A: The root architecture spec wins. BUILD_STATUS.md reports implementation state; it does not define schema, storage, lifecycle, or API contracts.
+
+**Q: Can a tracker doc (BUILD_STATUS.md, IMPLEMENTATION_PLAN.md) introduce a new API path, collection name, or field that is not in the authoritative specs?**
+A: No. Tracker docs may reference or describe existing contracts for task context, but any new contract surface must be defined in the appropriate authoritative document first (architecture spec, OpenAPI, event schema, or integration spec).
 
 ---
 
@@ -80,7 +95,8 @@ Promotion to `ACTIVE` requires:
 | `governance/TEST_SUITE_SPEC.md` | ACTIVE | R5 fix pass |
 | `governance/FAILURE_MITIGATION_REGISTER.md` | ACTIVE | R4 |
 | `governance/DOCUMENTATION_PLAN.md` | ACTIVE | R4 |
-| `chapters/BUILD_STATUS.md` | DRAFT | 2026-03-24 |
+| `chapters/BUILD_STATUS.md` | ACTIVE | 2026-03-24 |
+| `IMPLEMENTATION_PLAN.md` | ACTIVE | 2026-04-04 |
 | `api/*.openapi.yaml` | ACTIVE | R6 hardening pass |
 | `contracts/events/*.schema.json` | ACTIVE | R6 hardening pass |
 | `GUIDE_RULE_DOCS/*` | ACTIVE | retained as canonical process guidance |
@@ -93,4 +109,5 @@ Promotion to `ACTIVE` requires:
 
 | Date | Change | By |
 |---|---|---|
+| 2026-04-09 | Added explicit registry entries for `chapters/BUILD_STATUS.md` and `IMPLEMENTATION_PLAN.md` as status/execution documents. Added Conflict Resolution FAQ. Both docs marked as non-authoritative for architecture, API shape, schema shape, storage contracts, and lifecycle contracts. | Claude |
 | 2026-03-24 | Rebased document authority onto `new-docs`, added root DCR/PCR/gate/tamper specs, demoted legacy `.docx` and PCR v3 plan to historical reference, and made `GUIDE_RULE_DOCS/` the only canonical home for reusable process docs. | Codex |

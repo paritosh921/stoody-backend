@@ -2,6 +2,8 @@
 
 Last updated: 2026-03-24
 
+> **This document is a progress tracker.** It reports which implementation tasks are complete, in progress, or pending. It may be stale relative to actual code state. It must **not** be used as authority for architecture decisions, API behavior, storage contracts, schema shapes, or lifecycle rules. When this document conflicts with a root architecture spec (`architecture/*.md`), an integration spec (`integration/*.md`), an OpenAPI file (`api/*.openapi.yaml`), or an event schema (`contracts/events/*.schema.json`), the other document is correct and this one must be updated.
+
 This file is the execution tracker for getting the active ExamPen codebase working against the promoted root specs.
 
 Active authority:
@@ -307,10 +309,13 @@ Use these tasks for spawned agents. Each task has a bounded write set. An agent 
 - [x] ensure_indexes() called during app lifespan startup
 - [x] LLM Vision OCR via shared gate (no ONNX/PaddleOCR dependencies)
 - [x] exampen feature flag in tenant_features.py (MAX tier, default OFF)
-- [x] 11 evalpen routers mounted in main_async.py with graceful degradation
+- [x] 18 ExamPen routers mounted in main_async.py with graceful degradation
+- [x] All 16 router modules pass py_compile and direct import smoke (Step 23)
+- [x] All 23 exam-conductor sub-packages import cleanly (Step 23)
+- [x] ExamPen import block in main_async.py:303-351 succeeds in isolation (Step 23)
 - [ ] Enable exampen feature for test tenant
 - [ ] Run pytest backend/tests/exam_conductor/ -v
-- [ ] Verify backend starts with uvicorn
+- [x] Verify backend starts — `import main_async` succeeds, `_evalpen_available = True`, all 18 ExamPen routers + all other routes load (Step 24)
 - [ ] Test endpoint access with feature flag ON vs OFF
 
 ## Known Gaps (non-blocking)
@@ -319,8 +324,9 @@ Use these tasks for spawned agents. Each task has a bounded write set. An agent 
 |---|---|---|
 | DCR/PCR Vision OCR | Working (LLM Vision through gate) | Recognition quality depends on gate provider and model configuration |
 | Practice image OCR | Working (LLM Vision camera adapter) | Camera-based practice eval functional via gate |
-| Token rollup cron | Functions exist (`llm_gate/rollup.py`), no Celery scheduling yet | Manual rollup via `run_all_rollups()`, no auto-scheduling |
-| exampen_question_regions | Not populated | DCR uses whole-page fallback from answer keys |
+| Token rollup cron | Celery beat schedule in `celery_app.py` runs daily at 01:00 UTC | Auto-scheduled via `celery -A celery_app worker -B` |
+| exampen_question_regions | Not populated — requires exam paper template/layout system for bbox data | DCR uses whole-page fallback from answer keys (`evalpen_dcr_async.py:274-294`). Population TODO at `tutor_async.py:2936`. No code gap — waiting on frontend template editor. |
+| `pandas` / venv deps | Resolved (Step 24) — `pip install -r requirements.txt` installed all missing deps including pandas, pyotp, etc. | `main_async.py` now loads fully with `_evalpen_available = True`. |
 
 ---
 

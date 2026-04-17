@@ -105,6 +105,10 @@ class ConductedExamSubmission(BaseModel):
         default=None,
         description="BLE pen MAC address (required for ble_pen source)",
     )
+    hub_id: Optional[str] = Field(
+        default=None,
+        description="Hub identity that uploaded this submission (for per-hub rollup)",
+    )
     page_count: int = Field(
         default=0, ge=0, description="Total number of answer pages"
     )
@@ -125,6 +129,11 @@ class ConductedExamSubmission(BaseModel):
     )
 
     # --- status ---
+    upload_status: str = Field(
+        default="received",
+        description="Upload acknowledgment status: received | acknowledged. "
+                    "Set to 'received' at ingest, 'acknowledged' after canonical write confirmed.",
+    )
     segmentation_status: SubmissionStatus = Field(
         default=SubmissionStatus.PENDING,
         description="Downstream processing status (set by engines, not ingest)",

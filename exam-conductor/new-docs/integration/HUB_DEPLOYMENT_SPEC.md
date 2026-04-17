@@ -12,22 +12,23 @@ Reference: `architecture/DUAL_MODE_ARCHITECTURE.md`, `architecture/TAMPER_PROOF_
 
 | What | Location | Notes |
 |------|----------|-------|
-| **ExamPen hub code** | `stoody-pen-multi/exam-hub/` | **NEW directory — to be created.** All ExamPen hub implementation goes here. |
-| **Stoody smartboard hub** | `stoody-pen-multi/edge_hub/` | **DO NOT MODIFY for ExamPen.** This is the existing Stoody smartboard hub. It has its own BLE manager, TUI, and PWA server for the teacher monitoring dashboard. |
-| **Shared mobile app** | `stoody-pen-multi/mobile-app/` | The invigilator mobile app extends this for ExamPen BLE commands. Shared between smartboard and ExamPen. |
-| **Backend ingest API** | `backend/api/v1/evalpen_submissions_async.py`, `backend/api/v1/hub.py` | Hub uploads go to `POST /api/v1/hub/exam-upload` or `POST /api/v1/evalpen/submissions`. |
-| **Hub provisioning API** | `backend/api/v1/superadmin_async.py` (to be added) | See `integration/SUPERADMIN_SPEC.md`. |
+| **ExamPen hub code** | `stoody-multi-pen/HUB-exam-conductor/` | Partial runtime implemented: supervisor, store, timer, TUI, BLE/uplink scaffolds, and provisioning cache exist. Supervisor now owns in-process wiring for BLE→pen-sync→uplink data path. Production packaging, systemd install artifacts, and hardware validation are pending. |
+| **Stoody smartboard hub** | `stoody-multi-pen/edge_hub/` | **DO NOT MODIFY for ExamPen.** This is the existing Stoody smartboard hub. It has its own BLE manager, TUI, and PWA server for the teacher monitoring dashboard. |
+| **Shared mobile app** | `stoody-multi-pen/mobile-app/` | The invigilator mobile app extends this for ExamPen BLE commands. Shared between smartboard and ExamPen. |
+| **Backend ingest API** | `backend/api/v1/stroke_ingest_async.py` | Hub uploads go to `POST /api/v1/ingest/strokes/{exam_id}/{pen_mac}` (primary). Legacy bridge at `POST /api/v1/hub/exam-upload` is a compatibility surface only. |
+| **Hub provisioning + operations API** | `backend/api/v1/hub_ops_async.py` | Provisioning at `POST /api/v1/hubs/provision`. See §7 for full contract. |
+| **Super-admin hub provisioning** | `backend/api/v1/superadmin_async.py` | Admin generates provisioning codes. Hub consumes them via `POST /api/v1/hubs/provision`. See `integration/SUPERADMIN_SPEC.md`. |
 
 ### Hard Boundary Rule
 
 > **The ExamPen hub is a SEPARATE edge device from the Stoody smartboard hub.**
 >
-> - `stoody-pen-multi/edge_hub/` = Stoody smartboard hub (teacher monitoring, PWA, multi-pen dashboard). **DO NOT TOUCH.**
-> - `stoody-pen-multi/exam-hub/` = ExamPen conducted-exam hub (artifact collection, dual-write, exam timer, invigilator BLE). **BUILD HERE.**
+> - `stoody-multi-pen/edge_hub/` = Stoody smartboard hub (teacher monitoring, PWA, multi-pen dashboard). **DO NOT TOUCH.**
+> - `stoody-multi-pen/HUB-exam-conductor/` = ExamPen conducted-exam hub (artifact collection, dual-write, exam timer, invigilator BLE). **BUILD HERE.**
 >
 > They may share the same Raspberry Pi hardware in some deployments, but the software stacks are independent. The exam-hub has its own systemd services, SQLite DB, TUI, and BLE manager.
 >
-> The `stoody-pen-multi/mobile-app/` is shared — it connects to whichever hub (smartboard or exam) is nearby via BLE.
+> The `stoody-multi-pen/mobile-app/` is shared — it connects to whichever hub (smartboard or exam) is nearby via BLE.
 
 ---
 
@@ -112,7 +113,7 @@ ubuntu-server-24.04-arm64-raspi.img
 
 | Mount | Filesystem | Purpose |
 |---|---|---|
-| /mnt/exampen-backup | ext4, noatime | Pen data secondary copy (independent failure domain) |
+| /media/exampen-usb | ext4, noatime | Pen data secondary copy (independent failure domain) |
 
 Auto-mount via `/etc/fstab` with `nofail` flag — hub must boot even if USB drive is missing. `hub-store` module detects missing secondary and logs warning to TUI + invigilator app.
 
@@ -251,7 +252,7 @@ Sequence:
 1. Check for active exam session → warn if active
 2. Check for pending uploads → warn if pending
 3. Sync filesystem (`sync`)
-4. Unmount USB (`umount /mnt/exampen-backup`)
+4. Unmount USB (`umount /media/exampen-usb`)
 5. `systemctl poweroff`
 
 ---
@@ -262,134 +263,135 @@ Sequence:
 
 Path: `/var/lib/exampen/hub.db`
 
-**Tables:**
+WAL mode enabled. Foreign keys enabled via `PRAGMA foreign_keys=ON`.
+
+#### Config Persistence Split
+
+Hub config is stored in **two locations**:
+
+| Location | Format | Contents | Authority |
+|---|---|---|---|
+| `/etc/exampen/hub.conf` | JSON | `HubConfig` model: `hub_id`, `hub_code`, `backend_url`, `institute_id`, `region`, `uplink_mode`, `provisioned_at`, `provisioning_state`, `hub_token`, `invig_codes`, `pen_inventory` | Primary config load on boot |
+| `hub.db` → `hub_config` table | SQLite KV | Generic key-value rows (currently unused by runtime; kept for schema compatibility) | — |
+
+`hub_token` is persisted in the JSON config. It is the hub's long-lived JWT for API calls and is **offline-critical** — without it the hub cannot authenticate to the backend after provisioning.
+
+#### Tables
 
 ```sql
--- Hub identity and config (singleton)
-CREATE TABLE hub_config (
-    hub_id          TEXT PRIMARY KEY,
-    backend_url     TEXT NOT NULL,
-    uplink_mode     TEXT NOT NULL DEFAULT 'wifi' CHECK (uplink_mode IN ('wifi','mobile','auto')),
-    region          TEXT NOT NULL DEFAULT 'US',
-    provisioned_at  TEXT NOT NULL,  -- ISO 8601
-    last_backend_sync TEXT          -- ISO 8601
+-- Hub identity and config (key-value singleton rows)
+-- NOTE: Runtime config is loaded from /etc/exampen/hub.conf (JSON).
+-- This table exists for schema compatibility.
+CREATE TABLE IF NOT EXISTS hub_config (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
--- Cached invigilator codes (rotated daily, pre-cached for N days)
-CREATE TABLE invig_codes (
-    code            TEXT PRIMARY KEY,
-    valid_from      TEXT NOT NULL,  -- ISO 8601
-    valid_until     TEXT NOT NULL,  -- ISO 8601
-    fetched_at      TEXT NOT NULL
+-- Cached invigilator codes (offline-critical for exam auth)
+-- Written by ConfigStore.apply_provision_response() from provisioning response.
+CREATE TABLE IF NOT EXISTS invig_codes (
+    code       TEXT PRIMARY KEY,
+    valid_from TEXT,       -- NULL if not provided by backend
+    expires_at TEXT,       -- NULL if not provided by backend
+    fetched_at TEXT        -- when this code was cached from provisioning
 );
 
 -- Pen inventory (registered to this hub's institute)
-CREATE TABLE pen_inventory (
-    pen_mac         TEXT PRIMARY KEY,
-    pen_serial      TEXT,
-    fw_version      TEXT,
-    registered_at   TEXT NOT NULL,
-    last_seen       TEXT,
-    battery_pct     INTEGER
+-- Written by ConfigStore.apply_provision_response() from provisioning response.
+CREATE TABLE IF NOT EXISTS pen_inventory (
+    pen_mac      TEXT PRIMARY KEY,
+    pen_id       TEXT,
+    student_name TEXT,
+    student_id   TEXT
 );
 
--- Exam sessions
-CREATE TABLE exam_sessions (
-    exam_id         TEXT PRIMARY KEY,
-    invig_id        TEXT NOT NULL,
-    started_at      TEXT,           -- NULL until timer starts
-    duration_min    INTEGER NOT NULL,
-    timer_expires   TEXT,           -- computed: started_at + duration_min
-    state           TEXT NOT NULL DEFAULT 'created'
-                    CHECK (state IN ('created','armed','timer_running',
-                           'dongle_activation','pen_sync','sync_complete',
-                           'sync_partial','uploading','upload_complete','cancelled')),
-    created_at      TEXT NOT NULL,
-    completed_at    TEXT
+-- Exam sessions (session_id is a surrogate PK; exam_id is a regular column
+-- to allow re-arming the same exam)
+CREATE TABLE IF NOT EXISTS exam_sessions (
+    session_id   TEXT PRIMARY KEY,
+    exam_id      TEXT,
+    exam_type    TEXT,          -- 'dcr' or 'pcr'
+    state        TEXT,          -- created, armed, timer_running, dongle_activation,
+                                -- pen_sync, sync_complete, sync_partial,
+                                -- uploading, upload_complete, cancelled
+    started_at   TEXT,
+    ended_at     TEXT,
+    duration_sec INTEGER
 );
 
--- Pen-student bindings per exam
-CREATE TABLE pen_bindings (
-    exam_id         TEXT NOT NULL REFERENCES exam_sessions(exam_id),
-    pen_mac         TEXT NOT NULL,
-    student_id      TEXT,           -- NULL until resolved from backend
-    student_name    TEXT,
-    student_roll    TEXT,
-    status          TEXT NOT NULL DEFAULT 'discovered'
-                    CHECK (status IN ('discovered','provisional','confirmed','rejected')),
-    source          TEXT NOT NULL DEFAULT 'scan'
-                    CHECK (source IN ('scan','manual_register','server_sync')),
-    server_confirmed_at TEXT,
-    rejection_reason TEXT,
-    bound_at        TEXT NOT NULL,
-    PRIMARY KEY (exam_id, pen_mac)
+-- Pen-student bindings per exam session
+-- Future work: add status, source, server_confirmed_at, rejection_reason
+-- columns for the full binding workflow described in §4.3.
+CREATE TABLE IF NOT EXISTS pen_bindings (
+    pen_mac           TEXT,
+    exam_session_id   TEXT,
+    student_id        TEXT,
+    bound_at          TEXT,
+    PRIMARY KEY (pen_mac, exam_session_id)
 );
 
--- Per-pen sync status per exam
-CREATE TABLE pen_sync_status (
-    exam_id         TEXT NOT NULL,
-    pen_mac         TEXT NOT NULL,
-    dongle_mac      TEXT,           -- which dongle handled this pen
-    sync_started    TEXT,
-    sync_completed  TEXT,
-    bytes_expected  INTEGER,
-    bytes_received  INTEGER,
+-- Per-pen sync status per exam session
+CREATE TABLE IF NOT EXISTS pen_sync_status (
+    pen_mac           TEXT,
+    exam_session_id   TEXT,
+    bytes_expected    INTEGER DEFAULT 0,
+    bytes_received    INTEGER DEFAULT 0,
     checksum_expected TEXT,
-    checksum_actual TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','connecting','syncing',
-                           'complete','failed','timeout')),
-    error_detail    TEXT,
-    PRIMARY KEY (exam_id, pen_mac)
+    checksum_received TEXT,
+    status            TEXT DEFAULT 'pending',  -- pending, connecting, syncing,
+                                                -- complete, failed, timeout
+    PRIMARY KEY (pen_mac, exam_session_id)
 );
 
--- Per-pen upload ledger
-CREATE TABLE upload_ledger (
-    exam_id         TEXT NOT NULL,
-    pen_mac         TEXT NOT NULL,
-    total_chunks    INTEGER NOT NULL,
-    acked_chunks    TEXT NOT NULL DEFAULT '[]',  -- JSON array of indices
-    upload_path     TEXT CHECK (upload_path IN ('wifi','mobile')),
-    complete        INTEGER NOT NULL DEFAULT 0,
-    started_at      TEXT,
-    completed_at    TEXT,
-    PRIMARY KEY (exam_id, pen_mac)
+-- Upload ledger (per-artifact upload tracking with retry)
+CREATE TABLE IF NOT EXISTS upload_ledger (
+    upload_id        TEXT PRIMARY KEY,
+    exam_session_id  TEXT,
+    exam_id          TEXT,
+    exam_type        TEXT DEFAULT '',
+    pen_mac          TEXT,
+    student_id       TEXT,
+    artifact_path    TEXT,
+    status           TEXT DEFAULT 'pending',   -- pending, uploading, complete, failed
+    attempts         INTEGER DEFAULT 0,
+    last_attempt_at  TEXT,
+    completed_at     TEXT
 );
 
--- Dongle registry (persisted across reboots)
-CREATE TABLE dongle_registry (
-    dongle_mac      TEXT PRIMARY KEY,
-    hci_path        TEXT,           -- updated on each boot
-    usb_port_path   TEXT,           -- sysfs path for stable identification
-    first_seen      TEXT NOT NULL,
-    last_healthy    TEXT,
-    status          TEXT NOT NULL DEFAULT 'unknown'
-                    CHECK (status IN ('unknown','healthy','degraded','failed'))
+-- BLE dongle registry (persisted across reboots)
+CREATE TABLE IF NOT EXISTS dongle_registry (
+    dongle_id    TEXT PRIMARY KEY,
+    hci_path     TEXT,
+    status       TEXT DEFAULT 'ok',  -- ok, error, degraded
+    last_seen_at TEXT
 );
 
--- Interaction log (every hub action, for forensic audit)
-CREATE TABLE interaction_log (
-    log_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp       TEXT NOT NULL,  -- ISO 8601 with ms
-    source          TEXT NOT NULL,  -- module name
-    event_type      TEXT NOT NULL,  -- e.g., 'invig_auth', 'exam_start', 'pen_sync_complete'
-    exam_id         TEXT,
-    pen_mac         TEXT,
-    invig_id        TEXT,
-    detail          TEXT,           -- JSON blob for event-specific data
-    severity        TEXT NOT NULL DEFAULT 'info'
-                    CHECK (severity IN ('debug','info','warn','error','critical'))
+-- Interaction log (forensic audit trail)
+-- Future work: add exam_id, pen_mac, invig_id, severity columns for
+-- the full event catalog described in §3.4.
+CREATE TABLE IF NOT EXISTS interaction_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    source    TEXT,
+    action    TEXT,
+    detail    TEXT
 );
 
 -- Timer persistence (for reboot recovery)
-CREATE TABLE active_timer (
-    exam_id         TEXT PRIMARY KEY,
-    start_epoch     INTEGER NOT NULL,  -- Unix epoch seconds
-    duration_sec    INTEGER NOT NULL,
-    remaining_sec   INTEGER NOT NULL,  -- updated every 10s
-    last_updated    INTEGER NOT NULL   -- epoch
+CREATE TABLE IF NOT EXISTS active_timer (
+    exam_id       TEXT PRIMARY KEY,
+    start_epoch   REAL,          -- Unix epoch seconds (REAL for sub-second)
+    duration_sec  INTEGER,
+    remaining_sec REAL           -- updated every ~10s by timer module
 );
 ```
+
+#### Schema Versioning
+
+Not yet implemented. Future work: add a `schema_version` table and migration
+helpers to handle schema evolution across software updates. Current approach:
+`CREATE TABLE IF NOT EXISTS` is idempotent and safe for new installs. Schema
+changes require a new golden image or manual migration.
 
 ### 3.2 File Storage Layout
 
@@ -398,35 +400,30 @@ CREATE TABLE active_timer (
 ├── hub.db                          # SQLite database
 ├── hub.db-wal                      # WAL mode enabled
 ├── hub.db-shm
-├── data/
+├── artifacts/                      # DualWriteStorage primary root
 │   └── {exam_id}/
 │       └── {pen_mac}/
 │           ├── strokes_raw.bin     # Raw bytes from pen GATT read
-│           ├── strokes.meta.json   # {bytes, checksum_crc32, pages, sync_ts}
-│           └── chunks/
-│               ├── chunk_000.bin   # Pre-chunked for upload
-│               ├── chunk_001.bin
-│               └── ...
+│           └── strokes.meta.json   # {bytes, checksum_crc32, pages, sync_ts}
 └── logs/
     ├── sync.log
     ├── uplink.log
     └── invig.log
 
-/mnt/exampen-backup/                # USB thumb drive (secondary copy)
-├── data/
+/media/exampen-usb/                  # USB thumb drive (secondary copy)
+├── artifacts/                       # DualWriteStorage secondary root
 │   └── {exam_id}/
 │       └── {pen_mac}/
 │           ├── strokes_raw.bin     # Byte-identical copy
 │           └── strokes.meta.json
-└── hub.db.backup                   # Periodic SQLite backup
 ```
 
 ### 3.3 Dual-Write Protocol
 
 1. `hub-pen-sync` receives chunk from pen GATT.
-2. Write chunk to SD path (`/var/lib/exampen/data/{exam_id}/{pen_mac}/strokes_raw.bin`, append mode).
+2. Write chunk to SD path (`/var/lib/exampen/artifacts/{exam_id}/{pen_mac}/strokes_raw.bin`, append mode).
 3. `fsync()` SD file descriptor.
-4. Write identical chunk to USB path (`/mnt/exampen-backup/data/{exam_id}/{pen_mac}/strokes_raw.bin`, append mode).
+4. Write identical chunk to USB path (`/media/exampen-usb/artifacts/{exam_id}/{pen_mac}/strokes_raw.bin`, append mode).
 5. `fsync()` USB file descriptor.
 6. Only after both `fsync()` succeed → ACK pen to send next chunk.
 7. If USB write fails → log warning, continue with SD-only, set `hub-store` degraded flag → TUI shows amber warning.
@@ -474,30 +471,50 @@ Unknown → Discovered (registration scan) → Bound (exam session) → Syncing 
 
 ### 4.2 Pen State Transitions
 
+> **Note:** The current `pen_bindings` schema uses a simplified shape
+> (`pen_mac`, `exam_session_id`, `student_id`, `bound_at`). The full
+> binding workflow with `status`, `source`, `server_confirmed_at`,
+> `rejection_reason`, `student_name`, and `student_roll` columns is
+> **future work** (see §3.1 schema note). The transitions below describe
+> the intended end state; current runtime uses a subset.
+
 | From | To | Trigger | Hub Action |
 |---|---|---|---|
-| Unknown | Discovered | Registration scan detects MAC | Insert `pen_inventory`, insert `pen_bindings` with `status='discovered'`, `source='scan'` |
-| Discovered / Provisional | Bound | Backend resolves MAC→student | Update `pen_bindings.student_id/name/roll`, set `status='confirmed'`, set `server_confirmed_at` |
-| Bound | Syncing | Post-exam, pen connects to dongle | Start GATT read, update `pen_sync_status` |
+| Unknown | Discovered | Registration scan detects MAC | Insert `pen_inventory`, insert `pen_bindings` with `student_id` if known |
+| Discovered | Bound | Backend resolves MAC→student | Update `pen_bindings.student_id` |
+| Bound | Syncing | Post-exam, pen connects to dongle | Start GATT read, upsert `pen_sync_status` |
 | Syncing | Synced | All chunks received, checksum match | Mark `pen_sync_status.status = 'complete'` |
 | Syncing | Failed | Timeout or checksum mismatch | Mark `pen_sync_status.status = 'failed'`, log error |
-| Synced | Uploaded | All chunks ACKd by backend | Mark `upload_ledger.complete = 1` |
+| Synced | Uploaded | All chunks ACKd by backend | Mark `upload_ledger.status = 'complete'` |
 | Uploaded | Released | Exam session closed | Pen available for next session |
 
-### 4.3 Manual Pen Registration (Mid-Exam)
+### 4.3 Manual Pen Registration (Mid-Exam) — Local Implementation
 
-When a pen wasn't detected during pre-exam registration:
+The supervisor now handles `manual_register` commands locally against cached
+pen inventory and the simplified `pen_bindings` schema:
 
 1. Invigilator selects "Manual Register" on mobile app.
-2. App sends command to hub via BLE: `{cmd: 'manual_register', pen_mac: 'XX:XX:XX:XX:XX:XX', student_id: 'S123'}`.
-3. Hub inserts into `pen_bindings` with `status = 'provisional'`. This is a display hint only — NOT an authoritative binding.
-4. Mobile app queues a server-side binding request to the exam orchestration owner. Sent immediately if network available, queued otherwise.
-5. Server validates (pen MAC in inventory, student in roster, no conflicting binding) and responds with `status = 'confirmed'` or rejects.
-6. Hub updates `pen_bindings.status` to `confirmed` or `rejected` when server response arrives (via mobile relay or WiFi).
-7. During post-exam sync, hub includes this MAC in the expected pen list regardless of status — stroke data is always captured. Scoring pipeline uses server-confirmed bindings only.
-8. If pen connects but binding is still `provisional` (server unreachable), strokes are synced and stored tagged with pen_mac. Server resolves MAC→student when binding is eventually confirmed.
+2. App sends command to hub via BLE: `{cmd: 'manual_register', exam_id, pen_mac, student_id}`.
+3. Supervisor validates:
+   - `exam_id`, `pen_mac`, `student_id` are all present.
+   - `exam_id` resolves to an active or persisted session.
+   - `pen_mac` exists in cached `pen_inventory` (provisioned from institute data).
+   - If `pen_inventory.student_id` is set and conflicts with the payload, returns `student_mismatch`.
+4. Hub inserts/updates `pen_bindings` row via `INSERT OR REPLACE` (same `pen_mac` + `exam_session_id` replaces cleanly).
+5. Response includes `binding: "local"` — no server-confirmed status.
 
-**Ownership rule:** Hub never creates authoritative bindings. The exam orchestration owner remains the single writable owner. Hub holds provisional records for display and local workflow continuity.
+> **Scope note:** This does not add `status`, `source`, `server_confirmed_at`, or `rejection_reason`
+> columns. The binding is local-only. Server-confirmed binding workflow remains future work. The current
+> implementation does not claim provisional or confirmed status.
+
+> **BLE registration scan** is now implemented: `START_REGISTRATION_SCAN` calls `DongleDiscovery.scan_for_pens()`
+> via `BLEManager.scan_for_pens()`, cross-references against cached `pen_inventory`, and returns
+> `{known, unknown}` device lists. The scan is synchronous (blocking the BLE command thread for the
+> scan duration, default 10s).
+
+> **Ownership rule (future):** Once server-confirmed bindings are implemented, the exam orchestration
+> owner will remain the single authoritative binding source. Hub local bindings are for display and
+> local workflow continuity only.
 
 ---
 
@@ -549,15 +566,13 @@ After=network-online.target bluetooth.target
 Wants=network-online.target bluetooth.target
 
 [Service]
-Type=notify
-ExecStart=/opt/exampen/bin/hub-supervisor
+Type=simple
+WorkingDirectory=/opt/exampen
+ExecStart=/usr/bin/python3 -m hub_supervisor
 Restart=always
 RestartSec=5
-WatchdogSec=30
 StandardOutput=journal
 StandardError=journal
-Environment=EXAMPEN_DATA=/var/lib/exampen
-Environment=EXAMPEN_BACKUP=/mnt/exampen-backup
 
 [Install]
 WantedBy=multi-user.target
@@ -566,32 +581,89 @@ WantedBy=multi-user.target
 **Service dependency tree:**
 
 ```
-exampen-supervisor (Type=notify, watchdog=30s)
-├── exampen-ble-mgr (forked by supervisor)
-├── exampen-pen-sync (forked by supervisor)
-├── exampen-timer (forked by supervisor)
-├── exampen-store (forked by supervisor)
-├── exampen-uplink (forked by supervisor)
-├── exampen-invig-ble (forked by supervisor)
-└── exampen-tui (forked by supervisor, optional — only if HDMI/serial connected)
+exampen-supervisor (Type=simple)
+├── exampen-ble-mgr (threaded by supervisor)
+├── exampen-pen-sync (threaded by supervisor)
+├── exampen-timer (threaded by supervisor)
+├── exampen-uplink (threaded by supervisor)
+├── exampen-invig-ble (threaded by supervisor)
+└── exampen-tui (threaded by supervisor, optional — only if HDMI/serial connected)
+
+hub_store — library/repository layer used by the above services, not a supervisor thread
 ```
 
-Supervisor manages all child processes. If a child crashes, supervisor restarts it and logs to `interaction_log`.
+Supervisor manages all service threads. If a service thread crashes, supervisor restarts it and logs to `interaction_log`.
+
+> **In-process wiring (current runtime):** The supervisor owns all shared infrastructure — `HubRepository`, `DualWriteStorage`, `ExamTimer`, `ConfigStore` — and injects them into service threads at startup. `hub_ble_mgr` receives a supervisor-provided `on_pen_data` callback that forwards BLE notifications to `PenSyncManager.handle_pen_data`. `hub_pen_sync` and `hub_uplink` share the same `HubRepository` and `DualWriteStorage`. `hub_uplink` reads `backend_url`, `hub_id`, and `hub_token` from the supervisor-owned `ConfigStore`. Module-level `run()` fallbacks exist in each module for standalone/dev operation but are not used when the supervisor is active.
+
+> **Future work:** Upgrade to `Type=notify` with `sd_notify` readiness and `WatchdogSec` once the supervisor implements `READY=1` and `WATCHDOG=1` notifications.
 
 ---
 
 ## 7. First-Boot Provisioning Sequence
 
+### 7.1 Provisioning Contract
+
+**Endpoint:** `POST /api/v1/hubs/provision`
+**Authentication:** Admin or B2C-admin Bearer token (the admin who enters the hub code on the TUI Setup screen).
+**Caller type:** `admin` or `b2c_admin` (NOT the hub itself — the hub has no token yet).
+
+**Required input:**
+
+| Field | Type | Description |
+|---|---|---|
+| `hub_code` | string (min 4 chars) | Provisioning code generated by the admin or super-admin |
+
+**Response fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `hub_id` | string | Yes | System-assigned hub identifier (e.g., `hub-<hex>`) |
+| `institute_id` | string | Yes | Tenant identifier derived from the admin's JWT (`db_name`) |
+| `hub_token` | string | Yes | Long-lived JWT (365 days) with `user_type: "hub"` for subsequent hub API calls |
+| `invig_codes` | string[] | Yes | Pre-generated invigilator auth codes for local caching (minimum 3) |
+| `pen_inventory` | object[] | Yes | Known pens for this institute from `pen_registry` (may be empty array) |
+| `backend_url` | string | Yes | Absolute URL for hub-to-backend communication (e.g., `https://api.stoody.in`) |
+| `provisioned_at` | string (ISO 8601) | Yes | Timestamp of provisioning |
+
+**`backend_url` is absolute.** The hub needs a fully-qualified URL to reach the backend after WiFi connects.
+
+**`invig_codes` and `pen_inventory` are required on first boot.** The hub caches them locally in SQLite (`invig_codes` and `pen_inventory` tables) because WiFi may be unavailable during exam sessions.
+
+### 7.2 Provisioning Flow
+
 1. Power on RPi with golden image SD card + USB thumb drive.
 2. systemd boots → `exampen-supervisor` starts → detects first-boot (no `/etc/exampen/hub.conf`).
 3. TUI launches → Setup Screen forced.
-4. Operator enters: hub unique code, backend URL, WiFi credentials, uplink mode.
-5. Hub connects to WiFi → verifies backend → sends provisioning request: `POST /api/v1/hubs/provision {hub_code}`.
-6. Backend responds: `{hub_id, institute_id, invig_codes: [...], pen_inventory: [...]}`.
-7. Hub stores config, caches invig codes, populates `pen_inventory`.
-8. Hub state → `PROVISIONED` → TUI shows "Ready" on status screen.
-9. USB thumb drive formatted and mounted (if not already).
-10. First-boot complete. Hub ready for invigilator connection.
+4. Admin authenticates to the Stoody backend via the TUI (or a pre-obtained admin token is configured).
+5. Admin enters hub provisioning code on TUI.
+6. TUI calls `POST /api/v1/hubs/provision {hub_code}` with admin Bearer token.
+7. Backend validates code, assigns `hub_id`, returns provisioning response (§7.1).
+8. Hub stores config to `/etc/exampen/hub.conf`, caches invig codes and pen inventory in SQLite.
+9. Hub state → `PROVISIONED` → TUI shows "Ready" on status screen.
+10. USB thumb drive formatted and mounted (if not already).
+11. First-boot complete. Hub ready for invigilator connection.
+
+---
+
+## 8. Hub Upload Path — Authority
+
+The **authoritative** hub upload route family is:
+
+```
+POST   /api/v1/ingest/strokes/{exam_id}/{pen_mac}           — chunk upload
+POST   /api/v1/ingest/strokes/{exam_id}/{pen_mac}/complete   — finalize with checksum
+GET    /api/v1/ingest/strokes/{exam_id}/{pen_mac}/status     — per-pen status
+POST   /api/v1/ingest/strokes/{exam_id}/{pen_mac}/dedup      — dedup check
+```
+
+Contract authority: `api/stroke-ingest.openapi.yaml` (version 3.0.0+).
+
+Hub runtime (`HUB-exam-conductor/hub_uplink`) MUST use this route family for all pen artifact uploads.
+
+**Legacy bridge path:** `POST /api/v1/hub/exam-upload` exists in `backend/api/v1/hub.py` as a backward-compatibility surface. It is NOT the primary hub upload path. Do not use it for new implementations.
+
+**Non-hub submission path:** `POST /api/v1/evalpen/submissions` (in `backend/api/v1/evalpen_submissions_async.py`) is for direct client/camera submissions to the ingest substrate, NOT for hub-originated uploads.
 
 ---
 
@@ -599,4 +671,9 @@ Supervisor manages all child processes. If a child crashes, supervisor restarts 
 
 | Date | Change | By |
 |---|---|---|
+| 2026-04-15 | Step 13-14: wired `connected_pen_count` from BLEManager into UplinkManager heartbeat. Implemented `start_registration_scan`: `BLEManager.scan_for_pens()` calls `DongleDiscovery.scan_for_pens()` per dongle, cross-references against cached `pen_inventory`, returns `{known, unknown}` device lists. Updated §4.3 scope note. | Claude |
+| 2026-04-15 | Step 12: supervisor-owned in-process wiring for all managed services. `hub_ble_mgr` → `PenSyncManager.handle_pen_data`, `hub_pen_sync` and `hub_uplink` share supervisor-owned `HubRepository`/`DualWriteStorage`/`ConfigStore`. `start_upload` requires `exam_id`, resolves session, updates state, returns upload ledger counts. `request_snapshot` includes `upload`, `storage`, `dongles`. Added in-process wiring note to §6. | Claude |
+| 2026-04-15 | Step 11: implemented `manual_register` against cached `pen_inventory` + simplified `pen_bindings` (local binding, no server-confirmed status). Added `get_cached_pen()` to repository. Updated §4.3 to describe current local implementation scope. `start_registration_scan` validates exam_id but hardware scan remains pending. `request_snapshot` now includes `bindings`. | Claude |
+| 2026-04-13 | Reconciled §3 local persistence contract with hub_store implementation: updated all table schemas to match code reality (session_id PK, simpler binding/sync/upload shapes, KV hub_config), added config persistence split documentation, added schema versioning future-work note, updated file storage paths to match DualWriteStorage defaults. | Claude |
+| 2026-04-09 | Resolved authority conflicts: provisioning contract specified with exact endpoint, response fields, and caller type (§7). Upload path authority section added (§8) — `/api/v1/ingest/strokes/` is the primary hub upload route; legacy bridge paths explicitly marked as non-authoritative. Backend ingest API references updated to match `api/stroke-ingest.openapi.yaml` v3.0.0. | Claude |
 | 2026-03-18 | Removed mutable region setup, added explicit `pen_bindings` workflow fields, and aligned first-boot/setup flow with the locked US regulatory configuration. | Codex |

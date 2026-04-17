@@ -75,25 +75,57 @@ Super-admin may set platform-wide LLM budget caps that override per-tenant limit
 
 ## 5. Hub Provisioning
 
-When a school receives an ExamPen hub (Raspberry Pi), the super-admin provisions it:
+When a school receives an ExamPen hub (Raspberry Pi), the provisioning involves two parties: the super-admin creates the code, and the hub consumes it.
 
-### 5.1 Provisioning Flow
+### 5.1 Two-Party Provisioning Flow
 
-1. Super-admin creates a hub provisioning code in the desktop app
-2. Code is printed/shared with the school's IT admin
-3. School admin enters the code on the hub's TUI Setup screen
-4. Hub calls `POST /api/v1/hubs/provision {hub_code}`
-5. Backend validates code, assigns `hub_id`, returns config
-6. Super-admin sees hub status change to "provisioned"
+**Party 1 — Super-admin creates the provisioning code:**
 
-### 5.2 Hub Management Endpoints (super-admin scoped)
+1. Super-admin opens the desktop app and navigates to ExamPen Hub management
+2. Super-admin generates a hub provisioning code via `POST /api/v1/superadmin/evalpen/hubs/provision-code` (scoped to a tenant)
+3. Code is printed/shared with the school's IT admin (codes are single-use, expire after 72 hours)
 
-- `POST /api/v1/superadmin/evalpen/hubs/provision-code` — Generate provisioning code for a tenant
-- `GET /api/v1/superadmin/evalpen/hubs` — List all provisioned hubs across tenants
-- `GET /api/v1/superadmin/evalpen/hubs/{hub_id}` — Hub details (last seen, firmware, pen count)
-- `DELETE /api/v1/superadmin/evalpen/hubs/{hub_id}` — Decommission a hub
+**Party 2 — Admin provisions the hub on-site:**
 
-### 5.3 Hub Data in skb_master
+4. School admin powers on the hub, enters WiFi credentials on TUI Setup Screen
+5. Admin authenticates to the Stoody backend (admin JWT)
+6. Admin enters the provisioning code on the hub TUI
+7. TUI calls `POST /api/v1/hubs/provision {hub_code}` with the admin's Bearer token
+8. Backend validates the code, assigns a `hub_id`, and returns:
+   - `hub_id` — system-assigned hub identifier
+   - `institute_id` — tenant identifier
+   - `hub_token` — long-lived JWT (365 days) with `user_type: "hub"` for subsequent hub API calls
+   - `invig_codes` — pre-generated invigilator auth codes for local caching
+   - `pen_inventory` — known pens for this institute (may be empty array)
+   - `backend_url` — absolute URL for hub-to-backend communication
+   - `provisioned_at` — ISO 8601 timestamp
+9. Hub stores config locally, caches invig codes and pen inventory in SQLite
+10. Super-admin sees hub status change to "provisioned" in desktop app
+
+**Key distinction:** Super-admin generates the code; admin on-site consumes it at `POST /api/v1/hubs/provision`. The hub itself does not call super-admin endpoints.
+
+### 5.2 Super-Admin Hub Management Endpoints
+
+These endpoints are super-admin scoped (cross-tenant visibility):
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v1/superadmin/evalpen/hubs/provision-code` | POST | Generate a provisioning code for a tenant |
+| `/api/v1/superadmin/evalpen/hubs` | GET | List all provisioned hubs across tenants |
+| `/api/v1/superadmin/evalpen/hubs/{hub_id}` | GET | Hub details (last seen, firmware, pen count) |
+| `/api/v1/superadmin/evalpen/hubs/{hub_id}` | DELETE | Decommission a hub |
+
+### 5.3 Hub-Facing Provisioning Endpoint
+
+The hub consumes its provisioning code through the tenant-scoped admin API (NOT a super-admin endpoint):
+
+| Endpoint | Method | Caller | Purpose |
+|---|---|---|---|
+| `/api/v1/hubs/provision` | POST | Admin (`admin` or `b2c_admin` role) | Consume provisioning code, receive `hub_id` + `hub_token` + config |
+
+Full contract: `integration/HUB_DEPLOYMENT_SPEC.md` §7.
+
+### 5.4 Hub Data in skb_master
 
 Hub provisioning records live in `skb_master` (not per-tenant DB):
 
@@ -151,3 +183,11 @@ Data sources:
 3. Hub provisioning codes are single-use and expire after 72 hours.
 4. Platform budget caps cannot be bypassed by per-tenant config.
 5. All super-admin actions on ExamPen resources are logged in `skb_master.superadmin_audit_log`.
+
+---
+
+## Changelog
+
+| Date | Change | By |
+|---|---|---|
+| 2026-04-09 | Resolved provisioning contract authority: split into two-party flow (super-admin creates code, admin consumes it at `POST /api/v1/hubs/provision`). Added §5.3 with explicit hub-facing endpoint. Aligned response fields with HUB_DEPLOYMENT_SPEC §7. | Claude |

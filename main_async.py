@@ -301,6 +301,7 @@ if _exam_conductor_dir not in _sys.path:
     _sys.path.insert(0, _exam_conductor_dir)
 
 try:
+    from api.v1.exam_orch_async import router as exam_orch_router
     from api.v1.evalpen_usage_async import router as evalpen_usage_router
     from api.v1.evalpen_dcr_async import router as evalpen_dcr_router
     from api.v1.evalpen_submissions_async import (
@@ -321,8 +322,13 @@ try:
     from api.v1.evalpen_invigilator_async import router as evalpen_invigilator_router
     from api.v1.evalpen_teacher_bff_async import router as evalpen_teacher_bff_router
     from api.v1.evalpen_student_bff_async import router as evalpen_student_bff_router
+    from api.v1.invig_console_async import router as invig_console_router
+    from api.v1.hub_ops_async import router as hub_ops_router
+    from api.v1.stroke_ingest_async import router as stroke_ingest_router
+    from api.v1.camera_upload_async import router as camera_upload_router
     _evalpen_available = True
 except Exception as e:
+    exam_orch_router = None
     evalpen_usage_router = None
     evalpen_dcr_router = None
     evalpen_submissions_router = None
@@ -337,6 +343,10 @@ except Exception as e:
     evalpen_invigilator_router = None
     evalpen_teacher_bff_router = None
     evalpen_student_bff_router = None
+    invig_console_router = None
+    hub_ops_router = None
+    stroke_ingest_router = None
+    camera_upload_router = None
     _evalpen_available = False
     logging.warning(f"ExamPen routes disabled: {str(e)}")
 
@@ -1206,7 +1216,7 @@ if _superadmin_available and superadmin_router:
     if hub_provision_router is not None:
         app.include_router(
             hub_provision_router,
-            tags=["Hub Provisioning"]
+            tags=["Hub Provisioning (DEPRECATED — use /api/v1/hubs/provision)"]
         )
     logger.info("✅ Super Admin routes enabled")
 else:
@@ -1240,6 +1250,11 @@ else:
 
 # ExamPen routes (conducted-exam DCR/PCR evaluation, LLM gate usage)
 if _evalpen_available:
+    app.include_router(
+        exam_orch_router,
+        prefix=f"{API_V1_PREFIX}/exams",
+        tags=["ExamPen Orchestration"],
+    )
     app.include_router(
         evalpen_usage_router,
         prefix=f"{API_V1_PREFIX}/evalpen/usage",
@@ -1310,14 +1325,35 @@ if _evalpen_available:
         prefix=f"{API_V1_PREFIX}/student",
         tags=["evalpen-student-bff"],
     )
-    logger.info("✅ ExamPen routes enabled (14 routers)")
+    app.include_router(
+        invig_console_router,
+        prefix=f"{API_V1_PREFIX}/invig/sessions",
+        tags=["ExamPen Invigilator Console"],
+    )
+    app.include_router(
+        hub_ops_router,
+        prefix=f"{API_V1_PREFIX}/hubs",
+        tags=["ExamPen Hub Operations"],
+    )
+    app.include_router(
+        stroke_ingest_router,
+        prefix=f"{API_V1_PREFIX}/ingest/strokes",
+        tags=["ExamPen Stroke Ingest"],
+    )
+    app.include_router(
+        camera_upload_router,
+        prefix=f"{API_V1_PREFIX}/ingest/camera",
+        tags=["ExamPen Camera Upload"],
+    )
+    logger.info("✅ ExamPen routes enabled (18 routers)")
 else:
     logger.warning("⚠️ ExamPen routes disabled")
 
 
 # Static file serving
-app.mount("/images", StaticFiles(directory="images"), name="images")
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+_BACKEND_DIR = _Path(__file__).resolve().parent
+app.mount("/images", StaticFiles(directory=str(_BACKEND_DIR / "images")), name="images")
+app.mount("/uploads", StaticFiles(directory=str(_BACKEND_DIR / "uploads")), name="uploads")
 
 # Health check endpoint
 @app.get("/health")

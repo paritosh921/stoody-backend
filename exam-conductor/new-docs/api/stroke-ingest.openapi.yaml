@@ -1,18 +1,47 @@
 openapi: "3.1.0"
 info:
-  title: ExamPen Shared Ingest API
-  version: "2.0.0"
+  title: ExamPen Stroke Ingest API
+  version: "3.0.0"
   description: |
-    Conducted-exam ingest APIs for the shared substrate.
-    The substrate persists canonical artifacts, attaches provenance, and routes by `exam_type`.
+    Chunked pen-originated artifact upload from ExamPen hubs.
+
+    This is the **authoritative** hub upload contract. Hub runtime
+    (`HUB-exam-conductor/hub_uplink`) uploads pen stroke data through this
+    route family.
+
+    Legacy bridge: `POST /api/v1/hub/exam-upload` exists for backward
+    compatibility only and is not the primary hub upload path.
+
+    Authentication: Hub JWT (`user_type: "hub"`) or admin/tutor Bearer token.
 servers:
   - url: /
 security:
   - StoodyBearer: []
+
 paths:
-  /api/v1/strokes/ingest:
+  /api/v1/ingest/strokes/{exam_id}/{pen_mac}:
     post:
-      summary: Ingest one uploaded pen chunk from the hub
+      summary: Upload one stroke chunk
+      description: |
+        Accept a single base64-encoded stroke chunk from a hub for a specific
+        pen. Chunks are deduplicated by content hash. If the exact same chunk
+        was already received, the existing artifact_id is returned.
+
+        The exam must be in `in_progress`, `collection_closed`, or `uploading`
+        lifecycle state.
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Conducted exam identifier
+        - name: pen_mac
+          in: path
+          required: true
+          schema:
+            type: string
+          description: BLE pen MAC address (case-insensitive)
       requestBody:
         required: true
         content:
@@ -26,22 +55,122 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/IngestAck"
-  /api/v1/exams/{exam_id}/upload-status:
-    get:
-      summary: Get upload progress and engine route for one exam
+        "400":
+          description: Exam not in in_progress, collection_closed, or uploading state; or invalid payload
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Exam not found
+        "503":
+          description: Tenant database unavailable
+
+  /api/v1/ingest/strokes/{exam_id}/{pen_mac}/complete:
+    post:
+      summary: Finalize pen upload
+      description: |
+        Finalize a pen's upload for an exam. Verifies all chunks are received,
+        validates SHA-256 checksum over all chunk payloads in order, then
+        bridges the assembled data into the canonical ingest substrate via
+        IngestService (creating `evalpen_submissions` and `evalpen_answer_pages`).
       parameters:
         - name: exam_id
           in: path
           required: true
           schema:
             type: string
+        - name: pen_mac
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinalizeRequest"
       responses:
         "200":
-          description: Upload progress
+          description: Upload finalized
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/FinalizeResponse"
+        "400":
+          description: Exam not in in_progress, collection_closed, or uploading state; missing chunks; or checksum mismatch
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Exam not found
+        "503":
+          description: Tenant database unavailable
+
+  /api/v1/ingest/strokes/{exam_id}/{pen_mac}/status:
+    get:
+      summary: Get per-pen upload status
+      description: |
+        Return upload acknowledgment status for a specific pen in an exam:
+        how many chunks expected vs received, whether finalization and
+        checksum verification are complete, and whether canonical ingest
+        has occurred.
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pen_mac
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Upload status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PenUploadStatus"
+        "403":
+          description: Insufficient permissions
+        "503":
+          description: Tenant database unavailable
+
+  /api/v1/ingest/strokes/{exam_id}/{pen_mac}/dedup:
+    post:
+      summary: Pre-upload deduplication check
+      description: |
+        Check whether a chunk already exists before uploading. Hub calls this
+        after a reconnect or restart to skip already-received chunks.
+      parameters:
+        - name: exam_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: pen_mac
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DedupCheckRequest"
+      responses:
+        "200":
+          description: Dedup check result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DedupCheckResponse"
+        "403":
+          description: Insufficient permissions
+        "503":
+          description: Tenant database unavailable
+
 components:
   securitySchemes:
     StoodyBearer:
@@ -52,34 +181,141 @@ components:
     StrokeChunkUploadRequest:
       type: object
       required:
-        - exam_id
         - exam_type
         - student_id
-        - pen_mac
         - chunk_index
         - total_chunks
         - payload_base64
       properties:
-        exam_id:
-          type: string
         exam_type:
           type: string
           enum: [dcr, pcr]
+          description: Engine routing — dcr or pcr
         student_id:
           type: string
-        pen_mac:
-          type: string
+          description: Student who used this pen
         chunk_index:
           type: integer
+          minimum: 0
+          description: Zero-based chunk sequence number
         total_chunks:
           type: integer
+          minimum: 1
+          description: Total number of chunks for this pen
         payload_base64:
           type: string
+          description: Base64-encoded stroke chunk payload
     IngestAck:
       type: object
-      required: [artifact_id, deduplicated]
+      required: [artifact_id, chunk_index, deduplicated, accepted_at]
       properties:
         artifact_id:
           type: string
+          description: Unique identifier for the stored chunk
+        chunk_index:
+          type: integer
+          description: The chunk index that was accepted
         deduplicated:
           type: boolean
+          description: True if this chunk was already received
+        accepted_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of acceptance
+    FinalizeRequest:
+      type: object
+      required:
+        - student_id
+        - expected_checksum
+        - total_chunks
+      properties:
+        student_id:
+          type: string
+          description: Student who used this pen
+        expected_checksum:
+          type: string
+          description: SHA-256 hex digest of all base64-encoded payload strings concatenated in chunk_index order
+        total_chunks:
+          type: integer
+          minimum: 1
+          description: Total chunks expected for this pen
+        hub_id:
+          type: string
+          description: Hub that uploaded these chunks (optional)
+        pages:
+          type: array
+          description: Page-level metadata extracted from pen data
+          items:
+            type: object
+            properties:
+              page_number:
+                type: integer
+              raw_strokes:
+                type: array
+                items:
+                  type: object
+    FinalizeResponse:
+      type: object
+      required: [exam_id, pen_mac, student_id, chunks_received, checksum_match, ingested, message]
+      properties:
+        exam_id:
+          type: string
+        pen_mac:
+          type: string
+        student_id:
+          type: string
+        submission_id:
+          type: string
+          description: Set when canonical ingest succeeded
+        chunks_received:
+          type: integer
+        checksum_match:
+          type: boolean
+        ingested:
+          type: boolean
+          description: True if bridged into IngestService successfully
+        message:
+          type: string
+    PenUploadStatus:
+      type: object
+      required: [exam_id, pen_mac, chunks_expected, chunks_received, finalized, checksum_verified, ingested]
+      properties:
+        exam_id:
+          type: string
+        pen_mac:
+          type: string
+        student_id:
+          type: string
+        chunks_expected:
+          type: integer
+        chunks_received:
+          type: integer
+        finalized:
+          type: boolean
+        checksum_verified:
+          type: boolean
+        ingested:
+          type: boolean
+          description: True if canonical submission exists in evalpen_submissions
+        last_chunk_at:
+          type: string
+          format: date-time
+    DedupCheckRequest:
+      type: object
+      required: [chunk_index, payload_hash]
+      properties:
+        chunk_index:
+          type: integer
+        payload_hash:
+          type: string
+          description: SHA-256 hex digest of the base64-encoded payload string for this chunk
+    DedupCheckResponse:
+      type: object
+      required: [exists]
+      properties:
+        exists:
+          type: boolean
+          description: True if this chunk was already received
+        artifact_id:
+          type: string
+          description: Set when exists is true

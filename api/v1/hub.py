@@ -396,18 +396,21 @@ class HubExamUploadResponse(BaseModel):
     message: str = ""
 
 
-@router.post("/exam-upload", response_model=HubExamUploadResponse)
+@router.post("/exam-upload", response_model=HubExamUploadResponse, deprecated=True)
 async def hub_exam_upload(
     payload: HubExamUpload,
     token: Optional[str] = None,
     state=Depends(get_app_state),
 ):
-    """Receive conducted-exam artifacts from a hub and bridge into the
+    """[LEGACY BRIDGE — DO NOT USE FOR NEW IMPLEMENTATIONS]
+
+    Receive conducted-exam artifacts from a hub and bridge into the
     shared ingest substrate.
 
-    This endpoint is called by the hub's uplink module after post-exam
-    pen sync completes.  It persists the canonical pen artifacts through
-    ``IngestService.ingest_submission()`` with full provenance.
+    This endpoint is a backward-compatibility surface.  The authoritative
+    hub upload route family is ``/api/v1/ingest/strokes/{exam_id}/{pen_mac}``
+    (see ``stroke-ingest.openapi.yaml`` v3.0.0+ and
+    ``integration/HUB_DEPLOYMENT_SPEC.md`` §8).
 
     Non-exam flows should NOT call this endpoint — they continue using
     the existing ``/hub/register`` and Stoody pen sync paths.
@@ -415,6 +418,14 @@ async def hub_exam_upload(
     expected = state.dashboard_token
     if expected and token != expected:
         raise HTTPException(status_code=403, detail="Invalid token")
+
+    logger.warning(
+        "DEPRECATED: /hub/exam-upload called — hub should use "
+        "/api/v1/ingest/strokes/{exam_id}/{pen_mac} instead. "
+        "hub_id=%s exam_id=%s",
+        payload.hub_id,
+        payload.exam_id,
+    )
 
     # Convert pages to the dict format expected by IngestService
     page_dicts = [

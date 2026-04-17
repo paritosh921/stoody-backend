@@ -2420,8 +2420,13 @@ async def get_billing_summary(
 # EXAMPEN HUB PROVISIONING & GATE ADMIN (Tasks 6-7)
 # ============================================================================
 
-# Public router for hub self-provisioning (no superadmin auth required)
-hub_provision_router = APIRouter()
+# Hub provisioning is handled exclusively by hub_ops_async.py at
+# POST /api/v1/hubs/provision (admin JWT auth). The super-admin's role
+# is code generation only (POST /api/v1/superadmin/evalpen/hubs/provision-code).
+# The competing hub_provision_router that was here has been removed to
+# eliminate the dual-implementation conflict.  The variable is set to
+# None so that existing imports in main_async.py do not break.
+hub_provision_router = None
 
 
 # ---- Pydantic models for ExamPen endpoints ----
@@ -2429,11 +2434,6 @@ hub_provision_router = APIRouter()
 class HubProvisionCodeRequest(BaseModel):
     institution_id: str = Field(..., min_length=9, max_length=9, pattern=r'^[A-Z]{4}-[0-9]{4}$')
     note: Optional[str] = None
-
-
-class HubProvisionRequest(BaseModel):
-    hub_code: str = Field(..., min_length=12, max_length=12)
-    hub_mac: Optional[str] = None
 
 
 class GateConfigUpdateRequest(BaseModel):
@@ -2481,66 +2481,6 @@ async def generate_hub_provision_code(
         "code": code,
         "expires_at": expires_at.isoformat(),
         "institution_id": institution_id,
-    }
-
-
-@hub_provision_router.post("/api/v1/hubs/provision")
-async def provision_hub(
-    request: HubProvisionRequest,
-    db: DatabaseManager = Depends(get_database),
-):
-    """Public endpoint — hub calls this with a provisioning code to register itself."""
-    master_db = await get_master_db_or_503(db)
-
-    code_doc = await master_db["exampen_hub_provision_codes"].find_one({
-        "code": request.hub_code,
-        "used": False,
-    })
-    if not code_doc:
-        raise HTTPException(status_code=404, detail="Invalid or already-used provisioning code")
-
-    if code_doc["expires_at"] < datetime.utcnow():
-        raise HTTPException(status_code=410, detail="Provisioning code has expired")
-
-    institution_id = code_doc["institution_id"]
-
-    # Verify the tenant still exists and is active
-    tenant = await master_db["tenants"].find_one({
-        "institution_id": institution_id,
-        "status": {"$in": ["active", "approved"]},
-    })
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant associated with this code is no longer active")
-
-    # Create the hub record
-    hub_id = f"hub-{secrets.token_hex(8)}"
-    now = datetime.utcnow()
-
-    hub_doc = {
-        "hub_id": hub_id,
-        "institution_id": institution_id,
-        "hub_mac": request.hub_mac,
-        "status": "active",
-        "provisioned_at": now,
-        "last_seen_at": now,
-        "provision_code": request.hub_code,
-    }
-    await master_db["exampen_hubs"].insert_one(hub_doc)
-
-    # Mark the code as used (single-use)
-    await master_db["exampen_hub_provision_codes"].update_one(
-        {"_id": code_doc["_id"]},
-        {"$set": {"used": True, "used_at": now, "used_by_hub_id": hub_id}},
-    )
-
-    # Build backend URL from settings
-    backend_url = getattr(settings, "BACKEND_URL", "") or ""
-
-    return {
-        "hub_id": hub_id,
-        "institution_id": institution_id,
-        "backend_url": backend_url,
-        "config": {},
     }
 
 

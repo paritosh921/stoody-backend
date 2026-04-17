@@ -46,6 +46,23 @@ Every chapter must:
 
 ---
 
+## Tracker Document Rules
+
+Documents that track implementation state or work sequencing (e.g., `chapters/BUILD_STATUS.md`, `IMPLEMENTATION_PLAN.md`) are classified as **execution/status documents**. They exist to report progress and organize task assignments.
+
+Tracker documents:
+
+- **may** report which tasks are complete, in progress, or not started
+- **may** reference authoritative documents for task context
+- **may not** define API shape, endpoint paths, request/response fields, or HTTP status codes (authority: `api/*.openapi.yaml`)
+- **may not** define event payload shape or field names (authority: `contracts/events/*.schema.json`)
+- **may not** define storage collections, indexes, field names, or write-once rules (authority: root architecture specs)
+- **may not** define lifecycle state machines, ownership boundaries, or tamper-proofing rules (authority: root architecture specs + governance docs)
+
+If a tracker document describes an API path, schema field, or storage layout that conflicts with an authoritative document, the tracker is wrong and must be updated to match the authority.
+
+---
+
 ## Quality Gates
 
 A documentation unit is complete only when:
