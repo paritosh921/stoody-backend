@@ -208,6 +208,7 @@ class StudentResponse(BaseModel):
     phone: Optional[str] = None
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
+    allowed_pen_count: Optional[int] = None  # Per-student pen-binding cap; null → server default (1)
     is_active: bool
     requires_password_change: Optional[bool] = None
     password_reset_requested: Optional[bool] = None
@@ -904,6 +905,7 @@ async def get_students(
                     phone=student.get("phone"),
                     plan_types=student.get("plan_types"),
                     subjects=student.get("subjects"),
+                    allowed_pen_count=student.get("allowed_pen_count"),
                     is_active=student.get("is_active", True),
                     requires_password_change=student.get(
                         "requires_password_change", False
@@ -1015,6 +1017,7 @@ async def export_students(
                     phone=student.get("phone"),
                     plan_types=student.get("plan_types"),
                     subjects=student.get("subjects"),
+                    allowed_pen_count=student.get("allowed_pen_count"),
                     is_active=student.get("is_active", True),
                     requires_password_change=student.get(
                         "requires_password_change", False
