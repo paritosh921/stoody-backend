@@ -85,6 +85,7 @@ from api.v1.auth_async import router as auth_router
 from api.v1.auth_cookie import router as auth_cookie_router
 from api.v1.admin_async import router as admin_router
 from api.v1.admin_pens_async import router as admin_pens_router
+from api.v1.student_pens_async import router as student_pens_router
 from api.v1.student_bulk_upload import router as student_bulk_upload_router
 from api.v1.tutor_bulk_upload import router as tutor_bulk_upload_router
 from api.v1.student_async import router as student_router
@@ -863,6 +864,15 @@ app.include_router(
     admin_pens_router,
     prefix=f"{API_V1_PREFIX}/admin",
     tags=["Admin Pen Bindings"],
+)
+
+# Student-facing pen endpoints — used by the mobile app to load its own
+# bindings + auto-bind on first connect. Same per-student rules as the
+# desktop agent + admin paths; no DELETE (admin-only by policy).
+app.include_router(
+    student_pens_router,
+    prefix=f"{API_V1_PREFIX}/student",
+    tags=["Student Pen Bindings"],
 )
 
 # Student Bulk Upload routes (under admin)
