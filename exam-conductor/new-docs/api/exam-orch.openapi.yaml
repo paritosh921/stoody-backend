@@ -61,31 +61,6 @@ paths:
                 $ref: "#/components/schemas/ExamDetailResponse"
         "404":
           description: Exam not found
-    patch:
-      summary: Update exam metadata (roster, duration, etc.)
-      parameters:
-        - name: exam_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                roster:
-                  type: array
-                  items:
-                    type: string
-                duration_minutes:
-                  type: integer
-                  minimum: 1
-      responses:
-        "404":
-          description: Exam not found
   /api/v1/exams/{exam_id}/lifecycle:
     patch:
       summary: Transition exam lifecycle state

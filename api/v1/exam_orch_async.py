@@ -502,6 +502,14 @@ async def assign_hub(
             detail=f"Exam {exam_id} not found",
         )
 
+    current_state = doc.get("lifecycle_state", "draft")
+    if current_state != "draft":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Hub assignments can only be changed while exam is in draft state. "
+                   f"Current state: {current_state}",
+        )
+
     existing = doc.get("hub_assignments", [])
     if any(ha.get("hub_id") == body.hub_id for ha in existing):
         raise HTTPException(
@@ -561,6 +569,14 @@ async def unassign_hub(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {exam_id} not found",
+        )
+
+    current_state = doc.get("lifecycle_state", "draft")
+    if current_state != "draft":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Hub assignments can only be changed while exam is in draft state. "
+                   f"Current state: {current_state}",
         )
 
     existing = doc.get("hub_assignments", [])

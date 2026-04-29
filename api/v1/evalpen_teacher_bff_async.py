@@ -69,6 +69,8 @@ class ExamSummaryItem(BaseModel):
     exam_id: str
     title: str
     exam_type: Optional[str] = None
+    prepared_document_id: Optional[str] = None
+    lifecycle_state: Optional[str] = None
     total_students: int = 0
     evaluated_count: int = 0
     blocked_count: int = 0
@@ -218,12 +220,17 @@ async def list_exams(
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
 
     try:
+        def _normalize_exam_type(value: Optional[str]) -> Optional[str]:
+            if not value:
+                return None
+            return str(value).upper()
+
         # ----- Fetch prepared exams from finalized documents -----
         # These are offline exams that have been finalized but may have
         # no student submissions yet.  We merge them into the list so
         # teachers can see every exam they have prepared.
         prepared_items: List[ExamSummaryItem] = []
-        prepared_exam_ids: set = set()
+        prepared_doc_meta: Dict[str, Dict[str, Any]] = {}
 
         doc_query: Dict[str, Any] = {"exam_finalized": True}
         # Tutor scoping: match existing document visibility model —
@@ -272,12 +279,24 @@ async def list_exams(
         for fdoc in finalized_docs:
             doc_id = fdoc.get("document_id", "")
             if doc_id:
-                prepared_exam_ids.add(doc_id)
+                prepared_doc_meta[doc_id] = {
+                    "title": fdoc.get("title", doc_id),
+                    "exam_mode": fdoc.get("exam_mode"),
+                    "finalized_at": (
+                        fdoc["exam_finalized_at"].isoformat()
+                        if fdoc.get("exam_finalized_at")
+                        else None
+                    ),
+                    "question_count": live_q_counts.get(doc_id, 0),
+                }
                 prepared_items.append(
                     ExamSummaryItem(
                         exam_id=doc_id,
                         title=fdoc.get("title", doc_id),
-                        exam_type=(fdoc.get("exam_mode") or "").upper() or None,
+                        exam_type=_normalize_exam_type(
+                            fdoc.get("exam_mode")
+                        ),
+                        prepared_document_id=doc_id,
                         total_students=0,
                         evaluated_count=0,
                         blocked_count=0,
@@ -292,6 +311,75 @@ async def list_exams(
                         question_count=live_q_counts.get(doc_id, 0),
                     )
                 )
+
+        # ----- Fetch orchestration exams even before submissions exist -----
+        active_exam_query: Dict[str, Any] = {}
+        if scoped_ids is not None:
+            active_exam_filters: List[Dict[str, Any]] = []
+            if scoped_ids:
+                active_exam_filters.append({"roster": {"$in": scoped_ids}})
+            if finalized_doc_ids:
+                active_exam_filters.append(
+                    {"prepared_document_id": {"$in": finalized_doc_ids}}
+                )
+            if active_exam_filters:
+                active_exam_query = {"$or": active_exam_filters}
+            else:
+                active_exam_query = {"exam_id": {"$in": []}}
+
+        active_exam_docs = await tenant_db["exampen_exams"].find(
+            active_exam_query,
+            projection={
+                "exam_id": 1,
+                "exam_type": 1,
+                "lifecycle_state": 1,
+                "prepared_document_id": 1,
+            },
+        ).to_list(length=5000)
+        active_exam_map: Dict[str, Dict[str, Any]] = {
+            doc["exam_id"]: doc
+            for doc in active_exam_docs
+            if doc.get("exam_id")
+        }
+
+        def _build_active_exam_item(
+            exam_id: str,
+            exam_doc: Dict[str, Any],
+            *,
+            total_students: int = 0,
+            evaluated_count: int = 0,
+            blocked_count: int = 0,
+            published_count: int = 0,
+            title_override: Optional[str] = None,
+            exam_type_override: Optional[str] = None,
+        ) -> ExamSummaryItem:
+            prepared_document_id = exam_doc.get("prepared_document_id")
+            prepared_meta = prepared_doc_meta.get(prepared_document_id or "", {})
+            exam_type = (
+                exam_type_override
+                or _normalize_exam_type(exam_doc.get("exam_type"))
+                or _normalize_exam_type(prepared_meta.get("exam_mode"))
+            )
+            title = (
+                title_override
+                or prepared_meta.get("title")
+                or exam_id
+            )
+            return ExamSummaryItem(
+                exam_id=exam_id,
+                title=title,
+                exam_type=exam_type,
+                prepared_document_id=prepared_document_id,
+                lifecycle_state=exam_doc.get("lifecycle_state"),
+                total_students=total_students,
+                evaluated_count=evaluated_count,
+                blocked_count=blocked_count,
+                published_count=published_count,
+                status="active",
+                exam_mode=prepared_meta.get("exam_mode") or exam_doc.get("exam_type"),
+                finalized_at=prepared_meta.get("finalized_at"),
+                question_count=prepared_meta.get("question_count", 0),
+            )
 
         # ----- Fetch submissions (tutor-scoped) -----
         sub_query: Dict[str, Any] = {}
@@ -310,11 +398,23 @@ async def list_exams(
         submissions = await submissions_cursor.to_list(length=5000)
 
         if not submissions:
-            # Return only prepared exams (no submissions exist yet)
-            if prepared_items:
-                prepared_items.sort(key=lambda x: x.exam_id)
-                return ExamListResponse(items=prepared_items)
-            return ExamListResponse(items=[])
+            items: List[ExamSummaryItem] = [
+                _build_active_exam_item(exam_id, exam_doc)
+                for exam_id, exam_doc in active_exam_map.items()
+            ]
+            linked_prepared_ids = {
+                doc.get("prepared_document_id")
+                for doc in active_exam_docs
+                if doc.get("prepared_document_id")
+            }
+            for prep in prepared_items:
+                if (
+                    prep.exam_id not in linked_prepared_ids
+                    and prep.exam_id not in active_exam_map
+                ):
+                    items.append(prep)
+            items.sort(key=lambda x: x.exam_id)
+            return ExamListResponse(items=items)
 
         # ----- Group submissions by exam_id -----
         # exam_id -> list of submission dicts
@@ -449,36 +549,71 @@ async def list_exams(
 
             # Resolve title
             title_info = title_map.get(exam_id, {})
-            title = title_info.get("title") or exam_id
-            exam_type = title_info.get("exam_type")
-
-            items.append(
-                ExamSummaryItem(
-                    exam_id=exam_id,
-                    title=title,
-                    exam_type=exam_type,
-                    total_students=len(student_ids_set),
-                    evaluated_count=evaluated,
-                    blocked_count=blocked,
-                    published_count=published,
-                )
+            exam_doc = active_exam_map.get(exam_id, {})
+            prepared_meta = prepared_doc_meta.get(
+                (exam_doc.get("prepared_document_id") or ""),
+                {},
+            )
+            title = (
+                title_info.get("title")
+                or prepared_meta.get("title")
+                or exam_id
+            )
+            exam_type = (
+                _normalize_exam_type(title_info.get("exam_type"))
+                or _normalize_exam_type(exam_doc.get("exam_type"))
+                or _normalize_exam_type(prepared_meta.get("exam_mode"))
             )
 
-        # Merge prepared exams that have no submissions yet
-        submission_exam_ids = {item.exam_id for item in items}
-        for prep in prepared_items:
-            if prep.exam_id not in submission_exam_ids:
-                items.append(prep)
+            if exam_doc:
+                items.append(
+                    _build_active_exam_item(
+                        exam_id,
+                        exam_doc,
+                        total_students=len(student_ids_set),
+                        evaluated_count=evaluated,
+                        blocked_count=blocked,
+                        published_count=published,
+                        title_override=title,
+                        exam_type_override=exam_type,
+                    )
+                )
             else:
-                # Submission-driven item exists — enrich it with prepared metadata
-                for item in items:
-                    if item.exam_id == prep.exam_id:
-                        item.exam_mode = prep.exam_mode
-                        item.finalized_at = prep.finalized_at
-                        item.question_count = prep.question_count
-                        if item.status != "active":
-                            item.status = "active"
-                        break
+                items.append(
+                    ExamSummaryItem(
+                        exam_id=exam_id,
+                        title=title,
+                        exam_type=exam_type,
+                        total_students=len(student_ids_set),
+                        evaluated_count=evaluated,
+                        blocked_count=blocked,
+                        published_count=published,
+                        status="active",
+                    )
+                )
+
+        # Add active exams that exist in orchestration but have no submissions yet
+        submission_exam_ids = {item.exam_id for item in items}
+        for exam_id, exam_doc in active_exam_map.items():
+            if exam_id not in submission_exam_ids:
+                items.append(
+                    _build_active_exam_item(exam_id, exam_doc)
+                )
+
+        linked_prepared_ids = {
+            doc.get("prepared_document_id")
+            for doc in active_exam_docs
+            if doc.get("prepared_document_id")
+        }
+
+        # Merge prepared exams that have no linked orchestration exam yet
+        for prep in prepared_items:
+            if (
+                prep.exam_id not in submission_exam_ids
+                and prep.exam_id not in active_exam_map
+                and prep.exam_id not in linked_prepared_ids
+            ):
+                items.append(prep)
 
         # Sort by exam_id for deterministic order
         items.sort(key=lambda x: x.exam_id)
