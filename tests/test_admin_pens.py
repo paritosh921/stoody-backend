@@ -112,6 +112,26 @@ async def _call_admin_assign(student_id: str, pen_mac: str, pen_name: str, *, db
         )
 
 
+async def _call_tutor_assign(student_id: str, pen_mac: str, pen_name: str, *, db, can_edit_students: bool = True):
+    from api.v1.admin_pens_async import admin_assign_pen, AdminAssignPenRequest
+    from unittest.mock import patch
+
+    with patch("api.v1.admin_pens_async.get_tenant_db_or_403", return_value=db):
+        return await admin_assign_pen(
+            student_id=student_id,
+            payload=AdminAssignPenRequest(pen_mac=pen_mac, pen_name=pen_name),
+            db=None,  # type: ignore[arg-type]
+            current_user={
+                "db_name": "skb_test",
+                "user_id": "tutor-user-1",
+                "user_type": "tutor",
+                "tutor_id": "TUT-1",
+                "admin_id": "507f1f77bcf86cd799439011",
+                "can_edit_students": can_edit_students,
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_admin_assign_blocks_when_student_already_has_active_binding():
     """Admins also obey the one-active-pen-per-student rule. They must
@@ -189,6 +209,29 @@ async def _call_admin_set_pen_limit(student_id: str, allowed: int, *, db):
         )
 
 
+async def _call_tutor_set_pen_limit(student_id: str, allowed: int, *, db, can_edit_students: bool = True):
+    from unittest.mock import patch
+    from api.v1.admin_pens_async import (
+        admin_set_pen_limit,
+        AdminSetPenLimitRequest,
+    )
+
+    with patch("api.v1.admin_pens_async.get_tenant_db_or_403", return_value=db):
+        return await admin_set_pen_limit(
+            student_id=student_id,
+            payload=AdminSetPenLimitRequest(allowed_pen_count=allowed),
+            db=None,  # type: ignore[arg-type]
+            current_user={
+                "db_name": "skb_test",
+                "user_id": "tutor-user-1",
+                "user_type": "tutor",
+                "tutor_id": "TUT-1",
+                "admin_id": "507f1f77bcf86cd799439011",
+                "can_edit_students": can_edit_students,
+            },
+        )
+
+
 @pytest.mark.asyncio
 async def test_admin_set_pen_limit_persists():
     db = pytest.importorskip("mongomock_motor").AsyncMongoMockClient()["skb_test"]
@@ -227,6 +270,57 @@ async def test_admin_set_pen_limit_404_for_unknown_student():
     with pytest.raises(HTTPException) as exc:
         await _call_admin_set_pen_limit("STU-NONE", 2, db=db)
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_tutor_can_assign_pen_for_assigned_student():
+    db = pytest.importorskip("mongomock_motor").AsyncMongoMockClient()["skb_test"]
+    await _seed_student(db, username="alice", student_id="STU-1")
+    await db["tutors"].insert_one(
+        {"tutor_id": "TUT-1", "assigned_student_ids": ["STU-1"]}
+    )
+    result = await _call_tutor_assign("STU-1", "AA:BB:CC:DD:EE:01", "Alice pen", db=db)
+    assert result.pen_mac == "AA:BB:CC:DD:EE:01"
+    assert result.user_id == "alice"
+
+
+@pytest.mark.asyncio
+async def test_tutor_cannot_assign_pen_for_unscoped_student():
+    from fastapi import HTTPException
+
+    db = pytest.importorskip("mongomock_motor").AsyncMongoMockClient()["skb_test"]
+    await _seed_student(db, username="alice", student_id="STU-1")
+    await db["tutors"].insert_one(
+        {"tutor_id": "TUT-1", "assigned_student_ids": []}
+    )
+    with pytest.raises(HTTPException) as exc:
+        await _call_tutor_assign("STU-1", "AA:BB:CC:DD:EE:01", "Alice pen", db=db)
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_tutor_can_raise_pen_limit_for_assigned_student():
+    db = pytest.importorskip("mongomock_motor").AsyncMongoMockClient()["skb_test"]
+    await db["students"].insert_one({"username": "alice", "student_id": "STU-1"})
+    await db["tutors"].insert_one(
+        {"tutor_id": "TUT-1", "assigned_student_ids": ["STU-1"]}
+    )
+    result = await _call_tutor_set_pen_limit("STU-1", 3, db=db)
+    assert result == {"student_id": "STU-1", "allowed_pen_count": 3}
+
+
+@pytest.mark.asyncio
+async def test_tutor_without_edit_permission_cannot_manage_pens():
+    from fastapi import HTTPException
+
+    db = pytest.importorskip("mongomock_motor").AsyncMongoMockClient()["skb_test"]
+    await db["students"].insert_one({"username": "alice", "student_id": "STU-1"})
+    await db["tutors"].insert_one(
+        {"tutor_id": "TUT-1", "assigned_student_ids": ["STU-1"]}
+    )
+    with pytest.raises(HTTPException) as exc:
+        await _call_tutor_set_pen_limit("STU-1", 2, db=db, can_edit_students=False)
+    assert exc.value.status_code == 403
 
 
 def test_router_exports_expected_routes():

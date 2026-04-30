@@ -191,7 +191,7 @@ async def student_register_my_pen(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     f"Pen limit reached ({active_count}/{limit}). "
-                    "Ask your admin to raise your pen limit, or to unbind one of your existing pens."
+                    "Ask your admin or assigned teacher to raise your pen limit, or to unbind one of your existing pens."
                 ),
             )
 

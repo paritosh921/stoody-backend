@@ -27,13 +27,15 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
+from bson import ObjectId
 
 from api.v1.admin_async import (
     get_tenant_db_or_403,
-    require_admin,
+    require_admin_or_tutor,
 )
 from api.v1.auth_async import get_database
 from core.database import DatabaseManager
+from utils.tutor_scoping import build_tutor_class_criteria
 
 logger = logging.getLogger(__name__)
 
@@ -149,15 +151,139 @@ async def _resolve_student_username(tenant_db, student_id: str) -> str:
     return student["username"]
 
 
+def _actor_is_admin(current_user: Dict[str, Any]) -> bool:
+    return (current_user.get("user_type") or "").lower() in {"admin", "b2c_admin"}
+
+
+async def _get_tutor_doc_or_403(tenant_db, current_user: Dict[str, Any]) -> Dict[str, Any]:
+    if (current_user.get("user_type") or "").lower() != "tutor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or tutor access required",
+        )
+    if not current_user.get("can_edit_students"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor does not have permission to manage students",
+        )
+    tutor_id = current_user.get("tutor_id")
+    if not tutor_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor identity missing from token",
+        )
+    tutor_doc = await tenant_db["tutors"].find_one({"tutor_id": tutor_id})
+    if not tutor_doc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor not found in this tenant",
+        )
+    return tutor_doc
+
+
+async def _get_tutor_visible_student_usernames(
+    tenant_db,
+    current_user: Dict[str, Any],
+) -> set[str]:
+    tutor_doc = await _get_tutor_doc_or_403(tenant_db, current_user)
+    tutor_id = current_user.get("tutor_id")
+    usernames: set[str] = set()
+
+    assigned_student_ids = [s for s in (tutor_doc.get("assigned_student_ids") or []) if s]
+    if assigned_student_ids:
+        cursor = tenant_db["students"].find(
+            {"student_id": {"$in": assigned_student_ids}},
+            {"username": 1},
+        )
+        async for doc in cursor:
+            username = doc.get("username")
+            if username:
+                usernames.add(username)
+
+    cursor = tenant_db["students"].find(
+        {"teacher_ids": {"$in": [tutor_id]}},
+        {"username": 1},
+    )
+    async for doc in cursor:
+        username = doc.get("username")
+        if username:
+            usernames.add(username)
+
+    admin_oid = None
+    raw_admin_id = current_user.get("admin_id")
+    if raw_admin_id:
+        try:
+            admin_oid = ObjectId(raw_admin_id)
+        except Exception:
+            admin_oid = None
+    class_query = build_tutor_class_criteria(tutor_doc, admin_oid)
+    if class_query:
+        cursor = tenant_db["students"].find(class_query, {"username": 1})
+        async for doc in cursor:
+            username = doc.get("username")
+            if username:
+                usernames.add(username)
+
+    return usernames
+
+
+async def _resolve_student_username_for_actor(
+    tenant_db,
+    current_user: Dict[str, Any],
+    student_id: str,
+) -> str:
+    username = await _resolve_student_username(tenant_db, student_id)
+    if _actor_is_admin(current_user):
+        return username
+
+    visible_usernames = await _get_tutor_visible_student_usernames(tenant_db, current_user)
+    if username not in visible_usernames:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor can only manage pens for assigned students",
+        )
+    return username
+
+
+async def _require_pen_manage_access_for_mac(
+    tenant_db,
+    current_user: Dict[str, Any],
+    pen_mac: str,
+) -> None:
+    if _actor_is_admin(current_user):
+        return
+    visible_usernames = await _get_tutor_visible_student_usernames(tenant_db, current_user)
+    binding = await tenant_db["pens"].find_one(
+        {"pen_mac": pen_mac, "status": "active"},
+        {"user_id": 1},
+    )
+    if not binding:
+        return
+    if binding.get("user_id") not in visible_usernames:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor can only manage pens for assigned students",
+        )
+
+
 @router.get("/pens", response_model=List[PenBindingOut])
 async def list_all_pens_in_tenant(
     pen_status: str = Query("active", pattern="^(active|deregistered|all)$"),
     db: DatabaseManager = Depends(get_database),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
 ) -> List[PenBindingOut]:
-    """List every pen binding in the tenant, joined with student profile."""
+    """List pen bindings in the tenant.
+
+    Admins see all tenant bindings. Tutors with `can_edit_students`
+    only see pens belonging to students in their visible scope.
+    """
     tenant_db = await get_tenant_db_or_403(db, current_user)
     query: Dict[str, Any] = {} if pen_status == "all" else {"status": pen_status}
+    if not _actor_is_admin(current_user):
+        visible_usernames = sorted(await _get_tutor_visible_student_usernames(tenant_db, current_user))
+        if not visible_usernames:
+            return []
+        query["user_id"] = {"$in": visible_usernames}
     pens = await tenant_db["pens"].find(query).sort("last_registered_at", -1).to_list(length=2000)
     annotated = await _attach_student_metadata(tenant_db, pens)
     return [PenBindingOut(**row) for row in annotated]
@@ -171,10 +297,10 @@ async def list_pens_for_student(
     student_id: str,
     pen_status: str = Query("active", pattern="^(active|deregistered|all)$"),
     db: DatabaseManager = Depends(get_database),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
 ) -> List[PenBindingOut]:
     tenant_db = await get_tenant_db_or_403(db, current_user)
-    username = await _resolve_student_username(tenant_db, student_id)
+    username = await _resolve_student_username_for_actor(tenant_db, current_user, student_id)
     query: Dict[str, Any] = {"user_id": username}
     if pen_status != "all":
         query["status"] = pen_status
@@ -187,7 +313,7 @@ async def list_pens_for_student(
 async def admin_unbind_pen(
     pen_mac: str,
     db: DatabaseManager = Depends(get_database),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
 ) -> Dict[str, Any]:
     """Hard-unbind a pen — flips status to 'deregistered'.
 
@@ -196,6 +322,7 @@ async def admin_unbind_pen(
     """
     mac = _normalize_mac(pen_mac)
     tenant_db = await get_tenant_db_or_403(db, current_user)
+    await _require_pen_manage_access_for_mac(tenant_db, current_user, mac)
     result = await tenant_db["pens"].update_one(
         {"pen_mac": mac, "status": "active"},
         {
@@ -203,6 +330,7 @@ async def admin_unbind_pen(
                 "status": "deregistered",
                 "deregistered_at": datetime.utcnow(),
                 "deregistered_by_admin": str(current_user.get("user_id")),
+                "deregistered_by_user_type": str(current_user.get("user_type") or ""),
             }
         },
     )
@@ -223,7 +351,7 @@ async def admin_assign_pen(
     student_id: str,
     payload: AdminAssignPenRequest,
     db: DatabaseManager = Depends(get_database),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
 ) -> PenBindingOut:
     """Pre-assign a pen MAC to a student.
 
@@ -234,7 +362,7 @@ async def admin_assign_pen(
     returns 409.
     """
     tenant_db = await get_tenant_db_or_403(db, current_user)
-    username = await _resolve_student_username(tenant_db, student_id)
+    username = await _resolve_student_username_for_actor(tenant_db, current_user, student_id)
     mac = payload.pen_mac
     pens = tenant_db["pens"]
 
@@ -290,6 +418,7 @@ async def admin_assign_pen(
                 "updated_at": now,
                 "last_registered_at": now,
                 "assigned_by_admin": str(current_user.get("user_id")),
+                "assigned_by_user_type": str(current_user.get("user_type") or ""),
             },
         },
         upsert=True,
@@ -305,7 +434,7 @@ async def admin_set_pen_limit(
     student_id: str,
     payload: AdminSetPenLimitRequest,
     db: DatabaseManager = Depends(get_database),
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
 ) -> Dict[str, Any]:
     """Update a student's `allowed_pen_count`.
 
@@ -321,6 +450,7 @@ async def admin_set_pen_limit(
             detail="allowed_pen_count must be >= 1. Use DELETE /admin/pens/{mac} to unbind a specific pen.",
         )
     tenant_db = await get_tenant_db_or_403(db, current_user)
+    await _resolve_student_username_for_actor(tenant_db, current_user, student_id)
     result = await tenant_db["students"].update_one(
         {"student_id": student_id},
         {"$set": {"allowed_pen_count": payload.allowed_pen_count}},
