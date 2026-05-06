@@ -551,6 +551,11 @@ def export_legacy_features(effective_features: Optional[Dict[str, Any]]) -> Dict
 _FEATURE_EXEMPT_PREFIXES: Tuple[str, ...] = (
     # Canvas page persistence is core data storage, not a gated pen-capture feature.
     "/api/v1/strokes/pages",
+    # Smartboard pair bridge: bootstraps a smartboard session from a tutor's
+    # main-app JWT. Cannot be gated on smartboard_core_dummy because the
+    # mobile app needs to call register/redeem before any smartboard runtime
+    # endpoint is reachable. See sb-android/PAIRING_API.md.
+    "/api/v1/smartboard-pair",
 )
 
 
