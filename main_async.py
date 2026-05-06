@@ -281,6 +281,15 @@ except Exception as e:
     _smartboard_sessions_available = False
     logging.warning(f"Smartboard Sessions routes disabled: {str(e)}")
 
+# Smartboard Pairing routes (6-digit code for phone→tablet pairing)
+try:
+    from api.v1.smartboard_pair_async import router as smartboard_pair_router
+    _smartboard_pair_available = True
+except Exception as e:
+    smartboard_pair_router = None
+    _smartboard_pair_available = False
+    logging.warning(f"Smartboard Pairing routes disabled: {str(e)}")
+
 # Timetable routes (class timetable, teacher calendar, pre-reads)
 try:
     from api.v1.timetable_async import router as timetable_router
@@ -1250,6 +1259,16 @@ if _smartboard_sessions_available and smartboard_sessions_router:
     logger.info("✅ Smartboard Sessions routes enabled")
 else:
     logger.warning("⚠️ Smartboard Sessions routes disabled")
+
+# Smartboard Pairing routes (6-digit code bridge between phone and tablet)
+if _smartboard_pair_available and smartboard_pair_router:
+    app.include_router(
+        smartboard_pair_router,
+        tags=["Smartboard Pairing"]
+    )
+    logger.info("✅ Smartboard Pairing routes enabled")
+else:
+    logger.warning("⚠️ Smartboard Pairing routes disabled")
 
 # Timetable routes (class timetable, teacher calendar, academic calendar, pre-reads)
 if _timetable_available and timetable_router:
