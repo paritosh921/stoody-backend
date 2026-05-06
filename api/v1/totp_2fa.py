@@ -77,6 +77,11 @@ TWO_FA_EXEMPT_EMAILS = [
     "cielknowledge@gmail.com",  # Legacy admin account
 ]
 
+# Tutor usernames exempt from 2FA (e.g., Play Store review account)
+TWO_FA_EXEMPT_USERNAMES = [
+    "playstoreteacher",
+]
+
 
 # ============================================================================
 # Encryption helpers
@@ -509,10 +514,14 @@ async def login_with_2fa(
         
         user_id = str(user["_id"])
         user_email = (user.get("email") or "").lower()  # Handle None email
+        user_username = (user.get("username") or "").strip().lower()
         two_fa = user.get("two_fa", {})
-        
-        # Check if account is exempt from 2FA (legacy accounts)
-        is_exempt = user_email in [e.lower() for e in TWO_FA_EXEMPT_EMAILS]
+
+        # Check if account is exempt from 2FA (legacy accounts, app-store review accounts)
+        is_exempt = (
+            user_email in [e.lower() for e in TWO_FA_EXEMPT_EMAILS]
+            or (user_type == "tutor" and user_username in [u.lower() for u in TWO_FA_EXEMPT_USERNAMES])
+        )
         
         # Check 2FA status
         two_fa_enabled = two_fa.get("enabled", False)
