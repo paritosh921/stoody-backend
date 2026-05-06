@@ -12,15 +12,13 @@ endpoints accept it).
 See `stoody-multi-pen/sb-android/PAIRING_API.md` for the full contract.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -240,7 +238,7 @@ async def register_pair_code(
 @limiter.limit("20/minute")
 async def redeem_pair_code(
     request: Request,
-    body: RedeemPairCodeRequest,
+    body: RedeemPairCodeRequest = Body(...),
 ) -> RedeemPairCodeResponse:
     """
     Smartboard tablet calls this with the 6-digit code shown on the teacher's
