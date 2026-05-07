@@ -237,7 +237,7 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
         "status": STATUS_ACTIVE,
-        "default_enabled": False,
+        "default_enabled": True,
         "billing_code": "MAX_SMARTBOARD_CORE",
     },
     {
@@ -247,7 +247,7 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
         "status": STATUS_ACTIVE,
-        "default_enabled": False,
+        "default_enabled": True,
         "billing_code": "MAX_SMARTBOARD_LIVE",
     },
     {
@@ -257,7 +257,7 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
         "status": STATUS_ACTIVE,
-        "default_enabled": False,
+        "default_enabled": True,
         "billing_code": "MAX_SMARTBOARD_CLOUD",
     },
 ]
