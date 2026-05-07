@@ -355,6 +355,63 @@ This plan does **NOT** include:
 
 ---
 
+## Post-UP-18 Status: Downstream Frontend / Super-Admin / Mobile (2026-05-02)
+
+All UP-001 through UP-018 tasks are COMPLETE. The following downstream surfaces have been built since the upstream plan was completed. These are tracked here for visibility but were not part of the original UP task packs.
+
+### Frontend Teacher Workspace
+
+| Item | Status | Key Files |
+|---|---|---|
+| 5-tab teacher shell (Exams, Workspace, Results, Recheck, Conversations) | **DONE** | `ExamPenTeacher.tsx` |
+| IDE-style workspace (StudentExplorer + QuestionPaper + StudentCopy + QuestionInspector) | **DONE** | `TeacherWorkspace.tsx` |
+| Collection Monitor in workspace | **DONE** | `CollectionMonitor.tsx` (Review/Collection tab switcher) |
+| Results table with publish | **DONE** | `ExamResults.tsx`, `PublishSummaryBar.tsx`, `PublishAuditLog.tsx` |
+| Recheck tab with request management | **DONE** | `RecheckTab.tsx`, `RecheckRequestsPanel.tsx` |
+| Conversation tab | **DONE** | `ConversationTab.tsx` |
+| Setup/readiness surface | **DONE** | `WorkspaceSetupPanel.tsx`, `WorkspaceHeader.tsx` |
+| ExamPen readiness indicator in Document Manager | **DONE** | `ExamPenReadinessIndicator.tsx` mounted in `DocumentDetailPanel.tsx` |
+| Shared status module | **DONE** | `examPenStatus.ts` adopted across 6 components |
+
+### Frontend Student Portal
+
+| Item | Status | Key Files |
+|---|---|---|
+| Published exam list with score breakdown | **DONE** | `ExamPenStudent.tsx` |
+| Per-question detail with reference answers | **DONE** | Inline `EnhancedScoreCard` |
+| Recheck request dialog | **DONE** | `RecheckRequestDialog.tsx` |
+| Student conversation threads | **DONE** | `StudentConversationList.tsx` |
+
+### Super-Admin ExamPen Management
+
+| Item | Status | Key Files |
+|---|---|---|
+| Feature gate toggle per tenant | **DONE** | `ExamPenManagementPage.tsx` |
+| Hub fleet listing + provision code generation | **DONE** | `listProvisionedHubs()`, `generateHubProvisionCode()` |
+| Token usage (today) | **DONE** | `getEvalPenUsageAggregate()` |
+| Per-tenant exam/submission counts | **PENDING** | Requires new backend endpoint |
+
+### Mobile Camera Fallback
+
+| Item | Status | Key Files |
+|---|---|---|
+| Offline retry queue | **DONE** | `CameraFallbackScreen.tsx` |
+| Roster-backed student selector | **PENDING** | Manual student ID entry still required |
+
+### Still Pending (Backend)
+
+| Item | Status | Notes |
+|---|---|---|
+| Recheck request router | **Not mounted** | Frontend contract defined; backend endpoints needed |
+| Conversation thread router | **Not mounted** | Frontend contract defined; backend endpoints needed |
+| Plagiarism detection router | **Not mounted** | Spec exists in `api/plagiarism.openapi.yaml` |
+| Analytics router | **Not mounted** | Spec exists in `api/analytics.openapi.yaml` |
+| Hub detail endpoint | **Not mounted** | Spec exists in `SUPERADMIN_SPEC.md` §5.2 |
+| Hub decommission endpoint | **Not mounted** | Spec exists in `SUPERADMIN_SPEC.md` §5.2 |
+| Roster-backed student selector (mobile) | **Not mounted** | Mobile needs roster API for camera fallback |
+
+---
+
 ## Validation Tests
 
 | Test ID | What to Verify | Owner |

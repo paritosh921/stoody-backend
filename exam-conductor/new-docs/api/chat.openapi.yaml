@@ -5,6 +5,13 @@ info:
   description: |
     Supporting teacher-student communication APIs around ExamPen results and review.
     Chat is outside the ingest substrate and outside evaluator ownership.
+
+    **IMPLEMENTATION STATUS (2026-05-02): PENDING.** No backend router is mounted for these
+    endpoints. The frontend has implemented a conversation thread model
+    (`ConversationThread`, `ConversationMessage` types in `frontend/src/services/api.ts`)
+    with a different contract than this spec (using `/evalpen/conversations/*` paths).
+    When the backend is implemented, this spec must be reconciled with the actual frontend
+    contract, or the frontend contract must be reconciled with this spec.
 servers:
   - url: /
 security:

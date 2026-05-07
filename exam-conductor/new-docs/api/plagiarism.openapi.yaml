@@ -5,6 +5,9 @@ info:
   description: |
     Reviewable plagiarism flags built from DCR and PCR outputs.
     This API exposes flags and verdicts; it does not own raw ingest or evaluator state.
+
+    **IMPLEMENTATION STATUS (2026-05-02): PENDING.** No backend router is mounted for these
+    endpoints. No frontend surface exists for plagiarism review.
 servers:
   - url: /
 security:

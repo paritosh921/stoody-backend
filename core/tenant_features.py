@@ -231,34 +231,34 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
         "billing_code": "MAX_EXAMPEN",
     },
     {
-        "key": "smartboard_core_dummy",
-        "label": "Smartboard Core (Dummy)",
-        "description": "Reserved smartboard entitlement (not enforced yet)",
+        "key": "smartboard_core",
+        "label": "Smartboard Core",
+        "description": "Base Smartboard availability for the institution",
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
-        "status": STATUS_DUMMY,
+        "status": STATUS_ACTIVE,
         "default_enabled": False,
         "billing_code": "MAX_SMARTBOARD_CORE",
     },
     {
-        "key": "smartboard_live_session_dummy",
-        "label": "Smartboard Live Session (Dummy)",
-        "description": "Reserved live-session entitlement (not enforced yet)",
+        "key": "smartboard_live_session",
+        "label": "Smartboard Live Session",
+        "description": "Teacher-led live Smartboard teaching/session features",
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
-        "status": STATUS_DUMMY,
+        "status": STATUS_ACTIVE,
         "default_enabled": False,
         "billing_code": "MAX_SMARTBOARD_LIVE",
     },
     {
-        "key": "smartboard_token_dummy",
-        "label": "Smartboard Token (Dummy)",
-        "description": "Reserved smartboard token entitlement (not enforced yet)",
+        "key": "smartboard_cloud_access",
+        "label": "Smartboard Cloud Access",
+        "description": "Internet-backed features: OCR, AI, cloud sync, cloud session persistence",
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student", "tutor"],
-        "status": STATUS_DUMMY,
+        "status": STATUS_ACTIVE,
         "default_enabled": False,
-        "billing_code": "MAX_SMARTBOARD_TOKEN",
+        "billing_code": "MAX_SMARTBOARD_CLOUD",
     },
 ]
 
@@ -289,7 +289,7 @@ LEGACY_DEFAULT_TENANT_FEATURES: Dict[str, bool] = {
 }
 
 LEGACY_TO_V2_MAP: Dict[str, Tuple[str, ...]] = {
-    "smartboard": ("student_learning_mode", "smartboard_core_dummy"),
+    "smartboard": ("student_learning_mode", "smartboard_core"),
     "online_class": ("tutor_online_class",),
     "ai_chat": ("student_ai_mentor",),
     "stoody_pen": ("stoody_pen_capture",),
@@ -350,12 +350,16 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
         "/api/v1/ocr",
         "/api/v1/question-attempts",
     ),
-    "smartboard_core_dummy": (
+    "smartboard_core": (
         "/api/v1/smartboard",
+    ),
+    "smartboard_live_session": (
+        "/api/v1/smartboard/sessions",
         "/api/v1/smartboard-sessions",
     ),
-    "smartboard_token_dummy": (
+    "smartboard_cloud_access": (
         "/api/v1/smartboard/token",
+        "/api/v1/smartboard-pair",
     ),
     "admin_question_bank": (
         "/api/v1/questions",
@@ -396,6 +400,12 @@ ROLE_AWARE_PATH_PREFIXES: Dict[str, Dict[str, str]] = {
         "admin": "admin_leaderboard",
         "tutor": "tutor_leaderboard",
         "student": "student_leaderboard_view",
+    },
+    "/api/v1/ocr": {
+        "smartboard": "smartboard_cloud_access",
+    },
+    "/api/v1/notes": {
+        "smartboard": "smartboard_cloud_access",
     },
 }
 
@@ -478,17 +488,18 @@ def build_enabled_features_v2(
     raw_v2: Optional[Dict[str, Any]] = None,
     raw_legacy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    if isinstance(raw_v2, dict):
-        tier = normalize_tier(raw_v2.get("tier"))
+    migrated_v2 = _migrate_v2_overrides(raw_v2) if isinstance(raw_v2, dict) else None
+    if isinstance(migrated_v2, dict) and migrated_v2.get("overrides") is not None:
+        tier = normalize_tier(migrated_v2.get("tier"))
         overrides = {
             key: bool(value)
-            for key, value in (raw_v2.get("overrides") or {}).items()
+            for key, value in (migrated_v2.get("overrides") or {}).items()
             if key in FEATURE_CATALOG_BY_KEY
         }
-        if isinstance(raw_v2.get("effective"), dict):
+        if isinstance(migrated_v2.get("effective"), dict):
             effective = {
                 key: bool(value)
-                for key, value in raw_v2["effective"].items()
+                for key, value in migrated_v2["effective"].items()
                 if key in FEATURE_CATALOG_BY_KEY
             }
             if len(effective) < len(FEATURE_CATALOG_BY_KEY):
@@ -519,7 +530,8 @@ def merge_tenant_features(
     raw_features: Optional[Dict[str, Any]],
     raw_features_v2: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, bool]:
-    return build_enabled_features_v2(raw_features_v2, raw_features).get("effective", {})
+    migrated_legacy = migrate_feature_keys(raw_features)
+    return build_enabled_features_v2(raw_features_v2, migrated_legacy).get("effective", {})
 
 
 def is_feature_enabled(
@@ -551,7 +563,41 @@ def export_legacy_features(effective_features: Optional[Dict[str, Any]]) -> Dict
 _FEATURE_EXEMPT_PREFIXES: Tuple[str, ...] = (
     # Canvas page persistence is core data storage, not a gated pen-capture feature.
     "/api/v1/strokes/pages",
+    # Smartboard status endpoint is a public debug/config check.
+    "/api/v1/smartboard/status",
 )
+
+
+FEATURE_MIGRATION_MAP: Dict[str, str] = {
+    "smartboard_core_dummy": "smartboard_core",
+    "smartboard_live_session_dummy": "smartboard_live_session",
+    "smartboard_token_dummy": "smartboard_cloud_access",
+}
+
+
+def migrate_feature_keys(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(raw, dict):
+        return raw or {}
+    migrated = {}
+    for key, value in raw.items():
+        new_key = FEATURE_MIGRATION_MAP.get(key, key)
+        migrated[new_key] = value
+    return migrated
+
+
+def _migrate_v2_overrides(raw_v2: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(raw_v2, dict):
+        return raw_v2 or {}
+    migrated_overrides = migrate_feature_keys(raw_v2.get("overrides") or {})
+    migrated_effective = migrate_feature_keys(raw_v2.get("effective") or {})
+    result = {
+        "version": raw_v2.get("version", 2),
+        "tier": raw_v2.get("tier"),
+        "overrides": migrated_overrides,
+    }
+    if raw_v2.get("effective") is not None:
+        result["effective"] = migrated_effective
+    return result
 
 
 def required_feature_for_path(path: str, user_type: Optional[str] = None) -> Optional[str]:
@@ -566,11 +612,18 @@ def required_feature_for_path(path: str, user_type: Optional[str] = None) -> Opt
         if path.startswith(prefix):
             if role and role in role_map:
                 return role_map[role]
+            # Fallback to admin only for maps that include admin
             if "admin" in role_map:
                 return role_map["admin"]
-            return next(iter(role_map.values()), None)
+            # For role-specific maps (e.g., smartboard-only), if the
+            # caller's role isn't listed, skip this map and fall through.
+            continue
 
-    for feature_key, prefixes in FEATURE_PATH_PREFIXES.items():
+    for feature_key, prefixes in sorted(
+        FEATURE_PATH_PREFIXES.items(),
+        key=lambda kv: max(len(p) for p in kv[1]),
+        reverse=True,
+    ):
         for prefix in prefixes:
             if path.startswith(prefix):
                 return feature_key

@@ -5,6 +5,10 @@ info:
   description: |
     Read-oriented student and parent views over published ExamPen outcomes.
     Parent scope remains derived from Stoody relationships.
+
+    **IMPLEMENTATION STATUS (2026-05-02): MOUNTED.** Router at `/api/v1/student` in `evalpen_student_bff_async.py`.
+    The frontend consumes richer payloads than this spec currently documents (per-question scores
+    with reference answers, recheck status). Spec may need expansion to match actual response shapes.
 servers:
   - url: /
 security:

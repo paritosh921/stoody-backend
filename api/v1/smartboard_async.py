@@ -469,7 +469,10 @@ async def smartboard_websocket(
 ):
     """
     WebSocket endpoint for real-time pen data streaming
-    
+
+    Query params:
+    - token: JWT access token for authentication
+
     Message types:
     - pen_connect: Student pen connects to session
     - pen_stroke: Real-time stroke data from pen
@@ -479,6 +482,30 @@ async def smartboard_websocket(
     - question_end: Teacher ends question
     - student_submit: Student submits response
     """
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+
+    try:
+        auth_manager = websocket.app.state.auth
+        payload = auth_manager.decode_access_token(token)
+        if not payload:
+            await websocket.close(code=4001, reason="Invalid or expired token")
+            return
+
+        user_type = (payload.get("user_type") or "").lower()
+        if user_type not in ("tutor", "teacher", "admin"):
+            await websocket.close(code=4003, reason="Insufficient permissions")
+            return
+
+        user_id = payload.get("user_id") or payload.get("sub") or payload.get("tutor_id")
+        admin_id = payload.get("admin_id")
+    except Exception as e:
+        logger.warning(f"WebSocket auth rejected: {e}")
+        await websocket.close(code=4001, reason="Authentication failed")
+        return
+
     await websocket.accept()
     connection_tracked = False
     
@@ -490,8 +517,41 @@ async def smartboard_websocket(
         })
         await websocket.close()
         return
-    
+
     session = _sessions[session_id]
+
+    # Session ownership / tenant isolation check:
+    # The session creator (tutor_id) must match the caller's identity,
+    # or the caller must be an admin from the same tenant.
+    if user_type in ("tutor", "teacher"):
+        if user_id and str(user_id) != str(session.tutor_id):
+            await websocket.send_json({
+                "type": "error",
+                "message": "Not authorized for this session"
+            })
+            await websocket.close()
+            return
+    elif user_type == "admin":
+        db = websocket.app.state.db
+        try:
+            session_doc = await db.mongo_find_one(
+                "smartboard_sessions",
+                {"session_id": session_id, "admin_id": ObjectId(admin_id)},
+            )
+            if not session_doc:
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Not authorized for this session"
+                })
+                await websocket.close()
+                return
+        except Exception:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Authorization check failed"
+            })
+            await websocket.close()
+            return
     session.add_websocket(websocket)
     track_websocket_connection("smartboard", 1)
     connection_tracked = True

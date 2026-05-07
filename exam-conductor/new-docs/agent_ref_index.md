@@ -8,9 +8,9 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 
 | # | Boundary | Codebase Location | Tech | Notes |
 |---|----------|------------------|------|-------|
-| 1 | Backend + exam-conductor | `backend/` (includes `backend/exam-conductor/`) | Python 3.11, FastAPI, MongoDB | Core APIs, engines, gate. **BUILT.** |
-| 2 | Frontend | `frontend/` | React 18, TS, Vite, Tailwind | Tutor/student ExamPen UI. **NOT BUILT.** |
-| 3 | Super-Admin | `super-admin/` | Electron + React | Feature flag exists; ExamPen admin surface needed. See `integration/SUPERADMIN_SPEC.md`. |
+| 1 | Backend + exam-conductor | `backend/` (includes `backend/exam-conductor/`) | Python 3.11, FastAPI, MongoDB | Core APIs, engines, gate. **BUILT.** 18 routers mounted, `_evalpen_available = True`. |
+| 2 | Frontend | `frontend/` | React 18, TS, Vite, Tailwind | Teacher workspace, results, recheck, student portal, conversations **BUILT.** See `frontend/src/components/exam-pen/`. |
+| 3 | Super-Admin | `super-admin/` | Electron + React | Feature gate, hub provisioning, usage analytics **PARTIALLY BUILT.** See `super-admin/src/pages/ExamPenManagementPage.tsx`. |
 | 4 | ExamPen Hub (edge) | `stoody-multi-pen/HUB-exam-conductor/` | Python 3.12, Textual TUI, SQLite, systemd | Dedicated Pi edge device. Full runtime implemented (supervisor, BLE manager, pen sync, timer, uplink with dedup/retry/reconciliation, invig BLE commands, TUI). Code-smoke validated (33/33 py_compile, all imports clean). Production packaging, systemd installation, and hardware BLE validation pending. |
 
 ### Critical Folder Boundaries
@@ -37,6 +37,17 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 - `api/*.openapi.yaml`, `contracts/events/*.schema.json`, and `hub/*.md` override summary prose.
 - Root specs override chapters.
 - Current-state references override generic templates when the task is about matching existing Stoody behavior.
+
+## Known Drift (2026-05-02)
+
+Some tracker and chapter docs lag behind the current implementation. Active drifts:
+
+- **Frontend is ahead of older index/tracker wording.** The teacher workspace (5-tab model: Exams, Workspace, Results, Recheck, Conversations), student portal, and super-admin ExamPen management page are built and compiling. Some tracker docs still say "NOT BUILT" or omit these surfaces.
+- **Some frontend recheck/conversation flows exist before fully confirmed backend parity.** The frontend defines `RecheckStatus` (with required `submission_id`) and `ConversationThread` types, but backend recheck/conversation routers are not yet mounted. These are frontend-only contracts until backend endpoints are implemented.
+- **Plagiarism and analytics specs exist in authority docs** (`api/plagiarism.openapi.yaml`, `api/analytics.openapi.yaml`, chapters 13 and 15) but are not yet mounted backend surfaces.
+- **DCR question-region population is still pending.** `exampen_question_regions` collection is not populated end-to-end. DCR falls back to whole-page regions. See `BUILD_STATUS.md` Known Gaps.
+- **Hub runtime exists, but productionization remains pending.** Packaging, systemd installation, hardware BLE validation, and rollout verification are still open.
+- **Super-admin usage analytics is partial.** Tokens Today is real (from `evalpen/gate/usage/aggregate`). Per-tenant exam/submission counts require a new backend endpoint.
 
 ## Quick Task Router
 
@@ -78,6 +89,9 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 | `governance/FAILURE_MITIGATION_REGISTER.md` | AUTHORITATIVE | Failure modes and mitigation expectations. | Error handling and resilience work. |
 | `integration/SUPERADMIN_SPEC.md` | AUTHORITATIVE | Super-admin control surface for ExamPen (gate config, hub provisioning, usage analytics). | Super-admin or platform-level ExamPen work. |
 | `governance/DOCUMENTATION_PLAN.md` | PROCESS | Documentation templates, quality gates, chapter rules. | Editing docs or creating new ones. |
+| `chapters/09_TEACHER_BFF_DASHBOARD.md` | STATUS | Teacher workspace layout, tab model, pane structure, recheck/conversation UI. | Teacher frontend work. |
+| `chapters/10_STUDENT_BFF_PORTAL.md` | STATUS | Student portal: published exams, score breakdown, recheck requests, conversations. | Student frontend work. |
+| `chapters/12_MOBILE_APP.md` | STATUS | Mobile invigilator app: hub list, session dashboard, camera fallback. | Mobile app work. |
 | `chapters/BUILD_STATUS.md` | STATUS | Swarm task board, execution waves, and file-owned task packs. | Before claiming or sequencing work. |
 | `IMPLEMENTATION_PLAN.md` | STATUS | Upstream stack work sequencing (invigilator → hub → ingest → ready_for_eval). | Before claiming upstream tasks. Non-authoritative for contracts. |
 | `GUIDE_RULE_DOCS/*` | PROCESS/TEMPLATE | Reusable planning and design guidance. | Generic design/process guidance. |

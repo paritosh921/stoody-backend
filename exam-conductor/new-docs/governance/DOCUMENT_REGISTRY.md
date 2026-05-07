@@ -95,8 +95,12 @@ Promotion to `ACTIVE` requires:
 | `governance/TEST_SUITE_SPEC.md` | ACTIVE | R5 fix pass |
 | `governance/FAILURE_MITIGATION_REGISTER.md` | ACTIVE | R4 |
 | `governance/DOCUMENTATION_PLAN.md` | ACTIVE | R4 |
-| `chapters/BUILD_STATUS.md` | ACTIVE | 2026-03-24 |
-| `IMPLEMENTATION_PLAN.md` | ACTIVE | 2026-04-04 |
+| `chapters/BUILD_STATUS.md` | ACTIVE | 2026-05-02 |
+| `IMPLEMENTATION_PLAN.md` | ACTIVE | 2026-05-02 |
+| `chapters/09_TEACHER_BFF_DASHBOARD.md` | ACTIVE | 2026-05-02 |
+| `chapters/10_STUDENT_BFF_PORTAL.md` | ACTIVE | 2026-05-02 |
+| `chapters/12_MOBILE_APP.md` | ACTIVE | 2026-05-02 |
+| `integration/SUPERADMIN_SPEC.md` | ACTIVE | 2026-05-02 |
 | `api/*.openapi.yaml` | ACTIVE | R6 hardening pass |
 | `contracts/events/*.schema.json` | ACTIVE | R6 hardening pass |
 | `GUIDE_RULE_DOCS/*` | ACTIVE | retained as canonical process guidance |
@@ -109,5 +113,6 @@ Promotion to `ACTIVE` requires:
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-02 | Reconciled docs with current frontend/mobile/super-admin implementation. Promoted chapters 09, 10, 12 from DRAFT to ACTIVE. Updated BUILD_STATUS.md, IMPLEMENTATION_PLAN.md, SUPERADMIN_SPEC.md review dates. Added chapter docs to Current Status table. | Claude |
 | 2026-04-09 | Added explicit registry entries for `chapters/BUILD_STATUS.md` and `IMPLEMENTATION_PLAN.md` as status/execution documents. Added Conflict Resolution FAQ. Both docs marked as non-authoritative for architecture, API shape, schema shape, storage contracts, and lifecycle contracts. | Claude |
 | 2026-03-24 | Rebased document authority onto `new-docs`, added root DCR/PCR/gate/tamper specs, demoted legacy `.docx` and PCR v3 plan to historical reference, and made `GUIDE_RULE_DOCS/` the only canonical home for reusable process docs. | Codex |

@@ -46,6 +46,15 @@ class SchoolInfo(BaseModel):
     website: Optional[str] = None
 
 
+class SmartboardConfig(BaseModel):
+    """Smartboard institution-level configuration"""
+    enabled: bool = False
+    allow_cloud_features: bool = False
+    default_subject: Optional[str] = None
+    default_standard: Optional[str] = None
+    hub_mode_policy: Optional[str] = None
+
+
 class SchoolSettingsRequest(BaseModel):
     """Request model for updating school settings"""
     school_info: Optional[SchoolInfo] = None
@@ -55,6 +64,7 @@ class SchoolSettingsRequest(BaseModel):
     subjects: Optional[List[str]] = Field(None, description="List of subject names")
     plan_types: Optional[List[str]] = Field(None, description="List of plan types (e.g., CBSE, JEE)")
     streams: Optional[List[str]] = Field(None, description="List of streams (e.g., Science, Arts)")
+    smartboard: Optional[SmartboardConfig] = None
 
 
 class SchoolSettingsResponse(BaseModel):
@@ -67,6 +77,7 @@ class SchoolSettingsResponse(BaseModel):
     subjects: List[str]
     plan_types: List[str]
     streams: List[str]
+    smartboard: Optional[SmartboardConfig] = None
     updated_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
 
@@ -86,7 +97,14 @@ DEFAULT_SETTINGS = {
     "class_sections": {},
     "subjects": [],
     "plan_types": [],
-    "streams": []
+    "streams": [],
+    "smartboard": {
+        "enabled": False,
+        "allow_cloud_features": False,
+        "default_subject": None,
+        "default_standard": None,
+        "hub_mode_policy": None,
+    },
 }
 
 
@@ -182,6 +200,7 @@ async def get_school_settings(
             "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
             "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
             "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"]),
+            "smartboard": settings_doc.get("smartboard", DEFAULT_SETTINGS["smartboard"]),
             "created_at": settings_doc.get("created_at"),
             "updated_at": settings_doc.get("updated_at")
         }
@@ -277,6 +296,12 @@ async def update_school_settings(
         update_doc["subjects"] = settings_data.subjects if settings_data.subjects is not None else (existing_settings.get("subjects", DEFAULT_SETTINGS["subjects"]) if existing_settings else DEFAULT_SETTINGS["subjects"])
         update_doc["plan_types"] = settings_data.plan_types if settings_data.plan_types is not None else (existing_settings.get("plan_types", DEFAULT_SETTINGS["plan_types"]) if existing_settings else DEFAULT_SETTINGS["plan_types"])
         update_doc["streams"] = settings_data.streams if settings_data.streams is not None else (existing_settings.get("streams", DEFAULT_SETTINGS["streams"]) if existing_settings else DEFAULT_SETTINGS["streams"])
+
+        # Update smartboard config if provided
+        if settings_data.smartboard is not None:
+            update_doc["smartboard"] = settings_data.smartboard.dict()
+        else:
+            update_doc["smartboard"] = existing_settings.get("smartboard", DEFAULT_SETTINGS["smartboard"]) if existing_settings else DEFAULT_SETTINGS["smartboard"]
         
         # Upsert settings
         await db.mongo_update_one(
@@ -300,6 +325,7 @@ async def update_school_settings(
             "subjects": update_doc["subjects"],
             "plan_types": update_doc["plan_types"],
             "streams": update_doc["streams"],
+            "smartboard": update_doc.get("smartboard", DEFAULT_SETTINGS["smartboard"]),
             "created_at": update_doc["created_at"],
             "updated_at": update_doc["updated_at"]
         }

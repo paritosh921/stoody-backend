@@ -5,6 +5,10 @@ info:
   description: |
     Aggregated teacher-facing APIs over exam operations, DCR/PCR results, review state, and analytics.
     This BFF is read-oriented over backing domains and must not become a second evaluator.
+
+    **IMPLEMENTATION STATUS (2026-05-02): MOUNTED.** Router at `/api/v1/teacher` in `evalpen_teacher_bff_async.py`.
+    The frontend consumes richer payloads than this spec currently documents (submission queue with
+    status counts, recheck/conversation data). Spec may need expansion to match actual response shapes.
 servers:
   - url: /
 security:

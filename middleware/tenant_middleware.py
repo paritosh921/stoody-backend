@@ -134,7 +134,13 @@ class TenantMiddleware(BaseHTTPMiddleware):
                         user_data.get("user_type") in {"admin", "tutor", "student"}
                         and user_data.get("tenant_id")
                     )
-                    required_feature = required_feature_for_path(path, user_data.get("user_type"))
+                    # For role-aware feature gating, include device context.
+                    # Smartboard devices use "smartboard" as a pseudo-role for
+                    # OCR/notes path resolution.
+                    effective_role = user_data.get("user_type") or ""
+                    if user_data.get("device") == "smartboard":
+                        effective_role = "smartboard"
+                    required_feature = required_feature_for_path(path, effective_role)
 
                     # Fetch tenant doc for all authenticated tenant users
                     # (needed for platform_suspended check + feature gating)

@@ -5,6 +5,10 @@ info:
   description: |
     Read-only analytics APIs over finalized DCR and PCR outputs.
     Analytics is downstream of evaluation and publication; it does not own engine state.
+
+    **IMPLEMENTATION STATUS (2026-05-02): PENDING.** No backend router is mounted for these
+    endpoints. The super-admin frontend shows partial usage data (token usage today) from
+    the evalpen usage aggregate API. Per-exam analytics and leaderboards are not implemented.
 servers:
   - url: /
 security:

@@ -16,6 +16,10 @@ info:
     All endpoints require admin, tutor, or b2c_admin role (StoodyBearer JWT).
     Score overrides and flag resolutions follow TAMPER_PROOF_SPEC Layer 3
     (append-only audit trail with actor_id, reason, before/after, timestamp).
+
+    **IMPLEMENTATION STATUS (2026-05-02): MOUNTED.** Both review and flagged routers
+    are mounted in `main_async.py`. Frontend `ExamResults.tsx` and `RecheckTab.tsx`
+    consume these endpoints.
 servers:
   - url: /
 security:

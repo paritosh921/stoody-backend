@@ -127,11 +127,13 @@ async def get_tutor_id_from_token(request: Request) -> str:
     # Decode the JWT to get tutor_id
     auth_manager: AuthManager = request.app.state.auth
     try:
-        payload = await auth_manager.decode_token(token)
-        tutor_id = payload.get("tutor_id") or payload.get("user_id")
+        payload = auth_manager.decode_access_token(token)
+        tutor_id = payload.get("tutor_id") or payload.get("user_id") or payload.get("sub")
         if not tutor_id:
             raise HTTPException(status_code=401, detail="Token does not contain tutor information")
         return tutor_id
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Token decode failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid or expired token")

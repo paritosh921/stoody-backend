@@ -1,7 +1,7 @@
 # Chapter 10: Student BFF and Portal
 
 ## Status
-- **Build status:** DRAFT
+- **Build status:** ACTIVE — substantially implemented in `frontend/src/components/exam-pen/ExamPenStudent.tsx`
 - **Authority source:** `integration/STOODY_INTEGRATION_SPEC.md`
 
 ## Overview
@@ -14,11 +14,33 @@ Student-facing ExamPen behavior is read-oriented. Students view published outcom
 ╠══════════════════════════════════════════════════════════════╣
 ║ Published Exam List                                         ║
 ║   ├─ Score Card / Breakdown                                 ║
-║   ├─ Recheck / Flag Visibility                              ║
+║   ├─ Per-Question Score + Reference Answer                  ║
+║   ├─ Recheck Request Dialog                                 ║
 ║   ├─ Teacher Feedback                                       ║
 ║   └─ Student-Teacher Conversation                           ║
 ╚══════════════════════════════════════════════════════════════╝
 ```
+
+## Implementation Status
+
+The following student surfaces are implemented in `frontend/src/components/exam-pen/`:
+
+| Section | Component | Status | Notes |
+|---|---|---|---|
+| Published exam list | `ExamPenStudent.tsx` | **Built** | Fetches via `exampenAPI.getStudentExamsV2()` |
+| Score card with total + percentage | `EnhancedScoreCard` (inline) | **Built** | Expands to per-question breakdown |
+| Per-question breakdown | Inline in `EnhancedScoreCard` | **Built** | Shows score, max score, reference answer, confidence, recheck status badge |
+| Recheck request | `RecheckRequestDialog.tsx` | **Built** | Per-question dialog for requesting re-evaluation |
+| Recheck status badges | Shared `RECHECK_STATUS` from `examPenStatus.ts` | **Built** | open, under_review, resolved_* |
+| Teacher recheck response | Inline in question breakdown | **Built** | Shows teacher response text when recheck is resolved |
+| Conversation threads | `StudentConversationList.tsx` | **Built** | Thread list + detail with message bubbles, send, resolve |
+| Status module | `examPenStatus.ts` | **Built** | `RECHECK_STATUS`, `CONVERSATION_STATUS` shared maps |
+
+**Backend gaps (UI ahead of mounted routes):**
+- `exampenAPI.getStudentExamsV2()` — endpoint must be confirmed mounted
+- `exampenAPI.getExamScoresV2()` — endpoint must be confirmed mounted
+- `exampenAPI.createRecheckRequest()` — backend recheck router not yet mounted
+- `exampenAPI.getConversationThreads()` — backend conversation router not yet mounted
 
 ## Student Implementation Sections
 

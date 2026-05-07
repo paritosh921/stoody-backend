@@ -25,6 +25,7 @@ from slowapi.util import get_remote_address
 
 from api.v1.auth_async import get_current_user
 from core.auth import AuthManager
+from core.tenant_features import is_feature_enabled, merge_tenant_features
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +67,17 @@ class TutorIdentity(BaseModel):
     tenant_id: Optional[str] = None
 
 
+class CloudCapabilities(BaseModel):
+    smartboard_core: bool = False
+    smartboard_live_session: bool = False
+    smartboard_cloud_access: bool = False
+
+
 class RedeemPairCodeResponse(BaseModel):
     access_token: str
     expires_at: str  # ISO-8601 UTC
     tutor: TutorIdentity
+    capabilities: CloudCapabilities = CloudCapabilities()
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +172,17 @@ async def register_pair_code(
     Tutor calls this from their phone. Returns a 6-digit code (5-min TTL)
     that the smartboard tablet redeems for an 8-hour JWT.
     """
+    # Feature gate: smartboard_cloud_access must be enabled
+    if not is_feature_enabled(
+        current_user.get("enabled_features"),
+        "smartboard_cloud_access",
+        current_user.get("enabled_features_v2"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Smartboard cloud access is not enabled for your institution",
+        )
+
     redis = _redis_client(request)
     if redis is None:
         raise HTTPException(
@@ -332,6 +351,17 @@ async def redeem_pair_code(
     )
     expires_at = datetime.now(timezone.utc) + expires_delta
 
+    # Compute capabilities from the tutor's tenant feature state.
+    raw_features = identity.get("enabled_features")
+    raw_features_v2 = identity.get("enabled_features_v2")
+    merged = merge_tenant_features(raw_features, raw_features_v2)
+
+    capabilities = CloudCapabilities(
+        smartboard_core=bool(merged.get("smartboard_core", False)),
+        smartboard_live_session=bool(merged.get("smartboard_live_session", False)),
+        smartboard_cloud_access=bool(merged.get("smartboard_cloud_access", False)),
+    )
+
     logger.info("[SBPAIR] Code %s redeemed for tutor %s", code, tutor_id)
 
     return RedeemPairCodeResponse(
@@ -343,4 +373,5 @@ async def redeem_pair_code(
             email=str(identity.get("email") or ""),
             tenant_id=identity.get("tenant_id"),
         ),
+        capabilities=capabilities,
     )

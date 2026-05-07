@@ -190,4 +190,35 @@ Data sources:
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-02 | Added §9 implementation status. Marked implemented surfaces. Added pending items for hub detail, decommission, richer analytics, platform caps. | Claude |
 | 2026-04-09 | Resolved provisioning contract authority: split into two-party flow (super-admin creates code, admin consumes it at `POST /api/v1/hubs/provision`). Added §5.3 with explicit hub-facing endpoint. Aligned response fields with HUB_DEPLOYMENT_SPEC §7. | Claude |
+
+---
+
+## 9. Implementation Status (2026-05-02)
+
+The following super-admin ExamPen surfaces are implemented in `super-admin/src/`:
+
+### Implemented
+
+| Surface | Component / API | Status |
+|---|---|---|
+| Feature gate (exampen enable/disable per tenant) | `ExamPenManagementPage.tsx` → `updateTenantFeaturesV2()` | **Built** |
+| Hub fleet listing | `listProvisionedHubs()` → `GET /superadmin/evalpen/hubs` | **Built** |
+| Hub provision code generation | `generateHubProvisionCode()` → `POST /superadmin/evalpen/hubs/provision-code` | **Built** |
+| Per-hub display in UI | Hub list with status badges, last-seen dates | **Built** |
+| Provision code copy-to-clipboard | Button in `ExamPenManagementPage.tsx` | **Built** |
+| Token usage (today) | `getEvalPenUsageAggregate()` → `GET /superadmin/evalpen/gate/usage/aggregate` | **Built** |
+| Gate tenant listing | `GET /superadmin/evalpen/gate/tenants` | Backend exists, not yet wired in UI |
+| Gate tenant config override | `PUT /superadmin/evalpen/gate/tenants/{id}/config` | Backend exists, not yet wired in UI |
+
+### Pending (spec defined but not implemented)
+
+| Item | Spec Reference | Status |
+|---|---|---|
+| Per-hub detail endpoint | §5.2 `GET /superadmin/evalpen/hubs/{hub_id}` | **Not implemented** |
+| Hub decommission endpoint | §5.2 `DELETE /superadmin/evalpen/hubs/{hub_id}` | **Not implemented** |
+| Per-tenant exam/submission count analytics | §6 | **Not implemented** — requires new backend endpoint |
+| Platform-wide budget cap administration | §4.2 | **Not implemented** |
+| Top callers (DCR/PCR/practice token breakdown) | §6 | **Not implemented** |
+| Exam throughput across platform | §6 | **Not implemented** |

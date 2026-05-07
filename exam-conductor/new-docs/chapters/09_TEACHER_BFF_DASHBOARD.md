@@ -1,7 +1,7 @@
 # Chapter 09: Teacher BFF and Dashboard
 
 ## Status
-- **Build status:** DRAFT
+- **Build status:** ACTIVE — substantially implemented in `frontend/src/components/exam-pen/`
 - **Authority source:** `integration/STOODY_INTEGRATION_SPEC.md`
 
 ## Overview
@@ -354,15 +354,29 @@ This right-side inspector should feel like a code editor inspector panel rather 
 
 ### Build Phases For AI Agent
 
-| Phase | Scope |
-|---|---|
-| 1 | Replace tabs with `Exams`, `Workspace`, `Results`, `Recheck` |
-| 2 | Build the empty `Workspace` shell and header |
-| 3 | Add student explorer pane |
-| 4 | Add question paper viewer + student copy viewer |
-| 5 | Add question score / AI inspector cards |
-| 6 | Surface invigilator setup inside workspace header or panel |
-| 7 | Connect blocked/recheck flows back into workspace context |
+| Phase | Scope | Implementation Status |
+|---|---|---|
+| 1 | Replace tabs with `Exams`, `Workspace`, `Results`, `Recheck` | **DONE** — 5 tabs implemented (Exams, Workspace, Results, Recheck, Conversations) |
+| 2 | Build the empty `Workspace` shell and header | **DONE** — `TeacherWorkspace.tsx`, `WorkspaceHeader.tsx` |
+| 3 | Add student explorer pane | **DONE** — `StudentExplorerPane.tsx` with roster names, status filters, source tags |
+| 4 | Add question paper viewer + student copy viewer | **DONE** — `QuestionPaperPane.tsx`, `StudentCopyPane.tsx` with page thumbnails |
+| 5 | Add question score / AI inspector cards | **DONE** — `QuestionInspectorPane.tsx`, `QuestionScoreCard.tsx` with reference answers, confidence |
+| 6 | Surface invigilator setup inside workspace header or panel | **DONE** — `InvigilatorSetupPanel.tsx`, `WorkspaceSetupPanel.tsx` |
+| 7 | Connect blocked/recheck flows back into workspace context | **DONE** — `RecheckTab.tsx`, `RecheckRequestsPanel.tsx` with `openInWorkspace()` jumping to exact submission context |
+
+**Additionally implemented (not in original phases):**
+- `CollectionMonitor.tsx` — mounted in workspace via Review/Collection tab switcher
+- `ConversationTab.tsx` — teacher-side conversation thread management
+- `ExamPenReadinessIndicator.tsx` — mounted in `DocumentDetailPanel.tsx` for exam-mode documents
+- `PublishSummaryBar.tsx` — batch publish from results
+- `PublishAuditLog.tsx` — publish audit entries
+- `EmptyWorkspaceState.tsx` — empty state when no exam selected
+- Shared status module `frontend/src/utils/examPenStatus.ts` — `EXAMPEN_STATUS`, `RECHECK_STATUS`, `CONVERSATION_STATUS` maps
+
+**Backend gaps (UI ahead of mounted routes):**
+- Recheck request backend endpoints (`GET/POST /evalpen/recheck/requests`) are not yet mounted
+- Conversation thread backend endpoints (`GET/POST /evalpen/conversations/*`) are not yet mounted
+- Roster API (`getExamRoster`) is not confirmed mounted — student names may fall back to IDs
 
 ### File-Level Handoff
 
