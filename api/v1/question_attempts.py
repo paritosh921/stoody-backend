@@ -1,13 +1,18 @@
 """
 Question Attempt API
 
-This module handles question lock sessions and response collection.
+QLock (Question Lock) sessions for SmartBoard.
 When a teacher locks a question, all connected pens are tracked and their
 strokes are tagged with the question_attempt_id for later collection.
+
+Auth: Accepts SmartBoard cloud JWT via Authorization: Bearer header.
+Tenant isolation enforced via JWT claims.
+Feature gating: smartboard_cloud_access required.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -16,22 +21,80 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .dashboard import dashboard_ws_manager
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/question-attempts", tags=["question-attempts"])
+router = APIRouter(prefix="/api/v1/question-attempts", tags=["question-attempts"])
 
-# Storage path for question attempts
 ATTEMPTS_DIR = Path(__file__).resolve().parents[2] / "data" / "question_attempts"
+
+EVAL_CONCURRENCY = 4
+
+
+def _verify_tenant(attempt: QuestionAttempt, user: dict):
+    """Raise 403 if the authenticated user's tenant does not own this attempt."""
+    attempt_tenant = attempt.tenant_id
+    user_tenant = user.get("tenant_id") or user.get("db_name")
+    if attempt_tenant and user_tenant and attempt_tenant != user_tenant:
+        raise HTTPException(status_code=403, detail="Tenant mismatch — access denied")
 
 
 def ensure_attempts_dir():
-    """Ensure the attempts directory exists."""
     ATTEMPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_app_state():
+    from main_async import app
+    return app.state
+
+
+async def _require_smartboard_auth(request: Request) -> dict:
+    from api.v1.auth_async import get_current_user
+    from core.tenant_features import is_feature_enabled
+    from fastapi.security import HTTPBearer
+
+    security = HTTPBearer()
+    try:
+        credentials = await security(request)
+        user = await get_current_user(request, credentials, get_app_state().auth)
+    except Exception:
+        raise HTTPException(status_code=401, detail="SmartBoard JWT required")
+
+    if not is_feature_enabled(
+        user.get("enabled_features"),
+        "smartboard_cloud_access",
+        user.get("enabled_features_v2"),
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Smartboard cloud access not enabled for this institution",
+        )
+
+    user_type = (user.get("user_type") or user.get("role") or "").lower()
+    if user_type not in ("tutor", "teacher", "admin"):
+        raise HTTPException(status_code=403, detail="Only tutors/teachers can use QLock")
+
+    return user
+
+
+async def _resolve_tenant_db(user: dict):
+    """Resolve the tenant database for LLM gate routing."""
+    db_name = user.get("db_name") or user.get("tenant_id")
+    if not db_name:
+        return None
+
+    try:
+        db_manager = getattr(get_app_state(), "db", None)
+        if db_manager:
+            return await db_manager.get_tenant_db(db_name)
+    except Exception as exc:
+        logger.warning("[QLock] Could not resolve tenant DB for gate routing: %s", exc)
+
+    return None
 
 
 # --- Data Models ---
@@ -47,7 +110,8 @@ class CreateQuestionAttemptRequest(BaseModel):
     question_text: str
     question_image_b64: Optional[str] = None
     bounds: Optional[QuestionBounds] = None
-    auto_collect_after_ms: int = Field(default=120000, ge=30000, le=600000)  # 30s to 10min
+    duration: int = Field(default=120, ge=30, le=600)
+    pen_ids: List[str] = Field(default_factory=list)
 
 
 class EndQuestionAttemptRequest(BaseModel):
@@ -73,10 +137,13 @@ class QuestionAttempt(BaseModel):
     bounds: Optional[QuestionBounds] = None
     lock_ts: float
     end_ts: Optional[float] = None
-    auto_collect_after_ms: int = 120000
+    duration: int = 120
     status: Literal['active', 'collecting', 'completed'] = 'active'
     connected_pens: List[str] = Field(default_factory=list)
     pen_responses: Dict[str, PenResponseStatus] = Field(default_factory=dict)
+    ai_solution: Optional[str] = None
+    ai_final_answer: Optional[str] = None
+    tenant_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -85,7 +152,7 @@ class QuestionAttemptResponse(BaseModel):
     question_text: str
     lock_ts: float
     end_ts: Optional[float] = None
-    auto_collect_after_ms: int
+    duration: int
     status: str
     connected_pens: List[str]
     pen_responses: Dict[str, PenResponseStatus]
@@ -109,25 +176,49 @@ class TaggedStroke(BaseModel):
     book_type: Optional[str] = None
 
 
-# --- In-Memory Storage (will be persisted to disk) ---
+class EvaluationResult(BaseModel):
+    success: bool
+    pen_id: str
+    score: Optional[str] = None
+    extracted_answer: Optional[str] = None
+    correct_answer: Optional[str] = None
+    feedback: Optional[str] = None
+    ai_solution: Optional[str] = None
+    error: Optional[str] = None
 
-# Active question attempts
+
+class EvaluateRequest(BaseModel):
+    pen_id: str
+    answer_image_b64: str
+
+
+class EvaluateAllRequest(BaseModel):
+    pen_images: Dict[str, str]
+
+
+class EvaluateAllResponse(BaseModel):
+    success: bool
+    attempt_id: str
+    results: Dict[str, EvaluationResult]
+    errors: Optional[List[str]] = None
+
+
+class GenerateSolutionResponse(BaseModel):
+    success: bool
+    attempt_id: str
+    solution: Optional[str] = None
+    final_answer: Optional[str] = None
+    error: Optional[str] = None
+
+
+# --- In-Memory Storage ---
+
 _active_attempts: Dict[str, QuestionAttempt] = {}
-
-# Mapping of pen_id -> active attempt_id (for stroke tagging)
 _pen_to_attempt: Dict[str, str] = {}
-
-# Strokes tagged with question_attempt_id
 _attempt_strokes: Dict[str, List[Dict[str, Any]]] = {}
 
 
-def get_app_state():
-    from main_async import app
-    return app.state
-
-
 def _save_attempt(attempt: QuestionAttempt):
-    """Save attempt to disk."""
     ensure_attempts_dir()
     filepath = ATTEMPTS_DIR / f"{attempt.id}.json"
     with open(filepath, "w") as f:
@@ -135,7 +226,6 @@ def _save_attempt(attempt: QuestionAttempt):
 
 
 def _load_attempt(attempt_id: str) -> Optional[QuestionAttempt]:
-    """Load attempt from disk."""
     filepath = ATTEMPTS_DIR / f"{attempt_id}.json"
     if filepath.exists():
         with open(filepath, "r") as f:
@@ -144,18 +234,16 @@ def _load_attempt(attempt_id: str) -> Optional[QuestionAttempt]:
     return None
 
 
-# --- Public API for stroke tagging (used by pen_workers) ---
+# --- Public API for stroke tagging ---
 
 def get_active_attempt_for_pen(pen_id: str) -> Optional[str]:
-    """Get the active question attempt ID for a pen, if any."""
     return _pen_to_attempt.get(pen_id)
 
 
 def add_stroke_to_attempt(attempt_id: str, stroke: Dict[str, Any], pen_id: str, page_no: int):
-    """Add a stroke to an active attempt."""
     if attempt_id not in _attempt_strokes:
         _attempt_strokes[attempt_id] = []
-    
+
     stroke_with_meta = {
         **stroke,
         "question_attempt_id": attempt_id,
@@ -163,8 +251,7 @@ def add_stroke_to_attempt(attempt_id: str, stroke: Dict[str, Any], pen_id: str, 
         "page_no": page_no,
     }
     _attempt_strokes[attempt_id].append(stroke_with_meta)
-    
-    # Update pen response tracking
+
     if attempt_id in _active_attempts:
         attempt = _active_attempts[attempt_id]
         if pen_id in attempt.pen_responses:
@@ -175,7 +262,6 @@ def add_stroke_to_attempt(attempt_id: str, stroke: Dict[str, Any], pen_id: str, 
 
 
 def get_strokes_for_attempt(attempt_id: str, pen_id: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all strokes for an attempt, optionally filtered by pen_id."""
     strokes = _attempt_strokes.get(attempt_id, [])
     if pen_id:
         strokes = [s for s in strokes if s.get("pen_id") == pen_id]
@@ -186,73 +272,64 @@ def get_strokes_for_attempt(attempt_id: str, pen_id: Optional[str] = None) -> Li
 
 @router.post("", response_model=QuestionAttemptResponse)
 async def create_question_attempt(
+    request: Request,
     payload: CreateQuestionAttemptRequest,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
 ):
-    """
-    Create a new question attempt (lock a question).
-    All connected pens will be tracked for this question.
-    """
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
-    # Get all connected pens (may be empty if no pens connected yet)
-    pens_data = await state.dashboard_registry.list_pen_states()
-    connected_pens = [p["pen_id"] for p in pens_data if p.get("connected")]
-    
-    # Note: We allow creating attempts with 0 pens - pens can join later
-    # This supports the "teacher prep" workflow where question is locked before students start
-    
-    # Create new attempt
+    user = await _require_smartboard_auth(request)
+
+    connected_pens = payload.pen_ids
+    if not connected_pens:
+        try:
+            state = get_app_state()
+            pens_data = await state.dashboard_registry.list_pen_states()
+            connected_pens = [p["pen_id"] for p in pens_data if p.get("connected")]
+        except Exception:
+            connected_pens = []
+
     attempt_id = f"qa-{uuid4().hex[:12]}"
-    now = time.time() * 1000  # milliseconds
-    
+    now = time.time() * 1000
+
     attempt = QuestionAttempt(
         id=attempt_id,
         question_text=payload.question_text,
         question_image_b64=payload.question_image_b64,
         bounds=payload.bounds,
         lock_ts=now,
-        auto_collect_after_ms=payload.auto_collect_after_ms,
+        duration=payload.duration,
         status='active',
         connected_pens=connected_pens,
         pen_responses={
             pen_id: PenResponseStatus(pen_id=pen_id)
             for pen_id in connected_pens
         },
+        tenant_id=user.get("tenant_id") or user.get("db_name"),
     )
-    
-    # Store in memory
+
     _active_attempts[attempt_id] = attempt
     _attempt_strokes[attempt_id] = []
-    
-    # Map all connected pens to this attempt (for stroke tagging)
+
     for pen_id in connected_pens:
         _pen_to_attempt[pen_id] = attempt_id
-    
-    # Save to disk
+
     _save_attempt(attempt)
-    
-    # Broadcast to all connected frontends
+
     await dashboard_ws_manager.broadcast({
         "type": "question_lock",
         "attempt_id": attempt_id,
         "question_text": payload.question_text,
         "lock_ts": now,
-        "auto_collect_after_ms": payload.auto_collect_after_ms,
+        "duration": payload.duration,
         "connected_pens": connected_pens,
     })
-    
-    logger.info(f"Created question attempt {attempt_id} with {len(connected_pens)} pens")
-    
+
+    logger.info(f"[QLock] Created attempt {attempt_id} with {len(connected_pens)} pens")
+
     return QuestionAttemptResponse(
         id=attempt.id,
         question_text=attempt.question_text,
         lock_ts=attempt.lock_ts,
         end_ts=attempt.end_ts,
-        auto_collect_after_ms=attempt.auto_collect_after_ms,
+        duration=attempt.duration,
         status=attempt.status,
         connected_pens=attempt.connected_pens,
         pen_responses=attempt.pen_responses,
@@ -260,26 +337,21 @@ async def create_question_attempt(
 
 
 @router.get("/{attempt_id}", response_model=QuestionAttemptResponse)
-async def get_question_attempt(
-    attempt_id: str,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
-):
-    """Get the status of a question attempt."""
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
+async def get_question_attempt(request: Request, attempt_id: str):
+    user = await _require_smartboard_auth(request)
+
     attempt = _active_attempts.get(attempt_id) or _load_attempt(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
+
+    _verify_tenant(attempt, user)
+
     return QuestionAttemptResponse(
         id=attempt.id,
         question_text=attempt.question_text,
         lock_ts=attempt.lock_ts,
         end_ts=attempt.end_ts,
-        auto_collect_after_ms=attempt.auto_collect_after_ms,
+        duration=attempt.duration,
         status=attempt.status,
         connected_pens=attempt.connected_pens,
         pen_responses=attempt.pen_responses,
@@ -288,56 +360,46 @@ async def get_question_attempt(
 
 @router.post("/{attempt_id}/end")
 async def end_question_attempt(
+    request: Request,
     attempt_id: str,
     payload: EndQuestionAttemptRequest,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
 ):
-    """
-    End a question attempt (stop collecting responses).
-    This marks any unsubmitted pens as 'timeout'.
-    """
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
+    user = await _require_smartboard_auth(request)
+
     attempt = _active_attempts.get(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
+
+    _verify_tenant(attempt, user)
+
     if attempt.status != 'active':
         raise HTTPException(status_code=400, detail="Question attempt is not active")
-    
-    # Mark as completed
+
     now = time.time() * 1000
     attempt.end_ts = now
     attempt.status = 'completed'
-    
-    # Mark unsubmitted pens as timeout
+
     for pen_id, response in attempt.pen_responses.items():
         if response.status == 'writing':
             response.status = 'timeout'
             response.submit_ts = now
-    
-    # Remove pen-to-attempt mappings
+
     for pen_id in attempt.connected_pens:
         if _pen_to_attempt.get(pen_id) == attempt_id:
             del _pen_to_attempt[pen_id]
-    
-    # Save to disk
+
     _save_attempt(attempt)
-    
-    # Broadcast end
+
     await dashboard_ws_manager.broadcast({
         "type": "question_end",
         "attempt_id": attempt_id,
         "reason": payload.reason,
         "end_ts": now,
     })
-    
+
     strokes = get_strokes_for_attempt(attempt_id)
-    logger.info(f"Ended question attempt {attempt_id}: {len(strokes)} strokes collected")
-    
+    logger.info(f"[QLock] Ended attempt {attempt_id}: {len(strokes)} strokes collected")
+
     return {
         "status": "ok",
         "attempt_id": attempt_id,
@@ -349,53 +411,42 @@ async def end_question_attempt(
 
 @router.post("/{attempt_id}/submit")
 async def submit_response(
+    request: Request,
     attempt_id: str,
     payload: SubmitResponseRequest,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
 ):
-    """
-    Mark a student's response as submitted.
-    Called when student taps submit button or double-tap is detected.
-    """
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
+    user = await _require_smartboard_auth(request)
+
     attempt = _active_attempts.get(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
+
+    _verify_tenant(attempt, user)
+
     if attempt.status != 'active':
         raise HTTPException(status_code=400, detail="Question attempt is not active")
-    
+
     if payload.pen_id not in attempt.pen_responses:
         raise HTTPException(status_code=400, detail="Pen not part of this question attempt")
-    
-    # Mark as submitted
+
     now = time.time() * 1000
     response = attempt.pen_responses[payload.pen_id]
     response.status = 'submitted'
     response.submit_ts = now
-    
-    # Remove pen from active tracking
+
     if _pen_to_attempt.get(payload.pen_id) == attempt_id:
         del _pen_to_attempt[payload.pen_id]
-    
-    # Save to disk
+
     _save_attempt(attempt)
-    
-    # Broadcast submit
+
     await dashboard_ws_manager.broadcast({
         "type": "student_submit",
         "attempt_id": attempt_id,
         "pen_id": payload.pen_id,
         "submit_ts": now,
     })
-    
+
     strokes = get_strokes_for_attempt(attempt_id, payload.pen_id)
-    logger.info(f"Pen {payload.pen_id} submitted for attempt {attempt_id}: {len(strokes)} strokes")
-    
     return {
         "status": "ok",
         "pen_id": payload.pen_id,
@@ -405,35 +456,24 @@ async def submit_response(
 
 
 @router.get("/{attempt_id}/strokes")
-async def get_attempt_strokes(
-    attempt_id: str,
-    pen_id: Optional[str] = None,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
-):
-    """
-    Get all strokes collected for a question attempt.
-    Optionally filter by pen_id.
-    Returns strokes grouped by page number.
-    """
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
+async def get_attempt_strokes(request: Request, attempt_id: str, pen_id: Optional[str] = None):
+    user = await _require_smartboard_auth(request)
+
     attempt = _active_attempts.get(attempt_id) or _load_attempt(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
+
+    _verify_tenant(attempt, user)
+
     strokes = get_strokes_for_attempt(attempt_id, pen_id)
-    
-    # Group by page
+
     by_page: Dict[int, List[Dict[str, Any]]] = {}
     for stroke in strokes:
         page = stroke.get("page_no", 0)
         if page not in by_page:
             by_page[page] = []
         by_page[page].append(stroke)
-    
+
     return {
         "attempt_id": attempt_id,
         "pen_id": pen_id,
@@ -443,178 +483,171 @@ async def get_attempt_strokes(
     }
 
 
-class EvaluateRequest(BaseModel):
-    pen_id: str
-    answer_image_b64: str  # Base64 PNG of rendered strokes
+@router.post("/{attempt_id}/generate-solution", response_model=GenerateSolutionResponse)
+async def generate_solution(request: Request, attempt_id: str):
+    user = await _require_smartboard_auth(request)
 
-
-class EvaluationResult(BaseModel):
-    success: bool
-    pen_id: str
-    score: Optional[Literal['correct', 'incorrect', 'partial']] = None
-    extracted_answer: Optional[str] = None
-    feedback: Optional[str] = None
-    error: Optional[str] = None
-
-
-@router.post("/{attempt_id}/evaluate", response_model=EvaluationResult)
-async def evaluate_response(
-    attempt_id: str,
-    payload: EvaluateRequest,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
-):
-    """
-    Evaluate a student's response using AI.
-    
-    Expects:
-    - pen_id: Which student's response to evaluate
-    - answer_image_b64: Base64 PNG of the student's rendered strokes
-    
-    Returns:
-    - score: 'correct', 'incorrect', or 'partial'
-    - extracted_answer: What the AI read from the handwriting
-    - feedback: Brief feedback for the student
-    """
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
-    # Get the attempt
     attempt = _active_attempts.get(attempt_id) or _load_attempt(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
-    if payload.pen_id not in attempt.pen_responses:
-        raise HTTPException(status_code=400, detail="Pen not part of this question attempt")
-    
-    # Get the question text
-    question_text = attempt.question_text
-    
-    # Import OCR service and evaluate
+
+    _verify_tenant(attempt, user)
+
+    if attempt.ai_solution:
+        return GenerateSolutionResponse(
+            success=True,
+            attempt_id=attempt_id,
+            solution=attempt.ai_solution,
+            final_answer=attempt.ai_final_answer,
+        )
+
     from core.ocr_service import get_ocr_service
     ocr_service = get_ocr_service()
-    
+    tenant_db = await _resolve_tenant_db(user)
+
+    try:
+        result = await ocr_service.generate_solution(
+            question_text=attempt.question_text,
+            question_image_b64=attempt.question_image_b64,
+            tenant_db=tenant_db,
+        )
+    except Exception as e:
+        logger.error(f"[QLock] Solution generation failed: {e}")
+        return GenerateSolutionResponse(
+            success=False,
+            attempt_id=attempt_id,
+            error=str(e),
+        )
+
+    if result.get("success"):
+        attempt.ai_solution = result.get("solution")
+        attempt.ai_final_answer = result.get("final_answer")
+        _save_attempt(attempt)
+
+    return GenerateSolutionResponse(
+        success=result.get("success", False),
+        attempt_id=attempt_id,
+        solution=result.get("solution"),
+        final_answer=result.get("final_answer"),
+        error=result.get("error"),
+    )
+
+
+@router.post("/{attempt_id}/evaluate", response_model=EvaluationResult)
+async def evaluate_response(request: Request, attempt_id: str, payload: EvaluateRequest):
+    user = await _require_smartboard_auth(request)
+
+    attempt = _active_attempts.get(attempt_id) or _load_attempt(attempt_id)
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Question attempt not found")
+
+    _verify_tenant(attempt, user)
+
+    question_text = attempt.question_text
+    correct_answer = attempt.ai_final_answer
+
+    from core.ocr_service import get_ocr_service
+    ocr_service = get_ocr_service()
+    tenant_db = await _resolve_tenant_db(user)
+
     result = await ocr_service.evaluate_answer(
         question_text=question_text,
         answer_image_b64=payload.answer_image_b64,
+        tenant_db=tenant_db,
+        correct_answer=correct_answer,
     )
-    
+
     if not result.get("success"):
         return EvaluationResult(
             success=False,
             pen_id=payload.pen_id,
             error=result.get("error", "Evaluation failed"),
         )
-    
-    # Update the pen response with evaluation
-    if attempt_id in _active_attempts:
-        response = _active_attempts[attempt_id].pen_responses.get(payload.pen_id)
-        if response:
-            # Store evaluation in the response (would need to extend PenResponseStatus)
-            pass
-    
-    logger.info(f"Evaluated response for pen {payload.pen_id}: {result.get('score')}")
-    
+
+    score = result.get("score", "inconclusive")
+    if score not in ("correct", "incorrect", "partial", "inconclusive"):
+        score = "inconclusive"
+
+    logger.info(f"[QLock] Evaluated pen {payload.pen_id}: {score}")
+
     return EvaluationResult(
         success=True,
         pen_id=payload.pen_id,
-        score=result.get("score"),
+        score=score,
         extracted_answer=result.get("extracted_answer"),
+        correct_answer=correct_answer or result.get("correct_answer"),
         feedback=result.get("feedback"),
+        ai_solution=attempt.ai_solution if score != "correct" else None,
     )
 
 
-class EvaluateAllRequest(BaseModel):
-    """Request to evaluate all pens in a question attempt."""
-    pen_images: Dict[str, str]  # Map of pen_id -> base64 PNG of rendered strokes
-
-
-class EvaluateAllResponse(BaseModel):
-    """Response with evaluation results for all pens."""
-    success: bool
-    attempt_id: str
-    results: Dict[str, EvaluationResult]
-    errors: Optional[List[str]] = None
-
-
 @router.post("/{attempt_id}/evaluate-all", response_model=EvaluateAllResponse)
-async def evaluate_all_responses(
-    attempt_id: str,
-    payload: EvaluateAllRequest,
-    token: Optional[str] = None,
-    state=Depends(get_app_state)
-):
-    """
-    Evaluate all students' responses for a question attempt.
-    
-    This endpoint processes multiple pens in parallel for efficiency.
-    
-    Expects:
-    - pen_images: Dict mapping pen_id to base64 PNG of rendered strokes
-    
-    Returns:
-    - results: Dict mapping pen_id to EvaluationResult
-    """
-    import asyncio
-    
-    expected = state.dashboard_token
-    if expected and token != expected:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    
-    # Get the attempt
+async def evaluate_all_responses(request: Request, attempt_id: str, payload: EvaluateAllRequest):
+    user = await _require_smartboard_auth(request)
+
     attempt = _active_attempts.get(attempt_id) or _load_attempt(attempt_id)
     if not attempt:
         raise HTTPException(status_code=404, detail="Question attempt not found")
-    
+
+    _verify_tenant(attempt, user)
+
     question_text = attempt.question_text
-    
-    # Import OCR service
+    correct_answer = attempt.ai_final_answer
+
     from core.ocr_service import get_ocr_service
     ocr_service = get_ocr_service()
-    
-    # Evaluate all pens in parallel
+    tenant_db = await _resolve_tenant_db(user)
+
+    sem = asyncio.Semaphore(EVAL_CONCURRENCY)
+
     async def evaluate_single(pen_id: str, image_b64: str) -> tuple:
-        try:
-            result = await ocr_service.evaluate_answer(
-                question_text=question_text,
-                answer_image_b64=image_b64,
-            )
-            return (pen_id, EvaluationResult(
-                success=result.get("success", False),
-                pen_id=pen_id,
-                score=result.get("score"),
-                extracted_answer=result.get("extracted_answer"),
-                feedback=result.get("feedback"),
-                error=result.get("error"),
-            ))
-        except Exception as e:
-            logger.error(f"Evaluation failed for pen {pen_id}: {e}")
-            return (pen_id, EvaluationResult(
-                success=False,
-                pen_id=pen_id,
-                error=str(e),
-            ))
-    
-    # Create tasks for all pens
+        async with sem:
+            try:
+                result = await ocr_service.evaluate_answer(
+                    question_text=question_text,
+                    answer_image_b64=image_b64,
+                    tenant_db=tenant_db,
+                    correct_answer=correct_answer,
+                )
+                score = result.get("score", "inconclusive")
+                if score not in ("correct", "incorrect", "partial", "inconclusive"):
+                    score = "inconclusive"
+
+                return (pen_id, EvaluationResult(
+                    success=result.get("success", False),
+                    pen_id=pen_id,
+                    score=score,
+                    extracted_answer=result.get("extracted_answer"),
+                    correct_answer=correct_answer or result.get("correct_answer"),
+                    feedback=result.get("feedback"),
+                    ai_solution=attempt.ai_solution if score != "correct" else None,
+                    error=result.get("error"),
+                ))
+            except Exception as e:
+                logger.error(f"[QLock] Evaluation failed for pen {pen_id}: {e}")
+                return (pen_id, EvaluationResult(
+                    success=False,
+                    pen_id=pen_id,
+                    score="inconclusive",
+                    error=str(e),
+                ))
+
     tasks = [
         evaluate_single(pen_id, image_b64)
         for pen_id, image_b64 in payload.pen_images.items()
     ]
-    
-    # Run all evaluations in parallel
+
     results_list = await asyncio.gather(*tasks)
     results = {pen_id: result for pen_id, result in results_list}
-    
-    # Collect errors
+
     errors = [
         f"{pen_id}: {r.error}"
         for pen_id, r in results.items()
         if not r.success and r.error
     ]
-    
-    logger.info(f"Evaluated {len(results)} responses for attempt {attempt_id}")
-    
+
+    logger.info(f"[QLock] Evaluated {len(results)} responses for attempt {attempt_id}")
+
     return EvaluateAllResponse(
         success=len(errors) == 0,
         attempt_id=attempt_id,
