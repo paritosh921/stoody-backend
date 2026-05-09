@@ -195,6 +195,15 @@ def _auth_manager(request: Request) -> AuthManager:
     return auth
 
 
+def _decode_request_token_payload(request: Request) -> Dict[str, Any]:
+    authorization = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return {}
+    auth_manager = _auth_manager(request)
+    return auth_manager.decode_access_token(token) or {}
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -749,7 +758,8 @@ async def heartbeat_pairing_session(
     request: Request,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> PairingHeartbeatResponse:
-    session_id = str(current_user.get("pair_session_id") or "")
+    token_payload = _decode_request_token_payload(request)
+    session_id = str(current_user.get("pair_session_id") or token_payload.get("pair_session_id") or "")
     if not session_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Token missing pairing session")
 
@@ -765,7 +775,15 @@ async def heartbeat_pairing_session(
         return PairingHeartbeatResponse(session_id=session_id, status="expired", is_live=False)
 
     session = await _mark_expired_if_needed(redis, session)
-    token_tutor_id = str(current_user.get("tutor_id") or current_user.get("user_id") or current_user.get("sub") or "")
+    token_tutor_id = str(
+        current_user.get("tutor_id")
+        or current_user.get("user_id")
+        or current_user.get("sub")
+        or token_payload.get("tutor_id")
+        or token_payload.get("user_id")
+        or token_payload.get("sub")
+        or ""
+    )
     if token_tutor_id and str(session.get("tutor_id")) != token_tutor_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pairing session not found")
 

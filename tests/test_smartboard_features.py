@@ -328,6 +328,15 @@ class TestSmartboardAuthFixes:
         assert "CloudCapabilities" in content
         assert "capabilities" in content
 
+    def test_smartboard_pair_heartbeat_reads_pair_session_from_jwt_payload(self):
+        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pair_path = os.path.join(backend_dir, "api", "v1", "smartboard_pair_async.py")
+        with open(pair_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        assert "_decode_request_token_payload" in content
+        assert 'token_payload.get("pair_session_id")' in content
+        assert "current_user.get(\"pair_session_id\") or token_payload.get(\"pair_session_id\")" in content
+
     def test_websocket_auth_checks_session_ownership(self):
         backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         ws_path = os.path.join(backend_dir, "api", "v1", "smartboard_async.py")
