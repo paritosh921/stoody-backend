@@ -35,7 +35,7 @@ import string
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
@@ -50,17 +50,36 @@ router = APIRouter()
 # Hub token utilities
 # ---------------------------------------------------------------------------
 
-def _create_hub_token(hub_id: str, db_name: str) -> str:
+HUB_SCOPE_MANIFEST_READ = "hub:manifest:read"
+HUB_SCOPE_DATA_UPLOAD = "hub:data:upload"
+HUB_SCOPE_HEARTBEAT = "hub:heartbeat"
+HUB_BACKEND_SCOPES = [
+    HUB_SCOPE_MANIFEST_READ,
+    HUB_SCOPE_DATA_UPLOAD,
+    HUB_SCOPE_HEARTBEAT,
+]
+
+
+def _create_hub_token(
+    hub_id: str,
+    db_name: str,
+    *,
+    institution_id: Optional[str] = None,
+    scopes: Optional[List[str]] = None,
+) -> str:
     """Issue a long-lived JWT for a hub to authenticate with hub-facing endpoints."""
     import jwt as pyjwt
     from datetime import timedelta
     from core.auth import JWT_SECRET_KEY, JWT_ALGORITHM
 
+    restricted_scopes = scopes or HUB_BACKEND_SCOPES
     now = datetime.now(timezone.utc)
     payload = {
         "sub": hub_id,
         "hub_id": hub_id,
         "db_name": db_name,
+        "institution_id": institution_id,
+        "scopes": restricted_scopes,
         "user_type": "hub",
         "user_id": hub_id,
         "exp": now + timedelta(days=365),
@@ -143,8 +162,8 @@ def require_admin_or_tutor(
 def require_hub_or_admin(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Accept hub tokens (user_type=hub) or admin/tutor tokens."""
-    allowed = {"hub", "admin", "tutor", "b2c_admin"}
+    """Accept hub tokens (user_type=hub) or admin tokens."""
+    allowed = {"hub", "admin", "b2c_admin"}
     if current_user.get("user_type") not in allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -162,6 +181,34 @@ def require_hub(
             detail="Hub token required",
         )
     return current_user
+
+
+def _hub_scopes(current_user: Dict[str, Any]) -> set[str]:
+    raw_scopes = current_user.get("scopes") or []
+    if isinstance(raw_scopes, str):
+        return {raw_scopes}
+    return {str(scope) for scope in raw_scopes}
+
+
+def _require_hub_scope(current_user: Dict[str, Any], scope: str) -> None:
+    if current_user.get("user_type") != "hub":
+        return
+    if scope not in _hub_scopes(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Hub token missing required scope: {scope}",
+        )
+
+
+def _require_hub_id_match(current_user: Dict[str, Any], hub_id: str) -> None:
+    if current_user.get("user_type") != "hub":
+        return
+    token_hub_id = current_user.get("hub_id") or current_user.get("sub")
+    if str(token_hub_id) != hub_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hub token does not match requested hub_id",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +256,29 @@ class ProvisionResponse(BaseModel):
     pen_inventory: List[Dict[str, Any]]
     backend_url: str
     provisioned_at: str
+
+
+class LinkLocalHubRequest(BaseModel):
+    hub_id: str = Field(..., min_length=3, max_length=80)
+    hub_name: Optional[str] = Field(None, max_length=120)
+    hostname: Optional[str] = Field(None, max_length=120)
+    mac_address: Optional[str] = Field(None, max_length=64)
+    ip_address: Optional[str] = Field(None, max_length=64)
+    firmware_version: Optional[str] = Field(None, max_length=64)
+    capabilities: List[str] = Field(default_factory=list)
+
+
+class LinkLocalHubResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    hub_name: Optional[str] = None
+    tenant_id: str
+    institution_id: Optional[str] = None
+    db_name: str
+    hub_token: str
+    backend_url: str = ""
+    scopes: List[str]
+    linked_at: str
 
 
 class RegisterRequest(BaseModel):
@@ -513,6 +583,136 @@ def _fmt(v) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 @router.post(
+    "/link-local",
+    summary="Link a local classroom hub to the authenticated admin tenant",
+    responses={
+        403: {"description": "Admin access required"},
+        409: {"description": "Hub already linked to another tenant"},
+        503: {"description": "Tenant or master database unavailable"},
+    },
+)
+async def link_local_hub(
+    body: LinkLocalHubRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> LinkLocalHubResponse:
+    """Bind an independently setup RPi hub to the admin's tenant.
+
+    The admin JWT is used only for this link transaction. The returned token is
+    a restricted hub JWT and is the only backend credential the hub should cache.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    master_db = await _get_master_db(db)
+    collection = tenant_db["exampen_hubs"]
+    await _ensure_indexes(collection)
+
+    from config_async import settings
+
+    now = datetime.now(timezone.utc)
+    hub_id = body.hub_id.strip()
+    if not hub_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hub_id is required")
+    db_name = str(current_user.get("db_name") or "")
+    institution_id = current_user.get("institution_id") or db_name
+    linked_by = current_user.get("user_id") or current_user.get("sub") or current_user.get("email")
+    capabilities = [str(item).strip() for item in body.capabilities if str(item).strip()]
+
+    existing_master = await master_db["exampen_hubs"].find_one({"hub_id": hub_id})
+    if existing_master:
+        existing_db_name = existing_master.get("db_name")
+        existing_institution = existing_master.get("institution_id")
+        linked_elsewhere = (
+            existing_db_name
+            and existing_db_name != db_name
+        ) or (
+            existing_institution
+            and str(existing_institution) != str(institution_id)
+        )
+        if linked_elsewhere:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Hub is already linked to another tenant",
+            )
+
+    set_doc = {
+        "hub_id": hub_id,
+        "hub_name": body.hub_name,
+        "institute_id": db_name,
+        "institution_id": institution_id,
+        "db_name": db_name,
+        "hostname": body.hostname,
+        "mac_address": body.mac_address,
+        "ip_address": body.ip_address,
+        "firmware_version": body.firmware_version,
+        "capabilities": capabilities,
+        "linked_by": linked_by,
+        "linked_at": now,
+        "link_method": "admin_login",
+        "updated_at": now,
+    }
+    await collection.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": set_doc,
+            "$setOnInsert": {
+                "hub_code": None,
+                "invig_codes": [],
+                "provisioned_at": now,
+                "registered_at": None,
+                "dongles": [],
+                "registered_pens": [],
+                "storage_health": "unknown",
+                "last_heartbeat_at": None,
+                "connected_pen_count": 0,
+                "assigned_exam_id": None,
+                "failed_upload_count": 0,
+                "created_by": linked_by,
+            },
+        },
+        upsert=True,
+    )
+
+    await master_db["exampen_hubs"].update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "hub_id": hub_id,
+                "hub_name": body.hub_name,
+                "institution_id": institution_id,
+                "db_name": db_name,
+                "status": "linked",
+                "link_method": "admin_login",
+                "last_seen_at": now,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"provisioned_at": now},
+        },
+        upsert=True,
+    )
+
+    hub_token = _create_hub_token(
+        hub_id,
+        db_name=db_name,
+        institution_id=str(institution_id) if institution_id else None,
+        scopes=HUB_BACKEND_SCOPES,
+    )
+    backend_url = getattr(settings, "BACKEND_URL", "") or ""
+    logger.info("Hub %s linked locally to tenant %s by %s", hub_id, db_name, linked_by)
+
+    return LinkLocalHubResponse(
+        hub_id=hub_id,
+        hub_name=body.hub_name,
+        tenant_id=db_name,
+        institution_id=str(institution_id) if institution_id else None,
+        db_name=db_name,
+        hub_token=hub_token,
+        backend_url=backend_url,
+        scopes=HUB_BACKEND_SCOPES,
+        linked_at=now.isoformat(),
+    )
+
+
+@router.post(
     "/provision",
     status_code=status.HTTP_201_CREATED,
     summary="First-boot hub provisioning",
@@ -631,7 +831,12 @@ async def provision_hub(
         "last_seen_at": now,
     })
 
-    hub_token = _create_hub_token(hub_id, db_name=institute_id)
+    hub_token = _create_hub_token(
+        hub_id,
+        db_name=institute_id,
+        institution_id=str(code_doc.get("institution_id") or institute_id),
+        scopes=HUB_BACKEND_SCOPES,
+    )
 
     logger.info("Hub %s provisioned with code %s by %s", hub_id, body.hub_code, current_user.get("user_id"))
 
@@ -664,6 +869,9 @@ async def register_hub(
 
     Updates firmware version, dongle list, storage health, and IP.
     """
+    _require_hub_id_match(current_user, body.hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+
     tenant_db = await _get_tenant_db(db, current_user)
     collection = tenant_db["exampen_hubs"]
 
@@ -717,6 +925,9 @@ async def hub_heartbeat(
     Updates health status, pen count, storage, and uplink status.
     Returns server time and any pending exam assignment.
     """
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+
     tenant_db = await _get_tenant_db(db, current_user)
     collection = tenant_db["exampen_hubs"]
 
@@ -766,7 +977,7 @@ async def hub_heartbeat(
 async def assign_exam_to_hub(
     hub_id: str,
     body: AssignRequest,
-    current_user: Dict[str, Any] = Depends(require_hub_or_admin),
+    current_user: Dict[str, Any] = Depends(require_admin),
     db: DatabaseManager = Depends(get_database),
 ) -> AssignmentResponse:
     """Assign an exam to a hub. The hub will receive this assignment on next heartbeat."""
@@ -829,6 +1040,9 @@ async def get_assignment(
     db: DatabaseManager = Depends(get_database),
 ) -> AssignmentResponse:
     """Return the current exam assignment for a hub."""
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
     exam_col = tenant_db["exampen_exams"]
@@ -878,12 +1092,8 @@ async def get_tutor_manifest(
     secret so the RPi can validate short-lived mobile local-access tokens
     without proxying arbitrary requests to the backend.
     """
-    token_hub_id = current_user.get("hub_id") or current_user.get("sub")
-    if str(token_hub_id) != hub_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Hub token does not match requested hub_id",
-        )
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_MANIFEST_READ)
 
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
@@ -893,6 +1103,27 @@ async def get_tutor_manifest(
 
     manifest = await _ensure_mobile_manifest(hub_col, hub_doc, tenant_db)
     return TutorManifestResponse(**manifest)
+
+
+@router.get(
+    "/{hub_id}/auth-check",
+    summary="Validate restricted hub token scope",
+    responses={
+        403: {"description": "Hub token required, hub_id mismatch, or missing scope"},
+    },
+)
+async def hub_auth_check(
+    hub_id: str,
+    scope: str = Query(HUB_SCOPE_DATA_UPLOAD),
+    current_user: Dict[str, Any] = Depends(require_hub),
+) -> Dict[str, Any]:
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, scope)
+    return {
+        "success": True,
+        "hub_id": hub_id,
+        "scope": scope,
+    }
 
 
 @router.post(
@@ -1014,6 +1245,9 @@ async def session_start(
     db: DatabaseManager = Depends(get_database),
 ) -> SessionEventResponse:
     """Hub reports that an exam session has started (collection begins)."""
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_DATA_UPLOAD)
+
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
     exam_col = tenant_db["exampen_exams"]
@@ -1080,6 +1314,9 @@ async def session_end(
     db: DatabaseManager = Depends(get_database),
 ) -> SessionEventResponse:
     """Hub reports that collection has ended for an exam session."""
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_DATA_UPLOAD)
+
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
     exam_col = tenant_db["exampen_exams"]
