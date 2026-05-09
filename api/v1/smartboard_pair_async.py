@@ -50,6 +50,7 @@ PREFIX = "skillbot"  # matches CacheManager._make_key default
 KEY_CODE = f"{PREFIX}:sbpair:code:{{code}}"
 KEY_TUTOR = f"{PREFIX}:sbpair:tutor:{{tutor_id}}"
 KEY_SESSION = f"{PREFIX}:sbpair:session:{{session_id}}"
+KEY_SESSION_TERMINAL = f"{PREFIX}:sbpair:session_terminal:{{session_id}}"
 KEY_TUTOR_LIVE = f"{PREFIX}:sbpair:tutor_live:{{tutor_id}}"
 
 
@@ -223,6 +224,10 @@ async def _load_session(redis, session_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def _store_session(redis, session: Dict[str, Any]) -> None:
+    terminal_status = await _get_terminal_status(redis, str(session["session_id"]))
+    if terminal_status and session.get("status") != terminal_status:
+        return
+
     session_expires_at = _parse_dt(session.get("session_expires_at"))
     code_expires_at = _parse_dt(session.get("code_expires_at"))
     expires_at = session_expires_at or code_expires_at or (_utcnow() + timedelta(minutes=10))
@@ -233,7 +238,36 @@ async def _store_session(redis, session: Dict[str, Any]) -> None:
     )
 
 
+async def _get_terminal_status(redis, session_id: str) -> Optional[str]:
+    raw = await redis.get(KEY_SESSION_TERMINAL.format(session_id=session_id))
+    if raw is None:
+        return None
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+async def _set_terminal_status(redis, session: Dict[str, Any], terminal_status: str) -> None:
+    session_expires_at = _parse_dt(session.get("session_expires_at")) or (
+        _utcnow() + timedelta(minutes=DEFAULT_SESSION_MINUTES)
+    )
+    await redis.set(
+        KEY_SESSION_TERMINAL.format(session_id=session["session_id"]),
+        terminal_status,
+        ex=_ttl_until(session_expires_at),
+    )
+
+
+async def _apply_terminal_status(redis, session: Dict[str, Any]) -> Dict[str, Any]:
+    terminal_status = await _get_terminal_status(redis, str(session["session_id"]))
+    if terminal_status and session.get("status") != terminal_status:
+        session = {**session, "status": terminal_status}
+    return session
+
+
 async def _mark_expired_if_needed(redis, session: Dict[str, Any]) -> Dict[str, Any]:
+    session = await _apply_terminal_status(redis, session)
+    if session.get("status") == "signed_out":
+        return session
+
     now = _utcnow()
     status_value = session.get("status")
     session_expires_at = _parse_dt(session.get("session_expires_at"))
@@ -251,6 +285,7 @@ async def _mark_expired_if_needed(redis, session: Dict[str, Any]) -> Dict[str, A
         session["status"] = "expired"
         session["expired_at"] = _iso(now)
         await _store_session(redis, session)
+        await _set_terminal_status(redis, session, "expired")
     return session
 
 
@@ -682,6 +717,7 @@ async def signout_pairing_session(
     _require_tutor_session_owner(current_user, session)
     session["status"] = "signed_out"
     session["signed_out_at"] = _iso(_utcnow())
+    await _set_terminal_status(redis, session, "signed_out")
     await _store_session(redis, session)
     try:
         await redis.delete(KEY_TUTOR_LIVE.format(tutor_id=session.get("tutor_id")))
@@ -722,8 +758,10 @@ async def heartbeat_pairing_session(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pairing session not found")
 
     if session.get("status") == "connected":
-        session["last_seen_at"] = _iso(_utcnow())
-        await _store_session(redis, session)
+        session = await _apply_terminal_status(redis, session)
+        if session.get("status") == "connected":
+            session["last_seen_at"] = _iso(_utcnow())
+            await _store_session(redis, session)
 
     return PairingHeartbeatResponse(
         session_id=session_id,
