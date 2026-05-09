@@ -11,11 +11,12 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 | 1 | Backend + exam-conductor | `backend/` (includes `backend/exam-conductor/`) | Python 3.11, FastAPI, MongoDB | Core APIs, engines, gate. **BUILT.** 18 routers mounted, `_evalpen_available = True`. |
 | 2 | Frontend | `frontend/` | React 18, TS, Vite, Tailwind | Teacher workspace, results, recheck, student portal, conversations **BUILT.** See `frontend/src/components/exam-pen/`. |
 | 3 | Super-Admin | `super-admin/` | Electron + React | Feature gate, hub provisioning, usage analytics **PARTIALLY BUILT.** See `super-admin/src/pages/ExamPenManagementPage.tsx`. |
-| 4 | ExamPen Hub (edge) | `stoody-multi-pen/HUB-exam-conductor/` | Python 3.12, Textual TUI, SQLite, systemd | Dedicated Pi edge device. Full runtime implemented (supervisor, BLE manager, pen sync, timer, uplink with dedup/retry/reconciliation, invig BLE commands, TUI). Code-smoke validated (33/33 py_compile, all imports clean). Production packaging, systemd installation, and hardware BLE validation pending. |
+| 4 | Edge hub runtime + ExamPen mode | `stoody-multi-pen/edge_hub/` | Python 3.12, nRF UART transport, local services, systemd | Converged RPi host runtime. Smartboard mode and ExamPen mode must run as independent service groups over shared transport, pen registry, storage, health, logging, and uplink substrate. `stoody-multi-pen/HUB-exam-conductor/` remains a reference/decomposition donor until its ExamPen behavior is folded into the shared runtime. |
 
 ### Critical Folder Boundaries
 
-- **`stoody-multi-pen/edge_hub/`** — This is the Stoody smartboard hub. **DO NOT modify it** for ExamPen work. ExamPen has its own hub at `stoody-multi-pen/HUB-exam-conductor/`.
+- **`stoody-multi-pen/edge_hub/`** — Converged Stoody edge runtime. New ExamPen hub work should be added here as an independent ExamPen mode/service group, not interleaved into smartboard mode.
+- **`stoody-multi-pen/HUB-exam-conductor/`** — Legacy/reference ExamPen hub implementation. Use as a design donor for supervisor, timer, invigilator BLE, pen sync, and uplink behavior while migrating concepts into `edge_hub`.
 - **`stoody-multi-pen/mobile-app/`** — The invigilator mobile app will be extended for ExamPen (BLE commands to exam-hub). Shared between smartboard and ExamPen use cases.
 - **`backend/exam-conductor/`** — All ExamPen backend modules. Never import from `archiveDCR/` or root `exam-conductor/`.
 - **`frontend/`** — ExamPen tutor/student pages will be added here. Follow existing frontend patterns (see `frontend/CLAUDE.md`).
@@ -29,7 +30,7 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 4. Treat `archiveDCR/` as backup-only and out of scope for implementation decisions.
 5. Treat `GUIDE_RULE_DOCS/` as the only canonical home for reusable process guidance.
 6. Treat `architecture/unifiedPlan.md`, `references/exampen-system-design.docx`, and `../pcr/eval-engine-plan-v3.md` as historical context only.
-7. **Never modify `stoody-multi-pen/edge_hub/`** — ExamPen hub code goes in `stoody-multi-pen/HUB-exam-conductor/`.
+7. For new edge work, target `stoody-multi-pen/edge_hub/` shared runtime seams. Keep smartboard and ExamPen mode state machines independent. Use `stoody-multi-pen/HUB-exam-conductor/` as reference material, not as the final deployment boundary.
 
 ## Precedence Rules
 
@@ -63,7 +64,7 @@ Some tracker and chapter docs lag behind the current implementation. Active drif
 | Pen stack / frontend canvas / existing sync behavior | `references/PEN_TO_CANVAS_TO_DB_REFERENCE.md`, `references/P05_pen_SDK.md`, `integration/HUB_DEPLOYMENT_SPEC.md` |
 | Parallel build / agent coordination | `governance/COMPONENT_INDEPENDENCE_MAP.md`, `chapters/BUILD_STATUS.md`, `governance/TEST_SUITE_SPEC.md` |
 | Super-admin / platform control | `integration/SUPERADMIN_SPEC.md`, `governance/STATE_OWNERSHIP_MAP.md` |
-| ExamPen hub (edge device) work | `integration/HUB_DEPLOYMENT_SPEC.md`, `hub/ble-gatt-spec.md`, `hub/ipc-protocol.md` — **code goes in `stoody-multi-pen/HUB-exam-conductor/`, NOT `edge_hub/`** |
+| ExamPen hub (edge runtime) work | `integration/HUB_DEPLOYMENT_SPEC.md`, `hub/ble-gatt-spec.md`, `hub/ipc-protocol.md`, plus `stoody-multi-pen/docs/EDGE_HUB_NRF_UNIFIED_RUNTIME_PLAN.md` — **code goes in `stoody-multi-pen/edge_hub/` as independent ExamPen/shared-runtime services.** |
 | Hub provisioning / stroke ingest API work | `integration/HUB_DEPLOYMENT_SPEC.md` §7 (provisioning contract), §8 (upload path authority), `api/stroke-ingest.openapi.yaml` (upload wire format), `integration/SUPERADMIN_SPEC.md` §5 (two-party flow) |
 | Frontend ExamPen UI | `integration/STOODY_INTEGRATION_SPEC.md`, relevant `api/*.openapi.yaml` — **code goes in `frontend/`** |
 | Documentation changes | `governance/DOCUMENT_REGISTRY.md`, `governance/DOCUMENTATION_PLAN.md`, then the relevant authoritative spec |

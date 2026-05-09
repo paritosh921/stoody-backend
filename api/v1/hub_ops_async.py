@@ -27,9 +27,12 @@ Hard constraints:
 from __future__ import annotations
 
 import logging
+import hashlib
+import hmac
+import json
 import secrets
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -65,6 +68,47 @@ def _create_hub_token(hub_id: str, db_name: str) -> str:
         "type": "access",
     }
     return pyjwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+MOBILE_ACCESS_SCOPES = [
+    "hub:read",
+    "hub:pens",
+    "hub:storage",
+    "smartboard:read",
+    "smartboard:manage",
+]
+MOBILE_MANIFEST_DEFAULT_REFRESH_HOURS = 24
+MOBILE_MANIFEST_MIN_REFRESH_HOURS = 1
+MOBILE_MANIFEST_MAX_REFRESH_HOURS = 168
+MOBILE_LOCAL_TOKEN_TTL_SECONDS = 5 * 60
+
+
+def _canonical_json(data: Dict[str, Any]) -> bytes:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+def _manifest_signature(secret: str, payload: Dict[str, Any]) -> str:
+    return hmac.new(secret.encode("utf-8"), _canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def _safe_refresh_hours(value: Any) -> int:
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        return MOBILE_MANIFEST_DEFAULT_REFRESH_HOURS
+    return min(MOBILE_MANIFEST_MAX_REFRESH_HOURS, max(MOBILE_MANIFEST_MIN_REFRESH_HOURS, hours))
+
+
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +149,17 @@ def require_hub_or_admin(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Hub or admin access required",
+        )
+    return current_user
+
+
+def require_hub(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    if current_user.get("user_type") != "hub":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hub token required",
         )
     return current_user
 
@@ -222,6 +277,47 @@ class HubListItem(BaseModel):
     assigned_exam_id: Optional[str] = None
 
 
+class ManifestTutor(BaseModel):
+    tutor_id: str
+    name: Optional[str] = None
+    username: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: MOBILE_ACCESS_SCOPES.copy())
+
+
+class TutorManifestResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    tenant_id: str
+    manifest_id: str
+    version: int = 1
+    issued_at: str
+    expires_at: str
+    refresh_interval_hours: int
+    allowed_tutors: List[ManifestTutor]
+    scopes: List[str]
+    signature: str
+    local_access_secret: str = Field(
+        ...,
+        description="Per-hub HS256 verification secret. Returned only to authenticated hub tokens.",
+    )
+
+
+class LocalAccessRequest(BaseModel):
+    manifest_id: Optional[str] = None
+    device_label: Optional[str] = None
+
+
+class LocalAccessResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    tenant_id: str
+    manifest_id: str
+    tutor_id: str
+    local_token: str
+    expires_in_sec: int
+    scopes: List[str]
+
+
 # ---------------------------------------------------------------------------
 # Index helpers
 # ---------------------------------------------------------------------------
@@ -238,6 +334,94 @@ async def _ensure_indexes(collection) -> None:
     await collection.create_index("last_heartbeat_at")
     await collection.create_index("assigned_exam_id")
     _indexes_ensured = True
+
+
+async def _load_allowed_manifest_tutors(tenant_db) -> List[Dict[str, Any]]:
+    cursor = tenant_db["tutors"].find(
+        {"is_active": {"$ne": False}},
+        {"_id": 1, "tutor_id": 1, "name": 1, "username": 1, "full_name": 1},
+    )
+    docs = await cursor.to_list(length=2000)
+    tutors: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for doc in docs:
+        tutor_id = str(doc.get("tutor_id") or doc.get("_id") or "").strip()
+        if not tutor_id or tutor_id in seen:
+            continue
+        seen.add(tutor_id)
+        tutors.append({
+            "tutor_id": tutor_id,
+            "name": doc.get("name") or doc.get("full_name"),
+            "username": doc.get("username"),
+            "scopes": MOBILE_ACCESS_SCOPES.copy(),
+        })
+    return tutors
+
+
+async def _ensure_mobile_manifest(
+    hub_col,
+    hub_doc: Dict[str, Any],
+    tenant_db,
+    *,
+    rotate_if_expired: bool = True,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    mobile_access = dict(hub_doc.get("mobile_access") or {})
+    secret = mobile_access.get("local_access_secret") or secrets.token_urlsafe(32)
+    refresh_hours = _safe_refresh_hours(mobile_access.get("refresh_interval_hours"))
+    expires_at = _parse_dt(mobile_access.get("manifest_expires_at"))
+    issued_at = _parse_dt(mobile_access.get("manifest_issued_at"))
+    manifest_id = mobile_access.get("manifest_id")
+
+    should_rotate = (
+        not manifest_id
+        or not issued_at
+        or not expires_at
+        or (rotate_if_expired and expires_at <= now)
+    )
+    if should_rotate:
+        issued_at = now
+        expires_at = now + timedelta(hours=refresh_hours)
+        manifest_id = secrets.token_urlsafe(18)
+
+    tutors = await _load_allowed_manifest_tutors(tenant_db)
+    payload = {
+        "hub_id": hub_doc["hub_id"],
+        "tenant_id": hub_doc.get("institute_id") or "",
+        "manifest_id": manifest_id,
+        "version": 1,
+        "issued_at": issued_at.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "refresh_interval_hours": refresh_hours,
+        "allowed_tutors": tutors,
+        "scopes": MOBILE_ACCESS_SCOPES,
+    }
+    signature = _manifest_signature(secret, payload)
+
+    await hub_col.update_one(
+        {"hub_id": hub_doc["hub_id"]},
+        {
+            "$set": {
+                "mobile_access.local_access_secret": secret,
+                "mobile_access.manifest_id": manifest_id,
+                "mobile_access.manifest_issued_at": issued_at,
+                "mobile_access.manifest_expires_at": expires_at,
+                "mobile_access.refresh_interval_hours": refresh_hours,
+                "mobile_access.allowed_tutors": tutors,
+                "mobile_access.scopes": MOBILE_ACCESS_SCOPES,
+                "mobile_access.signature": signature,
+                "mobile_access.updated_at": now,
+            }
+        },
+    )
+    payload["signature"] = signature
+    payload["local_access_secret"] = secret
+    return payload
+
+
+def _actor_tutor_id(current_user: Dict[str, Any]) -> Optional[str]:
+    tutor_id = current_user.get("tutor_id") or current_user.get("user_id") or current_user.get("sub")
+    return str(tutor_id).strip() if tutor_id else None
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +855,146 @@ async def get_assignment(
         roster=exam_doc.get("roster", []),
         duration_minutes=exam_doc.get("duration_minutes"),
         lifecycle_state=exam_doc.get("lifecycle_state"),
+    )
+
+
+@router.get(
+    "/{hub_id}/tutor-manifest",
+    summary="Hub fetches signed tutor manifest for local mobile access",
+    responses={
+        403: {"description": "Hub token required or hub_id mismatch"},
+        404: {"description": "Hub not found"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def get_tutor_manifest(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> TutorManifestResponse:
+    """Return the 24-hour tutor manifest cached by the hub for local Wi-Fi access.
+
+    This endpoint is deliberately hub-only. It returns a per-hub verification
+    secret so the RPi can validate short-lived mobile local-access tokens
+    without proxying arbitrary requests to the backend.
+    """
+    token_hub_id = current_user.get("hub_id") or current_user.get("sub")
+    if str(token_hub_id) != hub_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hub token does not match requested hub_id",
+        )
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    manifest = await _ensure_mobile_manifest(hub_col, hub_doc, tenant_db)
+    return TutorManifestResponse(**manifest)
+
+
+@router.post(
+    "/{hub_id}/local-access",
+    summary="Tutor obtains short-lived local hub access token",
+    responses={
+        403: {"description": "Tutor not allowed for this hub"},
+        404: {"description": "Hub not found"},
+        409: {"description": "Hub manifest unavailable, expired, or mismatched"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def issue_local_access_token(
+    hub_id: str,
+    body: LocalAccessRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> LocalAccessResponse:
+    """Issue a short-lived token for the mobile app to call local hub APIs.
+
+    The backend validates the logged-in tutor against the current manifest.
+    The token is signed with the hub-specific secret already cached on the RPi.
+    """
+    if current_user.get("user_type") != "tutor":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor login required for local hub access",
+        )
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    mobile_access = hub_doc.get("mobile_access") or {}
+    manifest_id = mobile_access.get("manifest_id")
+    secret = mobile_access.get("local_access_secret")
+    expires_at = _parse_dt(mobile_access.get("manifest_expires_at"))
+    now = datetime.now(timezone.utc)
+    if not manifest_id or not secret:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Hub tutor manifest is not ready. Refresh the manifest from hub TUI first.",
+        )
+    if expires_at and expires_at <= now:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Hub tutor manifest has expired. Refresh the manifest from hub TUI first.",
+        )
+    if body.manifest_id and body.manifest_id != manifest_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Scanned hub manifest is stale. Refresh the smartboard QR and try again.",
+        )
+
+    tutor_id = _actor_tutor_id(current_user)
+    allowed_tutors = mobile_access.get("allowed_tutors") or []
+    allowed = {str(t.get("tutor_id")): t for t in allowed_tutors if t.get("tutor_id")}
+    if not tutor_id or tutor_id not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor is not authorised for this hub",
+        )
+
+    import jwt as pyjwt
+
+    exp = now + timedelta(seconds=MOBILE_LOCAL_TOKEN_TTL_SECONDS)
+    scopes = allowed[tutor_id].get("scopes") or MOBILE_ACCESS_SCOPES
+    claims = {
+        "type": "hub_local_access",
+        "aud": "stoody-edge-hub-local",
+        "hub_id": hub_id,
+        "tenant_id": hub_doc.get("institute_id") or current_user.get("db_name"),
+        "manifest_id": manifest_id,
+        "tutor_id": tutor_id,
+        "scopes": scopes,
+        "device_label": body.device_label,
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+        "jti": secrets.token_urlsafe(12),
+    }
+    token = pyjwt.encode(claims, secret, algorithm="HS256")
+
+    await tenant_db["hub_local_access_audit"].insert_one({
+        "hub_id": hub_id,
+        "manifest_id": manifest_id,
+        "tutor_id": tutor_id,
+        "device_label": body.device_label,
+        "issued_at": now,
+        "expires_at": exp,
+        "jti": claims["jti"],
+    })
+
+    return LocalAccessResponse(
+        hub_id=hub_id,
+        tenant_id=str(hub_doc.get("institute_id") or current_user.get("db_name") or ""),
+        manifest_id=manifest_id,
+        tutor_id=tutor_id,
+        local_token=token,
+        expires_in_sec=MOBILE_LOCAL_TOKEN_TTL_SECONDS,
+        scopes=scopes,
     )
 
 
