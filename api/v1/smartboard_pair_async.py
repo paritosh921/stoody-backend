@@ -390,8 +390,18 @@ async def register_pair_code(
         if prev_code:
             prev_code_str = prev_code.decode() if isinstance(prev_code, bytes) else str(prev_code)
             await redis.delete(KEY_CODE.format(code=prev_code_str), prev_key)
+        prev_live = await redis.get(KEY_TUTOR_LIVE.format(tutor_id=tutor_id))
+        if prev_live:
+            prev_session_id = prev_live.decode() if isinstance(prev_live, bytes) else str(prev_live)
+            prev_session = await _load_session(redis, prev_session_id)
+            if prev_session and prev_session.get("status") == "connected":
+                prev_session["status"] = "signed_out"
+                prev_session["signed_out_at"] = _iso(now)
+                await _set_terminal_status(redis, prev_session, "signed_out")
+                await _store_session(redis, prev_session)
+            await redis.delete(KEY_TUTOR_LIVE.format(tutor_id=tutor_id))
     except Exception as exc:
-        logger.warning("Failed to clear previous pair code for tutor %s: %s", tutor_id, exc)
+        logger.warning("Failed to clear previous smartboard pairing state for tutor %s: %s", tutor_id, exc)
 
     # Allocate a fresh code with one collision retry.
     code: Optional[str] = None
