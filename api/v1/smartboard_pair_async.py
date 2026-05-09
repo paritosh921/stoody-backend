@@ -373,13 +373,12 @@ async def register_pair_code(
     tutor_id = identity["tutor_id"]
     now = _utcnow()
     code_expires_at = now + timedelta(seconds=PAIR_CODE_TTL_SECONDS)
-    session_expires_at = now + timedelta(minutes=body.session_minutes)
+    planned_session_expires_at = now + timedelta(minutes=body.session_minutes)
     session_id = str(uuid.uuid4())
     payload_dict = {
         **identity,
         "session_id": session_id,
         "session_minutes": body.session_minutes,
-        "session_expires_at": _iso(session_expires_at),
     }
     payload = json.dumps(payload_dict, default=str)
 
@@ -448,7 +447,7 @@ async def register_pair_code(
         "tenant_id": identity.get("tenant_id"),
         "created_at": _iso(now),
         "code_expires_at": _iso(code_expires_at),
-        "session_expires_at": _iso(session_expires_at),
+        "session_minutes": body.session_minutes,
     }
     try:
         await _store_session(redis, session)
@@ -466,7 +465,7 @@ async def register_pair_code(
         code=code,
         expires_at=_iso(code_expires_at),
         session_id=session_id,
-        session_expires_at=_iso(session_expires_at),
+        session_expires_at=_iso(planned_session_expires_at),
         session_minutes=body.session_minutes,
     )
 
@@ -564,11 +563,7 @@ async def redeem_pair_code(
     # Mint the smartboard JWT — same shape as a tutor-login JWT plus
     # `device: "smartboard"` for audit trails.
     auth_manager = _auth_manager(request)
-    session_expires_at = _parse_dt(identity.get("session_expires_at")) or (
-        _utcnow() + timedelta(minutes=DEFAULT_SESSION_MINUTES)
-    )
-    remaining_seconds = int((session_expires_at - _utcnow()).total_seconds())
-    if remaining_seconds <= 0:
+    if session.get("status") == "expired":
         session["status"] = "expired"
         session["expired_at"] = _iso(_utcnow())
         await _store_session(redis, session)
@@ -576,7 +571,14 @@ async def redeem_pair_code(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Invalid or expired pairing code",
         )
-    expires_delta = timedelta(seconds=remaining_seconds)
+    session_minutes = int(
+        identity.get("session_minutes")
+        or session.get("session_minutes")
+        or DEFAULT_SESSION_MINUTES
+    )
+    session_minutes = max(MIN_SESSION_MINUTES, min(MAX_SESSION_MINUTES, session_minutes))
+    session_expires_at = _utcnow() + timedelta(minutes=session_minutes)
+    expires_delta = timedelta(minutes=session_minutes)
     token_payload = {
         "sub": tutor_id,
         "user_id": tutor_id,
