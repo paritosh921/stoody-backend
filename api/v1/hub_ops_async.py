@@ -33,6 +33,7 @@ import json
 import re
 import secrets
 import string
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -372,6 +373,7 @@ class HeartbeatResponse(BaseModel):
     pending_assignment: Optional[str] = None
     pending_manifest_refresh: bool = False
     manifest_refresh_requested_at: Optional[str] = None
+    pending_command_count: int = 0
 
 
 class AssignRequest(BaseModel):
@@ -412,6 +414,9 @@ class HubListItem(BaseModel):
     storage_health: str
     connected_pen_count: int
     assigned_exam_id: Optional[str] = None
+    class_name: Optional[str] = None
+    section: Optional[str] = None
+    room: Optional[str] = None
     capabilities: List[str] = Field(default_factory=list)
     scopes: List[str] = Field(default_factory=list)
     credential_status: str = HUB_CREDENTIAL_STATUS_ACTIVE
@@ -427,10 +432,92 @@ class HubListItem(BaseModel):
     manifest_expires_at: Optional[str] = None
     manifest_updated_at: Optional[str] = None
     allowed_tutor_count: int = 0
+    selected_tutor_count: int = 0
     manifest_refresh_requested_at: Optional[str] = None
     manifest_refresh_ack_at: Optional[str] = None
     manifest_refresh_status: Optional[str] = None
     manifest_refresh_error: Optional[str] = None
+
+
+class HubTeacherItem(BaseModel):
+    tutor_id: str
+    name: Optional[str] = None
+    username: Optional[str] = None
+    email: Optional[str] = None
+    standards: List[str] = Field(default_factory=list)
+    sections: List[str] = Field(default_factory=list)
+    subjects: List[str] = Field(default_factory=list)
+    selected: bool = False
+
+
+class HubTeachersResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    selected_tutor_ids: List[str] = Field(default_factory=list)
+    teachers: List[HubTeacherItem] = Field(default_factory=list)
+
+
+class HubTeacherSelectionRequest(BaseModel):
+    tutor_ids: List[str] = Field(default_factory=list)
+
+
+class HubMetadataRequest(BaseModel):
+    class_name: Optional[str] = None
+    section: Optional[str] = None
+    room: Optional[str] = None
+
+
+class HubCommandResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    command_id: str
+    status: str
+
+
+class HubCommandAckRequest(BaseModel):
+    status: str = Field("completed", description="completed | failed")
+    result: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+
+
+class HubCommandPollResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    commands: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class HubRawSessionUpload(BaseModel):
+    raw_session_key: str
+    session_id: str
+    pen_mac: Optional[str] = None
+    started_at: Optional[str] = None
+    frame_count: int = 0
+    file_size: int = 0
+    frames: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class HubDataUploadRequest(BaseModel):
+    command_id: Optional[str] = None
+    upload_batch_id: Optional[str] = None
+    sessions: List[HubRawSessionUpload] = Field(default_factory=list)
+
+
+class HubDataActionRequest(BaseModel):
+    data_ids: List[str] = Field(default_factory=list)
+
+
+class HubDataListResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    count: int = 0
+
+
+class HubAuditListResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    count: int = 0
 
 
 class ManifestRegenerateResponse(BaseModel):
@@ -523,10 +610,25 @@ async def _ensure_indexes(collection) -> None:
     _indexes_ensured = True
 
 
-async def _load_allowed_manifest_tutors(tenant_db) -> List[Dict[str, Any]]:
+def _hub_selected_tutor_ids(hub_doc: Dict[str, Any]) -> List[str]:
+    mobile_access = dict(hub_doc.get("mobile_access") or {})
+    return _safe_string_list(mobile_access.get("allowed_tutor_ids"))
+
+
+async def _load_available_tutors(tenant_db) -> List[Dict[str, Any]]:
     cursor = tenant_db["tutors"].find(
         {"is_active": {"$ne": False}},
-        {"_id": 1, "tutor_id": 1, "name": 1, "username": 1, "full_name": 1},
+        {
+            "_id": 1,
+            "tutor_id": 1,
+            "name": 1,
+            "username": 1,
+            "full_name": 1,
+            "email": 1,
+            "standards": 1,
+            "sections": 1,
+            "subjects": 1,
+        },
     )
     docs = await cursor.to_list(length=2000)
     tutors: List[Dict[str, Any]] = []
@@ -540,9 +642,82 @@ async def _load_allowed_manifest_tutors(tenant_db) -> List[Dict[str, Any]]:
             "tutor_id": tutor_id,
             "name": doc.get("name") or doc.get("full_name"),
             "username": doc.get("username"),
+            "email": doc.get("email"),
+            "standards": _safe_string_list(doc.get("standards")),
+            "sections": _safe_string_list(doc.get("sections")),
+            "subjects": _safe_string_list(doc.get("subjects")),
             "scopes": MOBILE_ACCESS_SCOPES.copy(),
         })
     return tutors
+
+
+async def _load_allowed_manifest_tutors(tenant_db, hub_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+    selected_ids = set(_hub_selected_tutor_ids(hub_doc))
+    if not selected_ids:
+        return []
+    tutors = await _load_available_tutors(tenant_db)
+    return [
+        {
+            "tutor_id": tutor["tutor_id"],
+            "name": tutor.get("name"),
+            "username": tutor.get("username"),
+            "scopes": MOBILE_ACCESS_SCOPES.copy(),
+        }
+        for tutor in tutors
+        if tutor["tutor_id"] in selected_ids
+    ]
+
+
+async def _log_hub_audit(
+    tenant_db,
+    hub_id: str,
+    *,
+    action: str,
+    actor: Dict[str, Any],
+    source: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    item = {
+        "audit_id": f"hub_audit_{uuid.uuid4().hex}",
+        "hub_id": hub_id,
+        "action": action,
+        "source": source,
+        "actor_type": actor.get("user_type") or source,
+        "actor_id": actor.get("user_id") or actor.get("sub") or actor.get("hub_id") or "",
+        "actor_name": actor.get("username") or actor.get("name") or "",
+        "details": details or {},
+        "created_at": now,
+    }
+    await tenant_db["hub_audit_logs"].insert_one(item)
+    return item
+
+
+async def _request_manifest_refresh(
+    hub_col,
+    hub_id: str,
+    *,
+    manifest_id: str,
+    actor: Dict[str, Any],
+) -> datetime:
+    now = datetime.now(timezone.utc)
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "mobile_access.refresh_requested_at": now,
+                "mobile_access.refresh_status": "pending",
+                "mobile_access.refresh_error": "",
+                "mobile_access.requested_manifest_id": manifest_id,
+                "mobile_access.refresh_requested_by": actor.get("user_id") or actor.get("sub") or actor.get("hub_id"),
+            },
+            "$unset": {
+                "mobile_access.refresh_ack_at": "",
+                "mobile_access.acknowledged_manifest_id": "",
+            },
+        },
+    )
+    return now
 
 
 async def _ensure_mobile_manifest(
@@ -574,7 +749,7 @@ async def _ensure_mobile_manifest(
         expires_at = now + timedelta(hours=refresh_hours)
         manifest_id = secrets.token_urlsafe(18)
 
-    tutors = await _load_allowed_manifest_tutors(tenant_db)
+    tutors = await _load_allowed_manifest_tutors(tenant_db, hub_doc)
     payload = {
         "hub_id": hub_doc["hub_id"],
         "tenant_id": hub_doc.get("institute_id") or "",
@@ -890,6 +1065,8 @@ async def link_local_hub(
         "firmware_version": body.firmware_version,
         "capabilities": capabilities,
         "hub_scopes": HUB_BACKEND_SCOPES,
+        "mobile_access.access_policy": "selected_only",
+        "mobile_access.allowed_tutor_ids": [],
         "hub_credentials": {
             "credential_hash": _hash_hub_device_credential(device_credential),
             "credential_version": credential_version,
@@ -1215,6 +1392,9 @@ async def hub_heartbeat(
             }
         },
     )
+    pending_command_count = await tenant_db["hub_commands"].count_documents(
+        {"hub_id": hub_id, "status": "pending"}
+    )
 
     return HeartbeatResponse(
         hub_id=hub_id,
@@ -1227,6 +1407,7 @@ async def hub_heartbeat(
         manifest_refresh_requested_at=_fmt(
             dict(existing.get("mobile_access") or {}).get("refresh_requested_at")
         ),
+        pending_command_count=pending_command_count,
     )
 
 
@@ -1607,22 +1788,19 @@ async def regenerate_tutor_manifest(
         tenant_db,
         force_rotate=True,
     )
-    now = datetime.now(timezone.utc)
-    await hub_col.update_one(
-        {"hub_id": hub_id},
-        {
-            "$set": {
-                "mobile_access.refresh_requested_at": now,
-                "mobile_access.refresh_status": "pending",
-                "mobile_access.refresh_error": "",
-                "mobile_access.requested_manifest_id": manifest["manifest_id"],
-                "mobile_access.refresh_requested_by": current_user.get("user_id") or current_user.get("sub"),
-            },
-            "$unset": {
-                "mobile_access.refresh_ack_at": "",
-                "mobile_access.acknowledged_manifest_id": "",
-            },
-        },
+    now = await _request_manifest_refresh(
+        hub_col,
+        hub_id,
+        manifest_id=manifest["manifest_id"],
+        actor=current_user,
+    )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="manifest_regenerated",
+        actor=current_user,
+        source="admin_portal",
+        details={"allowed_tutor_count": len(manifest["allowed_tutors"])},
     )
 
     return ManifestRegenerateResponse(
@@ -1633,6 +1811,129 @@ async def regenerate_tutor_manifest(
         allowed_tutor_count=len(manifest["allowed_tutors"]),
         refresh_requested_at=now.isoformat(),
     )
+
+
+@router.get(
+    "/{hub_id}/teachers",
+    response_model=HubTeachersResponse,
+    summary="List active teachers and current per-hub mobile access selection",
+)
+async def list_hub_teachers(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubTeachersResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_doc = await tenant_db["exampen_hubs"].find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    selected = set(_hub_selected_tutor_ids(hub_doc))
+    teachers = []
+    for tutor in await _load_available_tutors(tenant_db):
+        teachers.append(HubTeacherItem(
+            tutor_id=tutor["tutor_id"],
+            name=tutor.get("name"),
+            username=tutor.get("username"),
+            email=tutor.get("email"),
+            standards=_safe_string_list(tutor.get("standards")),
+            sections=_safe_string_list(tutor.get("sections")),
+            subjects=_safe_string_list(tutor.get("subjects")),
+            selected=tutor["tutor_id"] in selected,
+        ))
+    return HubTeachersResponse(hub_id=hub_id, selected_tutor_ids=sorted(selected), teachers=teachers)
+
+
+@router.put(
+    "/{hub_id}/teachers",
+    response_model=ManifestRegenerateResponse,
+    summary="Replace selected teachers for a hub and request manifest refresh",
+)
+async def update_hub_teachers(
+    hub_id: str,
+    body: HubTeacherSelectionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> ManifestRegenerateResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    active_tutors = await _load_available_tutors(tenant_db)
+    active_ids = {t["tutor_id"] for t in active_tutors}
+    selected_ids = sorted({str(tid).strip() for tid in body.tutor_ids if str(tid).strip() in active_ids})
+
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "mobile_access.allowed_tutor_ids": selected_ids,
+                "mobile_access.access_policy": "selected_only",
+                "mobile_access.teacher_selection_updated_at": datetime.now(timezone.utc),
+                "mobile_access.teacher_selection_updated_by": current_user.get("user_id") or current_user.get("sub"),
+            }
+        },
+    )
+    hub_doc = {**hub_doc, "mobile_access": {**dict(hub_doc.get("mobile_access") or {}), "allowed_tutor_ids": selected_ids}}
+    manifest = await _ensure_mobile_manifest(hub_col, hub_doc, tenant_db, force_rotate=True)
+    refresh_at = await _request_manifest_refresh(
+        hub_col,
+        hub_id,
+        manifest_id=manifest["manifest_id"],
+        actor=current_user,
+    )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="teacher_manifest_selection_updated",
+        actor=current_user,
+        source="admin_portal",
+        details={"selected_tutor_count": len(selected_ids), "selected_tutor_ids": selected_ids},
+    )
+    return ManifestRegenerateResponse(
+        hub_id=hub_id,
+        manifest_id=manifest["manifest_id"],
+        issued_at=manifest["issued_at"],
+        expires_at=manifest["expires_at"],
+        allowed_tutor_count=len(manifest["allowed_tutors"]),
+        refresh_requested_at=refresh_at.isoformat(),
+    )
+
+
+@router.put(
+    "/{hub_id}/metadata",
+    summary="Update admin-only hub class/section metadata",
+)
+async def update_hub_metadata(
+    hub_id: str,
+    body: HubMetadataRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+    metadata = {
+        "class_name": (body.class_name or "").strip(),
+        "section": (body.section or "").strip(),
+        "room": (body.room or "").strip(),
+        "updated_at": datetime.now(timezone.utc),
+        "updated_by": current_user.get("user_id") or current_user.get("sub"),
+    }
+    await hub_col.update_one({"hub_id": hub_id}, {"$set": {"classroom": metadata}})
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="hub_classroom_metadata_updated",
+        actor=current_user,
+        source="admin_portal",
+        details={k: v for k, v in metadata.items() if k not in {"updated_at"}},
+    )
+    return {"success": True, "hub_id": hub_id, "classroom": {**metadata, "updated_at": metadata["updated_at"].isoformat()}}
 
 
 @router.post(
@@ -1711,6 +2012,272 @@ async def revoke_hub_device_credentials(
         credential_version=version,
         action_at=now.isoformat(),
     )
+
+
+async def _create_hub_command(
+    tenant_db,
+    hub_id: str,
+    *,
+    command_type: str,
+    payload: Dict[str, Any],
+    actor: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    command = {
+        "command_id": f"hub_cmd_{uuid.uuid4().hex}",
+        "hub_id": hub_id,
+        "type": command_type,
+        "payload": payload,
+        "status": "pending",
+        "created_at": now,
+        "created_by": actor.get("user_id") or actor.get("sub") or "",
+        "created_by_type": actor.get("user_type") or "",
+    }
+    await tenant_db["hub_commands"].insert_one(command)
+    return command
+
+
+@router.post("/{hub_id}/commands/fetch-data", response_model=HubCommandResponse)
+async def request_hub_data_fetch(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCommandResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    if not await tenant_db["exampen_hubs"].find_one({"hub_id": hub_id}):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+    command = await _create_hub_command(
+        tenant_db,
+        hub_id,
+        command_type="fetch_data",
+        payload={"scope": "all_raw_sessions"},
+        actor=current_user,
+    )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="hub_data_fetch_requested",
+        actor=current_user,
+        source="admin_portal",
+        details={"command_id": command["command_id"]},
+    )
+    return HubCommandResponse(hub_id=hub_id, command_id=command["command_id"], status="pending")
+
+
+@router.get("/{hub_id}/commands/pending", response_model=HubCommandPollResponse)
+async def poll_hub_commands(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCommandPollResponse:
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+    tenant_db = await _get_tenant_db(db, current_user)
+    cursor = tenant_db["hub_commands"].find({"hub_id": hub_id, "status": "pending"}).sort("created_at", 1).limit(20)
+    commands = []
+    async for command in cursor:
+        command.pop("_id", None)
+        command["created_at"] = _fmt(command.get("created_at"))
+        commands.append(command)
+    return HubCommandPollResponse(hub_id=hub_id, commands=commands)
+
+
+@router.post("/{hub_id}/commands/{command_id}/ack", response_model=HubCommandResponse)
+async def ack_hub_command(
+    hub_id: str,
+    command_id: str,
+    body: HubCommandAckRequest,
+    current_user: Dict[str, Any] = Depends(require_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCommandResponse:
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+    tenant_db = await _get_tenant_db(db, current_user)
+    command = await tenant_db["hub_commands"].find_one({"hub_id": hub_id, "command_id": command_id})
+    if not command:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Command not found")
+    final_status = "completed" if body.status == "completed" else "failed"
+    now = datetime.now(timezone.utc)
+    await tenant_db["hub_commands"].update_one(
+        {"hub_id": hub_id, "command_id": command_id},
+        {"$set": {"status": final_status, "completed_at": now, "result": body.result, "error": body.error or ""}},
+    )
+    if command.get("type") == "delete_data" and final_status == "completed":
+        data_ids = _safe_string_list(dict(command.get("payload") or {}).get("data_ids"))
+        await tenant_db["hub_data_uploads"].update_many(
+            {"hub_id": hub_id, "data_id": {"$in": data_ids}},
+            {"$set": {"status": "deleted", "deleted_at": now, "updated_at": now}, "$unset": {"frames": ""}},
+        )
+    if command.get("type") == "convert_data" and final_status == "completed":
+        data_ids = _safe_string_list(dict(command.get("payload") or {}).get("data_ids"))
+        await tenant_db["hub_data_uploads"].update_many(
+            {"hub_id": hub_id, "data_id": {"$in": data_ids}},
+            {"$set": {"conversion_status": "converted", "converted_at": now, "updated_at": now}},
+        )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action=f"hub_command_{final_status}",
+        actor=current_user,
+        source="edge_hub",
+        details={"command_id": command_id, "command_type": command.get("type"), "result": body.result, "error": body.error},
+    )
+    return HubCommandResponse(hub_id=hub_id, command_id=command_id, status=final_status)
+
+
+@router.post("/{hub_id}/data/upload")
+async def upload_hub_data(
+    hub_id: str,
+    body: HubDataUploadRequest,
+    current_user: Dict[str, Any] = Depends(require_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_DATA_UPLOAD)
+    tenant_db = await _get_tenant_db(db, current_user)
+    now = datetime.now(timezone.utc)
+    batch_id = body.upload_batch_id or f"hub_upload_{uuid.uuid4().hex}"
+    upserts = 0
+    for session in body.sessions:
+        data_id = f"{hub_id}:{session.raw_session_key}"
+        doc = {
+            "data_id": data_id,
+            "hub_id": hub_id,
+            "raw_session_key": session.raw_session_key,
+            "session_id": session.session_id,
+            "pen_mac": session.pen_mac,
+            "started_at": session.started_at,
+            "frame_count": session.frame_count,
+            "file_size": session.file_size,
+            "frames": session.frames,
+            "upload_batch_id": batch_id,
+            "command_id": body.command_id,
+            "status": "uploaded",
+            "conversion_status": "raw",
+            "uploaded_at": now,
+            "updated_at": now,
+        }
+        await tenant_db["hub_data_uploads"].update_one(
+            {"data_id": data_id},
+            {"$set": doc, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+        upserts += 1
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="hub_data_uploaded",
+        actor=current_user,
+        source="edge_hub",
+        details={"upload_batch_id": batch_id, "session_count": upserts, "command_id": body.command_id},
+    )
+    return {"success": True, "hub_id": hub_id, "upload_batch_id": batch_id, "session_count": upserts}
+
+
+@router.get("/{hub_id}/data", response_model=HubDataListResponse)
+async def list_hub_data(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubDataListResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    cursor = tenant_db["hub_data_uploads"].find({"hub_id": hub_id}).sort("updated_at", -1).limit(500)
+    items: List[Dict[str, Any]] = []
+    async for doc in cursor:
+        doc.pop("_id", None)
+        doc.pop("frames", None)
+        for key in ("created_at", "uploaded_at", "updated_at", "deleted_at", "converted_at"):
+            if key in doc:
+                doc[key] = _fmt(doc.get(key))
+        items.append(doc)
+    return HubDataListResponse(hub_id=hub_id, items=items, count=len(items))
+
+
+@router.post("/{hub_id}/data/delete", response_model=HubCommandResponse)
+async def request_hub_data_delete(
+    hub_id: str,
+    body: HubDataActionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCommandResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    data_ids = sorted({str(data_id).strip() for data_id in body.data_ids if str(data_id).strip()})
+    if not data_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No data rows selected")
+    docs = await tenant_db["hub_data_uploads"].find({"hub_id": hub_id, "data_id": {"$in": data_ids}}).to_list(length=500)
+    raw_session_keys = [str(d.get("raw_session_key") or "") for d in docs if d.get("raw_session_key")]
+    command = await _create_hub_command(
+        tenant_db,
+        hub_id,
+        command_type="delete_data",
+        payload={"data_ids": data_ids, "raw_session_keys": raw_session_keys},
+        actor=current_user,
+    )
+    now = datetime.now(timezone.utc)
+    await tenant_db["hub_data_uploads"].update_many(
+        {"hub_id": hub_id, "data_id": {"$in": data_ids}},
+        {"$set": {"status": "delete_requested", "delete_command_id": command["command_id"], "updated_at": now}},
+    )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="hub_data_delete_requested",
+        actor=current_user,
+        source="admin_portal",
+        details={"command_id": command["command_id"], "data_ids": data_ids},
+    )
+    return HubCommandResponse(hub_id=hub_id, command_id=command["command_id"], status="pending")
+
+
+@router.post("/{hub_id}/data/convert", response_model=HubCommandResponse)
+async def request_hub_data_convert(
+    hub_id: str,
+    body: HubDataActionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCommandResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    data_ids = sorted({str(data_id).strip() for data_id in body.data_ids if str(data_id).strip()})
+    if not data_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No data rows selected")
+    command = await _create_hub_command(
+        tenant_db,
+        hub_id,
+        command_type="convert_data",
+        payload={"data_ids": data_ids},
+        actor=current_user,
+    )
+    now = datetime.now(timezone.utc)
+    await tenant_db["hub_data_uploads"].update_many(
+        {"hub_id": hub_id, "data_id": {"$in": data_ids}},
+        {"$set": {"conversion_status": "requested", "convert_command_id": command["command_id"], "updated_at": now}},
+    )
+    await _log_hub_audit(
+        tenant_db,
+        hub_id,
+        action="hub_data_conversion_requested",
+        actor=current_user,
+        source="admin_portal",
+        details={"command_id": command["command_id"], "data_ids": data_ids},
+    )
+    return HubCommandResponse(hub_id=hub_id, command_id=command["command_id"], status="pending")
+
+
+@router.get("/{hub_id}/audit-log", response_model=HubAuditListResponse)
+async def list_hub_audit_log(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_hub_or_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubAuditListResponse:
+    _require_hub_id_match(current_user, hub_id)
+    tenant_db = await _get_tenant_db(db, current_user)
+    cursor = tenant_db["hub_audit_logs"].find({"hub_id": hub_id}).sort("created_at", -1).limit(200)
+    items: List[Dict[str, Any]] = []
+    async for doc in cursor:
+        doc.pop("_id", None)
+        doc["created_at"] = _fmt(doc.get("created_at"))
+        items.append(doc)
+    return HubAuditListResponse(hub_id=hub_id, items=items, count=len(items))
 
 
 @router.get(
@@ -2052,6 +2619,7 @@ async def list_hubs(
     for d in docs:
         mobile_access = dict(d.get("mobile_access") or {})
         hub_credentials = dict(d.get("hub_credentials") or {})
+        classroom = dict(d.get("classroom") or {})
         last_heartbeat = _as_aware_utc_datetime(d.get("last_heartbeat_at"))
         items.append(
             HubListItem(
@@ -2068,6 +2636,9 @@ async def list_hubs(
                 storage_health=d.get("storage_health") or "unknown",
                 connected_pen_count=_safe_int(d.get("connected_pen_count")),
                 assigned_exam_id=d.get("assigned_exam_id"),
+                class_name=classroom.get("class_name") or "",
+                section=classroom.get("section") or "",
+                room=classroom.get("room") or "",
                 capabilities=_safe_string_list(d.get("capabilities")),
                 scopes=_safe_string_list(d.get("hub_scopes")) or HUB_BACKEND_SCOPES,
                 credential_status=hub_credentials.get("status") or HUB_CREDENTIAL_STATUS_ACTIVE,
@@ -2083,6 +2654,7 @@ async def list_hubs(
                 manifest_expires_at=_fmt(mobile_access.get("manifest_expires_at")),
                 manifest_updated_at=_fmt(mobile_access.get("updated_at")),
                 allowed_tutor_count=len(mobile_access.get("allowed_tutors") or []),
+                selected_tutor_count=len(mobile_access.get("allowed_tutor_ids") or []),
                 manifest_refresh_requested_at=_fmt(mobile_access.get("refresh_requested_at")),
                 manifest_refresh_ack_at=_fmt(mobile_access.get("refresh_ack_at")),
                 manifest_refresh_status=mobile_access.get("refresh_status"),
