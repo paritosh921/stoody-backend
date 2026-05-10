@@ -5,7 +5,7 @@
 Unified strict-mode backend stabilization and deployment plan, combining:
 
 - `DATABASE_manage_STRICT_codex.md` (strict auth/tenant acceptance criteria)
-- `backend/DATABASE_manage_STRICT_claude.md` (operational execution, commands, rollback)
+- retired `DATABASE_manage_STRICT_claude.md` notes (operational execution, commands, rollback)
 
 This version incorporates feedback to add an explicit EC2 source/runtime parity phase and avoids over-claiming a single 502 root cause.
 
@@ -255,4 +255,3 @@ curl -s -X POST http://127.0.0.1:5001/api/v1/auth/admin/login \
 | `scripts/migrations/migrate_legacy_tenants.py` | **NEW**: migration with orphan fix + feature backfill + integrity quarantine |
 | `CLAUDE.md` | Updated DB architecture docs, marked auth_bypass as resolved |
 | `api/v1/__pycache__/auth_bypass.cpython-*.pyc` | Deleted |
-

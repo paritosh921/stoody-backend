@@ -36,7 +36,7 @@ import string
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
@@ -67,6 +67,7 @@ def _create_hub_token(
     *,
     institution_id: Optional[str] = None,
     scopes: Optional[List[str]] = None,
+    expires_delta: Optional[timedelta] = None,
 ) -> str:
     """Issue a long-lived JWT for a hub to authenticate with hub-facing endpoints."""
     import jwt as pyjwt
@@ -83,7 +84,7 @@ def _create_hub_token(
         "scopes": restricted_scopes,
         "user_type": "hub",
         "user_id": hub_id,
-        "exp": now + timedelta(days=365),
+        "exp": now + (expires_delta or timedelta(days=365)),
         "iat": now,
         "type": "access",
     }
@@ -101,6 +102,11 @@ MOBILE_MANIFEST_DEFAULT_REFRESH_HOURS = 24
 MOBILE_MANIFEST_MIN_REFRESH_HOURS = 1
 MOBILE_MANIFEST_MAX_REFRESH_HOURS = 168
 MOBILE_LOCAL_TOKEN_TTL_SECONDS = 5 * 60
+HUB_ACCESS_TOKEN_TTL_SECONDS = 60 * 60
+HUB_DEVICE_CREDENTIAL_BYTES = 32
+HUB_CREDENTIAL_STATUS_ACTIVE = "active"
+HUB_CREDENTIAL_STATUS_ROTATION_REQUIRED = "rotation_required"
+HUB_CREDENTIAL_STATUS_REVOKED = "revoked"
 
 
 def _canonical_json(data: Dict[str, Any]) -> bytes:
@@ -109,6 +115,20 @@ def _canonical_json(data: Dict[str, Any]) -> bytes:
 
 def _manifest_signature(secret: str, payload: Dict[str, Any]) -> str:
     return hmac.new(secret.encode("utf-8"), _canonical_json(payload), hashlib.sha256).hexdigest()
+
+
+def _hash_hub_device_credential(credential: str) -> str:
+    return hashlib.sha256(credential.encode("utf-8")).hexdigest()
+
+
+def _new_hub_device_credential() -> str:
+    return secrets.token_urlsafe(HUB_DEVICE_CREDENTIAL_BYTES)
+
+
+def _verify_hub_device_credential(credential: str, stored_hash: str) -> bool:
+    if not credential or not stored_hash:
+        return False
+    return hmac.compare_digest(_hash_hub_device_credential(credential), str(stored_hash))
 
 
 def _safe_refresh_hours(value: Any) -> int:
@@ -232,6 +252,18 @@ async def _get_tenant_db(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Tenant database not available",
         )
+    if current_user.get("user_type") == "hub":
+        hub_id = current_user.get("hub_id") or current_user.get("sub")
+        hub_doc = await tenant_db["exampen_hubs"].find_one(
+            {"hub_id": hub_id},
+            {"hub_credentials.status": 1},
+        )
+        credential_status = (hub_doc or {}).get("hub_credentials", {}).get("status")
+        if credential_status == HUB_CREDENTIAL_STATUS_REVOKED:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Hub credentials revoked. Re-link this hub from the classroom device.",
+            )
     return tenant_db
 
 
@@ -277,9 +309,36 @@ class LinkLocalHubResponse(BaseModel):
     institution_id: Optional[str] = None
     db_name: str
     hub_token: str
+    hub_token_expires_in_sec: int = HUB_ACCESS_TOKEN_TTL_SECONDS
+    device_credential: str
+    credential_status: str = HUB_CREDENTIAL_STATUS_ACTIVE
+    credential_version: int = 1
     backend_url: str = ""
     scopes: List[str]
     linked_at: str
+
+
+class HubTokenRequest(BaseModel):
+    device_credential: str = Field(..., min_length=16)
+
+
+class HubTokenResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    hub_token: str
+    expires_in_sec: int = HUB_ACCESS_TOKEN_TTL_SECONDS
+    credential_status: str = HUB_CREDENTIAL_STATUS_ACTIVE
+    credential_version: int = 1
+    rotated: bool = False
+    device_credential: Optional[str] = None
+
+
+class HubCredentialActionResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    credential_status: str
+    credential_version: int = 0
+    action_at: str
 
 
 class RegisterRequest(BaseModel):
@@ -355,6 +414,13 @@ class HubListItem(BaseModel):
     assigned_exam_id: Optional[str] = None
     capabilities: List[str] = Field(default_factory=list)
     scopes: List[str] = Field(default_factory=list)
+    credential_status: str = HUB_CREDENTIAL_STATUS_ACTIVE
+    credential_version: int = 0
+    credential_issued_at: Optional[str] = None
+    credential_rotated_at: Optional[str] = None
+    credential_rotation_requested_at: Optional[str] = None
+    credential_revoked_at: Optional[str] = None
+    credential_last_refresh_at: Optional[str] = None
     manifest_ready: bool = False
     manifest_id: Optional[str] = None
     manifest_issued_at: Optional[str] = None
@@ -810,6 +876,8 @@ async def link_local_hub(
                 detail="Hub is already linked to another tenant",
             )
 
+    device_credential = _new_hub_device_credential()
+    credential_version = 1
     set_doc = {
         "hub_id": hub_id,
         "hub_name": body.hub_name,
@@ -822,6 +890,17 @@ async def link_local_hub(
         "firmware_version": body.firmware_version,
         "capabilities": capabilities,
         "hub_scopes": HUB_BACKEND_SCOPES,
+        "hub_credentials": {
+            "credential_hash": _hash_hub_device_credential(device_credential),
+            "credential_version": credential_version,
+            "status": HUB_CREDENTIAL_STATUS_ACTIVE,
+            "issued_at": now,
+            "rotated_at": None,
+            "rotation_requested_at": None,
+            "revoked_at": None,
+            "last_refresh_at": now,
+            "last_refresh_ip": None,
+        },
         "linked_by": linked_by,
         "linked_at": now,
         "link_method": "admin_login",
@@ -872,6 +951,7 @@ async def link_local_hub(
         db_name=db_name,
         institution_id=str(institution_id) if institution_id else None,
         scopes=HUB_BACKEND_SCOPES,
+        expires_delta=timedelta(seconds=HUB_ACCESS_TOKEN_TTL_SECONDS),
     )
     backend_url = getattr(settings, "BACKEND_URL", "") or ""
     logger.info("Hub %s linked locally to tenant %s by %s", hub_id, db_name, linked_by)
@@ -883,6 +963,10 @@ async def link_local_hub(
         institution_id=str(institution_id) if institution_id else None,
         db_name=db_name,
         hub_token=hub_token,
+        hub_token_expires_in_sec=HUB_ACCESS_TOKEN_TTL_SECONDS,
+        device_credential=device_credential,
+        credential_status=HUB_CREDENTIAL_STATUS_ACTIVE,
+        credential_version=credential_version,
         backend_url=backend_url,
         scopes=HUB_BACKEND_SCOPES,
         linked_at=now.isoformat(),
@@ -1330,6 +1414,173 @@ async def hub_auth_check(
 
 
 @router.post(
+    "/{hub_id}/token",
+    summary="Exchange a hub device credential for a short-lived hub access token",
+    responses={
+        401: {"description": "Invalid or revoked hub device credential"},
+        404: {"description": "Hub not found"},
+        503: {"description": "Tenant or master database unavailable"},
+    },
+)
+async def exchange_hub_device_credential(
+    hub_id: str,
+    body: HubTokenRequest,
+    request: Request,
+    db: DatabaseManager = Depends(get_database),
+) -> HubTokenResponse:
+    """Issue a short-lived hub JWT from the long-lived device credential.
+
+    This endpoint is intentionally not tied to admin/tutor session JWTs. Admin
+    login is required only for the original link transaction; the RPi then uses
+    this device credential to recover from normal backend deploys and to rotate
+    credentials without physical access.
+    """
+    master_db = await _get_master_db(db)
+    master_doc = await master_db["exampen_hubs"].find_one({"hub_id": hub_id})
+    db_name = str((master_doc or {}).get("db_name") or "")
+    if not db_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    tenant_db = await db.get_tenant_db(db_name)
+    if tenant_db is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Tenant database not available")
+
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    credentials = dict(hub_doc.get("hub_credentials") or {})
+    stored_hash = str(credentials.get("credential_hash") or "")
+    if not _verify_hub_device_credential(body.device_credential, stored_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid hub device credential")
+
+    credential_status = str(credentials.get("status") or HUB_CREDENTIAL_STATUS_ACTIVE)
+    if credential_status == HUB_CREDENTIAL_STATUS_REVOKED:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hub device credential revoked. Re-link this hub from the local TUI.",
+        )
+
+    now = datetime.now(timezone.utc)
+    next_credential: Optional[str] = None
+    rotated = False
+    credential_version = int(credentials.get("credential_version") or 1)
+    set_fields: Dict[str, Any] = {
+        "hub_credentials.last_refresh_at": now,
+        "hub_credentials.last_refresh_ip": request.client.host if request.client else None,
+    }
+
+    if credential_status == HUB_CREDENTIAL_STATUS_ROTATION_REQUIRED:
+        next_credential = _new_hub_device_credential()
+        credential_version += 1
+        credential_status = HUB_CREDENTIAL_STATUS_ACTIVE
+        rotated = True
+        set_fields.update({
+            "hub_credentials.credential_hash": _hash_hub_device_credential(next_credential),
+            "hub_credentials.credential_version": credential_version,
+            "hub_credentials.status": HUB_CREDENTIAL_STATUS_ACTIVE,
+            "hub_credentials.rotated_at": now,
+            "hub_credentials.rotation_completed_at": now,
+            "hub_credentials.rotation_requested_at": None,
+        })
+
+    await hub_col.update_one({"hub_id": hub_id}, {"$set": set_fields})
+    await master_db["exampen_hubs"].update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "last_seen_at": now,
+                "credential_status": credential_status,
+                "credential_version": credential_version,
+                "updated_at": now,
+            }
+        },
+    )
+
+    hub_token = _create_hub_token(
+        hub_id,
+        db_name=db_name,
+        institution_id=str(hub_doc.get("institution_id") or db_name),
+        scopes=_safe_string_list(hub_doc.get("hub_scopes")) or HUB_BACKEND_SCOPES,
+        expires_delta=timedelta(seconds=HUB_ACCESS_TOKEN_TTL_SECONDS),
+    )
+    return HubTokenResponse(
+        hub_id=hub_id,
+        hub_token=hub_token,
+        expires_in_sec=HUB_ACCESS_TOKEN_TTL_SECONDS,
+        credential_status=credential_status,
+        credential_version=credential_version,
+        rotated=rotated,
+        device_credential=next_credential,
+    )
+
+
+@router.post(
+    "/{hub_id}/credentials/bootstrap",
+    summary="Migrate a valid legacy hub JWT to a hub device credential",
+)
+async def bootstrap_hub_device_credential(
+    hub_id: str,
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> HubTokenResponse:
+    _require_hub_id_match(current_user, hub_id)
+    _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    credentials = dict(hub_doc.get("hub_credentials") or {})
+    if credentials.get("status") == HUB_CREDENTIAL_STATUS_REVOKED:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Hub device credential revoked. Re-link this hub from the local TUI.",
+        )
+    if credentials.get("credential_hash") and credentials.get("status") != HUB_CREDENTIAL_STATUS_REVOKED:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Hub device credential already exists")
+
+    now = datetime.now(timezone.utc)
+    device_credential = _new_hub_device_credential()
+    credential_version = int(credentials.get("credential_version") or 0) + 1
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "hub_credentials.credential_hash": _hash_hub_device_credential(device_credential),
+                "hub_credentials.credential_version": credential_version,
+                "hub_credentials.status": HUB_CREDENTIAL_STATUS_ACTIVE,
+                "hub_credentials.issued_at": now,
+                "hub_credentials.rotated_at": now,
+                "hub_credentials.last_refresh_at": now,
+                "hub_credentials.last_refresh_ip": request.client.host if request.client else None,
+                "hub_credentials.bootstrap_by": "legacy_hub_jwt",
+            }
+        },
+    )
+    hub_token = _create_hub_token(
+        hub_id,
+        db_name=str(current_user.get("db_name") or hub_doc.get("db_name") or hub_doc.get("institute_id")),
+        institution_id=str(current_user.get("institution_id") or hub_doc.get("institution_id") or ""),
+        scopes=_safe_string_list(hub_doc.get("hub_scopes")) or HUB_BACKEND_SCOPES,
+        expires_delta=timedelta(seconds=HUB_ACCESS_TOKEN_TTL_SECONDS),
+    )
+    return HubTokenResponse(
+        hub_id=hub_id,
+        hub_token=hub_token,
+        expires_in_sec=HUB_ACCESS_TOKEN_TTL_SECONDS,
+        credential_status=HUB_CREDENTIAL_STATUS_ACTIVE,
+        credential_version=credential_version,
+        rotated=True,
+        device_credential=device_credential,
+    )
+
+
+@router.post(
     "/{hub_id}/tutor-manifest/regenerate",
     summary="Admin regenerates the tutor manifest and requests hub refresh",
     responses={
@@ -1381,6 +1632,84 @@ async def regenerate_tutor_manifest(
         expires_at=manifest["expires_at"],
         allowed_tutor_count=len(manifest["allowed_tutors"]),
         refresh_requested_at=now.isoformat(),
+    )
+
+
+@router.post(
+    "/{hub_id}/credentials/rotate",
+    summary="Request automatic hub device credential rotation",
+)
+async def rotate_hub_device_credentials(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCredentialActionResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    credentials = dict(hub_doc.get("hub_credentials") or {})
+    if str(credentials.get("status") or HUB_CREDENTIAL_STATUS_ACTIVE) == HUB_CREDENTIAL_STATUS_REVOKED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Hub credentials are revoked. Re-link this hub from the local TUI.",
+        )
+
+    now = datetime.now(timezone.utc)
+    version = int(credentials.get("credential_version") or 1)
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "hub_credentials.status": HUB_CREDENTIAL_STATUS_ROTATION_REQUIRED,
+                "hub_credentials.rotation_requested_at": now,
+                "hub_credentials.rotation_requested_by": current_user.get("user_id") or current_user.get("sub"),
+            }
+        },
+    )
+    return HubCredentialActionResponse(
+        hub_id=hub_id,
+        credential_status=HUB_CREDENTIAL_STATUS_ROTATION_REQUIRED,
+        credential_version=version,
+        action_at=now.isoformat(),
+    )
+
+
+@router.post(
+    "/{hub_id}/credentials/revoke",
+    summary="Revoke hub device credentials and require local TUI relink",
+)
+async def revoke_hub_device_credentials(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubCredentialActionResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    now = datetime.now(timezone.utc)
+    credentials = dict(hub_doc.get("hub_credentials") or {})
+    version = int(credentials.get("credential_version") or 1)
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "hub_credentials.status": HUB_CREDENTIAL_STATUS_REVOKED,
+                "hub_credentials.revoked_at": now,
+                "hub_credentials.revoked_by": current_user.get("user_id") or current_user.get("sub"),
+            }
+        },
+    )
+    return HubCredentialActionResponse(
+        hub_id=hub_id,
+        credential_status=HUB_CREDENTIAL_STATUS_REVOKED,
+        credential_version=version,
+        action_at=now.isoformat(),
     )
 
 
@@ -1722,6 +2051,7 @@ async def list_hubs(
     items: List[HubListItem] = []
     for d in docs:
         mobile_access = dict(d.get("mobile_access") or {})
+        hub_credentials = dict(d.get("hub_credentials") or {})
         last_heartbeat = _as_aware_utc_datetime(d.get("last_heartbeat_at"))
         items.append(
             HubListItem(
@@ -1740,6 +2070,13 @@ async def list_hubs(
                 assigned_exam_id=d.get("assigned_exam_id"),
                 capabilities=_safe_string_list(d.get("capabilities")),
                 scopes=_safe_string_list(d.get("hub_scopes")) or HUB_BACKEND_SCOPES,
+                credential_status=hub_credentials.get("status") or HUB_CREDENTIAL_STATUS_ACTIVE,
+                credential_version=_safe_int(hub_credentials.get("credential_version")),
+                credential_issued_at=_fmt(hub_credentials.get("issued_at")),
+                credential_rotated_at=_fmt(hub_credentials.get("rotated_at")),
+                credential_rotation_requested_at=_fmt(hub_credentials.get("rotation_requested_at")),
+                credential_revoked_at=_fmt(hub_credentials.get("revoked_at")),
+                credential_last_refresh_at=_fmt(hub_credentials.get("last_refresh_at")),
                 manifest_ready=bool(mobile_access.get("manifest_id")),
                 manifest_id=mobile_access.get("manifest_id"),
                 manifest_issued_at=_fmt(mobile_access.get("manifest_issued_at")),

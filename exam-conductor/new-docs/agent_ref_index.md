@@ -19,7 +19,7 @@ ExamPen spans 4 implementation boundaries. Each boundary has its own codebase lo
 - **`stoody-multi-pen/HUB-exam-conductor/`** — Legacy/reference ExamPen hub implementation. Use as a design donor for supervisor, timer, invigilator BLE, pen sync, and uplink behavior while migrating concepts into `edge_hub`.
 - **`stoody-multi-pen/mobile-app/`** — The invigilator mobile app will be extended for ExamPen (BLE commands to exam-hub). Shared between smartboard and ExamPen use cases.
 - **`backend/exam-conductor/`** — All ExamPen backend modules. Never import from `archiveDCR/` or root `exam-conductor/`.
-- **`frontend/`** — ExamPen tutor/student pages will be added here. Follow existing frontend patterns (see `frontend/CLAUDE.md`).
+- **`frontend/`** — ExamPen tutor/student pages will be added here. Follow existing frontend patterns (see `frontend/README.md` and `frontend/docs/README.md`).
 - **`super-admin/`** — ExamPen platform admin surfaces. See `integration/SUPERADMIN_SPEC.md`.
 
 ## Agent Instructions
