@@ -115,6 +115,40 @@ async def _gate_text_call(
     return gate_resp.content
 
 
+async def _svg_to_png_b64(svg_b64: str) -> str:
+    """Convert SVG base64 (raw, no data URI prefix) to PNG base64 using cairosvg."""
+    import base64 as _b64
+    import cairosvg
+    svg_bytes = _b64.b64decode(svg_b64)
+    png_bytes = cairosvg.svg2png(bytestring=svg_bytes, output_width=1024)
+    return _b64.b64encode(png_bytes).decode("ascii")
+
+
+async def _normalize_image_b64(image_b64: str) -> tuple:
+    """
+    Strip data URI prefix, detect MIME, and convert SVG to PNG if needed.
+    Returns (png_b64_raw, mime_type).
+    """
+    raw = image_b64
+    mime = "image/png"
+    if "," in raw:
+        prefix, raw = raw.split(",", 1)
+        if "svg+xml" in prefix:
+            mime = "image/svg+xml"
+        elif "jpeg" in prefix or "jpg" in prefix:
+            mime = "image/jpeg"
+        elif "webp" in prefix:
+            mime = "image/webp"
+        elif "gif" in prefix:
+            mime = "image/gif"
+
+    if mime == "image/svg+xml":
+        raw = await _svg_to_png_b64(raw)
+        mime = "image/png"
+
+    return raw, mime
+
+
 async def _gate_vision_call(
     tenant_db: Any,
     image_b64: str,
@@ -127,6 +161,8 @@ async def _gate_vision_call(
 
     Builds an OpenAI-style messages array with text + image_url parts and
     forwards it via ``gate.call(messages=...)``.
+
+    Handles SVG→PNG conversion when the input is SVG-base64.
 
     Returns the response content string, or ``None`` **only** when the gate
     module was never importable (deployment issue).
@@ -146,6 +182,8 @@ async def _gate_vision_call(
 
     model_id = OPENAI_MODEL
 
+    img_raw, mime = await _normalize_image_b64(image_b64)
+
     # Build multimodal messages array (OpenAI format)
     messages: List[Dict[str, Any]] = [
         {
@@ -155,7 +193,7 @@ async def _gate_vision_call(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{image_b64}",
+                        "url": f"data:{mime};base64,{img_raw}",
                         "detail": "high",
                     },
                 },
@@ -211,10 +249,6 @@ class OCRService:
         Returns:
             dict with 'text' (extracted text) and 'success' (bool)
         """
-        # Clean up base64 data - remove data URI prefix if present
-        if "," in image_b64:
-            image_b64 = image_b64.split(",", 1)[1]
-
         default_prompt = """Extract all text and mathematical equations from this image exactly as written.
 Return ONLY the extracted text, nothing else. No explanations, no comments, no formatting notes."""
 
@@ -247,6 +281,8 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
             "Content-Type": "application/json",
         }
 
+        img_raw, mime = await _normalize_image_b64(image_b64)
+
         payload = {
             "model": OPENAI_MODEL,
             "messages": [
@@ -260,7 +296,7 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_b64}",
+                                "url": f"data:{mime};base64,{img_raw}",
                                 "detail": "high",
                             },
                         },
@@ -295,6 +331,7 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
         answer_image_b64: str,
         *,
         tenant_db: Any = None,
+        correct_answer: Optional[str] = None,
     ) -> dict:
         """
         Evaluate a student's handwritten answer.
@@ -307,27 +344,28 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
         Returns:
             dict with 'score' (correct/incorrect/partial), 'feedback', 'success'
         """
-        # Clean up base64 data
-        if "," in answer_image_b64:
-            answer_image_b64 = answer_image_b64.split(",", 1)[1]
-
         eval_prompt = f"""You are a teacher evaluating a student's handwritten answer.
 
 QUESTION: {question_text}
+"""
+        if correct_answer:
+            eval_prompt += f"\nCORRECT ANSWER: {correct_answer}\n"
 
+        eval_prompt += """
 The attached image shows the student's handwritten response to this question.
 
 Please:
 1. Read and interpret the student's handwritten answer
-2. Evaluate if the answer is correct, incorrect, or partially correct
+2. Evaluate if the answer is correct, incorrect, partially correct, or inconclusive (unreadable)
 3. Provide brief, helpful feedback
 
 Respond in this exact JSON format:
-{{
-  "score": "correct" or "incorrect" or "partial",
+{
+  "score": "correct" or "incorrect" or "partial" or "inconclusive",
   "extracted_answer": "what you read from the handwriting",
+  "correct_answer": "the correct answer if known",
   "feedback": "brief feedback for the student (1-2 sentences)"
-}}
+}
 
 Only respond with the JSON, nothing else."""
 
@@ -346,10 +384,14 @@ Only respond with the JSON, nothing else."""
                     clean_text = clean_text[4:]
             clean_text = clean_text.strip()
             result = json_module.loads(clean_text)
+            score = result.get("score", "inconclusive")
+            if score not in ("correct", "incorrect", "partial", "inconclusive"):
+                score = "inconclusive"
             return {
                 "success": True,
-                "score": result.get("score", "partial"),
+                "score": score,
                 "extracted_answer": result.get("extracted_answer", ""),
+                "correct_answer": result.get("correct_answer", correct_answer or ""),
                 "feedback": result.get("feedback", ""),
                 "provider": "gate:dcr_ai",
             }
@@ -359,12 +401,15 @@ Only respond with the JSON, nothing else."""
                 score = "correct"
             elif "incorrect" in lower_text:
                 score = "incorrect"
+            elif "inconclusive" in lower_text or "unreadable" in lower_text:
+                score = "inconclusive"
             else:
                 score = "partial"
             return {
                 "success": True,
                 "score": score,
                 "extracted_answer": "",
+                "correct_answer": correct_answer or "",
                 "feedback": gate_content[:200],
                 "provider": "gate:dcr_ai",
             }
@@ -380,6 +425,8 @@ Only respond with the JSON, nothing else."""
             "Content-Type": "application/json",
         }
 
+        img_raw, mime = await _normalize_image_b64(image_b64)
+
         payload = {
             "model": OPENAI_MODEL,
             "messages": [
@@ -390,7 +437,7 @@ Only respond with the JSON, nothing else."""
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_b64}",
+                                "url": f"data:{mime};base64,{img_raw}",
                                 "detail": "high",
                             },
                         },
@@ -448,6 +495,61 @@ Only respond with the JSON, nothing else."""
                 "extracted_answer": "",
                 "feedback": response_text[:200],
                 "provider": "openai",
+            }
+
+    async def generate_solution(
+        self,
+        question_text: str,
+        question_image_b64: Optional[str] = None,
+        *,
+        tenant_db: Any = None,
+    ) -> dict:
+        solution_prompt = f"""You are an expert teacher. Generate a step-by-step solution for this question.
+
+QUESTION: {question_text}
+
+Provide:
+1. A clear step-by-step solution
+2. The final answer clearly stated
+
+Respond in this exact JSON format:
+{{
+  "solution": "step-by-step solution explanation",
+  "final_answer": "the final answer"
+}}
+
+Only respond with the JSON, nothing else."""
+
+        if question_image_b64:
+            gate_content = await _gate_vision_call(
+                tenant_db, question_image_b64, solution_prompt, max_tokens=2048
+            )
+        else:
+            gate_content = await _gate_text_call(
+                tenant_db, solution_prompt, max_tokens=2048
+            )
+
+        import json as json_module
+        try:
+            clean_text = gate_content.strip()
+            if clean_text.startswith("```"):
+                clean_text = clean_text.split("```")[1]
+                if clean_text.startswith("json"):
+                    clean_text = clean_text[4:]
+            clean_text = clean_text.strip()
+            result = json_module.loads(clean_text)
+            return {
+                "success": True,
+                "solution": result.get("solution", ""),
+                "final_answer": result.get("final_answer", ""),
+                "provider": "gate:dcr_ai",
+            }
+        except json_module.JSONDecodeError:
+            return {
+                "success": True,
+                "solution": gate_content,
+                "final_answer": "",
+                "provider": "gate:dcr_ai",
             }
 
     async def close(self):

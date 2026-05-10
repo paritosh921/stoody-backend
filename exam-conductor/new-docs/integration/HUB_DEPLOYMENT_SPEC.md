@@ -12,23 +12,25 @@ Reference: `architecture/DUAL_MODE_ARCHITECTURE.md`, `architecture/TAMPER_PROOF_
 
 | What | Location | Notes |
 |------|----------|-------|
-| **ExamPen hub code** | `stoody-multi-pen/HUB-exam-conductor/` | Partial runtime implemented: supervisor, store, timer, TUI, BLE/uplink scaffolds, and provisioning cache exist. Supervisor now owns in-process wiring for BLE→pen-sync→uplink data path. Production packaging, systemd install artifacts, and hardware validation are pending. |
-| **Stoody smartboard hub** | `stoody-multi-pen/edge_hub/` | **DO NOT MODIFY for ExamPen.** This is the existing Stoody smartboard hub. It has its own BLE manager, TUI, and PWA server for the teacher monitoring dashboard. |
+| **Converged edge runtime** | `stoody-multi-pen/edge_hub/` | Deployment target for the shared RPi host runtime. It owns shared transport, pen registry, local storage, health, logging, provisioning, and outbound uplink substrate. Smartboard and ExamPen behavior must live in independent mode/service groups over this substrate. |
+| **ExamPen reference implementation** | `stoody-multi-pen/HUB-exam-conductor/` | Legacy/reference ExamPen hub stack. Its supervisor, timer, invigilator BLE, pen sync, and uplink concepts are design donors while folding ExamPen behavior into the converged `edge_hub` runtime. It is not the final deployment boundary for new work. |
 | **Shared mobile app** | `stoody-multi-pen/mobile-app/` | The invigilator mobile app extends this for ExamPen BLE commands. Shared between smartboard and ExamPen. |
 | **Backend ingest API** | `backend/api/v1/stroke_ingest_async.py` | Hub uploads go to `POST /api/v1/ingest/strokes/{exam_id}/{pen_mac}` (primary). Legacy bridge at `POST /api/v1/hub/exam-upload` is a compatibility surface only. |
 | **Hub provisioning + operations API** | `backend/api/v1/hub_ops_async.py` | Provisioning at `POST /api/v1/hubs/provision`. See §7 for full contract. |
 | **Super-admin hub provisioning** | `backend/api/v1/superadmin_async.py` | Admin generates provisioning codes. Hub consumes them via `POST /api/v1/hubs/provision`. See `integration/SUPERADMIN_SPEC.md`. |
 
-### Hard Boundary Rule
+### Runtime Convergence Rule
 
-> **The ExamPen hub is a SEPARATE edge device from the Stoody smartboard hub.**
+> **The production direction is one shared Stoody edge runtime with independent mode services.**
 >
-> - `stoody-multi-pen/edge_hub/` = Stoody smartboard hub (teacher monitoring, PWA, multi-pen dashboard). **DO NOT TOUCH.**
-> - `stoody-multi-pen/HUB-exam-conductor/` = ExamPen conducted-exam hub (artifact collection, dual-write, exam timer, invigilator BLE). **BUILD HERE.**
+> - `stoody-multi-pen/edge_hub/` = converged RPi host runtime.
+> - Smartboard mode = current smartboard streaming, monitoring, QLock, and Android-facing APIs.
+> - ExamPen mode = conducted-exam lifecycle, invigilator control, artifact collection, and upload.
+> - `stoody-multi-pen/HUB-exam-conductor/` = reference implementation/decomposition donor, not the target deployment boundary for new work.
 >
-> They may share the same Raspberry Pi hardware in some deployments, but the software stacks are independent. The exam-hub has its own systemd services, SQLite DB, TUI, and BLE manager.
+> Smartboard and ExamPen services may share the same Raspberry Pi, nRF transport, pen registry, storage substrate, health/logging infrastructure, and outbound backend uplink. They must not share writable mode state. Each mode keeps its own lifecycle/state machine and API ownership.
 >
-> The `stoody-multi-pen/mobile-app/` is shared — it connects to whichever hub (smartboard or exam) is nearby via BLE.
+> The `stoody-multi-pen/mobile-app/` is shared. For ExamPen it sends local invigilator commands to the hub and reads backend operational state. For smartboard-adjacent hub operations it may use a validated local hub URL, but backend identity and authorization must remain authoritative.
 
 ---
 
@@ -238,7 +240,7 @@ Quick summary: runs hardware checks (dongles, WiFi, USB, SD, NTP), software chec
 
 | Log Source | Path | Viewer |
 |---|---|---|
-| Hub supervisor | `journalctl -u exampen-supervisor` | Scrollable, filterable by level |
+| Edge runtime supervisor | `journalctl -u stoody-edge-hub` | Scrollable, filterable by level |
 | BLE manager | `journalctl -u exampen-ble-mgr` | Per-dongle filter |
 | Pen sync | `/var/log/exampen/sync.log` | Per-pen filter |
 | Uplink | `/var/log/exampen/uplink.log` | Per-upload filter |
@@ -559,16 +561,16 @@ School WiFi may have captive portals. Hub cannot handle browser-based portals.
 ## 6. systemd Service Definitions
 
 ```ini
-# /etc/systemd/system/exampen-supervisor.service
+# /etc/systemd/system/stoody-edge-hub.service
 [Unit]
-Description=ExamPen Hub Supervisor
+Description=Stoody Edge Hub Runtime
 After=network-online.target bluetooth.target
 Wants=network-online.target bluetooth.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/exampen
-ExecStart=/usr/bin/python3 -m hub_supervisor
+WorkingDirectory=/opt/stoody-edge-hub
+ExecStart=/usr/bin/python3 start_hub.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -581,20 +583,29 @@ WantedBy=multi-user.target
 **Service dependency tree:**
 
 ```
-exampen-supervisor (Type=simple)
-├── exampen-ble-mgr (threaded by supervisor)
-├── exampen-pen-sync (threaded by supervisor)
-├── exampen-timer (threaded by supervisor)
-├── exampen-uplink (threaded by supervisor)
-├── exampen-invig-ble (threaded by supervisor)
-└── exampen-tui (threaded by supervisor, optional — only if HDMI/serial connected)
+stoody-edge-hub (Type=simple)
+├── shared-runtime services
+│   ├── transport adapter / nRF session manager
+│   ├── pen registry
+│   ├── storage
+│   ├── health / logging / metrics
+│   └── uplink substrate
+├── smartboard-mode services
+│   ├── Android/smartboard API
+│   └── smartboard live streaming and local projections
+├── exampen-mode services
+│   ├── exam lifecycle / timer
+│   ├── invigilator command channel
+│   ├── exam pen sync
+│   └── ExamPen upload worker
+└── TUI services
 
-hub_store — library/repository layer used by the above services, not a supervisor thread
+Storage/repository layers are shared libraries used by service groups, not standalone owners of mode state.
 ```
 
-Supervisor manages all service threads. If a service thread crashes, supervisor restarts it and logs to `interaction_log`.
+The runtime supervisor manages service groups. If a service thread crashes, the supervisor restarts it and logs to the central runtime log. ExamPen-specific events must also be mirrored into the ExamPen interaction log.
 
-> **In-process wiring (current runtime):** The supervisor owns all shared infrastructure — `HubRepository`, `DualWriteStorage`, `ExamTimer`, `ConfigStore` — and injects them into service threads at startup. `hub_ble_mgr` receives a supervisor-provided `on_pen_data` callback that forwards BLE notifications to `PenSyncManager.handle_pen_data`. `hub_pen_sync` and `hub_uplink` share the same `HubRepository` and `DualWriteStorage`. `hub_uplink` reads `backend_url`, `hub_id`, and `hub_token` from the supervisor-owned `ConfigStore`. Module-level `run()` fallbacks exist in each module for standalone/dev operation but are not used when the supervisor is active.
+> **Reference implementation note:** `stoody-multi-pen/HUB-exam-conductor/` already demonstrates supervisor-owned in-process wiring for ExamPen concepts (`HubRepository`, `DualWriteStorage`, `ExamTimer`, `ConfigStore`, pen sync, and uplink). Those concepts should be folded into the converged `edge_hub` runtime without giving ExamPen mode ownership over smartboard state.
 
 > **Future work:** Upgrade to `Type=notify` with `sd_notify` readiness and `WatchdogSec` once the supervisor implements `READY=1` and `WATCHDOG=1` notifications.
 
@@ -633,7 +644,7 @@ Supervisor manages all service threads. If a service thread crashes, supervisor 
 ### 7.2 Provisioning Flow
 
 1. Power on RPi with golden image SD card + USB thumb drive.
-2. systemd boots → `exampen-supervisor` starts → detects first-boot (no `/etc/exampen/hub.conf`).
+2. systemd boots → `stoody-edge-hub` starts → detects first-boot or unprovisioned ExamPen mode state.
 3. TUI launches → Setup Screen forced.
 4. Admin authenticates to the Stoody backend via the TUI (or a pre-obtained admin token is configured).
 5. Admin enters hub provisioning code on TUI.
@@ -659,7 +670,7 @@ POST   /api/v1/ingest/strokes/{exam_id}/{pen_mac}/dedup      — dedup check
 
 Contract authority: `api/stroke-ingest.openapi.yaml` (version 3.0.0+).
 
-Hub runtime (`HUB-exam-conductor/hub_uplink`) MUST use this route family for all pen artifact uploads.
+The ExamPen upload worker in the converged `edge_hub` runtime MUST use this route family for all pen artifact uploads. The legacy `HUB-exam-conductor/hub_uplink` implementation remains a reference for retry, dedup, and reconciliation behavior.
 
 **Legacy bridge path:** `POST /api/v1/hub/exam-upload` exists in `backend/api/v1/hub.py` as a backward-compatibility surface. It is NOT the primary hub upload path. Do not use it for new implementations.
 
@@ -671,6 +682,7 @@ Hub runtime (`HUB-exam-conductor/hub_uplink`) MUST use this route family for all
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-09 | Aligned hub deployment authority with the converged `edge_hub` runtime direction. `HUB-exam-conductor` is now documented as a reference/decomposition donor, while new ExamPen edge work targets independent ExamPen services inside `edge_hub`. | Codex |
 | 2026-04-15 | Step 13-14: wired `connected_pen_count` from BLEManager into UplinkManager heartbeat. Implemented `start_registration_scan`: `BLEManager.scan_for_pens()` calls `DongleDiscovery.scan_for_pens()` per dongle, cross-references against cached `pen_inventory`, returns `{known, unknown}` device lists. Updated §4.3 scope note. | Claude |
 | 2026-04-15 | Step 12: supervisor-owned in-process wiring for all managed services. `hub_ble_mgr` → `PenSyncManager.handle_pen_data`, `hub_pen_sync` and `hub_uplink` share supervisor-owned `HubRepository`/`DualWriteStorage`/`ConfigStore`. `start_upload` requires `exam_id`, resolves session, updates state, returns upload ledger counts. `request_snapshot` includes `upload`, `storage`, `dongles`. Added in-process wiring note to §6. | Claude |
 | 2026-04-15 | Step 11: implemented `manual_register` against cached `pen_inventory` + simplified `pen_bindings` (local binding, no server-confirmed status). Added `get_cached_pen()` to repository. Updated §4.3 to describe current local implementation scope. `start_registration_scan` validates exam_id but hardware scan remains pending. `request_snapshot` now includes `bindings`. | Claude |

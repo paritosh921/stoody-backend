@@ -14,10 +14,14 @@ This plan covers the **upstream conducted-exam stack** — the path from invigil
 
 ```
 invigilator (mobile)
-    └── hub (HUB-exam-conductor)
+    └── hub (edge_hub shared runtime / ExamPen mode)
             └── backend (exam orchestration + ingest)
                     └── ready_for_eval
 ```
+
+> **2026-05-09 authority alignment:** Earlier task packs name `stoody-multi-pen/HUB-exam-conductor/` as the hub implementation boundary. That directory is now a reference/decomposition donor. New implementation work should fold the ExamPen behavior into `stoody-multi-pen/edge_hub/` as an independent ExamPen mode/service group over shared runtime services. Backend contracts, OpenAPI paths, lifecycle rules, and storage authority remain unchanged.
+>
+> Any later "Files to create" entries under `stoody-multi-pen/HUB-exam-conductor/` are historical module-shape references, not current create-path instructions. Map those responsibilities into `edge_hub` shared services or `edge_hub` ExamPen mode services before implementation.
 
 This plan does **NOT** include:
 - DCR execution
@@ -33,11 +37,11 @@ This plan does **NOT** include:
 |---|---|---|---|
 | Backend exam orchestration + invigilator APIs | COMPLETE | backend | W2, W3, W4 |
 | Hub provisioning + heartbeat contract | COMPLETE | backend + hub | W1, W3 |
-| Hub runtime: config, supervisor, store | COMPLETE | HUB-exam-conductor | W2 |
+| Hub runtime: config, supervisor, store | COMPLETE | `edge_hub` converged runtime; `HUB-exam-conductor` reference | W2 |
 | Mobile: multi-hub pairing + session model | COMPLETE | mobile-app | — (separate codebase) |
-| Hub runtime: BLE + pen sync + uplink | COMPLETE | HUB-exam-conductor | W1 |
+| Hub runtime: BLE + pen sync + uplink | COMPLETE | `edge_hub` converged runtime; `HUB-exam-conductor` reference | W1 |
 | Mobile: camera fallback upload | COMPLETE | mobile-app | W5 |
-| Hub runtime: TUI + diagnostics | COMPLETE | HUB-exam-conductor | W4, W5 |
+| Hub runtime: TUI + diagnostics | COMPLETE | `edge_hub` converged runtime; `HUB-exam-conductor` reference | W4, W5 |
 
 ---
 
@@ -128,7 +132,7 @@ This plan does **NOT** include:
 
 ### Wave UP-2 — Hub Runtime Skeleton
 
-> **Owner:** `stoody-multi-pen/HUB-exam-conductor/`  
+> **Owner:** `stoody-multi-pen/edge_hub/` shared runtime and ExamPen mode services. Use `stoody-multi-pen/HUB-exam-conductor/` as reference material for this task pack.  
 > **Depends on:** UP-003 (provisioning contract defined in backend)  
 > **Read first:** `integration/HUB_DEPLOYMENT_SPEC.md`, `hub/ipc-protocol.md`
 
@@ -181,7 +185,7 @@ This plan does **NOT** include:
 
 ### Wave UP-3 — Hub BLE + Pen Sync + Uplink
 
-> **Owner:** `stoody-multi-pen/HUB-exam-conductor/`  
+> **Owner:** `stoody-multi-pen/edge_hub/` shared runtime and ExamPen mode services. Use `stoody-multi-pen/HUB-exam-conductor/` as reference material for this task pack.  
 > **Depends on:** UP-006, UP-007, UP-008 (hub store and supervisor exist)  
 > **Read first:** `hub/ble-gatt-spec.md`, `hub/ipc-protocol.md`, `references/P05_pen_SDK.md`
 
@@ -236,7 +240,7 @@ This plan does **NOT** include:
 
 ### Wave UP-4 — Hub Timer + Invigilator BLE
 
-> **Owner:** `stoody-multi-pen/HUB-exam-conductor/`  
+> **Owner:** `stoody-multi-pen/edge_hub/` shared runtime and ExamPen mode services. Use `stoody-multi-pen/HUB-exam-conductor/` as reference material for this task pack.  
 > **Depends on:** UP-007, UP-008  
 > **Read first:** `integration/HUB_DEPLOYMENT_SPEC.md` §4, §5
 
@@ -331,7 +335,7 @@ This plan does **NOT** include:
 
 ### Wave UP-6 — Hub TUI
 
-> **Owner:** `stoody-multi-pen/HUB-exam-conductor/`  
+> **Owner:** `stoody-multi-pen/edge_hub/` shared runtime and ExamPen mode services. Use `stoody-multi-pen/HUB-exam-conductor/` as reference material for this task pack.  
 > **Depends on:** UP-006, UP-007, UP-008, UP-009, UP-010, UP-012  
 > **Read first:** `integration/HUB_DEPLOYMENT_SPEC.md` §2
 
@@ -421,9 +425,9 @@ All UP-001 through UP-018 tasks are COMPLETE. The following downstream surfaces 
 | VAL-UP-03 | Backend: pen upload lands in `evalpen_submissions` with correct provenance | backend + hub |
 | VAL-UP-04 | Backend: camera upload to PCR exam succeeds; camera upload to DCR exam is rejected | backend + mobile |
 | VAL-UP-05 | Backend: invigilator console APIs return correct per-hub and per-pen status | backend |
-| VAL-UP-06 | Hub: provisioning survives restart; cached invig codes are valid | HUB-exam-conductor |
-| VAL-UP-07 | Hub: multi-dongle pen sync; dual-write to SD+USB; upload retry on network loss | HUB-exam-conductor |
-| VAL-UP-08 | Hub: timer persists across restart and fires correctly on expiry | HUB-exam-conductor |
+| VAL-UP-06 | Hub: provisioning survives restart; cached invig codes are valid | `edge_hub` ExamPen mode |
+| VAL-UP-07 | Hub: multi-dongle pen sync; dual-write to SD+USB; upload retry on network loss | `edge_hub` shared runtime + ExamPen mode |
+| VAL-UP-08 | Hub: timer persists across restart and fires correctly on expiry | `edge_hub` ExamPen mode |
 | VAL-UP-09 | Mobile: pair multiple hubs; start exam on each independently | mobile-app |
 | VAL-UP-10 | Mobile: camera fallback upload with correct exam/student/page provenance | mobile-app |
 | VAL-UP-11 | End-to-end: prepared exam → invigilator arms hubs → pen data uploaded → backend shows `ready_for_eval` | all |
@@ -464,6 +468,7 @@ Upload path authority: see `integration/HUB_DEPLOYMENT_SPEC.md` §8 for the auth
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-09 | Authority alignment: `HUB-exam-conductor` task-pack paths are now historical/reference module shapes. New edge implementation work targets independent ExamPen mode services inside `stoody-multi-pen/edge_hub`. | Codex |
 | 2026-04-17 | Step 24 — restored backend startup. `pip install -r requirements.txt` resolved missing deps (pandas, pyotp, etc.). `import main_async` now succeeds with `_evalpen_available = True` — all 18 ExamPen routers and all other routes load cleanly. Updated BUILD_STATUS.md. | Claude |
 | 2026-04-17 | Step 23 — backend router import validation. All 16 ExamPen router modules pass py_compile and direct import. All 23 exam-conductor sub-packages import cleanly. ExamPen try/except block (main_async.py:303-351) succeeds in isolation. Pre-existing issue: `student_bulk_upload.py:17` requires `pandas` (not in venv) which blocks full `main_async.py` load — unrelated to ExamPen. Updated BUILD_STATUS.md deployment checklist (now 18 routers, not 11). | Claude |
 | 2026-04-16 | Step 22 — backend/mobile contract alignment check. Found one mismatch: `HubListItem` uses `last_heartbeat_at` / `connected_pen_count` while mobile `ExamHub` expects `last_heartbeat` / `connected_pens`. Fixed with field mapping in `exampenHubService.ts`. Verified all other surfaces aligned: exam list always returns arrays, 409 means same-exam duplicate only, invig console fields match exactly, camera multipart field names match, DCR rejection works both sides. npm run typecheck = 0 errors. | Claude |

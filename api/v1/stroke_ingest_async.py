@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+HUB_SCOPE_DATA_UPLOAD = "hub:data:upload"
+
 
 # ---------------------------------------------------------------------------
 # Auth dependencies
@@ -57,6 +59,18 @@ def require_hub_or_admin(
             detail="Hub or admin access required for stroke ingest",
         )
     return current_user
+
+
+def _require_hub_data_upload_scope(current_user: Dict[str, Any]) -> None:
+    if current_user.get("user_type") != "hub":
+        return
+    raw_scopes = current_user.get("scopes") or []
+    scopes = {raw_scopes} if isinstance(raw_scopes, str) else {str(scope) for scope in raw_scopes}
+    if HUB_SCOPE_DATA_UPLOAD not in scopes:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Hub token missing required scope: {HUB_SCOPE_DATA_UPLOAD}",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +226,7 @@ async def upload_stroke_chunk(
     Chunks are deduplicated by content hash. If the exact same chunk was
     already received, the existing artifact_id is returned.
     """
+    _require_hub_data_upload_scope(current_user)
     tenant_db = await _get_tenant_db(db, current_user)
 
     # Validate exam exists and is in uploading state
@@ -323,6 +338,7 @@ async def finalize_pen_upload(
     Verifies all chunks are received, validates checksum, then bridges
     the assembled data into the canonical ingest substrate via IngestService.
     """
+    _require_hub_data_upload_scope(current_user)
     tenant_db = await _get_tenant_db(db, current_user)
     pen_mac_upper = pen_mac.upper()
     chunk_col = tenant_db["exampen_stroke_chunks"]

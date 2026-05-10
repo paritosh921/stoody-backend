@@ -15,7 +15,7 @@ If two documents disagree, the document marked authoritative here wins.
 | Shared LLM gate contract, allowed callers, budgets, token storage | `architecture/LLM_GATE_SPEC.md` | — | Gate applies to both DCR and PCR. |
 | Tamper-proof rules, canonical artifact integrity, audit model | `architecture/TAMPER_PROOF_SPEC.md` | — | Covers conducted-exam flows. Practice persistence remains external. |
 | State ownership + read/write boundaries | `governance/STATE_OWNERSHIP_MAP.md` | `architecture/DUAL_MODE_ARCHITECTURE.md` | Ownership is defined by subsystem/engine, not by legacy folder layout. |
-| Hub hardware, OS, local storage, provisioning, operations | `integration/HUB_DEPLOYMENT_SPEC.md` | `references/P05_pen_SDK.md`, `references/PEN_TO_CANVAS_TO_DB_REFERENCE.md` | Hub collects and stores canonical artifacts; it does not evaluate them. |
+| Hub hardware, OS, local storage, provisioning, operations | `integration/HUB_DEPLOYMENT_SPEC.md` | `references/P05_pen_SDK.md`, `references/PEN_TO_CANVAS_TO_DB_REFERENCE.md`, `stoody-multi-pen/docs/EDGE_HUB_NRF_UNIFIED_RUNTIME_PLAN.md` | Hub collects and stores canonical artifacts; it does not evaluate them. The implementation target is the converged `stoody-multi-pen/edge_hub` runtime with independent ExamPen mode services. |
 | BLE GATT protocol | `hub/ble-gatt-spec.md` | `references/P05_pen_SDK.md`, `integration/HUB_DEPLOYMENT_SPEC.md` | Concrete BLE authority. |
 | Hub IPC protocol | `hub/ipc-protocol.md` | `integration/HUB_DEPLOYMENT_SPEC.md` | Concrete hub module-to-module contract. |
 | Current pen/canvas/backend behavior | `references/PEN_TO_CANVAS_TO_DB_REFERENCE.md` | `references/P05_pen_SDK.md` | Use when matching existing Stoody behavior instead of redesigning it. |
@@ -86,7 +86,7 @@ Promotion to `ACTIVE` requires:
 | `architecture/TAMPER_PROOF_SPEC.md` | ACTIVE | 2026-03-24 |
 | `governance/STATE_OWNERSHIP_MAP.md` | ACTIVE | R5 fix pass |
 | `governance/COMPONENT_INDEPENDENCE_MAP.md` | ACTIVE | R5 fix pass |
-| `integration/HUB_DEPLOYMENT_SPEC.md` | ACTIVE | R5 fix pass |
+| `integration/HUB_DEPLOYMENT_SPEC.md` | ACTIVE | 2026-05-09 |
 | `hub/ble-gatt-spec.md` | ACTIVE | R6 hardening pass |
 | `hub/ipc-protocol.md` | ACTIVE | R6 hardening pass |
 | `references/P05_pen_SDK.md` | ACTIVE | current reference pass |
@@ -113,6 +113,7 @@ Promotion to `ACTIVE` requires:
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-09 | Updated hub authority notes to align with the converged `stoody-multi-pen/edge_hub` runtime direction and added the unified runtime plan as supplementary hub guidance. | Codex |
 | 2026-05-02 | Reconciled docs with current frontend/mobile/super-admin implementation. Promoted chapters 09, 10, 12 from DRAFT to ACTIVE. Updated BUILD_STATUS.md, IMPLEMENTATION_PLAN.md, SUPERADMIN_SPEC.md review dates. Added chapter docs to Current Status table. | Claude |
 | 2026-04-09 | Added explicit registry entries for `chapters/BUILD_STATUS.md` and `IMPLEMENTATION_PLAN.md` as status/execution documents. Added Conflict Resolution FAQ. Both docs marked as non-authoritative for architecture, API shape, schema shape, storage contracts, and lifecycle contracts. | Claude |
 | 2026-03-24 | Rebased document authority onto `new-docs`, added root DCR/PCR/gate/tamper specs, demoted legacy `.docx` and PCR v3 plan to historical reference, and made `GUIDE_RULE_DOCS/` the only canonical home for reusable process docs. | Codex |

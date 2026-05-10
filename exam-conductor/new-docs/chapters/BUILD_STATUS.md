@@ -1,6 +1,6 @@
 # Build Status
 
-Last updated: 2026-05-02
+Last updated: 2026-05-09
 
 > **This document is a progress tracker.** It reports which implementation tasks are complete, in progress, or pending. It may be stale relative to actual code state. It must **not** be used as authority for architecture decisions, API behavior, storage contracts, schema shapes, or lifecycle rules. When this document conflicts with a root architecture spec (`architecture/*.md`), an integration spec (`integration/*.md`), an OpenAPI file (`api/*.openapi.yaml`), or an event schema (`contracts/events/*.schema.json`), the other document is correct and this one must be updated.
 
@@ -26,6 +26,7 @@ Active authority:
 - **Frontend student portal** (`ExamPenStudent.tsx`) is substantially built: published exam list, per-question score breakdown with reference answers, recheck request dialog, student-side conversation threads.
 - **Super-admin ExamPen page** (`ExamPenManagementPage.tsx`) is partially built: tenant feature gate toggle, hub fleet listing with provision code generation, partial usage analytics (tokens today from aggregate API).
 - **Mobile app** (`stoody-multi-pen/mobile-app/`) has hub list, exam selection, session dashboard, camera fallback upload with offline retry queue.
+- **Hub authority alignment** now targets the converged `stoody-multi-pen/edge_hub/` runtime for new edge work. `stoody-multi-pen/HUB-exam-conductor/` remains a reference/decomposition donor for ExamPen service behavior.
 - **Shared status module** (`frontend/src/utils/examPenStatus.ts`) adopted across all status-displaying components.
 
 ---
@@ -335,7 +336,7 @@ Use these tasks for spawned agents. Each task has a bounded write set. An agent 
 | Backend recheck/conversation routers | Frontend defines `RecheckStatus` (with `submission_id`) and `ConversationThread` types; backend endpoints not yet mounted | Frontend recheck/conversation UI will be non-functional until backend routers are implemented. |
 | Plagiarism API | Spec exists in `api/plagiarism.openapi.yaml` and chapter 13 | Not mounted; not implemented |
 | Analytics API | Spec exists in `api/analytics.openapi.yaml` and chapter 15 | Not mounted; not implemented. Super-admin shows token usage only. |
-| Hub production packaging | Runtime complete, code-smoke passed | Systemd installation, hardware BLE validation, rollout verification still pending |
+| Hub production packaging | Runtime authority now targets converged `edge_hub`; `HUB-exam-conductor` remains reference implementation | Need migration plan and validation for independent ExamPen mode services inside `edge_hub` |
 | Mobile camera fallback student ID | Manual entry required | Roster-backed student selector not yet implemented |
 | Super-admin exam/submission counts | Frontend shows placeholder dashes | Needs new backend endpoint for per-tenant ExamPen stats |
 | Hub decommission endpoint | Spec exists in `SUPERADMIN_SPEC.md` §5.2 | Not implemented |
@@ -347,6 +348,7 @@ Use these tasks for spawned agents. Each task has a bounded write set. An agent 
 
 | Date | Change | By |
 |---|---|---|
+| 2026-05-09 | Aligned status tracker with hub authority change: new edge work targets converged `edge_hub` runtime; `HUB-exam-conductor` is reference/decomposition donor. | Codex |
 | 2026-05-02 | Reconciled with current frontend/mobile/super-admin implementation. Expanded Current Code Reality with frontend teacher workspace, student portal, super-admin, mobile status. Expanded Known Gaps with recheck/conversation backend parity, plagiarism, analytics, hub productionization, mobile student ID, super-admin endpoints. | Claude |
 | 2026-03-25 | All SWM-001 through SWM-015 marked COMPLETE. Added deployment checklist and known stubs section. Infrastructure fixes applied (sys.path, indexes, requirements). | Claude |
 | 2026-03-24 | Replaced the completed documentation-migration tracker with the active implementation backlog, using modular workstreams for ingest, DCR, PCR, gate, backend integration, and validation. | Codex |
