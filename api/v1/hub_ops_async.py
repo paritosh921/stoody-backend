@@ -668,6 +668,31 @@ def _fmt(v) -> Optional[str]:
     return None
 
 
+def _as_aware_utc_datetime(v: Any) -> Optional[datetime]:
+    if not isinstance(v, datetime):
+        return None
+    if v.tzinfo is None:
+        return v.replace(tzinfo=timezone.utc)
+    return v.astimezone(timezone.utc)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_string_list(v: Any) -> List[str]:
+    if isinstance(v, list):
+        return [str(item) for item in v if item is not None]
+    if isinstance(v, tuple):
+        return [str(item) for item in v if item is not None]
+    if isinstance(v, str) and v:
+        return [v]
+    return []
+
+
 _PEN_MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
 
 
@@ -1688,7 +1713,6 @@ async def list_hubs(
     tenant_db = await _get_tenant_db(db, current_user)
     collection = tenant_db["exampen_hubs"]
 
-    from datetime import timedelta
     now = datetime.now(timezone.utc)
     stale_threshold = now - timedelta(seconds=90)
 
@@ -1698,7 +1722,7 @@ async def list_hubs(
     items: List[HubListItem] = []
     for d in docs:
         mobile_access = dict(d.get("mobile_access") or {})
-        last_heartbeat = d.get("last_heartbeat_at")
+        last_heartbeat = _as_aware_utc_datetime(d.get("last_heartbeat_at"))
         items.append(
             HubListItem(
                 hub_id=d.get("hub_id", ""),
@@ -1710,12 +1734,12 @@ async def list_hubs(
                 provisioned_at=_fmt(d.get("provisioned_at")),
                 last_heartbeat_at=_fmt(last_heartbeat),
                 online=bool(last_heartbeat and last_heartbeat > stale_threshold),
-                health=d.get("health", "unknown"),
-                storage_health=d.get("storage_health", "unknown"),
-                connected_pen_count=d.get("connected_pen_count", 0),
+                health=d.get("health") or "unknown",
+                storage_health=d.get("storage_health") or "unknown",
+                connected_pen_count=_safe_int(d.get("connected_pen_count")),
                 assigned_exam_id=d.get("assigned_exam_id"),
-                capabilities=list(d.get("capabilities") or []),
-                scopes=list(d.get("hub_scopes") or HUB_BACKEND_SCOPES),
+                capabilities=_safe_string_list(d.get("capabilities")),
+                scopes=_safe_string_list(d.get("hub_scopes")) or HUB_BACKEND_SCOPES,
                 manifest_ready=bool(mobile_access.get("manifest_id")),
                 manifest_id=mobile_access.get("manifest_id"),
                 manifest_issued_at=_fmt(mobile_access.get("manifest_issued_at")),
