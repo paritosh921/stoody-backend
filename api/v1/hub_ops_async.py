@@ -30,6 +30,7 @@ import logging
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
@@ -388,6 +389,26 @@ class LocalAccessResponse(BaseModel):
     scopes: List[str]
 
 
+class HubPenRegistryEntry(BaseModel):
+    pen_mac: str
+    pen_id: Optional[str] = None
+    name: Optional[str] = None
+
+
+class HubPenRegistryReplaceRequest(BaseModel):
+    pens: List[Any] = Field(default_factory=list)
+
+
+class HubPenRegistryResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    pens: List[HubPenRegistryEntry]
+    count: int
+    version: int = 0
+    has_registry: bool = False
+    updated_at: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Index helpers
 # ---------------------------------------------------------------------------
@@ -576,6 +597,67 @@ def _fmt(v) -> Optional[str]:
     if v is not None:
         return str(v)
     return None
+
+
+_PEN_MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+
+
+def _normalize_pen_mac(value: Any) -> str:
+    raw = str(value or "")
+    hex_only = re.sub(r"[^0-9A-Fa-f]", "", raw).upper()
+    if len(hex_only) != 12:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid pen MAC: {raw}",
+        )
+    mac = ":".join(hex_only[i:i + 2] for i in range(0, 12, 2))
+    if not _PEN_MAC_RE.match(mac):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid pen MAC: {raw}",
+        )
+    return mac
+
+
+def _default_pen_id(mac: str) -> str:
+    return f"PEN-{mac.replace(':', '')[-6:]}"
+
+
+def _normalise_pen_registry_entries(entries: List[Any]) -> List[Dict[str, str]]:
+    deduped: Dict[str, Dict[str, str]] = {}
+    for entry in entries:
+        if isinstance(entry, str):
+            mac = _normalize_pen_mac(entry)
+            pen_id = _default_pen_id(mac)
+        elif isinstance(entry, dict):
+            mac = _normalize_pen_mac(entry.get("pen_mac") or entry.get("mac"))
+            pen_id = str(entry.get("pen_id") or entry.get("name") or _default_pen_id(mac))
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Each pen must be a MAC string or an object with pen_mac",
+            )
+        deduped[mac] = {"pen_mac": mac, "pen_id": pen_id}
+    return list(deduped.values())
+
+
+def _hub_pen_registry_response(hub_doc: Dict[str, Any]) -> HubPenRegistryResponse:
+    pens = [
+        HubPenRegistryEntry(
+            pen_mac=row.get("pen_mac", ""),
+            pen_id=row.get("pen_id") or _default_pen_id(row.get("pen_mac", "")),
+        )
+        for row in hub_doc.get("registered_pens", [])
+        if row.get("pen_mac")
+    ]
+    return HubPenRegistryResponse(
+        hub_id=hub_doc.get("hub_id", ""),
+        pens=pens,
+        count=len(pens),
+        version=int(hub_doc.get("pen_registry_version") or 0),
+        has_registry=bool(hub_doc.get("pen_registry_uploaded_at")),
+        updated_at=_fmt(hub_doc.get("pen_registry_uploaded_at")),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1206,61 @@ async def hub_auth_check(
         "hub_id": hub_id,
         "scope": scope,
     }
+
+
+@router.get(
+    "/{hub_id}/pen-registry",
+    response_model=HubPenRegistryResponse,
+    summary="Return the allowed pen registry for a hub",
+)
+async def get_hub_pen_registry(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_hub_or_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> HubPenRegistryResponse:
+    if current_user.get("user_type") == "hub":
+        _require_hub_id_match(current_user, hub_id)
+        _require_hub_scope(current_user, HUB_SCOPE_HEARTBEAT)
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_doc = await tenant_db["exampen_hubs"].find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+    return _hub_pen_registry_response(hub_doc)
+
+
+@router.put(
+    "/{hub_id}/pen-registry",
+    response_model=HubPenRegistryResponse,
+    summary="Replace the allowed pen registry for a hub",
+)
+async def replace_hub_pen_registry(
+    hub_id: str,
+    body: HubPenRegistryReplaceRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> HubPenRegistryResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    existing = await hub_col.find_one({"hub_id": hub_id})
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    pens = _normalise_pen_registry_entries(body.pens)
+    now = datetime.now(timezone.utc)
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "registered_pens": pens,
+                "pen_registry_uploaded_at": now,
+                "pen_registry_updated_by": str(current_user.get("user_id") or ""),
+            },
+            "$inc": {"pen_registry_version": 1},
+        },
+    )
+    updated = await hub_col.find_one({"hub_id": hub_id}) or existing
+    return _hub_pen_registry_response(updated)
 
 
 @router.post(
