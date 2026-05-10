@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Try to import PIL for image processing
 try:
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    from PIL import Image, ImageEnhance, ImageFilter
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -142,80 +142,6 @@ def enhance_canvas_images_batch(data_urls: List[str], target_width: int = 1500) 
     return enhanced
 
 
-def merge_canvas_pages_vertical(data_urls: List[str], gap: int = 20, max_height: int = 4000) -> Optional[str]:
-    """
-    Merge multiple canvas pages into a single tall image.
-    Useful for multi-page handwritten answers.
-    
-    Args:
-        data_urls: List of base64 data URLs for each page
-        gap: Pixel gap between pages
-        max_height: Maximum height of merged image (to prevent memory issues)
-        
-    Returns:
-        Merged image as base64 data URL, or None if failed
-    """
-    if not PIL_AVAILABLE:
-        logger.warning("PIL not available for image merging")
-        return None
-    
-    if not data_urls:
-        return None
-    
-    try:
-        # Decode and open all images
-        images = []
-        for url in data_urls:
-            img_bytes = decode_base64_image(url)
-            if img_bytes:
-                img = Image.open(io.BytesIO(img_bytes))
-                if img.mode != 'RGB':
-                    # Handle transparency
-                    if img.mode == 'RGBA':
-                        background = Image.new('RGBA', img.size, (255, 255, 255, 255))
-                        img = Image.alpha_composite(background, img)
-                    img = img.convert('RGB')
-                images.append(img)
-        
-        if not images:
-            return None
-        
-        # Calculate dimensions
-        max_width = max(img.width for img in images)
-        total_height = sum(img.height for img in images) + gap * (len(images) - 1)
-        
-        # Check if exceeds max height
-        if total_height > max_height:
-            # Scale down all images proportionally
-            scale = max_height / total_height
-            images = [img.resize((int(img.width * scale), int(img.height * scale)), Image.Resampling.LANCZOS) 
-                      for img in images]
-            max_width = max(img.width for img in images)
-            total_height = sum(img.height for img in images) + gap * (len(images) - 1)
-        
-        # Create merged image
-        merged = Image.new('RGB', (max_width, total_height), (255, 255, 255))
-        
-        # Paste images
-        y_offset = 0
-        for img in images:
-            # Center horizontally
-            x_offset = (max_width - img.width) // 2
-            merged.paste(img, (x_offset, y_offset))
-            y_offset += img.height + gap
-        
-        # Save to bytes
-        output_buffer = io.BytesIO()
-        merged.save(output_buffer, format='PNG', quality=95)
-        output_bytes = output_buffer.getvalue()
-        
-        return encode_image_to_base64(output_bytes, "image/png")
-        
-    except Exception as e:
-        logger.error(f"Image merging failed: {e}", exc_info=True)
-        return None
-
-
 def get_image_dimensions(data_url: str) -> Optional[Tuple[int, int]]:
     """Get the dimensions of a base64-encoded image."""
     if not PIL_AVAILABLE:
@@ -277,44 +203,3 @@ def is_canvas_empty(data_url: str, threshold: float = 0.99) -> bool:
         return False
 
 
-def prepare_image_for_llm_evaluation(
-    canvas_pages: List[str],
-    enhance: bool = True,
-    merge_pages: bool = True,
-    target_width: int = 1500
-) -> Tuple[List[str], Optional[str]]:
-    """
-    Prepare canvas images for LLM evaluation with full processing pipeline.
-    
-    Args:
-        canvas_pages: List of canvas page data URLs
-        enhance: Whether to enhance individual pages
-        merge_pages: Whether to also create a merged view
-        target_width: Target width for enhancement
-        
-    Returns:
-        Tuple of (enhanced individual pages, merged image or None)
-    """
-    if not canvas_pages:
-        return [], None
-    
-    # Filter out empty canvases
-    non_empty_pages = [page for page in canvas_pages if page and not is_canvas_empty(page)]
-    
-    if not non_empty_pages:
-        logger.warning("All canvas pages appear to be empty")
-        return [], None
-    
-    # Enhance individual pages
-    enhanced_pages = non_empty_pages
-    if enhance:
-        enhanced_pages = enhance_canvas_images_batch(non_empty_pages, target_width)
-    
-    # Create merged view for multi-page context
-    merged_image = None
-    if merge_pages and len(enhanced_pages) > 1:
-        merged_image = merge_canvas_pages_vertical(enhanced_pages)
-    elif len(enhanced_pages) == 1:
-        merged_image = enhanced_pages[0]
-    
-    return enhanced_pages, merged_image
