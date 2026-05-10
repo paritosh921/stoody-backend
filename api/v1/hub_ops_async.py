@@ -548,6 +548,42 @@ def _actor_tutor_id(current_user: Dict[str, Any]) -> Optional[str]:
     return str(tutor_id).strip() if tutor_id else None
 
 
+def _find_allowed_manifest_tutor(
+    current_user: Dict[str, Any],
+    allowed_tutors: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Match current tutor against the manifest using stable tutor id first, then username.
+
+    Some mobile sessions can be older cached JWTs where the custom tutor_id is
+    missing even though the username is still present. The manifest already
+    carries both fields, so username fallback keeps local hub access aligned
+    with the admin-approved tutor list without broadening access outside it.
+    """
+    tutor_id_candidates = {
+        str(value).strip()
+        for value in (
+            current_user.get("tutor_id"),
+            current_user.get("user_id"),
+            current_user.get("sub"),
+        )
+        if value
+    }
+    username = str(current_user.get("username") or "").strip().lower()
+
+    for tutor in allowed_tutors:
+        manifest_tutor_id = str(tutor.get("tutor_id") or "").strip()
+        if manifest_tutor_id and manifest_tutor_id in tutor_id_candidates:
+            return tutor
+
+    if username:
+        for tutor in allowed_tutors:
+            manifest_username = str(tutor.get("username") or "").strip().lower()
+            if manifest_username and manifest_username == username:
+                return tutor
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Helper: generate invigilator codes
 # ---------------------------------------------------------------------------
@@ -1432,19 +1468,19 @@ async def issue_local_access_token(
             detail="Scanned hub manifest is stale. Refresh the smartboard QR and try again.",
         )
 
-    tutor_id = _actor_tutor_id(current_user)
     allowed_tutors = mobile_access.get("allowed_tutors") or []
-    allowed = {str(t.get("tutor_id")): t for t in allowed_tutors if t.get("tutor_id")}
-    if not tutor_id or tutor_id not in allowed:
+    allowed_tutor = _find_allowed_manifest_tutor(current_user, allowed_tutors)
+    if not allowed_tutor:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tutor is not authorised for this hub",
         )
+    tutor_id = str(allowed_tutor.get("tutor_id") or _actor_tutor_id(current_user) or "").strip()
 
     import jwt as pyjwt
 
     exp = now + timedelta(seconds=MOBILE_LOCAL_TOKEN_TTL_SECONDS)
-    scopes = allowed[tutor_id].get("scopes") or MOBILE_ACCESS_SCOPES
+    scopes = allowed_tutor.get("scopes") or MOBILE_ACCESS_SCOPES
     claims = {
         "type": "hub_local_access",
         "aud": "stoody-edge-hub-local",
