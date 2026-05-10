@@ -311,6 +311,8 @@ class HeartbeatResponse(BaseModel):
     ack: bool
     server_time: str
     pending_assignment: Optional[str] = None
+    pending_manifest_refresh: bool = False
+    manifest_refresh_requested_at: Optional[str] = None
 
 
 class AssignRequest(BaseModel):
@@ -340,12 +342,40 @@ class SessionEventResponse(BaseModel):
 class HubListItem(BaseModel):
     hub_id: str
     hub_name: Optional[str] = None
+    hostname: Optional[str] = None
+    ip_address: Optional[str] = None
+    firmware_version: Optional[str] = None
+    linked_at: Optional[str] = None
     provisioned_at: Optional[str] = None
     last_heartbeat_at: Optional[str] = None
     online: bool
+    health: str = "unknown"
     storage_health: str
     connected_pen_count: int
     assigned_exam_id: Optional[str] = None
+    capabilities: List[str] = Field(default_factory=list)
+    scopes: List[str] = Field(default_factory=list)
+    manifest_ready: bool = False
+    manifest_id: Optional[str] = None
+    manifest_issued_at: Optional[str] = None
+    manifest_expires_at: Optional[str] = None
+    manifest_updated_at: Optional[str] = None
+    allowed_tutor_count: int = 0
+    manifest_refresh_requested_at: Optional[str] = None
+    manifest_refresh_ack_at: Optional[str] = None
+    manifest_refresh_status: Optional[str] = None
+    manifest_refresh_error: Optional[str] = None
+
+
+class ManifestRegenerateResponse(BaseModel):
+    success: bool = True
+    hub_id: str
+    manifest_id: str
+    issued_at: str
+    expires_at: str
+    allowed_tutor_count: int
+    refresh_requested_at: str
+    refresh_status: str = "pending"
 
 
 class ManifestTutor(BaseModel):
@@ -455,6 +485,7 @@ async def _ensure_mobile_manifest(
     tenant_db,
     *,
     rotate_if_expired: bool = True,
+    force_rotate: bool = False,
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     mobile_access = dict(hub_doc.get("mobile_access") or {})
@@ -465,6 +496,8 @@ async def _ensure_mobile_manifest(
     manifest_id = mobile_access.get("manifest_id")
 
     should_rotate = (
+        force_rotate
+        or
         not manifest_id
         or not issued_at
         or not expires_at
@@ -727,6 +760,7 @@ async def link_local_hub(
         "ip_address": body.ip_address,
         "firmware_version": body.firmware_version,
         "capabilities": capabilities,
+        "hub_scopes": HUB_BACKEND_SCOPES,
         "linked_by": linked_by,
         "linked_at": now,
         "link_method": "admin_login",
@@ -1042,6 +1076,12 @@ async def hub_heartbeat(
         ack=True,
         server_time=now.isoformat(),
         pending_assignment=existing.get("assigned_exam_id"),
+        pending_manifest_refresh=(
+            dict(existing.get("mobile_access") or {}).get("refresh_status") == "pending"
+        ),
+        manifest_refresh_requested_at=_fmt(
+            dict(existing.get("mobile_access") or {}).get("refresh_requested_at")
+        ),
     )
 
 
@@ -1184,6 +1224,26 @@ async def get_tutor_manifest(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
 
     manifest = await _ensure_mobile_manifest(hub_col, hub_doc, tenant_db)
+    mobile_access = dict(hub_doc.get("mobile_access") or {})
+    if mobile_access.get("refresh_status") == "pending":
+        now = datetime.now(timezone.utc)
+        await hub_col.update_one(
+            {"hub_id": hub_id},
+            {
+                "$set": {
+                    "mobile_access.refresh_status": "synced",
+                    "mobile_access.refresh_ack_at": now,
+                    "mobile_access.acknowledged_manifest_id": manifest["manifest_id"],
+                    "mobile_access.last_hub_fetch_at": now,
+                    "mobile_access.refresh_error": "",
+                }
+            },
+        )
+    else:
+        await hub_col.update_one(
+            {"hub_id": hub_id},
+            {"$set": {"mobile_access.last_hub_fetch_at": datetime.now(timezone.utc)}},
+        )
     return TutorManifestResponse(**manifest)
 
 
@@ -1206,6 +1266,61 @@ async def hub_auth_check(
         "hub_id": hub_id,
         "scope": scope,
     }
+
+
+@router.post(
+    "/{hub_id}/tutor-manifest/regenerate",
+    summary="Admin regenerates the tutor manifest and requests hub refresh",
+    responses={
+        403: {"description": "Admin access required"},
+        404: {"description": "Hub not found"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def regenerate_tutor_manifest(
+    hub_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+) -> ManifestRegenerateResponse:
+    """Regenerate the 24h tutor manifest and mark it for hub-side pull."""
+    tenant_db = await _get_tenant_db(db, current_user)
+    hub_col = tenant_db["exampen_hubs"]
+    hub_doc = await hub_col.find_one({"hub_id": hub_id})
+    if hub_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+
+    manifest = await _ensure_mobile_manifest(
+        hub_col,
+        hub_doc,
+        tenant_db,
+        force_rotate=True,
+    )
+    now = datetime.now(timezone.utc)
+    await hub_col.update_one(
+        {"hub_id": hub_id},
+        {
+            "$set": {
+                "mobile_access.refresh_requested_at": now,
+                "mobile_access.refresh_status": "pending",
+                "mobile_access.refresh_error": "",
+                "mobile_access.requested_manifest_id": manifest["manifest_id"],
+                "mobile_access.refresh_requested_by": current_user.get("user_id") or current_user.get("sub"),
+            },
+            "$unset": {
+                "mobile_access.refresh_ack_at": "",
+                "mobile_access.acknowledged_manifest_id": "",
+            },
+        },
+    )
+
+    return ManifestRegenerateResponse(
+        hub_id=hub_id,
+        manifest_id=manifest["manifest_id"],
+        issued_at=manifest["issued_at"],
+        expires_at=manifest["expires_at"],
+        allowed_tutor_count=len(manifest["allowed_tutors"]),
+        refresh_requested_at=now.isoformat(),
+    )
 
 
 @router.get(
@@ -1544,16 +1659,37 @@ async def list_hubs(
     cursor = collection.find({}).sort("provisioned_at", -1)
     docs = await cursor.to_list(length=200)
 
-    return [
-        HubListItem(
-            hub_id=d.get("hub_id", ""),
-            hub_name=d.get("hub_name"),
-            provisioned_at=_fmt(d.get("provisioned_at")),
-            last_heartbeat_at=_fmt(d.get("last_heartbeat_at")),
-            online=bool(d.get("last_heartbeat_at") and d["last_heartbeat_at"] > stale_threshold),
-            storage_health=d.get("storage_health", "unknown"),
-            connected_pen_count=d.get("connected_pen_count", 0),
-            assigned_exam_id=d.get("assigned_exam_id"),
+    items: List[HubListItem] = []
+    for d in docs:
+        mobile_access = dict(d.get("mobile_access") or {})
+        last_heartbeat = d.get("last_heartbeat_at")
+        items.append(
+            HubListItem(
+                hub_id=d.get("hub_id", ""),
+                hub_name=d.get("hub_name"),
+                hostname=d.get("hostname"),
+                ip_address=d.get("ip_address"),
+                firmware_version=d.get("firmware_version"),
+                linked_at=_fmt(d.get("linked_at")),
+                provisioned_at=_fmt(d.get("provisioned_at")),
+                last_heartbeat_at=_fmt(last_heartbeat),
+                online=bool(last_heartbeat and last_heartbeat > stale_threshold),
+                health=d.get("health", "unknown"),
+                storage_health=d.get("storage_health", "unknown"),
+                connected_pen_count=d.get("connected_pen_count", 0),
+                assigned_exam_id=d.get("assigned_exam_id"),
+                capabilities=list(d.get("capabilities") or []),
+                scopes=list(d.get("hub_scopes") or HUB_BACKEND_SCOPES),
+                manifest_ready=bool(mobile_access.get("manifest_id")),
+                manifest_id=mobile_access.get("manifest_id"),
+                manifest_issued_at=_fmt(mobile_access.get("manifest_issued_at")),
+                manifest_expires_at=_fmt(mobile_access.get("manifest_expires_at")),
+                manifest_updated_at=_fmt(mobile_access.get("updated_at")),
+                allowed_tutor_count=len(mobile_access.get("allowed_tutors") or []),
+                manifest_refresh_requested_at=_fmt(mobile_access.get("refresh_requested_at")),
+                manifest_refresh_ack_at=_fmt(mobile_access.get("refresh_ack_at")),
+                manifest_refresh_status=mobile_access.get("refresh_status"),
+                manifest_refresh_error=mobile_access.get("refresh_error"),
+            )
         )
-        for d in docs
-    ]
+    return items
