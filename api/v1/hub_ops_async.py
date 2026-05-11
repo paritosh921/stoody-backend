@@ -2392,9 +2392,14 @@ async def issue_local_access_token(
     allowed_tutors = mobile_access.get("allowed_tutors") or []
     allowed_tutor = _find_allowed_manifest_tutor(current_user, allowed_tutors)
     if not allowed_tutor:
+        detail = (
+            "No teachers are selected for this hub. In Hub Management, open Teachers, select the allowed teachers, then refresh/authorise again."
+            if not allowed_tutors
+            else "Tutor is not selected for this hub. Ask the admin to add this teacher in Hub Management > Teachers."
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Tutor is not authorised for this hub",
+            detail=detail,
         )
     tutor_id = str(allowed_tutor.get("tutor_id") or _actor_tutor_id(current_user) or "").strip()
 
