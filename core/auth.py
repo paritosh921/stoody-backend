@@ -307,7 +307,7 @@ class AuthManager:
             # If a min_token_issued_at timestamp exists in skb_master.system_config,
             # reject any JWT whose iat predates it.
             token_iat = payload.get("iat")
-            if token_iat is not None:
+            if token_iat is not None and payload.get("user_type") != "hub":
                 min_iat = await self._get_min_token_issued_at()
                 if min_iat is not None and token_iat < min_iat:
                     logger.info(

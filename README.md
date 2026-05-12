@@ -1,311 +1,91 @@
-# SkillBot Backend API
+# Stoody Backend
 
-FastAPI backend server for the SkillBot learning platform with MongoDB for persistent question storage and image management.
+FastAPI backend for the Stoody learning platform. It owns tenant-aware APIs, authentication, content ingestion, canvas persistence, test/evaluator data, admin/tutor/student workflows, file storage, and platform integration endpoints.
 
-## Features
+This root README is the backend entry point. Detailed runbooks and architecture notes live in [docs/](docs/).
 
-- **MongoDB Integration**: Persistent storage for questions with flexible queries
-- **Image Management**: UUID-based file storage system for question images
-- **RESTful API**: Complete CRUD operations for questions and images
-- **CORS Support**: Configured for frontend integration
-- **Error Handling**: Comprehensive error handling and validation
+## Runtime
+
+- Python 3.11 is the recommended local runtime.
+- Main entry point: `main_async.py`
+- API base path: `/api/v1`
+- Default local port: `5001`
+- Primary database: MongoDB Atlas or a configured MongoDB instance
+- Optional services: Redis, S3-compatible storage, OAuth providers, OCR/AI providers
 
 ## Quick Start
 
-### 1. Use Python 3.11
-
-This backend must run on **Python 3.11**. Python 3.12 on Windows is known to trigger intermittent TLS handshake errors with MongoDB Atlas. Install Python 3.11 (alongside your existing interpreter if needed), then recreate the virtual environment with that interpreter:
-
-```bash
-# From the project root
+```powershell
 cd backend
 py -3.11 -m venv venv
-venv\Scripts\activate
-pip install --upgrade pip
-pip install -r requirements.txt
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python main_async.py
 ```
 
-### 2. Install Dependencies
+Health and API checks:
 
-```bash
-cd backend
-pip install -r requirements.txt
-```
-
-### 3. Start the Server
-
-```bash
-# Basic start
-python run.py
-
-# With debug mode
-python run.py --debug
-
-# Custom port
-python run.py --port 5001
-```
-
-### 4. Test the API
-
-```bash
-# Health check
-curl http://localhost:5000/health
-
-# API documentation
-curl http://localhost:5000/
-```
-
-## API Endpoints
-
-### Questions API (`/api/questions`)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/save` | Save a single question |
-| POST | `/batch-save` | Save multiple questions |
-| GET | `/<id>` | Get question by ID |
-| GET | `/search` | Search questions with filters |
-| PUT | `/<id>` | Update question |
-| DELETE | `/<id>` | Delete question |
-| GET | `/stats` | Get collection statistics |
-| GET | `/export` | Export all questions |
-
-### Images API (`/api/images`)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/upload` | Upload image file |
-| POST | `/upload-base64` | Upload base64 image |
-| GET | `/<path>` | Serve image file |
-| GET | `/<path>/base64` | Get image as base64 |
-| GET | `/<path>/info` | Get image information |
-| DELETE | `/<path>` | Delete image |
-| POST | `/cleanup` | Cleanup orphaned images |
-
-## Data Storage
-
-### MongoDB
-- **Database**: Configured via `MONGODB_URI` environment variable
-- **Collections**: `questions`, `documents`, `images`, etc.
-- **Features**: Flexible queries, aggregation, indexing
-
-### Images
-- **Location**: `./images/`
-- **Naming**: `{uuid}_{original_filename}`
-- **Formats**: PNG, JPG, JPEG, GIF, BMP, WEBP
-- **Max Size**: 10MB per image
-
-## Usage Examples
-
-### Save a Question
-
-```python
-import requests
-
-question_data = {
-    "id": "question_123",
-    "text": "What is the capital of France?",
-    "subject": "Geography",
-    "difficulty": "easy",
-    "options": ["London", "Berlin", "Paris", "Madrid"],
-    "correctAnswer": "Paris",
-    "images": [
-        {
-            "id": "img_1",
-            "filename": "france_map.png",
-            "description": "Map of France",
-            "type": "diagram",
-            "base64Data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
-        }
-    ]
-}
-
-response = requests.post(
-    "http://localhost:5000/api/questions/save",
-    json=question_data
-)
-print(response.json())
-```
-
-### Search Questions
-
-```python
-import requests
-
-# Search by query
-response = requests.get(
-    "http://localhost:5000/api/questions/search",
-    params={
-        "query": "capital of France",
-        "include_images": "true"
-    }
-)
-questions = response.json()["questions"]
-
-# Filter by subject and difficulty
-response = requests.get(
-    "http://localhost:5000/api/questions/search",
-    params={
-        "subject": "Geography",
-        "difficulty": "easy",
-        "limit": 10
-    }
-)
-```
-
-### Upload Image
-
-```python
-import requests
-
-# Upload file
-with open("image.png", "rb") as f:
-    response = requests.post(
-        "http://localhost:5000/api/images/upload",
-        files={"file": f}
-    )
-
-# Upload base64
-response = requests.post(
-    "http://localhost:5000/api/images/upload-base64",
-    json={
-        "filename": "diagram.png",
-        "base64Data": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
-    }
-)
+```powershell
+curl http://localhost:5001/health
+curl http://localhost:5001/api/v1/health
 ```
 
 ## Configuration
 
-Edit `config.py` to customize settings:
+Create `backend/.env` for local development. The exact production values are deployment-specific, but the common categories are:
 
-```python
-# Database configuration
-CHROMADB_COLLECTION_NAME = "questions"
-
-# Image storage
-MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
-
-# Flask configuration
-FLASK_PORT = 5000
-CORS_ORIGINS = ["http://localhost:8080", "http://127.0.0.1:8080"]
+```env
+HOST=0.0.0.0
+PORT=5001
+MONGODB_URI=mongodb+srv://...
+MONGODB_DB_NAME=skillbot_db
+JWT_SECRET_KEY=...
+FRONTEND_URL=http://localhost:8080
+GOOGLE_CLIENT_ID=...
+OPENAI_API_KEY=...
+MISTRAL_API_KEY=...
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=...
+S3_BUCKET_NAME=...
 ```
 
-## Development
+## Current Architecture
 
-### Project Structure
+- `main_async.py` boots the FastAPI application and registers versioned routers.
+- `api/v1/` contains the active route modules.
+- `services/` contains business logic and integrations.
+- `models/` contains data contracts and persistence models.
+- `core/` contains shared configuration, auth, security, tenant, and database helpers.
+- `scripts/` contains operational utilities. See [scripts/README.md](scripts/README.md).
+- `exam-conductor/` contains the ExamPen/DCR/PCR architecture and implementation docs.
 
-```
-backend/
-├── app.py                  # Main Flask application
-├── run.py                  # Server runner script
-├── config.py              # Configuration settings
-├── requirements.txt       # Python dependencies
-├── models/
-│   ├── question.py        # Question data models
-├── services/
-│   └── image_service.py    # Image processing
-├── routes/
-│   ├── questions.py       # Question API routes
-│   └── images.py          # Image API routes
-└── images/                # Image files (auto-created)
-```
+## Auth, Tenant, And Storage Rules
 
-### Adding New Features
+- JWT-bearing requests are tenant-aware where tenant isolation is required.
+- Tenant identity must be resolved through the established backend auth and tenant helpers, not from ad hoc request fields.
+- Canvas and document persistence use the backend storage abstractions rather than direct file writes in API handlers.
+- S3 object storage is documented in [docs/S3_STORAGE_MIGRATION.md](docs/S3_STORAGE_MIGRATION.md).
+- Tenant isolation is documented in [docs/TENANT_ISOLATION.md](docs/TENANT_ISOLATION.md).
 
-1. **Add new model**: Create in `models/`
-2. **Add business logic**: Create service in `services/`
-3. **Add API routes**: Create blueprint in `routes/`
-4. **Register blueprint**: Add to `app.py`
+## Documentation Index
 
-### Testing
+- [docs/README.md](docs/README.md) - curated backend documentation index
+- [docs/QUICK_START.md](docs/QUICK_START.md) - local startup path
+- [docs/BACKEND_SETUP.md](docs/BACKEND_SETUP.md) - environment and setup details
+- [docs/TENANT_ISOLATION.md](docs/TENANT_ISOLATION.md) - tenant isolation rules
+- [docs/DATABASE_manage_STRICT_UNIFIED.md](docs/DATABASE_manage_STRICT_UNIFIED.md) - strict database/auth/tenant operational runbook
+- [docs/S3_STORAGE_MIGRATION.md](docs/S3_STORAGE_MIGRATION.md) - object storage migration notes
+- [docs/B2C_USER_SUPPORT.md](docs/B2C_USER_SUPPORT.md) - B2C user support workflows
+- [docs/CURRENT_BACKEND_NOTES.md](docs/CURRENT_BACKEND_NOTES.md) - consolidation notes and removed-doc rationale
 
-```bash
-# Install test dependencies
-pip install pytest requests
+## Verification
 
-# Run tests (when implemented)
-pytest tests/
-```
-
-## Error Handling
-
-The API returns consistent error responses:
-
-```json
-{
-    "success": false,
-    "error": "Error type",
-    "message": "Detailed error message"
-}
+```powershell
+cd backend
+python -m compileall .
+python -m pytest
 ```
 
-Common HTTP status codes:
-- `200`: Success
-- `400`: Bad Request (validation error)
-- `404`: Not Found
-- `500`: Internal Server Error
-
-## Logging
-
-Logs are written to console with the format:
-```
-2024-01-01 12:00:00 - name - level - message
-```
-
-For production, configure file logging in `app.py`.
-
-## Production Deployment
-
-### Using Gunicorn
-
-```bash
-# Install gunicorn
-pip install gunicorn
-
-# Run with gunicorn
-gunicorn -w 4 -b 0.0.0.0:5000 app:create_app()
-```
-
-### Environment Variables
-
-```bash
-export FLASK_DEBUG=false
-export FLASK_PORT=5000
-```
-
-### Docker (Optional)
-
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-EXPOSE 5000
-
-CMD ["python", "run.py"]
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Image upload fails**: Check file size and format restrictions
-3. **CORS errors**: Verify frontend URL in `config.py`
-4. **Port conflicts**: Use `--port` flag to change port
-
-### Debug Mode
-
-Run with debug mode for detailed error information:
-
-```bash
-python run.py --debug
-```
-
-## License
-
-Part of the SkillBot Learning Platform project.
+Run narrower tests when working on a focused area. Keep implementation claims tied to current source files and current tests, not historical plan markdown.

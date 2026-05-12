@@ -1,44 +1,34 @@
 # Backend Documentation
 
-This folder contains documentation for the Skiller-Bot backend.
+This folder contains the backend documents that are still useful for current development. Old implementation plans, duplicate script indexes, and stale endpoint snapshots have been removed or folded into the references below.
 
-## Setup & Configuration
+## Start Here
 
-- **[BACKEND_SETUP.md](BACKEND_SETUP.md)** - Complete backend setup guide with environment configuration
-- **[QUICK_START.md](QUICK_START.md)** - Quick start guide for getting the backend running
+- [Backend README](../README.md) - current backend overview and entry point.
+- [QUICK_START.md](QUICK_START.md) - shortest local startup path.
+- [BACKEND_SETUP.md](BACKEND_SETUP.md) - environment setup and configuration details.
 
-## Scripts Documentation
+## Architecture And Operations
 
-- **[SCRIPTS_INDEX.md](SCRIPTS_INDEX.md)** - Index of all available backend scripts
-- **[SCRIPTS_SUMMARY.md](SCRIPTS_SUMMARY.md)** - Summary of script functionality and usage
+- [TENANT_ISOLATION.md](TENANT_ISOLATION.md) - tenant isolation rules, enforcement points, and backend behavior.
+- [DATABASE_manage_STRICT_UNIFIED.md](DATABASE_manage_STRICT_UNIFIED.md) - strict database/auth/tenant runbook consolidated from the older database docs.
+- [S3_STORAGE_MIGRATION.md](S3_STORAGE_MIGRATION.md) - object storage migration and runtime storage notes.
+- [B2C_USER_SUPPORT.md](B2C_USER_SUPPORT.md) - B2C account support and operations.
+- [CURRENT_BACKEND_NOTES.md](CURRENT_BACKEND_NOTES.md) - what was consolidated or removed during the docs cleanup.
 
-## Main README
+## Scripts
 
-- **[Backend README](../README.md)** - Main backend README with API documentation
-
-## Related Documentation
-
-- [Frontend Documentation](../../frontend/docs/)
-- [Main Project Documentation](../../docs/)
-- [Stoody Pen Documentation](../../stoody_pen/docs/)
+The maintained script reference is now [../scripts/README.md](../scripts/README.md). The previous `SCRIPTS_INDEX.md` and `SCRIPTS_SUMMARY.md` files duplicated that index and were removed.
 
 ## Quick Commands
 
-### Start Backend
-```bash
+```powershell
 cd backend
 python main_async.py
 ```
 
-### Install Dependencies
-```bash
+```powershell
 cd backend
-pip install -r requirements.txt
+python -m compileall .
+python -m pytest
 ```
-
-### Run Scripts
-```bash
-cd backend/scripts
-# Check SCRIPTS_INDEX.md for available scripts
-```
-
