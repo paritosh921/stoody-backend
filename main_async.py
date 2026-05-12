@@ -290,6 +290,16 @@ except Exception as e:
     _smartboard_pair_available = False
     logging.warning(f"Smartboard Pairing routes disabled: {str(e)}")
 
+# Teaching Materials routes (tutor-uploaded images/video/pdf/ppt; shared by
+# stoody-frontend web UI and the sb-android smartboard app).
+try:
+    from api.v1.teaching_materials_async import router as teaching_materials_router
+    _teaching_materials_available = True
+except Exception as e:
+    teaching_materials_router = None
+    _teaching_materials_available = False
+    logging.warning(f"Teaching Materials routes disabled: {str(e)}")
+
 # Timetable routes (class timetable, teacher calendar, pre-reads)
 try:
     from api.v1.timetable_async import router as timetable_router
@@ -1269,6 +1279,14 @@ if _smartboard_pair_available and smartboard_pair_router:
     logger.info("✅ Smartboard Pairing routes enabled")
 else:
     logger.warning("⚠️ Smartboard Pairing routes disabled")
+
+# Teaching Materials routes (tutor uploads images/video/pdf/ppt; consumed by
+# stoody-frontend web UI and sb-android smartboard app).
+if _teaching_materials_available and teaching_materials_router:
+    app.include_router(teaching_materials_router)
+    logger.info("✅ Teaching Materials routes enabled")
+else:
+    logger.warning("⚠️ Teaching Materials routes disabled")
 
 # Timetable routes (class timetable, teacher calendar, academic calendar, pre-reads)
 if _timetable_available and timetable_router:

@@ -1,0 +1,8 @@
+[mcp_servers.repowise]
+args = [
+    "mcp",
+    "D:/SOFTWARE_Projects_LP/skiller-bot/backend",
+    "--transport",
+    "stdio",
+]
+command = "repowise"
