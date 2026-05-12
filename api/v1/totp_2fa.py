@@ -77,9 +77,10 @@ TWO_FA_EXEMPT_EMAILS = [
     "cielknowledge@gmail.com",  # Legacy admin account
 ]
 
-# Tutor usernames exempt from 2FA (e.g., Play Store review account)
+# Tutor usernames exempt from 2FA (e.g., Play Store / App Store review accounts)
 TWO_FA_EXEMPT_USERNAMES = [
     "playstoreteacher",
+    "appstoreteacher",
 ]
 
 
