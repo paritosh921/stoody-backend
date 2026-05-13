@@ -1046,11 +1046,10 @@ app.include_router(
     tags=["Desktop Bug Reports"],
 )
 
-# Desktop app update metadata and backend-proxied downloads. This stays outside
-# API_V1_PREFIX because installed clients use https://api.stoody.in/desktop/*.
+# Desktop app update metadata and backend-proxied downloads.
 app.include_router(
     desktop_updates_router,
-    prefix="/desktop",
+    prefix=f"{API_V1_PREFIX}/desktop",
     tags=["Desktop Updates"],
 )
 
