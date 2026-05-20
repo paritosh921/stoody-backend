@@ -372,6 +372,14 @@ except Exception as e:
     _evalpen_available = False
     logging.warning(f"ExamPen routes disabled: {str(e)}")
 
+try:
+    from api.v1.exam_tally_async import router as exam_tally_router
+    _exam_tally_available = True
+except Exception as e:
+    exam_tally_router = None
+    _exam_tally_available = False
+    logging.warning(f"Exam Tally routes disabled: {str(e)}")
+
 
 # Configure logging
 logging.basicConfig(
@@ -1412,6 +1420,16 @@ if _evalpen_available:
     logger.info("✅ ExamPen routes enabled (18 routers)")
 else:
     logger.warning("⚠️ ExamPen routes disabled")
+
+if _exam_tally_available and exam_tally_router:
+    app.include_router(
+        exam_tally_router,
+        prefix=API_V1_PREFIX,
+        tags=["Exam Tally"],
+    )
+    logger.info("✅ Exam Tally routes enabled")
+else:
+    logger.warning("⚠️ Exam Tally routes disabled")
 
 
 # Static file serving

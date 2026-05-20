@@ -237,6 +237,7 @@ class OCRService:
         prompt: Optional[str] = None,
         *,
         tenant_db: Any = None,
+        max_tokens: int = 1024,
     ) -> dict:
         """
         Analyze an image and extract text/mathematical content.
@@ -259,13 +260,13 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
         if not image_b64:
             # Text-only path (rare — OCR usually has an image)
             gate_content = await _gate_text_call(
-                tenant_db, analysis_prompt, max_tokens=1024
+                tenant_db, analysis_prompt, max_tokens=max_tokens
             )
             return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
 
         # Vision path — the common case for OCR
         gate_content = await _gate_vision_call(
-            tenant_db, image_b64, analysis_prompt, max_tokens=1024
+            tenant_db, image_b64, analysis_prompt, max_tokens=max_tokens
         )
         return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
 
