@@ -2334,6 +2334,8 @@ class DocumentMetadata(BaseModel):
     total_minutes: Optional[int] = None  # Total minutes for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
     is_active: bool = True  # Whether the document is enabled for students
+    orientation_applied: Optional[int] = None  # Rotation degrees baked into the uploaded PDF at upload time (0/90/180/270). Audit-only — file is already pre-rotated.
+    exam_template_orientation_applied: Optional[int] = None  # Same as above for the DCR answer template.
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -2361,6 +2363,8 @@ async def upload_pdf(
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
     instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
     exam_mode: Optional[str] = Form(None),  # "dcr" or "pcr" — offline exam conduction mode
+    orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the PDF — audit only
+    exam_template_orientation_applied: Optional[int] = Form(None),  # Same for the DCR answer template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
     cache: CacheManager = Depends(get_cache)
@@ -2579,6 +2583,14 @@ async def upload_pdf(
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
+            "orientation_applied": (
+                orientation_applied if orientation_applied in (0, 90, 180, 270) else None
+            ),
+            "exam_template_orientation_applied": (
+                exam_template_orientation_applied
+                if exam_template_orientation_applied in (0, 90, 180, 270)
+                else None
+            ),
         }
 
         # Save to appropriate MongoDB database (B2C or regular)
@@ -2858,6 +2870,7 @@ async def upload_exam_template(
     request: Request,
     document_id: str,
     file: UploadFile = File(...),
+    orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -2887,7 +2900,10 @@ async def upload_exam_template(
 
         relative_path = await _store_exam_template_file(document_id=document_id, upload=file)
 
-        update_op = {"$set": {"exam_template_path": relative_path}}
+        update_set: Dict[str, Any] = {"exam_template_path": relative_path}
+        if orientation_applied in (0, 90, 180, 270):
+            update_set["exam_template_orientation_applied"] = orientation_applied
+        update_op = {"$set": update_set}
         if is_b2c:
             await db.b2c_db["documents"].update_one(
                 {"document_id": document_id}, update_op

@@ -20,8 +20,9 @@ Hard constraints:
 
 from __future__ import annotations
 
+import io
 import logging
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from .models import (
     DCRSubmissionPage,
@@ -45,6 +46,30 @@ DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.40
 # Default page dimensions (A4 in mm) used when the page doesn't specify them.
 _DEFAULT_PAGE_WIDTH_MM = 210.0
 _DEFAULT_PAGE_HEIGHT_MM = 297.0
+# Landscape A4 — used when the template image is wider than tall.
+_LANDSCAPE_PAGE_WIDTH_MM = 297.0
+_LANDSCAPE_PAGE_HEIGHT_MM = 210.0
+
+
+def _infer_page_size_from_template(template_image: bytes) -> Optional[Tuple[float, float]]:
+    """
+    Pick portrait or landscape A4 dimensions from a template image's aspect.
+
+    Returns ``(width_mm, height_mm)`` or ``None`` if the image cannot be read.
+    Pillow is already a dependency for stroke rasterisation; this function
+    deliberately keeps the same import scope.
+    """
+    try:
+        from PIL import Image  # local import to keep the module's import surface unchanged
+        with Image.open(io.BytesIO(template_image)) as img:
+            w, h = img.size
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    if w > h:
+        return (_LANDSCAPE_PAGE_WIDTH_MM, _LANDSCAPE_PAGE_HEIGHT_MM)
+    return (_DEFAULT_PAGE_WIDTH_MM, _DEFAULT_PAGE_HEIGHT_MM)
 
 # Default DPI for stroke rasterisation.
 _DEFAULT_DPI = 150
@@ -221,8 +246,14 @@ class HWRRecognizer:
             ]
 
         # ── 1. Render strokes to image ──────────────────────────────────
-        page_w = getattr(page, "page_width_mm", None) or _DEFAULT_PAGE_WIDTH_MM
-        page_h = getattr(page, "page_height_mm", None) or _DEFAULT_PAGE_HEIGHT_MM
+        page_w = getattr(page, "page_width_mm", None)
+        page_h = getattr(page, "page_height_mm", None)
+        if (page_w is None or page_h is None) and template_image is not None:
+            inferred = _infer_page_size_from_template(template_image)
+            if inferred is not None:
+                page_w, page_h = inferred
+        page_w = page_w or _DEFAULT_PAGE_WIDTH_MM
+        page_h = page_h or _DEFAULT_PAGE_HEIGHT_MM
 
         stroke_image = render_strokes_to_image(
             raw_strokes, page_w, page_h, dpi=self._dpi

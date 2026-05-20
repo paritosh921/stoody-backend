@@ -16,6 +16,7 @@ Conducted-exam bridge (SWM-012):
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
@@ -37,6 +38,12 @@ DEFAULT_COPY_SET_TITLES = (
     DEFAULT_NEW_COPY_TITLE,
     DEFAULT_PRACTICE_COPY_TITLE,
 )
+CANVAS_ONLY_COPY_ID_RE = re.compile(r"^tally-[A-Za-z0-9_.:-]{1,240}$")
+
+
+def _is_canvas_only_copy_id(copy_id: str) -> bool:
+    """Return true for virtual canvas scopes that are not physical copy sets."""
+    return bool(CANVAS_ONLY_COPY_ID_RE.fullmatch(copy_id))
 
 
 # ============================================================================
@@ -308,6 +315,9 @@ async def resolve_copy_id(
     write/read path can transparently handle the ``copy_id`` field.
     """
     if copy_id:
+        if _is_canvas_only_copy_id(str(copy_id)):
+            return str(copy_id)
+
         col = await get_copy_sets_collection(current_user, db)
         user_id = canonical_canvas_user_id(current_user)
         try:
