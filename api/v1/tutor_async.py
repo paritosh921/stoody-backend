@@ -562,26 +562,10 @@ async def unassign_student_from_tutor(
     return {"message": f"Student {student_id} unassigned from tutor {tutor_id}"}
 
 
-@router.get("/tutors/{tutor_id}/students", response_model=List[Dict[str, Any]])
-@limiter.limit("30/minute")
-async def get_tutor_students(
-    request: Request,
+async def _get_tutor_students_response(
     tutor_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
-    db: DatabaseManager = Depends(get_database),
-):
-    """
-    Get all students assigned to a tutor
-    Tutors can only see their own students
-    """
-    # If tutor, verify they're requesting their own students
-    if current_user.get("user_type") == "tutor":
-        if current_user.get("tutor_id") != tutor_id:
-            raise HTTPException(
-                status_code=403, detail="Tutors can only view their own students"
-            )
-
-    # Get tutor
+    db: DatabaseManager,
+) -> List[Dict[str, Any]]:
     tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
     if not tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
@@ -617,6 +601,44 @@ async def get_tutor_students(
         }
         for student in students
     ]
+
+
+@router.get("/tutors/me/students", response_model=List[Dict[str, Any]])
+@limiter.limit("30/minute")
+async def get_current_tutor_students(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Get all students visible to the currently authenticated tutor.
+    """
+    tutor_id = current_user.get("tutor_id")
+    if not tutor_id:
+        raise HTTPException(status_code=403, detail="Tutor id missing from session")
+    return await _get_tutor_students_response(tutor_id, db)
+
+
+@router.get("/tutors/{tutor_id}/students", response_model=List[Dict[str, Any]])
+@limiter.limit("30/minute")
+async def get_tutor_students(
+    request: Request,
+    tutor_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Get all students assigned to a tutor
+    Tutors can only see their own students
+    """
+    # If tutor, verify they're requesting their own students
+    if current_user.get("user_type") == "tutor":
+        if current_user.get("tutor_id") != tutor_id:
+            raise HTTPException(
+                status_code=403, detail="Tutors can only view their own students"
+            )
+
+    return await _get_tutor_students_response(tutor_id, db)
 
 
 @router.post("/tutors/{tutor_id}/reset-password-request")
