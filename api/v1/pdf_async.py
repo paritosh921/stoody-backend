@@ -8,6 +8,7 @@ import base64
 import asyncio
 import uuid
 import os
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
@@ -2336,6 +2337,9 @@ class DocumentMetadata(BaseModel):
     is_active: bool = True  # Whether the document is enabled for students
     orientation_applied: Optional[int] = None  # Rotation degrees baked into the uploaded PDF at upload time (0/90/180/270). Audit-only — file is already pre-rotated.
     exam_template_orientation_applied: Optional[int] = None  # Same as above for the DCR answer template.
+    tally_num_questions: Optional[int] = None
+    tally_max_marks_per_question: Optional[float] = None
+    tally_marking_scheme: Optional[List[Dict[str, float]]] = None
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -2363,6 +2367,9 @@ async def upload_pdf(
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
     instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
     exam_mode: Optional[str] = Form(None),  # "dcr" or "pcr" — offline exam conduction mode
+    tally_num_questions: Optional[int] = Form(None),
+    tally_max_marks_per_question: Optional[float] = Form(None),
+    tally_marking_scheme: Optional[str] = Form(None),
     orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the PDF — audit only
     exam_template_orientation_applied: Optional[int] = Form(None),  # Same for the DCR answer template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
@@ -2523,6 +2530,35 @@ async def upload_pdf(
         if teacher_ids:
             teacher_ids_list = [tid.strip() for tid in teacher_ids.split(",") if tid.strip()]
 
+        tally_marking_scheme_list: Optional[List[Dict[str, float]]] = None
+        if tally_marking_scheme:
+            try:
+                parsed_scheme = json.loads(tally_marking_scheme)
+            except json.JSONDecodeError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid tally marking scheme JSON",
+                )
+            if not isinstance(parsed_scheme, list):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Tally marking scheme must be a list",
+                )
+            tally_marking_scheme_list = []
+            for item in parsed_scheme:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    from_q = int(item.get("from"))
+                    to_q = int(item.get("to"))
+                    marks = float(item.get("marks"))
+                except (TypeError, ValueError):
+                    continue
+                if from_q > 0 and to_q >= from_q and marks > 0:
+                    tally_marking_scheme_list.append(
+                        {"from": from_q, "to": to_q, "marks": marks}
+                    )
+
         # If a tutor is uploading, ensure their ID is in teacher_ids
         if current_user.get("user_type") == "tutor":
             tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
@@ -2583,6 +2619,9 @@ async def upload_pdf(
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
+            "tally_num_questions": tally_num_questions,
+            "tally_max_marks_per_question": tally_max_marks_per_question,
+            "tally_marking_scheme": tally_marking_scheme_list,
             "orientation_applied": (
                 orientation_applied if orientation_applied in (0, 90, 180, 270) else None
             ),

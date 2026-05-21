@@ -29,12 +29,21 @@ class TallyStudentContext(BaseModel):
     roll_no: Optional[str] = None
 
 
+class TallyMarkingRange(BaseModel):
+    from_: int = Field(..., alias="from")
+    to: int = Field(..., alias="to")
+    marks: float
+
+
 class TallyDocumentContext(BaseModel):
     document_id: Optional[str] = None
     title: Optional[str] = None
     subject: Optional[str] = None
     standard: Optional[str] = None
     section: Optional[str] = None
+    num_questions: Optional[int] = None
+    max_marks_per_question: Optional[float] = None
+    marking_scheme: List[TallyMarkingRange] = Field(default_factory=list)
 
 
 class TallyExtractRequest(BaseModel):
@@ -61,6 +70,24 @@ class TallyExportRequest(BaseModel):
     filename: Optional[str] = None
     document: Optional[TallyDocumentContext] = None
     student: Optional[TallyStudentContext] = None
+
+
+class TallyTemplateSaveRequest(BaseModel):
+    image_b64: str = Field(..., description="Saved full-page tally template PNG data URL or raw base64")
+    template_copy_id: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class TallyTemplateResponse(BaseModel):
+    success: bool
+    document_id: str
+    image_b64: Optional[str] = None
+    template_copy_id: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
 
 
 def _require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
@@ -194,11 +221,32 @@ def _normalise_table(parsed: Dict[str, Any]) -> tuple[List[str], List[Dict[str, 
     return columns, rows, warnings, confidence
 
 
+def _format_marks(value: float) -> str:
+    return f"{value:g}"
+
+
+def _format_marking_scheme(scheme: List[TallyMarkingRange]) -> str:
+    parts: List[str] = []
+    for item in scheme:
+        if item.from_ <= 0 or item.to <= 0 or item.marks <= 0 or item.from_ > item.to:
+            continue
+        question_range = f"Q{item.from_}" if item.from_ == item.to else f"Q{item.from_}-Q{item.to}"
+        parts.append(f"{question_range} max {_format_marks(item.marks)}")
+    return ", ".join(parts)
+
+
 def _build_prompt(payload: TallyExtractRequest) -> str:
     document = payload.document or TallyDocumentContext()
     student = payload.student or TallyStudentContext()
+    marking_scheme = _format_marking_scheme(document.marking_scheme)
+    marking_rule = (
+        f"\n9. Use this marking scheme for validation only: {marking_scheme}. "
+        "If a recognized mark is greater than the allowed max for that question, keep the value and add a warning."
+        if marking_scheme
+        else ""
+    )
     context = {
-        "document": document.model_dump(exclude_none=True),
+        "document": document.model_dump(exclude_none=True, by_alias=True),
         "selected_student": student.model_dump(exclude_none=True),
         "copy_id": payload.copy_id,
     }
@@ -214,7 +262,7 @@ Task:
 5. If the sheet has multiple student rows, return all rows.
 6. Preserve blank cells as empty strings.
 7. Normalize question headings to Q1, Q2, Q3... where obvious.
-8. Do not invent marks or names. If uncertain, keep the cell empty and add a warning.
+8. Do not invent marks or names. If uncertain, keep the cell empty and add a warning.{marking_rule}
 
 Context from the UI, for disambiguation only:
 {json.dumps(context, ensure_ascii=False)}
@@ -235,6 +283,85 @@ def _safe_filename(value: Optional[str], fallback: str) -> str:
     base = (value or fallback).strip() or fallback
     base = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base).strip("-")
     return base or fallback
+
+
+def _safe_document_id(value: str) -> str:
+    document_id = (value or "").strip()
+    if not document_id:
+        raise HTTPException(status_code=400, detail="document_id is required")
+    if len(document_id) > 240 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", document_id):
+        raise HTTPException(status_code=400, detail="Invalid document_id")
+    return document_id
+
+
+@router.get("/templates/{document_id}", response_model=TallyTemplateResponse)
+async def get_tally_template(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    safe_document_id = _safe_document_id(document_id)
+    tenant_db = await _tenant_db(db, current_user)
+    doc = await tenant_db["exam_tally_templates"].find_one({"document_id": safe_document_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Tally template not found")
+
+    return TallyTemplateResponse(
+        success=True,
+        document_id=safe_document_id,
+        image_b64=doc.get("image_b64"),
+        template_copy_id=doc.get("template_copy_id"),
+        width=doc.get("width"),
+        height=doc.get("height"),
+        updated_at=doc.get("updated_at"),
+        updated_by=doc.get("updated_by"),
+    )
+
+
+@router.put("/templates/{document_id}", response_model=TallyTemplateResponse)
+async def save_tally_template(
+    document_id: str,
+    payload: TallyTemplateSaveRequest,
+    current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    safe_document_id = _safe_document_id(document_id)
+    if not payload.image_b64:
+        raise HTTPException(status_code=400, detail="image_b64 is required")
+    if len(payload.image_b64) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Template image too large")
+
+    tenant_db = await _tenant_db(db, current_user)
+    now = datetime.utcnow()
+    update_doc = {
+        "document_id": safe_document_id,
+        "image_b64": payload.image_b64,
+        "template_copy_id": payload.template_copy_id,
+        "width": payload.width,
+        "height": payload.height,
+        "updated_by": current_user.get("user_id"),
+        "updated_by_type": current_user.get("user_type"),
+        "updated_at": now,
+    }
+    await tenant_db["exam_tally_templates"].update_one(
+        {"document_id": safe_document_id},
+        {
+            "$set": update_doc,
+            "$setOnInsert": {"created_at": now, "created_by": current_user.get("user_id")},
+        },
+        upsert=True,
+    )
+
+    return TallyTemplateResponse(
+        success=True,
+        document_id=safe_document_id,
+        image_b64=payload.image_b64,
+        template_copy_id=payload.template_copy_id,
+        width=payload.width,
+        height=payload.height,
+        updated_at=now,
+        updated_by=current_user.get("user_id"),
+    )
 
 
 @router.post("/extract", response_model=TallyExtractResponse)
@@ -272,7 +399,7 @@ async def extract_tally(
     extraction_id = uuid4().hex
     doc = {
         "_id": extraction_id,
-        "document": (payload.document or TallyDocumentContext()).model_dump(exclude_none=True),
+        "document": (payload.document or TallyDocumentContext()).model_dump(exclude_none=True, by_alias=True),
         "student": (payload.student or TallyStudentContext()).model_dump(exclude_none=True),
         "copy_id": payload.copy_id,
         "columns": columns,
