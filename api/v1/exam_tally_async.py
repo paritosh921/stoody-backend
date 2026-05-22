@@ -118,6 +118,24 @@ class TallyTemplateResponse(BaseModel):
     updated_by: Optional[str] = None
 
 
+class TallyTemplateSummary(BaseModel):
+    document_id: str
+    title: Optional[str] = None
+    subject: Optional[str] = None
+    standard: Optional[str] = None
+    section: Optional[str] = None
+    image_b64: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+
+class TallyTemplateListResponse(BaseModel):
+    success: bool
+    templates: List[TallyTemplateSummary] = Field(default_factory=list)
+
+
 def _require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     if current_user.get("user_type") not in {"admin", "tutor", "b2c_admin"}:
         raise HTTPException(
@@ -392,6 +410,24 @@ def _parse_mark_value(value: Any) -> Optional[float]:
         return None
 
 
+def _format_question_ranges(question_numbers: List[int]) -> str:
+    unique = sorted({int(number) for number in question_numbers if int(number) > 0})
+    if not unique:
+        return ""
+
+    ranges: List[str] = []
+    start = unique[0]
+    previous = unique[0]
+    for number in unique[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(f"Q{start}" if start == previous else f"Q{start}-Q{previous}")
+        start = previous = number
+    ranges.append(f"Q{start}" if start == previous else f"Q{start}-Q{previous}")
+    return ", ".join(ranges)
+
+
 def _configured_question_count(document: TallyDocumentContext) -> Optional[int]:
     counts: List[int] = []
     if document.num_questions and document.num_questions > 0:
@@ -482,11 +518,13 @@ def _validate_tally_result(
 
     max_question = _configured_question_count(document)
     question_columns: List[Tuple[str, int]] = []
+    question_column_by_number: Dict[int, str] = {}
     seen_columns = set()
     for column in columns:
         question_number = _question_number_from_label(column)
         if question_number is not None and column not in seen_columns:
             question_columns.append((column, question_number))
+            question_column_by_number.setdefault(question_number, column)
             seen_columns.add(column)
 
     for row in rows:
@@ -496,18 +534,45 @@ def _validate_tally_result(
             question_number = _question_number_from_label(column)
             if question_number is not None:
                 question_columns.append((column, question_number))
+                question_column_by_number.setdefault(question_number, column)
                 seen_columns.add(column)
 
     if max_question and not question_columns:
         issues.append(
             TallyValidationIssue(
-                severity="warning",
+                severity="error",
                 code="question_columns_missing",
-                message="No question columns were confidently detected for validation.",
+                message=f"No question marks were confidently detected. Expected marks for Q1-Q{max_question}.",
+                expected=f"Q1-Q{max_question}",
             )
         )
 
     for row_index, row in enumerate(rows):
+        if max_question and question_columns:
+            missing_questions: List[int] = []
+            for question_number in range(1, max_question + 1):
+                column = question_column_by_number.get(question_number)
+                if not column or not _cell_text(row.get(column)):
+                    missing_questions.append(question_number)
+
+            if missing_questions:
+                missing_label = _format_question_ranges(missing_questions)
+                issues.append(
+                    TallyValidationIssue(
+                        severity="error",
+                        code="missing_question_marks",
+                        message=(
+                            f"Marks are missing for {missing_label}. "
+                            f"Expected marks for all {max_question} questions."
+                        ),
+                        row_index=row_index,
+                        column=missing_label,
+                        question_number=missing_questions[0],
+                        expected=f"Q1-Q{max_question}",
+                        actual=f"Missing {missing_label}",
+                    )
+                )
+
         for column, question_number in question_columns:
             raw_value = _cell_text(row.get(column))
             if not raw_value:
@@ -649,6 +714,63 @@ def _safe_document_id(value: str) -> str:
     if len(document_id) > 240 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", document_id):
         raise HTTPException(status_code=400, detail="Invalid document_id")
     return document_id
+
+
+@router.get("/templates", response_model=TallyTemplateListResponse)
+async def list_tally_templates(
+    current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    tenant_db = await _tenant_db(db, current_user)
+    template_docs = await tenant_db["exam_tally_templates"].find(
+        {"image_b64": {"$exists": True, "$ne": ""}},
+        {
+            "document_id": 1,
+            "image_b64": 1,
+            "width": 1,
+            "height": 1,
+            "updated_at": 1,
+            "updated_by": 1,
+        },
+    ).sort("updated_at", -1).to_list(length=200)
+
+    document_ids = [doc.get("document_id") for doc in template_docs if doc.get("document_id")]
+    document_map: Dict[str, Dict[str, Any]] = {}
+    if document_ids:
+        documents = await tenant_db["documents"].find(
+            {"document_id": {"$in": document_ids}},
+            {
+                "document_id": 1,
+                "title": 1,
+                "subject": 1,
+                "standard": 1,
+                "section": 1,
+            },
+        ).to_list(length=len(document_ids))
+        document_map = {str(doc.get("document_id")): doc for doc in documents if doc.get("document_id")}
+
+    summaries: List[TallyTemplateSummary] = []
+    for template in template_docs:
+        doc_id = str(template.get("document_id") or "")
+        if not doc_id:
+            continue
+        source_doc = document_map.get(doc_id, {})
+        summaries.append(
+            TallyTemplateSummary(
+                document_id=doc_id,
+                title=source_doc.get("title") or doc_id,
+                subject=source_doc.get("subject"),
+                standard=source_doc.get("standard"),
+                section=source_doc.get("section"),
+                image_b64=template.get("image_b64"),
+                width=template.get("width"),
+                height=template.get("height"),
+                updated_at=template.get("updated_at"),
+                updated_by=template.get("updated_by"),
+            )
+        )
+
+    return TallyTemplateListResponse(success=True, templates=summaries)
 
 
 @router.get("/templates/{document_id}", response_model=TallyTemplateResponse)
