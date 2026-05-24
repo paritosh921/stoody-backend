@@ -55,8 +55,6 @@ class TenantMiddleware(BaseHTTPMiddleware):
         "/docs",
         "/openapi.json",
         "/redoc",
-        "/api/v1/auth/admin/login",
-        "/api/v1/auth/tutor/login",
         "/api/v1/auth/student/login",
         "/api/v1/auth/register",
         "/api/v1/auth/admin/register",

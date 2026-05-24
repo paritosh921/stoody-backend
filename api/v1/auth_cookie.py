@@ -34,9 +34,7 @@ from core.tenant_features import (
 from api.v1.auth_async import (
     get_database,
     get_auth_manager,
-    AdminLoginRequest,
     StudentLoginRequest,
-    TutorLoginRequest,
     _resolve_tenant_for_auth,
     _get_tenant_db_or_503,
     _get_request_subdomain,
@@ -95,109 +93,6 @@ async def get_csrf_token(request: Request):
     logger.debug("CSRF token generated and set")
     
     return response
-
-
-@router.post("/admin/cookie-login")
-async def admin_cookie_login(
-    request: Request,
-    login_data: AdminLoginRequest,
-    db: DatabaseManager = Depends(get_database),
-    auth_manager: AuthManager = Depends(get_auth_manager)
-):
-    """
-    Admin login with cookie-based authentication
-    Sets JWT token in httpOnly cookie instead of returning it in response
-    
-    Returns:
-        JSON response with user data (NO token in body)
-    """
-    try:
-        tenant_id = normalize_tenant_id(login_data.tenant_id) if login_data.tenant_id else None
-        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
-        tenant_db = await _get_tenant_db_or_503(db, tenant)
-        enabled_features = merge_tenant_features(
-            tenant.get("enabled_features"),
-            tenant.get("enabled_features_v2"),
-        )
-        enabled_features_v2 = build_enabled_features_v2(
-            tenant.get("enabled_features_v2"),
-            tenant.get("enabled_features"),
-        )
-
-        admin_doc = await tenant_db["admins"].find_one({
-            "email": login_data.email,
-            "is_active": True
-        })
-
-        if not admin_doc:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-
-        if not auth_manager.verify_password(login_data.password, admin_doc.get("password_hash", "")):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-
-        await tenant_db["admins"].update_one(
-            {"_id": admin_doc["_id"]},
-            {"$set": {"last_login": datetime.utcnow()}}
-        )
-
-        admin_data = {
-            "user_id": str(admin_doc["_id"]),
-            "admin_id": str(admin_doc["_id"]),
-            "email": admin_doc.get("email"),
-            "full_name": admin_doc.get("full_name") or admin_doc.get("name"),
-            "user_type": "admin",
-            "subdomain": tenant.get("subdomain"),
-            "tenant_id": tenant.get("tenant_id"),
-            "db_name": tenant.get("db_name"),
-            "institution_id": tenant.get("institution_id"),
-            "admin_role": admin_doc.get("role", "master_admin"),
-            "permissions": admin_doc.get("permissions") or [],
-            "enabled_features": enabled_features,
-            "enabled_features_v2": enabled_features_v2,
-        }
-
-        session_data = await auth_manager.create_user_session(admin_data)
-        
-        # Generate CSRF token
-        csrf_token = csrf_protection.generate_csrf_token()
-
-        # Create response data (NO token in body)
-        response_data = {
-            "success": True,
-            "data": {
-                "user_type": "admin",
-                "user": session_data["user"],
-                "csrf_token": csrf_token
-            }
-        }
-
-        # Create response with auth cookie
-        response = create_response_with_cookie(
-            response_data,
-            session_data["access_token"]
-        )
-        
-        # Set CSRF cookie
-        csrf_protection.set_csrf_cookie(response, csrf_token)
-
-        logger.info(f"Admin logged in via cookie: {login_data.email}")
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Admin cookie login error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
-        )
 
 
 @router.post("/student/cookie-login")
@@ -351,96 +246,6 @@ async def student_cookie_login(
         raise
     except Exception as e:
         logger.error(f"Student cookie login error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed"
-        )
-
-
-@router.post("/tutor/cookie-login")
-async def tutor_cookie_login(
-    request: Request,
-    login_data: TutorLoginRequest,
-    db: DatabaseManager = Depends(get_database),
-    auth_manager: AuthManager = Depends(get_auth_manager)
-):
-    """
-    Tutor login with cookie-based authentication
-    Sets JWT token in httpOnly cookie instead of returning it in response
-    
-    Returns:
-        JSON response with user data (NO token in body)
-    """
-    try:
-        tenant_id = normalize_tenant_id(login_data.tenant_id)
-        tenant = await _resolve_tenant_for_auth(db, request, tenant_id)
-        tenant_db = await _get_tenant_db_or_503(db, tenant)
-        enabled_features = merge_tenant_features(
-            tenant.get("enabled_features"),
-            tenant.get("enabled_features_v2"),
-        )
-        enabled_features_v2 = build_enabled_features_v2(
-            tenant.get("enabled_features_v2"),
-            tenant.get("enabled_features"),
-        )
-
-        if not is_feature_enabled(enabled_features, "tutor_portal_access", enabled_features_v2):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tutor panel is disabled for this institution"
-            )
-
-        tutor_data = await auth_manager.authenticate_tutor(
-            login_data.username, login_data.password, db, tenant_db
-        )
-
-        if not tutor_data:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username or password"
-            )
-
-        tutor_data.update({
-            "subdomain": tenant.get("subdomain"),
-            "tenant_id": tenant.get("tenant_id"),
-            "db_name": tenant.get("db_name"),
-            "institution_id": tenant.get("institution_id"),
-            "enabled_features": enabled_features,
-            "enabled_features_v2": enabled_features_v2,
-        })
-
-        session_data = await auth_manager.create_user_session(tutor_data)
-
-        # Generate CSRF token
-        csrf_token = csrf_protection.generate_csrf_token()
-
-        # Create response data (NO token in body)
-        response_data = {
-            "success": True,
-            "data": {
-                "user_type": "tutor",
-                "user": session_data["user"],
-                "csrf_token": csrf_token
-            }
-        }
-
-        # Create response with auth cookie
-        response = create_response_with_cookie(
-            response_data,
-            session_data["access_token"]
-        )
-        
-        # Set CSRF cookie
-        csrf_protection.set_csrf_cookie(response, csrf_token)
-
-        logger.info(f"Tutor logged in via cookie: {login_data.username}")
-
-        return response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Tutor cookie login error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Login failed"

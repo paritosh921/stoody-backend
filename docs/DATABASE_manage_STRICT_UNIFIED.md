@@ -222,11 +222,16 @@ python -V                         → ___
 curl -s http://127.0.0.1:5001/health | python3 -m json.tool
 # Expected: {"healthy": true, "mongodb": {"connected": true, ...}}
 
-# Admin login (active tenant)
-curl -s -X POST http://127.0.0.1:5001/api/v1/auth/admin/login \
+# Admin 2FA login start (active tenant)
+curl -s -X POST http://127.0.0.1:5001/api/v1/auth/2fa/login-2fa \
   -H "Content-Type: application/json" \
-  -d '{"email":"...","password":"...","tenant_id":"..."}'
-# Expected: 200 with token containing db_name, tenant_id, admin_id
+  -d '{"username":"...","password":"...","tenant_id":"...","user_type":"admin"}'
+# Expected: next = DONE, SETUP_2FA, or OTP. Complete setup/OTP before expecting a session token.
+
+# Session invalidation after auth/2FA rollout
+curl -s -X POST http://127.0.0.1:5001/api/v1/auth/invalidate-all-sessions \
+  -H "X-Deploy-Secret: $DEPLOY_SESSION_SECRET"
+# Expected: {"success": true, "min_token_issued_at": ...}
 
 # Pending tenant login (should fail)
 # Expected: 403 "Tenant is not active"

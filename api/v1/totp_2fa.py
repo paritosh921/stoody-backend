@@ -71,19 +71,6 @@ TOTP_ISSUER = "Stoody"
 
 TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
 
-# Legacy accounts exempt from 2FA (old system compatibility)
-# These accounts will use regular login without 2FA requirement
-TWO_FA_EXEMPT_EMAILS = [
-    "cielknowledge@gmail.com",  # Legacy admin account
-]
-
-# Tutor usernames exempt from 2FA (e.g., Play Store / App Store review accounts)
-TWO_FA_EXEMPT_USERNAMES = [
-    "playstoreteacher",
-    "appstoreteacher",
-]
-
-
 # ============================================================================
 # Encryption helpers
 # ============================================================================
@@ -246,6 +233,11 @@ class TwoFAStatusResponse(BaseModel):
     two_fa_required: bool
 
 
+class RequirementUpdateRequest(BaseModel):
+    """Request to enable or disable 2FA requirement at login."""
+    required: bool
+
+
 # ============================================================================
 # Dependency Injection
 # ============================================================================
@@ -322,9 +314,35 @@ async def update_user_2fa(tenant_db, user_id: str, user_type: str,
             {"_id": ObjectId(user_id)},
             {"$set": update_data}
         )
-        return result.modified_count > 0
+        return bool(
+            getattr(result, "modified_count", 0) > 0
+            or getattr(result, "matched_count", 0) > 0
+        )
     except Exception as e:
         logger.error(f"Error updating user 2FA: {e}")
+        return False
+
+
+async def mark_successful_login(tenant_db, user_id: str, user_type: str,
+                                *, two_fa_verified: bool = False) -> bool:
+    """Record login metadata only after the 2FA login flow issues a session."""
+    collection = "admins" if user_type == "admin" else "tutors"
+    now = datetime.utcnow()
+    update_data = {"last_login": now}
+    if two_fa_verified:
+        update_data["two_fa.last_verified_at"] = now
+
+    try:
+        result = await tenant_db[collection].update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": update_data}
+        )
+        return bool(
+            getattr(result, "modified_count", 0) > 0
+            or getattr(result, "matched_count", 0) > 0
+        )
+    except Exception as e:
+        logger.error(f"Error updating successful login metadata: {e}")
         return False
 
 
@@ -514,19 +532,11 @@ async def login_with_2fa(
             )
         
         user_id = str(user["_id"])
-        user_email = (user.get("email") or "").lower()  # Handle None email
-        user_username = (user.get("username") or "").strip().lower()
         two_fa = user.get("two_fa", {})
-
-        # Check if account is exempt from 2FA (legacy accounts, app-store review accounts)
-        is_exempt = (
-            user_email in [e.lower() for e in TWO_FA_EXEMPT_EMAILS]
-            or (user_type == "tutor" and user_username in [u.lower() for u in TWO_FA_EXEMPT_USERNAMES])
-        )
         
         # Check 2FA status
-        two_fa_enabled = two_fa.get("enabled", False)
-        two_fa_required = two_fa.get("required", True) and not is_exempt  # Exempt accounts skip 2FA
+        two_fa_enabled = bool(two_fa.get("enabled", False))
+        two_fa_required = bool(two_fa.get("required", True))
         
         if two_fa_required and not two_fa_enabled:
             # User needs to set up 2FA
@@ -547,7 +557,7 @@ async def login_with_2fa(
                 temp_token=temp_token
             )
         
-        if two_fa_enabled and not is_exempt:
+        if two_fa_required and two_fa_enabled:
             # User needs to enter OTP
             temp_token = create_temp_token(
                 user_id,
@@ -566,10 +576,11 @@ async def login_with_2fa(
                 temp_token=temp_token
             )
         
-        # 2FA not required and not enabled - direct login
+        # 2FA requirement is disabled for this account - direct login
         user_data = _build_user_token_data(user, user_id, user_type, tenant=tenant)
 
         session_data = await auth_manager.create_user_session(user_data)
+        await mark_successful_login(tenant_db, user_id, user_type)
 
         # Clear any user-level revocation so the new token is accepted
         from core.token_blacklist import clear_user_session_revocation
@@ -713,14 +724,17 @@ async def verify_2fa_setup(
                 detail="Invalid verification code. Please try again."
             )
         
-        # Enable 2FA
+        # Enable 2FA and record the successful login completed by setup verification
+        now = datetime.utcnow()
         await update_user_2fa(tenant_db, user_id, user_type, {
             "two_fa.enabled": True,
             "two_fa.required": True,
             "two_fa.secret_enc": encrypt_secret(secret),
             "two_fa.temp_secret_enc": None,
-            "two_fa.verified_at": datetime.utcnow(),
-            "two_fa.setup_started_at": None
+            "two_fa.verified_at": now,
+            "two_fa.last_verified_at": now,
+            "two_fa.setup_started_at": None,
+            "last_login": now,
         })
         
         # Create access token with 6h expiry
@@ -806,12 +820,7 @@ async def verify_otp(
                 detail="Invalid verification code"
             )
         
-        # Update last login
-        collection = "admins" if user_type == "admin" else "tutors"
-        await tenant_db[collection].update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {"last_login": datetime.utcnow(), "two_fa.last_verified_at": datetime.utcnow()}}
-        )
+        await mark_successful_login(tenant_db, user_id, user_type, two_fa_verified=True)
         
         # Create access token with 6h expiry
         user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
@@ -840,6 +849,46 @@ async def verify_otp(
         )
 
 
+async def _get_current_2fa_user(
+    credentials: HTTPAuthorizationCredentials,
+    db: DatabaseManager,
+    auth_manager: AuthManager,
+) -> tuple[Dict[str, Any], Any, str, str, Dict[str, Any]]:
+    token = credentials.credentials
+    user_data = await auth_manager.verify_token_and_get_user(token)
+
+    if not user_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication"
+        )
+
+    user_id = user_data.get("user_id")
+    user_type = (user_data.get("user_type") or "").lower()
+
+    if user_type not in {"admin", "tutor"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="2FA settings are available for admins and tutors"
+        )
+
+    tenant_db = await db.get_tenant_db(user_data.get("db_name"))
+    if tenant_db is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tenant context required"
+        )
+
+    user = await get_user_by_id(tenant_db, user_id, user_type)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    return user_data, tenant_db, user_id, user_type, user
+
+
 @router.get("/status", response_model=TwoFAStatusResponse)
 async def get_2fa_status(
     request: Request,
@@ -848,45 +897,20 @@ async def get_2fa_status(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """
-    Get current user's 2FA status.
-    Requires authentication.
+    Get current admin/tutor 2FA status.
+    Missing 2FA documents default to required, so existing users are prompted
+    to enroll on their next login unless they explicitly disable the requirement.
     """
     try:
-        # Verify token
-        token = credentials.credentials
-        user_data = await auth_manager.verify_token_and_get_user(token)
-        
-        if not user_data:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication"
-            )
-        
-        user_id = user_data.get("user_id")
-        user_type = user_data.get("user_type")
-
-        tenant_db = await db.get_tenant_db(user_data.get("db_name"))
-        if tenant_db is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tenant context required"
-            )
-
-        user = await get_user_by_id(tenant_db, user_id, user_type)
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
-        
+        _, _, _, _, user = await _get_current_2fa_user(credentials, db, auth_manager)
         two_fa = user.get("two_fa", {})
-        
+
         return TwoFAStatusResponse(
             success=True,
-            two_fa_enabled=two_fa.get("enabled", False),
-            two_fa_required=two_fa.get("required", True)
+            two_fa_enabled=bool(two_fa.get("enabled", False)),
+            two_fa_required=bool(two_fa.get("required", True))
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -894,6 +918,65 @@ async def get_2fa_status(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get 2FA status"
+        )
+
+
+@router.patch("/requirement")
+async def set_2fa_requirement(
+    request: Request,
+    data: RequirementUpdateRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """
+    Enable or disable the current admin/tutor account's 2FA requirement at login.
+    This preserves any existing authenticator secret; disabling the requirement
+    does not delete the user's enrolled TOTP device.
+    """
+    try:
+        _, tenant_db, user_id, user_type, user = await _get_current_2fa_user(
+            credentials,
+            db,
+            auth_manager,
+        )
+        update = {
+            "two_fa.required": data.required,
+            "two_fa.requirement_updated_at": datetime.utcnow(),
+        }
+        if data.required:
+            update["two_fa.requirement_enabled_at"] = datetime.utcnow()
+        else:
+            update["two_fa.requirement_disabled_at"] = datetime.utcnow()
+
+        success = await update_user_2fa(tenant_db, user_id, user_type, update)
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update 2FA requirement"
+            )
+
+        two_fa = user.get("two_fa", {})
+        logger.info("2FA requirement set to %s for %s %s", data.required, user_type, user_id)
+
+        return {
+            "success": True,
+            "two_fa_required": data.required,
+            "two_fa_enabled": bool(two_fa.get("enabled", False)),
+            "message": (
+                "2FA will be required at login"
+                if data.required
+                else "2FA will not be required at login"
+            ),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"2FA requirement update error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update 2FA requirement"
         )
 
 
@@ -969,49 +1052,28 @@ async def disable_2fa(
     auth_manager: AuthManager = Depends(get_auth_manager)
 ):
     """
-    Disable 2FA for current user (admin only).
-    Note: This should be used with caution in production.
+    Disable the current admin/tutor account's 2FA requirement at login.
+    Kept for backward compatibility with older clients; it no longer deletes
+    the enrolled authenticator secret.
     """
     try:
-        # Verify token
-        token = credentials.credentials
-        user_data = await auth_manager.verify_token_and_get_user(token)
-
-        if not user_data:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication"
-            )
-
-        # Only allow admins to disable 2FA
-        if user_data.get("user_type") != "admin":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only admins can disable 2FA"
-            )
-
-        user_id = user_data.get("user_id")
-        user_type = user_data.get("user_type")
-
-        tenant_db = await db.get_tenant_db(user_data.get("db_name"))
-        if tenant_db is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tenant context required"
-            )
-
+        _, tenant_db, user_id, user_type, user = await _get_current_2fa_user(
+            credentials,
+            db,
+            auth_manager,
+        )
         await update_user_2fa(tenant_db, user_id, user_type, {
-            "two_fa.enabled": False,
             "two_fa.required": False,
-            "two_fa.secret_enc": None,
             "two_fa.disabled_at": datetime.utcnow()
         })
 
-        logger.info(f"2FA disabled for {user_type} {user_id}")
+        logger.info(f"2FA requirement disabled for {user_type} {user_id}")
 
         return {
             "success": True,
-            "message": "2FA has been disabled for your account"
+            "two_fa_required": False,
+            "two_fa_enabled": bool((user.get("two_fa") or {}).get("enabled", False)),
+            "message": "2FA will not be required at login"
         }
 
     except HTTPException:

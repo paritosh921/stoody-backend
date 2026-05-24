@@ -434,19 +434,6 @@ class AuthManager:
             if not self.verify_password(password, admin_data["password_hash"]):
                 return None
 
-            # Update last login
-            if db_override is not None:
-                await db_override["admins"].update_one(
-                    {"_id": admin_data["_id"]},
-                    {"$set": {"last_login": datetime.utcnow()}}
-                )
-            else:
-                await db_manager.mongo_update_one(
-                    "admins",
-                    {"_id": admin_data["_id"]},
-                    {"$set": {"last_login": datetime.utcnow()}}
-                )
-
             return {
                 "user_id": str(admin_data["_id"]),
                 "admin_id": str(admin_data["_id"]),  # Add admin_id for consistency
@@ -559,19 +546,6 @@ class AuthManager:
             if not self.verify_password(password, tutor_data.get("password_hash", "")):
                 return None
 
-            # Update last login
-            if db_override is not None:
-                await db_override["tutors"].update_one(
-                    {"_id": tutor_data["_id"]},
-                    {"$set": {"last_login": datetime.utcnow()}}
-                )
-            else:
-                await db_manager.mongo_update_one(
-                    "tutors",
-                    {"_id": tutor_data["_id"]},
-                    {"$set": {"last_login": datetime.utcnow()}}
-                )
-
             return {
                 "user_id": str(tutor_data["_id"]),
                 "tutor_id": tutor_data.get("tutor_id"),
@@ -588,6 +562,10 @@ class AuthManager:
                 "plan_types": tutor_data.get("plan_types", []),
                 "teaching_assignments": tutor_data.get("teaching_assignments", []),
                 "can_edit_students": tutor_data.get("can_edit_students", False),
+                "two_fa": {
+                    "enabled": bool((tutor_data.get("two_fa") or {}).get("enabled", False)),
+                    "required": bool((tutor_data.get("two_fa") or {}).get("required", True)),
+                },
             }
 
         except HTTPException:

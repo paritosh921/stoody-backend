@@ -504,11 +504,21 @@ class ExamPenAPIClient:
     async def login(self, user_type: str, username: str, password: str, tenant_id: str) -> Dict[str, Any]:
         """Login via Stoody auth endpoint."""
         if user_type == "admin":
-            endpoint = "/api/v1/auth/admin/login"
-            payload = {"email": username, "password": password, "tenant_id": tenant_id or None}
+            endpoint = "/api/v1/auth/2fa/login-2fa"
+            payload = {
+                "username": username,
+                "password": password,
+                "tenant_id": tenant_id or None,
+                "user_type": "admin",
+            }
         elif user_type == "tutor":
-            endpoint = "/api/v1/auth/tutor/login"
-            payload = {"username": username, "password": password, "tenant_id": tenant_id}
+            endpoint = "/api/v1/auth/2fa/login-2fa"
+            payload = {
+                "username": username,
+                "password": password,
+                "tenant_id": tenant_id,
+                "user_type": "tutor",
+            }
         elif user_type == "student":
             endpoint = "/api/v1/auth/student/login"
             payload = {"username": username, "password": password, "tenant_id": tenant_id}
@@ -519,9 +529,23 @@ class ExamPenAPIClient:
         data = resp.json()
 
         if resp.status_code in (200, 201) and data.get("success"):
-            token_data = data.get("data", {})
-            self.token = token_data.get("token") or token_data.get("access_token")
-            self.user_info = token_data.get("user", {})
+            if user_type in {"admin", "tutor"}:
+                next_step = str(data.get("next") or "").strip().upper()
+                if next_step and next_step != "DONE":
+                    return {
+                        "success": False,
+                        "status": 428,
+                        "detail": {
+                            "detail": "2FA required. Complete the 2FA login flow in the Stoody web app.",
+                            "next": next_step,
+                        },
+                    }
+                self.token = data.get("access_token")
+                self.user_info = data.get("user", {})
+            else:
+                token_data = data.get("data", {})
+                self.token = token_data.get("token") or token_data.get("access_token")
+                self.user_info = token_data.get("user", {})
             if self.token:
                 self.client.headers["Authorization"] = f"Bearer {self.token}"
             return {"success": True, "token": self.token, "user": self.user_info}

@@ -45,6 +45,7 @@ jobs:
       PROD_MENTOR_AI_PORT: ${{ vars.PROD_MENTOR_AI_PORT }}
       PROD_MENTOR_AI_BASE_PATH: ${{ vars.PROD_MENTOR_AI_BASE_PATH }}
       PROD_NGINX_SITE_PATH: ${{ vars.PROD_NGINX_SITE_PATH }}
+      PROD_DEPLOY_SESSION_SECRET: ${{ secrets.PROD_DEPLOY_SESSION_SECRET }}
     steps:
       - name: Guard branch
         run: |
@@ -75,6 +76,11 @@ jobs:
 
           if [[ -z "$PROD_DEPLOY_SSH_PRIVATE_KEY" ]]; then
             echo "Missing required GitHub secret: PROD_DEPLOY_SSH_PRIVATE_KEY"
+            exit 1
+          fi
+
+          if [[ -z "$PROD_DEPLOY_SESSION_SECRET" ]]; then
+            echo "Missing required GitHub secret: PROD_DEPLOY_SESSION_SECRET"
             exit 1
           fi
 
@@ -127,3 +133,24 @@ jobs:
             NGINX_SITE_PATH='${PROD_NGINX_SITE_PATH}' \
             bash /tmp/remote_deploy_python_service.sh \
             '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
+
+      - name: Invalidate existing sessions after prod deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          invalidate_url="$(python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+
+          health_url = os.environ["PROD_MAIN_BACKEND_HEALTHCHECK_URL"]
+          parsed = urlsplit(health_url)
+          if not parsed.scheme or not parsed.netloc:
+              raise SystemExit("Invalid PROD_MAIN_BACKEND_HEALTHCHECK_URL")
+          print(f"{parsed.scheme}://{parsed.netloc}/api/v1/auth/invalidate-all-sessions")
+          PY
+          )"
+
+          echo "Invalidating existing JWT sessions"
+          curl -fsS -X POST "$invalidate_url" \
+            -H "X-Deploy-Secret: ${PROD_DEPLOY_SESSION_SECRET}"

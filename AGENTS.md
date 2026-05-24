@@ -66,12 +66,12 @@ backend/
 
 ### Authentication
 ```
-POST /api/v1/auth/admin/login      # Admin login
+POST /api/v1/auth/2fa/login-2fa    # Admin/tutor login state machine (user_type: admin|tutor)
 POST /api/v1/auth/student/login    # Student login (with tenant_id)
-POST /api/v1/auth/tutor/login      # Tutor login
 POST /api/v1/auth/b2c/google-callback  # Google OAuth
-POST /api/v1/auth/2fa/setup        # 2FA setup (TOTP)
-POST /api/v1/auth/2fa/verify       # 2FA verification
+POST /api/v1/auth/2fa/setup/start  # 2FA setup (TOTP)
+POST /api/v1/auth/2fa/setup/verify # Verify first setup OTP
+POST /api/v1/auth/2fa/verify-otp   # Verify login OTP
 ```
 
 ### Content & Learning
