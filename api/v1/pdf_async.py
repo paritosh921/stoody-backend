@@ -2335,11 +2335,19 @@ class DocumentMetadata(BaseModel):
     total_minutes: Optional[int] = None  # Total minutes for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
     is_active: bool = True  # Whether the document is enabled for students
+    instructions: Optional[str] = None
+    exam_mode: Optional[str] = None
+    exam_template_path: Optional[str] = None
+    exam_finalized: Optional[bool] = None
+    exam_finalized_at: Optional[datetime] = None
+    exam_sync_summary: Optional[Dict[str, Any]] = None
     orientation_applied: Optional[int] = None  # Rotation degrees baked into the uploaded PDF at upload time (0/90/180/270). Audit-only — file is already pre-rotated.
     exam_template_orientation_applied: Optional[int] = None  # Same as above for the DCR answer template.
     tally_num_questions: Optional[int] = None
     tally_max_marks_per_question: Optional[float] = None
     tally_marking_scheme: Optional[List[Dict[str, float]]] = None
+    tally_validate_paper_set: Optional[bool] = None
+    tally_expected_paper_set: Optional[str] = None
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -3473,7 +3481,21 @@ async def get_documents(
                 pages_count=doc.get("pages_count", 0),
                 total_points=doc.get("total_points"),
                 total_minutes=doc.get("total_minutes"),
-                is_active=doc.get("is_active", True)
+                file_exists=file_exists,
+                is_active=doc.get("is_active", True),
+                instructions=doc.get("instructions"),
+                exam_mode=doc.get("exam_mode"),
+                exam_template_path=doc.get("exam_template_path"),
+                exam_finalized=doc.get("exam_finalized"),
+                exam_finalized_at=doc.get("exam_finalized_at"),
+                exam_sync_summary=doc.get("exam_sync_summary"),
+                orientation_applied=doc.get("orientation_applied"),
+                exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
+                tally_num_questions=doc.get("tally_num_questions"),
+                tally_max_marks_per_question=doc.get("tally_max_marks_per_question"),
+                tally_marking_scheme=doc.get("tally_marking_scheme"),
+                tally_validate_paper_set=doc.get("tally_validate_paper_set"),
+                tally_expected_paper_set=doc.get("tally_expected_paper_set"),
             ))
 
         return DocumentListResponse(
@@ -3967,7 +3989,21 @@ async def get_student_available_options(
                 ocr_job_id=doc.get("ocr_job_id"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
                 extracted_images_count=doc.get("extracted_images_count", 0),
-                file_exists=file_exists
+                file_exists=file_exists,
+                is_active=doc.get("is_active", True),
+                instructions=doc.get("instructions"),
+                exam_mode=doc.get("exam_mode"),
+                exam_template_path=doc.get("exam_template_path"),
+                exam_finalized=doc.get("exam_finalized"),
+                exam_finalized_at=doc.get("exam_finalized_at"),
+                exam_sync_summary=doc.get("exam_sync_summary"),
+                orientation_applied=doc.get("orientation_applied"),
+                exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
+                tally_num_questions=doc.get("tally_num_questions"),
+                tally_max_marks_per_question=doc.get("tally_max_marks_per_question"),
+                tally_marking_scheme=doc.get("tally_marking_scheme"),
+                tally_validate_paper_set=doc.get("tally_validate_paper_set"),
+                tally_expected_paper_set=doc.get("tally_expected_paper_set"),
             ))
 
         return DocumentListResponse(
