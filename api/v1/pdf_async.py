@@ -2378,6 +2378,8 @@ async def upload_pdf(
     tally_num_questions: Optional[int] = Form(None),
     tally_max_marks_per_question: Optional[float] = Form(None),
     tally_marking_scheme: Optional[str] = Form(None),
+    tally_validate_paper_set: Optional[bool] = Form(None),
+    tally_expected_paper_set: Optional[str] = Form(None),
     orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the PDF — audit only
     exam_template_orientation_applied: Optional[int] = Form(None),  # Same for the DCR answer template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
@@ -2630,6 +2632,10 @@ async def upload_pdf(
             "tally_num_questions": tally_num_questions,
             "tally_max_marks_per_question": tally_max_marks_per_question,
             "tally_marking_scheme": tally_marking_scheme_list,
+            "tally_validate_paper_set": tally_validate_paper_set,
+            "tally_expected_paper_set": (
+                tally_expected_paper_set.strip() if tally_expected_paper_set else None
+            ),
             "orientation_applied": (
                 orientation_applied if orientation_applied in (0, 90, 180, 270) else None
             ),
@@ -2660,7 +2666,11 @@ async def upload_pdf(
         ocr_job_id = None
 
         return {
-            "message": "Document uploaded successfully. Use 'Segment' to define question regions before processing OCR.",
+            "message": (
+                "DCR document uploaded successfully. OCR was not started."
+                if exam_mode == "dcr"
+                else "Document uploaded successfully. Use 'Segment' to define question regions before processing OCR."
+            ),
             "document_id": document_id,
             "file_path": relative_path,
             "ocr_status": ocr_status,
@@ -2720,7 +2730,7 @@ async def finalize_exam(
                 detail="Document is already finalized. Cannot re-finalize.",
             )
 
-        if doc.get("ocr_status") != "completed":
+        if exam_mode != "dcr" and doc.get("ocr_status") != "completed":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="OCR must be completed before finalizing.",
@@ -2738,7 +2748,11 @@ async def finalize_exam(
         if not questions:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No questions found for this document. Extract questions via OCR first.",
+                detail=(
+                    "No answer keys found for this DCR document. Add objective questions/answers first."
+                    if exam_mode == "dcr"
+                    else "No questions found for this document. Extract questions via OCR first."
+                ),
             )
 
         # Validate and sync based on exam_mode

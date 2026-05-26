@@ -232,7 +232,12 @@ async def list_exams(
         prepared_items: List[ExamSummaryItem] = []
         prepared_doc_meta: Dict[str, Dict[str, Any]] = {}
 
-        doc_query: Dict[str, Any] = {"exam_finalized": True}
+        doc_query: Dict[str, Any] = {
+            "$or": [
+                {"exam_finalized": True},
+                {"exam_mode": "dcr"},
+            ],
+        }
         # Tutor scoping: match existing document visibility model —
         # tutors see docs mapped to them OR docs open to all tutors
         # (teacher_ids is empty, null, or missing).
