@@ -4868,6 +4868,7 @@ async def create_question(
     course_plan: str = Form(...),
     standard: str = Form(...),
     question_type: str = Form(default="mcq"),  # mcq or integer
+    evaluation_mode: str = Form(default="auto"),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -4903,6 +4904,9 @@ async def create_question(
 
         # Parse options metadata
         options_metadata = json.loads(options_data) if options_data else []
+        normalized_evaluation_mode = str(evaluation_mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
+            normalized_evaluation_mode = "auto"
 
         # Prepare question document
         question_doc = {
@@ -4910,6 +4914,7 @@ async def create_question(
             "text": question_text,  # Standard field name used by MCQ service
             "question_text": question_text,  # Alias for compatibility
             "question_type": question_type,  # Store question type (mcq or integer)
+            "evaluation_mode": normalized_evaluation_mode,
             "options": [],  # Will be populated below (empty for integer type)
             "correct_answer": correct_answer,
             "subject": subject,
@@ -5080,6 +5085,12 @@ async def update_question(
             update_data["difficulty"] = question_data["difficulty"]
         if "document_type" in question_data:
             update_data["document_type"] = question_data["document_type"]
+        evaluation_mode = question_data.get("evaluation_mode") or question_data.get("evaluationMode")
+        if evaluation_mode is not None:
+            normalized_evaluation_mode = str(evaluation_mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
+                normalized_evaluation_mode = "auto"
+            update_data["evaluation_mode"] = normalized_evaluation_mode
         # Helper to process and save new images
         async def process_new_images(images_list, id_prefix):
             processed_images = []
