@@ -2055,18 +2055,34 @@ logic. Use this rubric:
 `is_correct` means the answer is acceptable / passing overall. Set it to true when
 score >= 0.60, false when score < 0.60.
 
-`extracted_answer` should be a concise assessment summary, not a single final answer.
-`work_shown` should describe what the student actually covered.
-`what_went_wrong` should list the main gaps and improvements. If score >= 0.90, this
-may be an empty string; otherwise include concrete improvement advice.
+Format all string fields as concise Markdown without tables.
+
+`extracted_answer` should be 1-2 short sentences summarizing the student's case response.
+`work_shown` should be a readable bullet list of what the student actually covered, grouped
+by themes when useful. Prefer this format:
+- **Pros:** ...
+- **Cons:** ...
+- **Framework:** ...
+- **TAM / Market:** ...
+- **Business model:** ...
+- **Competition:** ...
+
+`what_went_wrong` should be a readable bullet list of the main gaps and improvements.
+Use short, concrete bullets such as:
+- **Diagnosis:** ...
+- **Growth levers:** ...
+- **Metrics:** ...
+- **Execution plan:** ...
+- **Risks / assumptions:** ...
+If score >= 0.90 this may be an empty string; otherwise include concrete improvement advice.
 
 OUTPUT - strict JSON only (no markdown fences, no commentary, no text outside JSON):
 {
   "is_correct": true | false,
   "score": 0.0 to 1.0,
-  "extracted_answer": "short overall assessment of the student's case response",
-  "work_shown": "what the student covered, organized by business themes",
-  "what_went_wrong": "specific gaps/improvements in MBA case-answer terms"
+  "extracted_answer": "1-2 sentence overall assessment",
+  "work_shown": "- **Theme:** concise point\\n- **Theme:** concise point",
+  "what_went_wrong": "- **Gap:** concise improvement\\n- **Gap:** concise improvement"
 }''')
 
     return "\n".join(parts)
