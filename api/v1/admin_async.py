@@ -25,7 +25,7 @@ from fastapi import (
 from fastapi.responses import Response as RawResponse
 from pydantic import BaseModel, Field, EmailStr, field_validator
 
-# Valid grades for students (class 6 to 12)
+# Fallback grades for tenants that have not configured school settings yet.
 VALID_GRADES = ["6", "7", "8", "9", "10", "11", "12"]
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -82,18 +82,11 @@ class CreateStudentRequest(BaseModel):
     location: Optional[str] = None
     school: Optional[str] = None
     stream: Optional[str] = None
-    grade: Optional[str] = Field(None, description="Student grade/class (6-12)")
+    grade: Optional[str] = Field(None, description="Student grade/class")
     phone: Optional[str] = None
     section: Optional[str] = Field(None, description="Section (e.g. A, B, C)")
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
-
-    @field_validator("grade")
-    @classmethod
-    def validate_grade(cls, v):
-        if v is not None and v not in VALID_GRADES:
-            raise ValueError(f"Grade must be one of {VALID_GRADES}, got '{v}'")
-        return v
 
 
 class UpdateStudentRequest(BaseModel):
@@ -107,18 +100,9 @@ class UpdateStudentRequest(BaseModel):
     phone: Optional[str] = None
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
-    grade: Optional[str] = Field(
-        None, description="New grade/class for the student (6-12)"
-    )
+    grade: Optional[str] = Field(None, description="New grade/class for the student")
     section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
-
-    @field_validator("grade")
-    @classmethod
-    def validate_grade(cls, v):
-        if v is not None and v not in VALID_GRADES:
-            raise ValueError(f"Grade must be one of {VALID_GRADES}, got '{v}'")
-        return v
 
 
 class SessionPromotionRequest(BaseModel):
@@ -152,31 +136,6 @@ class SessionPromotionRequest(BaseModel):
     preview_only: bool = Field(
         False, description="If true, only return preview without making changes"
     )
-
-    @field_validator("grade_mappings")
-    @classmethod
-    def validate_grade_mappings(cls, v):
-        for from_grade, to_grade in v.items():
-            if from_grade not in VALID_GRADES:
-                raise ValueError(
-                    f"Source grade must be one of {VALID_GRADES}, got '{from_grade}'"
-                )
-            if to_grade not in VALID_GRADES:
-                raise ValueError(
-                    f"Target grade must be one of {VALID_GRADES}, got '{to_grade}'"
-                )
-        return v
-
-    @field_validator("grade_filter")
-    @classmethod
-    def validate_grade_filter(cls, v):
-        if v is not None:
-            for grade in v:
-                if grade not in VALID_GRADES:
-                    raise ValueError(
-                        f"Grade filter must only contain values from {VALID_GRADES}, got '{grade}'"
-                    )
-        return v
 
 
 class SessionPromotionResponse(BaseModel):
@@ -464,6 +423,66 @@ async def get_tenant_db_or_403(db: DatabaseManager, current_user: Dict[str, Any]
             detail="Tenant database not available",
         )
     return tenant_db
+
+
+def _clean_settings_list(values: Optional[List[Any]]) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for value in values or []:
+        item = str(value).strip()
+        if item and item not in seen:
+            cleaned.append(item)
+            seen.add(item)
+    return cleaned
+
+
+async def get_allowed_grades(admin_id, db: DatabaseManager) -> List[str]:
+    """Return tenant-configured classes, falling back to legacy 6-12 values."""
+    admin_id_str = str(admin_id)
+    settings_doc = await db.mongo_find_one("school_settings", {"admin_id": admin_id_str})
+    if not settings_doc:
+        try:
+            settings_doc = await db.mongo_find_one(
+                "school_settings", {"admin_id": ObjectId(admin_id_str)}
+            )
+        except Exception:
+            settings_doc = None
+
+    configured = _clean_settings_list((settings_doc or {}).get("classes"))
+    return configured or VALID_GRADES
+
+
+async def validate_grade_for_admin(
+    grade: Optional[str],
+    admin_id,
+    db: DatabaseManager,
+    *,
+    field_label: str = "Grade/Class",
+) -> None:
+    if not grade:
+        return
+    allowed = await get_allowed_grades(admin_id, db)
+    if grade not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_label} must be one of {allowed}, got '{grade}'",
+        )
+
+
+async def validate_grade_values_for_admin(
+    grades: List[str],
+    admin_id,
+    db: DatabaseManager,
+    *,
+    field_label: str,
+) -> None:
+    allowed = await get_allowed_grades(admin_id, db)
+    invalid = [grade for grade in grades if grade not in allowed]
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_label} must only contain values from {allowed}; invalid: {invalid}",
+        )
 
 
 async def get_default_section(grade: str, admin_id, db: DatabaseManager) -> str:
@@ -1058,6 +1077,7 @@ async def update_student(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context required"
             )
+        await validate_grade_for_admin(update.grade, admin_id, db)
 
         # Find by custom student_id first, then by ObjectId - WITH admin_id filter for tenant isolation
         query: Dict[str, Any] = {
@@ -1264,6 +1284,7 @@ async def create_student(
 
         # Get admin_id from JWT token
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        await validate_grade_for_admin(student_data.grade, admin_id, db)
 
         # Check if username already exists (case-insensitive)
         if student_data.username:
@@ -1587,6 +1608,7 @@ async def update_student_v2(
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context required"
             )
+        await validate_grade_for_admin(update_data.grade, admin_id, db)
 
         # Build update dict from provided fields only
         update_dict = {}
@@ -3565,6 +3587,22 @@ async def promote_session(
     """
     try:
         admin_id = ObjectId(current_user.get("admin_id", current_user["user_id"]))
+        mapping_grades: List[str] = []
+        for from_grade, to_grade in promotion_data.grade_mappings.items():
+            mapping_grades.extend([from_grade, to_grade])
+        await validate_grade_values_for_admin(
+            mapping_grades,
+            admin_id,
+            db,
+            field_label="Grade mappings",
+        )
+        if promotion_data.grade_filter:
+            await validate_grade_values_for_admin(
+                promotion_data.grade_filter,
+                admin_id,
+                db,
+                field_label="Grade filter",
+            )
 
         # Get all active students for this admin
         students = await db.mongo_find(
