@@ -10,6 +10,7 @@ import uuid
 import os
 import json
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from datetime import datetime
 
 # Suppress verbose aiohttp logging
@@ -2355,6 +2356,51 @@ class DocumentListResponse(BaseModel):
     page: int
     limit: int
 
+
+def _document_file_candidates(document: Dict[str, Any]) -> List[Path]:
+    backend_dir = Path(os.getcwd())
+    stored_path = str(document.get("file_path", "") or "").replace("\\", "/")
+    document_id = str(document.get("document_id", "") or "")
+    document_type = str(document.get("document_type", "") or "")
+    candidates: List[Path] = []
+
+    if stored_path:
+        path = Path(stored_path)
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.append(backend_dir / stored_path)
+
+        if "uploads/" in stored_path:
+            try:
+                uploads_index = stored_path.index("uploads/")
+                candidates.append(backend_dir / stored_path[uploads_index:])
+            except ValueError:
+                pass
+
+    if document_id and document_type:
+        candidates.append(backend_dir / "uploads" / "documents" / document_type / f"{document_id}.pdf")
+
+    return candidates
+
+
+def _resolve_document_file_path(document: Dict[str, Any]) -> Optional[Path]:
+    for candidate in _document_file_candidates(document):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _document_file_exists(document: Dict[str, Any]) -> bool:
+    stored_path = str(document.get("file_path", "") or "").replace("\\", "/")
+    if stored_path.startswith("s3://"):
+        return True
+    return _resolve_document_file_path(document) is not None
+
+
 @router.post("/upload")
 @limiter.limit("10/minute")
 async def upload_pdf(
@@ -3432,9 +3478,7 @@ async def get_documents(
                 sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
             )
 
-        # Format response and check file existence
-        from pathlib import Path
-
+        # Format response and check file availability
         # Collect unique uploader IDs to look up their names
         uploader_ids = list(set(doc.get("uploaded_by") for doc in documents if doc.get("uploaded_by")))
         uploader_names = {}
@@ -3465,9 +3509,7 @@ async def get_documents(
 
         document_list = []
         for doc in documents:
-            # Check if physical file exists on disk
-            file_path = Path(doc["file_path"])
-            file_exists = file_path.exists()
+            file_exists = _document_file_exists(doc)
 
             # Get uploader display name
             uploader_id = doc.get("uploaded_by", "")
@@ -3979,13 +4021,10 @@ async def get_student_available_options(
             sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
         )
 
-        # Format response and check file existence
-        from pathlib import Path
+        # Format response and check file availability
         document_list = []
         for doc in documents:
-            # Check if physical file exists on disk
-            file_path = Path(doc["file_path"])
-            file_exists = file_path.exists()
+            file_exists = _document_file_exists(doc)
 
             document_list.append(DocumentMetadata(
                 document_id=doc["document_id"],
@@ -4099,19 +4138,15 @@ async def get_document_file(
                 }
             )
 
-        # Local file handling
-        from pathlib import Path
-        backend_dir = Path(os.getcwd())
-        # Convert stored path to use forward slashes, then to Path
-        stored_path = stored_path.replace("\\", "/")
-        file_path = backend_dir / stored_path
-        logger.info(f"Full file path: {file_path}")
-
-        if not file_path.exists():
-            logger.error(f"File does not exist at path: {file_path}")
+        # Local file handling. Use the same path candidates as the document list
+        # so legacy absolute paths and repo-relative uploads resolve consistently.
+        file_path = _resolve_document_file_path(document)
+        if not file_path:
+            checked = ", ".join(str(candidate) for candidate in _document_file_candidates(document))
+            logger.error(f"File does not exist for document {document_id}. Checked: {checked}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"PDF file not found on server at: {file_path}"
+                detail="PDF file not found on server. Please re-upload this document from the Admin panel."
             )
 
         # Return file response
