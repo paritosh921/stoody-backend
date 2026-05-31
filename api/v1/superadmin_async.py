@@ -218,8 +218,8 @@ async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
 
 
-async def get_auth_manager(request: Request) -> AuthManager:
-    return request.app.state.auth
+async def get_auth_manager(request: Request) -> Optional[AuthManager]:
+    return getattr(request.app.state, "auth", None)
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -604,8 +604,12 @@ async def get_tenant_master_admin_or_error(tenant_db, tenant: Dict[str, Any]) ->
     raise HTTPException(status_code=400, detail="Master admin account not found for this tenant")
 
 
-async def best_effort_revoke_admin_sessions(auth_manager: AuthManager, admin_id: str) -> None:
+async def best_effort_revoke_admin_sessions(auth_manager: Optional[AuthManager], admin_id: str) -> None:
     """Try to force old sessions out without failing the completed reset."""
+    if auth_manager is None:
+        logger.warning("Auth manager unavailable; skipping session revocation for admin %s", admin_id)
+        return
+
     try:
         await auth_manager.invalidate_user_session(admin_id)
     except Exception as e:
@@ -1440,13 +1444,17 @@ async def reset_tenant_admin_password(
     request: ResetPasswordRequest,
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
-    auth_manager: AuthManager = Depends(get_auth_manager),
+    auth_manager: Optional[AuthManager] = Depends(get_auth_manager),
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     generated_password = generate_admin_reset_password()
-    new_password_hash = auth_manager.get_password_hash(generated_password)
+    new_password_hash = (
+        auth_manager.get_password_hash(generated_password)
+        if auth_manager is not None
+        else pwd_context.hash(generated_password)
+    )
     now = datetime.utcnow()
 
     if tenant["status"] == "pending" and tenant.get("pending_admin"):
@@ -1508,7 +1516,7 @@ async def reset_tenant_admin_2fa(
     tenant_id: str,
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
-    auth_manager: AuthManager = Depends(get_auth_manager),
+    auth_manager: Optional[AuthManager] = Depends(get_auth_manager),
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
