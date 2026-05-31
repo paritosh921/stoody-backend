@@ -260,6 +260,8 @@ async def _2fa_admin_login_returns_password_change_requirement(auth_dependencies
     assert response.success is True
     assert response.next == "DONE"
     assert response.user["requires_password_change"] is True
+    session_user_data = auth_manager.create_user_session.await_args.args[0]
+    assert session_user_data["requires_password_change"] is True
 
 
 def test_admin_change_password_clears_password_change_requirement(auth_dependencies):

@@ -1250,6 +1250,7 @@ async def verify_token(
             "email": current_user.get("email"),
             "username": current_user.get("username"),
             "full_name": current_user.get("full_name"),
+            "requires_password_change": current_user.get("requires_password_change", False),
             "enabled_features": enabled_features,
             "enabled_features_v2": enabled_features_v2,
         }

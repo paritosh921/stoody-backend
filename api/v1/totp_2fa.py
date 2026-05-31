@@ -447,10 +447,12 @@ def _build_user_token_data(user: Dict[str, Any], user_id: str, user_type: str,
         data["admin_id"] = user_id
         data["admin_role"] = user.get("role", "master_admin")
         data["permissions"] = user.get("permissions") or []
+        data["requires_password_change"] = user.get("requires_password_change", False)
     elif user_type == "tutor":
         data["admin_id"] = str(user.get("created_by", ""))
         # Use the custom tutor_id from the document, not the MongoDB _id
         data["tutor_id"] = user.get("tutor_id") or user_id
+        data["requires_password_change"] = user.get("requires_password_change", False)
 
     return data
 
