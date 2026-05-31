@@ -386,14 +386,17 @@ def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
         _string_fields = [
             "extracted_answer", "solved_answer", "feedback", "reasoning",
             "work_shown", "what_went_wrong", "correct_solution",
+            "solution", "final_answer",
         ]
         for field_name in _string_fields:
             val = _extract_string_field(field_name)
             if val:
                 extracted[field_name] = val
 
-        # If we got at least is_correct, use the extracted data
-        if "is_correct" in extracted:
+        # If we got a meaningful subset, use the extracted data. This also helps
+        # solution generation when a long model answer gets truncated before the
+        # final JSON brace.
+        if "is_correct" in extracted or "solution" in extracted:
             logger.info(f"📊 Partial JSON extraction succeeded: fields={list(extracted.keys())}")
             return extracted
 
@@ -427,6 +430,173 @@ def _normalize_latex_for_render(text: str) -> str:
     # Convert inline parens \( ... \) → $ ... $  (single-line preferred but allow multi-line)
     out = _re.sub(r"\\\(([\s\S]*?)\\\)", r"$\1$", out)
     return out
+
+
+def _clean_model_solution_text(text: str) -> str:
+    """Convert JSON-ish cached model answers into display-ready text.
+
+    The solution generator asks the LLM for JSON, but long case-study model
+    answers can occasionally be returned or cached as the raw JSON envelope.
+    This keeps that transport format out of the UI.
+    """
+    if not text:
+        return ""
+
+    import json as _json
+    import re as _re
+
+    raw = str(text).strip()
+    if not raw:
+        return ""
+    raw = _re.sub(r"^```(?:json|markdown)?\s*", "", raw, flags=_re.IGNORECASE).strip()
+    raw = _re.sub(r"\s*```$", "", raw).strip()
+
+    parsed = robust_json_parse(raw)
+    if isinstance(parsed, dict):
+        candidate = (
+            parsed.get("solution")
+            or parsed.get("correct_solution")
+            or parsed.get("model_answer")
+            or parsed.get("answer")
+        )
+        if candidate:
+            raw = str(candidate).strip()
+
+    if raw.lstrip().startswith("{"):
+        match = _re.search(r'"solution"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, _re.DOTALL)
+        if not match:
+            match = _re.search(r'"correct_solution"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, _re.DOTALL)
+        if match:
+            encoded = match.group(1)
+            try:
+                raw = _json.loads(f'"{encoded}"').strip()
+            except Exception:
+                raw = (
+                    encoded
+                    .replace('\\"', '"')
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace("\\r", "")
+                    .strip()
+                )
+        else:
+            truncated = _re.search(r'"solution"\s*:\s*"', raw)
+            if truncated:
+                raw = raw[truncated.end():].strip()
+
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        try:
+            raw = _json.loads(raw).strip()
+        except Exception:
+            raw = raw[1:-1].strip()
+
+    raw = (
+        raw
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "")
+        .replace('\\"', '"')
+    )
+    return _normalize_latex_for_render(raw.strip())
+
+
+EVALUATION_MODE_STANDARD = "standard"
+EVALUATION_MODE_CASE_STUDY = "case_study"
+CASE_STUDY_SOLUTION_CACHE_VERSION = "case_study_compact_v2"
+
+
+def _normalize_evaluation_mode(value: Any) -> Optional[str]:
+    """Normalize an explicit per-question evaluation mode, if one is stored."""
+    if value is None:
+        return None
+    raw = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if not raw:
+        return None
+    if raw in {"auto", "automatic", "default"}:
+        return None
+    if raw in {"case", "case_study", "business_case", "mba_case", "management_case"}:
+        return EVALUATION_MODE_CASE_STUDY
+    if raw in {"standard", "stem", "objective", "objective_stem", "subjective_stem"}:
+        return EVALUATION_MODE_STANDARD
+    return None
+
+
+def _explicit_evaluation_mode(question_doc: Dict[str, Any]) -> Optional[str]:
+    metadata = question_doc.get("metadata") or {}
+    candidates = [
+        question_doc.get("evaluation_mode"),
+        question_doc.get("evaluationMode"),
+        metadata.get("evaluation_mode") if isinstance(metadata, dict) else None,
+        metadata.get("evaluationMode") if isinstance(metadata, dict) else None,
+    ]
+    for candidate in candidates:
+        mode = _normalize_evaluation_mode(candidate)
+        if mode:
+            return mode
+    return None
+
+
+def _infer_evaluation_mode(question_doc: Dict[str, Any], *, is_mcq: Optional[bool] = None) -> str:
+    """Infer grading style per question so mixed practice sets keep working."""
+    explicit = _explicit_evaluation_mode(question_doc)
+    if explicit:
+        return explicit
+
+    if is_mcq is None:
+        stored_type = (question_doc.get("question_type") or "").lower().strip()
+        is_mcq = bool(_options_text_from_question(question_doc)) and stored_type != "subjective"
+    if is_mcq:
+        return EVALUATION_MODE_STANDARD
+
+    metadata = question_doc.get("metadata") or {}
+    text_parts = [
+        question_doc.get("text"),
+        question_doc.get("question_text"),
+        question_doc.get("subject"),
+        question_doc.get("course_plan"),
+        metadata.get("subject") if isinstance(metadata, dict) else "",
+        metadata.get("course_plan") if isinstance(metadata, dict) else "",
+    ]
+    haystack = "\n".join(str(part or "") for part in text_parts).lower()
+
+    business_terms = [
+        "case study", "business case", "mba", "strategy", "strategic",
+        "strategic analysis", "strategic considerations", "growth strategy",
+        "growth lever", "growth levers", "core problem", "problem areas",
+        "key metrics", "kpi", "90-day", "30/60/90", "go-to-market", "gtm",
+        "unit economics", "cac", "ltv", "retention", "churn", "funnel",
+        "segmentation", "pricing", "market share", "customer acquisition",
+        "d2c", "brand", "sales have stagnated", "stagnated", "profitability",
+        "business model", "operations", "supply chain", "founding team",
+        "tam", "market sizing", "opportunity size", "pros/cons", "pros and cons",
+        "swot", "porter", "five forces", "competition analysis", "competitive analysis",
+        "risk", "risks", "business models", "recommendation", "should netflix",
+        "live sports", "streaming rights", "sports rights",
+    ]
+    subject_terms = [
+        "business", "management", "entrepreneurship", "marketing", "sales",
+        "strategy", "strategic management",
+    ]
+    signal_count = sum(1 for term in business_terms if term in haystack)
+    subject_signal = any(term in haystack for term in subject_terms)
+    structured_prompt = (
+        "identify:" in haystack
+        or "recommend" in haystack
+        or "should" in haystack
+        or "strategy" in haystack
+        or "pros" in haystack
+        or "risks" in haystack
+        or "\n-" in haystack
+        or "\n*" in haystack
+    )
+
+    if signal_count >= 3:
+        return EVALUATION_MODE_CASE_STUDY
+    if signal_count >= 2 and structured_prompt:
+        return EVALUATION_MODE_CASE_STUDY
+    if subject_signal and signal_count >= 1 and structured_prompt:
+        return EVALUATION_MODE_CASE_STUDY
+    return EVALUATION_MODE_STANDARD
 
 
 def _truncate_for_prompt(text: str, max_chars: int) -> str:
@@ -591,7 +761,7 @@ async def _load_question_doc(db: DatabaseManager, qid: str, is_b2c: bool = False
     return await db.mongo_find_one("questions", {"id": qid}) or {}
 
 
-def _question_content_hash(question_doc: Dict[str, Any]) -> str:
+def _question_content_hash(question_doc: Dict[str, Any], evaluation_mode: Optional[str] = None) -> str:
     """Stable hash of the question's *content* for solution-cache invalidation.
 
     Hashes whatever a tutor would consider "the question": text, options,
@@ -602,10 +772,19 @@ def _question_content_hash(question_doc: Dict[str, Any]) -> str:
     import hashlib
     import json as _json
 
+    mode = (
+        evaluation_mode
+        or question_doc.get("evaluation_mode")
+        or question_doc.get("evaluationMode")
+        or ""
+    )
     parts: List[str] = [
         str(question_doc.get("text") or "").strip(),
         str(question_doc.get("correctAnswer") or question_doc.get("correct_answer") or "").strip(),
+        str(mode).strip(),
     ]
+    if _normalize_evaluation_mode(mode) == EVALUATION_MODE_CASE_STUDY:
+        parts.append(CASE_STUDY_SOLUTION_CACHE_VERSION)
 
     opts = question_doc.get("options") or []
     if opts:
@@ -647,6 +826,7 @@ async def _get_or_generate_solution(
     db: DatabaseManager,
     current_user: Dict[str, Any],
     is_b2c: bool,
+    evaluation_mode: Optional[str] = None,
 ) -> Dict[str, str]:
     """Return the canonical step-by-step solution for a question.
 
@@ -664,7 +844,8 @@ async def _get_or_generate_solution(
     Returns a dict with keys: solution (str), final_answer (str), source (str).
     """
     qid = question_doc.get("id") or ""
-    current_hash = _question_content_hash(question_doc)
+    mode = _normalize_evaluation_mode(evaluation_mode) or _infer_evaluation_mode(question_doc)
+    current_hash = _question_content_hash(question_doc, mode)
     cache = question_doc.get("solution_cache") or {}
 
     if (
@@ -672,10 +853,22 @@ async def _get_or_generate_solution(
         and cache.get("contentHash") == current_hash
         and (cache.get("correctSolution") or "").strip()
     ):
+        cached_solution_raw = str(cache.get("correctSolution") or "").strip()
+        cached_solution_text = _clean_model_solution_text(cached_solution_raw)
+        if cached_solution_text != cached_solution_raw:
+            try:
+                update = {"$set": {"solution_cache.correctSolution": cached_solution_text}}
+                if is_b2c:
+                    await db.b2c_update_one("questions", {"id": qid}, update)
+                else:
+                    await db.mongo_update_one("questions", {"id": qid}, update)
+                logger.info(f"🧹 Cleaned cached solution display text for Q:{qid}")
+            except Exception as clean_err:
+                logger.warning(f"Could not clean persisted solution cache for Q:{qid}: {clean_err}")
         logger.info(f"📚 Solution cache HIT for Q:{qid} (source={cache.get('source')})")
         return {
             # Normalise on read too — old cached entries may pre-date the normaliser.
-            "solution": _normalize_latex_for_render(str(cache.get("correctSolution") or "").strip()),
+            "solution": cached_solution_text,
             "final_answer": _normalize_latex_for_render(str(cache.get("finalAnswer") or "").strip()),
             "source": str(cache.get("source") or "cache"),
         }
@@ -706,45 +899,92 @@ async def _get_or_generate_solution(
     admin_value = (resolved["resolved_value"] or "").strip()
     admin_is_letter = bool(resolved["is_option_letter"])
 
-    prompt_parts: List[str] = [
-        "Generate a clear, complete model solution to the following question. "
-        "This solution will be shown to every student who attempts the question, so it must be "
-        "self-contained and must not reference any specific student attempt.",
-        "",
-        "QUESTION:",
-        question_text,
-    ]
-    if options_text:
-        prompt_parts.append("\nOPTIONS:")
-        prompt_parts.append(options_text)
+    if mode == EVALUATION_MODE_CASE_STUDY:
+        prompt_parts: List[str] = [
+            "Generate a compact MBA-style reference framework for the following case-study "
+            "question. This will be shown to every student who attempts the question, so it "
+            "must be self-contained and must not reference any specific student attempt. "
+            "Do not write an exhaustive essay. Keep the answer practical, concise, and tied "
+            "to the case facts.",
+            "",
+            "QUESTION:",
+            question_text,
+        ]
+        if options_text:
+            prompt_parts.append("\nOPTIONS / CASE MATERIAL:")
+            prompt_parts.append(options_text)
 
-    if correct_answer_raw:
-        prompt_parts.append("\nTEACHER'S STATED ANSWER:")
-        if admin_is_letter and admin_value and admin_value != admin_letter:
-            prompt_parts.append(
-                f"The teacher marked option {admin_letter}, which represents: {admin_value}"
-            )
-            prompt_parts.append(
-                f"\nSolve the question yourself, step by step. Your derivation must arrive at the "
-                f"VALUE {admin_value} (not just label your answer with the letter '{admin_letter}'). "
-                f"If your honest derivation lands on a different value, set "
-                f"`teacher_answer_disagreement` to true in the JSON and report what you actually "
-                f"derived — do NOT force-fit the math to match {admin_value}."
-            )
-        else:
+        if correct_answer_raw:
+            prompt_parts.append("\nTEACHER'S REFERENCE ANSWER OR RUBRIC:")
             prompt_parts.append(admin_value or admin_letter)
             prompt_parts.append(
-                "\nSolve the question yourself, step by step. Your derivation must arrive at this "
-                "answer. If your honest derivation produces a different answer, set "
-                "`teacher_answer_disagreement` to true and report what you actually derived."
+                "Use this as grading guidance, but do not require the student to match "
+                "the wording exactly. Case-study answers can be correct through sound "
+                "business reasoning, prioritization, and execution logic."
             )
-    else:
-        prompt_parts.append(
-            "\nNo answer was provided by the teacher — solve the question yourself and write the "
-            "step-by-step derivation."
-        )
+        else:
+            prompt_parts.append(
+                "\nNo teacher rubric was provided. Create a strong reference answer using "
+                "standard MBA case-analysis expectations."
+            )
 
-    prompt_parts.append('''
+        prompt_parts.append('''
+Return strict JSON (no markdown fences, no commentary):
+{
+  "solution": "a compact MBA-style reference framework under 500 words. Use exactly these sections: Executive Diagnosis, Core Problem Areas, Growth Levers, Key Metrics, 90-Day Plan, Risks/Assumptions. Use 1-3 concise bullets per section. Do not invent precise numbers that are not in the case; use assumptions where needed.",
+  "final_answer": "a short summary of what a strong answer should include",
+  "teacher_answer_disagreement": false
+}
+For case studies, set `teacher_answer_disagreement` to false unless the teacher's reference answer is internally impossible or contradicts the case facts.'''.strip())
+
+        system_prompt = (
+            "You are an MBA case evaluator writing a reusable model answer and rubric. "
+            "Favor structured business reasoning over one exact answer. Keep the reference "
+            "answer compact: no more than 500 words, no exhaustive lists, no unsupported "
+            "precise numbers, no speculation beyond clear assumptions. Include practical "
+            "diagnosis, prioritized actions, metrics, timeline, assumptions, and risks. "
+            "Output ONLY valid JSON, no markdown code fences, no commentary."
+        )
+    else:
+        prompt_parts = [
+            "Generate a clear, complete model solution to the following question. "
+            "This solution will be shown to every student who attempts the question, so it must be "
+            "self-contained and must not reference any specific student attempt.",
+            "",
+            "QUESTION:",
+            question_text,
+        ]
+        if options_text:
+            prompt_parts.append("\nOPTIONS:")
+            prompt_parts.append(options_text)
+
+        if correct_answer_raw:
+            prompt_parts.append("\nTEACHER'S STATED ANSWER:")
+            if admin_is_letter and admin_value and admin_value != admin_letter:
+                prompt_parts.append(
+                    f"The teacher marked option {admin_letter}, which represents: {admin_value}"
+                )
+                prompt_parts.append(
+                    f"\nSolve the question yourself, step by step. Your derivation must arrive at the "
+                    f"VALUE {admin_value} (not just label your answer with the letter '{admin_letter}'). "
+                    f"If your honest derivation lands on a different value, set "
+                    f"`teacher_answer_disagreement` to true in the JSON and report what you actually "
+                    f"derived - do NOT force-fit the math to match {admin_value}."
+                )
+            else:
+                prompt_parts.append(admin_value or admin_letter)
+                prompt_parts.append(
+                    "\nSolve the question yourself, step by step. Your derivation must arrive at this "
+                    "answer. If your honest derivation produces a different answer, set "
+                    "`teacher_answer_disagreement` to true and report what you actually derived."
+                )
+        else:
+            prompt_parts.append(
+                "\nNo answer was provided by the teacher - solve the question yourself and write the "
+                "step-by-step derivation."
+            )
+
+        prompt_parts.append('''
 Return strict JSON (no markdown fences, no commentary):
 {
   "solution": "the step-by-step derivation, written for a student. Use $...$ for inline math (e.g. $v_0$, $\\frac{1}{2}mv^2$) and $$...$$ for display math. Do NOT use \\(...\\) or \\[...\\]. All math identifiers must be wrapped in $...$.",
@@ -753,15 +993,15 @@ Return strict JSON (no markdown fences, no commentary):
 }
 Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands on a value different from the teacher's stated answer. Do not flip the field for minor formatting differences (e.g. \\"7 days\\" vs \\"7\\" when the question is about days). When unsure, default to false.'''.strip())
 
-    system_prompt = (
-        "You are an expert tutor writing a model solution. The solution must be mathematically "
-        "correct, concise, and pedagogical. It will be cached and shown to every student who "
-        "attempts this question, so do NOT mention any specific student or attempt. "
-        "Use $...$ for inline math and $$...$$ for display math; never \\(...\\) or \\[...\\]. "
-        "Wrap every math identifier (single variables, subscripts, fractions) in delimiters so "
-        "the renderer typesets them correctly. "
-        "Output ONLY valid JSON, no markdown code fences, no commentary."
-    )
+        system_prompt = (
+            "You are an expert tutor writing a model solution. The solution must be mathematically "
+            "correct, concise, and pedagogical. It will be cached and shown to every student who "
+            "attempts this question, so do NOT mention any specific student or attempt. "
+            "Use $...$ for inline math and $$...$$ for display math; never \\(...\\) or \\[...\\]. "
+            "Wrap every math identifier (single variables, subscripts, fractions) in delimiters so "
+            "the renderer typesets them correctly. "
+            "Output ONLY valid JSON, no markdown code fences, no commentary."
+        )
 
     full_prompt = "\n".join(prompt_parts)
     question_images = await _figure_images_base64(question_doc, db, is_b2c)
@@ -770,30 +1010,31 @@ Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands o
     all_question_images = question_images + option_images
 
     try:
+        generation_max_tokens = 1400 if mode == EVALUATION_MODE_CASE_STUDY else 1500
         if all_question_images:
             response = await _gate_vision_call(
                 db, current_user, all_question_images, full_prompt,
                 system_prompt=system_prompt,
-                max_tokens=1500,
+                max_tokens=generation_max_tokens,
                 temperature=0.2,
             )
         else:
             response = await _gate_text_call(
                 db, current_user, full_prompt,
                 system_prompt=system_prompt,
-                max_tokens=1500,
+                max_tokens=generation_max_tokens,
                 temperature=0.2,
             )
         raw = (response.get("response") or "").strip()
         parsed = robust_json_parse(raw) or {}
-        solution_text = _normalize_latex_for_render(str(parsed.get("solution") or "").strip())
+        solution_text = _clean_model_solution_text(str(parsed.get("solution") or raw).strip())
         final_answer = _normalize_latex_for_render(str(parsed.get("final_answer") or "").strip())
         llm_flagged_disagreement = bool(parsed.get("teacher_answer_disagreement"))
 
         if not solution_text:
             # Fallback: use raw response so we at least have *something* useful.
             logger.warning(f"⚠️ Solution generation produced no JSON for Q:{qid}; using raw text.")
-            solution_text = raw[:4000]
+            solution_text = _clean_model_solution_text(raw[:8000])
     except Exception as gen_err:
         logger.error(f"❌ Solution generation failed for Q:{qid}: {gen_err}", exc_info=True)
         return {"solution": "", "final_answer": correct_answer_raw or "", "source": "error"}
@@ -801,7 +1042,7 @@ Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands o
     # Detect admin/LLM disagreement, even when the LLM forgot to flag it. Use the existing
     # _answers_are_equivalent helper if present, else a simple normalised compare.
     admin_llm_disagree = False
-    if admin_value and final_answer:
+    if mode != EVALUATION_MODE_CASE_STUDY and admin_value and final_answer:
         s_norm = "".join(final_answer.split()).lower()
         a_norm = "".join(admin_value.split()).lower()
         # Strip common LaTeX wrapping and punctuation so "$2mv_0^2$" matches "2mv_0^2".
@@ -810,7 +1051,7 @@ Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands o
             a_norm = a_norm.replace(ch, "")
         if s_norm and a_norm and s_norm != a_norm:
             admin_llm_disagree = True
-    if llm_flagged_disagreement:
+    if mode != EVALUATION_MODE_CASE_STUDY and llm_flagged_disagreement:
         admin_llm_disagree = True
 
     if admin_llm_disagree:
@@ -828,6 +1069,8 @@ Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands o
         "adminStatedValue": admin_value,
         "adminLlmDisagree": admin_llm_disagree,
         "source": "admin" if (correct_answer_raw and not admin_llm_disagree) else "llm_generated",
+        "evaluationMode": mode,
+        "solutionCacheVersion": CASE_STUDY_SOLUTION_CACHE_VERSION if mode == EVALUATION_MODE_CASE_STUDY else "standard",
         "contentHash": current_hash,
         "model": str(response.get("model") or ""),
         "updatedAt": datetime.utcnow(),
@@ -1371,6 +1614,7 @@ async def get_next_practice_question(
         # Format LaTeX in question text and options
         from utils.latex_formatter import format_question_latex
 
+        evaluation_mode = _infer_evaluation_mode(question_doc)
         question = {
             "id": question_id,
             "text": question_doc.get("text", ""),
@@ -1381,6 +1625,8 @@ async def get_next_practice_question(
             "questionFigures": figures_with_urls,  # Separate field for diagrams/figures
             "enhancedOptions": question_doc.get("enhancedOptions"),
             "correctAnswer": question_doc.get("correctAnswer") or question_doc.get("correct_answer"),  # Include answer for debugging
+            "evaluationMode": evaluation_mode,
+            "evaluation_mode": evaluation_mode,
             "metadata": question_doc.get("metadata", {})
         }
 
@@ -1718,6 +1964,130 @@ OUTPUT — strict JSON only (no markdown fences, no commentary, no text outside 
     return "\n".join(parts)
 
 
+def _build_case_study_evaluation_prompt(
+    *,
+    question_text: str,
+    options_text: str,
+    answer_text: str,
+    uploaded_doc_text: str,
+    num_student_images: int,
+    num_question_figures: int,
+    num_option_images: int,
+    model_solution_text: str,
+    teacher_reference_answer: str,
+) -> str:
+    """Build a case-study rubric prompt that grades structure and reasoning."""
+    parts: List[str] = []
+    num_q_images = num_question_figures + num_option_images
+    total_images = num_q_images + num_student_images
+
+    if total_images > 0:
+        guide: List[str] = ["IMAGES IN THIS REQUEST (read in order):"]
+        idx = 1
+        for fi in range(num_question_figures):
+            guide.append(f"  Image {idx} - QUESTION / CASE FIGURE {fi + 1}")
+            idx += 1
+        for oi in range(num_option_images):
+            opt_letter = chr(ord("A") + oi)
+            guide.append(f"  Image {idx} - OPTION {opt_letter} / CASE MATERIAL")
+            idx += 1
+        for sp in range(num_student_images):
+            guide.append(
+                f"  Image {idx} - STUDENT'S ANSWER, page {sp + 1} of {num_student_images}"
+            )
+            idx += 1
+        guide.append("")
+        guide.append(
+            "Use question/case images only as context. In `work_shown`, describe only "
+            "the student's submitted pages and uploaded answer material."
+        )
+        parts.append("\n".join(guide))
+
+    parts.append("\nCASE QUESTION:")
+    parts.append((question_text or "").strip() or "(Question text not available.)")
+    if options_text:
+        parts.append("\nOPTIONS / CASE MATERIAL:")
+        parts.append(options_text)
+
+    submission_lines: List[str] = []
+    if answer_text:
+        submission_lines.append(f"Typed answer: {answer_text}")
+    if uploaded_doc_text:
+        submission_lines.append(
+            f"Uploaded document content:\n{_truncate_for_prompt(uploaded_doc_text, 8000)}"
+        )
+    if num_student_images:
+        submission_lines.append(
+            f"Handwritten canvas: {num_student_images} page(s) - read the response structure carefully."
+        )
+    if not submission_lines:
+        submission_lines.append("(No answer submitted)")
+    parts.append("\nSTUDENT'S SUBMISSION:")
+    parts.append("\n".join(submission_lines))
+
+    if teacher_reference_answer:
+        parts.append("\nTEACHER REFERENCE / RUBRIC:")
+        parts.append(teacher_reference_answer)
+        parts.append(
+            "Use this as guidance, not an exact wording match. Award credit for equivalent "
+            "business reasoning, prioritization, and executable recommendations."
+        )
+    if model_solution_text:
+        parts.append("\nMODEL MBA-STYLE ANSWER / RUBRIC:")
+        parts.append(_truncate_for_prompt(model_solution_text, 7000))
+
+    parts.append('''
+HOW TO EVALUATE THIS CASE STUDY:
+
+Grade the student's response like an MBA / business-school case answer, not like a
+single-answer STEM problem. Score the quality of thinking, structure, and execution
+logic. Use this rubric:
+
+  1. Problem diagnosis (20%): identifies the core causes, not only symptoms.
+  2. Growth levers (20%): proposes relevant acquisition, retention, pricing, product,
+     channel, conversion, or operations levers.
+  3. Prioritization and tradeoffs (15%): explains what to do first and why.
+  4. Metrics (15%): names useful KPIs such as revenue growth, CAC, LTV, conversion,
+     retention, repeat purchase, AOV, contribution margin, churn, payback period.
+  5. 90-day execution plan (20%): gives a practical 30/60/90 day or phased action plan.
+  6. Clarity and assumptions (10%): communicates cleanly and states risks/assumptions.
+
+`is_correct` means the answer is acceptable / passing overall. Set it to true when
+score >= 0.60, false when score < 0.60.
+
+Format all string fields as concise Markdown without tables.
+
+`extracted_answer` should be 1-2 short sentences summarizing the student's case response.
+`work_shown` should be a readable bullet list of what the student actually covered, grouped
+by themes when useful. Prefer this format:
+- **Pros:** ...
+- **Cons:** ...
+- **Framework:** ...
+- **TAM / Market:** ...
+- **Business model:** ...
+- **Competition:** ...
+
+`what_went_wrong` should be a readable bullet list of the main gaps and improvements.
+Use short, concrete bullets such as:
+- **Diagnosis:** ...
+- **Growth levers:** ...
+- **Metrics:** ...
+- **Execution plan:** ...
+- **Risks / assumptions:** ...
+If score >= 0.90 this may be an empty string; otherwise include concrete improvement advice.
+
+OUTPUT - strict JSON only (no markdown fences, no commentary, no text outside JSON):
+{
+  "is_correct": true | false,
+  "score": 0.0 to 1.0,
+  "extracted_answer": "1-2 sentence overall assessment",
+  "work_shown": "- **Theme:** concise point\\n- **Theme:** concise point",
+  "what_went_wrong": "- **Gap:** concise improvement\\n- **Gap:** concise improvement"
+}''')
+
+    return "\n".join(parts)
+
+
 def _build_evaluation_system_prompt(detected_language: str) -> str:
     """Subjective-first system prompt for the evaluator.
 
@@ -1757,12 +2127,33 @@ def _build_evaluation_system_prompt(detected_language: str) -> str:
     )
 
 
+def _build_case_study_evaluation_system_prompt(detected_language: str) -> str:
+    lang_rule = ""
+    if detected_language == "hindi":
+        lang_rule = (
+            "CRITICAL: The question is in Hindi (Devanagari script). Respond ENTIRELY in Hindi "
+            "(all JSON string fields must be in Hindi). "
+        )
+    return (
+        f"{lang_rule}"
+        "You are an MBA case-study evaluator grading a student's handwritten or typed answer. "
+        "Do not look for one exact answer. Judge the quality of diagnosis, business logic, "
+        "prioritization, metrics, execution plan, assumptions, and clarity. "
+        "Be fair to different valid strategies, but be strict about vague answers that only "
+        "list generic actions without reasoning or metrics. "
+        "OUTPUT: only valid JSON with the five required keys (is_correct, score, "
+        "extracted_answer, work_shown, what_went_wrong). No markdown fences, no commentary, "
+        "no extra fields."
+    )
+
+
 def _parse_evaluation_response(
     *,
     raw_response: str,
     correct_answer_display: str,
     has_correct_answer: bool,
     answer_text: str,
+    evaluation_mode: str = EVALUATION_MODE_STANDARD,
 ) -> Dict[str, Any]:
     """Parse the LLM evaluator JSON output.
 
@@ -1780,6 +2171,8 @@ def _parse_evaluation_response(
         "correctSolution": "",  # filled in by caller from solution_cache
         "correctAnswer": correct_answer_display if has_correct_answer else "",
         "correctAnswerSource": "admin_provided" if has_correct_answer else "unknown",
+        "evaluationMode": evaluation_mode,
+        "evaluation_mode": evaluation_mode,
     }
 
     parsed = robust_json_parse(raw_response) if raw_response else None
@@ -1788,6 +2181,8 @@ def _parse_evaluation_response(
         logger.warning(f"⚠️ Could not parse JSON from LLM. Raw (first 200): {raw_response[:200]!r}")
         evaluation_data["whatWentWrong"] = (
             "We could not read the submission clearly. Please try writing again."
+            if evaluation_mode != EVALUATION_MODE_CASE_STUDY
+            else "We could not read the case-study response clearly. Please rewrite it with clear sections."
         )
         evaluation_data["extractedAnswer"] = answer_text or ""
         return evaluation_data
@@ -1899,6 +2294,9 @@ async def evaluate_submission(
             correct_answer_display = ""
             is_option_letter = False
 
+        evaluation_mode = _infer_evaluation_mode(question_doc, is_mcq=is_mcq)
+        logger.info(f"Evaluation mode for Q:{qid}: {evaluation_mode}")
+
         # 2. Load question images (figures + option images)
         question_figure_images = await _figure_images_base64(question_doc, db, is_b2c)
         option_images_data = await _option_images_base64(question_doc, db, is_b2c)
@@ -1999,41 +2397,58 @@ async def evaluate_submission(
         logger.info(
             f"📷 Q:{qid} images — student={num_student_images} {student_image_sizes}, "
             f"question_figures={num_question_figures}, option_images={num_option_images}, "
-            f"is_mcq={is_mcq}, has_ref_answer={has_correct_answer}, lang={detected_language}"
+            f"is_mcq={is_mcq}, mode={evaluation_mode}, has_ref_answer={has_correct_answer}, "
+            f"lang={detected_language}"
         )
 
         # 5b. Resolve the cached step-by-step solution. This is shared across all students
         # who attempt the same question; the helper hits the LLM only on cache miss / hash
         # mismatch. The student's canvas pages are intentionally NOT passed in so a wrong
         # attempt cannot pollute the shared solution.
-        cached = await _get_or_generate_solution(question_doc, db, current_user, is_b2c)
+        cached = await _get_or_generate_solution(
+            question_doc, db, current_user, is_b2c, evaluation_mode=evaluation_mode
+        )
         cached_solution_text = cached.get("solution") or ""
         cached_final_answer = (cached.get("final_answer") or "").strip()
 
         # If admin didn't provide a correctAnswer but the cache has a final_answer, use it
         # as the evaluator's reference. The full step-by-step is shown to the student
         # post-evaluation; the evaluator only needs the short reference for the verdict.
-        if not has_correct_answer and cached_final_answer:
+        if evaluation_mode != EVALUATION_MODE_CASE_STUDY and not has_correct_answer and cached_final_answer:
             correct_answer = cached_final_answer
             correct_answer_value = cached_final_answer
             correct_answer_display = cached_final_answer
             has_correct_answer = True
 
         # 6. Build the single, unified prompt + system prompt
-        prompt = _build_evaluation_prompt(
-            question_text=question_text,
-            options_text=options_text,
-            correct_answer=correct_answer,
-            correct_answer_value=correct_answer_value,
-            is_option_letter=is_option_letter,
-            is_mcq=is_mcq,
-            answer_text=answer_text,
-            uploaded_doc_text=uploaded_doc_text,
-            num_student_images=num_student_images,
-            num_question_figures=num_question_figures,
-            num_option_images=num_option_images,
-        )
-        system_prompt = _build_evaluation_system_prompt(detected_language)
+        if evaluation_mode == EVALUATION_MODE_CASE_STUDY:
+            prompt = _build_case_study_evaluation_prompt(
+                question_text=question_text,
+                options_text=options_text,
+                answer_text=answer_text,
+                uploaded_doc_text=uploaded_doc_text,
+                num_student_images=num_student_images,
+                num_question_figures=num_question_figures,
+                num_option_images=num_option_images,
+                model_solution_text=cached_solution_text,
+                teacher_reference_answer=correct_answer_display or correct_answer_value or correct_answer,
+            )
+            system_prompt = _build_case_study_evaluation_system_prompt(detected_language)
+        else:
+            prompt = _build_evaluation_prompt(
+                question_text=question_text,
+                options_text=options_text,
+                correct_answer=correct_answer,
+                correct_answer_value=correct_answer_value,
+                is_option_letter=is_option_letter,
+                is_mcq=is_mcq,
+                answer_text=answer_text,
+                uploaded_doc_text=uploaded_doc_text,
+                num_student_images=num_student_images,
+                num_question_figures=num_question_figures,
+                num_option_images=num_option_images,
+            )
+            system_prompt = _build_evaluation_system_prompt(detected_language)
 
         # 7. ONE LLM call. Output is now small (5 fields, no solution/feedback/reasoning),
         # so 1000 tokens is plenty.
@@ -2065,6 +2480,7 @@ async def evaluate_submission(
             correct_answer_display=correct_answer_display,
             has_correct_answer=has_correct_answer,
             answer_text=answer_text,
+            evaluation_mode=evaluation_mode,
         )
         evaluation_data["correctSolution"] = cached_solution_text
         if cached.get("source") and not has_correct_answer:
@@ -2088,7 +2504,7 @@ async def evaluate_submission(
                 doc_id = meta.get("document_id") or meta.get("documentId") or question_doc.get("document_id")
             
             # Prepare attempt record
-            q_type = "mcq" if is_mcq else "subjective"
+            q_type = "case_study" if evaluation_mode == EVALUATION_MODE_CASE_STUDY else ("mcq" if is_mcq else "subjective")
 
             # Build question_page_refs from the Stoody Pen QuestionSession
             question_page_refs = None
@@ -2109,6 +2525,7 @@ async def evaluate_submission(
                 "question_id": qid,
                 "question_text": question_text[:2000] if question_text else "",
                 "question_type": q_type,
+                "evaluation_mode": evaluation_mode,
                 "options": question_doc.get("options"),
                 "student_answer": evaluation_data.get("extractedAnswer", ""),
                 "correct_answer": correct_answer,

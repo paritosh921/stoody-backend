@@ -59,3 +59,5 @@ def test_prod_backend_deploy_invalidates_existing_sessions():
     assert "PROD_DEPLOY_SESSION_SECRET" in workflow
     assert "/api/v1/auth/invalidate-all-sessions" in workflow
     assert "X-Deploy-Secret" in workflow
+    assert "remote_curl_command" in workflow
+    assert "ssh -i ~/.ssh/prod_deploy_key" in workflow

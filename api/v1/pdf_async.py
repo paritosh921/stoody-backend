@@ -10,6 +10,7 @@ import uuid
 import os
 import json
 from typing import Optional, Dict, Any, List
+from pathlib import Path
 from datetime import datetime
 
 # Suppress verbose aiohttp logging
@@ -2335,17 +2336,70 @@ class DocumentMetadata(BaseModel):
     total_minutes: Optional[int] = None  # Total minutes for Test Series documents
     file_exists: bool = True  # Whether the physical file exists on disk
     is_active: bool = True  # Whether the document is enabled for students
+    instructions: Optional[str] = None
+    exam_mode: Optional[str] = None
+    exam_template_path: Optional[str] = None
+    exam_finalized: Optional[bool] = None
+    exam_finalized_at: Optional[datetime] = None
+    exam_sync_summary: Optional[Dict[str, Any]] = None
     orientation_applied: Optional[int] = None  # Rotation degrees baked into the uploaded PDF at upload time (0/90/180/270). Audit-only — file is already pre-rotated.
     exam_template_orientation_applied: Optional[int] = None  # Same as above for the DCR answer template.
     tally_num_questions: Optional[int] = None
     tally_max_marks_per_question: Optional[float] = None
     tally_marking_scheme: Optional[List[Dict[str, float]]] = None
+    tally_validate_paper_set: Optional[bool] = None
+    tally_expected_paper_set: Optional[str] = None
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
     total: int
     page: int
     limit: int
+
+
+def _document_file_candidates(document: Dict[str, Any]) -> List[Path]:
+    backend_dir = Path(os.getcwd())
+    stored_path = str(document.get("file_path", "") or "").replace("\\", "/")
+    document_id = str(document.get("document_id", "") or "")
+    document_type = str(document.get("document_type", "") or "")
+    candidates: List[Path] = []
+
+    if stored_path:
+        path = Path(stored_path)
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.append(backend_dir / stored_path)
+
+        if "uploads/" in stored_path:
+            try:
+                uploads_index = stored_path.index("uploads/")
+                candidates.append(backend_dir / stored_path[uploads_index:])
+            except ValueError:
+                pass
+
+    if document_id and document_type:
+        candidates.append(backend_dir / "uploads" / "documents" / document_type / f"{document_id}.pdf")
+
+    return candidates
+
+
+def _resolve_document_file_path(document: Dict[str, Any]) -> Optional[Path]:
+    for candidate in _document_file_candidates(document):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _document_file_exists(document: Dict[str, Any]) -> bool:
+    stored_path = str(document.get("file_path", "") or "").replace("\\", "/")
+    if stored_path.startswith("s3://"):
+        return True
+    return _resolve_document_file_path(document) is not None
+
 
 @router.post("/upload")
 @limiter.limit("10/minute")
@@ -2370,6 +2424,8 @@ async def upload_pdf(
     tally_num_questions: Optional[int] = Form(None),
     tally_max_marks_per_question: Optional[float] = Form(None),
     tally_marking_scheme: Optional[str] = Form(None),
+    tally_validate_paper_set: Optional[bool] = Form(None),
+    tally_expected_paper_set: Optional[str] = Form(None),
     orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the PDF — audit only
     exam_template_orientation_applied: Optional[int] = Form(None),  # Same for the DCR answer template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
@@ -2622,6 +2678,10 @@ async def upload_pdf(
             "tally_num_questions": tally_num_questions,
             "tally_max_marks_per_question": tally_max_marks_per_question,
             "tally_marking_scheme": tally_marking_scheme_list,
+            "tally_validate_paper_set": tally_validate_paper_set,
+            "tally_expected_paper_set": (
+                tally_expected_paper_set.strip() if tally_expected_paper_set else None
+            ),
             "orientation_applied": (
                 orientation_applied if orientation_applied in (0, 90, 180, 270) else None
             ),
@@ -2652,7 +2712,11 @@ async def upload_pdf(
         ocr_job_id = None
 
         return {
-            "message": "Document uploaded successfully. Use 'Segment' to define question regions before processing OCR.",
+            "message": (
+                "DCR document uploaded successfully. OCR was not started."
+                if exam_mode == "dcr"
+                else "Document uploaded successfully. Use 'Segment' to define question regions before processing OCR."
+            ),
             "document_id": document_id,
             "file_path": relative_path,
             "ocr_status": ocr_status,
@@ -2712,7 +2776,7 @@ async def finalize_exam(
                 detail="Document is already finalized. Cannot re-finalize.",
             )
 
-        if doc.get("ocr_status") != "completed":
+        if exam_mode != "dcr" and doc.get("ocr_status") != "completed":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="OCR must be completed before finalizing.",
@@ -2730,7 +2794,11 @@ async def finalize_exam(
         if not questions:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No questions found for this document. Extract questions via OCR first.",
+                detail=(
+                    "No answer keys found for this DCR document. Add objective questions/answers first."
+                    if exam_mode == "dcr"
+                    else "No questions found for this document. Extract questions via OCR first."
+                ),
             )
 
         # Validate and sync based on exam_mode
@@ -3410,9 +3478,7 @@ async def get_documents(
                 sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
             )
 
-        # Format response and check file existence
-        from pathlib import Path
-
+        # Format response and check file availability
         # Collect unique uploader IDs to look up their names
         uploader_ids = list(set(doc.get("uploaded_by") for doc in documents if doc.get("uploaded_by")))
         uploader_names = {}
@@ -3443,9 +3509,7 @@ async def get_documents(
 
         document_list = []
         for doc in documents:
-            # Check if physical file exists on disk
-            file_path = Path(doc["file_path"])
-            file_exists = file_path.exists()
+            file_exists = _document_file_exists(doc)
 
             # Get uploader display name
             uploader_id = doc.get("uploaded_by", "")
@@ -3473,7 +3537,21 @@ async def get_documents(
                 pages_count=doc.get("pages_count", 0),
                 total_points=doc.get("total_points"),
                 total_minutes=doc.get("total_minutes"),
-                is_active=doc.get("is_active", True)
+                file_exists=file_exists,
+                is_active=doc.get("is_active", True),
+                instructions=doc.get("instructions"),
+                exam_mode=doc.get("exam_mode"),
+                exam_template_path=doc.get("exam_template_path"),
+                exam_finalized=doc.get("exam_finalized"),
+                exam_finalized_at=doc.get("exam_finalized_at"),
+                exam_sync_summary=doc.get("exam_sync_summary"),
+                orientation_applied=doc.get("orientation_applied"),
+                exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
+                tally_num_questions=doc.get("tally_num_questions"),
+                tally_max_marks_per_question=doc.get("tally_max_marks_per_question"),
+                tally_marking_scheme=doc.get("tally_marking_scheme"),
+                tally_validate_paper_set=doc.get("tally_validate_paper_set"),
+                tally_expected_paper_set=doc.get("tally_expected_paper_set"),
             ))
 
         return DocumentListResponse(
@@ -3943,13 +4021,10 @@ async def get_student_available_options(
             sort=[("uploaded_at", -1)]  # Sort by upload date, newest first
         )
 
-        # Format response and check file existence
-        from pathlib import Path
+        # Format response and check file availability
         document_list = []
         for doc in documents:
-            # Check if physical file exists on disk
-            file_path = Path(doc["file_path"])
-            file_exists = file_path.exists()
+            file_exists = _document_file_exists(doc)
 
             document_list.append(DocumentMetadata(
                 document_id=doc["document_id"],
@@ -3967,7 +4042,21 @@ async def get_student_available_options(
                 ocr_job_id=doc.get("ocr_job_id"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
                 extracted_images_count=doc.get("extracted_images_count", 0),
-                file_exists=file_exists
+                file_exists=file_exists,
+                is_active=doc.get("is_active", True),
+                instructions=doc.get("instructions"),
+                exam_mode=doc.get("exam_mode"),
+                exam_template_path=doc.get("exam_template_path"),
+                exam_finalized=doc.get("exam_finalized"),
+                exam_finalized_at=doc.get("exam_finalized_at"),
+                exam_sync_summary=doc.get("exam_sync_summary"),
+                orientation_applied=doc.get("orientation_applied"),
+                exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
+                tally_num_questions=doc.get("tally_num_questions"),
+                tally_max_marks_per_question=doc.get("tally_max_marks_per_question"),
+                tally_marking_scheme=doc.get("tally_marking_scheme"),
+                tally_validate_paper_set=doc.get("tally_validate_paper_set"),
+                tally_expected_paper_set=doc.get("tally_expected_paper_set"),
             ))
 
         return DocumentListResponse(
@@ -4049,19 +4138,15 @@ async def get_document_file(
                 }
             )
 
-        # Local file handling
-        from pathlib import Path
-        backend_dir = Path(os.getcwd())
-        # Convert stored path to use forward slashes, then to Path
-        stored_path = stored_path.replace("\\", "/")
-        file_path = backend_dir / stored_path
-        logger.info(f"Full file path: {file_path}")
-
-        if not file_path.exists():
-            logger.error(f"File does not exist at path: {file_path}")
+        # Local file handling. Use the same path candidates as the document list
+        # so legacy absolute paths and repo-relative uploads resolve consistently.
+        file_path = _resolve_document_file_path(document)
+        if not file_path:
+            checked = ", ".join(str(candidate) for candidate in _document_file_candidates(document))
+            logger.error(f"File does not exist for document {document_id}. Checked: {checked}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"PDF file not found on server at: {file_path}"
+                detail="PDF file not found on server. Please re-upload this document from the Admin panel."
             )
 
         # Return file response
@@ -4818,6 +4903,7 @@ async def create_question(
     course_plan: str = Form(...),
     standard: str = Form(...),
     question_type: str = Form(default="mcq"),  # mcq or integer
+    evaluation_mode: str = Form(default="auto"),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -4853,6 +4939,9 @@ async def create_question(
 
         # Parse options metadata
         options_metadata = json.loads(options_data) if options_data else []
+        normalized_evaluation_mode = str(evaluation_mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
+            normalized_evaluation_mode = "auto"
 
         # Prepare question document
         question_doc = {
@@ -4860,6 +4949,7 @@ async def create_question(
             "text": question_text,  # Standard field name used by MCQ service
             "question_text": question_text,  # Alias for compatibility
             "question_type": question_type,  # Store question type (mcq or integer)
+            "evaluation_mode": normalized_evaluation_mode,
             "options": [],  # Will be populated below (empty for integer type)
             "correct_answer": correct_answer,
             "subject": subject,
@@ -5030,6 +5120,12 @@ async def update_question(
             update_data["difficulty"] = question_data["difficulty"]
         if "document_type" in question_data:
             update_data["document_type"] = question_data["document_type"]
+        evaluation_mode = question_data.get("evaluation_mode") or question_data.get("evaluationMode")
+        if evaluation_mode is not None:
+            normalized_evaluation_mode = str(evaluation_mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
+                normalized_evaluation_mode = "auto"
+            update_data["evaluation_mode"] = normalized_evaluation_mode
         # Helper to process and save new images
         async def process_new_images(images_list, id_prefix):
             processed_images = []

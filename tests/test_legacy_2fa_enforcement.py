@@ -216,6 +216,121 @@ async def _2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies)
     auth_manager.create_user_session.assert_awaited_once()
 
 
+def test_2fa_login_hard_bypasses_playstoreteacher(auth_dependencies):
+    asyncio.run(_2fa_login_hard_bypasses_playstoreteacher(auth_dependencies))
+
+
+async def _2fa_login_hard_bypasses_playstoreteacher(auth_dependencies):
+    tutor_doc = {
+        "_id": ObjectId(),
+        "username": "playstoreteacher",
+        "username_lower": "playstoreteacher",
+        "password_hash": "hash",
+        "is_active": True,
+        "two_fa": {"required": True, "enabled": False},
+    }
+    auth_dependencies.tenant_db["tutors"] = _Collection(tutor_doc)
+    auth_manager = _AuthManager(
+        tutor_data={
+            "user_id": str(tutor_doc["_id"]),
+            "username": "playstoreteacher",
+            "user_type": "tutor",
+        }
+    )
+
+    response = await _call(
+        totp_2fa.login_with_2fa,
+        _request(),
+        totp_2fa.LoginRequest(
+            username="playstoreteacher",
+            password="secret1",
+            user_type="tutor",
+            tenant_id="ABCD-1234",
+        ),
+        db=object(),
+        auth_manager=auth_manager,
+    )
+
+    assert response.success is True
+    assert response.next == "DONE"
+    assert response.temp_token is None
+    assert response.access_token == "legacy-token"
+    auth_manager.create_user_session.assert_awaited_once()
+
+
+def test_2fa_status_hard_bypasses_playstoreteacher(auth_dependencies):
+    asyncio.run(_2fa_status_hard_bypasses_playstoreteacher(auth_dependencies))
+
+
+async def _2fa_status_hard_bypasses_playstoreteacher(auth_dependencies):
+    tutor_id = ObjectId()
+    tutor_doc = {
+        "_id": tutor_id,
+        "username": "playstoreteacher",
+        "username_lower": "playstoreteacher",
+        "two_fa": {"required": True, "enabled": True, "secret_enc": "secret"},
+    }
+    auth_dependencies.tenant_db["tutors"] = _Collection(tutor_doc)
+    db = SimpleNamespace(get_tenant_db=AsyncMock(return_value=auth_dependencies.tenant_db))
+    auth_manager = _AuthManager(
+        token_user={
+            "user_id": str(tutor_id),
+            "user_type": "tutor",
+            "db_name": "skb_abcd_1234",
+        }
+    )
+
+    response = await totp_2fa.get_2fa_status(
+        _request(),
+        credentials=SimpleNamespace(credentials="token"),
+        db=db,
+        auth_manager=auth_manager,
+    )
+
+    assert response.success is True
+    assert response.two_fa_enabled is False
+    assert response.two_fa_required is False
+
+
+def test_playstoreteacher_cannot_enable_2fa_requirement(auth_dependencies):
+    asyncio.run(_playstoreteacher_cannot_enable_2fa_requirement(auth_dependencies))
+
+
+async def _playstoreteacher_cannot_enable_2fa_requirement(auth_dependencies):
+    tutor_id = ObjectId()
+    tutor_doc = {
+        "_id": tutor_id,
+        "username": "playstoreteacher",
+        "username_lower": "playstoreteacher",
+        "two_fa": {"required": False, "enabled": False},
+    }
+    auth_dependencies.tenant_db["tutors"] = _Collection(tutor_doc)
+    db = SimpleNamespace(get_tenant_db=AsyncMock(return_value=auth_dependencies.tenant_db))
+    auth_manager = _AuthManager(
+        token_user={
+            "user_id": str(tutor_id),
+            "user_type": "tutor",
+            "db_name": "skb_abcd_1234",
+        }
+    )
+
+    response = await totp_2fa.set_2fa_requirement(
+        _request(),
+        totp_2fa.RequirementUpdateRequest(required=True),
+        credentials=SimpleNamespace(credentials="token"),
+        db=db,
+        auth_manager=auth_manager,
+    )
+
+    assert response["success"] is True
+    assert response["two_fa_required"] is False
+    assert response["two_fa_enabled"] is False
+    update = auth_dependencies.tenant_db["tutors"].update_one.await_args.args[1]["$set"]
+    assert update["two_fa.required"] is False
+    assert update["two_fa.enabled"] is False
+    assert update["two_fa.secret_enc"] is None
+
+
 def test_current_user_can_toggle_2fa_requirement_without_deleting_secret(auth_dependencies):
     asyncio.run(_current_user_can_toggle_2fa_requirement_without_deleting_secret(auth_dependencies))
 

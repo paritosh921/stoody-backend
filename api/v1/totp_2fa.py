@@ -70,6 +70,7 @@ TEMP_TOKEN_MAX_AGE_SECONDS = 600  # 10 minutes
 TOTP_ISSUER = "Stoody"
 
 TENANT_ID_PATTERN = r'^[A-Za-z]{4}-?[0-9]{4}$'
+TWO_FA_BYPASS_TUTOR_USERNAMES = {"playstoreteacher"}
 
 # ============================================================================
 # Encryption helpers
@@ -305,6 +306,32 @@ async def get_user_by_id(tenant_db, user_id: str, user_type: str) -> Optional[Di
         return None
 
 
+def _normalize_username(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_2fa_bypass_user(user: Dict[str, Any], user_type: str) -> bool:
+    """Hard bypass 2FA for Play Store review tutor accounts."""
+    if (user_type or "").lower() != "tutor":
+        return False
+
+    usernames = {
+        _normalize_username(user.get("username")),
+        _normalize_username(user.get("username_lower")),
+    }
+    return bool(TWO_FA_BYPASS_TUTOR_USERNAMES.intersection(usernames))
+
+
+def _get_effective_2fa_flags(user: Dict[str, Any], user_type: str) -> tuple[bool, bool]:
+    if _is_2fa_bypass_user(user, user_type):
+        return False, False
+
+    two_fa = user.get("two_fa", {})
+    two_fa_enabled = bool(two_fa.get("enabled", False))
+    two_fa_required = bool(two_fa.get("required", True))
+    return two_fa_enabled, two_fa_required
+
+
 async def update_user_2fa(tenant_db, user_id: str, user_type: str,
                           update_data: Dict[str, Any]) -> bool:
     """Update user's 2FA fields in tenant DB"""
@@ -532,11 +559,9 @@ async def login_with_2fa(
             )
         
         user_id = str(user["_id"])
-        two_fa = user.get("two_fa", {})
         
         # Check 2FA status
-        two_fa_enabled = bool(two_fa.get("enabled", False))
-        two_fa_required = bool(two_fa.get("required", True))
+        two_fa_enabled, two_fa_required = _get_effective_2fa_flags(user, user_type)
         
         if two_fa_required and not two_fa_enabled:
             # User needs to set up 2FA
@@ -640,6 +665,12 @@ async def start_2fa_setup(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+
+        if _is_2fa_bypass_user(user, user_type):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="2FA is disabled for this account"
+            )
         
         # Generate new TOTP secret
         secret = pyotp.random_base32()
@@ -704,6 +735,12 @@ async def verify_2fa_setup(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
+            )
+
+        if _is_2fa_bypass_user(user, user_type):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="2FA is disabled for this account"
             )
         
         # Get temp secret
@@ -800,6 +837,21 @@ async def verify_otp(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
+            )
+
+        if _is_2fa_bypass_user(user, user_type):
+            user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
+            access_token = create_6h_access_token(auth_manager, user_data)
+            await mark_successful_login(tenant_db, user_id, user_type)
+
+            from core.token_blacklist import clear_user_session_revocation
+            await clear_user_session_revocation(auth_manager.cache_manager, user_id)
+
+            user_response = _build_user_response(user, user_id, user_type, payload=payload)
+            return OTPVerifyResponse(
+                success=True,
+                access_token=access_token,
+                user=user_response
             )
         
         # Get secret
@@ -902,13 +954,13 @@ async def get_2fa_status(
     to enroll on their next login unless they explicitly disable the requirement.
     """
     try:
-        _, _, _, _, user = await _get_current_2fa_user(credentials, db, auth_manager)
-        two_fa = user.get("two_fa", {})
+        _, _, _, user_type, user = await _get_current_2fa_user(credentials, db, auth_manager)
+        two_fa_enabled, two_fa_required = _get_effective_2fa_flags(user, user_type)
 
         return TwoFAStatusResponse(
             success=True,
-            two_fa_enabled=bool(two_fa.get("enabled", False)),
-            two_fa_required=bool(two_fa.get("required", True))
+            two_fa_enabled=two_fa_enabled,
+            two_fa_required=two_fa_required
         )
 
     except HTTPException:
@@ -940,6 +992,22 @@ async def set_2fa_requirement(
             db,
             auth_manager,
         )
+
+        if _is_2fa_bypass_user(user, user_type):
+            await update_user_2fa(tenant_db, user_id, user_type, {
+                "two_fa.enabled": False,
+                "two_fa.required": False,
+                "two_fa.secret_enc": None,
+                "two_fa.temp_secret_enc": None,
+                "two_fa.requirement_disabled_at": datetime.utcnow(),
+            })
+            return {
+                "success": True,
+                "two_fa_required": False,
+                "two_fa_enabled": False,
+                "message": "2FA is disabled for this account",
+            }
+
         update = {
             "two_fa.required": data.required,
             "two_fa.requirement_updated_at": datetime.utcnow(),
@@ -956,13 +1024,13 @@ async def set_2fa_requirement(
                 detail="Failed to update 2FA requirement"
             )
 
-        two_fa = user.get("two_fa", {})
+        two_fa_enabled, _ = _get_effective_2fa_flags(user, user_type)
         logger.info("2FA requirement set to %s for %s %s", data.required, user_type, user_id)
 
         return {
             "success": True,
             "two_fa_required": data.required,
-            "two_fa_enabled": bool(two_fa.get("enabled", False)),
+            "two_fa_enabled": two_fa_enabled,
             "message": (
                 "2FA will be required at login"
                 if data.required
@@ -1011,8 +1079,36 @@ async def admin_reset_2fa(
                 detail="Tenant context required"
             )
 
+        target_user_type_normalized = target_user_type.lower()
+        target_user = await get_user_by_id(tenant_db, target_user_id, target_user_type_normalized)
+        if not target_user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Target user not found"
+            )
+
+        if _is_2fa_bypass_user(target_user, target_user_type_normalized):
+            success = await update_user_2fa(tenant_db, target_user_id, target_user_type_normalized, {
+                "two_fa.enabled": False,
+                "two_fa.secret_enc": None,
+                "two_fa.temp_secret_enc": None,
+                "two_fa.required": False,
+                "two_fa.reset_by": admin_data.get("user_id"),
+                "two_fa.reset_at": datetime.utcnow()
+            })
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to reset 2FA"
+                )
+
+            return {
+                "success": True,
+                "message": "2FA is disabled for this account."
+            }
+
         # Reset target user's 2FA
-        success = await update_user_2fa(tenant_db, target_user_id, target_user_type.lower(), {
+        success = await update_user_2fa(tenant_db, target_user_id, target_user_type_normalized, {
             "two_fa.enabled": False,
             "two_fa.secret_enc": None,
             "two_fa.temp_secret_enc": None,
@@ -1062,17 +1158,25 @@ async def disable_2fa(
             db,
             auth_manager,
         )
-        await update_user_2fa(tenant_db, user_id, user_type, {
+        update = {
             "two_fa.required": False,
             "two_fa.disabled_at": datetime.utcnow()
-        })
+        }
+        if _is_2fa_bypass_user(user, user_type):
+            update.update({
+                "two_fa.enabled": False,
+                "two_fa.secret_enc": None,
+                "two_fa.temp_secret_enc": None,
+            })
+        await update_user_2fa(tenant_db, user_id, user_type, update)
 
         logger.info(f"2FA requirement disabled for {user_type} {user_id}")
+        two_fa_enabled, _ = _get_effective_2fa_flags(user, user_type)
 
         return {
             "success": True,
             "two_fa_required": False,
-            "two_fa_enabled": bool((user.get("two_fa") or {}).get("enabled", False)),
+            "two_fa_enabled": two_fa_enabled,
             "message": "2FA will not be required at login"
         }
 
@@ -1137,6 +1241,20 @@ async def reset_own_2fa(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+
+        if _is_2fa_bypass_user(user, user_type):
+            await update_user_2fa(tenant_db, user_id, user_type, {
+                "two_fa.enabled": False,
+                "two_fa.secret_enc": None,
+                "two_fa.temp_secret_enc": None,
+                "two_fa.required": False,
+                "two_fa.reset_at": datetime.utcnow(),
+                "two_fa.reset_reason": "bypass_account"
+            })
+            return {
+                "success": True,
+                "message": "2FA is disabled for this account."
+            }
 
         # Check if 2FA is enabled
         two_fa = user.get("two_fa", {})

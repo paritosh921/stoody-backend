@@ -3,7 +3,7 @@ SmartBoard API - Real-time Pen Monitoring for Teaching
 Handles session management, WebSocket connections, and AI evaluation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -17,6 +17,9 @@ from bson import ObjectId
 from core.database import DatabaseManager
 from core.permissions import has_permission
 from core.observability import track_websocket_connection
+from core.tenant_features import is_feature_enabled
+from utils.tutor_scoping import build_tutor_class_criteria
+from api.v1.admin_async import get_tenant_db_or_403
 from api.v1.auth_async import get_current_user
 
 router = APIRouter()
@@ -78,6 +81,24 @@ class EvaluateRequest(BaseModel):
     correct_answer: Optional[str] = None
 
 
+class SmartboardPenName(BaseModel):
+    """Minimal pen display-name row exposed to paired smartboards."""
+    pen_mac: str
+    pen_id: Optional[str] = None
+    name: Optional[str] = None
+    pen_name: Optional[str] = None
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    last_registered_at: Optional[datetime] = None
+
+
+class SmartboardPenNamesResponse(BaseModel):
+    pens: List[SmartboardPenName]
+    count: int
+    tenant_id: Optional[str] = None
+    refreshed_at: datetime
+
+
 # =============================================================================
 # In-Memory Session Storage (Consider Redis for production)
 # =============================================================================
@@ -135,14 +156,181 @@ def require_tutor(current_user: Dict[str, Any] = Depends(get_current_user)):
     return current_user
 
 
+def require_smartboard_cloud_user(current_user: Dict[str, Any] = Depends(require_tutor)):
+    """Require a tutor/admin token that is allowed to use SmartBoard cloud APIs."""
+    if not is_feature_enabled(
+        current_user.get("enabled_features"),
+        "smartboard_cloud_access",
+        current_user.get("enabled_features_v2"),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Smartboard cloud access not enabled for this institution",
+        )
+    return current_user
+
+
 def generate_session_id() -> str:
     """Generate unique session ID"""
     return f"SB{datetime.utcnow().strftime('%Y%m%d%H%M%S')}{secrets.token_hex(4).upper()}"
 
 
+def _actor_is_admin(current_user: Dict[str, Any]) -> bool:
+    return (current_user.get("user_type") or "").lower() in {"admin", "b2c_admin"}
+
+
+def _safe_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _display_name(*, student_name: Optional[str], pen_name: Optional[str]) -> Optional[str]:
+    return _safe_str(student_name) or _safe_str(pen_name)
+
+
+async def _smartboard_visible_student_usernames(
+    tenant_db,
+    current_user: Dict[str, Any],
+) -> set[str]:
+    """
+    Return student usernames visible to this tutor for SmartBoard display.
+
+    Unlike admin pen-management endpoints, this read-only display endpoint does
+    not require `can_edit_students`; it follows assigned-student, teacher_ids,
+    and class/section tutor scoping.
+    """
+    tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
+    if not tutor_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor identity missing from token",
+        )
+
+    tutor_doc = await tenant_db["tutors"].find_one({"tutor_id": tutor_id})
+    if tutor_doc is None:
+        try:
+            tutor_doc = await tenant_db["tutors"].find_one({"_id": ObjectId(str(tutor_id))})
+        except Exception:
+            tutor_doc = None
+    if tutor_doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor not found in this tenant",
+        )
+
+    usernames: set[str] = set()
+    assigned_student_ids = [s for s in (tutor_doc.get("assigned_student_ids") or []) if s]
+    if assigned_student_ids:
+        cursor = tenant_db["students"].find(
+            {"student_id": {"$in": assigned_student_ids}},
+            {"username": 1},
+        )
+        async for doc in cursor:
+            username = doc.get("username")
+            if username:
+                usernames.add(username)
+
+    cursor = tenant_db["students"].find(
+        {"teacher_ids": {"$in": [tutor_id]}},
+        {"username": 1},
+    )
+    async for doc in cursor:
+        username = doc.get("username")
+        if username:
+            usernames.add(username)
+
+    admin_oid = None
+    raw_admin_id = current_user.get("admin_id")
+    if raw_admin_id:
+        try:
+            admin_oid = ObjectId(str(raw_admin_id))
+        except Exception:
+            admin_oid = None
+
+    class_query = build_tutor_class_criteria(tutor_doc, admin_oid)
+    if class_query:
+        cursor = tenant_db["students"].find(class_query, {"username": 1})
+        async for doc in cursor:
+            username = doc.get("username")
+            if username:
+                usernames.add(username)
+
+    return usernames
+
+
+async def _load_smartboard_pen_names(
+    tenant_db,
+    current_user: Dict[str, Any],
+) -> List[SmartboardPenName]:
+    query: Dict[str, Any] = {"status": "active"}
+    if not _actor_is_admin(current_user):
+        visible_usernames = await _smartboard_visible_student_usernames(tenant_db, current_user)
+        if not visible_usernames:
+            return []
+        query["user_id"] = {"$in": sorted(visible_usernames)}
+
+    pen_docs = await tenant_db["pens"].find(query).sort("last_registered_at", -1).to_list(length=5000)
+    usernames = sorted({p.get("user_id") for p in pen_docs if p.get("user_id")})
+    student_lookup: Dict[str, Dict[str, Any]] = {}
+    if usernames:
+        cursor = tenant_db["students"].find(
+            {"username": {"$in": usernames}},
+            {"username": 1, "student_id": 1, "name": 1, "full_name": 1},
+        )
+        async for doc in cursor:
+            username = doc.get("username")
+            if username:
+                student_lookup[username] = doc
+
+    rows: List[SmartboardPenName] = []
+    for pen in pen_docs:
+        pen_mac = _safe_str(pen.get("pen_mac"))
+        if not pen_mac:
+            continue
+        student_doc = student_lookup.get(pen.get("user_id")) or {}
+        student_name = _safe_str(student_doc.get("full_name")) or _safe_str(student_doc.get("name"))
+        pen_name = _safe_str(pen.get("pen_name"))
+        rows.append(
+            SmartboardPenName(
+                pen_mac=pen_mac.upper(),
+                pen_id=_safe_str(pen.get("pen_id")),
+                name=_display_name(student_name=student_name, pen_name=pen_name),
+                pen_name=pen_name,
+                student_id=_safe_str(student_doc.get("student_id")),
+                student_name=student_name,
+                last_registered_at=pen.get("last_registered_at"),
+            )
+        )
+    return rows
+
+
 # =============================================================================
 # API Endpoints
 # =============================================================================
+
+@router.get("/pen-names", response_model=SmartboardPenNamesResponse)
+async def get_pen_names(
+    current_user: Dict[str, Any] = Depends(require_smartboard_cloud_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """
+    Return a safe `pen_mac -> display name` map for paired smartboards.
+
+    This endpoint is intentionally narrower than `/admin/pens`: the tablet only
+    receives active pen IDs, MACs, and display labels needed to overlay student
+    names on locally streamed hub strokes.
+    """
+    tenant_db = await get_tenant_db_or_403(db, current_user)
+    pens = await _load_smartboard_pen_names(tenant_db, current_user)
+    return SmartboardPenNamesResponse(
+        pens=pens,
+        count=len(pens),
+        tenant_id=current_user.get("db_name") or current_user.get("tenant_id"),
+        refreshed_at=datetime.utcnow(),
+    )
+
 
 @router.post("/sessions", response_model=SessionResponse, status_code=201)
 async def create_session(

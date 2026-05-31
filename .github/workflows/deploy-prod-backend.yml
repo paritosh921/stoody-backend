@@ -139,18 +139,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          invalidate_url="$(python - <<'PY'
+          remote_curl_command="$(python - <<'PY'
           import os
+          import shlex
           from urllib.parse import urlsplit
 
           health_url = os.environ["PROD_MAIN_BACKEND_HEALTHCHECK_URL"]
           parsed = urlsplit(health_url)
           if not parsed.scheme or not parsed.netloc:
               raise SystemExit("Invalid PROD_MAIN_BACKEND_HEALTHCHECK_URL")
-          print(f"{parsed.scheme}://{parsed.netloc}/api/v1/auth/invalidate-all-sessions")
+          invalidate_url = f"{parsed.scheme}://{parsed.netloc}/api/v1/auth/invalidate-all-sessions"
+          deploy_secret_header = f"X-Deploy-Secret: {os.environ['PROD_DEPLOY_SESSION_SECRET']}"
+          print(
+              "curl -fsS -X POST "
+              + shlex.quote(invalidate_url)
+              + " -H "
+              + shlex.quote(deploy_secret_header)
+          )
           PY
           )"
 
-          echo "Invalidating existing JWT sessions"
-          curl -fsS -X POST "$invalidate_url" \
-            -H "X-Deploy-Secret: ${PROD_DEPLOY_SESSION_SECRET}"
+          echo "Invalidating existing JWT sessions on prod backend"
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "$remote_curl_command"

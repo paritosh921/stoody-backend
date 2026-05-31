@@ -442,6 +442,8 @@ def _expected_marks_for_question(document: TallyDocumentContext, question_number
     for item in document.marking_scheme:
         if item.from_ <= question_number <= item.to and item.marks > 0:
             return float(item.marks)
+    if document.marking_scheme:
+        return None
     if document.max_marks_per_question and document.max_marks_per_question > 0:
         return float(document.max_marks_per_question)
     return None
@@ -546,6 +548,32 @@ def _validate_tally_result(
                 expected=f"Q1-Q{max_question}",
             )
         )
+
+    if max_question and document.marking_scheme:
+        covered_questions = {
+            question_number
+            for item in document.marking_scheme
+            for question_number in range(max(1, item.from_), min(max_question, item.to) + 1)
+            if item.marks > 0
+        }
+        missing_config = [
+            question_number
+            for question_number in range(1, max_question + 1)
+            if question_number not in covered_questions
+        ]
+        if missing_config:
+            missing_label = _format_question_ranges(missing_config)
+            issues.append(
+                TallyValidationIssue(
+                    severity="error",
+                    code="marking_scheme_incomplete",
+                    message=f"No max marks are configured for {missing_label}.",
+                    column=missing_label,
+                    question_number=missing_config[0],
+                    expected=f"Q1-Q{max_question}",
+                    actual=f"Missing {missing_label}",
+                )
+            )
 
     for row_index, row in enumerate(rows):
         if max_question and question_columns:
