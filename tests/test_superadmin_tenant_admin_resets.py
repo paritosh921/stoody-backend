@@ -141,9 +141,55 @@ async def _superadmin_2fa_reset_is_separate_from_password_reset(monkeypatch):
     assert response["success"] is True
     update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
     assert update["two_fa.enabled"] is False
-    assert update["two_fa.required"] is True
+    assert update["two_fa.required"] is False
     assert update["two_fa.secret_enc"] is None
     assert update["two_fa.temp_secret_enc"] is None
     assert "password_hash" not in update
     auth_manager.invalidate_user_session.assert_awaited_once_with(str(admin_id))
     revoke_user_session.assert_awaited_once_with(cache_manager, str(admin_id))
+
+
+def test_superadmin_2fa_reset_succeeds_if_session_revocation_fails(monkeypatch):
+    asyncio.run(_superadmin_2fa_reset_succeeds_if_session_revocation_fails(monkeypatch))
+
+
+async def _superadmin_2fa_reset_succeeds_if_session_revocation_fails(monkeypatch):
+    tenant_id = ObjectId()
+    admin_id = ObjectId()
+    tenant = {
+        "_id": tenant_id,
+        "status": "active",
+        "db_name": "skb_abcd_1234",
+        "admin_email": "school-admin@example.com",
+        "assigned_superadmin_id": ObjectId(),
+    }
+    tenant_db = _TenantDb(
+        db_name="skb_abcd_1234",
+        admin_doc={
+            "_id": admin_id,
+            "email": "school-admin@example.com",
+            "role": "master_admin",
+            "password_hash": "existing-hash",
+            "two_fa": {"enabled": False, "required": False, "secret_enc": None},
+        },
+    )
+    db = _Db(tenant=tenant, tenant_db=tenant_db)
+    superadmin = {"admin_id": str(tenant["assigned_superadmin_id"]), "email": "owner@example.com"}
+    auth_manager = SimpleNamespace(
+        invalidate_user_session=AsyncMock(side_effect=RuntimeError("cache unavailable")),
+        cache_manager=object(),
+    )
+    revoke_user_session = AsyncMock(side_effect=RuntimeError("redis unavailable"))
+    monkeypatch.setattr(superadmin_async, "revoke_user_session", revoke_user_session)
+
+    response = await superadmin_async.reset_tenant_admin_2fa(
+        str(tenant_id),
+        db=db,
+        admin=superadmin,
+        auth_manager=auth_manager,
+    )
+
+    assert response["success"] is True
+    update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
+    assert update["two_fa.enabled"] is False
+    assert update["two_fa.required"] is False
