@@ -146,7 +146,7 @@ class TestSmartboardPairFeatureGating:
         assert tf.required_feature_for_path("/api/v1/smartboard/sessions") == "smartboard_live_session"
 
     def test_live_session_gates_smartboard_sessions(self):
-        assert tf.required_feature_for_path("/api/v1/smartboard-sessions") == "smartboard_live_session"
+        assert tf.required_feature_for_path("/api/v1/smartboard-sessions") == "smartboard_cloud_access"
 
 
 # ---------------------------------------------------------------------------
