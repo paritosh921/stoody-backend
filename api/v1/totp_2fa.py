@@ -43,6 +43,7 @@ from core.tenant_features import (
     is_feature_enabled,
     merge_tenant_features,
 )
+from core.token_blacklist import revoke_user_session
 from config_async import settings, JWT_SECRET_KEY
 
 logger = logging.getLogger(__name__)
@@ -348,6 +349,18 @@ async def update_user_2fa(tenant_db, user_id: str, user_type: str,
     except Exception as e:
         logger.error(f"Error updating user 2FA: {e}")
         return False
+
+
+async def _revoke_2fa_user_sessions(auth_manager: AuthManager, user_id: str) -> None:
+    try:
+        await auth_manager.invalidate_user_session(user_id)
+    except Exception as exc:
+        logger.warning("Failed to invalidate 2FA user session %s: %s", user_id, exc)
+
+    try:
+        await revoke_user_session(getattr(auth_manager, "cache_manager", None), user_id)
+    except Exception as exc:
+        logger.warning("Failed to revoke 2FA user token sessions %s: %s", user_id, exc)
 
 
 async def mark_successful_login(tenant_db, user_id: str, user_type: str,
@@ -1097,7 +1110,8 @@ async def admin_reset_2fa(
                 "two_fa.temp_secret_enc": None,
                 "two_fa.required": False,
                 "two_fa.reset_by": admin_data.get("user_id"),
-                "two_fa.reset_at": datetime.utcnow()
+                "two_fa.reset_at": datetime.utcnow(),
+                "two_fa.reset_reason": "admin_reset",
             })
             if not success:
                 raise HTTPException(
@@ -1105,6 +1119,7 @@ async def admin_reset_2fa(
                     detail="Failed to reset 2FA"
                 )
 
+            await _revoke_2fa_user_sessions(auth_manager, target_user_id)
             return {
                 "success": True,
                 "message": "2FA is disabled for this account."
@@ -1115,9 +1130,10 @@ async def admin_reset_2fa(
             "two_fa.enabled": False,
             "two_fa.secret_enc": None,
             "two_fa.temp_secret_enc": None,
-            "two_fa.required": True,  # Still require 2FA on next login
+            "two_fa.required": False,
             "two_fa.reset_by": admin_data.get("user_id"),
-            "two_fa.reset_at": datetime.utcnow()
+            "two_fa.reset_at": datetime.utcnow(),
+            "two_fa.reset_reason": "admin_reset",
         })
         
         if not success:
@@ -1125,12 +1141,14 @@ async def admin_reset_2fa(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to reset 2FA"
             )
+
+        await _revoke_2fa_user_sessions(auth_manager, target_user_id)
         
         logger.info(f"2FA reset for {target_user_type} {target_user_id} by admin {admin_data.get('user_id')}")
         
         return {
             "success": True,
-            "message": f"2FA has been reset for user. They will need to set up 2FA on next login."
+            "message": "2FA has been reset for user. They can enable 2FA again from settings."
         }
     
     except HTTPException:
