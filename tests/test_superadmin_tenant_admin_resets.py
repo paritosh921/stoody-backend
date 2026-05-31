@@ -96,6 +96,7 @@ async def _superadmin_password_reset_generates_copyable_admin_password(monkeypat
 
     update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
     assert AuthManager().verify_password(generated_password, update["password_hash"])
+    assert update["requires_password_change"] is True
     assert "two_fa.enabled" not in update
     assert "two_fa.secret_enc" not in update
     auth_manager.invalidate_user_session.assert_awaited_once_with(str(admin_id))
@@ -139,6 +140,7 @@ async def _superadmin_password_reset_succeeds_without_auth_manager():
     assert response["success"] is True
     update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
     assert AuthManager().verify_password(response["generated_password"], update["password_hash"])
+    assert update["requires_password_change"] is True
 
 
 def test_superadmin_password_reset_accepts_motor_database_object():
@@ -176,6 +178,35 @@ async def _superadmin_password_reset_accepts_motor_database_object():
     )
 
     assert response["success"] is True
+
+
+def test_superadmin_pending_password_reset_requires_password_change():
+    asyncio.run(_superadmin_pending_password_reset_requires_password_change())
+
+
+async def _superadmin_pending_password_reset_requires_password_change():
+    tenant_id = ObjectId()
+    tenant = {
+        "_id": tenant_id,
+        "status": "pending",
+        "pending_admin": {"email": "school-admin@example.com", "password_hash": "old-hash"},
+        "admin_email": "school-admin@example.com",
+        "assigned_superadmin_id": ObjectId(),
+    }
+    db = _Db(tenant=tenant, tenant_db=_TenantDb(db_name="unused", admin_doc={}))
+    superadmin = {"admin_id": str(tenant["assigned_superadmin_id"]), "email": "owner@example.com"}
+
+    response = await superadmin_async.reset_tenant_admin_password(
+        str(tenant_id),
+        superadmin_async.ResetPasswordRequest(),
+        db=db,
+        admin=superadmin,
+        auth_manager=None,
+    )
+
+    assert response["success"] is True
+    update = db.master_db["tenants"].update_one.await_args.args[1]["$set"]
+    assert update["pending_admin.requires_password_change"] is True
 
 
 def test_superadmin_2fa_reset_is_separate_from_password_reset(monkeypatch):

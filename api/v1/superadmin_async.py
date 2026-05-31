@@ -1237,6 +1237,7 @@ async def approve_tenant(
             "role": "master_admin",
             "permissions": [],
             "is_active": True,
+            "requires_password_change": bool(pending_admin.get("requires_password_change", False)),
             "created_at": datetime.utcnow(),
             "created_by": None,
             "two_fa": pending_admin.get("two_fa") or {
@@ -1464,6 +1465,7 @@ async def reset_tenant_admin_password(
                 "$set": {
                     "pending_admin.password_hash": new_password_hash,
                     "pending_admin.password_reset_by_superadmin_at": now,
+                    "pending_admin.requires_password_change": True,
                 },
                 "$push": {
                     "approval_history": {
@@ -1486,6 +1488,7 @@ async def reset_tenant_admin_password(
                 {
                     "$set": {
                         "password_hash": new_password_hash,
+                        "requires_password_change": True,
                         "password_reset_by_superadmin_at": now,
                         "password_reset_by_superadmin_id": admin["admin_id"],
                     }

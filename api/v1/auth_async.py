@@ -626,6 +626,84 @@ async def tutor_change_password(
         )
 
 
+@router.post("/admin/change-password")
+async def admin_change_password(
+    request: Request,
+    password_data: StudentChangePasswordRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager)
+):
+    """Admin changes their password after first login or a super-admin reset."""
+    try:
+        if current_user.get("user_type") != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only admins can use this endpoint"
+            )
+
+        admin_id = ObjectId(current_user["user_id"])
+        tenant_db = await _get_tenant_db_from_user(db, current_user)
+        if tenant_db is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tenant context required"
+            )
+
+        admin = await tenant_db["admins"].find_one({"_id": admin_id})
+        if not admin:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Admin not found"
+            )
+
+        if not auth_manager.verify_password(
+            password_data.current_password,
+            admin.get("password_hash", "")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect"
+            )
+
+        password_validator = get_password_validator()
+        is_valid, errors = password_validator.validate(password_data.new_password)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Password too weak: {'; '.join(errors)}"
+            )
+
+        new_password_hash = auth_manager.get_password_hash(password_data.new_password)
+
+        await tenant_db["admins"].update_one(
+            {"_id": admin_id},
+            {"$set": {
+                "password_hash": new_password_hash,
+                "requires_password_change": False,
+                "password_changed_at": datetime.utcnow()
+            }}
+        )
+
+        await auth_manager.invalidate_user_session(str(admin_id))
+
+        logger.info("Admin %s changed their password", admin.get("email"))
+
+        return {
+            "success": True,
+            "message": "Password changed successfully. Please log in again."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin change password error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password"
+        )
+
+
 @router.post("/student/forgot-password")
 @limiter.limit("3/hour")
 async def student_forgot_password(

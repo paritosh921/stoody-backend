@@ -402,6 +402,7 @@ def _build_user_response(user: Dict[str, Any], user_id: str, user_type: str,
     if user_type == "admin":
         response["admin_role"] = user.get("role", "master_admin")
         response["permissions"] = user.get("permissions") or []
+        response["requires_password_change"] = user.get("requires_password_change", False)
     elif user_type == "tutor":
         # Use the custom tutor_id from the document, not the MongoDB _id
         response["tutor_id"] = user.get("tutor_id") or user_id
