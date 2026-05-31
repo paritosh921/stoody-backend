@@ -43,6 +43,11 @@ class _TenantDb(dict):
         self["admins"] = _Collection(admin_doc)
 
 
+class _MotorLikeTenantDb(_TenantDb):
+    def __bool__(self):
+        raise NotImplementedError("Database objects do not implement truth value testing")
+
+
 def test_superadmin_password_reset_generates_copyable_admin_password(monkeypatch):
     asyncio.run(_superadmin_password_reset_generates_copyable_admin_password(monkeypatch))
 
@@ -134,6 +139,43 @@ async def _superadmin_password_reset_succeeds_without_auth_manager():
     assert response["success"] is True
     update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
     assert AuthManager().verify_password(response["generated_password"], update["password_hash"])
+
+
+def test_superadmin_password_reset_accepts_motor_database_object():
+    asyncio.run(_superadmin_password_reset_accepts_motor_database_object())
+
+
+async def _superadmin_password_reset_accepts_motor_database_object():
+    tenant_id = ObjectId()
+    admin_id = ObjectId()
+    tenant = {
+        "_id": tenant_id,
+        "status": "active",
+        "db_name": "skb_abcd_1234",
+        "admin_email": "school-admin@example.com",
+        "assigned_superadmin_id": ObjectId(),
+    }
+    tenant_db = _MotorLikeTenantDb(
+        db_name="skb_abcd_1234",
+        admin_doc={
+            "_id": admin_id,
+            "email": "school-admin@example.com",
+            "role": "master_admin",
+            "password_hash": "old-hash",
+        },
+    )
+    db = _Db(tenant=tenant, tenant_db=tenant_db)
+    superadmin = {"admin_id": str(tenant["assigned_superadmin_id"]), "email": "owner@example.com"}
+
+    response = await superadmin_async.reset_tenant_admin_password(
+        str(tenant_id),
+        superadmin_async.ResetPasswordRequest(),
+        db=db,
+        admin=superadmin,
+        auth_manager=None,
+    )
+
+    assert response["success"] is True
 
 
 def test_superadmin_2fa_reset_is_separate_from_password_reset(monkeypatch):
@@ -272,3 +314,40 @@ async def _superadmin_2fa_reset_succeeds_without_auth_manager():
     update = tenant_db["admins"].update_one.await_args.args[1]["$set"]
     assert update["two_fa.enabled"] is False
     assert update["two_fa.required"] is False
+
+
+def test_superadmin_2fa_reset_accepts_motor_database_object():
+    asyncio.run(_superadmin_2fa_reset_accepts_motor_database_object())
+
+
+async def _superadmin_2fa_reset_accepts_motor_database_object():
+    tenant_id = ObjectId()
+    admin_id = ObjectId()
+    tenant = {
+        "_id": tenant_id,
+        "status": "active",
+        "db_name": "skb_abcd_1234",
+        "admin_email": "school-admin@example.com",
+        "assigned_superadmin_id": ObjectId(),
+    }
+    tenant_db = _MotorLikeTenantDb(
+        db_name="skb_abcd_1234",
+        admin_doc={
+            "_id": admin_id,
+            "email": "school-admin@example.com",
+            "role": "master_admin",
+            "password_hash": "existing-hash",
+            "two_fa": {"enabled": True, "required": True, "secret_enc": "encrypted-secret"},
+        },
+    )
+    db = _Db(tenant=tenant, tenant_db=tenant_db)
+    superadmin = {"admin_id": str(tenant["assigned_superadmin_id"]), "email": "owner@example.com"}
+
+    response = await superadmin_async.reset_tenant_admin_2fa(
+        str(tenant_id),
+        db=db,
+        admin=superadmin,
+        auth_manager=None,
+    )
+
+    assert response["success"] is True

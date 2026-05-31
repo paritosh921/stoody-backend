@@ -1479,7 +1479,7 @@ async def reset_tenant_admin_password(
 
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
-        if tenant_db:
+        if tenant_db is not None:
             master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
             await tenant_db["admins"].update_one(
                 {"_id": master_admin["_id"]},
@@ -1551,7 +1551,7 @@ async def reset_tenant_admin_2fa(
 
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
-        if tenant_db:
+        if tenant_db is not None:
             master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
             await tenant_db["admins"].update_one(
                 {"_id": master_admin["_id"]},
