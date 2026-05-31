@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import secrets
+import string
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
@@ -22,7 +23,9 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 
 from config_async import settings
+from core.auth import AuthManager
 from core.database import DatabaseManager
+from core.token_blacklist import revoke_user_session
 from core.tenant_features import (
     LEGACY_DEFAULT_TENANT_FEATURES,
     build_enabled_features_v2,
@@ -123,7 +126,9 @@ class UpdateLimitsRequest(BaseModel):
 
 
 class ResetPasswordRequest(BaseModel):
-    new_password: str = Field(..., min_length=8)
+    # Legacy clients may still send this field, but super-admin resets now
+    # generate the replacement password server-side and return it once.
+    new_password: Optional[str] = Field(default=None, min_length=8)
 
 
 class UpdateTenantIdRequest(BaseModel):
@@ -211,6 +216,10 @@ class MarkNotificationsReadRequest(BaseModel):
 
 async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
+
+
+async def get_auth_manager(request: Request) -> AuthManager:
+    return request.app.state.auth
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -569,6 +578,30 @@ async def get_tenant_for_admin_or_error(master_db, tenant_id: str, admin_id: str
 
     ensure_tenant_owned_by_admin(tenant, admin_id)
     return tenant
+
+
+def generate_admin_reset_password(length: int = 22) -> str:
+    """Generate a copyable high-entropy password for super-admin resets."""
+    alphabet = string.ascii_letters + string.digits + "-_"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+async def get_tenant_master_admin_or_error(tenant_db, tenant: Dict[str, Any]) -> Dict[str, Any]:
+    admin_email = tenant.get("admin_email") or (tenant.get("pending_admin") or {}).get("email")
+    queries: List[Dict[str, Any]] = []
+    if admin_email:
+        queries.extend([
+            {"email": admin_email, "role": "master_admin"},
+            {"email": admin_email},
+        ])
+    queries.append({"role": "master_admin"})
+
+    for query in queries:
+        master_admin = await tenant_db["admins"].find_one(query)
+        if master_admin:
+            return master_admin
+
+    raise HTTPException(status_code=400, detail="Master admin account not found for this tenant")
 
 
 async def ensure_tenant_indexes(tenant_db) -> None:
@@ -1394,55 +1427,143 @@ async def reset_tenant_admin_password(
     request: ResetPasswordRequest,
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
+    auth_manager: AuthManager = Depends(get_auth_manager),
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
-    new_password_hash = pwd_context.hash(request.new_password)
+    generated_password = generate_admin_reset_password()
+    new_password_hash = auth_manager.get_password_hash(generated_password)
+    now = datetime.utcnow()
 
     if tenant["status"] == "pending" and tenant.get("pending_admin"):
         await master_db["tenants"].update_one(
             {"_id": ObjectId(tenant_id)},
             {
-                "$set": {"pending_admin.password_hash": new_password_hash},
+                "$set": {
+                    "pending_admin.password_hash": new_password_hash,
+                    "pending_admin.password_reset_by_superadmin_at": now,
+                },
                 "$push": {
                     "approval_history": {
                         "action": "password_reset",
                         "by": admin["email"],
-                        "at": datetime.utcnow(),
+                        "at": now,
                         "notes": "Password reset by super admin",
                     }
                 }
             }
         )
-        return {"success": True}
+        return {"success": True, "generated_password": generated_password}
 
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
         if tenant_db:
-            master_admin = await tenant_db["admins"].find_one({"role": "master_admin"})
-            if master_admin:
-                await tenant_db["admins"].update_one(
-                    {"_id": master_admin["_id"]},
-                    {"$set": {"password_hash": new_password_hash}}
-                )
+            master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
+            await tenant_db["admins"].update_one(
+                {"_id": master_admin["_id"]},
+                {
+                    "$set": {
+                        "password_hash": new_password_hash,
+                        "password_reset_by_superadmin_at": now,
+                        "password_reset_by_superadmin_id": admin["admin_id"],
+                    }
+                }
+            )
+            await auth_manager.invalidate_user_session(str(master_admin["_id"]))
+            await revoke_user_session(auth_manager.cache_manager, str(master_admin["_id"]))
 
-                await master_db["tenants"].update_one(
-                    {"_id": ObjectId(tenant_id)},
-                    {
-                        "$push": {
-                            "approval_history": {
-                                "action": "password_reset",
-                                "by": admin["email"],
-                                "at": datetime.utcnow(),
-                                "notes": "Password reset by super admin",
-                            }
+            await master_db["tenants"].update_one(
+                {"_id": ObjectId(tenant_id)},
+                {
+                    "$push": {
+                        "approval_history": {
+                            "action": "password_reset",
+                            "by": admin["email"],
+                            "at": now,
+                            "notes": "Password reset by super admin",
                         }
                     }
-                )
-                return {"success": True}
+                }
+            )
+            return {"success": True, "generated_password": generated_password}
 
     raise HTTPException(status_code=400, detail="Unable to reset password for this tenant")
+
+
+@router.post("/tenants/{tenant_id}/reset-admin-2fa")
+async def reset_tenant_admin_2fa(
+    tenant_id: str,
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    master_db = await get_master_db_or_503(db)
+    tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+    now = datetime.utcnow()
+
+    if tenant["status"] == "pending" and tenant.get("pending_admin"):
+        await master_db["tenants"].update_one(
+            {"_id": ObjectId(tenant_id)},
+            {
+                "$set": {
+                    "pending_admin.two_fa.enabled": False,
+                    "pending_admin.two_fa.required": True,
+                    "pending_admin.two_fa.secret_enc": None,
+                    "pending_admin.two_fa.temp_secret_enc": None,
+                    "pending_admin.two_fa.reset_by_superadmin_at": now,
+                    "pending_admin.two_fa.reset_by_superadmin_id": admin["admin_id"],
+                },
+                "$push": {
+                    "approval_history": {
+                        "action": "two_fa_reset",
+                        "by": admin["email"],
+                        "at": now,
+                        "notes": "2FA reset by super admin",
+                    }
+                }
+            }
+        )
+        return {"success": True, "message": "Admin 2FA reset successfully"}
+
+    if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
+        tenant_db = await db.get_tenant_db(tenant["db_name"])
+        if tenant_db:
+            master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
+            await tenant_db["admins"].update_one(
+                {"_id": master_admin["_id"]},
+                {
+                    "$set": {
+                        "two_fa.enabled": False,
+                        "two_fa.required": True,
+                        "two_fa.secret_enc": None,
+                        "two_fa.temp_secret_enc": None,
+                        "two_fa.setup_started_at": None,
+                        "two_fa.last_verified_at": None,
+                        "two_fa.reset_by_superadmin_at": now,
+                        "two_fa.reset_by_superadmin_id": admin["admin_id"],
+                    }
+                }
+            )
+            await auth_manager.invalidate_user_session(str(master_admin["_id"]))
+            await revoke_user_session(auth_manager.cache_manager, str(master_admin["_id"]))
+
+            await master_db["tenants"].update_one(
+                {"_id": ObjectId(tenant_id)},
+                {
+                    "$push": {
+                        "approval_history": {
+                            "action": "two_fa_reset",
+                            "by": admin["email"],
+                            "at": now,
+                            "notes": "2FA reset by super admin",
+                        }
+                    }
+                }
+            )
+            return {"success": True, "message": "Admin 2FA reset successfully"}
+
+    raise HTTPException(status_code=400, detail="Unable to reset 2FA for this tenant")
 
 
 @router.put("/tenants/{tenant_id}/institution-id")
