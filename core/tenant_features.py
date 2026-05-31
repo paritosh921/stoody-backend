@@ -355,11 +355,11 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
     ),
     "smartboard_live_session": (
         "/api/v1/smartboard/sessions",
-        "/api/v1/smartboard-sessions",
     ),
     "smartboard_cloud_access": (
         "/api/v1/smartboard/token",
         "/api/v1/smartboard-pair",
+        "/api/v1/smartboard-sessions",
     ),
     "admin_question_bank": (
         "/api/v1/questions",
