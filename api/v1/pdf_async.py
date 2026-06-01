@@ -2339,6 +2339,11 @@ class DocumentMetadata(BaseModel):
     instructions: Optional[str] = None
     exam_mode: Optional[str] = None
     exam_template_path: Optional[str] = None
+    answer_sheet_path: Optional[str] = None
+    answer_sheet_filename: Optional[str] = None
+    answer_sheet_uploaded_at: Optional[datetime] = None
+    answer_sheet_pages_count: Optional[int] = None
+    has_answer_sheet: bool = False
     exam_finalized: Optional[bool] = None
     exam_finalized_at: Optional[datetime] = None
     exam_sync_summary: Optional[Dict[str, Any]] = None
@@ -2407,6 +2412,7 @@ async def upload_pdf(
     request: Request,
     file: UploadFile = File(...),
     exam_template: Optional[UploadFile] = File(None),
+    answer_sheet: Optional[UploadFile] = File(None),
     document_id: str = Form(...),
     title: str = Form(...),
     document_type: str = Form(...),
@@ -2446,6 +2452,11 @@ async def upload_pdf(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only PDF files are supported"
+            )
+        if answer_sheet is not None and not (answer_sheet.filename or "").endswith('.pdf'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only PDF files are supported for answer sheet uploads"
             )
 
         # Validate document_id (alphanumeric only, no spaces or special chars)
@@ -2504,6 +2515,13 @@ async def upload_pdf(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Answer template upload is only allowed for DCR exam documents",
             )
+
+        if answer_sheet is not None:
+            if document_type != "Test Series" or exam_mode or question_type == "subjective":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Answer sheet upload is only allowed for online objective Test Series documents",
+                )
 
         # Validate title length
         if len(title) > 100:
@@ -2638,6 +2656,54 @@ async def upload_pdf(
                 upload=exam_template,
             )
 
+        answer_sheet_path = None
+        answer_sheet_filename = None
+        answer_sheet_file_size = None
+        answer_sheet_pages_count = None
+        answer_sheet_uploaded_at = None
+        if answer_sheet is not None:
+            answer_sheet_content = await answer_sheet.read()
+            answer_sheet_file_size = len(answer_sheet_content)
+            answer_sheet_filename = answer_sheet.filename
+            answer_sheet_uploaded_at = datetime.utcnow()
+
+            try:
+                import io
+                from pypdf import PdfReader
+                answer_sheet_reader = PdfReader(io.BytesIO(answer_sheet_content))
+                answer_sheet_pages_count = len(answer_sheet_reader.pages)
+                logger.info(f"Answer sheet for {document_id} has {answer_sheet_pages_count} pages")
+            except Exception as pdf_err:
+                logger.warning(f"Failed to count answer sheet pages for {document_id}: {pdf_err}")
+
+            answer_sheet_dir = upload_dir / "answer_sheets"
+            answer_sheet_file_path = answer_sheet_dir / f"{document_id}_answer_sheet.pdf"
+            local_answer_sheet_relative_path = (
+                f"uploads/documents/{document_type}/answer_sheets/{document_id}_answer_sheet.pdf"
+            )
+
+            if is_s3_enabled():
+                success, storage_path = await s3_upload_file(
+                    file_data=answer_sheet_content,
+                    local_path=str(answer_sheet_file_path),
+                    content_type="application/pdf",
+                )
+                if success:
+                    answer_sheet_path = storage_path
+                    logger.info(f"✅ Uploaded answer sheet to S3: {storage_path}")
+                else:
+                    logger.warning("S3 answer sheet upload failed, falling back to local storage")
+                    answer_sheet_dir.mkdir(parents=True, exist_ok=True)
+                    async with aiofiles.open(str(answer_sheet_file_path), "wb") as f:
+                        await f.write(answer_sheet_content)
+                    answer_sheet_path = local_answer_sheet_relative_path
+            else:
+                answer_sheet_dir.mkdir(parents=True, exist_ok=True)
+                async with aiofiles.open(str(answer_sheet_file_path), "wb") as f:
+                    await f.write(answer_sheet_content)
+                answer_sheet_path = local_answer_sheet_relative_path
+                logger.info(f"Saved answer sheet locally: {answer_sheet_file_path}")
+
         document_metadata = {
             "document_id": document_id,
             "title": title,
@@ -2672,6 +2738,14 @@ async def upload_pdf(
             "is_s3": is_s3_enabled(),  # Track storage location
             "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
             "exam_template_path": exam_template_path,
+            "answer_sheet_path": answer_sheet_path,
+            "answer_sheet_filename": answer_sheet_filename,
+            "answer_sheet_file_size": answer_sheet_file_size,
+            "answer_sheet_uploaded_at": answer_sheet_uploaded_at,
+            "answer_sheet_pages_count": answer_sheet_pages_count,
+            "answer_sheet_ocr_status": "not_processed" if answer_sheet_path else None,
+            "answer_sheet_ocr_job_id": None,
+            "answer_sheet_mapped_answers_count": 0,
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
@@ -2719,6 +2793,8 @@ async def upload_pdf(
             ),
             "document_id": document_id,
             "file_path": relative_path,
+            "answer_sheet_path": answer_sheet_path,
+            "has_answer_sheet": bool(answer_sheet_path),
             "ocr_status": ocr_status,
             "ocr_job_id": ocr_job_id,
             "pages_count": pages_count,
@@ -3542,6 +3618,11 @@ async def get_documents(
                 instructions=doc.get("instructions"),
                 exam_mode=doc.get("exam_mode"),
                 exam_template_path=doc.get("exam_template_path"),
+                answer_sheet_path=doc.get("answer_sheet_path"),
+                answer_sheet_filename=doc.get("answer_sheet_filename"),
+                answer_sheet_uploaded_at=doc.get("answer_sheet_uploaded_at"),
+                answer_sheet_pages_count=doc.get("answer_sheet_pages_count"),
+                has_answer_sheet=bool(doc.get("answer_sheet_path")),
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
                 exam_sync_summary=doc.get("exam_sync_summary"),
@@ -4047,6 +4128,11 @@ async def get_student_available_options(
                 instructions=doc.get("instructions"),
                 exam_mode=doc.get("exam_mode"),
                 exam_template_path=doc.get("exam_template_path"),
+                answer_sheet_path=doc.get("answer_sheet_path"),
+                answer_sheet_filename=doc.get("answer_sheet_filename"),
+                answer_sheet_uploaded_at=doc.get("answer_sheet_uploaded_at"),
+                answer_sheet_pages_count=doc.get("answer_sheet_pages_count"),
+                has_answer_sheet=bool(doc.get("answer_sheet_path")),
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
                 exam_sync_summary=doc.get("exam_sync_summary"),
@@ -5795,6 +5881,13 @@ async def delete_document(
         if file_path.exists():
             file_path.unlink()
             logger.info(f"Deleted PDF file: {file_path}")
+
+        answer_sheet_path = str(document.get("answer_sheet_path") or "").replace("\\", "/")
+        if answer_sheet_path and not answer_sheet_path.startswith("s3://"):
+            answer_sheet_file_path = backend_dir / answer_sheet_path
+            if answer_sheet_file_path.exists():
+                answer_sheet_file_path.unlink()
+                logger.info(f"Deleted answer sheet PDF file: {answer_sheet_file_path}")
 
         # Delete all questions associated with this document
         if is_b2c:
