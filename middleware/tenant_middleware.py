@@ -75,6 +75,12 @@ class TenantMiddleware(BaseHTTPMiddleware):
         "/api/v1/superadmin",
     }
 
+    # Uploaded documents are served only through authenticated API routes.
+    # Direct static URLs reveal stored PDFs after logout and bypass document ACLs.
+    PROTECTED_STATIC_PREFIXES = (
+        "/uploads/documents",
+    )
+
     # Static/resource prefixes — served without tenant context (images, uploads, etc.)
     STATIC_PREFIXES = (
         "/images/",
@@ -95,6 +101,14 @@ class TenantMiddleware(BaseHTTPMiddleware):
         # Skip tenant context for exempt path prefixes (super admin uses separate JWT)
         if any(path.startswith(prefix) for prefix in self.EXEMPT_PREFIXES):
             return await call_next(request)
+
+        if any(path.startswith(prefix) for prefix in self.PROTECTED_STATIC_PREFIXES):
+            logger.warning("Blocked direct protected upload access: %s", path)
+            return Response(
+                content='{"detail":"Not found"}',
+                status_code=status.HTTP_404_NOT_FOUND,
+                media_type="application/json",
+            )
 
         # Static resources (images, uploads) served without tenant context
         if any(path.startswith(prefix) for prefix in self.STATIC_PREFIXES):
