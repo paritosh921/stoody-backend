@@ -1251,7 +1251,8 @@ async def extract_questions_with_gpt(
     ocr_result: Dict[str, Any],
     subject: str,
     difficulty: str,
-    skip_option_extraction: bool = False
+    skip_option_extraction: bool = False,
+    document_anchor_text: Optional[str] = None
 ) -> List[ExtractedQuestion]:
     """
     Use LLM to extract structured questions from OCR text.
@@ -1295,9 +1296,18 @@ async def extract_questions_with_gpt(
     # extract_model = OCR_FALLBACK_MODEL
 
     print(f"[Q-EXTRACT] Sending {len(full_text)} chars from {len(pages)} pages (provider: {provider_name}, model: {extract_model})", flush=True)
+    anchor_instruction = ""
+    if document_anchor_text and document_anchor_text.strip():
+        anchor_instruction = (
+            "\nDOCUMENT ANCHOR TEXT PROVIDED BY TEACHER:\n"
+            f"{document_anchor_text.strip()}\n"
+            "Use this anchor text as an additional hint when locating and organizing relevant question content. "
+            "Do not invent content from the anchor text; only extract what is present in the document.\n"
+        )
 
     extraction_prompt = (
         "You are a question paper parser. Extract ONLY the questions from the text below.\n\n"
+        f"{anchor_instruction}"
         "RULES:\n"
         "- Extract every question (MCQ, subjective, fill-in-the-blank, true/false, assertion-reason, case study, etc.)\n"
         "- Ignore headers, instructions, school name, exam title, general instructions, section headers, marks info\n"
@@ -1491,6 +1501,7 @@ async def extract_questions_with_gpt(
                 f"{failed_nums}\n\n"
                 "Below is the page text containing those questions. "
                 "Extract ONLY the questions listed above.\n\n"
+                f"{anchor_instruction}"
                 "RULES:\n"
                 "- Include full question text with all sub-parts\n"
                 "- For MCQs: separate question text from options\n"
@@ -6516,11 +6527,13 @@ class QuestionRegion(BaseModel):
 class DocumentRegionsRequest(BaseModel):
     """Request body for saving document regions"""
     regions: List[QuestionRegion]
+    excludedPages: List[int] = Field(default_factory=list)
 
 class DocumentRegionsResponse(BaseModel):
     """Response for document regions"""
     documentId: str
     regions: List[QuestionRegion]
+    excludedPages: List[int] = Field(default_factory=list)
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
     createdBy: Optional[str] = None
@@ -6598,6 +6611,7 @@ async def get_document_regions(
                 "documentId": document_id,
                 "regionScope": region_scope,
                 "regions": [],
+                "excludedPages": [],
                 "createdAt": None,
                 "updatedAt": None,
                 "createdBy": None
@@ -6607,6 +6621,7 @@ async def get_document_regions(
             "documentId": document_id,
             "regionScope": region_scope,
             "regions": regions_doc.get("regions", []),
+            "excludedPages": regions_doc.get("excluded_pages", []),
             "createdAt": regions_doc.get("created_at"),
             "updatedAt": regions_doc.get("updated_at"),
             "createdBy": regions_doc.get("created_by")
@@ -6660,14 +6675,27 @@ async def save_document_regions(
         
         now = datetime.utcnow().isoformat()
         
-        # Convert regions to dict format
+        excluded_pages = sorted({
+            int(page)
+            for page in (request.excludedPages or [])
+            if isinstance(page, int) and page > 0
+        })
+        excluded_page_set = set(excluded_pages)
+
+        # Convert regions to dict format and never persist regions for deleted pages
         regions_data = [region.dict() for region in request.regions]
+        regions_data = [
+            region
+            for region in regions_data
+            if int(region.get("pageNumber", 0) or 0) not in excluded_page_set
+        ]
         
         # Prepare regions document
         regions_doc = {
             "document_id": document_id,
             "region_scope": region_scope,
             "regions": regions_data,
+            "excluded_pages": excluded_pages,
             "created_by": current_user.get("user_id"),
             "updated_at": now
         }
@@ -7049,7 +7077,16 @@ async def process_regions_ocr(
                 detail=f"No {region_scope} regions defined for this document. Please draw regions first."
             )
         
-        all_regions = regions_doc.get("regions", [])
+        excluded_pages = {
+            int(page)
+            for page in (regions_doc.get("excluded_pages", []) or [])
+            if isinstance(page, int) and page > 0
+        }
+        all_regions = [
+            region
+            for region in regions_doc.get("regions", [])
+            if int(region.get("pageNumber", 0) or 0) not in excluded_pages
+        ]
         
         # Filter regions if specific IDs provided
         if ocr_request.regionIds:
@@ -7182,7 +7219,8 @@ async def process_regions_ocr(
                         extraction_result.get("ocrResult", {"pages": []}),
                         document.get("subject", "General"),
                         document.get("difficulty", "medium"),
-                        skip_option_extraction=skip_option_extraction
+                        skip_option_extraction=skip_option_extraction,
+                        document_anchor_text=ocr_request.documentAnchorText
                     )
                     if parsed_questions:
                         parsed_question = parsed_questions[0]
