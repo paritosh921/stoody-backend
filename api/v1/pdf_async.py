@@ -36,6 +36,17 @@ from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
 from utils.path_utils import get_relative_path, get_absolute_path
 from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url, download_file
+from services.ai_gateway_service import (
+    AIGatewayService,
+    AIUsageLimitExceeded,
+    estimate_ocr_tokens,
+    estimate_text_tokens,
+)
+from services.answer_question_mapping_service import AnswerQuestionMappingService
+from services.extraction_validator import ExtractionValidator
+from services.layout_preflight_service import LayoutPreflightService
+from services.option_layout_normalizer import OptionLayoutNormalizer
+from services.region_crop_service import RegionCropService
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +160,26 @@ def require_admin_or_tutor(current_user: Dict[str, Any] = Depends(get_current_us
 def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
     return current_user.get("user_type") == "b2c_admin"
+
+
+def _build_ai_gateway_context(
+    *,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    document_id: Optional[str] = None,
+    region_id: Optional[str] = None,
+    region_scope: Optional[str] = None,
+    is_b2c: Optional[bool] = None,
+) -> Dict[str, Any]:
+    return {
+        "db": db,
+        "is_b2c": is_b2c_admin(current_user) if is_b2c is None else is_b2c,
+        "user_id": current_user.get("user_id") or current_user.get("_id"),
+        "tenant_id": current_user.get("tenant_id") or current_user.get("db_name") or current_user.get("institution_id"),
+        "document_id": document_id,
+        "region_id": region_id,
+        "region_scope": region_scope,
+    }
 
 async def delete_existing_ocr_outputs(
     *,
@@ -282,6 +313,43 @@ async def call_gpt_vision_ocr(file_content: bytes) -> Dict[str, Any]:
 
     print(f"[GPT-OCR] Done! {total_pages} pages OCR'd (figures detected with OpenCV later)", flush=True)
     return {"pages": pages_result}
+
+
+async def call_gpt_vision_ocr_validation_fallback(
+    file_content: bytes,
+    *,
+    gateway_context: Optional[Dict[str, Any]],
+    fallback_reason: str,
+) -> Dict[str, Any]:
+    async def _raw_call():
+        return await call_gpt_vision_ocr(file_content)
+
+    if gateway_context:
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        result = await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=gateway_context.get("region_id"),
+            region_scope=gateway_context.get("region_scope"),
+            stage="ocr_fallback_validation",
+            provider="openai",
+            model=OCR_FALLBACK_MODEL,
+            input_kind="pdf_region",
+            estimated_input_tokens=estimate_ocr_tokens(pdf_bytes=len(file_content), page_count=1),
+            estimated_output_tokens=2048,
+            input_units={"pdf_bytes": len(file_content), "page_count": 1},
+            call_fn=_raw_call,
+        )
+    else:
+        result = await _raw_call()
+    result["_ocr_provider"] = "openai"
+    result["_ocr_model"] = OCR_FALLBACK_MODEL
+    result["_fallback_reason"] = fallback_reason
+    return result
 
 
 async def call_mistral_ocr(file_content: bytes) -> Dict[str, Any]:
@@ -654,7 +722,11 @@ def _augment_ocr_with_pymupdf(
         )
 
 
-async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
+async def call_sarvam_ocr(
+    file_content: bytes,
+    *,
+    gateway_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Primary OCR entry point for the pipeline.
     Uses Mistral OCR as primary, GPT Vision as fallback.
@@ -671,23 +743,74 @@ async def call_sarvam_ocr(file_content: bytes) -> Dict[str, Any]:
         ]
     }
     """
+    async def _gateway_call(stage: str, provider: str, model: str, call_fn):
+        if not gateway_context:
+            return await call_fn()
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        return await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=gateway_context.get("region_id"),
+            region_scope=gateway_context.get("region_scope"),
+            stage=stage,
+            provider=provider,
+            model=model,
+            input_kind="pdf_region",
+            estimated_input_tokens=estimate_ocr_tokens(pdf_bytes=len(file_content), page_count=1),
+            estimated_output_tokens=2048,
+            input_units={"pdf_bytes": len(file_content), "page_count": 1},
+            call_fn=call_fn,
+        )
+
     # --- Mistral OCR primary, GPT Vision fallback ---
+    fallback_reason = None
     if MISTRAL_API_KEY:
         try:
-            result = await call_mistral_ocr(file_content)
+            result = await _gateway_call(
+                "ocr_primary",
+                "mistral",
+                MISTRAL_OCR_MODEL,
+                lambda: call_mistral_ocr(file_content),
+            )
+            result["_ocr_provider"] = "mistral"
+            result["_ocr_model"] = MISTRAL_OCR_MODEL
             print("[OCR] Provider: Mistral AI", flush=True)
             return result
+        except AIUsageLimitExceeded as limit_err:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=limit_err.payload,
+            )
         except Exception as mistral_err:
             print(f"[OCR] Mistral OCR failed ({type(mistral_err).__name__}: {mistral_err}), falling back to GPT Vision...", flush=True)
             logger.warning(f"Mistral OCR failed: {mistral_err}")
+            fallback_reason = f"mistral_error:{type(mistral_err).__name__}"
     else:
         print("[OCR] MISTRAL_API_KEY not set, skipping Mistral...", flush=True)
+        fallback_reason = "mistral_api_key_missing"
 
     # GPT Vision fallback
     try:
-        result = await call_gpt_vision_ocr(file_content)
+        result = await _gateway_call(
+            "ocr_fallback",
+            "openai",
+            OCR_FALLBACK_MODEL,
+            lambda: call_gpt_vision_ocr(file_content),
+        )
+        result["_ocr_provider"] = "openai"
+        result["_ocr_model"] = OCR_FALLBACK_MODEL
+        result["_fallback_reason"] = fallback_reason or "primary_unavailable"
         print("[OCR] Provider: GPT Vision (fallback)", flush=True)
         return result
+    except AIUsageLimitExceeded as limit_err:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=limit_err.payload,
+        )
     except Exception as gpt_err:
         logger.error(f"GPT Vision OCR also failed: {gpt_err}")
         raise HTTPException(
@@ -1252,7 +1375,10 @@ async def extract_questions_with_gpt(
     subject: str,
     difficulty: str,
     skip_option_extraction: bool = False,
-    document_anchor_text: Optional[str] = None
+    document_anchor_text: Optional[str] = None,
+    gateway_context: Optional[Dict[str, Any]] = None,
+    layout_report: Optional[Dict[str, Any]] = None,
+    retry_reason: Optional[str] = None,
 ) -> List[ExtractedQuestion]:
     """
     Use LLM to extract structured questions from OCR text.
@@ -1304,10 +1430,30 @@ async def extract_questions_with_gpt(
             "Use this anchor text as an additional hint when locating and organizing relevant question content. "
             "Do not invent content from the anchor text; only extract what is present in the document.\n"
         )
+    layout_instruction = ""
+    if layout_report:
+        layout_instruction = (
+            "\nLAYOUT PREFLIGHT REPORT:\n"
+            f"{json.dumps(layout_report, default=str)[:6000]}\n"
+            "Use this deterministic crop-layout report to avoid trusting OCR reading order blindly.\n"
+        )
+        if "staggered_options" in (layout_report.get("layout_risks") or []):
+            layout_instruction += (
+                "This cropped question region may have staggered MCQ options. "
+                "Some option labels may appear below their option text. "
+                "Use visual/layout association and the supplied layout report. "
+                "Do not bind options only by reading order. "
+                "Return exactly four options when four visual choices exist.\n"
+            )
+    if retry_reason:
+        layout_instruction += (
+            f"\nRETRY REASON: {retry_reason}. Re-check option association before returning JSON.\n"
+        )
 
     extraction_prompt = (
         "You are a question paper parser. Extract ONLY the questions from the text below.\n\n"
         f"{anchor_instruction}"
+        f"{layout_instruction}"
         "RULES:\n"
         "- Extract every question (MCQ, subjective, fill-in-the-blank, true/false, assertion-reason, case study, etc.)\n"
         "- Ignore headers, instructions, school name, exam title, general instructions, section headers, marks info\n"
@@ -1332,13 +1478,39 @@ async def extract_questions_with_gpt(
     # Try extraction with retry — model can return empty responses
     raw_response = ""
     max_retries = 2
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = await client.chat.completions.create(
+    async def _chat_completion(prompt: str):
+        async def _raw_call():
+            return await client.chat.completions.create(
                 model=extract_model,
-                messages=[{"role": "user", "content": extraction_prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 max_completion_tokens=16384,
             )
+
+        if not gateway_context:
+            return await _raw_call()
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        return await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=gateway_context.get("region_id"),
+            region_scope=gateway_context.get("region_scope"),
+            stage="question_structuring_retry" if retry_reason else "question_structuring",
+            provider=provider_name.lower(),
+            model=extract_model,
+            input_kind="text",
+            estimated_input_tokens=estimate_text_tokens(prompt),
+            estimated_output_tokens=4096,
+            max_output_tokens=16384,
+            call_fn=_raw_call,
+        )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await _chat_completion(extraction_prompt)
             raw_response = response.choices[0].message.content or ""
             print(f"[Q-EXTRACT] Attempt {attempt}: got {len(raw_response)} chars", flush=True)
             if raw_response.strip():
@@ -1515,11 +1687,7 @@ async def extract_questions_with_gpt(
             )
 
             try:
-                retry_response = await client.chat.completions.create(
-                    model=extract_model,
-                    messages=[{"role": "user", "content": retry_prompt}],
-                    max_completion_tokens=4096,
-                )
+                retry_response = await _chat_completion(retry_prompt)
                 retry_raw = (retry_response.choices[0].message.content or "").strip()
                 if retry_raw:
                     if retry_raw.startswith("```"):
@@ -1969,7 +2137,16 @@ async def run_document_ocr_pipeline(
     document_id = document["document_id"]
     try:
         logger.info(f"Calling OCR for job {job_id}")
-        ocr_result = await call_sarvam_ocr(file_content)
+        ocr_result = await call_sarvam_ocr(
+            file_content,
+            gateway_context=_build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_scope="document",
+                is_b2c=is_b2c_admin(current_user),
+            ),
+        )
 
         # Mistral OCR's image extraction is unreliable for many Word/Pages-generated
         # PDFs (it returns 0 images even when the PDF has real embedded raster
@@ -2002,7 +2179,14 @@ async def run_document_ocr_pipeline(
             ocr_result,
             document.get("subject", "General"),
             document.get("difficulty", "medium"),
-            skip_option_extraction=skip_option_extraction
+            skip_option_extraction=skip_option_extraction,
+            gateway_context=_build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_scope="document",
+                is_b2c=is_b2c_pre,
+            ),
         )
         
         if skip_option_extraction:
@@ -3259,7 +3443,16 @@ async def run_answer_sheet_ocr_pipeline(
 
     try:
         logger.info(f"Calling answer-sheet OCR for job {job_id}")
-        ocr_result = await call_sarvam_ocr(file_content)
+        ocr_result = await call_sarvam_ocr(
+            file_content,
+            gateway_context=_build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_scope="answer_document",
+                is_b2c=is_b2c,
+            ),
+        )
         extracted_text = _ocr_pages_to_plain_text(ocr_result)
         page_summaries = _ocr_pages_for_storage(ocr_result)
 
@@ -3814,7 +4007,8 @@ async def perform_direct_ocr(
     file: UploadFile = File(...),
     subject: Optional[str] = Form("General"),
     difficulty: Optional[str] = Form("medium"),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
 ):
     """Direct OCR processing for authenticated users (no document persistence)."""
     ocr_started_at = datetime.utcnow()
@@ -3828,7 +4022,15 @@ async def perform_direct_ocr(
         file_content = await file.read()
 
         async def _run_ocr() -> Dict[str, Any]:
-            return await call_sarvam_ocr(file_content)
+            return await call_sarvam_ocr(
+                file_content,
+                gateway_context=_build_ai_gateway_context(
+                    current_user=current_user,
+                    db=db,
+                    region_scope="direct",
+                    is_b2c=is_b2c_admin(current_user),
+                ),
+            )
 
         semaphore = getattr(request.app.state, "ocr_semaphore", None)
         if semaphore:
@@ -6782,7 +6984,10 @@ async def extract_region_from_pdf(
     pdf_content: bytes,
     page_number: int,
     bbox: Dict[str, float],
-    region_id: str
+    region_id: str,
+    *,
+    region_scope: str = "question",
+    gateway_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Extract a specific region from a PDF page and process it with OCR.
@@ -6802,140 +7007,42 @@ async def extract_region_from_pdf(
         Dict with extracted text, images list, and region screenshot
     """
     try:
-        from PIL import Image
-        import fitz  # PyMuPDF
-        import io
-        
-        # Open PDF
-        doc = fitz.open(stream=pdf_content, filetype="pdf")
-        
-        if page_number < 1 or page_number > len(doc):
-            return {
-                "success": False,
-                "error": f"Invalid page number {page_number}"
-            }
-        
-        page = doc[page_number - 1]  # 0-indexed
-        page_rect = page.rect
-        
-        # Convert percentage coordinates to actual coordinates
-        x0 = page_rect.width * (bbox['x'] / 100)
-        y0 = page_rect.height * (bbox['y'] / 100)
-        x1 = x0 + page_rect.width * (bbox['width'] / 100)
-        y1 = y0 + page_rect.height * (bbox['height'] / 100)
-        
-        clip_rect = fitz.Rect(x0, y0, x1, y1)
-        
-        # Create a new single-page PDF with just the region
-        # This allows us to use Sarvam OCR which expects a PDF file
-        region_doc = fitz.open()  # Create new empty PDF
-        
-        # Create a new page with the region dimensions
-        region_width = x1 - x0
-        region_height = y1 - y0
-        new_page = region_doc.new_page(width=region_width, height=region_height)
-        
-        # Copy the content from the original region to the new page
-        # Use show_pdf_page to copy a portion of the original page
-        new_page.show_pdf_page(
-            fitz.Rect(0, 0, region_width, region_height),  # Target rect on new page
-            doc,  # Source document
-            page_number - 1,  # Source page (0-indexed)
-            clip=clip_rect  # Clip to the region
-        )
-        
-        # Get the region PDF as bytes
-        region_pdf_bytes = region_doc.tobytes()
-        region_doc.close()
-        
-        # Also render the region as an image for fallback/reference
-        mat = fitz.Matrix(3.0, 3.0)  # 3x zoom for better quality
-        pix = page.get_pixmap(matrix=mat, clip=clip_rect)
-        region_img_bytes = pix.tobytes("png")
-        region_img_base64 = base64.b64encode(region_img_bytes).decode('utf-8')
-
-        # Keep only embedded raster images whose visible bbox intersects this
-        # exact manual segment in the original PDF. Running PyMuPDF extraction on
-        # the cropped PDF can expose reused page resources and attach the same
-        # image to unrelated regions.
-        region_embedded_images = []
         try:
-            image_infos = page.get_image_info(xrefs=True)
-            seen_image_regions = set()
-            image_matrix = fitz.Matrix(3.0, 3.0)
-            page_area = max(float(page_rect.get_area()), 1.0)
-
-            for img_idx, info in enumerate(image_infos):
-                bbox_value = info.get("bbox")
-                if not bbox_value or len(bbox_value) != 4:
-                    continue
-
-                try:
-                    img_rect = fitz.Rect(bbox_value)
-                    intersection = img_rect & clip_rect
-                except Exception:
-                    continue
-
-                intersection_area = float(intersection.get_area())
-                if intersection.is_empty or intersection_area <= 0:
-                    continue
-                if intersection.width < 8.0 or intersection.height < 8.0:
-                    continue
-
-                img_area = max(float(img_rect.get_area()), 1.0)
-                if img_area / page_area > 0.75:
-                    # Full-page scanned/background images are not question
-                    # figures; the existing region screenshot fallback handles
-                    # those only when the text suggests a figure is needed.
-                    continue
-                if intersection_area / img_area < 0.10:
-                    continue
-
-                region_key = (
-                    round(float(intersection.x0), 1),
-                    round(float(intersection.y0), 1),
-                    round(float(intersection.x1), 1),
-                    round(float(intersection.y1), 1),
-                )
-                if region_key in seen_image_regions:
-                    continue
-                seen_image_regions.add(region_key)
-
-                try:
-                    img_pix = page.get_pixmap(matrix=image_matrix, clip=intersection)
-                    img_bytes = img_pix.tobytes("png")
-                    region_embedded_images.append({
-                        "id": f"page-{page_number}-region-{region_id}-img-{img_idx}",
-                        "base64": base64.b64encode(img_bytes).decode("ascii"),
-                        "top_left_x": int(round(intersection.x0 - clip_rect.x0)),
-                        "top_left_y": int(round(intersection.y0 - clip_rect.y0)),
-                        "bottom_right_x": int(round(intersection.x1 - clip_rect.x0)),
-                        "bottom_right_y": int(round(intersection.y1 - clip_rect.y0)),
-                        "source": "pymupdf_region_intersection"
-                    })
-                except Exception as img_err:
-                    logger.debug(
-                        f"Region {region_id}: failed to render intersecting image "
-                        f"{img_idx}: {img_err}"
-                    )
-        except Exception as img_scan_err:
-            logger.warning(
-                f"Region {region_id}: failed to scan original-page images: {img_scan_err}"
+            crop_result = RegionCropService().crop(
+                pdf_content=pdf_content,
+                page_number=page_number,
+                bbox=bbox,
+                region_id=region_id,
+                region_scope=region_scope,
             )
-        
-        doc.close()
+        except ValueError as crop_err:
+            return {"success": False, "error": str(crop_err)}
+
+        region_pdf_bytes = crop_result["region_pdf_bytes"]
+        region_img_base64 = crop_result["region_png_base64"]
+        region_embedded_images = crop_result.get("embedded_images", [])
+        layout_report = LayoutPreflightService().analyze(
+            region_id=region_id,
+            text_items=crop_result.get("text_items", []),
+            embedded_images=region_embedded_images,
+        )
 
         # OCR the cropped region PDF
         logger.info(f"Calling OCR for region {region_id} (PDF size: {len(region_pdf_bytes)} bytes)")
 
         try:
-            ocr_result = await call_sarvam_ocr(region_pdf_bytes)
+            ocr_result = await call_sarvam_ocr(
+                region_pdf_bytes,
+                gateway_context=gateway_context,
+            )
         except Exception as ocr_err:
             logger.error(f"Sarvam OCR failed for region {region_id}: {ocr_err}")
             return {
                 "success": False,
                 "error": f"OCR failed for region: {ocr_err}",
-                "regionImageBase64": region_img_base64
+                "regionImageBase64": region_img_base64,
+                "layoutReport": layout_report,
+                "cropMetadata": crop_result.get("crop_metadata", {}),
             }
 
         # Extract text and images from OCR result
@@ -6996,7 +7103,11 @@ async def extract_region_from_pdf(
             "extractedText": extracted_text,
             "extractedImages": unique_figures,
             "regionImageBase64": region_img_base64,
-            "ocrResult": ocr_result
+            "ocrResult": ocr_result,
+            "layoutReport": layout_report,
+            "cropMetadata": crop_result.get("crop_metadata", {}),
+            "textItems": crop_result.get("text_items", []),
+            "_regionPdfBytes": region_pdf_bytes,
         }
                 
     except ImportError as e:
@@ -7184,13 +7295,29 @@ async def process_regions_ocr(
                     'width': region['width'],
                     'height': region['height']
                 },
-                region_id=region_id
+                region_id=region_id,
+                region_scope=region_scope,
+                gateway_context=_build_ai_gateway_context(
+                    current_user=current_user,
+                    db=db,
+                    document_id=document_id,
+                    region_id=region_id,
+                    region_scope=region_scope,
+                    is_b2c=is_b2c,
+                ),
             )
             
             if extraction_result['success']:
                 successful += 1
                 region['ocrStatus'] = 'completed'
                 region['extractedText'] = extraction_result.get('extractedText', '')
+                layout_report = extraction_result.get("layoutReport", {})
+                crop_metadata = extraction_result.get("cropMetadata", {})
+                text_items = extraction_result.get("textItems", [])
+                region['layoutStatus'] = 'completed'
+                region['layoutRisks'] = layout_report.get("layout_risks", [])
+                region['manualReviewRequired'] = False
+                region['cropMetadata'] = crop_metadata
                 
                 # Parse extracted text to extract options if present
                 extracted_text = extraction_result.get('extractedText', '')
@@ -7206,6 +7333,7 @@ async def process_regions_ocr(
                         "extractedText": extracted_text,
                         "extractedOptions": None,
                         "extractedImages": None,
+                        "layoutReport": layout_report,
                         "error": None
                     })
                     continue
@@ -7219,9 +7347,18 @@ async def process_regions_ocr(
                         extraction_result.get("ocrResult", {"pages": []}),
                         document.get("subject", "General"),
                         document.get("difficulty", "medium"),
-                        skip_option_extraction=skip_option_extraction,
-                        document_anchor_text=ocr_request.documentAnchorText
-                    )
+                            skip_option_extraction=skip_option_extraction,
+                            document_anchor_text=ocr_request.documentAnchorText,
+                            gateway_context=_build_ai_gateway_context(
+                                current_user=current_user,
+                                db=db,
+                                document_id=document_id,
+                                region_id=region_id,
+                                region_scope=region_scope,
+                                is_b2c=is_b2c,
+                            ),
+                            layout_report=layout_report,
+                        )
                     if parsed_questions:
                         parsed_question = parsed_questions[0]
                         extracted_text = parsed_question.text or extracted_text
@@ -7246,6 +7383,164 @@ async def process_regions_ocr(
                     option_pattern = re.compile(r'^([A-D])\)\s*(.+)$', re.MULTILINE)
                     for match in option_pattern.finditer(extracted_text):
                         options.append(match.group(2).strip())
+
+                layout_corrections: List[Dict[str, Any]] = []
+                validator = ExtractionValidator()
+                expected_option_count = (
+                    4
+                    if not skip_option_extraction
+                    and str(document.get("question_type", "mcq")).lower() == "mcq"
+                    else None
+                )
+                validation_result = validator.validate_question(
+                    question_text=parsed_question.text if parsed_question else extracted_text,
+                    options=options,
+                    layout_report=layout_report,
+                    expected_option_count=expected_option_count,
+                    has_figure=bool(extraction_result.get("extractedImages")),
+                )
+
+                if (
+                    not skip_option_extraction
+                    and "staggered_options" in layout_report.get("layout_risks", [])
+                ):
+                    normalization = OptionLayoutNormalizer().correct(
+                        text_items=text_items,
+                        layout_report=layout_report,
+                    )
+                    normalized_options = normalization.get("options_by_label", {})
+                    if normalized_options and not normalization.get("manual_review_required"):
+                        options = [normalized_options[label] for label in sorted(normalized_options)]
+                        layout_corrections = normalization.get("corrections", [])
+                        validation_result = validator.validate_question(
+                            question_text=parsed_question.text if parsed_question else extracted_text,
+                            options=options,
+                            layout_report=layout_report,
+                            expected_option_count=expected_option_count,
+                            has_figure=bool(extraction_result.get("extractedImages")),
+                        )
+                    elif normalization.get("manual_review_required"):
+                        validation_result["manual_review_required"] = True
+                        validation_result.setdefault("reasons", []).append("ambiguous_option_layout")
+
+                if (
+                    not skip_option_extraction
+                    and not validation_result.get("valid")
+                    and extracted_text.strip()
+                    and parsed_question is not None
+                ):
+                    retry_reason = ",".join(validation_result.get("reasons", []))
+                    try:
+                        retry_questions = await extract_questions_with_gpt(
+                            extraction_result.get("ocrResult", {"pages": []}),
+                            document.get("subject", "General"),
+                            document.get("difficulty", "medium"),
+                            skip_option_extraction=skip_option_extraction,
+                            document_anchor_text=ocr_request.documentAnchorText,
+                            gateway_context=_build_ai_gateway_context(
+                                current_user=current_user,
+                                db=db,
+                                document_id=document_id,
+                                region_id=region_id,
+                                region_scope=region_scope,
+                                is_b2c=is_b2c,
+                            ),
+                            layout_report=layout_report,
+                            retry_reason=retry_reason,
+                        )
+                        if retry_questions:
+                            retry_question = retry_questions[0]
+                            retry_options = list(retry_question.options or [])
+                            retry_validation = validator.validate_question(
+                                question_text=retry_question.text,
+                                options=retry_options,
+                                layout_report=layout_report,
+                                expected_option_count=expected_option_count,
+                                has_figure=bool(extraction_result.get("extractedImages")),
+                            )
+                            if retry_validation.get("valid"):
+                                parsed_question = retry_question
+                                extracted_text = retry_question.text or extracted_text
+                                options = retry_options
+                                validation_result = retry_validation
+                    except Exception as retry_err:
+                        logger.warning(
+                            "Layout-aware parser retry failed for region %s: %s",
+                            region_id,
+                            retry_err,
+                        )
+
+                if (
+                    not skip_option_extraction
+                    and not validation_result.get("valid")
+                    and extraction_result.get("_regionPdfBytes")
+                ):
+                    fallback_reason = "validation_failed_after_layout_retry"
+                    try:
+                        vision_ocr_result = await call_gpt_vision_ocr_validation_fallback(
+                            extraction_result["_regionPdfBytes"],
+                            gateway_context=_build_ai_gateway_context(
+                                current_user=current_user,
+                                db=db,
+                                document_id=document_id,
+                                region_id=region_id,
+                                region_scope=region_scope,
+                                is_b2c=is_b2c,
+                            ),
+                            fallback_reason=fallback_reason,
+                        )
+                        vision_text = _ocr_pages_to_plain_text(vision_ocr_result)
+                        if vision_text.strip():
+                            vision_questions = await extract_questions_with_gpt(
+                                vision_ocr_result,
+                                document.get("subject", "General"),
+                                document.get("difficulty", "medium"),
+                                skip_option_extraction=skip_option_extraction,
+                                document_anchor_text=ocr_request.documentAnchorText,
+                                gateway_context=_build_ai_gateway_context(
+                                    current_user=current_user,
+                                    db=db,
+                                    document_id=document_id,
+                                    region_id=region_id,
+                                    region_scope=region_scope,
+                                    is_b2c=is_b2c,
+                                ),
+                                layout_report=layout_report,
+                                retry_reason=fallback_reason,
+                            )
+                            if vision_questions:
+                                vision_question = vision_questions[0]
+                                vision_options = list(vision_question.options or [])
+                                vision_validation = validator.validate_question(
+                                    question_text=vision_question.text,
+                                    options=vision_options,
+                                    layout_report=layout_report,
+                                    expected_option_count=expected_option_count,
+                                    has_figure=bool(extraction_result.get("extractedImages")),
+                                )
+                                if vision_validation.get("valid"):
+                                    extraction_result["ocrResult"] = vision_ocr_result
+                                    parsed_question = vision_question
+                                    extracted_text = vision_question.text or vision_text
+                                    options = vision_options
+                                    validation_result = vision_validation
+                                else:
+                                    validation_result.setdefault("reasons", []).append("vision_fallback_validation_failed")
+                        else:
+                            validation_result.setdefault("reasons", []).append("vision_fallback_empty")
+                    except Exception as vision_err:
+                        logger.warning(
+                            "Validation-triggered GPT Vision fallback failed for region %s: %s",
+                            region_id,
+                            vision_err,
+                        )
+                        validation_result.setdefault("reasons", []).append("vision_fallback_failed")
+
+                region['manualReviewRequired'] = bool(validation_result.get("manual_review_required"))
+                region['validationStatus'] = "completed"
+                region['validationReasons'] = validation_result.get("reasons", [])
+                if layout_corrections:
+                    region['layoutCorrections'] = layout_corrections
                 
                 # ============================================
                 # SAVE THE EXTRACTED IMAGES (CROPPED FIGURES)
@@ -7366,11 +7661,15 @@ async def process_regions_ocr(
                     "extractedText": extracted_text,
                     "extractedOptions": options if options else None,
                     "extractedImages": [{"id": img['id'], "path": img['path']} for img in question_figures],
+                    "layoutReport": layout_report,
+                    "validation": validation_result,
+                    "manualReviewRequired": bool(validation_result.get("manual_review_required")),
                     "error": None
                 })
                 
                 # Create question in database
                 question_text = parsed_question.text if parsed_question else extracted_text
+                ocr_result_metadata = extraction_result.get("ocrResult", {})
                 
                 # Only parse question structure if not Practice Sets
                 if not parsed_question and not skip_option_extraction:
@@ -7404,12 +7703,32 @@ async def process_regions_ocr(
                     "is_region_based": True,
                     "options_inline": skip_option_extraction,  # Flag indicating options are in text
                     "metadata": parsed_question.metadata if parsed_question else {},
+                    "extraction_metadata": {
+                        "ocr_provider": ocr_result_metadata.get("_ocr_provider", "unknown"),
+                        "ocr_model": ocr_result_metadata.get("_ocr_model", MISTRAL_OCR_MODEL),
+                        "ocr_fallback_reason": ocr_result_metadata.get("_fallback_reason"),
+                        "parser_provider": "groq" if GROQ_API_KEY else "openai",
+                        "parser_model": GROQ_MODEL if GROQ_API_KEY else OCR_FALLBACK_MODEL,
+                        "layout_risks": layout_report.get("layout_risks", []),
+                        "layout_corrections": [
+                            correction.get("correction")
+                            for correction in layout_corrections
+                            if correction.get("correction")
+                        ],
+                        "layout_report": layout_report,
+                        "validation": validation_result,
+                        "extraction_confidence": layout_report.get("option_layout", {}).get("confidence"),
+                        "manual_review_required": bool(validation_result.get("manual_review_required")),
+                    },
                     "region_metadata": {
                         "page": region['pageNumber'],
                         "x": region['x'],
                         "y": region['y'],
                         "width": region['width'],
-                        "height": region['height']
+                        "height": region['height'],
+                        "crop": crop_metadata,
+                        "layout_risks": layout_report.get("layout_risks", []),
+                        "manual_review_required": bool(validation_result.get("manual_review_required")),
                     },
                     "points": parsed_question.points if parsed_question and parsed_question.points else 4.0,
                     "penalty": parsed_question.penalty if parsed_question and parsed_question.penalty else 1.0,
@@ -7433,6 +7752,21 @@ async def process_regions_ocr(
                     "extractedImages": None,
                     "error": extraction_result.get('error', 'Unknown error')
                 })
+
+        answer_question_mappings: List[Dict[str, Any]] = []
+        if is_answer_scope:
+            question_regions_filter = _document_regions_filter(document_id, "question")
+            if is_b2c:
+                question_regions_doc = await db.b2c_find_one("document_regions", question_regions_filter)
+            else:
+                question_regions_doc = await db.mongo_find_one("document_regions", question_regions_filter)
+            answer_question_mappings = await AnswerQuestionMappingService().map_region_order(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
+                question_regions=(question_regions_doc or {}).get("regions", []),
+                answer_regions=all_regions,
+            )
         
         # Update regions with OCR status
         regions_update_filter = {"_id": regions_doc["_id"]} if regions_doc and regions_doc.get("_id") else regions_filter
@@ -7456,6 +7790,13 @@ async def process_regions_ocr(
                 "answer_sheet_ocr_status": final_status,
                 "answer_sheet_ocr_completed_at": datetime.utcnow(),
                 "answer_sheet_processed_regions_count": successful,
+                "answer_sheet_mapped_answers_count": len(
+                    [
+                        mapping
+                        for mapping in answer_question_mappings
+                        if not mapping.get("manual_review_required")
+                    ]
+                ),
                 "answer_sheet_document_anchor_text": (
                     ocr_request.documentAnchorText.strip()
                     if ocr_request.documentAnchorText
@@ -7495,6 +7836,11 @@ async def process_regions_ocr(
             "processedRegions": len(regions_to_process),
             "successfulRegions": successful,
             "failedRegions": failed,
+            "mappedAnswers": len([
+                mapping
+                for mapping in answer_question_mappings
+                if not mapping.get("manual_review_required")
+            ]) if is_answer_scope else None,
             "results": results
         }
         observe_ocr_job(

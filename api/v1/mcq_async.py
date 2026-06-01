@@ -93,6 +93,24 @@ def require_student_or_admin(current_user: Dict[str, Any] = Depends(get_current_
         )
     return current_user
 
+
+async def _get_mapped_worked_answer(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+    question_doc: Dict[str, Any],
+    question_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = {
+        "question_id": question_id,
+        "manual_review_required": False,
+        "confidence": {"$gte": 0.75},
+    }
+    if question_doc.get("document_id"):
+        query["document_id"] = question_doc.get("document_id")
+    if current_user.get("user_type") in {"b2c_user", "b2c_admin"}:
+        return await db.b2c_find_one("answer_question_mappings", query)
+    return await db.mongo_find_one("answer_question_mappings", query)
+
 async def get_current_user_optional(db: DatabaseManager = Depends(get_database)):
     """Optional authentication - returns user if authenticated, None if not"""
     try:
@@ -1377,15 +1395,21 @@ async def check_mcq_answer(
             except (InvalidOperation, TypeError):
                 # Fallback to plain string equality if parsing fails
                 is_correct = user_raw == stored_raw
+            mapped_answer = await _get_mapped_worked_answer(db, current_user, question_doc, question_id)
+            explanation = "Validated against answer key."
+            solution_source = "answer_key"
+            if mapped_answer and not is_correct:
+                explanation = mapped_answer.get("answer_text") or explanation
+                solution_source = "mapped_answer_sheet"
 
             result = {
                 "question_id": question_id,
                 "selected_answer": str(selected_answer),
                 "correct_answer": stored_answer,
                 "is_correct": bool(is_correct),
-                "explanation": "Validated against answer key.",
-                "solution_source": "answer_key",
-                "confidence_score": 1.0
+                "explanation": explanation,
+                "solution_source": solution_source,
+                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0
             }
 
             return {"success": True, "result": result}
@@ -1394,15 +1418,21 @@ async def check_mcq_answer(
         stored_correct_answer = stored_answer_raw.upper()
         if stored_correct_answer in ["A", "B", "C", "D", "E", "F"]:
             is_correct = str(selected_answer).strip().upper() == stored_correct_answer
+            mapped_answer = await _get_mapped_worked_answer(db, current_user, question_doc, question_id)
+            explanation = "Validated against answer key."
+            solution_source = "answer_key"
+            if mapped_answer and not is_correct:
+                explanation = mapped_answer.get("answer_text") or explanation
+                solution_source = "mapped_answer_sheet"
 
             result = {
                 "question_id": question_id,
                 "selected_answer": selected_answer,
                 "correct_answer": stored_correct_answer,
                 "is_correct": is_correct,
-                "explanation": "Validated against answer key.",
-                "solution_source": "answer_key",
-                "confidence_score": 1.0
+                "explanation": explanation,
+                "solution_source": solution_source,
+                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0
             }
             return {"success": True, "result": result}
 
