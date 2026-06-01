@@ -14,9 +14,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
+
+from api.v1.auth_async import get_current_user
+from config_async import MONGODB_DB_STOODY
 
 logger = logging.getLogger(__name__)
 
@@ -72,26 +75,14 @@ async def get_db(request: Request):
     return request.app.state.db
 
 
-async def get_tutor_id_from_token(request: Request) -> str:
-    from core.auth import AuthManager
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization")
-
-    token = auth_header.split(" ", 1)[1]
-    auth_manager: AuthManager = request.app.state.auth
-    try:
-        payload = auth_manager.decode_access_token(token)
-        tutor_id = payload.get("tutor_id") or payload.get("user_id") or payload.get("sub")
-        if not tutor_id:
-            raise HTTPException(status_code=401, detail="Token does not contain tutor information")
-        return str(tutor_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Token decode failed: %s", exc)
-        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+def get_tutor_id_from_user(current_user: Dict[str, Any]) -> str:
+    tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
+    if not tutor_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token does not contain tutor information",
+        )
+    return str(tutor_id)
 
 
 def _coerce_session_data(value: Any) -> Dict[str, Any]:
@@ -154,24 +145,34 @@ def _serialize_detail(doc: dict) -> SessionDetail:
     )
 
 
-async def _get_collection(request: Request, db):
-    tenant_db = await db.get_tenant_db_from_request(request)
+async def _get_collection(db, current_user: Dict[str, Any]):
+    user_type = current_user.get("user_type")
+    is_b2c = current_user.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
+    db_name = current_user.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
+    if not db_name:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant database missing. Please log in again with tenant ID.",
+        )
+
+    tenant_db = await db.get_tenant_db(db_name)
     if tenant_db is None:
-        tenant_db = await db.get_master_db()
-    if tenant_db is None:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant database not available",
+        )
     return tenant_db[COLLECTION_NAME]
 
 
 @router.get("", response_model=SessionListResponse)
 async def list_sessions(
-    request: Request,
     limit: int = 50,
     offset: int = 0,
     db=Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tutor_id = await get_tutor_id_from_token(request)
-    collection = await _get_collection(request, db)
+    tutor_id = get_tutor_id_from_user(current_user)
+    collection = await _get_collection(db, current_user)
     query = {"tutor_id": tutor_id}
 
     try:
@@ -193,12 +194,12 @@ async def list_sessions(
 
 @router.post("", response_model=SessionDetail)
 async def create_session(
-    request: Request,
     payload: CreateSessionRequest,
     db=Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tutor_id = await get_tutor_id_from_token(request)
-    collection = await _get_collection(request, db)
+    tutor_id = get_tutor_id_from_user(current_user)
+    collection = await _get_collection(db, current_user)
     session_data = _session_data_from_payload(payload)
     if session_data is None:
         raise HTTPException(status_code=422, detail="sessionData is required")
@@ -227,12 +228,12 @@ async def create_session(
 
 @router.get("/{session_id}", response_model=SessionDetail)
 async def get_session(
-    request: Request,
     session_id: str,
     db=Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tutor_id = await get_tutor_id_from_token(request)
-    collection = await _get_collection(request, db)
+    tutor_id = get_tutor_id_from_user(current_user)
+    collection = await _get_collection(db, current_user)
 
     try:
         obj_id = ObjectId(session_id)
@@ -247,13 +248,13 @@ async def get_session(
 
 @router.put("/{session_id}", response_model=SessionDetail)
 async def update_session(
-    request: Request,
     session_id: str,
     payload: UpdateSessionRequest,
     db=Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tutor_id = await get_tutor_id_from_token(request)
-    collection = await _get_collection(request, db)
+    tutor_id = get_tutor_id_from_user(current_user)
+    collection = await _get_collection(db, current_user)
 
     try:
         obj_id = ObjectId(session_id)
@@ -293,12 +294,12 @@ async def update_session(
 
 @router.delete("/{session_id}")
 async def delete_session(
-    request: Request,
     session_id: str,
     db=Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    tutor_id = await get_tutor_id_from_token(request)
-    collection = await _get_collection(request, db)
+    tutor_id = get_tutor_id_from_user(current_user)
+    collection = await _get_collection(db, current_user)
 
     try:
         obj_id = ObjectId(session_id)
