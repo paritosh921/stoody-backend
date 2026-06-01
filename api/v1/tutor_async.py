@@ -18,7 +18,9 @@ from models.tutor import (
 from models.student import Student
 from core.database import DatabaseManager
 from core.permissions import has_permission
-from api.v1.auth_async import get_current_user, get_database
+from core.auth import AuthManager
+from core.token_blacklist import revoke_user_session
+from api.v1.auth_async import get_auth_manager, get_current_user, get_database
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -27,6 +29,22 @@ from slowapi.util import get_remote_address
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
+
+
+async def _revoke_tutor_sessions(tutor: Dict[str, Any], auth_manager: Optional[AuthManager]) -> None:
+    user_id = str(tutor.get("_id") or tutor.get("id") or tutor.get("tutor_id") or "")
+    if not user_id or auth_manager is None:
+        return
+
+    try:
+        await auth_manager.invalidate_user_session(user_id)
+    except Exception as exc:
+        _logger.warning("Failed to invalidate tutor auth session %s: %s", user_id, exc)
+
+    try:
+        await revoke_user_session(getattr(auth_manager, "cache_manager", None), user_id)
+    except Exception as exc:
+        _logger.warning("Failed to revoke tutor token sessions %s: %s", user_id, exc)
 
 
 # Helper dependency functions
@@ -700,6 +718,65 @@ async def reset_tutor_password(
     return {
         "message": "Password reset successfully",
         "new_password": new_password,  # Return new password to admin
+    }
+
+
+@router.post("/tutors/{tutor_id}/reset-2fa")
+@limiter.limit("5/minute")
+async def reset_tutor_2fa(
+    request: Request,
+    tutor_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    """
+    Reset tutor 2FA without changing their password (Admin only).
+    The tutor can re-enable 2FA later from their own settings.
+    """
+    tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+    if not tutor:
+        raise HTTPException(status_code=404, detail="Tutor not found")
+
+    now = datetime.utcnow()
+    admin_id = (
+        current_user.get("user_id")
+        or current_user.get("admin_id")
+        or current_user.get("id")
+    )
+    update_data = {
+        "two_fa.enabled": False,
+        "two_fa.required": False,
+        "two_fa.secret_enc": None,
+        "two_fa.temp_secret_enc": None,
+        "two_fa.setup_started_at": None,
+        "two_fa.verified_at": None,
+        "two_fa.last_verified_at": None,
+        "two_fa.requirement_disabled_at": now,
+        "two_fa.reset_at": now,
+        "two_fa.reset_by_admin_id": str(admin_id) if admin_id else None,
+        "two_fa.reset_by_admin_email": current_user.get("email"),
+        "two_fa.reset_reason": "admin_reset",
+    }
+
+    updated = await db.mongo_update_one(
+        "tutors",
+        {"tutor_id": tutor_id},
+        {"$set": update_data},
+    )
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to reset tutor 2FA")
+
+    await _revoke_tutor_sessions(tutor, auth_manager)
+
+    _logger.info(
+        "2FA reset for tutor %s by admin %s",
+        tutor_id,
+        update_data["two_fa.reset_by_admin_id"] or current_user.get("email"),
+    )
+    return {
+        "success": True,
+        "message": "Tutor 2FA reset successfully. The teacher can enable 2FA again from settings.",
     }
 
 

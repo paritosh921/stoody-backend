@@ -218,8 +218,8 @@ async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
 
 
-async def get_auth_manager(request: Request) -> AuthManager:
-    return request.app.state.auth
+async def get_auth_manager(request: Request) -> Optional[AuthManager]:
+    return getattr(request.app.state, "auth", None)
 
 
 def _model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -602,6 +602,23 @@ async def get_tenant_master_admin_or_error(tenant_db, tenant: Dict[str, Any]) ->
             return master_admin
 
     raise HTTPException(status_code=400, detail="Master admin account not found for this tenant")
+
+
+async def best_effort_revoke_admin_sessions(auth_manager: Optional[AuthManager], admin_id: str) -> None:
+    """Try to force old sessions out without failing the completed reset."""
+    if auth_manager is None:
+        logger.warning("Auth manager unavailable; skipping session revocation for admin %s", admin_id)
+        return
+
+    try:
+        await auth_manager.invalidate_user_session(admin_id)
+    except Exception as e:
+        logger.warning("Failed to invalidate cached admin session for %s: %s", admin_id, e)
+
+    try:
+        await revoke_user_session(auth_manager.cache_manager, admin_id)
+    except Exception as e:
+        logger.warning("Failed to set admin session revocation for %s: %s", admin_id, e)
 
 
 async def ensure_tenant_indexes(tenant_db) -> None:
@@ -1220,6 +1237,7 @@ async def approve_tenant(
             "role": "master_admin",
             "permissions": [],
             "is_active": True,
+            "requires_password_change": bool(pending_admin.get("requires_password_change", False)),
             "created_at": datetime.utcnow(),
             "created_by": None,
             "two_fa": pending_admin.get("two_fa") or {
@@ -1427,13 +1445,17 @@ async def reset_tenant_admin_password(
     request: ResetPasswordRequest,
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
-    auth_manager: AuthManager = Depends(get_auth_manager),
+    auth_manager: Optional[AuthManager] = Depends(get_auth_manager),
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
 
     generated_password = generate_admin_reset_password()
-    new_password_hash = auth_manager.get_password_hash(generated_password)
+    new_password_hash = (
+        auth_manager.get_password_hash(generated_password)
+        if auth_manager is not None
+        else pwd_context.hash(generated_password)
+    )
     now = datetime.utcnow()
 
     if tenant["status"] == "pending" and tenant.get("pending_admin"):
@@ -1443,6 +1465,7 @@ async def reset_tenant_admin_password(
                 "$set": {
                     "pending_admin.password_hash": new_password_hash,
                     "pending_admin.password_reset_by_superadmin_at": now,
+                    "pending_admin.requires_password_change": True,
                 },
                 "$push": {
                     "approval_history": {
@@ -1458,20 +1481,20 @@ async def reset_tenant_admin_password(
 
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
-        if tenant_db:
+        if tenant_db is not None:
             master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
             await tenant_db["admins"].update_one(
                 {"_id": master_admin["_id"]},
                 {
                     "$set": {
                         "password_hash": new_password_hash,
+                        "requires_password_change": True,
                         "password_reset_by_superadmin_at": now,
                         "password_reset_by_superadmin_id": admin["admin_id"],
                     }
                 }
             )
-            await auth_manager.invalidate_user_session(str(master_admin["_id"]))
-            await revoke_user_session(auth_manager.cache_manager, str(master_admin["_id"]))
+            await best_effort_revoke_admin_sessions(auth_manager, str(master_admin["_id"]))
 
             await master_db["tenants"].update_one(
                 {"_id": ObjectId(tenant_id)},
@@ -1496,7 +1519,7 @@ async def reset_tenant_admin_2fa(
     tenant_id: str,
     db: DatabaseManager = Depends(get_database),
     admin: Dict = Depends(verify_superadmin_token),
-    auth_manager: AuthManager = Depends(get_auth_manager),
+    auth_manager: Optional[AuthManager] = Depends(get_auth_manager),
 ):
     master_db = await get_master_db_or_503(db)
     tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
@@ -1508,7 +1531,7 @@ async def reset_tenant_admin_2fa(
             {
                 "$set": {
                     "pending_admin.two_fa.enabled": False,
-                    "pending_admin.two_fa.required": True,
+                    "pending_admin.two_fa.required": False,
                     "pending_admin.two_fa.secret_enc": None,
                     "pending_admin.two_fa.temp_secret_enc": None,
                     "pending_admin.two_fa.reset_by_superadmin_at": now,
@@ -1524,18 +1547,21 @@ async def reset_tenant_admin_2fa(
                 }
             }
         )
-        return {"success": True, "message": "Admin 2FA reset successfully"}
+        return {
+            "success": True,
+            "message": "Admin 2FA reset successfully. The admin can enable 2FA again from settings.",
+        }
 
     if tenant["status"] in ["active", "approved"] and tenant.get("db_name"):
         tenant_db = await db.get_tenant_db(tenant["db_name"])
-        if tenant_db:
+        if tenant_db is not None:
             master_admin = await get_tenant_master_admin_or_error(tenant_db, tenant)
             await tenant_db["admins"].update_one(
                 {"_id": master_admin["_id"]},
                 {
                     "$set": {
                         "two_fa.enabled": False,
-                        "two_fa.required": True,
+                        "two_fa.required": False,
                         "two_fa.secret_enc": None,
                         "two_fa.temp_secret_enc": None,
                         "two_fa.setup_started_at": None,
@@ -1545,8 +1571,7 @@ async def reset_tenant_admin_2fa(
                     }
                 }
             )
-            await auth_manager.invalidate_user_session(str(master_admin["_id"]))
-            await revoke_user_session(auth_manager.cache_manager, str(master_admin["_id"]))
+            await best_effort_revoke_admin_sessions(auth_manager, str(master_admin["_id"]))
 
             await master_db["tenants"].update_one(
                 {"_id": ObjectId(tenant_id)},
@@ -1561,7 +1586,10 @@ async def reset_tenant_admin_2fa(
                     }
                 }
             )
-            return {"success": True, "message": "Admin 2FA reset successfully"}
+            return {
+                "success": True,
+                "message": "Admin 2FA reset successfully. The admin can enable 2FA again from settings.",
+            }
 
     raise HTTPException(status_code=400, detail="Unable to reset 2FA for this tenant")
 

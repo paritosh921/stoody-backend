@@ -44,6 +44,12 @@ class _AuthManager:
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
         return True
 
+    def get_password_hash(self, password: str) -> str:
+        return f"hashed:{password}"
+
+    async def invalidate_user_session(self, user_id: str) -> bool:
+        return True
+
 
 @pytest.fixture
 def auth_dependencies(monkeypatch):
@@ -214,6 +220,88 @@ async def _2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies)
     assert response.next == "DONE"
     assert response.access_token == "legacy-token"
     auth_manager.create_user_session.assert_awaited_once()
+
+
+def test_2fa_admin_login_returns_password_change_requirement(auth_dependencies):
+    asyncio.run(_2fa_admin_login_returns_password_change_requirement(auth_dependencies))
+
+
+async def _2fa_admin_login_returns_password_change_requirement(auth_dependencies):
+    admin_doc = {
+        "_id": ObjectId(),
+        "email": "admin@example.com",
+        "password_hash": "hash",
+        "is_active": True,
+        "requires_password_change": True,
+        "two_fa": {"required": False, "enabled": False},
+    }
+    auth_dependencies.tenant_db["admins"] = _Collection(admin_doc)
+    auth_manager = _AuthManager(
+        admin_data={
+            "user_id": str(admin_doc["_id"]),
+            "email": "admin@example.com",
+            "user_type": "admin",
+        }
+    )
+
+    response = await _call(
+        totp_2fa.login_with_2fa,
+        _request(),
+        totp_2fa.LoginRequest(
+            username="admin@example.com",
+            password="secret1",
+            user_type="admin",
+            tenant_id="ABCD-1234",
+        ),
+        db=object(),
+        auth_manager=auth_manager,
+    )
+
+    assert response.success is True
+    assert response.next == "DONE"
+    assert response.user["requires_password_change"] is True
+    session_user_data = auth_manager.create_user_session.await_args.args[0]
+    assert session_user_data["requires_password_change"] is True
+
+
+def test_admin_change_password_clears_password_change_requirement(auth_dependencies):
+    asyncio.run(_admin_change_password_clears_password_change_requirement(auth_dependencies))
+
+
+async def _admin_change_password_clears_password_change_requirement(auth_dependencies):
+    admin_id = ObjectId()
+    admin_doc = {
+        "_id": admin_id,
+        "email": "admin@example.com",
+        "password_hash": "old-hash",
+        "is_active": True,
+        "requires_password_change": True,
+    }
+    auth_dependencies.tenant_db["admins"] = _Collection(admin_doc)
+    db = SimpleNamespace(get_tenant_db=AsyncMock(return_value=auth_dependencies.tenant_db))
+    auth_manager = _AuthManager()
+
+    response = await _call(
+        auth_async.admin_change_password,
+        _request(),
+        auth_async.StudentChangePasswordRequest(
+            current_password="generated-password",
+            new_password="NewStrong1!",
+        ),
+        current_user={
+            "user_id": str(admin_id),
+            "user_type": "admin",
+            "db_name": "skb_abcd_1234",
+        },
+        db=db,
+        auth_manager=auth_manager,
+    )
+
+    assert response["success"] is True
+    update = auth_dependencies.tenant_db["admins"].update_one.await_args.args[1]["$set"]
+    assert update["password_hash"] == "hashed:NewStrong1!"
+    assert update["requires_password_change"] is False
+    assert "password_changed_at" in update
 
 
 def test_2fa_login_hard_bypasses_playstoreteacher(auth_dependencies):
