@@ -162,6 +162,20 @@ def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     return current_user.get("user_type") == "b2c_admin"
 
 
+def _serialize_answer_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the admin-safe fields needed to display a worked-answer mapping."""
+    return {
+        "mapping_id": str(mapping.get("mapping_id") or ""),
+        "question_id": str(mapping.get("question_id") or mapping.get("question_region_id") or ""),
+        "question_region_id": str(mapping.get("question_region_id") or mapping.get("question_id") or ""),
+        "answer_region_id": str(mapping.get("answer_region_id") or ""),
+        "answer_text": mapping.get("answer_text") or "",
+        "mapping_strategy": mapping.get("mapping_strategy") or "",
+        "confidence": mapping.get("confidence"),
+        "manual_review_required": bool(mapping.get("manual_review_required")),
+    }
+
+
 def _build_ai_gateway_context(
     *,
     current_user: Dict[str, Any],
@@ -5440,6 +5454,21 @@ async def get_document_questions(
         else:
             questions = await db.mongo_find("questions", {"document_id": document_id})
 
+        # Worked-answer mappings are an admin/tutor review surface. Do not attach
+        # them for student/B2C learner reads from this shared route.
+        include_worked_answers = user_type in ["admin", "tutor", "b2c_admin"]
+        mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
+        if include_worked_answers:
+            if is_b2c:
+                answer_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+            else:
+                answer_mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+
+            for mapping in answer_mappings:
+                question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
+                if question_id and mapping.get("answer_text"):
+                    mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
+
         # Convert ObjectId to string for JSON serialization and map field names
         serialized_questions = []
         for q in questions:
@@ -5579,8 +5608,12 @@ async def get_document_questions(
                     })
                 except Exception as img_err:
                     logger.error(f"Error processing image: {img_err}")
-            
+
             question_dict["images"] = enriched_images
+
+            question_id = str(question_dict.get("id") or "")
+            if include_worked_answers:
+                question_dict["mapped_worked_answer"] = mappings_by_question_id.get(question_id)
 
             serialized_questions.append(question_dict)
 
@@ -5588,6 +5621,9 @@ async def get_document_questions(
             "document_id": document_id,
             "document_title": document["title"],
             "questions_count": len(serialized_questions),
+            "answer_sheet_ocr_status": document.get("answer_sheet_ocr_status"),
+            "answer_sheet_mapped_answers_count": document.get("answer_sheet_mapped_answers_count"),
+            "has_answer_sheet": bool(document.get("answer_sheet_path")),
             "questions": serialized_questions
         }
 
@@ -6836,6 +6872,128 @@ async def get_document_regions(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get document regions: {str(e)}"
+        )
+
+
+@router.get("/documents/{document_id}/answer-mappings")
+async def get_document_answer_mappings(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Return question-to-worked-answer mappings for admin/tutor review."""
+    try:
+        is_b2c = is_b2c_admin(current_user)
+
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        if not is_b2c:
+            from config_async import DEBUG_MODE as _DEBUG_MODE
+
+            document_admin_id = document.get("admin_id")
+            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+            user_type = current_user.get("user_type")
+
+            if user_type == "admin":
+                admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
+                if admin_id != document_admin_id_str and not _DEBUG_MODE:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You don't have access to this document"
+                    )
+            elif user_type == "tutor":
+                tutor_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
+                if tutor_admin_id != document_admin_id_str and not _DEBUG_MODE:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="You don't have access to this document"
+                    )
+
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+            mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+            answer_regions_doc = await db.b2c_find_one(
+                "document_regions",
+                _document_regions_filter(document_id, "answer")
+            )
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+            mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+            answer_regions_doc = await db.mongo_find_one(
+                "document_regions",
+                _document_regions_filter(document_id, "answer")
+            )
+
+        mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
+        for mapping in mappings:
+            question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
+            if question_id:
+                mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
+
+        def _question_sort_key(question: Dict[str, Any]) -> tuple:
+            region = question.get("region_metadata") or {}
+            return (
+                int(question.get("page_number") or region.get("page") or 0),
+                float(region.get("y") or 0),
+                str(question.get("id") or ""),
+            )
+
+        answer_regions = (answer_regions_doc or {}).get("regions", []) or []
+        extracted_answer_count = len(
+            [
+                region
+                for region in answer_regions
+                if str(region.get("extractedText") or "").strip()
+            ]
+        )
+
+        rows: List[Dict[str, Any]] = []
+        for index, question in enumerate(sorted(questions, key=_question_sort_key), start=1):
+            question_id = str(question.get("id") or "")
+            mapping = mappings_by_question_id.get(question_id)
+            rows.append({
+                "question_index": index,
+                "question_id": question_id,
+                "question_text": question.get("text") or question.get("question_text") or "",
+                "correct_answer": question.get("correct_answer"),
+                "mapped_answer": mapping,
+            })
+
+        mapped_count = len(
+            [
+                mapping
+                for mapping in mappings_by_question_id.values()
+                if mapping.get("answer_text") and not mapping.get("manual_review_required")
+            ]
+        )
+
+        return {
+            "documentId": document_id,
+            "hasAnswerSheet": bool(document.get("answer_sheet_path")),
+            "questionOcrStatus": document.get("ocr_status"),
+            "answerSheetOcrStatus": document.get("answer_sheet_ocr_status") or "not_processed",
+            "questionCount": len(questions),
+            "answerCount": extracted_answer_count,
+            "mappedCount": mapped_count,
+            "mappings": rows,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting answer mappings: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get answer mappings: {str(e)}"
         )
 
 
