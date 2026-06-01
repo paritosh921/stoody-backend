@@ -1988,6 +1988,197 @@ async def extract_questions_with_gpt(
     return questions
 
 
+def _region_sort_key(region: Dict[str, Any]) -> tuple:
+    return (
+        int(region.get("pageNumber", 0) or 0),
+        float(region.get("y", 0) or 0),
+        float(region.get("x", 0) or 0),
+        str(region.get("id") or ""),
+    )
+
+
+def _number_cues_from_text(text: str) -> List[str]:
+    import re
+
+    cues: List[str] = []
+    for pattern in (
+        r"^\s*(?:q(?:uestion)?\.?\s*)?(\d{1,3})[\.\)]\s+",
+        r"\bq(?:uestion)?\.?\s*(\d{1,3})\b",
+    ):
+        match = re.search(pattern, text or "", re.IGNORECASE)
+        if match:
+            cues.append(str(int(match.group(1))))
+    return cues
+
+
+def _resolve_question_context_for_answer_region(
+    *,
+    answer_region: Dict[str, Any],
+    answer_text: str,
+    answer_region_order: int,
+    question_regions: List[Dict[str, Any]],
+    questions_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    questions_by_number: Dict[str, Dict[str, Any]] = {}
+    for index, region in enumerate(question_regions, start=1):
+        for number in {
+            str(index),
+            *_number_cues_from_text(str(region.get("label") or "")),
+            *_number_cues_from_text(str(region.get("extractedText") or "")),
+            *_number_cues_from_text(str(region.get("id") or "")),
+        }:
+            if number and number not in questions_by_number:
+                questions_by_number[number] = region
+
+    matched_region: Optional[Dict[str, Any]] = None
+    for number in _number_cues_from_text(answer_text):
+        candidate = questions_by_number.get(number)
+        if candidate:
+            matched_region = candidate
+            break
+
+    match_strategy = "question_number" if matched_region else "region_order"
+    if matched_region is None and 0 <= answer_region_order < len(question_regions):
+        matched_region = question_regions[answer_region_order]
+
+    question_id = str((matched_region or {}).get("id") or "")
+    question_doc = questions_by_id.get(question_id, {})
+    return {
+        "question_id": question_id,
+        "question_label": (matched_region or {}).get("label"),
+        "match_strategy": match_strategy,
+        "question_text": question_doc.get("text") or question_doc.get("question_text") or (matched_region or {}).get("extractedText") or "",
+        "options": question_doc.get("options") or [],
+        "correct_answer": question_doc.get("correct_answer"),
+        "answer_region_id": answer_region.get("id"),
+    }
+
+
+async def extract_worked_answer_with_gpt(
+    *,
+    ocr_result: Dict[str, Any],
+    raw_answer_text: str,
+    question_context: Dict[str, Any],
+    document_anchor_text: Optional[str] = None,
+    gateway_context: Optional[Dict[str, Any]] = None,
+    layout_report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Extract only the worked solution from an OCR'd answer-sheet region."""
+    import json as _json
+    from openai import AsyncOpenAI
+
+    if GROQ_API_KEY:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        extract_model = GROQ_MODEL
+        provider_name = "Groq"
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY configured - cannot structure worked answer")
+        client = AsyncOpenAI(api_key=openai_key)
+        extract_model = OCR_FALLBACK_MODEL
+        provider_name = "OpenAI"
+
+    pages_text = _ocr_pages_to_plain_text(ocr_result)
+    anchor_instruction = ""
+    if document_anchor_text and document_anchor_text.strip():
+        anchor_instruction = (
+            "\nTEACHER DOCUMENT ANCHOR TEXT / INSTRUCTION:\n"
+            f"{document_anchor_text.strip()}\n"
+            "Use this as the teacher's hint for where the actual worked solution starts "
+            "or how final solution syntax should be organized. If the OCR region contains "
+            "content before this anchor, treat that earlier content as question/restatement "
+            "unless it is clearly required for the worked solution.\n"
+        )
+
+    layout_instruction = ""
+    if layout_report:
+        layout_instruction = (
+            "\nLAYOUT PREFLIGHT REPORT:\n"
+            f"{json.dumps(layout_report, default=str)[:4000]}\n"
+            "Use this crop-layout report as a hint when OCR reading order is noisy.\n"
+        )
+
+    question_text = str(question_context.get("question_text") or "").strip()
+    options_text = "\n".join(
+        f"{chr(65 + idx)}. {option}"
+        for idx, option in enumerate(question_context.get("options") or [])
+    )
+    prompt = (
+        "You are cleaning OCR output from a worked-answer sheet for an objective test.\n"
+        "Extract ONLY the worked solution/explanation for the mapped question.\n\n"
+        f"{anchor_instruction}"
+        f"{layout_instruction}"
+        "MAPPED QUESTION CONTEXT - do not copy this into the answer unless a formula/value is needed:\n"
+        f"Question ID: {question_context.get('question_id') or ''}\n"
+        f"Question label: {question_context.get('question_label') or ''}\n"
+        f"Correct option: {question_context.get('correct_answer') or ''}\n"
+        f"Question:\n{question_text[:6000]}\n"
+        f"Options:\n{options_text[:3000]}\n\n"
+        "RULES:\n"
+        "- Remove any restated question text, option list, exam headers, page headers, or repeated prompt text.\n"
+        "- Keep the mathematical derivation, explanation, final answer, diagrams described in text, and conclusion.\n"
+        "- If the teacher anchor text is present in OCR, start the solution from that anchor or immediately after it.\n"
+        "- If no worked solution is present, return an empty answer_text and set manual_review_required true.\n"
+        "- Preserve math notation, LaTeX, symbols, and line breaks.\n"
+        "- Return ONLY valid JSON, with no markdown fences.\n\n"
+        "JSON format:\n"
+        '{"answer_text": "worked solution only", "confidence": 0.0, "manual_review_required": false, "notes": ""}\n\n'
+        "--- RAW ANSWER REGION OCR ---\n"
+        f"{pages_text or raw_answer_text}"
+    )
+
+    async def _raw_call():
+        return await client.chat.completions.create(
+            model=extract_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=8192,
+        )
+
+    if gateway_context:
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        response = await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=gateway_context.get("region_id"),
+            region_scope=gateway_context.get("region_scope"),
+            stage="answer_structuring",
+            provider=provider_name.lower(),
+            model=extract_model,
+            input_kind="text",
+            estimated_input_tokens=estimate_text_tokens(prompt),
+            estimated_output_tokens=2048,
+            max_output_tokens=8192,
+            call_fn=_raw_call,
+        )
+    else:
+        response = await _raw_call()
+
+    raw_response = (response.choices[0].message.content or "").strip()
+    if raw_response.startswith("```"):
+        raw_response = raw_response.split("\n", 1)[-1]
+        if raw_response.endswith("```"):
+            raw_response = raw_response[:-3].strip()
+
+    data = _json.loads(raw_response)
+    answer_text = str(data.get("answer_text") or "").strip()
+    return {
+        "answer_text": answer_text,
+        "confidence": data.get("confidence"),
+        "manual_review_required": bool(data.get("manual_review_required") or not answer_text),
+        "notes": data.get("notes") or "",
+        "provider": provider_name.lower(),
+        "model": extract_model,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenCV + LLM Figure Detection Pipeline — DISABLED
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7434,6 +7625,33 @@ async def process_regions_ocr(
         successful = 0
         failed = 0
         total_images_saved = 0  # Track total images saved
+        question_regions_for_answer: List[Dict[str, Any]] = []
+        questions_by_id_for_answer: Dict[str, Dict[str, Any]] = {}
+        answer_region_order_by_id: Dict[str, int] = {}
+
+        if is_answer_scope:
+            question_regions_filter = _document_regions_filter(document_id, "question")
+            if is_b2c:
+                question_regions_doc = await db.b2c_find_one("document_regions", question_regions_filter)
+                question_docs_for_answer = await db.b2c_find("questions", {"document_id": document_id})
+            else:
+                question_regions_doc = await db.mongo_find_one("document_regions", question_regions_filter)
+                question_docs_for_answer = await db.mongo_find("questions", {"document_id": document_id})
+
+            question_regions_for_answer = sorted(
+                (question_regions_doc or {}).get("regions", []) or [],
+                key=_region_sort_key,
+            )
+            questions_by_id_for_answer = {
+                str(question.get("id")): question
+                for question in question_docs_for_answer
+                if question.get("id")
+            }
+            answer_region_order_by_id = {
+                str(region.get("id")): index
+                for index, region in enumerate(sorted(all_regions, key=_region_sort_key))
+                if region.get("id")
+            }
         
         for region in regions_to_process:
             region_id = region['id']
@@ -7485,6 +7703,55 @@ async def process_regions_ocr(
                         if ocr_request.documentAnchorText
                         else None
                     )
+                    question_context = _resolve_question_context_for_answer_region(
+                        answer_region=region,
+                        answer_text=extracted_text,
+                        answer_region_order=answer_region_order_by_id.get(str(region_id), -1),
+                        question_regions=question_regions_for_answer,
+                        questions_by_id=questions_by_id_for_answer,
+                    )
+                    try:
+                        structured_answer = await extract_worked_answer_with_gpt(
+                            ocr_result=extraction_result.get("ocrResult", {"pages": []}),
+                            raw_answer_text=extracted_text,
+                            question_context=question_context,
+                            document_anchor_text=ocr_request.documentAnchorText,
+                            gateway_context=_build_ai_gateway_context(
+                                current_user=current_user,
+                                db=db,
+                                document_id=document_id,
+                                region_id=region_id,
+                                region_scope=region_scope,
+                                is_b2c=is_b2c,
+                            ),
+                            layout_report=layout_report,
+                        )
+                        if structured_answer.get("answer_text"):
+                            extracted_text = structured_answer["answer_text"]
+                            region['extractedText'] = extracted_text
+                        region['answerExtractionMetadata'] = {
+                            "question_id": question_context.get("question_id"),
+                            "question_label": question_context.get("question_label"),
+                            "question_match_strategy": question_context.get("match_strategy"),
+                            "answer_parser_provider": structured_answer.get("provider"),
+                            "answer_parser_model": structured_answer.get("model"),
+                            "answer_parser_confidence": structured_answer.get("confidence"),
+                            "answer_parser_notes": structured_answer.get("notes"),
+                        }
+                        region['manualReviewRequired'] = bool(structured_answer.get("manual_review_required"))
+                    except Exception as answer_parse_err:
+                        logger.warning(
+                            "Answer structuring failed for region %s; falling back to raw OCR text: %s",
+                            region_id,
+                            answer_parse_err,
+                        )
+                        region['manualReviewRequired'] = True
+                        region['answerExtractionMetadata'] = {
+                            "question_id": question_context.get("question_id"),
+                            "question_label": question_context.get("question_label"),
+                            "question_match_strategy": question_context.get("match_strategy"),
+                            "answer_parser_error": str(answer_parse_err),
+                        }
                     results.append({
                         "regionId": region_id,
                         "success": True,
@@ -7492,6 +7759,8 @@ async def process_regions_ocr(
                         "extractedOptions": None,
                         "extractedImages": None,
                         "layoutReport": layout_report,
+                        "manualReviewRequired": bool(region.get("manualReviewRequired")),
+                        "answerExtractionMetadata": region.get("answerExtractionMetadata"),
                         "error": None
                     })
                     continue

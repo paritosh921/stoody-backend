@@ -48,9 +48,14 @@ class AnswerQuestionMappingService:
                 used_question_ids.add(str(question_region_id))
             answer_text = str(answer_region.get("extractedText", "") or "").strip()
             confidence = 0.96 if strategy == "question_number" else (0.94 if count_aligned and question_region_id else 0.45)
-            manual_review_required = not count_aligned or not question_region_id or not answer_text
+            manual_review_required = (
+                not count_aligned
+                or not question_region_id
+                or not answer_text
+                or bool(answer_region.get("manualReviewRequired"))
+            )
             if strategy == "question_number" and question_region_id and answer_text:
-                manual_review_required = False
+                manual_review_required = bool(answer_region.get("manualReviewRequired"))
             mapping = {
                 "mapping_id": f"{document_id}:{question_region_id or 'unmapped'}:{answer_region.get('id')}",
                 "document_id": document_id,

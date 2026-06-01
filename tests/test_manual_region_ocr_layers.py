@@ -393,3 +393,67 @@ def test_answer_mapping_uses_question_number_cues_before_region_order():
     assert by_answer["a-first"]["question_id"] == "q2"
     assert by_answer["a-first"]["mapping_strategy"] == "question_number"
     assert by_answer["a-second"]["question_id"] == "q1"
+
+
+def test_answer_context_uses_question_number_and_question_doc():
+    from api.v1.pdf_async import _resolve_question_context_for_answer_region
+
+    question_regions = [
+        {"id": "q1", "label": "Q1", "extractedText": "1. first question", "pageNumber": 1, "x": 0, "y": 10},
+        {"id": "q2", "label": "Q2", "extractedText": "2. second question", "pageNumber": 1, "x": 0, "y": 20},
+    ]
+    questions_by_id = {
+        "q2": {
+            "id": "q2",
+            "text": "Which option is correct?",
+            "options": ["alpha", "beta", "gamma", "delta"],
+            "correct_answer": "C",
+        }
+    }
+
+    context = _resolve_question_context_for_answer_region(
+        answer_region={"id": "a1"},
+        answer_text="2. exp: worked solution for second question",
+        answer_region_order=0,
+        question_regions=question_regions,
+        questions_by_id=questions_by_id,
+    )
+
+    assert context["question_id"] == "q2"
+    assert context["match_strategy"] == "question_number"
+    assert context["question_text"] == "Which option is correct?"
+    assert context["correct_answer"] == "C"
+
+
+def test_answer_mapping_preserves_answer_manual_review_flag():
+    from services.answer_question_mapping_service import AnswerQuestionMappingService
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    mappings = asyncio.run(
+        AnswerQuestionMappingService().map_region_order(
+            db=FakeDb(),
+            is_b2c=False,
+            document_id="doc-1",
+            question_regions=[{"id": "q1", "label": "Q1", "pageNumber": 1, "x": 0, "y": 10}],
+            answer_regions=[
+                {
+                    "id": "a1",
+                    "extractedText": "1. exp: worked solution",
+                    "manualReviewRequired": True,
+                    "pageNumber": 1,
+                    "x": 0,
+                    "y": 10,
+                }
+            ],
+        )
+    )
+
+    assert mappings[0]["question_id"] == "q1"
+    assert mappings[0]["manual_review_required"] is True
