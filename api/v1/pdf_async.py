@@ -147,6 +147,49 @@ def is_b2c_admin(current_user: Dict[str, Any]) -> bool:
     """Check if the current user is a B2C admin"""
     return current_user.get("user_type") == "b2c_admin"
 
+async def delete_existing_ocr_outputs(
+    *,
+    document: Dict[str, Any],
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    question_ids: Optional[List[str]] = None,
+    delete_images: bool = True,
+) -> Dict[str, Any]:
+    """Delete previously extracted OCR questions/images for a document."""
+    document_id = document.get("document_id")
+    filename = document.get("filename", "")
+    is_b2c = is_b2c_admin(current_user)
+    question_filter: Dict[str, Any] = {"document_id": document_id}
+
+    if question_ids:
+        question_filter["id"] = {"$in": question_ids}
+
+    if is_b2c:
+        questions_deleted = await db.b2c_delete_many("questions", question_filter)
+        images_deleted = (
+            await db.b2c_delete_many("images", {"source_pdf": filename})
+            if delete_images and filename
+            else False
+        )
+    else:
+        questions_deleted = await db.mongo_delete_many("questions", question_filter)
+        images_deleted = (
+            await db.mongo_delete_many("images", {"source_pdf": filename})
+            if delete_images and filename
+            else 0
+        )
+
+    logger.info(
+        "Deleted existing OCR outputs for %s: questions=%s, images=%s",
+        document_id,
+        questions_deleted,
+        images_deleted,
+    )
+    return {
+        "questions_deleted": questions_deleted,
+        "images_deleted": images_deleted,
+    }
+
 async def call_gpt_vision_ocr(file_content: bytes) -> Dict[str, Any]:
     """
     OCR using GPT Vision. Renders PDF pages and extracts text via GPT.
@@ -5907,6 +5950,7 @@ class DocumentRegionsResponse(BaseModel):
 class RegionOCRRequest(BaseModel):
     """Request for processing specific regions with OCR"""
     regionIds: Optional[List[str]] = None  # If None, process all regions
+    replaceExisting: bool = True
 
 class RegionOCRResult(BaseModel):
     """Result of OCR processing for a single region"""
@@ -6110,8 +6154,10 @@ async def extract_region_from_pdf(
     """
     Extract a specific region from a PDF page and process it with OCR.
 
-    Uses Sarvam AI Document Intelligence to extract text AND images from the region,
-    just like the direct OCR pipeline does for full documents.
+    Uses Sarvam AI Document Intelligence to extract text from the region, and
+    attaches only images that intersect the selected region on the original PDF
+    page. The original-page intersection avoids duplicated image resources from
+    clipped region PDFs.
 
     Args:
         pdf_content: Raw PDF bytes
@@ -6174,6 +6220,75 @@ async def extract_region_from_pdf(
         pix = page.get_pixmap(matrix=mat, clip=clip_rect)
         region_img_bytes = pix.tobytes("png")
         region_img_base64 = base64.b64encode(region_img_bytes).decode('utf-8')
+
+        # Keep only embedded raster images whose visible bbox intersects this
+        # exact manual segment in the original PDF. Running PyMuPDF extraction on
+        # the cropped PDF can expose reused page resources and attach the same
+        # image to unrelated regions.
+        region_embedded_images = []
+        try:
+            image_infos = page.get_image_info(xrefs=True)
+            seen_image_regions = set()
+            image_matrix = fitz.Matrix(3.0, 3.0)
+            page_area = max(float(page_rect.get_area()), 1.0)
+
+            for img_idx, info in enumerate(image_infos):
+                bbox_value = info.get("bbox")
+                if not bbox_value or len(bbox_value) != 4:
+                    continue
+
+                try:
+                    img_rect = fitz.Rect(bbox_value)
+                    intersection = img_rect & clip_rect
+                except Exception:
+                    continue
+
+                intersection_area = float(intersection.get_area())
+                if intersection.is_empty or intersection_area <= 0:
+                    continue
+                if intersection.width < 8.0 or intersection.height < 8.0:
+                    continue
+
+                img_area = max(float(img_rect.get_area()), 1.0)
+                if img_area / page_area > 0.75:
+                    # Full-page scanned/background images are not question
+                    # figures; the existing region screenshot fallback handles
+                    # those only when the text suggests a figure is needed.
+                    continue
+                if intersection_area / img_area < 0.10:
+                    continue
+
+                region_key = (
+                    round(float(intersection.x0), 1),
+                    round(float(intersection.y0), 1),
+                    round(float(intersection.x1), 1),
+                    round(float(intersection.y1), 1),
+                )
+                if region_key in seen_image_regions:
+                    continue
+                seen_image_regions.add(region_key)
+
+                try:
+                    img_pix = page.get_pixmap(matrix=image_matrix, clip=intersection)
+                    img_bytes = img_pix.tobytes("png")
+                    region_embedded_images.append({
+                        "id": f"page-{page_number}-region-{region_id}-img-{img_idx}",
+                        "base64": base64.b64encode(img_bytes).decode("ascii"),
+                        "top_left_x": int(round(intersection.x0 - clip_rect.x0)),
+                        "top_left_y": int(round(intersection.y0 - clip_rect.y0)),
+                        "bottom_right_x": int(round(intersection.x1 - clip_rect.x0)),
+                        "bottom_right_y": int(round(intersection.y1 - clip_rect.y0)),
+                        "source": "pymupdf_region_intersection"
+                    })
+                except Exception as img_err:
+                    logger.debug(
+                        f"Region {region_id}: failed to render intersecting image "
+                        f"{img_idx}: {img_err}"
+                    )
+        except Exception as img_scan_err:
+            logger.warning(
+                f"Region {region_id}: failed to scan original-page images: {img_scan_err}"
+            )
         
         doc.close()
 
@@ -6192,7 +6307,7 @@ async def extract_region_from_pdf(
 
         # Extract text and images from OCR result
         extracted_text = ""
-        extracted_images = []
+        provider_images = []
 
         for page_data in ocr_result.get("pages", []):
             page_markdown = page_data.get("markdown", "")
@@ -6200,31 +6315,53 @@ async def extract_region_from_pdf(
 
             for img in page_data.get("images", []):
                 if img.get("image_base64"):
-                    extracted_images.append({
-                        "id": img.get("id", f"img-{len(extracted_images)}"),
+                    provider_images.append({
+                        "id": img.get("id", f"img-{len(provider_images)}"),
                         "base64": img.get("image_base64"),
                         "top_left_x": img.get("top_left_x", 0),
                         "top_left_y": img.get("top_left_y", 0),
                         "bottom_right_x": img.get("bottom_right_x", 0),
-                        "bottom_right_y": img.get("bottom_right_y", 0)
+                        "bottom_right_y": img.get("bottom_right_y", 0),
+                        "source": "ocr_provider"
                     })
 
         extracted_text = extracted_text.strip()
 
-        # Filter images: only keep those referenced in the markdown
+        # Prefer images proven to intersect this manual segment in the original
+        # page. Only fall back to provider images when the OCR markdown explicitly
+        # references them; unreferenced provider images from clipped PDFs can be
+        # page-resource duplicates.
         import re
         referenced_ids = set(re.findall(r'!\[[^\]]*\]\(([^)]+)\)', extracted_text))
-        real_figures = [img for img in extracted_images if img['id'] in referenced_ids]
+        candidate_images = list(region_embedded_images)
+
+        if not candidate_images:
+            for img in provider_images:
+                img_id = img.get("id")
+                if img_id and img_id in referenced_ids:
+                    candidate_images.append(img)
+
+        unique_figures = []
+        seen_image_keys = set()
+        for img in candidate_images:
+            img_id = img.get("id")
+            image_key = img.get("base64", "")[:128] or img_id
+            if not image_key or image_key in seen_image_keys:
+                continue
+            seen_image_keys.add(image_key)
+            img["referencedInMarkdown"] = img_id in referenced_ids
+            unique_figures.append(img)
 
         logger.info(
             f"Region {region_id}: {len(extracted_text)} chars, "
-            f"{len(extracted_images)} raw images, {len(real_figures)} actual figures"
+            f"{len(provider_images)} OCR images, {len(region_embedded_images)} "
+            f"region-matched PDF images, {len(unique_figures)} retained figures"
         )
 
         return {
             "success": True,
             "extractedText": extracted_text,
-            "extractedImages": real_figures,
+            "extractedImages": unique_figures,
             "regionImageBase64": region_img_base64,
             "ocrResult": ocr_result
         }
@@ -6278,6 +6415,12 @@ async def process_regions_ocr(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
             )
+
+        if document.get("ocr_status") == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="OCR processing already in progress"
+            )
         
         # Get regions
         if is_b2c:
@@ -6304,6 +6447,8 @@ async def process_regions_ocr(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No matching regions found to process"
             )
+
+        processing_all_regions = not ocr_request.regionIds
         
         # Load PDF content
         from pathlib import Path as _Path
@@ -6345,6 +6490,15 @@ async def process_regions_ocr(
                 {"document_id": document_id},
                 {"$set": {"ocr_status": "processing"}}
             )
+
+        if ocr_request.replaceExisting:
+            await delete_existing_ocr_outputs(
+                document=document,
+                current_user=current_user,
+                db=db,
+                question_ids=None if processing_all_regions else [r["id"] for r in regions_to_process],
+                delete_images=processing_all_regions,
+            )
         
         # Process each region
         results = []
@@ -6380,15 +6534,38 @@ async def process_regions_ocr(
                 
                 # Parse extracted text to extract options if present
                 extracted_text = extraction_result.get('extractedText', '')
-                options = []
-                
-                # Check if this is Practice Sets - skip option extraction
                 document_type = document.get("document_type", "Chapter Notes")
                 skip_option_extraction = document_type == "Practice Sets"
+                parsed_question = None
+
+                try:
+                    parsed_questions = await extract_questions_with_gpt(
+                        extraction_result.get("ocrResult", {"pages": []}),
+                        document.get("subject", "General"),
+                        document.get("difficulty", "medium"),
+                        skip_option_extraction=skip_option_extraction
+                    )
+                    if parsed_questions:
+                        parsed_question = parsed_questions[0]
+                        extracted_text = parsed_question.text or extracted_text
+                        if len(parsed_questions) > 1:
+                            logger.info(
+                                "Region %s produced %s parsed questions; using the first for this segment",
+                                region_id,
+                                len(parsed_questions),
+                            )
+                except Exception as parse_err:
+                    logger.warning(
+                        "Question extraction failed for region %s; falling back to raw OCR text: %s",
+                        region_id,
+                        parse_err,
+                    )
+
+                options = list(parsed_question.options) if parsed_question and not skip_option_extraction else []
                 
                 # Simple parsing for MCQ options (only if not Practice Sets)
                 import re
-                if not skip_option_extraction:
+                if not skip_option_extraction and not options:
                     option_pattern = re.compile(r'^([A-D])\)\s*(.+)$', re.MULTILINE)
                     for match in option_pattern.finditer(extracted_text):
                         options.append(match.group(2).strip())
@@ -6421,7 +6598,7 @@ async def process_regions_ocr(
                                     pdf_filename=document.get("filename", "unknown.pdf"),
                                     db=db,
                                     user_id=current_user.get("user_id"),
-                                    split_composite=True,  # Split if it's a composite image with multiple options
+                                    split_composite=False,
                                     is_b2c=is_b2c
                                 )
                                 
@@ -6454,52 +6631,57 @@ async def process_regions_ocr(
                             except Exception as img_err:
                                 logger.error(f"Failed to save cropped figure {img_id} for region {region_id}: {img_err}")
                 
-                elif region_image_base64 and len(extracted_text.strip()) < 50:
-                    # Fallback: Save region screenshot ONLY when text extraction failed.
-                    # Short text (< 50 chars) means the content is likely a pure diagram/figure
-                    # that OCR couldn't read as text. Don't save for text-heavy questions —
-                    # that would just duplicate the already-extracted text as an image.
-                    logger.info(f"Region {region_id}: minimal text extracted, saving screenshot as figure fallback")
-
-                    try:
-                        saved_images = await save_image_to_disk(
-                            image_base64=region_image_base64,
-                            image_id=f"region-{region_id}-full",
-                            pdf_filename=document.get("filename", "unknown.pdf"),
-                            db=db,
-                            user_id=current_user.get("user_id"),
-                            split_composite=False,
-                            is_b2c=is_b2c
-                        )
-
-                        if saved_images:
-                            total_images_saved += len(saved_images)
-
-                            for saved_img in saved_images:
-                                image_obj = {
-                                    'id': saved_img['id'],
-                                    'filename': saved_img['filename'],
-                                    'path': saved_img['path'],
-                                    'base64Data': region_image_base64,
-                                    'description': '',
-                                    'type': 'region_screenshot',
-                                    'bbox': {
-                                        'x': region['x'],
-                                        'y': region['y'],
-                                        'width': region['width'],
-                                        'height': region['height']
-                                    },
-                                    'metadata': {
-                                        'source': 'manual_segmentation_fallback',
-                                        'page': region['pageNumber'],
-                                        'extractedAt': datetime.utcnow().isoformat()
-                                    }
-                                }
-                                question_figures.append(image_obj)
-                    except Exception as img_err:
-                        logger.error(f"Failed to save region screenshot for {region_id}: {img_err}")
                 else:
-                    logger.info(f"Region {region_id}: text extracted successfully, no figures needed")
+                    figure_hint_pattern = r'\b(figure|fig\.?|diagram|graph|plot|chart|image|shown below|given below|following diagram|following figure)\b'
+                    should_save_region_snapshot = bool(region_image_base64) and (
+                        len(extracted_text.strip()) < 50 or
+                        bool(re.search(figure_hint_pattern, extracted_text, re.IGNORECASE))
+                    )
+
+                    if not should_save_region_snapshot:
+                        logger.info(f"Region {region_id}: text extracted successfully, no figures needed")
+                    else:
+                        # Fallback for vector/embedded diagrams that the OCR provider
+                        # and PyMuPDF image extraction do not expose as separate images.
+                        logger.info(f"Region {region_id}: saving region screenshot as figure fallback")
+
+                        try:
+                            saved_images = await save_image_to_disk(
+                                image_base64=region_image_base64,
+                                image_id=f"region-{region_id}-full",
+                                pdf_filename=document.get("filename", "unknown.pdf"),
+                                db=db,
+                                user_id=current_user.get("user_id"),
+                                split_composite=False,
+                                is_b2c=is_b2c
+                            )
+
+                            if saved_images:
+                                total_images_saved += len(saved_images)
+
+                                for saved_img in saved_images:
+                                    image_obj = {
+                                        'id': saved_img['id'],
+                                        'filename': saved_img['filename'],
+                                        'path': saved_img['path'],
+                                        'base64Data': region_image_base64,
+                                        'description': '',
+                                        'type': 'region_screenshot',
+                                        'bbox': {
+                                            'x': region['x'],
+                                            'y': region['y'],
+                                            'width': region['width'],
+                                            'height': region['height']
+                                        },
+                                        'metadata': {
+                                            'source': 'manual_segmentation_fallback',
+                                            'page': region['pageNumber'],
+                                            'extractedAt': datetime.utcnow().isoformat()
+                                        }
+                                    }
+                                    question_figures.append(image_obj)
+                        except Exception as img_err:
+                            logger.error(f"Failed to save region screenshot for {region_id}: {img_err}")
                 
                 results.append({
                     "regionId": region_id,
@@ -6511,10 +6693,10 @@ async def process_regions_ocr(
                 })
                 
                 # Create question in database
-                question_text = extracted_text
+                question_text = parsed_question.text if parsed_question else extracted_text
                 
                 # Only parse question structure if not Practice Sets
-                if not skip_option_extraction:
+                if not parsed_question and not skip_option_extraction:
                     question_match = re.search(r'QUESTION:\s*(.+?)(?:OPTIONS:|FIGURES:|$)', extracted_text, re.DOTALL)
                     if question_match:
                         question_text = question_match.group(1).strip()
@@ -6541,9 +6723,10 @@ async def process_regions_ocr(
                         }
                         for i, opt in enumerate(options)
                     ] if options else [],  # Empty for Practice Sets
-                    "correct_answer": None,
+                    "correct_answer": parsed_question.correct_answer if parsed_question else None,
                     "is_region_based": True,
                     "options_inline": skip_option_extraction,  # Flag indicating options are in text
+                    "metadata": parsed_question.metadata if parsed_question else {},
                     "region_metadata": {
                         "page": region['pageNumber'],
                         "x": region['x'],
@@ -6551,8 +6734,8 @@ async def process_regions_ocr(
                         "width": region['width'],
                         "height": region['height']
                     },
-                    "points": 4.0,  # Default 4 marks per question
-                    "penalty": 1.0,  # Default 1 mark penalty for wrong answer
+                    "points": parsed_question.points if parsed_question and parsed_question.points else 4.0,
+                    "penalty": parsed_question.penalty if parsed_question and parsed_question.penalty else 1.0,
                     "created_by": current_user.get("user_id"),
                     "created_at": datetime.utcnow()
                 }
