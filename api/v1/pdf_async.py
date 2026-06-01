@@ -101,6 +101,9 @@ class PDFProcessingResult(BaseModel):
     timestamp: datetime
     pages: Optional[List[OCRPage]] = None
 
+class AnswerSheetOCRRequest(BaseModel):
+    documentAnchorText: Optional[str] = None
+
 class QuestionImage(BaseModel):
     id: str
     filename: str
@@ -2386,6 +2389,11 @@ class DocumentMetadata(BaseModel):
     answer_sheet_filename: Optional[str] = None
     answer_sheet_uploaded_at: Optional[datetime] = None
     answer_sheet_pages_count: Optional[int] = None
+    answer_sheet_ocr_status: Optional[str] = None
+    answer_sheet_ocr_job_id: Optional[str] = None
+    answer_sheet_ocr_completed_at: Optional[datetime] = None
+    answer_sheet_processed_regions_count: Optional[int] = None
+    answer_sheet_mapped_answers_count: Optional[int] = None
     has_answer_sheet: bool = False
     exam_finalized: Optional[bool] = None
     exam_finalized_at: Optional[datetime] = None
@@ -3202,6 +3210,328 @@ async def upload_exam_template(
         )
 
 
+def _ocr_pages_to_plain_text(ocr_result: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for page in ocr_result.get("pages", []) or []:
+        page_index = page.get("index", 0)
+        markdown = str(page.get("markdown") or "").strip()
+        if markdown:
+            parts.append(f"=== PAGE {page_index + 1} ===\n{markdown}")
+    return "\n\n".join(parts).strip()
+
+
+def _ocr_pages_for_storage(ocr_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pages: List[Dict[str, Any]] = []
+    for page in ocr_result.get("pages", []) or []:
+        pages.append({
+            "index": page.get("index", 0),
+            "markdown": page.get("markdown", ""),
+            "images": [],
+            "dimensions": page.get("dimensions", {}),
+        })
+    return pages
+
+
+async def run_answer_sheet_ocr_pipeline(
+    document: Dict[str, Any],
+    file_content: bytes,
+    job_id: str,
+    processing_result: Dict[str, Any],
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    cache: CacheManager,
+    document_anchor_text: Optional[str] = None,
+) -> PDFProcessingResult:
+    """Run OCR for the answer sheet without creating student-visible questions."""
+    document_id = document["document_id"]
+    is_b2c = is_b2c_admin(current_user)
+
+    try:
+        logger.info(f"Calling answer-sheet OCR for job {job_id}")
+        ocr_result = await call_sarvam_ocr(file_content)
+        extracted_text = _ocr_pages_to_plain_text(ocr_result)
+        page_summaries = _ocr_pages_for_storage(ocr_result)
+
+        processing_result["progress"] = 90
+        await cache.set(f"pdf_answer_sheet_job:{job_id}", processing_result, 3600, "admin")
+
+        update_data = {
+            "answer_sheet_ocr_status": "completed",
+            "answer_sheet_ocr_job_id": job_id,
+            "answer_sheet_ocr_completed_at": datetime.utcnow(),
+            "answer_sheet_extracted_text": extracted_text,
+            "answer_sheet_ocr_pages": page_summaries,
+            "answer_sheet_document_anchor_text": document_anchor_text.strip() if document_anchor_text else None,
+            "answer_sheet_mapped_answers_count": 0,
+        }
+
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+
+        processing_result["status"] = "completed"
+        processing_result["progress"] = 100
+        processing_result["pages"] = page_summaries
+        await cache.set(f"pdf_answer_sheet_job:{job_id}", processing_result, 3600, "admin")
+
+        logger.info(
+            f"Answer-sheet OCR completed for {document_id}: "
+            f"{len(page_summaries)} pages, {len(extracted_text)} chars"
+        )
+        return PDFProcessingResult(**processing_result)
+
+    except Exception as exc:
+        logger.error(f"Answer-sheet OCR pipeline failed for {document_id}: {exc}", exc_info=True)
+        update_data = {
+            "answer_sheet_ocr_status": "error",
+            "answer_sheet_ocr_error": str(exc),
+            "answer_sheet_ocr_job_id": job_id,
+        }
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+
+        error_result = {
+            "job_id": job_id,
+            "status": "error",
+            "progress": 100,
+            "error": str(exc),
+            "timestamp": datetime.utcnow(),
+        }
+        await cache.set(f"pdf_answer_sheet_job:{job_id}", error_result, 3600, "admin")
+        raise
+
+
+@router.post("/documents/{document_id}/answer-sheet/process-ocr", response_model=PDFProcessingResult)
+@limiter.limit("5/minute")
+async def process_answer_sheet_ocr(
+    request: Request,
+    document_id: str,
+    ocr_request: Optional[AnswerSheetOCRRequest] = Body(default=None),
+    async_mode: bool = Query(True, description="Queue OCR and return immediately when true"),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+    cache: CacheManager = Depends(get_cache),
+):
+    """Trigger OCR processing on an uploaded answer sheet without exposing it to students."""
+    ocr_started_at = datetime.utcnow()
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found",
+            )
+
+        if not document.get("answer_sheet_path"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No answer sheet uploaded for this document",
+            )
+
+        if document.get("answer_sheet_ocr_status") == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Answer sheet OCR processing already in progress",
+            )
+
+        stored_path_raw = str(document.get("answer_sheet_path") or "").replace("\\", "/")
+        file_content = None
+
+        if stored_path_raw.startswith("s3://"):
+            file_content = await download_file(stored_path_raw)
+            if not file_content:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Failed to download answer sheet from S3: {stored_path_raw}",
+                )
+        else:
+            file_path = _resolve_answer_sheet_file_path(document)
+            if not file_path:
+                checked = ", ".join(str(candidate) for candidate in _answer_sheet_file_candidates(document))
+                logger.error(f"Answer sheet file not found for {document_id}. Checked: {checked}")
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Answer sheet PDF file not found on server.",
+                )
+
+            async with aiofiles.open(str(file_path), "rb") as f:
+                file_content = await f.read()
+
+        job_id = str(uuid.uuid4())
+        update_data = {
+            "answer_sheet_ocr_status": "processing",
+            "answer_sheet_ocr_job_id": job_id,
+            "answer_sheet_ocr_started_at": datetime.utcnow(),
+            "answer_sheet_ocr_error": None,
+            "answer_sheet_document_anchor_text": (
+                ocr_request.documentAnchorText.strip()
+                if ocr_request and ocr_request.documentAnchorText
+                else None
+            ),
+        }
+
+        if is_b2c:
+            await db.b2c_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+        else:
+            await db.mongo_update_one(
+                "documents",
+                {"document_id": document_id},
+                {"$set": update_data},
+            )
+
+        processing_result = {
+            "job_id": job_id,
+            "status": "processing",
+            "progress": 20,
+            "extracted_questions": 0,
+            "extracted_images": 0,
+            "output_folder": f"answer_sheet_{document_id}_{int(datetime.utcnow().timestamp())}",
+            "timestamp": datetime.utcnow(),
+        }
+
+        await cache.set(f"pdf_answer_sheet_job:{job_id}", processing_result, 3600, "admin")
+
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        raise
+    except Exception as exc:
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        logger.error(f"Failed to prepare answer-sheet OCR job for {document_id}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start answer sheet OCR processing: {exc}",
+        )
+
+    async def execute_pipeline() -> PDFProcessingResult:
+        return await run_answer_sheet_ocr_pipeline(
+            document=document,
+            file_content=file_content,
+            job_id=job_id,
+            processing_result=processing_result,
+            current_user=current_user,
+            db=db,
+            cache=cache,
+            document_anchor_text=ocr_request.documentAnchorText if ocr_request else None,
+        )
+
+    async def execute_with_semaphore() -> PDFProcessingResult:
+        semaphore = getattr(request.app.state, "ocr_semaphore", None)
+        if semaphore:
+            async with semaphore:
+                return await execute_pipeline()
+        return await execute_pipeline()
+
+    if async_mode:
+        tasks = getattr(request.app.state, "ocr_tasks", None)
+
+        async def background_runner():
+            try:
+                await execute_with_semaphore()
+                observe_ocr_job(
+                    job_type="answer_sheet",
+                    status="success_async",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
+            except HTTPException as exc:
+                logger.error(
+                    f"Background answer-sheet OCR job {job_id} failed with HTTP {exc.status_code}: {exc.detail}"
+                )
+                observe_ocr_job(
+                    job_type="answer_sheet",
+                    status=f"error_{exc.status_code}",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
+            except Exception as exc:
+                observe_ocr_job(
+                    job_type="answer_sheet",
+                    status="error_500",
+                    duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+                )
+                logger.error(f"Background answer-sheet OCR job {job_id} failed: {exc}", exc_info=True)
+
+        task = asyncio.create_task(background_runner())
+        if isinstance(tasks, dict):
+            tasks[job_id] = task
+
+            def _cleanup(_):
+                tasks.pop(job_id, None)
+
+            task.add_done_callback(_cleanup)
+
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status="queued",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content=jsonable_encoder(PDFProcessingResult(**processing_result)),
+        )
+
+    try:
+        result = await execute_with_semaphore()
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status="success",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        return result
+    except HTTPException as exc:
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status=f"error_{exc.status_code}",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        raise
+    except Exception as exc:
+        observe_ocr_job(
+            job_type="answer_sheet",
+            status="error_500",
+            duration_seconds=(datetime.utcnow() - ocr_started_at).total_seconds(),
+        )
+        logger.error(f"Answer-sheet OCR processing failed for {document_id}: {exc}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Answer sheet OCR processing failed: {exc}",
+        )
+
+
 @router.post("/documents/{document_id}/process-ocr", response_model=PDFProcessingResult)
 @limiter.limit("5/minute")
 async def process_document_ocr(
@@ -3709,6 +4039,11 @@ async def get_documents(
                 answer_sheet_filename=doc.get("answer_sheet_filename"),
                 answer_sheet_uploaded_at=doc.get("answer_sheet_uploaded_at"),
                 answer_sheet_pages_count=doc.get("answer_sheet_pages_count"),
+                answer_sheet_ocr_status=doc.get("answer_sheet_ocr_status"),
+                answer_sheet_ocr_job_id=doc.get("answer_sheet_ocr_job_id"),
+                answer_sheet_ocr_completed_at=doc.get("answer_sheet_ocr_completed_at"),
+                answer_sheet_processed_regions_count=doc.get("answer_sheet_processed_regions_count"),
+                answer_sheet_mapped_answers_count=doc.get("answer_sheet_mapped_answers_count"),
                 has_answer_sheet=bool(doc.get("answer_sheet_path")),
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
@@ -4215,11 +4550,16 @@ async def get_student_available_options(
                 instructions=doc.get("instructions"),
                 exam_mode=doc.get("exam_mode"),
                 exam_template_path=doc.get("exam_template_path"),
-                answer_sheet_path=doc.get("answer_sheet_path"),
-                answer_sheet_filename=doc.get("answer_sheet_filename"),
-                answer_sheet_uploaded_at=doc.get("answer_sheet_uploaded_at"),
-                answer_sheet_pages_count=doc.get("answer_sheet_pages_count"),
-                has_answer_sheet=bool(doc.get("answer_sheet_path")),
+                answer_sheet_path=None,
+                answer_sheet_filename=None,
+                answer_sheet_uploaded_at=None,
+                answer_sheet_pages_count=None,
+                answer_sheet_ocr_status=None,
+                answer_sheet_ocr_job_id=None,
+                answer_sheet_ocr_completed_at=None,
+                answer_sheet_processed_regions_count=None,
+                answer_sheet_mapped_answers_count=None,
+                has_answer_sheet=False,
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
                 exam_sync_summary=doc.get("exam_sync_summary"),
@@ -6190,6 +6530,7 @@ class RegionOCRRequest(BaseModel):
     regionIds: Optional[List[str]] = None  # If None, process all regions
     replaceExisting: bool = True
     regionScope: str = "question"
+    documentAnchorText: Optional[str] = None
 
 class RegionOCRResult(BaseModel):
     """Result of OCR processing for a single region"""
@@ -6754,6 +7095,12 @@ async def process_regions_ocr(
         
         # Update document status to processing
         processing_status_update = {status_field: "processing"}
+        if is_answer_scope:
+            processing_status_update["answer_sheet_document_anchor_text"] = (
+                ocr_request.documentAnchorText.strip()
+                if ocr_request.documentAnchorText
+                else None
+            )
         if is_b2c:
             await db.b2c_update_one(
                 "documents",
@@ -6811,6 +7158,11 @@ async def process_regions_ocr(
                 # Parse extracted text to extract options if present
                 extracted_text = extraction_result.get('extractedText', '')
                 if is_answer_scope:
+                    region['documentAnchorText'] = (
+                        ocr_request.documentAnchorText.strip()
+                        if ocr_request.documentAnchorText
+                        else None
+                    )
                     results.append({
                         "regionId": region_id,
                         "success": True,
@@ -7066,6 +7418,11 @@ async def process_regions_ocr(
                 "answer_sheet_ocr_status": final_status,
                 "answer_sheet_ocr_completed_at": datetime.utcnow(),
                 "answer_sheet_processed_regions_count": successful,
+                "answer_sheet_document_anchor_text": (
+                    ocr_request.documentAnchorText.strip()
+                    if ocr_request.documentAnchorText
+                    else None
+                ),
             }
         else:
             document_status_update = {
@@ -7127,17 +7484,19 @@ async def process_regions_ocr(
         # Reset status on error
         try:
             is_b2c = is_b2c_admin(current_user)
+            error_region_scope = _normalise_region_scope(getattr(ocr_request, "regionScope", "question"))
+            error_status_field = "answer_sheet_ocr_status" if error_region_scope == "answer" else "ocr_status"
             if is_b2c:
                 await db.b2c_update_one(
                     "documents",
                     {"document_id": document_id},
-                    {"$set": {"ocr_status": "error"}}
+                    {"$set": {error_status_field: "error"}}
                 )
             else:
                 await db.mongo_update_one(
                     "documents",
                     {"document_id": document_id},
-                    {"$set": {"ocr_status": "error"}}
+                    {"$set": {error_status_field: "error"}}
                 )
         except:
             pass
