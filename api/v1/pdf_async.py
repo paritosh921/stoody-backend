@@ -2432,8 +2432,52 @@ def _document_file_candidates(document: Dict[str, Any]) -> List[Path]:
     return candidates
 
 
+def _answer_sheet_file_candidates(document: Dict[str, Any]) -> List[Path]:
+    backend_dir = Path(os.getcwd())
+    stored_path = str(document.get("answer_sheet_path", "") or "").replace("\\", "/")
+    document_id = str(document.get("document_id", "") or "")
+    document_type = str(document.get("document_type", "") or "")
+    candidates: List[Path] = []
+
+    if stored_path:
+        path = Path(stored_path)
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            candidates.append(backend_dir / stored_path)
+
+        if "uploads/" in stored_path:
+            try:
+                uploads_index = stored_path.index("uploads/")
+                candidates.append(backend_dir / stored_path[uploads_index:])
+            except ValueError:
+                pass
+
+    if document_id and document_type:
+        candidates.append(
+            backend_dir
+            / "uploads"
+            / "documents"
+            / document_type
+            / "answer_sheets"
+            / f"{document_id}_answer_sheet.pdf"
+        )
+
+    return candidates
+
+
 def _resolve_document_file_path(document: Dict[str, Any]) -> Optional[Path]:
     for candidate in _document_file_candidates(document):
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _resolve_answer_sheet_file_path(document: Dict[str, Any]) -> Optional[Path]:
+    for candidate in _answer_sheet_file_candidates(document):
         try:
             if candidate.exists():
                 return candidate
@@ -4295,6 +4339,81 @@ async def get_document_file(
             detail=f"Failed to retrieve document file: {str(e)}"
         )
 
+
+@router.get("/documents/{document_id}/answer-sheet/file")
+@limiter.limit("30/minute")
+async def get_document_answer_sheet_file(
+    request: Request,
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Serve uploaded answer sheet PDF for viewing."""
+    from fastapi.responses import FileResponse, Response
+
+    try:
+        document = await db.mongo_find_one("documents", {"document_id": document_id})
+        if not document:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found"
+            )
+
+        if current_user.get("user_type") == "tutor":
+            tutor_id = current_user.get("tutor_id")
+            teacher_ids = document.get("teacher_ids")
+            if teacher_ids and tutor_id not in teacher_ids:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tutor not authorized for this document")
+
+        stored_path = str(document.get("answer_sheet_path") or "")
+        if not stored_path:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No answer sheet uploaded for this document"
+            )
+
+        filename = document.get("answer_sheet_filename") or f"{document_id}_answer_sheet.pdf"
+
+        if stored_path.startswith("s3://"):
+            file_data = await download_file(stored_path)
+            if not file_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Answer sheet PDF file not found in S3"
+                )
+            return Response(
+                content=file_data,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"inline; filename=\"{filename}\""}
+            )
+
+        file_path = _resolve_answer_sheet_file_path(document)
+        if not file_path:
+            checked = ", ".join(str(candidate) for candidate in _answer_sheet_file_candidates(document))
+            logger.error(f"Answer sheet file does not exist for document {document_id}. Checked: {checked}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Answer sheet PDF file not found on server. Please re-upload this answer sheet from the Admin panel."
+            )
+
+        return FileResponse(
+            path=str(file_path),
+            media_type="application/pdf",
+            filename=filename
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get answer sheet file error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve answer sheet file: {str(e)}"
+        )
+
 @router.post("/documents/{document_id}/recalculate-points")
 @limiter.limit("30/minute")
 async def recalculate_document_points(
@@ -6011,6 +6130,32 @@ async def delete_document(
 # Manual question segmentation and region-based OCR processing
 # =============================================================================
 
+VALID_REGION_SCOPES = {"question", "answer"}
+
+
+def _normalise_region_scope(region_scope: str) -> str:
+    scope = (region_scope or "question").strip().lower()
+    if scope not in VALID_REGION_SCOPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="region_scope must be either 'question' or 'answer'"
+        )
+    return scope
+
+
+def _document_regions_filter(document_id: str, region_scope: str) -> Dict[str, Any]:
+    if region_scope == "question":
+        return {
+            "document_id": document_id,
+            "$or": [
+                {"region_scope": "question"},
+                {"region_scope": {"$exists": False}},
+                {"region_scope": None},
+            ],
+        }
+    return {"document_id": document_id, "region_scope": region_scope}
+
+
 class QuestionRegion(BaseModel):
     """Represents a bounding box for a question region on a PDF page"""
     id: str
@@ -6044,6 +6189,7 @@ class RegionOCRRequest(BaseModel):
     """Request for processing specific regions with OCR"""
     regionIds: Optional[List[str]] = None  # If None, process all regions
     replaceExisting: bool = True
+    regionScope: str = "question"
 
 class RegionOCRResult(BaseModel):
     """Result of OCR processing for a single region"""
@@ -6067,6 +6213,7 @@ class RegionOCRResponse(BaseModel):
 @router.get("/documents/{document_id}/regions")
 async def get_document_regions(
     document_id: str,
+    region_scope: str = Query("question"),
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -6077,6 +6224,7 @@ async def get_document_regions(
     on the PDF pages for question segmentation.
     """
     try:
+        region_scope = _normalise_region_scope(region_scope)
         is_b2c = is_b2c_admin(current_user)
         
         # Verify document exists
@@ -6090,16 +6238,24 @@ async def get_document_regions(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
             )
+
+        if region_scope == "answer" and not document.get("answer_sheet_path"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No answer sheet uploaded for this document"
+            )
         
         # Get regions for this document
+        regions_filter = _document_regions_filter(document_id, region_scope)
         if is_b2c:
-            regions_doc = await db.b2c_find_one("document_regions", {"document_id": document_id})
+            regions_doc = await db.b2c_find_one("document_regions", regions_filter)
         else:
-            regions_doc = await db.mongo_find_one("document_regions", {"document_id": document_id})
+            regions_doc = await db.mongo_find_one("document_regions", regions_filter)
         
         if not regions_doc:
             return {
                 "documentId": document_id,
+                "regionScope": region_scope,
                 "regions": [],
                 "createdAt": None,
                 "updatedAt": None,
@@ -6108,6 +6264,7 @@ async def get_document_regions(
         
         return {
             "documentId": document_id,
+            "regionScope": region_scope,
             "regions": regions_doc.get("regions", []),
             "createdAt": regions_doc.get("created_at"),
             "updatedAt": regions_doc.get("updated_at"),
@@ -6128,6 +6285,7 @@ async def get_document_regions(
 async def save_document_regions(
     document_id: str,
     request: DocumentRegionsRequest,
+    region_scope: str = Query("question"),
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -6138,6 +6296,7 @@ async def save_document_regions(
     This replaces any existing regions for the document.
     """
     try:
+        region_scope = _normalise_region_scope(region_scope)
         is_b2c = is_b2c_admin(current_user)
         
         # Verify document exists
@@ -6151,6 +6310,12 @@ async def save_document_regions(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
             )
+
+        if region_scope == "answer" and not document.get("answer_sheet_path"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No answer sheet uploaded for this document"
+            )
         
         now = datetime.utcnow().isoformat()
         
@@ -6160,41 +6325,44 @@ async def save_document_regions(
         # Prepare regions document
         regions_doc = {
             "document_id": document_id,
+            "region_scope": region_scope,
             "regions": regions_data,
             "created_by": current_user.get("user_id"),
             "updated_at": now
         }
         
         # Upsert regions document
+        regions_filter = _document_regions_filter(document_id, region_scope)
         if is_b2c:
-            existing = await db.b2c_find_one("document_regions", {"document_id": document_id})
+            existing = await db.b2c_find_one("document_regions", regions_filter)
             if existing:
                 await db.b2c_update_one(
                     "document_regions",
-                    {"document_id": document_id},
+                    {"_id": existing["_id"]},
                     {"$set": regions_doc}
                 )
             else:
                 regions_doc["created_at"] = now
                 await db.b2c_insert_one("document_regions", regions_doc)
         else:
-            existing = await db.mongo_find_one("document_regions", {"document_id": document_id})
+            existing = await db.mongo_find_one("document_regions", regions_filter)
             if existing:
                 await db.mongo_update_one(
                     "document_regions",
-                    {"document_id": document_id},
+                    {"_id": existing["_id"]},
                     {"$set": regions_doc}
                 )
             else:
                 regions_doc["created_at"] = now
                 await db.mongo_insert_one("document_regions", regions_doc)
         
-        logger.info(f"Saved {len(request.regions)} regions for document {document_id}")
+        logger.info(f"Saved {len(request.regions)} {region_scope} regions for document {document_id}")
         
         return {
             "success": True,
             "message": f"Saved {len(request.regions)} regions",
             "documentId": document_id,
+            "regionScope": region_scope,
             "regionsCount": len(request.regions)
         }
         
@@ -6211,6 +6379,7 @@ async def save_document_regions(
 @router.delete("/documents/{document_id}/regions")
 async def delete_document_regions(
     document_id: str,
+    region_scope: str = Query("question"),
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -6218,16 +6387,18 @@ async def delete_document_regions(
     Delete all regions for a document.
     """
     try:
+        region_scope = _normalise_region_scope(region_scope)
         is_b2c = is_b2c_admin(current_user)
+        regions_filter = _document_regions_filter(document_id, region_scope)
         
         if is_b2c:
-            result = await db.b2c_delete_one("document_regions", {"document_id": document_id})
+            result = await db.b2c_delete_one("document_regions", regions_filter)
         else:
-            result = await db.mongo_delete_one("document_regions", {"document_id": document_id})
+            result = await db.mongo_delete_one("document_regions", regions_filter)
         
         return {
             "success": True,
-            "message": f"Deleted regions for document {document_id}"
+            "message": f"Deleted {region_scope} regions for document {document_id}"
         }
         
     except Exception as e:
@@ -6495,6 +6666,8 @@ async def process_regions_ocr(
     """
     ocr_started_at = datetime.utcnow()
     try:
+        region_scope = _normalise_region_scope(ocr_request.regionScope)
+        is_answer_scope = region_scope == "answer"
         is_b2c = is_b2c_admin(current_user)
         
         # Get document
@@ -6509,22 +6682,30 @@ async def process_regions_ocr(
                 detail=f"Document {document_id} not found"
             )
 
-        if document.get("ocr_status") == "processing":
+        status_field = "answer_sheet_ocr_status" if is_answer_scope else "ocr_status"
+        if document.get(status_field) == "processing":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="OCR processing already in progress"
             )
+
+        if is_answer_scope and not document.get("answer_sheet_path"):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No answer sheet uploaded for this document"
+            )
         
         # Get regions
+        regions_filter = _document_regions_filter(document_id, region_scope)
         if is_b2c:
-            regions_doc = await db.b2c_find_one("document_regions", {"document_id": document_id})
+            regions_doc = await db.b2c_find_one("document_regions", regions_filter)
         else:
-            regions_doc = await db.mongo_find_one("document_regions", {"document_id": document_id})
+            regions_doc = await db.mongo_find_one("document_regions", regions_filter)
         
         if not regions_doc or not regions_doc.get("regions"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No regions defined for this document. Please draw question regions first."
+                detail=f"No {region_scope} regions defined for this document. Please draw regions first."
             )
         
         all_regions = regions_doc.get("regions", [])
@@ -6546,7 +6727,7 @@ async def process_regions_ocr(
         # Load PDF content
         from pathlib import Path as _Path
         backend_dir = _Path(os.getcwd())
-        file_path = document.get("file_path", "")
+        file_path = document.get("answer_sheet_path" if is_answer_scope else "file_path", "")
         
         pdf_content = None
         
@@ -6559,7 +6740,8 @@ async def process_regions_ocr(
                 logger.error(f"Failed to download PDF from S3: {s3_err}")
         else:
             # Try local file
-            local_path = backend_dir / file_path if not _Path(file_path).is_absolute() else _Path(file_path)
+            resolved_path = _resolve_answer_sheet_file_path(document) if is_answer_scope else _resolve_document_file_path(document)
+            local_path = resolved_path or (backend_dir / file_path if not _Path(file_path).is_absolute() else _Path(file_path))
             if local_path.exists():
                 async with aiofiles.open(str(local_path), "rb") as f:
                     pdf_content = await f.read()
@@ -6567,24 +6749,25 @@ async def process_regions_ocr(
         if not pdf_content:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="PDF file not found"
+                detail="Answer sheet PDF file not found" if is_answer_scope else "PDF file not found"
             )
         
         # Update document status to processing
+        processing_status_update = {status_field: "processing"}
         if is_b2c:
             await db.b2c_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {"ocr_status": "processing"}}
+                {"$set": processing_status_update}
             )
         else:
             await db.mongo_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {"ocr_status": "processing"}}
+                {"$set": processing_status_update}
             )
 
-        if ocr_request.replaceExisting:
+        if ocr_request.replaceExisting and not is_answer_scope:
             await delete_existing_ocr_outputs(
                 document=document,
                 current_user=current_user,
@@ -6627,6 +6810,17 @@ async def process_regions_ocr(
                 
                 # Parse extracted text to extract options if present
                 extracted_text = extraction_result.get('extractedText', '')
+                if is_answer_scope:
+                    results.append({
+                        "regionId": region_id,
+                        "success": True,
+                        "extractedText": extracted_text,
+                        "extractedOptions": None,
+                        "extractedImages": None,
+                        "error": None
+                    })
+                    continue
+
                 document_type = document.get("document_type", "Chapter Notes")
                 skip_option_extraction = document_type == "Practice Sets"
                 parsed_question = None
@@ -6851,50 +7045,58 @@ async def process_regions_ocr(
                 })
         
         # Update regions with OCR status
+        regions_update_filter = {"_id": regions_doc["_id"]} if regions_doc and regions_doc.get("_id") else regions_filter
         if is_b2c:
             await db.b2c_update_one(
                 "document_regions",
-                {"document_id": document_id},
+                regions_update_filter,
                 {"$set": {"regions": all_regions, "updated_at": datetime.utcnow().isoformat()}}
             )
         else:
             await db.mongo_update_one(
                 "document_regions",
-                {"document_id": document_id},
+                regions_update_filter,
                 {"$set": {"regions": all_regions, "updated_at": datetime.utcnow().isoformat()}}
             )
         
         # Update document status
         final_status = "completed" if failed == 0 else ("error" if successful == 0 else "completed")
+        if is_answer_scope:
+            document_status_update = {
+                "answer_sheet_ocr_status": final_status,
+                "answer_sheet_ocr_completed_at": datetime.utcnow(),
+                "answer_sheet_processed_regions_count": successful,
+            }
+        else:
+            document_status_update = {
+                "ocr_status": final_status,
+                "extracted_questions_count": successful,
+                "extracted_images_count": total_images_saved,
+                "ocr_completed_at": datetime.utcnow()
+            }
         
         if is_b2c:
             await db.b2c_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {
-                    "ocr_status": final_status,
-                    "extracted_questions_count": successful,
-                    "extracted_images_count": total_images_saved,
-                    "ocr_completed_at": datetime.utcnow()
-                }}
+                {"$set": document_status_update}
             )
         else:
             await db.mongo_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {
-                    "ocr_status": final_status,
-                    "extracted_questions_count": successful,
-                    "extracted_images_count": total_images_saved,
-                    "ocr_completed_at": datetime.utcnow()
-                }}
+                {"$set": document_status_update}
             )
         
-        logger.info(f"Region OCR completed for {document_id}: {successful} questions, {total_images_saved} images, {failed} failed")
+        logger.info(
+            f"{region_scope.title()} region OCR completed for {document_id}: "
+            f"{successful} regions, {total_images_saved} images, {failed} failed"
+        )
         
         result = {
             "success": True,
             "documentId": document_id,
+            "regionScope": region_scope,
             "processedRegions": len(regions_to_process),
             "successfulRegions": successful,
             "failedRegions": failed,
