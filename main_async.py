@@ -149,6 +149,7 @@ except Exception:
     _debugger_available = False
 
 from api.v1.pdf_async import router as pdf_router
+from api.v1.ai_usage_async import router as ai_usage_router
 from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
 from api.v1.totp_2fa import router as totp_2fa_router
@@ -1009,6 +1010,12 @@ app.include_router(
     pdf_router,
     prefix=f"{API_V1_PREFIX}/pdf",
     tags=["PDF Processing"]
+)
+
+app.include_router(
+    ai_usage_router,
+    prefix=f"{API_V1_PREFIX}/ai-usage",
+    tags=["AI Usage"]
 )
 
 if _debugger_available and debugger_router:

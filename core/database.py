@@ -568,6 +568,57 @@ class DatabaseManager:
             except OperationFailure:
                 pass  # index may already exist with different options
 
+            ai_usage_events = db["ai_usage_events"]
+            await self._ensure_index_with_spec_check(
+                ai_usage_events,
+                [("user_id", 1), ("created_at", -1)],
+                name="idx_ai_usage_user_time"
+            )
+            await self._ensure_index_with_spec_check(
+                ai_usage_events,
+                [("document_id", 1), ("region_id", 1), ("stage", 1), ("created_at", -1)],
+                name="idx_ai_usage_document_region_stage"
+            )
+            await self._ensure_index_with_spec_check(
+                ai_usage_events,
+                [("provider", 1), ("model", 1), ("stage", 1), ("created_at", -1)],
+                name="idx_ai_usage_provider_model_stage"
+            )
+
+            ai_usage_counters = db["ai_usage_counters"]
+            await self._ensure_index_with_spec_check(
+                ai_usage_counters,
+                [("counter_id", 1)],
+                unique=True,
+                name="uniq_ai_usage_counter"
+            )
+            await self._ensure_index_with_spec_check(
+                ai_usage_counters,
+                [("scope", 1), ("subject_id", 1), ("period", 1), ("period_key", 1)],
+                name="idx_ai_usage_counter_scope_period"
+            )
+
+            ai_usage_limits = db["ai_usage_limits"]
+            await self._ensure_index_with_spec_check(
+                ai_usage_limits,
+                [("scope", 1), ("subject_id", 1)],
+                unique=True,
+                name="uniq_ai_usage_limit_subject"
+            )
+
+            answer_question_mappings = db["answer_question_mappings"]
+            await self._ensure_index_with_spec_check(
+                answer_question_mappings,
+                [("document_id", 1), ("question_id", 1)],
+                name="idx_answer_mapping_question"
+            )
+            await self._ensure_index_with_spec_check(
+                answer_question_mappings,
+                [("document_id", 1), ("answer_region_id", 1)],
+                unique=True,
+                name="uniq_answer_mapping_answer_region"
+            )
+
             # Notices collection indexes
             notices = db["notices"]
             await self._ensure_index_with_spec_check(
