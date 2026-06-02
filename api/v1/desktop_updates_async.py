@@ -37,6 +37,21 @@ def _safe_download_name(value: str) -> str:
     return name[:150] or "Stoody_Client_Update.exe"
 
 
+async def _latest_desktop_asset(client: httpx.AsyncClient) -> dict | None:
+    response = await client.get(
+        desktop_updates.latest_release_url(),
+        headers=desktop_updates.github_headers(),
+    )
+    if response.status_code >= 400:
+        logger.warning("Desktop update latest release validation returned HTTP %s", response.status_code)
+        return None
+    release = response.json()
+    latest_version = desktop_updates.normalize_release_version(str(release.get("tag_name") or ""))
+    if not desktop_updates.is_semver(latest_version):
+        return None
+    return desktop_updates.select_windows_asset(release)
+
+
 @router.get("/latest")
 @limiter.limit("60/minute")
 async def latest_desktop_update(request: Request):
@@ -122,6 +137,23 @@ async def desktop_release_notes(request: Request, limit: int = Query(default=10,
 async def download_desktop_update(request: Request, asset_id: int):
     """Stream a GitHub release asset through the backend."""
     client = httpx.AsyncClient(timeout=GITHUB_TIMEOUT, follow_redirects=True)
+    try:
+        allowed_asset = await _latest_desktop_asset(client)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        logger.warning("Desktop update asset validation failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Update download temporarily unavailable",
+        ) from exc
+
+    if not allowed_asset or str(allowed_asset.get("id") or "") != str(asset_id):
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Desktop update asset not found",
+        )
+
     req = client.build_request(
         "GET",
         desktop_updates.asset_api_url(asset_id),

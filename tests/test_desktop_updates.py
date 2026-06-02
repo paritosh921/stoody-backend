@@ -40,3 +40,15 @@ def test_release_notes_payload_filters_non_desktop_versions():
     notes = desktop_updates.release_notes_payload(releases, 10)
 
     assert [note["version"] for note in notes] == ["1.2.21", "1.2.20"]
+
+
+def test_select_windows_asset_rejects_non_exe_assets():
+    release = {
+        "tag_name": "v1.2.21",
+        "assets": [
+            {"id": 101, "name": "firmware.json", "size": 10},
+            {"id": 102, "name": "update-ota.ufw", "size": 100},
+        ],
+    }
+
+    assert desktop_updates.select_windows_asset(release) is None

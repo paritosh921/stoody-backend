@@ -55,6 +55,54 @@ async def _download_asset_bytes(client: httpx.AsyncClient, asset_id: int | str, 
     return response.content
 
 
+async def _valid_firmware_asset_ids(client: httpx.AsyncClient, channel: str) -> set[str]:
+    prefix = desktop_firmware_updates.release_prefix(channel)
+    response = await client.get(
+        desktop_firmware_updates.releases_url(20),
+        headers=desktop_firmware_updates.github_headers(channel),
+    )
+    if response.status_code >= 400:
+        logger.warning("Firmware release validation returned HTTP %s", response.status_code)
+        return set()
+
+    releases = response.json()
+    if not isinstance(releases, list):
+        return set()
+
+    valid_asset_ids: set[str] = set()
+    for release in releases:
+        tag = str(release.get("tag_name") or "")
+        if not tag.startswith(prefix):
+            continue
+
+        manifest_asset = desktop_firmware_updates.asset_by_name(release, "firmware.json")
+        if not manifest_asset or not manifest_asset.get("id"):
+            continue
+
+        try:
+            manifest_bytes = await _download_asset_bytes(client, manifest_asset["id"], channel)
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (HTTPException, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        manifest_channel = str(manifest.get("channel") or "").strip()
+        if manifest_channel and manifest_channel != channel:
+            continue
+
+        for firmware in manifest.get("firmwares") or []:
+            if not firmware.get("enabled", True):
+                continue
+            entry_channel = str(firmware.get("channel") or manifest_channel or channel).strip()
+            if entry_channel != channel:
+                continue
+            asset_name = str(firmware.get("assetName") or "update-ota.ufw")
+            binary_asset = desktop_firmware_updates.asset_by_name(release, asset_name)
+            if binary_asset and binary_asset.get("id"):
+                valid_asset_ids.add(str(binary_asset["id"]))
+
+    return valid_asset_ids
+
+
 @router.get("/firmware/check")
 @limiter.limit("60/minute")
 async def check_desktop_firmware_update(
@@ -147,6 +195,23 @@ async def download_desktop_firmware(
     _ = current_user
     selected_channel = desktop_firmware_updates.normalize_channel(channel)
     client = httpx.AsyncClient(timeout=GITHUB_TIMEOUT, follow_redirects=True)
+    try:
+        valid_asset_ids = await _valid_firmware_asset_ids(client, selected_channel)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        logger.warning("Firmware asset validation failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firmware download temporarily unavailable",
+        ) from exc
+
+    if str(asset_id) not in valid_asset_ids:
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Firmware asset not found",
+        )
+
     req = client.build_request(
         "GET",
         desktop_firmware_updates.asset_api_url(asset_id),

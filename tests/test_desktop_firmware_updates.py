@@ -77,3 +77,19 @@ def test_backend_firmware_token_selection_uses_expected_env_names(monkeypatch):
 
     assert desktop_firmware_updates.github_token("prod") == "prod-secret"
     assert desktop_firmware_updates.github_token("dev") == "dev-secret"
+
+
+def test_asset_by_name_limits_firmware_binary_to_manifest_name():
+    release = {
+        "assets": [
+            {"id": 11, "name": "firmware.json"},
+            {"id": 22, "name": "update-ota.ufw"},
+            {"id": 33, "name": "internal-notes.txt"},
+        ]
+    }
+
+    selected = desktop_firmware_updates.asset_by_name(release, "update-ota.ufw")
+
+    assert selected is not None
+    assert selected["id"] == 22
+    assert desktop_firmware_updates.asset_by_name(release, "missing.ufw") is None
