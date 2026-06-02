@@ -103,13 +103,23 @@ async def _get_mapped_worked_answer(
     query = {
         "question_id": question_id,
         "manual_review_required": False,
-        "confidence": {"$gte": 0.75},
+        "answer_text": {"$exists": True, "$ne": ""},
+        "$or": [
+            {"confidence": {"$gte": 0.75}},
+            {"source": "ai_generated"},
+            {"mapping_strategy": "ai_generated_solution"},
+        ],
     }
     if question_doc.get("document_id"):
         query["document_id"] = question_doc.get("document_id")
     if current_user.get("user_type") in {"b2c_user", "b2c_admin"}:
         return await db.b2c_find_one("answer_question_mappings", query)
     return await db.mongo_find_one("answer_question_mappings", query)
+
+
+def _can_expose_test_answer_key(current_user: Dict[str, Any]) -> bool:
+    return current_user.get("user_type") in {"admin", "b2c_admin"}
+
 
 async def get_current_user_optional(db: DatabaseManager = Depends(get_database)):
     """Optional authentication - returns user if authenticated, None if not"""
@@ -880,7 +890,6 @@ async def get_test_series_questions(
                         "options": q.get("options", []),
                         "enhanced_options": q.get("enhanced_options", []),
                         "enhancedOptions": q.get("enhanced_options", []),  # CamelCase for frontend
-                        "correct_answer": q.get("correct_answer"),
                         "questionType": q.get("question_type", "mcq"),  # Critical for integer input display
                         "question_type": q.get("question_type", "mcq"),
                         "metadata": q.get("metadata", {}),
@@ -890,6 +899,9 @@ async def get_test_series_questions(
                         "extracted_at": q.get("extracted_at"),
                     }
                     
+                    if _can_expose_test_answer_key(current_user):
+                        payload["correct_answer"] = q.get("correct_answer")
+
                     # Enrich figures with base64 from B2C database
                     try:
                         figures: List[Dict[str, Any]] = []
@@ -1035,7 +1047,6 @@ async def get_test_series_questions(
                         "options": q.get("options", []),
                         "enhanced_options": q.get("enhanced_options", []),
                         "enhancedOptions": q.get("enhanced_options", []),  # CamelCase for frontend
-                        "correct_answer": q.get("correct_answer"),
                         "questionType": q.get("question_type", "mcq"),  # Critical for frontend to show correct input type
                         "question_type": q.get("question_type", "mcq"),  # Also include snake_case version
                         "metadata": q.get("metadata", {}),
@@ -1044,6 +1055,9 @@ async def get_test_series_questions(
                         "created_at": q.get("created_at"),
                         "extracted_at": q.get("extracted_at"),
                     }
+
+                    if _can_expose_test_answer_key(current_user):
+                        payload["correct_answer"] = q.get("correct_answer")
 
                     # Enrich figures with base64 (for UI that displays diagrams)
                     try:
@@ -2086,6 +2100,23 @@ async def submit_test_series(
                     points_earned = -penalty_marks
                     score -= penalty_marks
 
+            mapped_answer = await _get_mapped_worked_answer(db, current_user, question, question_id)
+            explanation = ""
+            solution_source = None
+            if mapped_answer:
+                explanation = str(mapped_answer.get("answer_text") or "").strip()
+                mapped_source = str(mapped_answer.get("source") or "").strip()
+                mapped_strategy = str(mapped_answer.get("mapping_strategy") or "").strip()
+                if mapped_source == "ai_generated" or mapped_strategy == "ai_generated_solution":
+                    solution_source = "generated_solution"
+                elif mapped_source:
+                    solution_source = mapped_source
+                else:
+                    solution_source = "mapped_answer_sheet"
+            elif not is_correct:
+                explanation = "Review the correct answer selected by your teacher."
+                solution_source = "answer_key"
+
             question_results.append({
                 "question_id": question_id,
                 "student_answer": student_answer,
@@ -2094,7 +2125,9 @@ async def submit_test_series(
                 "is_attempted": is_attempted,
                 "points": question_points,
                 "penalty_marks": penalty_marks,
-                "points_earned": points_earned
+                "points_earned": points_earned,
+                "explanation": explanation,
+                "solution_source": solution_source
             })
 
         # Calculate percentage

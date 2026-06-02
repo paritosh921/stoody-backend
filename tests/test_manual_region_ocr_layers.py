@@ -1134,3 +1134,75 @@ def test_answer_mapping_preserves_answer_manual_review_flag():
 
     assert mappings[0]["question_id"] == "q1"
     assert mappings[0]["manual_review_required"] is True
+
+
+def test_test_series_activation_requires_correct_answers():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={"document_type": "Test Series", "total_minutes": 30},
+        questions=[
+            {"id": "q1", "correct_answer": "A"},
+            {"id": "q2", "correct_answer": ""},
+            {"id": "q3"},
+        ],
+    )
+
+    assert len(errors) == 1
+    assert "2 question(s) do not have a correct answer selected" in errors[0]
+    assert "Question 2" not in errors[0]
+
+
+def test_test_series_activation_requires_uploaded_answer_sheet_full_mapping():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={
+            "document_type": "Test Series",
+            "total_minutes": 30,
+            "answer_sheet_path": "uploads/answers.pdf",
+        },
+        questions=[
+            {"id": "q1", "correct_answer": "A"},
+            {"id": "q2", "correct_answer": "B"},
+            {"id": "q3", "correct_answer": "C"},
+        ],
+        answer_coverage={
+            "answer_solution_coverage_status": "not_ready",
+            "answer_solution_coverage_summary": {
+                "question_count": 3,
+                "mapped_answer_count": 2,
+                "manual_review_count": 0,
+            },
+        },
+    )
+
+    assert errors == [
+        "Uploaded answer sheet is not fully mapped. 2/3 question(s) have mapped solutions."
+    ]
+
+
+def test_test_series_activation_allows_ready_test_series():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={
+            "document_type": "Test Series",
+            "total_minutes": 30,
+            "answer_sheet_path": "uploads/answers.pdf",
+        },
+        questions=[
+            {"id": "q1", "correct_answer": "A"},
+            {"id": "q2", "correct_answer": "B"},
+        ],
+        answer_coverage={
+            "answer_solution_coverage_status": "ready",
+            "answer_solution_coverage_summary": {
+                "question_count": 2,
+                "mapped_answer_count": 2,
+                "manual_review_count": 0,
+            },
+        },
+    )
+
+    assert errors == []

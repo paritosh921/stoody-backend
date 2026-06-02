@@ -2117,6 +2117,68 @@ async def refresh_answer_solution_coverage(
     return coverage
 
 
+def _has_uploaded_answer_sheet(document: Dict[str, Any]) -> bool:
+    return bool(document.get("answer_sheet_path") or document.get("has_answer_sheet"))
+
+
+def _build_test_series_activation_errors(
+    *,
+    document: Dict[str, Any],
+    questions: List[Dict[str, Any]],
+    answer_coverage: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return concise reasons why a Test Series cannot be activated."""
+    if document.get("document_type") != "Test Series":
+        return []
+
+    errors: List[str] = []
+    if not questions:
+        errors.append("No questions found. Run question OCR before activating this test series.")
+        return errors
+
+    missing_correct_count = len(
+        [
+            q
+            for q in questions
+            if not str(q.get("correct_answer") or "").strip()
+        ]
+    )
+    if missing_correct_count:
+        errors.append(
+            f"{missing_correct_count} question(s) do not have a correct answer selected. "
+            "Select a correct answer for every question before activating."
+        )
+
+    total_minutes = document.get("total_minutes") or 0
+    if total_minutes <= 0:
+        errors.append("Test duration is not set. Set total minutes before activating.")
+
+    if _has_uploaded_answer_sheet(document):
+        coverage_summary = (answer_coverage or {}).get("answer_solution_coverage_summary") or {}
+        coverage_status = (answer_coverage or {}).get("answer_solution_coverage_status")
+        question_count = coverage_summary.get("question_count") or len(questions)
+        mapped_count = coverage_summary.get("mapped_answer_count") or 0
+        manual_review_count = coverage_summary.get("manual_review_count") or 0
+
+        if coverage_status != "ready":
+            errors.append(
+                "Uploaded answer sheet is not fully mapped. "
+                f"{mapped_count}/{question_count} question(s) have mapped solutions."
+            )
+        elif mapped_count < question_count:
+            errors.append(
+                "Uploaded answer sheet is not fully mapped. "
+                f"{mapped_count}/{question_count} question(s) have mapped solutions."
+            )
+
+        if manual_review_count:
+            errors.append(
+                f"{manual_review_count} mapped answer(s) still need manual review before activation."
+            )
+
+    return errors
+
+
 async def extract_worked_answer_with_gpt(
     *,
     ocr_result: Dict[str, Any],
@@ -5758,7 +5820,37 @@ async def update_document_metadata(
             update_data["total_minutes"] = total_minutes
 
         if "is_active" in metadata:
-            update_data["is_active"] = bool(metadata["is_active"])
+            desired_active = bool(metadata["is_active"])
+            if desired_active:
+                merged_doc = {**existing_doc, **update_data, "is_active": desired_active}
+                questions = await db.mongo_find("questions", {"document_id": document_id})
+                answer_coverage: Optional[Dict[str, Any]] = None
+
+                if _has_uploaded_answer_sheet(merged_doc):
+                    mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+                    coverage_document = {**merged_doc, "answer_solution_mode": "upload"}
+                    answer_coverage = AnswerSolutionCoverageService().compute(
+                        document=coverage_document,
+                        questions=questions or [],
+                        mappings=mappings or [],
+                    )
+                    update_data.update(answer_coverage)
+
+                activation_errors = _build_test_series_activation_errors(
+                    document=merged_doc,
+                    questions=questions or [],
+                    answer_coverage=answer_coverage,
+                )
+                if activation_errors:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "message": "Cannot activate this test series yet.",
+                            "errors": activation_errors,
+                        },
+                    )
+
+            update_data["is_active"] = desired_active
 
         if not update_data:
             raise HTTPException(
