@@ -173,6 +173,9 @@ def _serialize_answer_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
         "mapping_strategy": mapping.get("mapping_strategy") or "",
         "confidence": mapping.get("confidence"),
         "manual_review_required": bool(mapping.get("manual_review_required")),
+        "source": mapping.get("source") or "answer_sheet",
+        "correct_option_verified": mapping.get("correct_option_verified"),
+        "generation_notes": mapping.get("generation_notes") or "",
     }
 
 
@@ -2179,6 +2182,122 @@ async def extract_worked_answer_with_gpt(
     }
 
 
+def _normalise_correct_answer_label(value: Any) -> str:
+    label = str(value or "").strip().upper()
+    if label in {"A", "B", "C", "D"}:
+        return label
+    if label in {"1", "2", "3", "4"}:
+        return chr(64 + int(label))
+    return label
+
+
+async def generate_worked_solution_batch(
+    *,
+    questions: List[Dict[str, Any]],
+    document: Dict[str, Any],
+    gateway_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate worked MCQ explanations for a batch of extracted questions."""
+    import json as _json
+    from openai import AsyncOpenAI
+
+    if GROQ_API_KEY:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        extract_model = GROQ_MODEL
+        provider_name = "Groq"
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY configured - cannot generate solutions")
+        client = AsyncOpenAI(api_key=openai_key)
+        extract_model = OCR_FALLBACK_MODEL
+        provider_name = "OpenAI"
+
+    question_payload = []
+    for question in questions:
+        options = question.get("options") or []
+        enhanced_options = question.get("enhanced_options") or []
+        if not options and enhanced_options:
+            options = [
+                opt.get("content") if isinstance(opt, dict) else str(opt)
+                for opt in enhanced_options
+            ]
+        question_payload.append({
+            "question_id": str(question.get("id") or ""),
+            "question_text": question.get("text") or question.get("question_text") or "",
+            "options": options,
+            "correct_answer": _normalise_correct_answer_label(question.get("correct_answer")),
+        })
+
+    prompt = (
+        "You are generating worked solutions for objective test-series questions.\n"
+        "Each item is already extracted by OCR and reviewed by the tutor before this call.\n\n"
+        "For every item:\n"
+        "- Use ONLY the provided question text, options, and tutor-selected correct answer label.\n"
+        "- First judge whether the selected correct option is actually consistent with the question and options.\n"
+        "- If the selected option appears correct, provide a detailed worked explanation leading to that option.\n"
+        "- If the selected option appears wrong, ambiguous, or the OCR/options are insufficient, still explain the issue, "
+        "set manual_review_required true, and do not pretend the answer is verified.\n"
+        "- Do not use the original PDF, screenshots, or any external document context.\n"
+        "- Preserve math notation and use clear rich text / markdown-compatible formatting.\n\n"
+        "Return ONLY valid JSON, with no markdown fences:\n"
+        '{"solutions": ['
+        '{"question_id": "id", "answer_text": "worked explanation", "confidence": 0.0, '
+        '"correct_option_verified": true, "manual_review_required": false, "notes": ""}'
+        "]}\n\n"
+        f"Document: {document.get('title') or document.get('document_id')}\n"
+        f"Subject: {document.get('subject') or 'General'}\n"
+        "--- QUESTION OPTION SETS ---\n"
+        f"{json.dumps(question_payload, ensure_ascii=False, default=str)}"
+    )
+
+    async def _raw_call():
+        return await client.chat.completions.create(
+            model=extract_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=16384,
+        )
+
+    if gateway_context:
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        response = await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=None,
+            region_scope="generated_solution_batch",
+            stage="solution_generation_batch",
+            provider=provider_name.lower(),
+            model=extract_model,
+            input_kind="text",
+            estimated_input_tokens=estimate_text_tokens(prompt),
+            estimated_output_tokens=4096,
+            max_output_tokens=16384,
+            input_units={"questions": len(question_payload)},
+            call_fn=_raw_call,
+        )
+    else:
+        response = await _raw_call()
+
+    raw_response = (response.choices[0].message.content or "").strip()
+    if raw_response.startswith("```"):
+        raw_response = raw_response.split("\n", 1)[-1]
+        if raw_response.endswith("```"):
+            raw_response = raw_response[:-3].strip()
+    data = _json.loads(raw_response)
+    return {
+        "solutions": data.get("solutions", []),
+        "provider": provider_name.lower(),
+        "model": extract_model,
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenCV + LLM Figure Detection Pipeline — DISABLED
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2922,6 +3041,7 @@ async def upload_pdf(
     question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
     instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
     exam_mode: Optional[str] = Form(None),  # "dcr" or "pcr" — offline exam conduction mode
+    answer_solution_mode: Optional[str] = Form(None),  # none, upload, or auto
     tally_num_questions: Optional[int] = Form(None),
     tally_max_marks_per_question: Optional[float] = Form(None),
     tally_marking_scheme: Optional[str] = Form(None),
@@ -3016,6 +3136,24 @@ async def upload_pdf(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Answer sheet upload is only allowed for online objective Test Series documents",
+                )
+
+        answer_solution_mode = (answer_solution_mode or ("upload" if answer_sheet is not None else "none")).strip().lower()
+        if answer_solution_mode not in {"none", "upload", "auto"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="answer_solution_mode must be one of: none, upload, auto",
+            )
+        if answer_solution_mode == "upload" and answer_sheet is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Upload mode requires an answer sheet PDF",
+            )
+        if answer_solution_mode == "auto":
+            if document_type != "Test Series" or exam_mode or question_type == "subjective":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Auto-generated solutions are only allowed for online objective Test Series documents",
                 )
 
         # Validate title length
@@ -3241,6 +3379,9 @@ async def upload_pdf(
             "answer_sheet_ocr_status": "not_processed" if answer_sheet_path else None,
             "answer_sheet_ocr_job_id": None,
             "answer_sheet_mapped_answers_count": 0,
+            "answer_solution_mode": answer_solution_mode,
+            "generated_solutions_status": "not_generated" if answer_solution_mode == "auto" else None,
+            "generated_solutions_count": 0,
             "exam_finalized": False,
             "exam_finalized_at": None,
             "exam_sync_summary": None,
@@ -5815,6 +5956,9 @@ async def get_document_questions(
             "answer_sheet_ocr_status": document.get("answer_sheet_ocr_status"),
             "answer_sheet_mapped_answers_count": document.get("answer_sheet_mapped_answers_count"),
             "has_answer_sheet": bool(document.get("answer_sheet_path")),
+            "answer_solution_mode": document.get("answer_solution_mode"),
+            "generated_solutions_status": document.get("generated_solutions_status"),
+            "generated_solutions_count": document.get("generated_solutions_count"),
             "questions": serialized_questions
         }
 
@@ -6974,6 +7118,13 @@ class RegionOCRRequest(BaseModel):
     regionScope: str = "question"
     documentAnchorText: Optional[str] = None
 
+
+class GenerateSolutionsRequest(BaseModel):
+    """Request for generating worked solutions from extracted MCQ questions."""
+    confirmQuestionsReviewed: bool = False
+    replaceExisting: bool = True
+    batchSize: int = Field(default=8, ge=1, le=20)
+
 class RegionOCRResult(BaseModel):
     """Result of OCR processing for a single region"""
     regionId: str
@@ -7146,6 +7297,14 @@ async def get_document_answer_mappings(
                 if str(region.get("extractedText") or "").strip()
             ]
         )
+        generated_solution_count = len(
+            [
+                mapping
+                for mapping in mappings
+                if mapping.get("source") == "ai_generated" and mapping.get("answer_text")
+            ]
+        )
+        answer_count = extracted_answer_count or generated_solution_count
 
         rows: List[Dict[str, Any]] = []
         for index, question in enumerate(sorted(questions, key=_question_sort_key), start=1):
@@ -7172,8 +7331,11 @@ async def get_document_answer_mappings(
             "hasAnswerSheet": bool(document.get("answer_sheet_path")),
             "questionOcrStatus": document.get("ocr_status"),
             "answerSheetOcrStatus": document.get("answer_sheet_ocr_status") or "not_processed",
+            "answerSolutionMode": document.get("answer_solution_mode") or ("upload" if document.get("answer_sheet_path") else "none"),
+            "generatedSolutionsStatus": document.get("generated_solutions_status"),
+            "generatedSolutionCount": generated_solution_count,
             "questionCount": len(questions),
-            "answerCount": extracted_answer_count,
+            "answerCount": answer_count,
             "mappedCount": mapped_count,
             "mappings": rows,
         }
@@ -7185,6 +7347,227 @@ async def get_document_answer_mappings(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get answer mappings: {str(e)}"
+        )
+
+
+@router.post("/documents/{document_id}/generate-solutions")
+async def generate_document_solutions(
+    document_id: str,
+    generation_request: GenerateSolutionsRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Generate worked explanations from extracted MCQ question data."""
+    started_at = datetime.utcnow()
+    is_b2c = is_b2c_admin(current_user)
+    try:
+        if not generation_request.confirmQuestionsReviewed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Confirm that OCR has identified the questions/options correctly before generating solutions.",
+            )
+
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+
+        if not document:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+        if not is_b2c:
+            from config_async import DEBUG_MODE as _DEBUG_MODE
+
+            document_admin_id = document.get("admin_id")
+            document_admin_id_str = str(document_admin_id) if document_admin_id is not None else None
+            user_type = current_user.get("user_type")
+            if user_type == "admin":
+                admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
+                if admin_id != document_admin_id_str and not _DEBUG_MODE:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+            elif user_type == "tutor":
+                tutor_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
+                if tutor_admin_id != document_admin_id_str and not _DEBUG_MODE:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+
+        if document.get("document_type") != "Test Series" or document.get("exam_mode"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Auto-generated solutions are only available for online Test Series documents.",
+            )
+        if str(document.get("question_type") or "mcq").lower() != "mcq":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Auto-generated solutions require objective questions.",
+            )
+        if document.get("ocr_status") != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Question paper OCR must be completed before generating solutions.",
+            )
+
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+
+        if not questions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No extracted questions found. Run question paper OCR first.",
+            )
+
+        missing_correct = [
+            str(question.get("id") or index + 1)
+            for index, question in enumerate(questions)
+            if not _normalise_correct_answer_label(question.get("correct_answer"))
+        ]
+        if missing_correct:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"All questions must have a correct answer before generating solutions. Missing: {', '.join(missing_correct[:10])}",
+            )
+
+        def _question_sort_key(question: Dict[str, Any]) -> tuple:
+            region = question.get("region_metadata") or {}
+            return (
+                int(question.get("page_number") or region.get("page") or 0),
+                float(region.get("y") or 0),
+                str(question.get("id") or ""),
+            )
+
+        sorted_questions = sorted(questions, key=_question_sort_key)
+
+        status_update = {
+            "answer_solution_mode": "auto",
+            "generated_solutions_status": "processing",
+            "generated_solutions_started_at": started_at,
+            "generated_solutions_error": None,
+        }
+        if is_b2c:
+            await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": status_update})
+        else:
+            await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": status_update})
+
+        if not generation_request.replaceExisting:
+            if is_b2c:
+                existing_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+            else:
+                existing_mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+            existing_question_ids = {
+                str(mapping.get("question_id") or "")
+                for mapping in existing_mappings
+                if mapping.get("answer_text")
+            }
+            sorted_questions = [
+                question
+                for question in sorted_questions
+                if str(question.get("id") or "") not in existing_question_ids
+            ]
+
+        generated = 0
+        manual_review = 0
+        failed = 0
+        batch_size = max(1, min(20, int(generation_request.batchSize or 8)))
+        for offset in range(0, len(sorted_questions), batch_size):
+            batch = sorted_questions[offset:offset + batch_size]
+            batch_result = await generate_worked_solution_batch(
+                questions=batch,
+                document=document,
+                gateway_context=_build_ai_gateway_context(
+                    current_user=current_user,
+                    db=db,
+                    document_id=document_id,
+                    region_scope="generated_solution_batch",
+                    is_b2c=is_b2c,
+                ),
+            )
+            solutions_by_id = {
+                str(solution.get("question_id") or ""): solution
+                for solution in batch_result.get("solutions", [])
+            }
+            for question in batch:
+                question_id = str(question.get("id") or "")
+                solution = solutions_by_id.get(question_id)
+                if not solution:
+                    failed += 1
+                    continue
+                answer_text = str(solution.get("answer_text") or "").strip()
+                if not answer_text:
+                    failed += 1
+                    continue
+                confidence = solution.get("confidence")
+                try:
+                    confidence = float(confidence)
+                except (TypeError, ValueError):
+                    confidence = 0.5
+                review_required = bool(solution.get("manual_review_required")) or not bool(solution.get("correct_option_verified"))
+                if review_required:
+                    manual_review += 1
+                mapping = {
+                    "mapping_id": f"{document_id}:{question_id}:generated",
+                    "document_id": document_id,
+                    "question_region_id": question_id,
+                    "question_id": question_id,
+                    "answer_region_id": f"generated:{question_id}",
+                    "answer_text": answer_text,
+                    "mapping_strategy": "ai_generated_solution",
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "manual_review_required": review_required,
+                    "source": "ai_generated",
+                    "correct_option_verified": bool(solution.get("correct_option_verified")),
+                    "generation_notes": solution.get("notes") or "",
+                    "generator_provider": batch_result.get("provider"),
+                    "generator_model": batch_result.get("model"),
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                }
+                query = {"document_id": document_id, "question_id": question_id}
+                if is_b2c:
+                    await db.b2c_update_one("answer_question_mappings", query, {"$set": mapping}, upsert=True)
+                else:
+                    await db.mongo_update_one("answer_question_mappings", query, {"$set": mapping}, upsert=True)
+                generated += 1
+
+        completed_update = {
+            "answer_solution_mode": "auto",
+            "generated_solutions_status": "completed",
+            "generated_solutions_completed_at": datetime.utcnow(),
+            "generated_solutions_count": generated,
+            "generated_solutions_manual_review_count": manual_review,
+            "generated_solutions_failed_count": failed,
+            "answer_sheet_mapped_answers_count": generated - manual_review,
+        }
+        if is_b2c:
+            await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": completed_update})
+        else:
+            await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": completed_update})
+
+        return {
+            "success": True,
+            "documentId": document_id,
+            "processedQuestions": len(sorted_questions),
+            "generated": generated,
+            "manualReviewRequired": manual_review,
+            "failed": failed,
+            "batchSize": batch_size,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_update = {
+            "generated_solutions_status": "error",
+            "generated_solutions_error": str(e),
+        }
+        if is_b2c:
+            await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": error_update})
+        else:
+            await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": error_update})
+        logger.error(f"Generate solutions failed for {document_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate solutions: {e}",
         )
 
 
