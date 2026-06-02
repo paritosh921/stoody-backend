@@ -124,6 +124,7 @@ def test_document_layout_provider_pymupdf_detects_question_and_staggered_options
     page.insert_text((20, 105), "c. Gamma", fontsize=10)
     page.insert_text((35, 125), "Delta", fontsize=10)
     page.insert_text((20, 140), "d.", fontsize=10)
+    page.insert_text((20, 160), "e. Epsilon", fontsize=10)
     pdf = doc.tobytes()
     doc.close()
 
@@ -139,6 +140,10 @@ def test_document_layout_provider_pymupdf_detects_question_and_staggered_options
     assert report["page_count"] == 1
     assert report["pages"][0]["question_anchors"][0]["number"] == "1"
     assert "staggered_options_possible" in report["document_layout_risks"]
+    evidence = report["pages"][0]["question_option_evidence"][0]
+    assert evidence["question_number"] == "1"
+    assert evidence["option_labels_found"] == ["A", "B", "C", "D", "E"]
+    assert evidence["expected_option_count"] == 5
 
 
 def test_full_document_validator_marks_low_question_count_against_anchors():
@@ -155,11 +160,212 @@ def test_full_document_validator_marks_low_question_count_against_anchors():
     summary = FullDocumentExtractionValidator().validate_questions(
         questions=questions,
         layout_report=layout_report,
-        expected_option_count=4,
     )
 
     assert summary["status"] == "manual_segmentation_recommended"
     assert "question_count_lower_than_layout_anchors" in summary["reasons"]
+
+
+def test_full_document_validator_accepts_layout_supported_three_option_mcq():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id="q1",
+            text="Which statement is correct?",
+            options=["alpha", "beta", "gamma"],
+            metadata={"question_number": "1"},
+        )
+    ]
+    layout_report = {
+        "pages": [
+            {
+                "question_anchors": [{"number": "1"}],
+                "question_option_evidence": [
+                    {
+                        "question_number": "1",
+                        "option_labels_found": ["A", "B", "C"],
+                        "expected_option_count": 3,
+                        "evidence_confidence": 0.9,
+                    }
+                ],
+            }
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+    )
+
+    assert summary["status"] == "trusted_draft"
+    assert summary["warnings"] == []
+
+
+def test_full_document_validator_flags_missing_options_when_five_option_layout_has_two_extracted():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id="q1",
+            text="Choose the best alternative from the options.",
+            options=["alpha", "beta"],
+            metadata={"question_number": "1"},
+        )
+    ]
+    layout_report = {
+        "pages": [
+            {
+                "question_anchors": [{"number": "1"}],
+                "question_option_evidence": [
+                    {
+                        "question_number": "1",
+                        "option_labels_found": ["A", "B", "C", "D", "E"],
+                        "expected_option_count": 5,
+                        "evidence_confidence": 0.88,
+                    }
+                ],
+            }
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+    )
+
+    warning = summary["warnings"][0]
+    assert "missing_options_detected" in warning["reasons"]
+    assert warning["observed_option_count"] == 2
+    assert warning["expected_option_count"] == 5
+    assert warning["missing_option_labels"] == ["C", "D", "E"]
+
+
+def test_full_document_validator_uses_ocr_markdown_option_evidence_for_scanned_pdf():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id="q1",
+            text="Choose the best answer from the following.",
+            options=["alpha", "beta"],
+            metadata={"question_number": "1"},
+        )
+    ]
+    layout_report = {
+        "has_text_layer": False,
+        "pages": [
+            {
+                "question_anchors": [{"number": "1"}],
+                "question_option_evidence": [],
+            }
+        ],
+    }
+    ocr_result = {
+        "pages": [
+            {
+                "index": 0,
+                "markdown": "1. Choose the best answer from the following.\nA. Alpha\nB. Beta\nC. Gamma\nD. Delta",
+            }
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+        ocr_result=ocr_result,
+    )
+
+    warning = summary["warnings"][0]
+    assert "missing_options_detected" in warning["reasons"]
+    assert warning["expected_option_count"] == 4
+    assert warning["missing_option_labels"] == ["C", "D"]
+    assert warning["option_evidence"]["source"] == "ocr_markdown"
+
+
+def test_full_document_validator_accepts_layout_supported_two_option_objective_question():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id="q1",
+            text="The statement is true or false.",
+            options=["True", "False"],
+            metadata={"question_number": "1"},
+        )
+    ]
+    layout_report = {
+        "pages": [
+            {
+                "question_anchors": [{"number": "1"}],
+                "question_option_evidence": [
+                    {
+                        "question_number": "1",
+                        "option_labels_found": ["A", "B"],
+                        "expected_option_count": 2,
+                        "evidence_confidence": 0.86,
+                    }
+                ],
+            }
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+    )
+
+    assert "missing_options_detected" not in summary["reasons"]
+    assert summary["status"] == "trusted_draft"
+
+
+def test_full_document_validator_flags_incomplete_question_text():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id="q1",
+            text="Which of the",
+            options=["alpha", "beta", "gamma"],
+            metadata={"question_number": "1"},
+        )
+    ]
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report={"pages": [{"question_anchors": [{"number": "1"}]}]},
+    )
+
+    assert "incomplete_question_text" in summary["warnings"][0]["reasons"]
+    assert summary["warnings"][0]["reason_severities"]["incomplete_question_text"] == "medium"
+
+
+def test_document_layout_provider_does_not_infer_subjective_subparts_as_options():
+    from services.document_layout_provider import DocumentLayoutProvider
+
+    report = DocumentLayoutProvider()._text_report_for_page(
+        text=(
+            "1. Answer the following parts.\n"
+            "(a) Prove that the sequence is convergent.\n"
+            "(b) Explain why the limit exists.\n"
+            "(c) Calculate the final value."
+        ),
+        page_number=1,
+        mode="question",
+        text_blocks=[],
+        width=None,
+        height=None,
+    )
+
+    evidence = report["question_option_evidence"][0]
+    assert evidence["option_labels_found"] == ["A", "B", "C"]
+    assert evidence["expected_option_count"] is None
+    assert evidence["evidence_confidence"] < 0.7
 
 
 def test_answer_sheet_block_normalizer_groups_anchor_numbered_answers():

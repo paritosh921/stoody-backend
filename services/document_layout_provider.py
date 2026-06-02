@@ -17,8 +17,12 @@ ANSWER_ANCHOR_RE = re.compile(
     r"^\s*(?:(?:ans(?:wer)?|sol(?:ution)?|exp(?:lanation)?)\s*[:\-]?\s*)?(\d{1,3})[\.\)]\s+",
     re.IGNORECASE,
 )
-OPTION_LABEL_RE = re.compile(r"^\s*[\(\[]?([a-dA-D])[\.\)]\s*(.*)$")
+OPTION_LABEL_RE = re.compile(r"^\s*[\(\[]?([a-zA-Z])[\.\)]\s*(.*)$")
 ANSWER_CUE_RE = re.compile(r"\b(ans(?:wer)?|sol(?:ution)?|exp(?:lanation)?|worked)\b", re.IGNORECASE)
+SUBPART_VERB_RE = re.compile(
+    r"^\s*(prove|show|derive|explain|calculate|find|determine|write|draw|state|discuss|verify)\b",
+    re.IGNORECASE,
+)
 
 
 class DocumentLayoutProvider:
@@ -183,16 +187,20 @@ class DocumentLayoutProvider:
         question_anchors: List[Dict[str, Any]] = []
         answer_anchors: List[Dict[str, Any]] = []
         option_risks: List[Dict[str, Any]] = []
+        question_option_evidence: List[Dict[str, Any]] = []
         layout_risks: List[str] = []
         option_labels: List[str] = []
         label_only: List[str] = []
         unlabelled_before_label = 0
+        question_line_indices: List[Dict[str, Any]] = []
+        option_line_indices: List[Dict[str, Any]] = []
 
         for idx, line in enumerate(lines):
             line_text = str(line.get("text") or "").strip()
             q_match = QUESTION_ANCHOR_RE.match(line_text)
             if q_match:
                 question_anchors.append({"number": q_match.group(1), "x": line.get("x"), "y": line.get("y")})
+                question_line_indices.append({"index": idx, "number": q_match.group(1), "x": line.get("x"), "y": line.get("y")})
             a_match = ANSWER_ANCHOR_RE.match(line_text)
             answer_cue = self._answer_cue(line_text)
             if a_match and answer_cue:
@@ -208,6 +216,16 @@ class DocumentLayoutProvider:
             if option_match:
                 label = option_match.group(1).lower()
                 option_labels.append(label)
+                option_line_indices.append(
+                    {
+                        "index": idx,
+                        "label": label,
+                        "x": line.get("x"),
+                        "y": line.get("y"),
+                        "has_text": bool(option_match.group(2).strip()),
+                        "text": option_match.group(2).strip(),
+                    }
+                )
                 if not option_match.group(2).strip():
                     label_only.append(label)
                     prev = lines[idx - 1] if idx > 0 else {}
@@ -228,6 +246,11 @@ class DocumentLayoutProvider:
         if image_regions:
             layout_risks.append("formula_or_image_dependency")
 
+        question_option_evidence = self._question_option_evidence(
+            question_lines=question_line_indices,
+            option_lines=option_line_indices,
+        )
+
         density = "none"
         if has_text_layer:
             chars = len(text or "")
@@ -241,6 +264,7 @@ class DocumentLayoutProvider:
             "height": height,
             "question_anchors": question_anchors[:100],
             "answer_anchors": answer_anchors[:100],
+            "question_option_evidence": question_option_evidence[:100],
             "option_layout_risks": option_risks,
             "image_or_formula_regions": image_regions or [],
             "layout_risks": sorted(set(layout_risks)),
@@ -275,6 +299,96 @@ class DocumentLayoutProvider:
         match = ANSWER_CUE_RE.search(text or "")
         return match.group(1).lower() if match else None
 
+    def _question_option_evidence(
+        self,
+        *,
+        question_lines: List[Dict[str, Any]],
+        option_lines: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        evidence: List[Dict[str, Any]] = []
+        if not question_lines:
+            return evidence
+        for idx, question in enumerate(question_lines):
+            start = int(question["index"])
+            end = int(question_lines[idx + 1]["index"]) if idx + 1 < len(question_lines) else 10**9
+            scoped_options = [
+                option
+                for option in option_lines
+                if start < int(option["index"]) < end
+            ]
+            labels = [str(option["label"]).lower() for option in scoped_options]
+            unique_labels: List[str] = []
+            for label in labels:
+                if label not in unique_labels:
+                    unique_labels.append(label)
+            expected_count: Optional[int] = None
+            missing_labels: List[str] = []
+            confidence = 0.0
+            if len(unique_labels) >= 2 and unique_labels[0] == "a":
+                ordinals = [ord(label) - ord("a") for label in unique_labels if len(label) == 1]
+                contiguous = ordinals == list(range(0, len(ordinals)))
+                if contiguous:
+                    text_ratio = sum(1 for option in scoped_options if option.get("has_text")) / max(1, len(scoped_options))
+                    option_like_ratio = (
+                        sum(1 for option in scoped_options if self._option_text_looks_like_choice(option.get("text")))
+                        / max(1, len(scoped_options))
+                    )
+                    aligned_geometry = self._options_have_choice_geometry(scoped_options)
+                    if option_like_ratio >= 0.75 or (len(unique_labels) >= 3 and aligned_geometry):
+                        expected_count = len(unique_labels)
+                        confidence = round(
+                            min(
+                                0.95,
+                                0.62
+                                + (0.04 * len(unique_labels))
+                                + (0.08 * text_ratio)
+                                + (0.12 * option_like_ratio)
+                                + (0.08 if aligned_geometry else 0),
+                            ),
+                            2,
+                        )
+                    else:
+                        confidence = 0.5
+                else:
+                    missing_labels = [
+                        chr(ord("A") + ordinal)
+                        for ordinal in range(0, max(ordinals) + 1)
+                        if ordinal not in ordinals
+                    ]
+                    confidence = 0.45
+            evidence.append(
+                {
+                    "question_number": str(question.get("number")),
+                    "option_labels_found": [label.upper() for label in unique_labels],
+                    "expected_option_count": expected_count,
+                    "evidence_confidence": confidence,
+                    "missing_option_labels": missing_labels,
+                }
+            )
+        return evidence
+
+    def _option_text_looks_like_choice(self, text: Any) -> bool:
+        normalized = " ".join(str(text or "").split()).strip()
+        if not normalized:
+            return False
+        if len(normalized) > 160:
+            return False
+        if SUBPART_VERB_RE.match(normalized):
+            return False
+        if normalized.endswith(":"):
+            return False
+        return True
+
+    def _options_have_choice_geometry(self, options: List[Dict[str, Any]]) -> bool:
+        x_values = [
+            float(option.get("x"))
+            for option in options
+            if option.get("x") is not None
+        ]
+        if len(x_values) < 2:
+            return False
+        return max(x_values) - min(x_values) <= 24
+
     def _recommended_strategy(self, risks: List[str]) -> str:
         unique = set(risks or [])
         if "staggered_options_possible" in unique:
@@ -297,6 +411,7 @@ def compact_layout_context(layout_report: Optional[Dict[str, Any]], *, max_pages
                 "text_density": page.get("text_density"),
                 "question_anchors": page.get("question_anchors", [])[:50],
                 "answer_anchors": page.get("answer_anchors", [])[:50],
+                "question_option_evidence": page.get("question_option_evidence", [])[:50],
                 "option_layout_risks": page.get("option_layout_risks", [])[:20],
                 "layout_risks": page.get("layout_risks", []),
             }

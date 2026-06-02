@@ -2542,17 +2542,18 @@ async def run_document_ocr_pipeline(
             layout_report=layout_context,
         )
 
-        expected_option_count = (
-            4
-            if not skip_option_extraction
-            and str(document.get("question_type", "mcq")).lower() == "mcq"
-            else None
+        full_document_validator = FullDocumentExtractionValidator()
+        option_evidence_by_question = full_document_validator.option_evidence_by_question(
+            layout_report,
+            ocr_result=ocr_result,
         )
-        quality_summary = FullDocumentExtractionValidator().validate_questions(
+        quality_summary = full_document_validator.validate_questions(
             questions=extracted_questions,
             layout_report=layout_report,
-            expected_option_count=expected_option_count,
+            ocr_result=ocr_result,
+            option_evidence_by_question=option_evidence_by_question,
             skip_option_extraction=skip_option_extraction,
+            objective_questions=str(document.get("question_type", "mcq")).lower() == "mcq",
         )
         warning_by_question_id = {
             str(warning.get("question_id")): warning
@@ -2566,7 +2567,13 @@ async def run_document_ocr_pipeline(
                 "status": quality_summary.get("status"),
                 "score": quality_summary.get("score"),
                 "manual_review_required": bool(warning),
+                "manual_segmentation_recommended": bool((warning or {}).get("manual_segmentation_recommended")),
                 "reasons": warning.get("reasons", []) if warning else [],
+                "reason_severities": warning.get("reason_severities", {}) if warning else {},
+                "observed_option_count": warning.get("observed_option_count") if warning else len(question.options or []),
+                "expected_option_count": warning.get("expected_option_count") if warning else None,
+                "missing_option_labels": warning.get("missing_option_labels", []) if warning else [],
+                "option_evidence": option_evidence_by_question.get(str(question.metadata.get("question_number") or ""), {}),
             }
             question.metadata["layout_provider"] = layout_report.get("provider")
             question.metadata["layout_risks"] = layout_report.get("document_layout_risks", [])
