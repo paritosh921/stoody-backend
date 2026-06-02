@@ -109,6 +109,117 @@ def test_region_crop_service_returns_crop_pdf_preview_and_text_items():
     assert crop["crop_metadata"]["page"] == 1
 
 
+def test_document_layout_provider_pymupdf_detects_question_and_staggered_options(monkeypatch):
+    import fitz
+
+    from services.document_layout_provider import DocumentLayoutProvider
+
+    monkeypatch.setenv("LITEPARSE_LAYOUT_ENABLED", "false")
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((20, 30), "1. Which sequence is correct?", fontsize=10)
+    page.insert_text((20, 50), "a. Alpha", fontsize=10)
+    page.insert_text((35, 70), "Beta", fontsize=10)
+    page.insert_text((20, 85), "b.", fontsize=10)
+    page.insert_text((20, 105), "c. Gamma", fontsize=10)
+    page.insert_text((35, 125), "Delta", fontsize=10)
+    page.insert_text((20, 140), "d.", fontsize=10)
+    pdf = doc.tobytes()
+    doc.close()
+
+    report = asyncio.run(
+        DocumentLayoutProvider().analyze(
+            pdf_bytes=pdf,
+            document_id="doc-1",
+            mode="question_paper",
+        )
+    )
+
+    assert report["provider"] == "pymupdf"
+    assert report["page_count"] == 1
+    assert report["pages"][0]["question_anchors"][0]["number"] == "1"
+    assert "staggered_options_possible" in report["document_layout_risks"]
+
+
+def test_full_document_validator_marks_low_question_count_against_anchors():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [ExtractedQuestion(id="q1", text="Question 1", options=["a", "b", "c", "d"], metadata={"number": "1"})]
+    layout_report = {
+        "pages": [
+            {"question_anchors": [{"number": "1"}, {"number": "2"}]},
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+        expected_option_count=4,
+    )
+
+    assert summary["status"] == "manual_segmentation_recommended"
+    assert "question_count_lower_than_layout_anchors" in summary["reasons"]
+
+
+def test_answer_sheet_block_normalizer_groups_anchor_numbered_answers():
+    from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
+
+    result = AnswerSheetBlockNormalizer().normalize(
+        pages=[
+            {"index": 1, "markdown": "exp 1. Start of answer\nsecond line\nexp 2. Next answer"}
+        ],
+        anchor_text="exp",
+    )
+
+    assert result["answer_count"] == 2
+    assert result["answers"][0]["number"] == "1"
+    assert "second line" in result["answers"][0]["text"]
+
+
+def test_answer_sheet_block_normalizer_does_not_split_plain_numbered_steps():
+    from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
+
+    result = AnswerSheetBlockNormalizer().normalize(
+        pages=[
+            {
+                "index": 1,
+                "markdown": "exp 1. Worked answer starts\n1. square both sides\n2. simplify\ntherefore option A",
+            }
+        ],
+        anchor_text="exp",
+    )
+
+    assert result["answer_count"] == 1
+    assert "2. simplify" in result["answers"][0]["text"]
+
+
+def test_document_layout_provider_answer_anchors_require_solution_cue(monkeypatch):
+    import fitz
+
+    from services.document_layout_provider import DocumentLayoutProvider
+
+    monkeypatch.setenv("LITEPARSE_LAYOUT_ENABLED", "false")
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((20, 30), "1. square both sides", fontsize=10)
+    page.insert_text((20, 50), "2. simplify expression", fontsize=10)
+    page.insert_text((20, 70), "exp 3. worked solution", fontsize=10)
+    pdf = doc.tobytes()
+    doc.close()
+
+    report = asyncio.run(
+        DocumentLayoutProvider().analyze(
+            pdf_bytes=pdf,
+            document_id="doc-1",
+            mode="answer_sheet",
+        )
+    )
+
+    anchors = report["pages"][0]["answer_anchors"]
+    assert [anchor["number"] for anchor in anchors] == ["3"]
+
+
 class _FakeGatewayDb:
     def __init__(self):
         self.events = []
@@ -126,20 +237,42 @@ class _FakeGatewayDb:
                 return True
         return False
 
-    async def reserve_usage(self, *, scope, subject_id, period="daily", period_key, tokens, limit):
+    async def reserve_usage(
+        self,
+        *,
+        scope,
+        subject_id,
+        period="daily",
+        period_key,
+        tokens,
+        limit=None,
+        page_units=0,
+        call_units=1,
+        token_limit=None,
+        page_limit=None,
+        call_limit=None,
+    ):
         if scope == "tenant" and self.fail_tenant_reservation:
             key = (scope, subject_id, period_key)
-            return False, self.counters.get(key, 0)
+            return False, {"metric": "tokens", "limit": token_limit if token_limit is not None else limit, "used": self.counters.get(key, 0), "required": tokens}
         key = (scope, subject_id, period_key)
         used = self.counters.get(key, 0)
-        if limit is not None and used + tokens > limit:
-            return False, used
+        effective_token_limit = token_limit if token_limit is not None else limit
+        if effective_token_limit is not None and used + tokens > effective_token_limit:
+            return False, {"metric": "tokens", "limit": effective_token_limit, "used": used, "required": tokens}
+        page_key = (scope, subject_id, period_key, "pages")
+        page_used = self.counters.get(page_key, 0)
+        if page_limit is not None and page_used + page_units > page_limit:
+            return False, {"metric": "page_units", "limit": page_limit, "used": page_used, "required": page_units}
         self.counters[key] = used + tokens
-        return True, self.counters[key]
+        self.counters[page_key] = page_used + page_units
+        return True, {"metric": "tokens", "limit": effective_token_limit, "used": self.counters[key], "required": tokens}
 
-    async def release_usage(self, *, scope, subject_id, period="daily", period_key, tokens):
+    async def release_usage(self, *, scope, subject_id, period="daily", period_key, tokens, page_units=0, call_units=1):
         key = (scope, subject_id, period_key)
         self.counters[key] = max(0, self.counters.get(key, 0) - tokens)
+        page_key = (scope, subject_id, period_key, "pages")
+        self.counters[page_key] = max(0, self.counters.get(page_key, 0) - page_units)
         return True
 
 
@@ -329,6 +462,149 @@ def test_ai_gateway_enforces_monthly_user_limit(monkeypatch):
     assert db.events[-1]["error"] == "ai_token_limit_exceeded"
 
 
+def test_ai_gateway_enforces_page_units_before_provider_call(monkeypatch):
+    from services.ai_gateway_service import AIGatewayService, AIUsageLimitExceeded
+
+    monkeypatch.setenv("AI_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("AI_BLOCK_ON_LIMIT", "true")
+    monkeypatch.delenv("AI_DAILY_TOKEN_LIMIT_PER_USER", raising=False)
+    monkeypatch.setenv("AI_DAILY_PAGE_LIMIT_PER_USER", "2")
+    db = _FakeGatewayDb()
+    called = False
+
+    async def provider_call():
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    async def run_case():
+        with pytest.raises(AIUsageLimitExceeded):
+            await AIGatewayService(db).call(
+                user_id="user-1",
+                tenant_id="tenant-1",
+                document_id="doc-1",
+                region_id=None,
+                region_scope="document",
+                stage="ocr_primary",
+                provider="mistral",
+                model="mistral-ocr-latest",
+                input_kind="pdf_region",
+                estimated_input_tokens=1,
+                input_units={"page_count": 3},
+                call_fn=provider_call,
+            )
+
+    asyncio.run(run_case())
+
+    assert called is False
+    assert db.events[-1]["status"] == "blocked"
+    assert db.events[-1]["metric"] == "page_units"
+
+
+def test_ai_gateway_mongo_path_blocks_single_call_over_page_limit(monkeypatch):
+    from services.ai_gateway_service import AIGatewayService, AIUsageLimitExceeded
+
+    class FakeCollection:
+        def __init__(self):
+            self.docs = {}
+            self.inserted_events = []
+
+        async def insert_one(self, doc):
+            if doc.get("event_id"):
+                self.inserted_events.append(dict(doc))
+                return type("Result", (), {"inserted_id": doc["event_id"]})()
+            self.docs[doc["counter_id"]] = dict(doc)
+            return type("Result", (), {"inserted_id": doc["counter_id"]})()
+
+        async def find_one(self, query):
+            if "counter_id" in query:
+                return self.docs.get(query["counter_id"])
+            return None
+
+        async def find_one_and_update(self, query, update, upsert=False, return_document=None):
+            counter_id = query.get("counter_id")
+            doc = self.docs.get(counter_id)
+            if doc is None and upsert:
+                doc = {
+                    "counter_id": counter_id,
+                    "reserved_tokens": 0,
+                    "reserved_page_units": 0,
+                    "reserved_calls": 0,
+                }
+                self.docs[counter_id] = doc
+            if doc is None:
+                return None
+            for condition in query.get("$and", []):
+                matched_or = False
+                for option in condition.get("$or", []):
+                    field, requirement = next(iter(option.items()))
+                    if "$exists" in requirement:
+                        matched_or = matched_or or ((field in doc) is bool(requirement["$exists"]))
+                    elif "$lte" in requirement:
+                        matched_or = matched_or or (doc.get(field, 0) <= requirement["$lte"])
+                if not matched_or:
+                    return None
+            for field, value in update.get("$inc", {}).items():
+                doc[field] = doc.get(field, 0) + value
+            for field, value in update.get("$set", {}).items():
+                doc[field] = value
+            return dict(doc)
+
+        async def update_one(self, query, update):
+            return type("Result", (), {"modified_count": 1})()
+
+    class FakeContextDb(dict):
+        def __init__(self):
+            super().__init__()
+            self["ai_usage_events"] = FakeCollection()
+            self["ai_usage_counters"] = FakeCollection()
+            self["ai_usage_limits"] = FakeCollection()
+
+    class FakeMongoDb:
+        def __init__(self):
+            self.context = FakeContextDb()
+
+        async def get_context_db(self):
+            return self.context
+
+    monkeypatch.setenv("AI_GATEWAY_ENABLED", "true")
+    monkeypatch.setenv("AI_BLOCK_ON_LIMIT", "true")
+    monkeypatch.delenv("AI_DAILY_TOKEN_LIMIT_PER_USER", raising=False)
+    monkeypatch.setenv("AI_DAILY_PAGE_LIMIT_PER_USER", "2")
+    db = FakeMongoDb()
+    called = False
+
+    async def provider_call():
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    async def run_case():
+        with pytest.raises(AIUsageLimitExceeded):
+            await AIGatewayService(db).call(
+                user_id="user-1",
+                tenant_id="tenant-1",
+                document_id="doc-1",
+                region_id=None,
+                region_scope="document",
+                stage="ocr_primary",
+                provider="mistral",
+                model="mistral-ocr-latest",
+                input_kind="pdf_region",
+                estimated_input_tokens=1,
+                input_units={"page_count": 3},
+                call_fn=provider_call,
+            )
+
+    asyncio.run(run_case())
+
+    assert called is False
+    assert all(
+        doc.get("reserved_page_units", 0) == 0
+        for doc in db.context["ai_usage_counters"].docs.values()
+    )
+
+
 def test_tutor_is_not_ai_usage_admin():
     from api.v1.ai_usage_async import _is_admin
 
@@ -423,6 +699,14 @@ def test_answer_context_uses_question_number_and_question_doc():
     assert context["match_strategy"] == "question_number"
     assert context["question_text"] == "Which option is correct?"
     assert context["correct_answer"] == "C"
+
+
+def test_generate_solutions_request_does_not_replace_existing_by_default():
+    from api.v1.pdf_async import GenerateSolutionsRequest
+
+    request = GenerateSolutionsRequest(confirmQuestionsReviewed=True)
+
+    assert request.replaceExisting is False
 
 
 def test_answer_mapping_preserves_answer_manual_review_flag():

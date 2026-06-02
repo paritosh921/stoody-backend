@@ -43,7 +43,10 @@ from services.ai_gateway_service import (
     estimate_text_tokens,
 )
 from services.answer_question_mapping_service import AnswerQuestionMappingService
+from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
+from services.document_layout_provider import DocumentLayoutProvider, compact_layout_context
 from services.extraction_validator import ExtractionValidator
+from services.full_document_extraction_validator import FullDocumentExtractionValidator
 from services.layout_preflight_service import LayoutPreflightService
 from services.option_layout_normalizer import OptionLayoutNormalizer
 from services.region_crop_service import RegionCropService
@@ -739,10 +742,24 @@ def _augment_ocr_with_pymupdf(
         )
 
 
+def _count_pdf_pages(pdf_content: bytes) -> int:
+    try:
+        import fitz
+
+        doc = fitz.open(stream=pdf_content, filetype="pdf")
+        try:
+            return int(doc.page_count or 0)
+        finally:
+            doc.close()
+    except Exception:
+        return 0
+
+
 async def call_sarvam_ocr(
     file_content: bytes,
     *,
     gateway_context: Optional[Dict[str, Any]] = None,
+    page_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Primary OCR entry point for the pipeline.
@@ -760,6 +777,8 @@ async def call_sarvam_ocr(
         ]
     }
     """
+    estimated_page_count = max(1, int(page_count or _count_pdf_pages(file_content) or 1))
+
     async def _gateway_call(stage: str, provider: str, model: str, call_fn):
         if not gateway_context:
             return await call_fn()
@@ -777,9 +796,9 @@ async def call_sarvam_ocr(
             provider=provider,
             model=model,
             input_kind="pdf_region",
-            estimated_input_tokens=estimate_ocr_tokens(pdf_bytes=len(file_content), page_count=1),
+            estimated_input_tokens=estimate_ocr_tokens(pdf_bytes=len(file_content), page_count=estimated_page_count),
             estimated_output_tokens=2048,
-            input_units={"pdf_bytes": len(file_content), "page_count": 1},
+            input_units={"pdf_bytes": len(file_content), "page_count": estimated_page_count},
             call_fn=call_fn,
         )
 
@@ -2460,6 +2479,14 @@ async def run_document_ocr_pipeline(
     """Run the full OCR extraction pipeline for a stored document."""
     document_id = document["document_id"]
     try:
+        layout_report = await DocumentLayoutProvider().analyze(
+            pdf_bytes=file_content,
+            document_id=document_id,
+            mode="question_paper",
+        )
+        layout_context = compact_layout_context(layout_report)
+        page_count = int(layout_report.get("page_count") or _count_pdf_pages(file_content) or 1)
+
         logger.info(f"Calling OCR for job {job_id}")
         ocr_result = await call_sarvam_ocr(
             file_content,
@@ -2470,6 +2497,7 @@ async def run_document_ocr_pipeline(
                 region_scope="document",
                 is_b2c=is_b2c_admin(current_user),
             ),
+            page_count=page_count,
         )
 
         # Mistral OCR's image extraction is unreliable for many Word/Pages-generated
@@ -2511,7 +2539,37 @@ async def run_document_ocr_pipeline(
                 region_scope="document",
                 is_b2c=is_b2c_pre,
             ),
+            layout_report=layout_context,
         )
+
+        expected_option_count = (
+            4
+            if not skip_option_extraction
+            and str(document.get("question_type", "mcq")).lower() == "mcq"
+            else None
+        )
+        quality_summary = FullDocumentExtractionValidator().validate_questions(
+            questions=extracted_questions,
+            layout_report=layout_report,
+            expected_option_count=expected_option_count,
+            skip_option_extraction=skip_option_extraction,
+        )
+        warning_by_question_id = {
+            str(warning.get("question_id")): warning
+            for warning in quality_summary.get("warnings", [])
+            if warning.get("question_id")
+        }
+        for question in extracted_questions:
+            warning = warning_by_question_id.get(str(question.id))
+            question.metadata = question.metadata or {}
+            question.metadata["full_document_ocr_quality"] = {
+                "status": quality_summary.get("status"),
+                "score": quality_summary.get("score"),
+                "manual_review_required": bool(warning),
+                "reasons": warning.get("reasons", []) if warning else [],
+            }
+            question.metadata["layout_provider"] = layout_report.get("provider")
+            question.metadata["layout_risks"] = layout_report.get("document_layout_risks", [])
         
         if skip_option_extraction:
             logger.info(f"📝 Practice Sets mode: Options kept inline with question text")
@@ -2820,7 +2878,12 @@ async def run_document_ocr_pipeline(
             "ocr_status": "completed",
             "extracted_questions_count": len(extracted_questions),
             "extracted_images_count": len(all_images),
-            "ocr_completed_at": datetime.utcnow()
+            "ocr_completed_at": datetime.utcnow(),
+            "ocr_layout_summary": layout_context,
+            "ocr_quality_status": quality_summary.get("status"),
+            "ocr_quality_score": quality_summary.get("score"),
+            "ocr_quality_summary": quality_summary,
+            "ocr_manual_segmentation_recommended": quality_summary.get("manual_segmentation_recommended", False),
         }
 
         if document_fresh and document_fresh.get("document_type") == "Test Series":
@@ -2894,6 +2957,10 @@ class DocumentMetadata(BaseModel):
     uploaded_at: datetime
     ocr_status: str
     ocr_job_id: Optional[str] = None
+    ocr_quality_status: Optional[str] = None
+    ocr_quality_score: Optional[float] = None
+    ocr_quality_summary: Optional[Dict[str, Any]] = None
+    ocr_manual_segmentation_recommended: Optional[bool] = None
     extracted_questions_count: int = 0
     extracted_images_count: int = 0
     pages_count: int = 0  # Number of pages in the PDF (for Notes display)
@@ -2911,6 +2978,10 @@ class DocumentMetadata(BaseModel):
     answer_sheet_ocr_status: Optional[str] = None
     answer_sheet_ocr_job_id: Optional[str] = None
     answer_sheet_ocr_completed_at: Optional[datetime] = None
+    answer_sheet_ocr_quality_status: Optional[str] = None
+    answer_sheet_ocr_quality_score: Optional[float] = None
+    answer_sheet_ocr_quality_summary: Optional[Dict[str, Any]] = None
+    answer_sheet_manual_segmentation_recommended: Optional[bool] = None
     answer_sheet_processed_regions_count: Optional[int] = None
     answer_sheet_mapped_answers_count: Optional[int] = None
     has_answer_sheet: bool = False
@@ -3788,6 +3859,14 @@ async def run_answer_sheet_ocr_pipeline(
     is_b2c = is_b2c_admin(current_user)
 
     try:
+        layout_report = await DocumentLayoutProvider().analyze(
+            pdf_bytes=file_content,
+            document_id=document_id,
+            mode="answer_sheet",
+        )
+        layout_context = compact_layout_context(layout_report)
+        page_count = int(layout_report.get("page_count") or _count_pdf_pages(file_content) or 1)
+
         logger.info(f"Calling answer-sheet OCR for job {job_id}")
         ocr_result = await call_sarvam_ocr(
             file_content,
@@ -3798,9 +3877,27 @@ async def run_answer_sheet_ocr_pipeline(
                 region_scope="answer_document",
                 is_b2c=is_b2c,
             ),
+            page_count=page_count,
         )
         extracted_text = _ocr_pages_to_plain_text(ocr_result)
         page_summaries = _ocr_pages_for_storage(ocr_result)
+        answer_blocks = AnswerSheetBlockNormalizer().normalize(
+            pages=page_summaries,
+            layout_report=layout_report,
+            anchor_text=document_anchor_text,
+        )
+
+        if is_b2c:
+            question_docs = await db.b2c_find("questions", {"document_id": document_id})
+        else:
+            question_docs = await db.mongo_find("questions", {"document_id": document_id})
+        quality_summary = FullDocumentExtractionValidator().validate_answer_sheet(
+            extracted_text=extracted_text,
+            page_summaries=page_summaries,
+            layout_report=layout_report,
+            mapped_count=0,
+            question_count=len(question_docs or []) if document.get("ocr_status") == "completed" else None,
+        )
 
         processing_result["progress"] = 90
         await cache.set(f"pdf_answer_sheet_job:{job_id}", processing_result, 3600, "admin")
@@ -3811,6 +3908,13 @@ async def run_answer_sheet_ocr_pipeline(
             "answer_sheet_ocr_completed_at": datetime.utcnow(),
             "answer_sheet_extracted_text": extracted_text,
             "answer_sheet_ocr_pages": page_summaries,
+            "answer_sheet_layout_summary": layout_context,
+            "answer_sheet_extracted_answers": answer_blocks.get("answers", []),
+            "answer_sheet_extracted_answers_count": answer_blocks.get("answer_count", 0),
+            "answer_sheet_ocr_quality_status": quality_summary.get("status"),
+            "answer_sheet_ocr_quality_score": quality_summary.get("score"),
+            "answer_sheet_ocr_quality_summary": quality_summary,
+            "answer_sheet_manual_segmentation_recommended": quality_summary.get("manual_segmentation_recommended", False),
             "answer_sheet_document_anchor_text": document_anchor_text.strip() if document_anchor_text else None,
             "answer_sheet_mapped_answers_count": 0,
         }
@@ -3937,6 +4041,10 @@ async def process_answer_sheet_ocr(
             "answer_sheet_ocr_job_id": job_id,
             "answer_sheet_ocr_started_at": datetime.utcnow(),
             "answer_sheet_ocr_error": None,
+            "answer_sheet_ocr_quality_status": None,
+            "answer_sheet_ocr_quality_score": None,
+            "answer_sheet_ocr_quality_summary": None,
+            "answer_sheet_manual_segmentation_recommended": False,
             "answer_sheet_document_anchor_text": (
                 ocr_request.documentAnchorText.strip()
                 if ocr_request and ocr_request.documentAnchorText
@@ -4215,13 +4323,27 @@ async def process_document_ocr(
             await db.b2c_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+                {"$set": {
+                    "ocr_status": "processing",
+                    "ocr_job_id": job_id,
+                    "ocr_quality_status": None,
+                    "ocr_quality_score": None,
+                    "ocr_quality_summary": None,
+                    "ocr_manual_segmentation_recommended": False,
+                }}
             )
         else:
             await db.mongo_update_one(
                 "documents",
                 {"document_id": document_id},
-                {"$set": {"ocr_status": "processing", "ocr_job_id": job_id}}
+                {"$set": {
+                    "ocr_status": "processing",
+                    "ocr_job_id": job_id,
+                    "ocr_quality_status": None,
+                    "ocr_quality_score": None,
+                    "ocr_quality_summary": None,
+                    "ocr_manual_segmentation_recommended": False,
+                }}
             )
 
         processing_result = {
@@ -4584,6 +4706,10 @@ async def get_documents(
                 uploaded_at=doc["uploaded_at"],
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
+                ocr_quality_status=doc.get("ocr_quality_status"),
+                ocr_quality_score=doc.get("ocr_quality_score"),
+                ocr_quality_summary=doc.get("ocr_quality_summary"),
+                ocr_manual_segmentation_recommended=doc.get("ocr_manual_segmentation_recommended"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
                 extracted_images_count=doc.get("extracted_images_count", 0),
                 pages_count=doc.get("pages_count", 0),
@@ -4601,6 +4727,10 @@ async def get_documents(
                 answer_sheet_ocr_status=doc.get("answer_sheet_ocr_status"),
                 answer_sheet_ocr_job_id=doc.get("answer_sheet_ocr_job_id"),
                 answer_sheet_ocr_completed_at=doc.get("answer_sheet_ocr_completed_at"),
+                answer_sheet_ocr_quality_status=doc.get("answer_sheet_ocr_quality_status"),
+                answer_sheet_ocr_quality_score=doc.get("answer_sheet_ocr_quality_score"),
+                answer_sheet_ocr_quality_summary=doc.get("answer_sheet_ocr_quality_summary"),
+                answer_sheet_manual_segmentation_recommended=doc.get("answer_sheet_manual_segmentation_recommended"),
                 answer_sheet_processed_regions_count=doc.get("answer_sheet_processed_regions_count"),
                 answer_sheet_mapped_answers_count=doc.get("answer_sheet_mapped_answers_count"),
                 has_answer_sheet=bool(doc.get("answer_sheet_path")),
@@ -5102,6 +5232,10 @@ async def get_student_available_options(
                 uploaded_at=doc["uploaded_at"],
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
+                ocr_quality_status=doc.get("ocr_quality_status"),
+                ocr_quality_score=doc.get("ocr_quality_score"),
+                ocr_quality_summary=doc.get("ocr_quality_summary"),
+                ocr_manual_segmentation_recommended=doc.get("ocr_manual_segmentation_recommended"),
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
                 extracted_images_count=doc.get("extracted_images_count", 0),
                 file_exists=file_exists,
@@ -5116,6 +5250,10 @@ async def get_student_available_options(
                 answer_sheet_ocr_status=None,
                 answer_sheet_ocr_job_id=None,
                 answer_sheet_ocr_completed_at=None,
+                answer_sheet_ocr_quality_status=None,
+                answer_sheet_ocr_quality_score=None,
+                answer_sheet_ocr_quality_summary=None,
+                answer_sheet_manual_segmentation_recommended=None,
                 answer_sheet_processed_regions_count=None,
                 answer_sheet_mapped_answers_count=None,
                 has_answer_sheet=False,
@@ -5953,7 +6091,15 @@ async def get_document_questions(
             "document_id": document_id,
             "document_title": document["title"],
             "questions_count": len(serialized_questions),
+            "ocr_quality_status": document.get("ocr_quality_status"),
+            "ocr_quality_score": document.get("ocr_quality_score"),
+            "ocr_quality_summary": document.get("ocr_quality_summary"),
+            "ocr_manual_segmentation_recommended": document.get("ocr_manual_segmentation_recommended"),
             "answer_sheet_ocr_status": document.get("answer_sheet_ocr_status"),
+            "answer_sheet_ocr_quality_status": document.get("answer_sheet_ocr_quality_status"),
+            "answer_sheet_ocr_quality_score": document.get("answer_sheet_ocr_quality_score"),
+            "answer_sheet_ocr_quality_summary": document.get("answer_sheet_ocr_quality_summary"),
+            "answer_sheet_manual_segmentation_recommended": document.get("answer_sheet_manual_segmentation_recommended"),
             "answer_sheet_mapped_answers_count": document.get("answer_sheet_mapped_answers_count"),
             "has_answer_sheet": bool(document.get("answer_sheet_path")),
             "answer_solution_mode": document.get("answer_solution_mode"),
@@ -7122,7 +7268,7 @@ class RegionOCRRequest(BaseModel):
 class GenerateSolutionsRequest(BaseModel):
     """Request for generating worked solutions from extracted MCQ questions."""
     confirmQuestionsReviewed: bool = False
-    replaceExisting: bool = True
+    replaceExisting: bool = False
     batchSize: int = Field(default=8, ge=1, le=20)
 
 class RegionOCRResult(BaseModel):
@@ -7536,7 +7682,6 @@ async def generate_document_solutions(
             "generated_solutions_count": generated,
             "generated_solutions_manual_review_count": manual_review,
             "generated_solutions_failed_count": failed,
-            "answer_sheet_mapped_answers_count": generated - manual_review,
         }
         if is_b2c:
             await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": completed_update})

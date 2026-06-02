@@ -18,6 +18,10 @@ router = APIRouter()
 class UsageLimitPatch(BaseModel):
     daily_token_limit: Optional[int] = Field(None, ge=0)
     monthly_token_limit: Optional[int] = Field(None, ge=0)
+    daily_page_limit: Optional[int] = Field(None, ge=0)
+    monthly_page_limit: Optional[int] = Field(None, ge=0)
+    daily_call_limit: Optional[int] = Field(None, ge=0)
+    monthly_call_limit: Optional[int] = Field(None, ge=0)
     max_tokens_per_region: Optional[int] = Field(None, ge=0)
     enabled: Optional[bool] = None
 
@@ -57,7 +61,7 @@ async def _events(
     collection = await _collection(db, user, "ai_usage_events")
     if collection is None:
         return []
-    cursor = collection.find(query, {"_id": 0, "input_units": 1, "event_id": 1, "user_id": 1, "tenant_id": 1, "document_id": 1, "region_id": 1, "region_scope": 1, "stage": 1, "provider": 1, "model": 1, "estimated_total_tokens": 1, "actual_input_tokens": 1, "actual_output_tokens": 1, "usage_source": 1, "status": 1, "error": 1, "latency_ms": 1, "created_at": 1})
+    cursor = collection.find(query, {"_id": 0, "input_units": 1, "event_id": 1, "user_id": 1, "tenant_id": 1, "document_id": 1, "region_id": 1, "region_scope": 1, "stage": 1, "provider": 1, "model": 1, "estimated_total_tokens": 1, "estimated_page_units": 1, "estimated_call_units": 1, "actual_input_tokens": 1, "actual_output_tokens": 1, "usage_source": 1, "status": 1, "error": 1, "latency_ms": 1, "created_at": 1})
     cursor = cursor.sort("created_at", -1 if sort_desc else 1).limit(limit)
     return await cursor.to_list(length=limit)
 
@@ -148,6 +152,8 @@ async def get_ai_usage_summary(
                 "_id": group_field,
                 "calls": {"$sum": 1},
                 "estimated_tokens": {"$sum": {"$ifNull": ["$estimated_total_tokens", 0]}},
+                "estimated_page_units": {"$sum": {"$ifNull": ["$estimated_page_units", 0]}},
+                "estimated_call_units": {"$sum": {"$ifNull": ["$estimated_call_units", 1]}},
                 "actual_input_tokens": {"$sum": {"$ifNull": ["$actual_input_tokens", 0]}},
                 "actual_output_tokens": {"$sum": {"$ifNull": ["$actual_output_tokens", 0]}},
             }
@@ -210,6 +216,8 @@ async def _summary(
 ) -> Dict[str, Any]:
     events = await _events(db, user, query, limit=1000, sort_desc=False)
     tokens_used = 0
+    page_units_used = 0
+    call_units_used = 0
     calls: Dict[str, int] = {}
     models: Dict[str, Dict[str, int]] = {}
     for event in events:
@@ -219,16 +227,23 @@ async def _summary(
             or int(event.get("estimated_total_tokens") or 0)
         )
         tokens_used += token_count
+        page_units = int(event.get("estimated_page_units") or (event.get("input_units") or {}).get("page_count") or 0)
+        call_units = int(event.get("estimated_call_units") or 1)
+        page_units_used += page_units
+        call_units_used += call_units
         stage = event.get("stage") or "unknown"
         model = event.get("model") or "unknown"
         calls[stage] = calls.get(stage, 0) + 1
-        models.setdefault(model, {"calls": 0, "tokens": 0})
+        models.setdefault(model, {"calls": 0, "tokens": 0, "page_units": 0})
         models[model]["calls"] += 1
         models[model]["tokens"] += token_count
+        models[model]["page_units"] += page_units
     return {
         "from": from_value,
         "to": to_value,
         "tokens_used": tokens_used,
+        "page_units_used": page_units_used,
+        "call_units_used": call_units_used,
         "calls": calls,
         "models": models,
         "events": events,
