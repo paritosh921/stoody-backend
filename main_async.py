@@ -121,6 +121,7 @@ from api.v1.strokes_async import router as strokes_router
 from api.v1.desktop_diagnostics_async import router as desktop_diagnostics_router
 from api.v1.desktop_bug_reports_async import router as desktop_bug_reports_router
 from api.v1.desktop_updates_async import router as desktop_updates_router
+from api.v1.desktop_firmware_updates_async import router as desktop_firmware_updates_router
 
 # Student Copies routes (pen stroke pages and pinned PDFs)
 try:
@@ -1066,6 +1067,13 @@ app.include_router(
     desktop_updates_router,
     prefix=f"{API_V1_PREFIX}/desktop",
     tags=["Desktop Updates"],
+)
+
+# Desktop pen firmware update metadata and backend-proxied downloads.
+app.include_router(
+    desktop_firmware_updates_router,
+    prefix=f"{API_V1_PREFIX}/desktop",
+    tags=["Desktop Firmware Updates"],
 )
 
 # Student Copies routes (pen stroke pages and pinned PDFs)
