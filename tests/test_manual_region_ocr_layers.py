@@ -426,6 +426,187 @@ def test_document_layout_provider_answer_anchors_require_solution_cue(monkeypatc
     assert [anchor["number"] for anchor in anchors] == ["3"]
 
 
+def test_answer_solution_coverage_not_expected_when_no_answer_mode():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={"answer_solution_mode": "none"},
+        questions=[{"id": "q1"}],
+        mappings=[],
+    )
+
+    assert result["answer_solution_coverage_status"] == "not_expected"
+    assert result["answer_solution_coverage_score"] == 0.0
+
+
+def test_answer_solution_coverage_pending_when_answer_sheet_uploaded_not_processed():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "upload",
+            "answer_sheet_path": "uploads/answer.pdf",
+            "answer_sheet_ocr_status": "not_processed",
+        },
+        questions=[{"id": "q1"}, {"id": "q2"}],
+        mappings=[],
+    )
+
+    assert result["answer_solution_coverage_status"] == "pending"
+    assert result["answer_solution_coverage_summary"]["answer_source"] == "upload"
+    assert "answer_sheet_ocr_pending" in result["answer_solution_coverage_summary"]["reasons"]
+
+
+def test_answer_solution_coverage_not_ready_when_answer_sheet_maps_zero_answers():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "upload",
+            "answer_sheet_path": "uploads/answer.pdf",
+            "answer_sheet_ocr_status": "completed",
+            "ocr_quality_score": 0.99,
+        },
+        questions=[{"id": f"q{i}"} for i in range(1, 6)],
+        mappings=[],
+    )
+
+    assert result["answer_solution_coverage_status"] == "not_ready"
+    assert result["answer_solution_coverage_score"] == 0.0
+    assert result["answer_solution_coverage_summary"]["manual_segmentation_recommended"] is True
+    assert "no_answers_mapped" in result["answer_solution_coverage_summary"]["reasons"]
+
+
+def test_answer_solution_coverage_needs_review_with_partial_review_mappings():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    mappings = [
+        {
+            "question_id": f"q{i}",
+            "answer_text": f"solution {i}",
+            "manual_review_required": i in {1, 2},
+            "source": "manual_answer_segmentation",
+        }
+        for i in range(1, 8)
+    ]
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "upload",
+            "answer_sheet_path": "uploads/answer.pdf",
+            "answer_sheet_processed_regions_count": 7,
+        },
+        questions=[{"id": f"q{i}"} for i in range(1, 11)],
+        mappings=mappings,
+    )
+
+    assert result["answer_solution_coverage_status"] == "needs_review"
+    assert result["answer_solution_coverage_score"] == 0.7
+    assert result["answer_solution_coverage_summary"]["manual_review_count"] == 2
+
+
+def test_answer_solution_coverage_ready_for_generated_solutions():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "auto",
+            "generated_solutions_status": "completed",
+            "generated_solutions_count": 3,
+        },
+        questions=[{"id": f"q{i}"} for i in range(1, 4)],
+        mappings=[
+            {
+                "question_id": f"q{i}",
+                "answer_text": f"solution {i}",
+                "manual_review_required": False,
+                "source": "ai_generated",
+            }
+            for i in range(1, 4)
+        ],
+    )
+
+    assert result["answer_solution_coverage_status"] == "ready"
+    assert result["answer_solution_coverage_score"] == 1.0
+    assert result["answer_solution_coverage_summary"]["answer_source"] == "generated"
+
+
+def test_answer_solution_coverage_upload_mode_ignores_generated_mappings():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "upload",
+            "answer_sheet_path": "uploads/answer.pdf",
+            "answer_sheet_ocr_status": "completed",
+            "generated_solutions_count": 3,
+        },
+        questions=[{"id": f"q{i}"} for i in range(1, 4)],
+        mappings=[
+            {
+                "question_id": f"q{i}",
+                "answer_text": f"generated solution {i}",
+                "manual_review_required": False,
+                "source": "ai_generated",
+                "mapping_strategy": "ai_generated_solution",
+            }
+            for i in range(1, 4)
+        ],
+    )
+
+    assert result["answer_solution_coverage_status"] == "not_ready"
+    assert result["answer_solution_coverage_score"] == 0.0
+    assert result["answer_solution_coverage_summary"]["answer_source"] == "upload"
+    assert "no_answers_mapped" in result["answer_solution_coverage_summary"]["reasons"]
+
+
+def test_answer_solution_coverage_ignores_stale_question_mappings_and_clamps_score():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "answer_solution_mode": "upload",
+            "answer_sheet_path": "uploads/answer.pdf",
+            "answer_sheet_processed_regions_count": 2,
+        },
+        questions=[{"id": "q-current"}],
+        mappings=[
+            {
+                "question_id": "q-old-1",
+                "answer_text": "old solution 1",
+                "manual_review_required": False,
+                "source": "manual_answer_segmentation",
+            },
+            {
+                "question_id": "q-old-2",
+                "answer_text": "old solution 2",
+                "manual_review_required": False,
+                "source": "manual_answer_segmentation",
+            },
+        ],
+    )
+
+    assert result["answer_solution_coverage_status"] == "not_ready"
+    assert result["answer_solution_coverage_score"] == 0.0
+    assert result["answer_solution_coverage_summary"]["mapped_answer_count"] == 0
+    assert result["answer_solution_coverage_summary"]["stale_mapping_count"] == 2
+
+
+def test_answer_sheet_validator_flags_zero_mappings_when_questions_exist():
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    summary = FullDocumentExtractionValidator().validate_answer_sheet(
+        extracted_text="1. Worked answer\n2. Worked answer",
+        page_summaries=[{"index": 0, "markdown": "1. Worked answer\n2. Worked answer"}],
+        layout_report={"pages": [{"answer_anchors": [{"number": "1"}, {"number": "2"}]}]},
+        mapped_count=0,
+        question_count=2,
+    )
+
+    assert "mapped_answer_count_lower_than_answer_anchors" in summary["reasons"]
+    assert "no_answers_mapped" in summary["reasons"]
+
+
 class _FakeGatewayDb:
     def __init__(self):
         self.events = []
@@ -849,6 +1030,9 @@ def test_answer_mapping_uses_question_number_cues_before_region_order():
             self.mappings.append(update["$set"])
             return True
 
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
     service = AnswerQuestionMappingService()
     db = FakeDb()
 
@@ -925,6 +1109,9 @@ def test_answer_mapping_preserves_answer_manual_review_flag():
         async def mongo_update_one(self, collection_name, query, update, upsert=False):
             self.mappings.append(update["$set"])
             return True
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
 
     mappings = asyncio.run(
         AnswerQuestionMappingService().map_region_order(

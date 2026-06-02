@@ -43,6 +43,7 @@ from services.ai_gateway_service import (
     estimate_text_tokens,
 )
 from services.answer_question_mapping_service import AnswerQuestionMappingService
+from services.answer_solution_coverage_service import AnswerSolutionCoverageService
 from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
 from services.document_layout_provider import DocumentLayoutProvider, compact_layout_context
 from services.extraction_validator import ExtractionValidator
@@ -2076,6 +2077,46 @@ def _resolve_question_context_for_answer_region(
     }
 
 
+async def refresh_answer_solution_coverage(
+    *,
+    db: DatabaseManager,
+    is_b2c: bool,
+    document_id: str,
+    document: Optional[Dict[str, Any]] = None,
+    questions: Optional[List[Dict[str, Any]]] = None,
+    mappings: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Recompute answer readiness without touching question OCR quality fields."""
+    if document is None:
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+    if not document:
+        return {}
+    if questions is None:
+        if is_b2c:
+            questions = await db.b2c_find("questions", {"document_id": document_id})
+        else:
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+    if mappings is None:
+        if is_b2c:
+            mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+        else:
+            mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+
+    coverage = AnswerSolutionCoverageService().compute(
+        document=document,
+        questions=questions or [],
+        mappings=mappings or [],
+    )
+    if is_b2c:
+        await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": coverage})
+    else:
+        await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": coverage})
+    return coverage
+
+
 async def extract_worked_answer_with_gpt(
     *,
     ocr_result: Dict[str, Any],
@@ -2911,6 +2952,11 @@ async def run_document_ocr_pipeline(
                 {"document_id": document_id},
                 {"$set": update_data}
             )
+        await refresh_answer_solution_coverage(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+        )
 
         processing_result["status"] = "completed"
         processing_result["progress"] = 100
@@ -2991,6 +3037,10 @@ class DocumentMetadata(BaseModel):
     answer_sheet_manual_segmentation_recommended: Optional[bool] = None
     answer_sheet_processed_regions_count: Optional[int] = None
     answer_sheet_mapped_answers_count: Optional[int] = None
+    answer_solution_coverage_status: Optional[str] = None
+    answer_solution_coverage_score: Optional[float] = None
+    answer_solution_coverage_summary: Optional[Dict[str, Any]] = None
+    answer_solution_coverage_updated_at: Optional[datetime] = None
     has_answer_sheet: bool = False
     exam_finalized: Optional[bool] = None
     exam_finalized_at: Optional[datetime] = None
@@ -3479,6 +3529,13 @@ async def upload_pdf(
                 else None
             ),
         }
+        document_metadata.update(
+            AnswerSolutionCoverageService().compute(
+                document=document_metadata,
+                questions=[],
+                mappings=[],
+            )
+        )
 
         # Save to appropriate MongoDB database (B2C or regular)
         if is_b2c:
@@ -3938,6 +3995,11 @@ async def run_answer_sheet_ocr_pipeline(
                 {"document_id": document_id},
                 {"$set": update_data},
             )
+        await refresh_answer_solution_coverage(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+        )
 
         processing_result["status"] = "completed"
         processing_result["progress"] = 100
@@ -4740,6 +4802,10 @@ async def get_documents(
                 answer_sheet_manual_segmentation_recommended=doc.get("answer_sheet_manual_segmentation_recommended"),
                 answer_sheet_processed_regions_count=doc.get("answer_sheet_processed_regions_count"),
                 answer_sheet_mapped_answers_count=doc.get("answer_sheet_mapped_answers_count"),
+                answer_solution_coverage_status=doc.get("answer_solution_coverage_status"),
+                answer_solution_coverage_score=doc.get("answer_solution_coverage_score"),
+                answer_solution_coverage_summary=doc.get("answer_solution_coverage_summary"),
+                answer_solution_coverage_updated_at=doc.get("answer_solution_coverage_updated_at"),
                 has_answer_sheet=bool(doc.get("answer_sheet_path")),
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
@@ -5263,6 +5329,10 @@ async def get_student_available_options(
                 answer_sheet_manual_segmentation_recommended=None,
                 answer_sheet_processed_regions_count=None,
                 answer_sheet_mapped_answers_count=None,
+                answer_solution_coverage_status=doc.get("answer_solution_coverage_status"),
+                answer_solution_coverage_score=doc.get("answer_solution_coverage_score"),
+                answer_solution_coverage_summary=doc.get("answer_solution_coverage_summary"),
+                answer_solution_coverage_updated_at=doc.get("answer_solution_coverage_updated_at"),
                 has_answer_sheet=False,
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
@@ -5935,11 +6005,30 @@ async def get_document_questions(
         # them for student/B2C learner reads from this shared route.
         include_worked_answers = user_type in ["admin", "tutor", "b2c_admin"]
         mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
+        answer_mappings: List[Dict[str, Any]] = []
+        coverage_fields: Dict[str, Any] = {
+            "answer_solution_coverage_status": document.get("answer_solution_coverage_status"),
+            "answer_solution_coverage_score": document.get("answer_solution_coverage_score"),
+            "answer_solution_coverage_summary": document.get("answer_solution_coverage_summary"),
+        }
         if include_worked_answers:
             if is_b2c:
                 answer_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
             else:
                 answer_mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+            refreshed_coverage = await refresh_answer_solution_coverage(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
+                document=document,
+                questions=questions,
+                mappings=answer_mappings,
+            )
+            coverage_fields = {
+                "answer_solution_coverage_status": refreshed_coverage.get("answer_solution_coverage_status"),
+                "answer_solution_coverage_score": refreshed_coverage.get("answer_solution_coverage_score"),
+                "answer_solution_coverage_summary": refreshed_coverage.get("answer_solution_coverage_summary"),
+            }
 
             for mapping in answer_mappings:
                 question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
@@ -6112,6 +6201,7 @@ async def get_document_questions(
             "answer_solution_mode": document.get("answer_solution_mode"),
             "generated_solutions_status": document.get("generated_solutions_status"),
             "generated_solutions_count": document.get("generated_solutions_count"),
+            **coverage_fields,
             "questions": serialized_questions
         }
 
@@ -7478,6 +7568,15 @@ async def get_document_answer_mappings(
                 if mapping.get("answer_text") and not mapping.get("manual_review_required")
             ]
         )
+        coverage = await refresh_answer_solution_coverage(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+            document=document,
+            questions=questions,
+            mappings=mappings,
+        )
+        coverage_summary = coverage.get("answer_solution_coverage_summary") or {}
 
         return {
             "documentId": document_id,
@@ -7490,6 +7589,12 @@ async def get_document_answer_mappings(
             "questionCount": len(questions),
             "answerCount": answer_count,
             "mappedCount": mapped_count,
+            "answer_solution_coverage_status": coverage.get("answer_solution_coverage_status"),
+            "answer_solution_coverage_score": coverage.get("answer_solution_coverage_score"),
+            "answer_solution_coverage_summary": coverage_summary,
+            "answerSolutionCoverageStatus": coverage.get("answer_solution_coverage_status"),
+            "answerSolutionCoverageScore": coverage.get("answer_solution_coverage_score"),
+            "answerSolutionCoverageSummary": coverage_summary,
             "mappings": rows,
         }
 
@@ -7694,6 +7799,11 @@ async def generate_document_solutions(
             await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": completed_update})
         else:
             await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": completed_update})
+        await refresh_answer_solution_coverage(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+        )
 
         return {
             "success": True,
@@ -8784,6 +8894,12 @@ async def process_regions_ocr(
                 "documents",
                 {"document_id": document_id},
                 {"$set": document_status_update}
+            )
+        if is_answer_scope:
+            await refresh_answer_solution_coverage(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
             )
         
         logger.info(

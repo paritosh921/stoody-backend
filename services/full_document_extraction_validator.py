@@ -141,8 +141,10 @@ class FullDocumentExtractionValidator:
             reasons.append("empty_answer_sheet_text")
         if page_summaries and text_length < max(80, len(page_summaries) * 40):
             reasons.append("very_low_answer_text_density")
-        if answer_anchor_count and mapped_count and mapped_count < answer_anchor_count:
+        if answer_anchor_count and mapped_count < answer_anchor_count:
             reasons.append("mapped_answer_count_lower_than_answer_anchors")
+        if question_count and mapped_count == 0:
+            reasons.append("no_answers_mapped")
         if question_count is not None and answer_anchor_count and answer_anchor_count != question_count:
             reasons.append("answer_anchor_count_differs_from_question_count")
         if self._layout_has_risk(layout_report, "formula_or_image_dependency"):

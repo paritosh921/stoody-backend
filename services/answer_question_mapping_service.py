@@ -27,6 +27,7 @@ class AnswerQuestionMappingService:
             answer_regions or [],
             key=lambda r: (int(r.get("pageNumber", 0) or 0), float(r.get("y", 0) or 0), float(r.get("x", 0) or 0)),
         )
+        await self._clear_existing_manual_mappings(db, is_b2c, document_id)
         if not question_regions_sorted or not answer_regions_sorted:
             return []
 
@@ -66,6 +67,7 @@ class AnswerQuestionMappingService:
                 "mapping_strategy": strategy,
                 "confidence": confidence,
                 "manual_review_required": manual_review_required,
+                "source": "manual_answer_segmentation",
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
@@ -74,15 +76,39 @@ class AnswerQuestionMappingService:
         return mappings
 
     async def _upsert_mapping(self, db: Any, is_b2c: bool, mapping: Dict[str, Any]) -> None:
-        query = {
-            "document_id": mapping["document_id"],
-            "answer_region_id": mapping["answer_region_id"],
-        }
+        if mapping.get("question_id"):
+            query = {
+                "document_id": mapping["document_id"],
+                "question_id": mapping["question_id"],
+                "source": "manual_answer_segmentation",
+            }
+        else:
+            query = {
+                "document_id": mapping["document_id"],
+                "answer_region_id": mapping["answer_region_id"],
+                "source": "manual_answer_segmentation",
+            }
         update = {"$set": mapping}
         if is_b2c:
             await db.b2c_update_one("answer_question_mappings", query, update, upsert=True)
         else:
             await db.mongo_update_one("answer_question_mappings", query, update, upsert=True)
+
+    async def _clear_existing_manual_mappings(self, db: Any, is_b2c: bool, document_id: str) -> None:
+        query = {
+            "document_id": document_id,
+            "$or": [
+                {"source": "manual_answer_segmentation"},
+                {
+                    "source": {"$exists": False},
+                    "mapping_strategy": {"$in": ["question_number", "region_order"]},
+                },
+            ],
+        }
+        if is_b2c:
+            await db.b2c_delete_many("answer_question_mappings", query)
+        else:
+            await db.mongo_delete_many("answer_question_mappings", query)
 
     def _questions_by_number(self, question_regions: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         indexed: Dict[str, Dict[str, Any]] = {}
