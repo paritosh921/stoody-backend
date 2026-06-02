@@ -137,15 +137,21 @@ class FullDocumentExtractionValidator:
         reasons: List[str] = []
         answer_anchor_count = self._anchor_count(layout_report, "answer_anchors")
         text_length = len(str(extracted_text or "").strip())
+        complete_question_mapping = bool(question_count and mapped_count >= question_count)
         if text_length == 0:
             reasons.append("empty_answer_sheet_text")
         if page_summaries and text_length < max(80, len(page_summaries) * 40):
             reasons.append("very_low_answer_text_density")
-        if answer_anchor_count and mapped_count < answer_anchor_count:
+        if answer_anchor_count and mapped_count < answer_anchor_count and not complete_question_mapping:
             reasons.append("mapped_answer_count_lower_than_answer_anchors")
         if question_count and mapped_count == 0:
             reasons.append("no_answers_mapped")
-        if question_count is not None and answer_anchor_count and answer_anchor_count != question_count:
+        if (
+            question_count is not None
+            and answer_anchor_count
+            and answer_anchor_count != question_count
+            and not complete_question_mapping
+        ):
             reasons.append("answer_anchor_count_differs_from_question_count")
         if self._layout_has_risk(layout_report, "formula_or_image_dependency"):
             reasons.append("formula_or_image_dependency_review")

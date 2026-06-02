@@ -1136,6 +1136,625 @@ def test_answer_mapping_preserves_answer_manual_review_flag():
     assert mappings[0]["manual_review_required"] is True
 
 
+def test_full_answer_sheet_mapping_uses_answer_numbers():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+            self.deleted_queries = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            self.deleted_queries.append(query)
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=None).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question text", "region_metadata": {"page": 1, "y": 10}},
+                {"id": "q2", "text": "2. Second question text", "region_metadata": {"page": 1, "y": 20}},
+            ],
+            answer_blocks=[
+                {"number": "2", "text": "Worked solution for question two with enough detail.", "confidence": 0.82},
+                {"number": "1", "text": "Worked solution for question one with enough detail.", "confidence": 0.82},
+            ],
+        )
+    )
+
+    by_number = {mapping["answer_number"]: mapping for mapping in result["mappings"]}
+    assert by_number["2"]["question_id"] == "q2"
+    assert by_number["1"]["question_id"] == "q1"
+    assert by_number["2"]["mapping_strategy"] == "answer_number"
+    assert by_number["2"]["review_status"] == "accepted"
+    assert result["mapped_count"] == 2
+    assert len(db.mappings) == 2
+
+
+def test_full_answer_sheet_mapping_uses_extraction_order_before_uuid_order():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=None).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "zzz-q2", "text": "Second question text", "extraction_order": 2},
+                {"id": "aaa-q1", "text": "First question text", "extraction_order": 1},
+            ],
+            answer_blocks=[
+                {"number": "1", "text": "Worked solution for question one with enough detail.", "confidence": 0.9},
+                {"number": "2", "text": "Worked solution for question two with enough detail.", "confidence": 0.9},
+            ],
+        )
+    )
+
+    by_number = {mapping["answer_number"]: mapping["question_id"] for mapping in result["mappings"]}
+    assert by_number == {"1": "aaa-q1", "2": "zzz-q2"}
+    assert result["mapped_count"] == 2
+
+
+def test_full_answer_sheet_mapping_uses_vision_for_weak_cases():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        def __init__(self):
+            self.called = False
+            self.reasons = []
+
+        async def map(self, **kwargs):
+            self.called = True
+            self.reasons = kwargs.get("reasons") or []
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mappings": [
+                    {
+                        "question_id": "q1",
+                        "answer_block_id": "answer_block_1",
+                        "answer_number": "1",
+                        "answer_text": "Vision confirmed worked solution for question one.",
+                        "confidence": 0.91,
+                        "manual_review_required": False,
+                        "evidence": "Visible answer number 1 matches question 1.",
+                    }
+                ],
+            }
+
+    class FakeDb:
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            return True
+
+    vision = FakeVisionMapper()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=vision).map_full_document_blocks(
+            db=FakeDb(),
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question text"},
+                {"id": "q2", "text": "2. Second question text"},
+            ],
+            answer_blocks=[
+                {"text": "short", "confidence": 0.4},
+            ],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert vision.called is True
+    assert "answer_question_count_mismatch" in vision.reasons
+    assert result["mappings"][0]["mapping_strategy"] == "gpt_vision_mapper"
+    assert result["mappings"][0]["review_status"] == "needs_review"
+    assert result["mappings"][0]["manual_review_required"] is True
+    assert result["mapped_count"] == 0
+    assert result["summary"]["auto_acceptance_blocked"] is True
+    assert result["summary"]["vision_used"] is True
+
+
+def test_full_answer_sheet_question_anchored_vision_can_auto_accept_complete_result():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        async def extract_by_question(self, **kwargs):
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mode": "question_anchored",
+                "mappings": [
+                    {
+                        "question_id": "q1",
+                        "answer_block_id": "question_anchored_q_1",
+                        "answer_item_id": "question_anchored_q_1",
+                        "answer_number": "1",
+                        "correct_answer": "B",
+                        "correct_answer_confidence": 0.96,
+                        "answer_text": "Teacher uploaded worked solution for question one.",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 0.95,
+                        "manual_review_required": False,
+                        "evidence": "Question index 1 visible as Ans 2.",
+                    },
+                    {
+                        "question_id": "q2",
+                        "answer_block_id": "question_anchored_q_2",
+                        "answer_item_id": "question_anchored_q_2",
+                        "answer_number": "2",
+                        "correct_answer": "D",
+                        "correct_answer_confidence": 0.97,
+                        "answer_text": "Teacher uploaded worked solution for question two.",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 0.96,
+                        "manual_review_required": False,
+                        "evidence": "Question index 2 visible as Ans 4.",
+                    },
+                ],
+            }
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=FakeVisionMapper()).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question text", "extraction_order": 1},
+                {"id": "q2", "text": "2. Second question text", "extraction_order": 2},
+            ],
+            answer_blocks=[{"text": "OCR grouped the sheet badly.", "confidence": 0.2}],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert result["mapped_count"] == 2
+    assert result["manual_review_count"] == 0
+    assert result["summary"]["auto_acceptance_blocked"] is False
+    assert result["summary"]["manual_segmentation_recommended"] is False
+    assert {m["correct_answer_candidate"] for m in result["mappings"]} == {"B", "D"}
+    assert all(m["mapping_strategy"] == "gpt_question_anchored" for m in result["mappings"])
+
+
+def test_full_answer_sheet_question_anchored_high_confidence_model_review_is_not_global_block():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        async def extract_by_question(self, **kwargs):
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mode": "question_anchored",
+                "mappings": [
+                    {
+                        "question_id": "q1",
+                        "answer_block_id": "question_anchored_q_1",
+                        "answer_item_id": "question_anchored_q_1",
+                        "answer_number": "1",
+                        "correct_answer": "B",
+                        "correct_answer_confidence": 1.0,
+                        "answer_text": "Teacher uploaded worked solution for question one.",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 1.0,
+                        "manual_review_required": True,
+                    },
+                    {
+                        "question_id": "q2",
+                        "answer_block_id": "question_anchored_q_2",
+                        "answer_item_id": "question_anchored_q_2",
+                        "answer_number": "2",
+                        "correct_answer": "D",
+                        "correct_answer_confidence": 0.95,
+                        "answer_text": "Teacher uploaded worked solution for question two.",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 0.95,
+                        "manual_review_required": True,
+                    },
+                ],
+            }
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=FakeVisionMapper()).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question text", "extraction_order": 1},
+                {"id": "q2", "text": "2. Second question text", "extraction_order": 2},
+            ],
+            answer_blocks=[{"text": "OCR grouped the sheet badly.", "confidence": 0.2}],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert result["mapped_count"] == 2
+    assert result["manual_review_count"] == 0
+    assert result["summary"]["auto_acceptance_blocked"] is False
+    assert "answer_question_count_mismatch" in result["summary"]["vision_reasons"]
+    assert all(mapping["review_status"] == "accepted" for mapping in result["mappings"])
+    assert all(mapping["manual_review_required"] is False for mapping in result["mappings"])
+
+
+def test_full_answer_sheet_vision_mappings_from_same_block_use_unique_answer_items():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        async def map(self, **kwargs):
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mappings": [
+                    {
+                        "question_id": "q1",
+                        "answer_block_id": "answer_block_1",
+                        "answer_text": "Solution one from the same visual block.",
+                        "confidence": 0.92,
+                    },
+                    {
+                        "question_id": "q2",
+                        "answer_block_id": "answer_block_1",
+                        "answer_text": "Solution two from the same visual block.",
+                        "confidence": 0.91,
+                    },
+                ],
+            }
+
+    class FakeDb:
+        def __init__(self):
+            self.answer_region_ids = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            answer_region_id = update["$set"]["answer_region_id"]
+            assert answer_region_id not in self.answer_region_ids
+            self.answer_region_ids.append(answer_region_id)
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=FakeVisionMapper()).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question text"},
+                {"id": "q2", "text": "2. Second question text"},
+            ],
+            answer_blocks=[
+                {"text": "A broad OCR block containing multiple solutions.", "confidence": 0.4},
+            ],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert result["mapped_count"] == 0
+    assert result["manual_review_count"] == 2
+    assert len(db.answer_region_ids) == 2
+    assert all("answer_block_1" in answer_region_id for answer_region_id in db.answer_region_ids)
+    assert db.answer_region_ids[0] != db.answer_region_ids[1]
+
+
+def test_answer_key_reconciliation_auto_applies_complete_table():
+    from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
+
+    class FakeDb:
+        def __init__(self):
+            self.updates = []
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.updates.append((collection_name, query, update))
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerKeyReconciliationService().reconcile(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question", "correct_answer": ""},
+                {"id": "q2", "text": "2. Second question", "correct_answer": None},
+            ],
+            page_summaries=[
+                {"index": 0, "markdown": "| Q | Ans |\n| 1 | B |\n| 2 | D |"}
+            ],
+            mappings=[],
+            mapping_summary={"auto_acceptance_blocked": True},
+        )
+    )
+
+    assert result["summary"]["status"] == "ready"
+    assert result["summary"]["extracted_count"] == 2
+    assert result["summary"]["auto_applied_count"] == 2
+    applied = [update["$set"]["correct_answer"] for _, _, update in db.updates]
+    assert applied == ["B", "D"]
+
+
+def test_answer_key_reconciliation_auto_applies_complete_high_confidence_mappings():
+    from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
+
+    class FakeDb:
+        def __init__(self):
+            self.updates = []
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.updates.append((collection_name, query, update))
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerKeyReconciliationService().reconcile(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question", "correct_answer": ""},
+                {"id": "q2", "text": "2. Second question", "correct_answer": None},
+            ],
+            page_summaries=[],
+            mappings=[
+                {
+                    "question_id": "q1",
+                    "correct_answer_candidate": "B",
+                    "correct_answer_confidence": 0.96,
+                    "confidence": 0.95,
+                    "review_status": "accepted",
+                    "manual_review_required": False,
+                    "mapping_strategy": "gpt_question_anchored",
+                },
+                {
+                    "question_id": "q2",
+                    "correct_answer_candidate": "D",
+                    "correct_answer_confidence": 0.97,
+                    "confidence": 0.96,
+                    "review_status": "accepted",
+                    "manual_review_required": False,
+                    "mapping_strategy": "gpt_question_anchored",
+                },
+            ],
+        )
+    )
+
+    assert result["summary"]["status"] == "ready"
+    assert result["summary"]["extracted_count"] == 2
+    assert result["summary"]["auto_applied_count"] == 2
+    applied = [update["$set"]["correct_answer"] for _, _, update in db.updates]
+    assert applied == ["B", "D"]
+
+
+def test_answer_key_reconciliation_prefers_accepted_mappings_over_noisy_page_regex():
+    from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
+
+    class FakeDb:
+        def __init__(self):
+            self.updates = []
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.updates.append((collection_name, query, update))
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerKeyReconciliationService().reconcile(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question", "correct_answer": ""},
+                {"id": "q2", "text": "2. Second question", "correct_answer": ""},
+            ],
+            page_summaries=[
+                {
+                    "index": 0,
+                    "markdown": "Answer key: 1 B, 2 D\n1. A distractor-like worked-solution line\n2. A second noisy line",
+                }
+            ],
+            mappings=[
+                {
+                    "question_id": "q1",
+                    "correct_answer_candidate": "B",
+                    "correct_answer_confidence": 1.0,
+                    "confidence": 1.0,
+                    "review_status": "accepted",
+                    "manual_review_required": False,
+                    "mapping_strategy": "gpt_question_anchored",
+                },
+                {
+                    "question_id": "q2",
+                    "correct_answer_candidate": "D",
+                    "correct_answer_confidence": 1.0,
+                    "confidence": 1.0,
+                    "review_status": "accepted",
+                    "manual_review_required": False,
+                    "mapping_strategy": "gpt_question_anchored",
+                },
+            ],
+        )
+    )
+
+    assert result["summary"]["status"] == "ready"
+    assert result["summary"]["duplicate_count"] == 0
+    assert result["summary"]["auto_applied_count"] == 2
+    assert result["summary"]["review_required_count"] == 0
+    applied = [update["$set"]["correct_answer"] for _, _, update in db.updates]
+    assert applied == ["B", "D"]
+
+
+def test_answer_key_reconciliation_does_not_auto_apply_partial_table():
+    from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
+
+    class FakeDb:
+        def __init__(self):
+            self.updates = []
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.updates.append((collection_name, query, update))
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerKeyReconciliationService().reconcile(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[
+                {"id": "q1", "text": "1. First question", "correct_answer": ""},
+                {"id": "q2", "text": "2. Second question", "correct_answer": ""},
+            ],
+            page_summaries=[{"index": 0, "markdown": "1. A"}],
+            mappings=[],
+        )
+    )
+
+    assert result["summary"]["status"] == "needs_review"
+    assert result["summary"]["extracted_count"] == 1
+    assert result["summary"]["auto_applied_count"] == 0
+    assert result["summary"]["missing_count"] == 1
+    assert db.updates == []
+
+
+def test_full_answer_sheet_mapping_does_not_overwrite_manual_mapping():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return [
+                {
+                    "document_id": "doc-1",
+                    "question_id": "q1",
+                    "answer_text": "Manual answer",
+                    "source": "manual_answer_segmentation",
+                }
+            ]
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=None).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-1",
+            question_docs=[{"id": "q1", "text": "1. First question text"}],
+            answer_blocks=[
+                {"number": "1", "text": "Automatic answer should not replace manual mapping.", "confidence": 0.9}
+            ],
+        )
+    )
+
+    assert result["summary"]["protected_manual_mapping_count"] == 1
+    assert result["mappings"] == []
+    assert db.mappings == []
+
+
+def test_coverage_counts_full_answer_sheet_ocr_mappings():
+    from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+
+    result = AnswerSolutionCoverageService().compute(
+        document={"answer_sheet_path": "answers.pdf", "answer_solution_mode": "upload", "answer_sheet_ocr_status": "completed"},
+        questions=[{"id": "q1"}, {"id": "q2"}],
+        mappings=[
+            {
+                "question_id": "q1",
+                "answer_text": "Worked answer one",
+                "source": "answer_sheet_full_ocr",
+                "mapping_strategy": "answer_number",
+                "confidence": 0.9,
+                "manual_review_required": False,
+                "review_status": "accepted",
+            },
+            {
+                "question_id": "q2",
+                "answer_text": "Worked answer two",
+                "source": "answer_sheet_full_ocr",
+                "mapping_strategy": "gpt_vision_mapper",
+                "confidence": 0.91,
+                "manual_review_required": False,
+                "review_status": "accepted",
+            },
+        ],
+    )
+
+    assert result["answer_solution_coverage_status"] == "ready"
+    assert result["answer_solution_coverage_summary"]["mapped_answer_count"] == 2
+
+
 def test_test_series_activation_requires_correct_answers():
     from api.v1.pdf_async import _build_test_series_activation_errors
 

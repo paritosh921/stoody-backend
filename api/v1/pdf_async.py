@@ -43,6 +43,8 @@ from services.ai_gateway_service import (
     estimate_text_tokens,
 )
 from services.answer_question_mapping_service import AnswerQuestionMappingService
+from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
+from services.answer_sheet_mapping_service import AnswerSheetMappingService
 from services.answer_solution_coverage_service import AnswerSolutionCoverageService
 from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
 from services.document_layout_provider import DocumentLayoutProvider, compact_layout_context
@@ -73,6 +75,7 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 # OpenAI GPT — used as fallback for question extraction if Groq unavailable,
 # and as primary for GPT Vision OCR fallback
 OCR_FALLBACK_MODEL = os.getenv("OCR_FALLBACK_MODEL", "gpt-5-mini")
+ANSWER_MAPPING_VISION_MODEL = os.getenv("ANSWER_MAPPING_VISION_MODEL", "gpt-5.4-mini")
 
 # IMPORTANT: Grade/Standard matching uses EXACT string matching
 # Both student.grade and document.standard should come from the same admin settings
@@ -177,10 +180,45 @@ def _serialize_answer_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
         "mapping_strategy": mapping.get("mapping_strategy") or "",
         "confidence": mapping.get("confidence"),
         "manual_review_required": bool(mapping.get("manual_review_required")),
+        "review_status": mapping.get("review_status") or ("needs_review" if mapping.get("manual_review_required") else "accepted"),
         "source": mapping.get("source") or "answer_sheet",
+        "answer_number": mapping.get("answer_number"),
+        "mapping_reasons": mapping.get("mapping_reasons") or [],
+        "mapping_evidence": mapping.get("mapping_evidence") or "",
+        "mapping_notes": mapping.get("mapping_notes") or "",
+        "mapper_provider": mapping.get("mapper_provider") or mapping.get("answer_parser_provider") or mapping.get("generator_provider"),
+        "mapper_model": mapping.get("mapper_model") or mapping.get("answer_parser_model") or mapping.get("generator_model"),
+        "correct_answer_candidate": mapping.get("correct_answer_candidate") or "",
+        "correct_answer_confidence": mapping.get("correct_answer_confidence"),
+        "final_answer_text": mapping.get("final_answer_text") or "",
+        "solution_image_notes": mapping.get("solution_image_notes") or "",
+        "solution_images": mapping.get("solution_images") if isinstance(mapping.get("solution_images"), list) else [],
         "correct_option_verified": mapping.get("correct_option_verified"),
         "generation_notes": mapping.get("generation_notes") or "",
     }
+
+
+def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
+    source = str(mapping.get("source") or "").strip().lower()
+    strategy = str(mapping.get("mapping_strategy") or "").strip().lower()
+    source_rank = 0
+    if source == "manual_answer_segmentation":
+        source_rank = 40
+    elif source == "answer_sheet_full_ocr":
+        source_rank = 30
+    elif source in {"answer_sheet", "uploaded_answer_sheet", "upload"}:
+        source_rank = 25
+    elif source == "ai_generated" or strategy == "ai_generated_solution":
+        source_rank = 10
+    review_status = str(mapping.get("review_status") or "").strip().lower()
+    review_rank = 10 if review_status in {"accepted", "trusted"} else 0
+    if review_status == "rejected":
+        review_rank -= 20
+    try:
+        confidence_rank = float(mapping.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence_rank = 0.0
+    return (source_rank, review_rank, confidence_rank)
 
 
 def _build_ai_gateway_context(
@@ -2306,9 +2344,9 @@ async def extract_worked_answer_with_gpt(
 
 def _normalise_correct_answer_label(value: Any) -> str:
     label = str(value or "").strip().upper()
-    if label in {"A", "B", "C", "D"}:
+    if label in {"A", "B", "C", "D", "E", "F"}:
         return label
-    if label in {"1", "2", "3", "4"}:
+    if label in {"1", "2", "3", "4", "5", "6"}:
         return chr(64 + int(label))
     return label
 
@@ -2743,7 +2781,9 @@ async def run_document_ocr_pipeline(
 
         print(f"[OCR-PIPELINE] Storing {len(extracted_questions)} questions for {document_type}...", flush=True)
 
-        for question in extracted_questions:
+        for question_index, question in enumerate(extracted_questions, start=1):
+            question_page_number = int((question.metadata or {}).get("page") or 0) + 1
+            extraction_order = int((question.metadata or {}).get("question_number") or question_index)
             if document_type in ["Practice Sets", "Test Series"]:
                 page_index = question.metadata.get('page', 0)
                 image_refs = question.metadata.get('image_refs', [])
@@ -2911,6 +2951,9 @@ async def run_document_ocr_pipeline(
                     "difficulty": document.get("difficulty", "medium"),
                     "question_type": document.get("question_type", "mcq"),
                     "document_type": document_type,
+                    "question_number": extraction_order,
+                    "extraction_order": extraction_order,
+                    "page_number": question_page_number,
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document["filename"],
                     "document_id": document_id,
@@ -2946,6 +2989,9 @@ async def run_document_ocr_pipeline(
                     "difficulty": document.get("difficulty", "medium"),
                     "question_type": document.get("question_type", "mcq"),
                     "document_type": document_type,
+                    "question_number": extraction_order,
+                    "extraction_order": extraction_order,
+                    "page_number": question_page_number,
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document["filename"],
                     "document_id": document_id,
@@ -3014,6 +3060,17 @@ async def run_document_ocr_pipeline(
                 {"document_id": document_id},
                 {"$set": update_data}
             )
+
+        if document_fresh:
+            deferred_mapping_result = await map_completed_answer_sheet_after_question_ocr(
+                document={**document_fresh, **update_data},
+                current_user=current_user,
+                db=db,
+            )
+            if deferred_mapping_result:
+                processing_result["mapped_answers"] = deferred_mapping_result.get("mapped_count", 0)
+                processing_result["answer_sheet_mapping_summary"] = deferred_mapping_result.get("summary", {})
+
         await refresh_answer_solution_coverage(
             db=db,
             is_b2c=is_b2c,
@@ -3096,6 +3153,11 @@ class DocumentMetadata(BaseModel):
     answer_sheet_ocr_quality_status: Optional[str] = None
     answer_sheet_ocr_quality_score: Optional[float] = None
     answer_sheet_ocr_quality_summary: Optional[Dict[str, Any]] = None
+    answer_sheet_mapping_summary: Optional[Dict[str, Any]] = None
+    answer_key_extraction_summary: Optional[Dict[str, Any]] = None
+    answer_key_candidates: Optional[List[Dict[str, Any]]] = None
+    answer_key_auto_applied_count: Optional[int] = None
+    answer_key_review_required_count: Optional[int] = None
     answer_sheet_manual_segmentation_recommended: Optional[bool] = None
     answer_sheet_processed_regions_count: Optional[int] = None
     answer_sheet_mapped_answers_count: Optional[int] = None
@@ -3970,6 +4032,130 @@ def _ocr_pages_for_storage(ocr_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     return pages
 
 
+async def map_completed_answer_sheet_after_question_ocr(
+    *,
+    document: Dict[str, Any],
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> Dict[str, Any]:
+    """Map stored full-answer-sheet OCR once question OCR becomes available."""
+    document_id = document.get("document_id")
+    if not document_id or not document.get("answer_sheet_path"):
+        return {}
+    if document.get("answer_sheet_ocr_status") != "completed":
+        return {}
+
+    answer_blocks = document.get("answer_sheet_extracted_answers") or []
+
+    mapping_summary = document.get("answer_sheet_mapping_summary") or {}
+    mapped_count = int(document.get("answer_sheet_mapped_answers_count") or 0)
+    if mapped_count > 0 and not mapping_summary.get("mapping_deferred"):
+        return {}
+
+    is_b2c = is_b2c_admin(current_user)
+    if is_b2c:
+        question_docs = await db.b2c_find("questions", {"document_id": document_id})
+    else:
+        question_docs = await db.mongo_find("questions", {"document_id": document_id})
+    if not question_docs:
+        return {}
+
+    answer_pdf_bytes: Optional[bytes] = None
+    answer_sheet_path = str(document.get("answer_sheet_path") or "").replace("\\", "/")
+    try:
+        if answer_sheet_path.startswith("s3://"):
+            answer_pdf_bytes = await download_file(answer_sheet_path)
+        else:
+            answer_file_path = _resolve_answer_sheet_file_path(document)
+            if answer_file_path and answer_file_path.exists():
+                async with aiofiles.open(str(answer_file_path), "rb") as f:
+                    answer_pdf_bytes = await f.read()
+    except Exception as exc:
+        logger.warning(
+            "Could not load answer sheet PDF for deferred mapping on %s; using deterministic mapping only: %s",
+            document_id,
+            exc,
+        )
+
+    if not answer_blocks and not answer_pdf_bytes:
+        logger.info(
+            "Deferred answer-sheet mapping skipped for %s: no parsed answer blocks and no answer-sheet PDF bytes",
+            document_id,
+        )
+        return {}
+
+    page_summaries = document.get("answer_sheet_ocr_pages") or []
+    stored_text = str(document.get("answer_sheet_extracted_text") or "")
+    layout_report = document.get("answer_sheet_layout_summary") or {}
+    mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
+        db=db,
+        is_b2c=is_b2c,
+        document_id=document_id,
+        question_docs=question_docs,
+        answer_blocks=answer_blocks,
+        page_summaries=page_summaries,
+        layout_report=layout_report,
+        pdf_bytes=answer_pdf_bytes,
+        gateway_context=_build_ai_gateway_context(
+            current_user=current_user,
+            db=db,
+            document_id=document_id,
+            region_scope="answer_mapping_vision",
+            is_b2c=is_b2c,
+        ),
+    )
+    answer_key_result = await AnswerKeyReconciliationService().reconcile(
+        db=db,
+        is_b2c=is_b2c,
+        document_id=document_id,
+        question_docs=question_docs,
+        page_summaries=page_summaries,
+        mappings=mapping_result.get("mappings") or [],
+        mapping_summary=mapping_result.get("summary") or {},
+    )
+
+    new_mapped_count = int(mapping_result.get("mapped_count") or 0)
+    new_mapping_summary = mapping_result.get("summary") or {}
+    quality_summary = FullDocumentExtractionValidator().validate_answer_sheet(
+        extracted_text=stored_text,
+        page_summaries=page_summaries,
+        layout_report=layout_report,
+        mapped_count=new_mapped_count,
+        question_count=len(question_docs),
+    )
+    update_data = {
+        "answer_sheet_mapped_answers_count": new_mapped_count,
+        "answer_sheet_mapping_summary": new_mapping_summary,
+        "answer_key_extraction_summary": answer_key_result.get("summary") or {},
+        "answer_key_candidates": answer_key_result.get("candidates") or [],
+        "answer_key_auto_applied_count": (answer_key_result.get("summary") or {}).get("auto_applied_count", 0),
+        "answer_key_review_required_count": (answer_key_result.get("summary") or {}).get("review_required_count", 0),
+        "answer_sheet_ocr_quality_status": quality_summary.get("status"),
+        "answer_sheet_ocr_quality_score": quality_summary.get("score"),
+        "answer_sheet_ocr_quality_summary": quality_summary,
+        "answer_sheet_manual_segmentation_recommended": bool(
+            quality_summary.get("manual_segmentation_recommended", False)
+            or new_mapping_summary.get("manual_segmentation_recommended", False)
+        ),
+    }
+    if is_b2c:
+        await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": update_data})
+    else:
+        await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": update_data})
+
+    logger.info(
+        "Deferred answer-sheet mapping completed for %s: %s mapped, %s review",
+        document_id,
+        new_mapped_count,
+        mapping_result.get("manual_review_count", 0),
+    )
+    return {
+        **mapping_result,
+        "answer_key_result": answer_key_result,
+        "quality_summary": quality_summary,
+    }
+
+
 async def run_answer_sheet_ocr_pipeline(
     document: Dict[str, Any],
     file_content: bytes,
@@ -4017,11 +4203,53 @@ async def run_answer_sheet_ocr_pipeline(
             question_docs = await db.b2c_find("questions", {"document_id": document_id})
         else:
             question_docs = await db.mongo_find("questions", {"document_id": document_id})
+
+        answer_mapping_result: Dict[str, Any] = {
+            "mapped_count": 0,
+            "manual_review_count": 0,
+            "summary": {
+                "source": "answer_sheet_full_ocr",
+                "mapping_deferred": document.get("ocr_status") != "completed",
+                "reason": "question_ocr_not_completed" if document.get("ocr_status") != "completed" else None,
+            },
+        }
+        if document.get("ocr_status") == "completed" and question_docs:
+            answer_mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
+                question_docs=question_docs,
+                answer_blocks=answer_blocks.get("answers", []),
+                page_summaries=page_summaries,
+                layout_report=layout_report,
+                pdf_bytes=file_content,
+                gateway_context=_build_ai_gateway_context(
+                    current_user=current_user,
+                    db=db,
+                    document_id=document_id,
+                    region_scope="answer_mapping_vision",
+                    is_b2c=is_b2c,
+                ),
+            )
+
+        mapped_count = int(answer_mapping_result.get("mapped_count") or 0)
+        mapping_summary = answer_mapping_result.get("summary") or {}
+        answer_key_result: Dict[str, Any] = {}
+        if document.get("ocr_status") == "completed" and question_docs:
+            answer_key_result = await AnswerKeyReconciliationService().reconcile(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
+                question_docs=question_docs,
+                page_summaries=page_summaries,
+                mappings=answer_mapping_result.get("mappings") or [],
+                mapping_summary=mapping_summary,
+            )
         quality_summary = FullDocumentExtractionValidator().validate_answer_sheet(
             extracted_text=extracted_text,
             page_summaries=page_summaries,
             layout_report=layout_report,
-            mapped_count=0,
+            mapped_count=mapped_count,
             question_count=len(question_docs or []) if document.get("ocr_status") == "completed" else None,
         )
 
@@ -4040,9 +4268,17 @@ async def run_answer_sheet_ocr_pipeline(
             "answer_sheet_ocr_quality_status": quality_summary.get("status"),
             "answer_sheet_ocr_quality_score": quality_summary.get("score"),
             "answer_sheet_ocr_quality_summary": quality_summary,
-            "answer_sheet_manual_segmentation_recommended": quality_summary.get("manual_segmentation_recommended", False),
+            "answer_sheet_mapping_summary": mapping_summary,
+            "answer_key_extraction_summary": answer_key_result.get("summary") or {},
+            "answer_key_candidates": answer_key_result.get("candidates") or [],
+            "answer_key_auto_applied_count": (answer_key_result.get("summary") or {}).get("auto_applied_count", 0),
+            "answer_key_review_required_count": (answer_key_result.get("summary") or {}).get("review_required_count", 0),
+            "answer_sheet_manual_segmentation_recommended": bool(
+                quality_summary.get("manual_segmentation_recommended", False)
+                or mapping_summary.get("manual_segmentation_recommended", False)
+            ),
             "answer_sheet_document_anchor_text": document_anchor_text.strip() if document_anchor_text else None,
-            "answer_sheet_mapped_answers_count": 0,
+            "answer_sheet_mapped_answers_count": mapped_count,
         }
 
         if is_b2c:
@@ -4066,6 +4302,8 @@ async def run_answer_sheet_ocr_pipeline(
         processing_result["status"] = "completed"
         processing_result["progress"] = 100
         processing_result["pages"] = page_summaries
+        processing_result["mapped_answers"] = mapped_count
+        processing_result["answer_sheet_mapping_summary"] = mapping_summary
         await cache.set(f"pdf_answer_sheet_job:{job_id}", processing_result, 3600, "admin")
 
         logger.info(
@@ -4175,6 +4413,11 @@ async def process_answer_sheet_ocr(
             "answer_sheet_ocr_quality_status": None,
             "answer_sheet_ocr_quality_score": None,
             "answer_sheet_ocr_quality_summary": None,
+            "answer_sheet_mapping_summary": None,
+            "answer_key_extraction_summary": None,
+            "answer_key_candidates": [],
+            "answer_key_auto_applied_count": 0,
+            "answer_key_review_required_count": 0,
             "answer_sheet_manual_segmentation_recommended": False,
             "answer_sheet_document_anchor_text": (
                 ocr_request.documentAnchorText.strip()
@@ -4861,6 +5104,7 @@ async def get_documents(
                 answer_sheet_ocr_quality_status=doc.get("answer_sheet_ocr_quality_status"),
                 answer_sheet_ocr_quality_score=doc.get("answer_sheet_ocr_quality_score"),
                 answer_sheet_ocr_quality_summary=doc.get("answer_sheet_ocr_quality_summary"),
+                answer_sheet_mapping_summary=doc.get("answer_sheet_mapping_summary"),
                 answer_sheet_manual_segmentation_recommended=doc.get("answer_sheet_manual_segmentation_recommended"),
                 answer_sheet_processed_regions_count=doc.get("answer_sheet_processed_regions_count"),
                 answer_sheet_mapped_answers_count=doc.get("answer_sheet_mapped_answers_count"),
@@ -5388,6 +5632,7 @@ async def get_student_available_options(
                 answer_sheet_ocr_quality_status=None,
                 answer_sheet_ocr_quality_score=None,
                 answer_sheet_ocr_quality_summary=None,
+                answer_sheet_mapping_summary=None,
                 answer_sheet_manual_segmentation_recommended=None,
                 answer_sheet_processed_regions_count=None,
                 answer_sheet_mapped_answers_count=None,
@@ -6092,18 +6337,39 @@ async def get_document_questions(
             questions = await db.b2c_find("questions", {"document_id": document_id})
         else:
             questions = await db.mongo_find("questions", {"document_id": document_id})
+        def _question_response_sort_key(question: Dict[str, Any]) -> tuple:
+            region = question.get("region_metadata") or {}
+            try:
+                explicit_order = int(question.get("extraction_order") or question.get("question_number") or 0)
+            except (TypeError, ValueError):
+                explicit_order = 0
+            if explicit_order > 0:
+                return (0, explicit_order, 0.0, str(question.get("id") or ""))
+            return (
+                1,
+                int(question.get("page_number") or region.get("page") or 0),
+                float(region.get("y") or 0),
+                str(question.get("id") or ""),
+            )
+        questions = sorted(questions, key=_question_response_sort_key)
 
         # Worked-answer mappings are an admin/tutor review surface. Do not attach
         # them for student/B2C learner reads from this shared route.
         include_worked_answers = user_type in ["admin", "tutor", "b2c_admin"]
         mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
         answer_mappings: List[Dict[str, Any]] = []
+        answer_key_candidates_by_question_id: Dict[str, Dict[str, Any]] = {}
         coverage_fields: Dict[str, Any] = {
             "answer_solution_coverage_status": document.get("answer_solution_coverage_status"),
             "answer_solution_coverage_score": document.get("answer_solution_coverage_score"),
             "answer_solution_coverage_summary": document.get("answer_solution_coverage_summary"),
         }
         if include_worked_answers:
+            answer_key_candidates_by_question_id = {
+                str(candidate.get("question_id") or ""): candidate
+                for candidate in (document.get("answer_key_candidates") or [])
+                if candidate.get("question_id")
+            }
             if is_b2c:
                 answer_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
             else:
@@ -6125,7 +6391,9 @@ async def get_document_questions(
             for mapping in answer_mappings:
                 question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
                 if question_id and mapping.get("answer_text"):
-                    mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
+                    existing = mappings_by_question_id.get(question_id)
+                    if existing is None or _answer_mapping_rank(mapping) > _answer_mapping_rank(existing):
+                        mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
 
         # Convert ObjectId to string for JSON serialization and map field names
         serialized_questions = []
@@ -6272,6 +6540,7 @@ async def get_document_questions(
             question_id = str(question_dict.get("id") or "")
             if include_worked_answers:
                 question_dict["mapped_worked_answer"] = mappings_by_question_id.get(question_id)
+                question_dict["answer_key_candidate"] = answer_key_candidates_by_question_id.get(question_id)
 
             serialized_questions.append(question_dict)
 
@@ -6287,6 +6556,10 @@ async def get_document_questions(
             "answer_sheet_ocr_quality_status": document.get("answer_sheet_ocr_quality_status"),
             "answer_sheet_ocr_quality_score": document.get("answer_sheet_ocr_quality_score"),
             "answer_sheet_ocr_quality_summary": document.get("answer_sheet_ocr_quality_summary"),
+            "answer_sheet_mapping_summary": document.get("answer_sheet_mapping_summary"),
+            "answer_key_extraction_summary": document.get("answer_key_extraction_summary"),
+            "answer_key_auto_applied_count": document.get("answer_key_auto_applied_count"),
+            "answer_key_review_required_count": document.get("answer_key_review_required_count"),
             "answer_sheet_manual_segmentation_recommended": document.get("answer_sheet_manual_segmentation_recommended"),
             "answer_sheet_mapped_answers_count": document.get("answer_sheet_mapped_answers_count"),
             "has_answer_sheet": bool(document.get("answer_sheet_path")),
@@ -7460,6 +7733,16 @@ class GenerateSolutionsRequest(BaseModel):
     replaceExisting: bool = False
     batchSize: int = Field(default=8, ge=1, le=20)
 
+
+class AnswerMappingReviewRequest(BaseModel):
+    """Request for accepting, flagging, or rejecting an answer mapping."""
+    reviewStatus: str = Field(..., pattern="^(accepted|needs_review|rejected)$")
+    manualReviewRequired: Optional[bool] = None
+    questionId: Optional[str] = None
+    answerText: Optional[str] = None
+    correctAnswer: Optional[str] = None
+
+
 class RegionOCRResult(BaseModel):
     """Result of OCR processing for a single region"""
     regionId: str
@@ -7613,12 +7896,22 @@ async def get_document_answer_mappings(
         mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
         for mapping in mappings:
             question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
-            if question_id:
+            if not question_id:
+                continue
+            existing = mappings_by_question_id.get(question_id)
+            if existing is None or _answer_mapping_rank(mapping) > _answer_mapping_rank(existing):
                 mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
 
         def _question_sort_key(question: Dict[str, Any]) -> tuple:
             region = question.get("region_metadata") or {}
+            try:
+                explicit_order = int(question.get("extraction_order") or question.get("question_number") or 0)
+            except (TypeError, ValueError):
+                explicit_order = 0
+            if explicit_order > 0:
+                return (0, explicit_order, 0.0, str(question.get("id") or ""))
             return (
+                1,
                 int(question.get("page_number") or region.get("page") or 0),
                 float(region.get("y") or 0),
                 str(question.get("id") or ""),
@@ -7639,7 +7932,13 @@ async def get_document_answer_mappings(
                 if mapping.get("source") == "ai_generated" and mapping.get("answer_text")
             ]
         )
-        answer_count = extracted_answer_count or generated_solution_count
+        full_answer_count = int(document.get("answer_sheet_extracted_answers_count") or 0)
+        answer_count = max(extracted_answer_count, full_answer_count, generated_solution_count)
+        answer_key_candidates_by_question_id = {
+            str(candidate.get("question_id") or ""): candidate
+            for candidate in (document.get("answer_key_candidates") or [])
+            if candidate.get("question_id")
+        }
 
         rows: List[Dict[str, Any]] = []
         for index, question in enumerate(sorted(questions, key=_question_sort_key), start=1):
@@ -7650,6 +7949,7 @@ async def get_document_answer_mappings(
                 "question_id": question_id,
                 "question_text": question.get("text") or question.get("question_text") or "",
                 "correct_answer": question.get("correct_answer"),
+                "answer_key_candidate": answer_key_candidates_by_question_id.get(question_id),
                 "mapped_answer": mapping,
             })
 
@@ -7657,7 +7957,9 @@ async def get_document_answer_mappings(
             [
                 mapping
                 for mapping in mappings_by_question_id.values()
-                if mapping.get("answer_text") and not mapping.get("manual_review_required")
+                if mapping.get("answer_text")
+                and not mapping.get("manual_review_required")
+                and str(mapping.get("review_status") or "accepted").lower() in {"accepted", "trusted"}
             ]
         )
         coverage = await refresh_answer_solution_coverage(
@@ -7681,6 +7983,10 @@ async def get_document_answer_mappings(
             "questionCount": len(questions),
             "answerCount": answer_count,
             "mappedCount": mapped_count,
+            "answerSheetMappingSummary": document.get("answer_sheet_mapping_summary") or {},
+            "answerKeyExtractionSummary": document.get("answer_key_extraction_summary") or {},
+            "answerKeyAutoAppliedCount": document.get("answer_key_auto_applied_count") or 0,
+            "answerKeyReviewRequiredCount": document.get("answer_key_review_required_count") or 0,
             "answer_solution_coverage_status": coverage.get("answer_solution_coverage_status"),
             "answer_solution_coverage_score": coverage.get("answer_solution_coverage_score"),
             "answer_solution_coverage_summary": coverage_summary,
@@ -7697,6 +8003,152 @@ async def get_document_answer_mappings(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get answer mappings: {str(e)}"
+        )
+
+
+@router.patch("/documents/{document_id}/answer-mappings/{mapping_id}")
+async def update_document_answer_mapping_review(
+    document_id: str,
+    mapping_id: str,
+    review_request: AnswerMappingReviewRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """Accept, flag, reject, or lightly edit a worked-answer mapping."""
+    try:
+        is_b2c = is_b2c_admin(current_user)
+        if is_b2c:
+            document = await db.b2c_find_one("documents", {"document_id": document_id})
+            mapping = await db.b2c_find_one(
+                "answer_question_mappings",
+                {"document_id": document_id, "mapping_id": mapping_id},
+            )
+        else:
+            document = await db.mongo_find_one("documents", {"document_id": document_id})
+            mapping = await db.mongo_find_one(
+                "answer_question_mappings",
+                {"document_id": document_id, "mapping_id": mapping_id},
+            )
+
+        if not document:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+        if not mapping:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer mapping not found")
+
+        if not is_b2c:
+            from config_async import DEBUG_MODE as _DEBUG_MODE
+
+            document_admin_id = str(document.get("admin_id")) if document.get("admin_id") is not None else None
+            user_type = current_user.get("user_type")
+            if user_type == "admin":
+                admin_id = str(current_user.get("user_id")) if current_user.get("user_id") is not None else None
+                if admin_id != document_admin_id and not _DEBUG_MODE:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+            elif user_type == "tutor":
+                tutor_admin_id = str(current_user.get("admin_id")) if current_user.get("admin_id") is not None else None
+                if tutor_admin_id != document_admin_id and not _DEBUG_MODE:
+                    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+
+        review_status = review_request.reviewStatus
+        if review_request.manualReviewRequired is not None:
+            manual_review_required = bool(review_request.manualReviewRequired)
+        else:
+            manual_review_required = review_status != "accepted"
+
+        update_fields: Dict[str, Any] = {
+            "review_status": review_status,
+            "manual_review_required": manual_review_required,
+            "reviewed_by": current_user.get("user_id") or current_user.get("_id"),
+            "reviewed_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        if review_request.questionId is not None and review_request.questionId.strip():
+            update_fields["question_id"] = review_request.questionId.strip()
+            update_fields["question_region_id"] = review_request.questionId.strip()
+        if review_request.answerText is not None:
+            update_fields["answer_text"] = review_request.answerText.strip()
+        if review_request.correctAnswer is not None:
+            update_fields["correct_answer_candidate"] = _normalise_correct_answer_label(review_request.correctAnswer)
+
+        query = {"document_id": document_id, "mapping_id": mapping_id}
+        if is_b2c:
+            await db.b2c_update_one("answer_question_mappings", query, {"$set": update_fields})
+            updated_mapping = await db.b2c_find_one("answer_question_mappings", query)
+        else:
+            await db.mongo_update_one("answer_question_mappings", query, {"$set": update_fields})
+            updated_mapping = await db.mongo_find_one("answer_question_mappings", query)
+
+        applied_correct_answer: Optional[str] = None
+        correct_answer_conflict: Optional[Dict[str, Any]] = None
+        candidate_correct_answer = _normalise_correct_answer_label(
+            review_request.correctAnswer
+            if review_request.correctAnswer is not None
+            else (updated_mapping or mapping).get("correct_answer_candidate")
+        )
+        if candidate_correct_answer not in {"A", "B", "C", "D", "E", "F"}:
+            candidate_correct_answer = ""
+        target_question_id = str(
+            update_fields.get("question_id")
+            or (updated_mapping or mapping).get("question_id")
+            or (updated_mapping or mapping).get("question_region_id")
+            or ""
+        )
+        if review_status == "accepted" and candidate_correct_answer and target_question_id:
+            question_query = {"document_id": document_id, "id": target_question_id}
+            if is_b2c:
+                question_doc = await db.b2c_find_one("questions", question_query)
+            else:
+                question_doc = await db.mongo_find_one("questions", question_query)
+            existing_correct = _normalise_correct_answer_label((question_doc or {}).get("correct_answer"))
+            if question_doc and (not existing_correct or existing_correct == candidate_correct_answer):
+                question_update = {
+                    "correct_answer": candidate_correct_answer,
+                    "correct_answer_source": "answer_sheet_mapping_review",
+                    "correct_answer_confidence": (updated_mapping or mapping).get("correct_answer_confidence"),
+                    "correct_answer_reviewed_by": current_user.get("user_id") or current_user.get("_id"),
+                    "correct_answer_reviewed_at": datetime.utcnow(),
+                }
+                if is_b2c:
+                    await db.b2c_update_one("questions", question_query, {"$set": question_update})
+                else:
+                    await db.mongo_update_one("questions", question_query, {"$set": question_update})
+                applied_correct_answer = candidate_correct_answer
+            elif question_doc and existing_correct != candidate_correct_answer:
+                correct_answer_conflict = {
+                    "existing_correct_answer": existing_correct,
+                    "candidate_correct_answer": candidate_correct_answer,
+                    "detected_at": datetime.utcnow(),
+                }
+                if is_b2c:
+                    await db.b2c_update_one("answer_question_mappings", query, {"$set": {"correct_answer_conflict": correct_answer_conflict}})
+                    updated_mapping = await db.b2c_find_one("answer_question_mappings", query)
+                else:
+                    await db.mongo_update_one("answer_question_mappings", query, {"$set": {"correct_answer_conflict": correct_answer_conflict}})
+                    updated_mapping = await db.mongo_find_one("answer_question_mappings", query)
+
+        coverage = await refresh_answer_solution_coverage(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+            document=document,
+        )
+        return {
+            "success": True,
+            "documentId": document_id,
+            "mapping": _serialize_answer_mapping(updated_mapping or {**mapping, **update_fields}),
+            "appliedCorrectAnswer": applied_correct_answer,
+            "correctAnswerConflict": correct_answer_conflict,
+            "answerSolutionCoverageStatus": coverage.get("answer_solution_coverage_status"),
+            "answerSolutionCoverageSummary": coverage.get("answer_solution_coverage_summary"),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating answer mapping review: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update answer mapping: {str(e)}"
         )
 
 
@@ -7780,7 +8232,14 @@ async def generate_document_solutions(
 
         def _question_sort_key(question: Dict[str, Any]) -> tuple:
             region = question.get("region_metadata") or {}
+            try:
+                explicit_order = int(question.get("extraction_order") or question.get("question_number") or 0)
+            except (TypeError, ValueError):
+                explicit_order = 0
+            if explicit_order > 0:
+                return (0, explicit_order, 0.0, str(question.get("id") or ""))
             return (
+                1,
                 int(question.get("page_number") or region.get("page") or 0),
                 float(region.get("y") or 0),
                 str(question.get("id") or ""),
@@ -7864,6 +8323,7 @@ async def generate_document_solutions(
                     "mapping_strategy": "ai_generated_solution",
                     "confidence": max(0.0, min(1.0, confidence)),
                     "manual_review_required": review_required,
+                    "review_status": "needs_review" if review_required else "accepted",
                     "source": "ai_generated",
                     "correct_option_verified": bool(solution.get("correct_option_verified")),
                     "generation_notes": solution.get("notes") or "",

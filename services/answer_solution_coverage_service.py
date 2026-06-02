@@ -28,6 +28,7 @@ class AnswerSolutionCoverageService:
             mapping
             for mapping in (mappings or [])
             if str(mapping.get("answer_text") or "").strip()
+            and str(mapping.get("review_status") or "").strip().lower() != "rejected"
         ]
         answer_source = self._answer_source(document=document, mappings=all_answer_mappings)
         mapped = [
@@ -55,7 +56,10 @@ class AnswerSolutionCoverageService:
             [
                 mapping
                 for mapping in mapped
-                if mapping.get("manual_review_required")
+                if (
+                    mapping.get("manual_review_required")
+                    or str(mapping.get("review_status") or "").strip().lower() in {"draft", "needs_review"}
+                )
                 and self._mapping_question_id(mapping) in mapped_question_ids
             ]
         )
@@ -156,7 +160,20 @@ class AnswerSolutionCoverageService:
         if answer_source == "manual":
             return source in {"manual_answer_segmentation", ""} or strategy in {"question_number", "region_order"}
         if answer_source == "upload":
-            return source in {"answer_sheet", "upload", "uploaded_answer_sheet", "manual_answer_segmentation", ""} or strategy in {"question_number", "region_order"}
+            return source in {
+                "answer_sheet",
+                "answer_sheet_full_ocr",
+                "upload",
+                "uploaded_answer_sheet",
+                "manual_answer_segmentation",
+                "",
+            } or strategy in {
+                "answer_number",
+                "document_order",
+                "gpt_vision_mapper",
+                "question_number",
+                "region_order",
+            }
         return False
 
     def _mapping_question_id(self, mapping: Dict[str, Any]) -> str:

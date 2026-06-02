@@ -104,10 +104,20 @@ async def _get_mapped_worked_answer(
         "question_id": question_id,
         "manual_review_required": False,
         "answer_text": {"$exists": True, "$ne": ""},
-        "$or": [
-            {"confidence": {"$gte": 0.75}},
-            {"source": "ai_generated"},
-            {"mapping_strategy": "ai_generated_solution"},
+        "$and": [
+            {
+                "$or": [
+                    {"review_status": {"$exists": False}},
+                    {"review_status": {"$in": ["accepted", "trusted"]}},
+                ]
+            },
+            {
+                "$or": [
+                    {"confidence": {"$gte": 0.75}},
+                    {"source": "ai_generated"},
+                    {"mapping_strategy": "ai_generated_solution"},
+                ]
+            },
         ],
     }
     if question_doc.get("document_id"):
@@ -1412,9 +1422,11 @@ async def check_mcq_answer(
             mapped_answer = await _get_mapped_worked_answer(db, current_user, question_doc, question_id)
             explanation = "Validated against answer key."
             solution_source = "answer_key"
-            if mapped_answer and not is_correct:
+            solution_images = []
+            if mapped_answer:
                 explanation = mapped_answer.get("answer_text") or explanation
                 solution_source = "mapped_answer_sheet"
+                solution_images = mapped_answer.get("solution_images") if isinstance(mapped_answer.get("solution_images"), list) else []
 
             result = {
                 "question_id": question_id,
@@ -1423,7 +1435,8 @@ async def check_mcq_answer(
                 "is_correct": bool(is_correct),
                 "explanation": explanation,
                 "solution_source": solution_source,
-                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0
+                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0,
+                "solution_images": solution_images,
             }
 
             return {"success": True, "result": result}
@@ -1435,9 +1448,11 @@ async def check_mcq_answer(
             mapped_answer = await _get_mapped_worked_answer(db, current_user, question_doc, question_id)
             explanation = "Validated against answer key."
             solution_source = "answer_key"
-            if mapped_answer and not is_correct:
+            solution_images = []
+            if mapped_answer:
                 explanation = mapped_answer.get("answer_text") or explanation
                 solution_source = "mapped_answer_sheet"
+                solution_images = mapped_answer.get("solution_images") if isinstance(mapped_answer.get("solution_images"), list) else []
 
             result = {
                 "question_id": question_id,
@@ -1446,7 +1461,8 @@ async def check_mcq_answer(
                 "is_correct": is_correct,
                 "explanation": explanation,
                 "solution_source": solution_source,
-                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0
+                "confidence_score": mapped_answer.get("confidence", 1.0) if mapped_answer else 1.0,
+                "solution_images": solution_images,
             }
             return {"success": True, "result": result}
 
@@ -2105,6 +2121,7 @@ async def submit_test_series(
             solution_source = None
             if mapped_answer:
                 explanation = str(mapped_answer.get("answer_text") or "").strip()
+                solution_images = mapped_answer.get("solution_images") if isinstance(mapped_answer.get("solution_images"), list) else []
                 mapped_source = str(mapped_answer.get("source") or "").strip()
                 mapped_strategy = str(mapped_answer.get("mapping_strategy") or "").strip()
                 if mapped_source == "ai_generated" or mapped_strategy == "ai_generated_solution":
@@ -2116,6 +2133,9 @@ async def submit_test_series(
             elif not is_correct:
                 explanation = "Review the correct answer selected by your teacher."
                 solution_source = "answer_key"
+                solution_images = []
+            else:
+                solution_images = []
 
             question_results.append({
                 "question_id": question_id,
@@ -2127,7 +2147,8 @@ async def submit_test_series(
                 "penalty_marks": penalty_marks,
                 "points_earned": points_earned,
                 "explanation": explanation,
-                "solution_source": solution_source
+                "solution_source": solution_source,
+                "solution_images": solution_images,
             })
 
         # Calculate percentage

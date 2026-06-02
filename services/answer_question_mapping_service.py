@@ -57,6 +57,7 @@ class AnswerQuestionMappingService:
             )
             if strategy == "question_number" and question_region_id and answer_text:
                 manual_review_required = bool(answer_region.get("manualReviewRequired"))
+            review_status = "needs_review" if manual_review_required else "accepted"
             mapping = {
                 "mapping_id": f"{document_id}:{question_region_id or 'unmapped'}:{answer_region.get('id')}",
                 "document_id": document_id,
@@ -67,6 +68,7 @@ class AnswerQuestionMappingService:
                 "mapping_strategy": strategy,
                 "confidence": confidence,
                 "manual_review_required": manual_review_required,
+                "review_status": review_status,
                 "source": "manual_answer_segmentation",
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
