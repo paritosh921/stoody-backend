@@ -1,8 +1,10 @@
 import logging
 from datetime import datetime
+import asyncio
+import logging
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -31,6 +33,7 @@ from services.online_class import jitsi_provider_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 
@@ -202,7 +205,6 @@ async def api_create_submission(
     meeting_id: str,
     lock_id: str,
     body: CreateSubmissionRequest,
-    background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -229,5 +231,13 @@ async def api_create_submission(
         client_submitted_at=body.client_submitted_at,
     )
     from services.online_class.analysis_service import run_submission_analysis
-    background_tasks.add_task(run_submission_analysis, db, current_user, lock, sub)
+    task = asyncio.create_task(run_submission_analysis(db, current_user, lock, sub.copy()))
+    task.add_done_callback(_log_analysis_task_error)
     return SubmissionResponse(**sub)
+
+
+def _log_analysis_task_error(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Online-class submission analysis task crashed")
