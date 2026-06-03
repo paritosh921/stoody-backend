@@ -192,6 +192,15 @@ except Exception as e:
     _meeting_available = False
     logging.warning(f"Meeting routes disabled: {str(e)}")
 
+# Online Class routes (Jitsi integration, QLock, submissions)
+try:
+    from api.v1.online_class import router as online_class_v2_router
+    _online_class_v2_available = True
+except Exception as e:
+    online_class_v2_router = None
+    _online_class_v2_available = False
+    logging.warning(f"Online Class V2 routes disabled: {str(e)}")
+
 # SmartBoard routes (real-time pen monitoring for teaching)
 try:
     from api.v1.smartboard_async import router as smartboard_router
@@ -1191,6 +1200,17 @@ if _meeting_available and meeting_router:
     logger.info("✅ Meeting routes enabled")
 else:
     logger.warning("⚠️ Meeting routes disabled")
+
+# Online Class routes (Jitsi integration, QLock, submissions)
+if _online_class_v2_available and online_class_v2_router:
+    app.include_router(
+        online_class_v2_router,
+        prefix=f"{API_V1_PREFIX}/online-class",
+        tags=["Online Class"]
+    )
+    logger.info("✅ Online Class routes enabled")
+else:
+    logger.warning("⚠️ Online Class routes disabled")
 
 # SmartBoard routes (real-time pen monitoring, question attempts)
 if _smartboard_available and smartboard_router:

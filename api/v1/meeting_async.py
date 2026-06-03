@@ -14,6 +14,7 @@ import logging
 
 from models.meeting import Meeting
 from services.google_meet import google_meet_service
+from services.online_class import jitsi_provider_service
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
 from slowapi import Limiter
@@ -51,6 +52,16 @@ class CreateMeetingRequest(BaseModel):
     duration_minutes: int = Field(60, ge=15, le=480, description="Duration in minutes")
 
 
+class ProviderDetails(BaseModel):
+    provider: Optional[str] = None
+    domain: Optional[str] = None
+    room_name: Optional[str] = None
+    url: Optional[str] = None
+    token_required: bool = False
+    token: Optional[str] = None
+    configured: bool = False
+
+
 class MeetingResponse(BaseModel):
     meeting_id: str
     tutor_id: str
@@ -70,6 +81,7 @@ class MeetingResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    provider_details: Optional[ProviderDetails] = None
 
 
 class StudentMeetingResponse(BaseModel):
@@ -86,10 +98,18 @@ class StudentMeetingResponse(BaseModel):
     meet_code: Optional[str] = None
     status: str
     started_at: Optional[datetime] = None
+    provider_details: Optional[ProviderDetails] = None
 
 
 async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
+
+
+def _build_provider_details(meeting_id: str) -> ProviderDetails:
+    if jitsi_provider_service.configured:
+        details = jitsi_provider_service.get_provider_details(meeting_id)
+        return ProviderDetails(**details)
+    return ProviderDetails(provider=None, configured=False)
 
 
 @router.post("/meetings", response_model=MeetingResponse, status_code=201)
@@ -188,6 +208,7 @@ async def create_meeting(
         created_at=meeting_doc["created_at"],
         started_at=None,
         ended_at=None,
+        provider_details=_build_provider_details(meeting_id),
     )
 
 
@@ -314,6 +335,7 @@ async def get_tutor_meetings(
             created_at=m.get("created_at"),
             started_at=m.get("started_at"),
             ended_at=m.get("ended_at"),
+            provider_details=_build_provider_details(m.get("meeting_id")),
         )
         for m in meetings
     ]
@@ -354,10 +376,11 @@ async def get_student_meetings(
             tutor_name=m.get("tutor_name"),
             scheduled_at=m.get("scheduled_at"),
             duration_minutes=m.get("duration_minutes", 60),
-            meet_link=m.get("meet_link") if m.get("status") == "active" else None,  # Only show link if active
+            meet_link=m.get("meet_link") if m.get("status") == "active" else None,
             meet_code=m.get("meet_code") if m.get("status") == "active" else None,
             status=m.get("status"),
             started_at=m.get("started_at"),
+            provider_details=_build_provider_details(m.get("meeting_id")) if m.get("status") == "active" else None,
         )
         for m in meetings
     ]

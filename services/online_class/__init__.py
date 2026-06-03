@@ -1,0 +1,1 @@
+from .jitsi_provider import jitsi_provider_service
