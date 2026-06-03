@@ -129,6 +129,7 @@ async def _test_duplicate_submission_updates_existing_record():
 
 def test_jitsi_provider_uses_base_url_host_when_domain_missing(monkeypatch):
     monkeypatch.delenv("ONLINE_CLASS_JITSI_DOMAIN", raising=False)
+    monkeypatch.delenv("ONLINE_CLASS_JITSI_JWT_SECRET", raising=False)
     monkeypatch.setenv("ONLINE_CLASS_JITSI_BASE_URL", "https://class.stoody.in")
     monkeypatch.setenv("ONLINE_CLASS_JITSI_JWT_ENABLED", "true")
 
