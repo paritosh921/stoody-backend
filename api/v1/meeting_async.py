@@ -19,6 +19,7 @@ from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from bson import ObjectId as BsonObjectId
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,43 @@ def require_student(current_user: Dict[str, Any] = Depends(get_current_user)):
     if current_user.get("user_type") != "student":
         raise HTTPException(status_code=403, detail="Student access required")
     return current_user
+
+
+async def resolve_business_student_id(
+    current_user: Dict[str, Any], db: DatabaseManager
+) -> Optional[str]:
+    if current_user.get("user_type") != "student":
+        return None
+    raw = current_user.get("student_id") or current_user.get("user_id")
+    if not raw:
+        return None
+    raw = str(raw)
+    if raw.startswith("STU_"):
+        return raw
+    try:
+        oid = BsonObjectId(raw)
+    except Exception:
+        return raw
+    student = await db.mongo_find_one("students", {"_id": oid})
+    if student and student.get("student_id"):
+        return student["student_id"]
+    return raw
+
+
+async def resolve_notification_recipient_ids(
+    db: DatabaseManager, invited_student_ids: List[str]
+) -> List[str]:
+    if not invited_student_ids:
+        return []
+    students = await db.mongo_find(
+        "students", {"student_id": {"$in": invited_student_ids}}
+    )
+    oid_map: Dict[str, str] = {}
+    for s in students:
+        sid = s.get("student_id")
+        if sid and sid in invited_student_ids:
+            oid_map[sid] = str(s["_id"])
+    return [oid_map.get(sid, sid) for sid in invited_student_ids]
 
 
 # Pydantic Models
@@ -188,6 +226,35 @@ async def create_meeting(
     await db.mongo_insert_one("meetings", meeting_doc)
 
     logger.info(f"Created meeting {meeting_id} with {len(invited_student_ids)} invited students")
+
+    if invited_student_ids:
+        try:
+            from api.v1.notifications_async import create_notifications_batch
+            notif_recipient_ids = await resolve_notification_recipient_ids(
+                db, invited_student_ids
+            )
+            await create_notifications_batch(
+                db=db,
+                admin_id=admin_id,
+                recipient_ids=notif_recipient_ids,
+                notif_type="info",
+                category="online_class",
+                title="Online Class Scheduled",
+                message=f"{tutor_name} scheduled '{meeting_data.topic}' for {meeting_data.subject}",
+                metadata={
+                    "meeting_id": meeting_id,
+                    "topic": meeting_data.topic,
+                    "subject": meeting_data.subject,
+                    "standard": meeting_data.standard,
+                    "section": meeting_data.section,
+                    "scheduled_at": meeting_data.scheduled_at.isoformat() if meeting_data.scheduled_at else None,
+                    "status": "scheduled",
+                },
+                created_by=tutor_id,
+                created_by_name=tutor_name,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send online-class creation notifications: {e}")
 
     return MeetingResponse(
         meeting_id=meeting_id,
@@ -352,7 +419,9 @@ async def get_student_meetings(
     """
     Get all meetings the current student is invited to.
     """
-    student_id = current_user.get("student_id")
+    student_id = await resolve_business_student_id(current_user, db)
+    if not student_id:
+        raise HTTPException(status_code=403, detail="Could not resolve student identity")
 
     # Build query - find meetings where student is invited
     query = {"invited_student_ids": student_id}
@@ -459,6 +528,36 @@ async def start_meeting(
     )
 
     logger.info(f"Meeting {meeting_id} started by tutor {tutor_id}")
+
+    invited = meeting.get("invited_student_ids", [])
+    if invited:
+        try:
+            from api.v1.notifications_async import create_notifications_batch
+            notif_recipient_ids = await resolve_notification_recipient_ids(
+                db, invited
+            )
+            await create_notifications_batch(
+                db=db,
+                admin_id=meeting.get("admin_id"),
+                recipient_ids=notif_recipient_ids,
+                notif_type="info",
+                category="online_class",
+                title="Online Class is Live!",
+                message=f"'{meeting.get('topic', 'Class')}' has started. Join now!",
+                metadata={
+                    "meeting_id": meeting_id,
+                    "topic": meeting.get("topic"),
+                    "subject": meeting.get("subject"),
+                    "standard": meeting.get("standard"),
+                    "section": meeting.get("section"),
+                    "scheduled_at": meeting.get("scheduled_at").isoformat() if meeting.get("scheduled_at") else None,
+                    "status": "active",
+                },
+                created_by=tutor_id,
+                created_by_name=meeting.get("tutor_name", "Tutor"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send online-class live notifications: {e}")
 
     return {
         "message": "Meeting started",
@@ -585,4 +684,44 @@ async def student_join_meeting(
         "meeting_id": meeting_id,
         "meet_link": meeting.get("meet_link"),
         "meet_code": meeting.get("meet_code"),
+    }
+
+
+@router.post("/meetings/{meeting_id}/join-auth")
+@limiter.limit("30/minute")
+async def student_join_meeting_auth(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(require_student),
+    db: DatabaseManager = Depends(get_database)
+):
+    student_id = await resolve_business_student_id(current_user, db)
+    if not student_id:
+        raise HTTPException(status_code=403, detail="Could not resolve student identity")
+
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    if meeting.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Meeting is not active")
+
+    if student_id not in meeting.get("invited_student_ids", []):
+        raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+
+    await db.mongo_update_one(
+        "meetings",
+        {"meeting_id": meeting_id},
+        {"$addToSet": {"joined_student_ids": student_id}}
+    )
+
+    logger.info(f"Student {student_id} joined meeting {meeting_id} via auth endpoint")
+
+    provider = _build_provider_details(meeting_id)
+    return {
+        "message": "Joined meeting",
+        "meeting_id": meeting_id,
+        "meet_link": meeting.get("meet_link"),
+        "meet_code": meeting.get("meet_code"),
+        "provider_details": provider.dict() if provider.configured else None,
     }

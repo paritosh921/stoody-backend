@@ -7,6 +7,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from api.v1.auth_async import get_current_user, get_database
+from api.v1.meeting_async import resolve_business_student_id
 from api.v1.online_class.models import (
     CreateLockRequest,
     LockResponse,
@@ -114,7 +115,8 @@ async def api_get_current_lock(
     if user_type == "tutor":
         await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
     elif user_type == "student":
-        await _verify_student_invited(db, meeting_id, current_user.get("student_id"))
+        student_id = await resolve_business_student_id(current_user, db)
+        await _verify_student_invited(db, meeting_id, student_id)
     else:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -199,7 +201,9 @@ async def api_create_submission(
     db: DatabaseManager = Depends(get_database),
 ):
     _require_student(current_user)
-    student_id = current_user.get("student_id")
+    student_id = await resolve_business_student_id(current_user, db)
+    if not student_id:
+        raise HTTPException(status_code=403, detail="Could not resolve student identity")
     await _verify_student_invited(db, meeting_id, student_id)
     await _verify_meeting_active(db, meeting_id)
 

@@ -40,6 +40,8 @@ def _build_push_url(category: str, metadata: Dict[str, Any]) -> str:
         return f"/learning?mode=notes&{hl}" if hl else "/learning?mode=notes"
     elif category == "notice":
         return "/dashboard"  # Notices open in modal via notification panel
+    elif category == "online_class":
+        return "/online-class"
     return "/dashboard"
 
 
