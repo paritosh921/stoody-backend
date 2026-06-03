@@ -143,9 +143,26 @@ async def get_database(request: Request) -> DatabaseManager:
     return request.app.state.db
 
 
-def _build_provider_details(meeting_id: str) -> ProviderDetails:
+def _build_provider_details(
+    meeting_id: str,
+    current_user: Optional[Dict[str, Any]] = None,
+    moderator: bool = False,
+) -> ProviderDetails:
     if jitsi_provider_service.configured:
-        details = jitsi_provider_service.get_provider_details(meeting_id)
+        user_id = ""
+        user_name = ""
+        user_email = ""
+        if current_user:
+            user_id = current_user.get("user_id") or current_user.get("tutor_id") or current_user.get("student_id") or ""
+            user_name = current_user.get("name") or current_user.get("username") or ""
+            user_email = current_user.get("email") or ""
+        details = jitsi_provider_service.get_provider_details(
+            meeting_id=meeting_id,
+            user_id=user_id,
+            user_name=user_name,
+            user_email=user_email,
+            moderator=moderator,
+        )
         return ProviderDetails(**details)
     return ProviderDetails(provider=None, configured=False)
 
@@ -275,7 +292,7 @@ async def create_meeting(
         created_at=meeting_doc["created_at"],
         started_at=None,
         ended_at=None,
-        provider_details=_build_provider_details(meeting_id),
+        provider_details=_build_provider_details(meeting_id, current_user=current_user, moderator=True),
     )
 
 
@@ -402,7 +419,7 @@ async def get_tutor_meetings(
             created_at=m.get("created_at"),
             started_at=m.get("started_at"),
             ended_at=m.get("ended_at"),
-            provider_details=_build_provider_details(m.get("meeting_id")),
+            provider_details=_build_provider_details(m.get("meeting_id"), current_user=current_user, moderator=True),
         )
         for m in meetings
     ]
@@ -449,7 +466,7 @@ async def get_student_meetings(
             meet_code=m.get("meet_code") if m.get("status") == "active" else None,
             status=m.get("status"),
             started_at=m.get("started_at"),
-            provider_details=_build_provider_details(m.get("meeting_id")) if m.get("status") == "active" else None,
+            provider_details=_build_provider_details(m.get("meeting_id"), current_user=current_user, moderator=False) if m.get("status") == "active" else None,
         )
         for m in meetings
     ]
@@ -717,7 +734,7 @@ async def student_join_meeting_auth(
 
     logger.info(f"Student {student_id} joined meeting {meeting_id} via auth endpoint")
 
-    provider = _build_provider_details(meeting_id)
+    provider = _build_provider_details(meeting_id, current_user=current_user, moderator=False)
     return {
         "message": "Joined meeting",
         "meeting_id": meeting_id,

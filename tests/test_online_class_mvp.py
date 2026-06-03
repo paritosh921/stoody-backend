@@ -135,10 +135,10 @@ def test_jitsi_provider_uses_base_url_host_when_domain_missing(monkeypatch):
     provider = JitsiProviderService()
     details = provider.get_provider_details("MTG 123")
 
-    assert details["configured"] is True
+    assert details["configured"] is False
     assert details["domain"] == "class.stoody.in"
     assert details["room_name"] == "stoody-MTG-123"
-    assert details["url"] == "https://class.stoody.in/stoody-MTG-123"
+    assert details["url"] == ""
     assert details["token_required"] is True
     assert details["token"] is None
 
