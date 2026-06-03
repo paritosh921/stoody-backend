@@ -131,6 +131,75 @@ def _can_expose_test_answer_key(current_user: Dict[str, Any]) -> bool:
     return current_user.get("user_type") in {"admin", "b2c_admin"}
 
 
+def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, list):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_jsonable(item) for key, item in value.items()}
+    return value
+
+
+def _serialize_test_series_attempt(
+    attempt: Dict[str, Any],
+    *,
+    include_question_results: bool = False,
+) -> Dict[str, Any]:
+    serialized = {
+        "attempt_id": str(attempt.get("_id") or attempt.get("attempt_id") or ""),
+        "score": attempt.get("score", 0),
+        "total_points": attempt.get("total_points", 0),
+        "percentage": attempt.get("percentage", 0),
+        "total_questions": attempt.get("total_questions", 0),
+        "correct_count": attempt.get("correct_count", 0),
+        "incorrect_count": attempt.get("incorrect_count", 0),
+        "unanswered_count": attempt.get("unanswered_count", 0),
+        "time_taken": attempt.get("time_taken", 0),
+        "total_minutes": attempt.get("total_minutes", 0),
+        "submitted_at": _to_jsonable(attempt.get("submitted_at")),
+    }
+
+    if include_question_results:
+        serialized["answers"] = _to_jsonable(attempt.get("answers", {}))
+        serialized["question_results"] = _to_jsonable(attempt.get("question_results", []))
+
+    return serialized
+
+
+def _build_question_snapshot(question: Dict[str, Any]) -> Dict[str, Any]:
+    figures = []
+    for figure in question.get("questionFigures") or question.get("question_figures") or []:
+        if isinstance(figure, dict):
+            figures.append({
+                "id": _to_jsonable(figure.get("id")),
+                "url": figure.get("url"),
+                "description": figure.get("description", ""),
+                "contentType": figure.get("contentType") or figure.get("content_type"),
+                "filename": figure.get("filename") or figure.get("original_filename"),
+            })
+        else:
+            figures.append({"id": _to_jsonable(figure)})
+
+    question_type = question.get("questionType") or question.get("question_type") or "mcq"
+    enhanced_options = question.get("enhancedOptions") or question.get("enhanced_options") or []
+    question_text = question.get("text") or question.get("question_text") or ""
+
+    return {
+        "question_text": question_text,
+        "text": question_text,
+        "options": _to_jsonable(question.get("options", [])),
+        "enhanced_options": _to_jsonable(enhanced_options),
+        "enhancedOptions": _to_jsonable(enhanced_options),
+        "question_figures": _to_jsonable(figures),
+        "questionFigures": _to_jsonable(figures),
+        "question_type": question_type,
+        "questionType": question_type,
+    }
+
+
 async def get_current_user_optional(db: DatabaseManager = Depends(get_database)):
     """Optional authentication - returns user if authenticated, None if not"""
     try:
@@ -585,13 +654,7 @@ async def get_test_series_list(
                 latest_attempt = None
                 
                 if has_attempted:
-                    latest_attempt = {
-                        "attempt_id": str(attempts[0]["_id"]),
-                        "score": attempts[0].get("score", 0),
-                        "total_points": attempts[0].get("total_points", 0),
-                        "percentage": attempts[0].get("percentage", 0),
-                        "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
-                    }
+                    latest_attempt = _serialize_test_series_attempt(attempts[0])
                 
                 test_series_list.append({
                     "document_id": doc_id,
@@ -692,13 +755,7 @@ async def get_test_series_list(
                 latest_attempt = None
 
                 if has_attempted:
-                    latest_attempt = {
-                        "attempt_id": str(attempts[0]["_id"]),
-                        "score": attempts[0].get("score", 0),
-                        "total_points": attempts[0].get("total_points", 0),
-                        "percentage": attempts[0].get("percentage", 0),
-                        "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
-                    }
+                    latest_attempt = _serialize_test_series_attempt(attempts[0])
 
                 test_series_list.append({
                     "document_id": doc_id,
@@ -1879,6 +1936,119 @@ async def get_mcq_stats(
             detail="Failed to get MCQ statistics"
         )
 
+
+@router.get("/test-series/{document_id}/attempts")
+@limiter.limit("60/minute")
+async def get_test_series_attempts(
+    request: Request,
+    document_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    current_user: Dict[str, Any] = Depends(require_student_or_admin),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Return the current student's saved attempts for a test series.
+    Includes per-question results so the student can review old submissions.
+    """
+    try:
+        user_id = current_user["user_id"]
+        user_type = current_user.get("user_type", "student")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        if user_type in {"admin", "b2c_admin"}:
+            return {
+                "success": True,
+                "data": {
+                    "document_id": document_id,
+                    "attempts": [],
+                    "latest_attempt": None,
+                    "total": 0,
+                },
+            }
+
+        attempt_filter = {
+            "student_id": user_id,
+            "document_id": document_id,
+        }
+
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "student_test_attempts",
+                attempt_filter,
+                sort=[("submitted_at", -1)],
+                limit=limit,
+            )
+            questions = await db.b2c_find(
+                "questions",
+                {"document_id": document_id},
+                projection={
+                    "id": 1,
+                    "text": 1,
+                    "question_text": 1,
+                    "options": 1,
+                    "enhanced_options": 1,
+                    "question_figures": 1,
+                    "question_type": 1,
+                },
+            )
+        else:
+            attempts = await db.mongo_find(
+                "student_test_attempts",
+                attempt_filter,
+                sort=[("submitted_at", -1)],
+                limit=limit,
+            )
+            questions = await db.mongo_find(
+                "questions",
+                {"document_id": document_id},
+                projection={
+                    "id": 1,
+                    "text": 1,
+                    "question_text": 1,
+                    "options": 1,
+                    "enhanced_options": 1,
+                    "question_figures": 1,
+                    "question_type": 1,
+                },
+            )
+
+        question_snapshots = {
+            str(question.get("id") or question.get("_id")): _build_question_snapshot(question)
+            for question in questions
+        }
+
+        serialized_attempts = []
+        for attempt in attempts:
+            serialized = _serialize_test_series_attempt(attempt, include_question_results=True)
+            for result in serialized.get("question_results", []):
+                if not isinstance(result, dict):
+                    continue
+                snapshot = question_snapshots.get(str(result.get("question_id") or ""))
+                if not snapshot:
+                    continue
+                for key, value in snapshot.items():
+                    if result.get(key) in (None, "", []):
+                        result[key] = value
+            serialized_attempts.append(serialized)
+
+        return {
+            "success": True,
+            "data": {
+                "document_id": document_id,
+                "attempts": serialized_attempts,
+                "latest_attempt": serialized_attempts[0] if serialized_attempts else None,
+                "total": len(serialized_attempts),
+            },
+        }
+
+    except Exception as e:
+        logger.error(f"Get test series attempts error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get test attempts: {str(e)}",
+        )
+
+
 @router.get("/test-series/{document_id}/check-attempt")
 @limiter.limit("60/minute")
 async def check_test_attempt(
@@ -1933,7 +2103,6 @@ async def check_test_attempt(
         can_attempt = True
         if has_attempted:
             # Check if admin has enabled re-attempt for this student
-            latest_attempt = attempts[0]
             can_attempt = True  # Always allow attempts on learning platform
 
         return {
@@ -1941,12 +2110,7 @@ async def check_test_attempt(
             "has_attempted": has_attempted,
             "can_attempt": can_attempt,
             "attempt_count": attempt_count,
-            "latest_attempt": {
-                "attempt_id": str(attempts[0]["_id"]),
-                "score": attempts[0].get("score", 0),
-                "total_points": attempts[0].get("total_points", 0),
-                "submitted_at": attempts[0].get("submitted_at").isoformat() if attempts[0].get("submitted_at") else None
-            } if has_attempted else None
+            "latest_attempt": _serialize_test_series_attempt(attempts[0]) if has_attempted else None
         }
 
     except Exception as e:
@@ -2149,6 +2313,7 @@ async def submit_test_series(
                 "explanation": explanation,
                 "solution_source": solution_source,
                 "solution_images": solution_images,
+                **_build_question_snapshot(question),
             })
 
         # Calculate percentage
