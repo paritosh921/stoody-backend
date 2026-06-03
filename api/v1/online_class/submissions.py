@@ -8,6 +8,19 @@ logger = logging.getLogger(__name__)
 LOCKS_COLLECTION = "online_class_locks"
 SUBMISSIONS_COLLECTION = "online_class_submissions"
 
+_RESET_ANALYSIS_FIELDS = {
+    "analysis_status": "pending",
+    "score": None,
+    "is_correct": None,
+    "student_answer": None,
+    "work_shown": None,
+    "what_went_wrong": None,
+    "correct_solution": None,
+    "analysis_error": None,
+    "analysis_completed_at": None,
+    "analysis_failed_at": None,
+}
+
 
 async def create_or_update_submission(
     db,
@@ -41,6 +54,8 @@ async def create_or_update_submission(
         if client_submitted_at is not None:
             update_fields["client_submitted_at"] = client_submitted_at
 
+        update_fields.update(_RESET_ANALYSIS_FIELDS)
+
         await db.mongo_update_one(
             SUBMISSIONS_COLLECTION,
             {"submission_id": existing["submission_id"]},
@@ -64,8 +79,13 @@ async def create_or_update_submission(
         "analysis_status": "pending",
         "score": None,
         "is_correct": None,
+        "student_answer": None,
+        "work_shown": None,
         "what_went_wrong": None,
         "correct_solution": None,
+        "analysis_error": None,
+        "analysis_completed_at": None,
+        "analysis_failed_at": None,
         "created_at": now,
         "updated_at": now,
     }

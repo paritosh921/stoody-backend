@@ -2,7 +2,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -182,8 +182,13 @@ async def api_get_lock_results(
                 analysis_status=sub.get("analysis_status", "pending"),
                 score=sub.get("score"),
                 is_correct=sub.get("is_correct"),
+                student_answer=sub.get("student_answer"),
+                work_shown=sub.get("work_shown"),
                 what_went_wrong=sub.get("what_went_wrong"),
                 correct_solution=sub.get("correct_solution"),
+                analysis_error=sub.get("analysis_error"),
+                analysis_completed_at=sub.get("analysis_completed_at"),
+                analysis_failed_at=sub.get("analysis_failed_at"),
                 created_at=sub.get("created_at"),
             )
         )
@@ -197,6 +202,7 @@ async def api_create_submission(
     meeting_id: str,
     lock_id: str,
     body: CreateSubmissionRequest,
+    background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -222,4 +228,6 @@ async def api_create_submission(
         time_spent=body.time_spent,
         client_submitted_at=body.client_submitted_at,
     )
+    from services.online_class.analysis_service import run_submission_analysis
+    background_tasks.add_task(run_submission_analysis, db, current_user, lock, sub)
     return SubmissionResponse(**sub)

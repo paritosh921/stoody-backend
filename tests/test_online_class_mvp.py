@@ -340,3 +340,162 @@ async def _test_notification_recipient_ids_empty_input():
     db = FakeStudentDb()
     result = await resolve_notification_recipient_ids(db, [])
     assert result == []
+
+
+class AnalysisFakeDb(FakeDb):
+    def __init__(self):
+        super().__init__()
+
+    async def mongo_find(self, collection, query):
+        return []
+
+
+def _mock_text_call_success(db, current_user, prompt, **kwargs):
+    return {
+        "success": True,
+        "response": '{"score": 0.8, "is_correct": false, "student_answer": "x=1", "work_shown": "solved", "what_went_wrong": "sign error", "correct_solution": "x=3"}',
+    }
+
+
+def _mock_vision_call_success(db, current_user, images, prompt, **kwargs):
+    return {
+        "success": True,
+        "response": '{"score": 1.0, "is_correct": true, "student_answer": "42", "work_shown": "calculated", "what_went_wrong": null, "correct_solution": "42"}',
+    }
+
+
+def _mock_text_call_failure(db, current_user, prompt, **kwargs):
+    raise RuntimeError("LLM service unavailable")
+
+
+def test_analysis_success_sets_fields_on_submission():
+    asyncio.run(_test_analysis_success())
+
+
+async def _test_analysis_success():
+    from unittest.mock import patch
+
+    db = AnalysisFakeDb()
+    current_user = {"db_name": "test_db"}
+    lock = {"question_text": "Solve x + 1 = 2"}
+    submission = {
+        "submission_id": "sub-test123",
+        "meeting_id": "MTG1",
+        "lock_id": "lck-1",
+        "student_id": "stu-1",
+        "canvas_pages": [],
+        "answer_text": "x = 1",
+        "analysis_status": "pending",
+    }
+
+    with patch("api.v1.practice_async._gate_text_call", side_effect=_mock_text_call_success), \
+         patch("api.v1.practice_async._gate_vision_call", side_effect=_mock_vision_call_success):
+        from services.online_class.analysis_service import run_submission_analysis
+        result = await run_submission_analysis(db, current_user, lock, submission)
+
+    assert result["analysis_status"] == "completed"
+    assert result["score"] == 0.8
+    assert result["is_correct"] is False
+    assert result["student_answer"] == "x=1"
+    assert result["work_shown"] == "solved"
+    assert result["what_went_wrong"] == "sign error"
+    assert result["correct_solution"] == "x=3"
+    assert result["analysis_completed_at"] is not None
+    assert result["analysis_error"] is None
+
+
+def test_analysis_failure_preserves_canvas_and_marks_failed():
+    asyncio.run(_test_analysis_failure())
+
+
+async def _test_analysis_failure():
+    from unittest.mock import patch
+
+    db = AnalysisFakeDb()
+    current_user = {"db_name": "test_db"}
+    lock = {"question_text": "Solve for x"}
+    submission = {
+        "submission_id": "sub-fail001",
+        "meeting_id": "MTG1",
+        "lock_id": "lck-1",
+        "student_id": "stu-1",
+        "canvas_pages": ["data:image/png;base64,ABC123"],
+        "question_page_refs": {"pages": [3]},
+        "answer_text": "my answer",
+        "analysis_status": "pending",
+    }
+
+    with patch("api.v1.practice_async._gate_vision_call", side_effect=_mock_text_call_failure), \
+         patch("api.v1.practice_async._gate_text_call", side_effect=_mock_text_call_failure):
+        from services.online_class.analysis_service import run_submission_analysis
+        result = await run_submission_analysis(db, current_user, lock, submission)
+
+    assert result["analysis_status"] == "failed"
+    assert result["analysis_error"] is not None
+    assert result["analysis_failed_at"] is not None
+    assert result["canvas_pages"] == ["data:image/png;base64,ABC123"]
+    assert result["question_page_refs"] == {"pages": [3]}
+    assert result["answer_text"] == "my answer"
+    assert result["score"] is None
+    assert result["is_correct"] is None
+
+
+def test_duplicate_submission_resets_stale_analysis_fields():
+    asyncio.run(_test_duplicate_resets_stale_analysis_fields())
+
+
+async def _test_duplicate_resets_stale_analysis_fields():
+    db = AnalysisFakeDb()
+
+    first = await create_or_update_submission(
+        db=db,
+        meeting_id="MTG1",
+        lock_id="lck-1",
+        student_id="stu-1",
+        canvas_pages=[],
+        question_page_refs={"pages": [1]},
+        answer_text="4",
+        time_spent=10,
+        client_submitted_at=datetime.utcnow(),
+    )
+
+    stale_fields = {
+        "analysis_status": "completed",
+        "score": 1.0,
+        "is_correct": True,
+        "student_answer": "4",
+        "work_shown": "old work",
+        "what_went_wrong": None,
+        "correct_solution": "2 + 2 = 4",
+        "analysis_error": None,
+        "analysis_completed_at": datetime.utcnow(),
+        "analysis_failed_at": None,
+    }
+    await db.mongo_update_one(
+        "online_class_submissions",
+        {"submission_id": first["submission_id"]},
+        {"$set": stale_fields},
+    )
+
+    second = await create_or_update_submission(
+        db=db,
+        meeting_id="MTG1",
+        lock_id="lck-1",
+        student_id="stu-1",
+        canvas_pages=["img-b"],
+        question_page_refs={"pages": [2]},
+        answer_text="5",
+        time_spent=20,
+        client_submitted_at=datetime.utcnow(),
+    )
+
+    assert second["submission_id"] == first["submission_id"]
+    assert second["canvas_pages"] == ["img-b"]
+    assert second["answer_text"] == "5"
+    assert second["analysis_status"] == "pending"
+    assert second["score"] is None
+    assert second["is_correct"] is None
+    assert second["student_answer"] is None
+    assert second["work_shown"] is None
+    assert second["correct_solution"] is None
+    assert len(db.collections["online_class_submissions"]) == 1

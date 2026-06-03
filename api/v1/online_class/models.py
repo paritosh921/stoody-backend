@@ -43,6 +43,15 @@ class SubmissionResponse(BaseModel):
     answer_text: Optional[str] = None
     time_spent: Optional[float] = None
     analysis_status: str
+    score: Optional[float] = None
+    is_correct: Optional[bool] = None
+    student_answer: Optional[str] = None
+    work_shown: Optional[str] = None
+    what_went_wrong: Optional[str] = None
+    correct_solution: Optional[str] = None
+    analysis_error: Optional[str] = None
+    analysis_completed_at: Optional[datetime] = None
+    analysis_failed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -57,6 +66,11 @@ class SubmissionResultItem(BaseModel):
     analysis_status: str
     score: Optional[float] = None
     is_correct: Optional[bool] = None
+    student_answer: Optional[str] = None
+    work_shown: Optional[str] = None
     what_went_wrong: Optional[str] = None
     correct_solution: Optional[str] = None
+    analysis_error: Optional[str] = None
+    analysis_completed_at: Optional[datetime] = None
+    analysis_failed_at: Optional[datetime] = None
     created_at: datetime

@@ -1,1 +1,2 @@
 from .jitsi_provider import jitsi_provider_service
+from .analysis_service import run_submission_analysis
