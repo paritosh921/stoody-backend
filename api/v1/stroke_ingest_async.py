@@ -107,6 +107,10 @@ class StrokeChunkUpload(BaseModel):
     chunk_index: int = Field(..., ge=0)
     total_chunks: int = Field(..., ge=1)
     payload_base64: str = Field(..., description="Base64-encoded stroke chunk payload")
+    payload_hash: Optional[str] = Field(
+        None,
+        description="Optional SHA-256 of the base64-encoded payload string; verified when supplied",
+    )
 
 
 class IngestAck(BaseModel):
@@ -473,6 +477,14 @@ async def upload_stroke_chunk(
 
     # Deduplication check
     payload_hash = _compute_payload_hash(body.payload_base64)
+    if body.payload_hash is not None and body.payload_hash != payload_hash:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "payload_hash mismatch: supplied hash does not match "
+                "payload_base64"
+            ),
+        )
     dedup_hash = _compute_dedup_hash(exam_id, pen_mac_upper, body.chunk_index, payload_hash)
 
     existing = await chunk_col.find_one({"dedup_hash": dedup_hash})

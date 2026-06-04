@@ -124,7 +124,10 @@ async def _upload_chunk(db, current_user, **overrides):
         chunk_index=0,
         total_chunks=1,
         payload_base64=payload_b64,
-        payload_hash=hashlib.sha256(payload_b64.encode()).hexdigest(),
+        payload_hash=overrides.pop(
+            "payload_hash",
+            hashlib.sha256(payload_b64.encode()).hexdigest(),
+        ),
         hub_id=overrides.pop("hub_id", "HUB-1"),
         metadata=overrides.pop("metadata", {}),
         **overrides,
@@ -189,6 +192,18 @@ async def test_upload_chunk_uses_canonical_exam_type_and_records_hub_id():
 
     assert stored["exam_type"] == "dcr"
     assert stored["hub_id"] == "HUB-1"
+
+
+@pytest.mark.asyncio
+async def test_upload_chunk_rejects_payload_hash_mismatch():
+    db = _fresh_db()
+    await _seed_exam(db, exam_type="pcr")
+
+    with pytest.raises(HTTPException) as exc:
+        await _upload_chunk(db, _hub_user("HUB-1"), payload_hash="bad-hash")
+
+    assert exc.value.status_code == 400
+    assert "payload_hash mismatch" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio
