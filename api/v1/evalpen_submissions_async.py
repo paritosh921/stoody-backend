@@ -106,6 +106,20 @@ class SubmissionAcceptedAPI(BaseModel):
     segmentation_status: str
 
 
+class SubmissionProcessResultAPI(BaseModel):
+    """API response for PCR segmentation/response detection."""
+
+    submission_id: str
+    segmentation_status: str
+    page_count: int = 0
+    response_count: int = 0
+    inserted_count: int = 0
+    duplicate_count: int = 0
+    blocked_count: int = 0
+    warning_count: int = 0
+    error: Optional[str] = None
+
+
 class SubmissionSummaryAPI(BaseModel):
     """Submission summary for listing.
 
@@ -243,6 +257,30 @@ def _doc_to_detected_response(doc: Dict[str, Any]) -> Dict[str, Any]:
         "ocr_confidence": doc.get("ocr_confidence"),
         "flags": flags if flags else None,
     }
+
+
+async def _build_submission_service(tenant_db: Any) -> Any:
+    """Build the PCR submission processor for canonical artifacts."""
+    from api.v1._exampen_imports import load_exampen
+
+    IngestService = load_exampen("ingest.service").IngestService
+    pcr_storage = load_exampen("pcr.storage")
+    pcr_services = load_exampen("pcr.services")
+    LLMGate = load_exampen("llm_gate").LLMGate
+
+    ingest = IngestService(tenant_db)
+    await ingest.initialize()
+
+    gate = LLMGate(tenant_db)
+    if hasattr(gate, "initialize"):
+        await gate.initialize()
+
+    return pcr_services.SubmissionService(
+        ingest=ingest,
+        response_repo=pcr_storage.DetectedResponseRepository(tenant_db),
+        question_repo=pcr_storage.QuestionRepository(tenant_db),
+        gate=gate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +483,70 @@ async def get_submission_responses(
         )
 
 
+@router.post(
+    "/{submission_id}/process",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SubmissionProcessResultAPI,
+    summary="Process one PCR submission into detected responses",
+    responses={
+        400: {"description": "Submission could not be processed"},
+        403: {"description": "Insufficient permissions"},
+        503: {"description": "Tenant database or PCR engine unavailable"},
+    },
+)
+async def process_submission(
+    submission_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> SubmissionProcessResultAPI:
+    """Run OCR/segmentation for one canonical conducted-exam submission.
+
+    This is the PCR-owned bridge from immutable ingest artifacts to
+    ``evalpen_detected_responses``. It reads the submission server-side
+    through ``IngestService`` and does not accept answer text from the
+    caller.
+    """
+    tenant_db = await _get_tenant_db_for_user(db, current_user)
+
+    try:
+        processor = await _build_submission_service(tenant_db)
+        result = await processor.process_submission(submission_id)
+    except ImportError as exc:
+        logger.error("PCR submission processor import failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PCR submission processor is not available in this deployment",
+        )
+    except Exception as exc:
+        logger.error(
+            "Failed to process submission=%s: %s",
+            submission_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Submission processing encountered an internal error",
+        )
+
+    if result.error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.error,
+        )
+
+    return SubmissionProcessResultAPI(
+        submission_id=result.submission_id,
+        segmentation_status="complete",
+        page_count=result.page_count,
+        response_count=result.response_count,
+        inserted_count=result.inserted_count,
+        duplicate_count=result.duplicate_count,
+        blocked_count=result.blocked_count,
+        warning_count=result.warning_count,
+    )
+
+
 @flags_router.patch(
     "/{flag_id}/resolve",
     summary="Resolve one PCR flag",
@@ -473,6 +575,7 @@ async def resolve_flag(
     tenant_db = await _get_tenant_db_for_user(db, current_user)
 
     try:
+        from api.v1._exampen_imports import load_exampen
         DetectedResponseRepository = load_exampen("pcr.storage").DetectedResponseRepository
 
         resp_repo = DetectedResponseRepository(tenant_db)

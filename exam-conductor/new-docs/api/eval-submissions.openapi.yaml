@@ -1,7 +1,7 @@
 openapi: "3.1.0"
 info:
   title: ExamPen PCR Submission API
-  version: "2.1.0"
+  version: "2.2.0"
   description: |
     PCR conducted-exam submission APIs operating on canonical server-side artifacts.
 servers:
@@ -62,6 +62,22 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/DetectedResponse"
+  /api/v1/evalpen/submissions/{submission_id}/process:
+    post:
+      summary: Process one PCR submission into detected responses
+      parameters:
+        - name: submission_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Submission processed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmissionProcessResult"
   /api/v1/evalpen/flags/{flag_id}/resolve:
     patch:
       summary: Resolve one PCR flag
@@ -139,6 +155,37 @@ components:
         submitted_at:
           type: string
           format: date-time
+    SubmissionProcessResult:
+      type: object
+      required:
+        - submission_id
+        - segmentation_status
+        - page_count
+        - response_count
+        - inserted_count
+        - duplicate_count
+        - blocked_count
+        - warning_count
+      properties:
+        submission_id:
+          type: string
+        segmentation_status:
+          type: string
+          enum: [complete]
+        page_count:
+          type: integer
+        response_count:
+          type: integer
+        inserted_count:
+          type: integer
+        duplicate_count:
+          type: integer
+        blocked_count:
+          type: integer
+        warning_count:
+          type: integer
+        error:
+          type: string
     DetectedResponse:
       type: object
       required: [response_id, question_id, content_type, eval_status]

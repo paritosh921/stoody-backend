@@ -179,10 +179,11 @@ async def _build_eval_core(tenant_db: Any) -> Any:
     Imports are deferred to avoid top-level dependency on the
     exam-conductor package.
     """
-    import importlib
-    _pcr_storage = importlib.import_module("exam-conductor.pcr.storage")
-    _pcr_services = importlib.import_module("exam-conductor.pcr.services")
-    _llm_gate = importlib.import_module("exam-conductor.llm_gate")
+    from api.v1._exampen_imports import load_exampen
+
+    _pcr_storage = load_exampen("pcr.storage")
+    _pcr_services = load_exampen("pcr.services")
+    _llm_gate = load_exampen("llm_gate")
     DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
     EvaluationRepository = _pcr_storage.EvaluationRepository
     QuestionRepository = _pcr_storage.QuestionRepository
@@ -529,8 +530,9 @@ async def get_evaluation(
     tenant_db = await _get_tenant_db_for_user(db, current_user)
 
     try:
-        import importlib
-        _pcr_storage = importlib.import_module("exam-conductor.pcr.storage")
+        from api.v1._exampen_imports import load_exampen
+
+        _pcr_storage = load_exampen("pcr.storage")
         EvaluationRepository = _pcr_storage.EvaluationRepository
 
         eval_repo = EvaluationRepository(tenant_db)
