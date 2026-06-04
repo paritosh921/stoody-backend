@@ -144,6 +144,7 @@ class ExamCreateRequest(BaseModel):
 
 class ExamDetailResponse(BaseModel):
     exam_id: str
+    title: Optional[str] = None
     exam_type: str
     lifecycle_state: str
     prepared_document_id: Optional[str] = None
@@ -194,6 +195,7 @@ def _build_exam_doc(
     exam_id: str,
     exam_type: str,
     current_user: Dict[str, Any],
+    title: Optional[str] = None,
     prepared_document_id: Optional[str] = None,
     roster: Optional[List[str]] = None,
     duration_minutes: Optional[int] = None,
@@ -204,6 +206,7 @@ def _build_exam_doc(
     now = datetime.now(timezone.utc)
     return {
         "exam_id": exam_id,
+        "title": title,
         "exam_type": exam_type,
         "lifecycle_state": "draft",
         "prepared_document_id": prepared_document_id,
@@ -248,6 +251,7 @@ def _doc_to_response(doc: Dict[str, Any]) -> ExamDetailResponse:
 
     return ExamDetailResponse(
         exam_id=doc.get("exam_id", ""),
+        title=_fmt(doc.get("title")),
         exam_type=doc.get("exam_type", ""),
         lifecycle_state=doc.get("lifecycle_state", "draft"),
         prepared_document_id=doc.get("prepared_document_id"),
@@ -339,6 +343,25 @@ async def _load_prepared_document(
         )
 
     return doc
+
+
+def _prepared_document_duration_minutes(doc: Dict[str, Any]) -> Optional[int]:
+    """Return the canonical exam duration from prepared-document metadata."""
+    for field in ("duration_minutes", "total_minutes"):
+        raw = doc.get(field)
+        if raw is None:
+            continue
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, str) and raw.strip().isdigit():
+            value = int(raw.strip())
+        else:
+            continue
+        if value > 0:
+            return value
+    return None
 
 
 def _is_tutor_admin_role(current_user: Dict[str, Any]) -> bool:
@@ -433,6 +456,8 @@ async def create_exam(
     derived_admin_id: Optional[str] = None
     derived_teacher_ids: Optional[List[str]] = None
     derived_exam_type: Optional[str] = body.exam_type
+    derived_title: Optional[str] = None
+    derived_duration_minutes: Optional[int] = body.duration_minutes
 
     if body.prepared_document_id:
         doc = await _load_prepared_document(tenant_db, body.prepared_document_id)
@@ -440,6 +465,10 @@ async def create_exam(
         # linked. Caller-supplied exam_type is ignored to keep the prepared
         # document the single source of truth for the exam mode.
         derived_exam_type = doc.get("exam_mode")
+        raw_title = doc.get("title")
+        if raw_title is not None:
+            derived_title = str(raw_title)
+        derived_duration_minutes = _prepared_document_duration_minutes(doc)
         raw_admin = doc.get("admin_id")
         if raw_admin is not None:
             derived_admin_id = str(raw_admin)
@@ -490,9 +519,10 @@ async def create_exam(
         exam_id=body.exam_id,
         exam_type=derived_exam_type,
         current_user=current_user,
+        title=derived_title,
         prepared_document_id=body.prepared_document_id,
         roster=body.roster,
-        duration_minutes=body.duration_minutes,
+        duration_minutes=derived_duration_minutes,
         admin_id=derived_admin_id,
         teacher_ids=derived_teacher_ids,
         created_by_tutor_id=created_by_tutor_id,

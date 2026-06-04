@@ -33,6 +33,7 @@ async def _seed_document(db, **overrides) -> None:
         "title": "PCR Paper",
         "exam_mode": "pcr",
         "exam_finalized": True,
+        "total_minutes": 45,
         "admin_id": "admin-1",
         "teacher_ids": ["tut-1"],
         "is_active": True,
@@ -74,9 +75,11 @@ async def test_create_exam_maps_prepared_document_to_tutor_owner():
     await _seed_document(
         db,
         document_id="doc-1",
+        title="DCR Final Paper",
         exam_mode="dcr",
         admin_id="admin-doc",
         teacher_ids=["tut-1", "tut-2"],
+        total_minutes=90,
     )
 
     result = await _create_exam(
@@ -84,12 +87,30 @@ async def test_create_exam_maps_prepared_document_to_tutor_owner():
         _tutor_user("tut-1"),
         exam_type="pcr",
         prepared_document_id="doc-1",
+        duration_minutes=15,
     )
 
+    assert result.title == "DCR Final Paper"
     assert result.exam_type == "dcr"
+    assert result.duration_minutes == 90
     assert result.admin_id == "admin-doc"
     assert result.teacher_ids == ["tut-1", "tut-2"]
     assert result.created_by_tutor_id == "tut-1"
+
+
+@pytest.mark.asyncio
+async def test_prepared_document_duration_rejects_bool_and_uses_total_minutes_fallback():
+    db = _fresh_db()
+    await _seed_document(db, duration_minutes=True, total_minutes=75)
+
+    result = await _create_exam(
+        db,
+        _tutor_user("tut-1"),
+        prepared_document_id="doc-1",
+        duration_minutes=15,
+    )
+
+    assert result.duration_minutes == 75
 
 
 @pytest.mark.asyncio
