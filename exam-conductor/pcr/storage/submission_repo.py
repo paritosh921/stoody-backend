@@ -141,6 +141,7 @@ class SubmissionRepository:
         *,
         admin_id: Optional[str] = None,
         exam_id: Optional[str] = None,
+        exam_ids: Optional[List[str]] = None,
         limit: int = 100,
         skip: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -152,7 +153,9 @@ class SubmissionRepository:
         query: Dict[str, Any] = {}
         if admin_id is not None:
             query["admin_id"] = admin_id
-        if exam_id is not None:
+        if exam_ids is not None:
+            query["exam_id"] = {"$in": exam_ids}
+        elif exam_id is not None:
             query["exam_id"] = exam_id
 
         cursor = (

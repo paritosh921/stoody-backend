@@ -39,6 +39,11 @@ from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from api.v1.exam_orch_async import (
+    _current_tutor_id,
+    _is_exam_visible_to_tutor,
+    _is_tutor_admin_role,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +202,62 @@ async def _get_tenant_db_for_user(
             detail="Tenant database not available",
         )
     return tenant_db
+
+
+async def _visible_exam_ids_for_tutor(
+    tenant_db: Any,
+    current_user: Dict[str, Any],
+) -> Optional[List[str]]:
+    """Return tutor-visible exam ids, or None for admin-like users.
+
+    Canonical submissions remain admin-owned. Tutor read access is derived
+    from ExamPen exam visibility, not from a second ownership field on the
+    submission.
+    """
+    if _is_tutor_admin_role(current_user):
+        return None
+
+    tutor_id = _current_tutor_id(current_user)
+    if tutor_id is None:
+        return []
+
+    query = {
+        "$or": [
+            {"created_by_tutor_id": tutor_id},
+            {"teacher_ids": tutor_id},
+            {"teacher_ids": []},
+            {"teacher_ids": None},
+            {"teacher_ids": {"$exists": False}},
+        ]
+    }
+    cursor = tenant_db["exampen_exams"].find(query, {"exam_id": 1})
+    docs = await cursor.to_list(length=1000)
+    return [str(doc["exam_id"]) for doc in docs if doc.get("exam_id")]
+
+
+async def _require_submission_visible_to_user(
+    tenant_db: Any,
+    submission: Dict[str, Any],
+    current_user: Dict[str, Any],
+) -> None:
+    """Enforce tutor visibility for per-submission read/process routes."""
+    if _is_tutor_admin_role(current_user):
+        return
+
+    tutor_id = _current_tutor_id(current_user)
+    if tutor_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Submission is not visible to this user",
+        )
+
+    exam_id = submission.get("exam_id")
+    exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam_doc is None or not _is_exam_visible_to_tutor(exam_doc, tutor_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Submission is not visible to this tutor",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +459,14 @@ async def list_submissions(
         SubmissionRepository = load_exampen("pcr.storage").SubmissionRepository
 
         repo = SubmissionRepository(tenant_db)
-        admin_id = current_user.get("user_id")
-        docs = await repo.list_submissions(admin_id=admin_id)
+        visible_exam_ids = await _visible_exam_ids_for_tutor(tenant_db, current_user)
+        if visible_exam_ids is None:
+            admin_id = current_user.get("user_id")
+            docs = await repo.list_submissions(admin_id=admin_id)
+        elif not visible_exam_ids:
+            docs = []
+        else:
+            docs = await repo.list_submissions(exam_ids=visible_exam_ids)
 
         return {
             "items": [_doc_to_submission_summary(d) for d in docs],
@@ -453,6 +520,9 @@ async def get_submission_responses(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Submission {submission_id} not found",
             )
+        await _require_submission_visible_to_user(
+            tenant_db, submission, current_user
+        )
 
         # Fetch detected responses
         resp_repo = DetectedResponseRepository(tenant_db)
@@ -509,8 +579,24 @@ async def process_submission(
     tenant_db = await _get_tenant_db_for_user(db, current_user)
 
     try:
+        from api.v1._exampen_imports import load_exampen
+
+        SubmissionRepository = load_exampen("pcr.storage").SubmissionRepository
+        sub_repo = SubmissionRepository(tenant_db)
+        submission = await sub_repo.get_submission(submission_id)
+        if submission is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Submission {submission_id} not found",
+            )
+        await _require_submission_visible_to_user(
+            tenant_db, submission, current_user
+        )
+
         processor = await _build_submission_service(tenant_db)
         result = await processor.process_submission(submission_id)
+    except HTTPException:
+        raise
     except ImportError as exc:
         logger.error("PCR submission processor import failed: %s", exc)
         raise HTTPException(
