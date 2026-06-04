@@ -96,6 +96,7 @@ MOBILE_ACCESS_SCOPES = [
     "hub:read",
     "hub:pens",
     "hub:storage",
+    "exampen:control",
     "smartboard:read",
     "smartboard:manage",
 ]
@@ -387,6 +388,62 @@ class AssignmentResponse(BaseModel):
     roster: List[str] = Field(default_factory=list)
     duration_minutes: Optional[int] = None
     lifecycle_state: Optional[str] = None
+    teacher_ids: List[str] = Field(default_factory=list)
+    pen_bindings: Dict[str, str] = Field(default_factory=dict)
+
+
+def _safe_string_dict(v: Any) -> Dict[str, str]:
+    """Coerce arbitrary MongoDB values into a dict[str, str].
+
+    ExamPen pen_bindings is expected to map pen_mac -> student_id so the
+    edge collector can tag captured frames without guessing identity. Anything
+    that isn't a mapping is dropped to an empty dict to keep the contract
+    stable for the edge hub.
+    """
+    if not isinstance(v, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in v.items():
+        if value is None:
+            continue
+        out[str(key)] = str(value)
+    return out
+
+
+def _build_assignment_response(
+    hub_id: str,
+    exam_doc: Optional[Dict[str, Any]],
+    *,
+    assigned_exam_id: Optional[str] = None,
+) -> AssignmentResponse:
+    """Build an AssignmentResponse from an exam document and hub_id.
+
+    Used by both POST /assign and GET /assignment so the two endpoints
+    cannot drift on field coverage. When ``exam_doc`` is None the response
+    is empty apart from the explicit ``assigned_exam_id`` (which may also
+    be None for the no-assignment case).
+    """
+    if exam_doc is None:
+        return AssignmentResponse(
+            hub_id=hub_id,
+            assigned_exam_id=assigned_exam_id,
+        )
+
+    duration_minutes = exam_doc.get("duration_minutes")
+    if duration_minutes is None:
+        # Older exam docs store the duration under total_minutes.
+        duration_minutes = exam_doc.get("total_minutes")
+
+    return AssignmentResponse(
+        hub_id=hub_id,
+        assigned_exam_id=assigned_exam_id or exam_doc.get("exam_id"),
+        exam_type=exam_doc.get("exam_type"),
+        roster=_safe_string_list(exam_doc.get("roster")),
+        duration_minutes=duration_minutes,
+        lifecycle_state=exam_doc.get("lifecycle_state"),
+        teacher_ids=_safe_string_list(exam_doc.get("teacher_ids")),
+        pen_bindings=_safe_string_dict(exam_doc.get("pen_bindings")),
+    )
 
 
 class SessionEventRequest(BaseModel):
@@ -1033,6 +1090,15 @@ async def link_local_hub(
     institution_id = current_user.get("institution_id") or db_name
     linked_by = current_user.get("user_id") or current_user.get("sub") or current_user.get("email")
     capabilities = [str(item).strip() for item in body.capabilities if str(item).strip()]
+    existing_hub = await collection.find_one({"hub_id": hub_id})
+    existing_mobile_access = dict((existing_hub or {}).get("mobile_access") or {})
+    existing_allowed_tutor_ids = _safe_string_list(
+        existing_mobile_access.get("allowed_tutor_ids")
+    )
+    existing_access_policy = (
+        str(existing_mobile_access.get("access_policy") or "selected_only").strip()
+        or "selected_only"
+    )
 
     existing_master = await master_db["exampen_hubs"].find_one({"hub_id": hub_id})
     if existing_master:
@@ -1065,8 +1131,8 @@ async def link_local_hub(
         "firmware_version": body.firmware_version,
         "capabilities": capabilities,
         "hub_scopes": HUB_BACKEND_SCOPES,
-        "mobile_access.access_policy": "selected_only",
-        "mobile_access.allowed_tutor_ids": [],
+        "mobile_access.access_policy": existing_access_policy,
+        "mobile_access.allowed_tutor_ids": existing_allowed_tutor_ids,
         "hub_credentials": {
             "credential_hash": _hash_hub_device_credential(device_credential),
             "credential_version": credential_version,
@@ -1464,14 +1530,7 @@ async def assign_exam_to_hub(
 
     logger.info("Hub %s assigned to exam %s by %s", hub_id, body.exam_id, current_user.get("user_id"))
 
-    return AssignmentResponse(
-        hub_id=hub_id,
-        assigned_exam_id=body.exam_id,
-        exam_type=exam_doc.get("exam_type"),
-        roster=exam_doc.get("roster", []),
-        duration_minutes=exam_doc.get("duration_minutes"),
-        lifecycle_state=exam_doc.get("lifecycle_state"),
-    )
+    return _build_assignment_response(hub_id, exam_doc, assigned_exam_id=body.exam_id)
 
 
 @router.get(
@@ -1510,14 +1569,7 @@ async def get_assignment(
     if exam_doc is None:
         return AssignmentResponse(hub_id=hub_id, assigned_exam_id=assigned_exam_id)
 
-    return AssignmentResponse(
-        hub_id=hub_id,
-        assigned_exam_id=assigned_exam_id,
-        exam_type=exam_doc.get("exam_type"),
-        roster=exam_doc.get("roster", []),
-        duration_minutes=exam_doc.get("duration_minutes"),
-        lifecycle_state=exam_doc.get("lifecycle_state"),
-    )
+    return _build_assignment_response(hub_id, exam_doc, assigned_exam_id=assigned_exam_id)
 
 
 @router.get(
@@ -2480,6 +2532,17 @@ async def session_start(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {body.exam_id} not found",
         )
+    if str(hub_doc.get("assigned_exam_id") or "") != body.exam_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Hub {hub_id} is not assigned to exam {body.exam_id}",
+        )
+    hub_assignments = exam_doc.get("hub_assignments") or []
+    if not any(str(item.get("hub_id") or "") == hub_id for item in hub_assignments):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Exam {body.exam_id} does not include hub assignment {hub_id}",
+        )
 
     lifecycle = exam_doc.get("lifecycle_state", "draft")
     if lifecycle not in ("armed", "in_progress"):
@@ -2499,7 +2562,13 @@ async def session_start(
     # Update exam's hub_assignments with session_started_at for this hub
     await exam_col.update_one(
         {"exam_id": body.exam_id, "hub_assignments.hub_id": hub_id},
-        {"$set": {"hub_assignments.$.session_started_at": now, "updated_at": now}},
+        {
+            "$set": {
+                "hub_assignments.$.session_started_at": now,
+                "lifecycle_state": "in_progress",
+                "updated_at": now,
+            }
+        },
     )
 
     logger.info("Hub %s started session for exam %s", hub_id, body.exam_id)
@@ -2541,6 +2610,27 @@ async def session_end(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Hub {hub_id} not found",
         )
+    exam_doc = await exam_col.find_one({"exam_id": body.exam_id})
+    if exam_doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Exam {body.exam_id} not found",
+        )
+    assigned_or_active = {
+        str(hub_doc.get("assigned_exam_id") or ""),
+        str(hub_doc.get("active_exam_id") or ""),
+    }
+    if body.exam_id not in assigned_or_active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Hub {hub_id} is not active for exam {body.exam_id}",
+        )
+    hub_assignments = exam_doc.get("hub_assignments") or []
+    if not any(str(item.get("hub_id") or "") == hub_id for item in hub_assignments):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Exam {body.exam_id} does not include hub assignment {hub_id}",
+        )
 
     now = datetime.now(timezone.utc)
 
@@ -2551,7 +2641,13 @@ async def session_end(
 
     await exam_col.update_one(
         {"exam_id": body.exam_id, "hub_assignments.hub_id": hub_id},
-        {"$set": {"hub_assignments.$.session_ended_at": now, "updated_at": now}},
+        {
+            "$set": {
+                "hub_assignments.$.session_ended_at": now,
+                "lifecycle_state": "collection_closed",
+                "updated_at": now,
+            }
+        },
     )
 
     logger.info("Hub %s ended session for exam %s", hub_id, body.exam_id)

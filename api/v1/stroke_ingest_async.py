@@ -103,6 +103,7 @@ async def _get_tenant_db(
 class StrokeChunkUpload(BaseModel):
     exam_type: str = Field(..., description="dcr or pcr")
     student_id: str
+    hub_id: Optional[str] = Field(None, description="Hub that uploaded this chunk")
     chunk_index: int = Field(..., ge=0)
     total_chunks: int = Field(..., ge=1)
     payload_base64: str = Field(..., description="Base64-encoded stroke chunk payload")
@@ -152,6 +153,7 @@ class PenUploadStatus(BaseModel):
 class DedupCheckRequest(BaseModel):
     chunk_index: int
     payload_hash: str = Field(..., description="SHA-256 of the base64-encoded payload string for this chunk")
+    hub_id: Optional[str] = Field(None, description="Hub probing for this chunk")
 
 
 class DedupCheckResponse(BaseModel):
@@ -191,12 +193,214 @@ def _compute_payload_hash(payload_b64: str) -> str:
     return hashlib.sha256(payload_b64.encode()).hexdigest()
 
 
+def _normalize_pen_mac(pen_mac: str) -> str:
+    return str(pen_mac or "").upper()
+
+
+def _expected_student_for_bound_pen(
+    exam_doc: Dict[str, Any],
+    pen_mac_upper: str,
+) -> Optional[str]:
+    bindings = exam_doc.get("pen_bindings") or {}
+    if not isinstance(bindings, dict):
+        return None
+    for raw_mac, raw_student_id in bindings.items():
+        if _normalize_pen_mac(str(raw_mac)) != pen_mac_upper:
+            continue
+        if raw_student_id is None:
+            return None
+        student_id = str(raw_student_id)
+        return student_id or None
+    return None
+
+
+def _require_student_binding_match(
+    exam_doc: Dict[str, Any],
+    pen_mac_upper: str,
+    student_id: str,
+) -> None:
+    expected_student_id = _expected_student_for_bound_pen(exam_doc, pen_mac_upper)
+    if expected_student_id is None:
+        return
+    if str(student_id) != expected_student_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Student {student_id} is not bound to pen {pen_mac_upper} "
+                f"for exam {exam_doc.get('exam_id')}"
+            ),
+        )
+
+
 def _fmt(v) -> Optional[str]:
     if hasattr(v, "isoformat"):
         return v.isoformat()
     if v is not None:
         return str(v)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Exam owner / caller authority resolution
+# ---------------------------------------------------------------------------
+#
+# Task 2 of the shared collector plan: finalization must attribute ingest
+# provenance to the exam OWNER (admin_id stored on exampen_exams), not to
+# the caller's identity (hub id / admin user_id / tutor user_id).
+#
+# This helper is applied to ALL stroke ingest route handlers
+# (upload_stroke_chunk, finalize_pen_upload, get_pen_upload_status,
+# dedup_check) so hub-assignment authorization is consistent across the
+# full surface, not just finalize.
+#
+# Visibility / hub-assignment rules mirror Task 1 in exam_orch_async:
+#   - admin / b2c_admin callers always pass
+#   - tutor callers pass iff (created_by_tutor_id == tutor id)
+#                            OR (teacher_ids contains tutor id)
+#                            OR (teacher_ids is empty / None / missing)
+#   - hub tokens pass iff the hub is assigned to the exam (either via
+#     exam_doc.hub_assignments OR exampen_hubs.assigned_exam_id) AND
+#     the body.hub_id matches the token hub id when body.hub_id is supplied
+#
+# If exampen_exams.admin_id is missing/empty the exam is in an
+# indeterminate ownership state — we refuse the request with 400 BEFORE
+# IngestService is invoked so we never have to fall back to the caller's
+# identity (which would silently reintroduce hub-id provenance).
+
+
+async def _resolve_exam_context_for_ingest(
+    tenant_db: Any,
+    exam_id: str,
+    current_user: Dict[str, Any],
+    body_hub_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load the exam, enforce caller authority, and return the canonical
+    exam context used by every stroke-ingest route handler.
+
+    Returns
+    -------
+    dict
+        ``{"exam_doc": <exam_doc>, "admin_id": <canonical owner admin_id>,
+           "exam_type": <"dcr"|"pcr">, "teacher_ids": [...]}``
+
+    Raises
+    ------
+    HTTPException
+        - 404 if the exam is missing
+        - 403 if the caller is a hub token that does not match an assigned
+          hub, or whose body.hub_id disagrees with the token hub id
+        - 403 if the caller is a tutor that is not visible to the exam
+          (Task 1 visibility rules)
+        - 400 if the exam has no admin_id (data-integrity refusal; we
+          will not fall back to the caller's identity)
+    """
+    exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam_doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Exam {exam_id} not found",
+        )
+
+    user_type = (current_user.get("user_type") or "").lower()
+    canonical_admin_id = exam_doc.get("admin_id")
+    if canonical_admin_id is not None:
+        canonical_admin_id = str(canonical_admin_id)
+
+    raw_teacher_ids = exam_doc.get("teacher_ids") or []
+    if not isinstance(raw_teacher_ids, list):
+        raw_teacher_ids = []
+    teacher_ids = [str(t) for t in raw_teacher_ids]
+
+    if user_type == "hub":
+        token_hub_id = (
+            current_user.get("hub_id")
+            or current_user.get("user_id")
+        )
+        # body.hub_id, when supplied, must match the token hub id.
+        if body_hub_id is not None and token_hub_id is not None:
+            if str(body_hub_id) != str(token_hub_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Hub token hub_id does not match body.hub_id "
+                        f"(token={token_hub_id}, body={body_hub_id})"
+                    ),
+                )
+
+        effective_hub_id = (
+            str(body_hub_id) if body_hub_id is not None else (
+                str(token_hub_id) if token_hub_id is not None else None
+            )
+        )
+
+        # Determine assignment: either exam_doc.hub_assignments or
+        # exampen_hubs.assigned_exam_id.
+        assigned = False
+        for ha in exam_doc.get("hub_assignments", []) or []:
+            if str(ha.get("hub_id", "")) == effective_hub_id:
+                assigned = True
+                break
+
+        if not assigned and effective_hub_id is not None:
+            hub_doc = await tenant_db["exampen_hubs"].find_one(
+                {"hub_id": effective_hub_id}
+            )
+            if hub_doc is not None and str(
+                hub_doc.get("assigned_exam_id") or ""
+            ) == str(exam_id):
+                assigned = True
+
+        if not assigned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Hub {effective_hub_id} is not assigned to exam {exam_id}"
+                ),
+            )
+
+    elif user_type in ("admin", "b2c_admin"):
+        # Admin / b2c_admin bypass visibility; canonical admin_id is the
+        # exam owner (not the caller).
+        pass
+
+    elif user_type == "tutor":
+        raw_tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
+        tutor_id = str(raw_tutor_id) if raw_tutor_id is not None else None
+        visible = False
+        if tutor_id is not None:
+            if exam_doc.get("created_by_tutor_id") == tutor_id:
+                visible = True
+            elif not teacher_ids:
+                visible = True
+            elif tutor_id in teacher_ids:
+                visible = True
+        if not visible:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Exam is not visible to this tutor",
+            )
+
+    # Other user types are already rejected by require_hub_or_admin.
+
+    # Data-integrity guard: refuse to operate on an exam whose owner
+    # admin_id is missing/empty. This prevents any caller path from
+    # silently falling back to current_user.user_id (which would
+    # reintroduce hub-id / tutor-id provenance).
+    if not canonical_admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Exam {exam_id} has no admin_id (owner) set; cannot "
+                "process stroke ingest until the exam owner is established"
+            ),
+        )
+
+    return {
+        "exam_doc": exam_doc,
+        "admin_id": canonical_admin_id,
+        "exam_type": exam_doc.get("exam_type"),
+        "teacher_ids": teacher_ids,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -229,13 +433,17 @@ async def upload_stroke_chunk(
     _require_hub_data_upload_scope(current_user)
     tenant_db = await _get_tenant_db(db, current_user)
 
-    # Validate exam exists and is in uploading state
-    exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
-    if exam_doc is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Exam {exam_id} not found",
-        )
+    # Resolve exam owner / caller authority BEFORE touching chunks so 404,
+    # 403 (unassigned hub / invisible tutor) and 400 (missing admin_id) are
+    # surfaced consistently across all stroke-ingest route handlers.
+    exam_ctx = await _resolve_exam_context_for_ingest(
+        tenant_db=tenant_db,
+        exam_id=exam_id,
+        current_user=current_user,
+        body_hub_id=body.hub_id,
+    )
+    exam_doc = exam_ctx["exam_doc"]
+    canonical_exam_type = exam_ctx["exam_type"]
 
     lifecycle = exam_doc.get("lifecycle_state", "draft")
     if lifecycle not in ("in_progress", "collection_closed", "uploading"):
@@ -244,13 +452,22 @@ async def upload_stroke_chunk(
             detail=f"Exam {exam_id} is in state '{lifecycle}' — must be 'in_progress', 'collection_closed', or 'uploading' to accept chunks",
         )
 
-    if body.exam_type not in ("dcr", "pcr"):
+    if canonical_exam_type not in ("dcr", "pcr"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="exam_type must be 'dcr' or 'pcr'",
+            detail=f"Exam {exam_id} has no valid exam_type set",
+        )
+    if body.exam_type != canonical_exam_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Chunk exam_type {body.exam_type!r} does not match "
+                f"canonical exam_type {canonical_exam_type!r}"
+            ),
         )
 
-    pen_mac_upper = pen_mac.upper()
+    pen_mac_upper = _normalize_pen_mac(pen_mac)
+    _require_student_binding_match(exam_doc, pen_mac_upper, body.student_id)
     chunk_col = tenant_db["exampen_stroke_chunks"]
     await _ensure_indexes(chunk_col)
 
@@ -278,7 +495,8 @@ async def upload_stroke_chunk(
     doc = {
         "artifact_id": artifact_id,
         "exam_id": exam_id,
-        "exam_type": body.exam_type,
+        "exam_type": canonical_exam_type,
+        "hub_id": body.hub_id,
         "pen_mac": pen_mac_upper,
         "student_id": body.student_id,
         "chunk_index": body.chunk_index,
@@ -337,11 +555,30 @@ async def finalize_pen_upload(
 
     Verifies all chunks are received, validates checksum, then bridges
     the assembled data into the canonical ingest substrate via IngestService.
+
+    The canonical admin_id sent to IngestService is the exam OWNER's
+    admin_id (read from exampen_exams.admin_id), not the caller's user_id.
+    See Task 2 of the shared collector plan.
     """
     _require_hub_data_upload_scope(current_user)
     tenant_db = await _get_tenant_db(db, current_user)
-    pen_mac_upper = pen_mac.upper()
+    pen_mac_upper = _normalize_pen_mac(pen_mac)
     chunk_col = tenant_db["exampen_stroke_chunks"]
+
+    # Resolve exam owner / caller authority BEFORE touching chunks so 404
+    # and 403 are surfaced for missing exams and unauthorized hubs/tutors.
+    exam_ctx = await _resolve_exam_context_for_ingest(
+        tenant_db=tenant_db,
+        exam_id=exam_id,
+        current_user=current_user,
+        body_hub_id=body.hub_id,
+    )
+    canonical_admin_id = exam_ctx["admin_id"]
+    _require_student_binding_match(
+        exam_ctx["exam_doc"],
+        pen_mac_upper,
+        body.student_id,
+    )
 
     # Count received chunks
     received = await chunk_col.count_documents({
@@ -414,7 +651,7 @@ async def finalize_pen_upload(
         result = await service.ingest_submission(
             exam_id=exam_id,
             student_id=body.student_id,
-            admin_id=current_user.get("user_id", "unknown"),
+            admin_id=canonical_admin_id,
             source="ble_pen",
             pen_mac=pen_mac_upper,
             hub_id=body.hub_id,
@@ -461,6 +698,16 @@ async def get_pen_upload_status(
 ) -> PenUploadStatus:
     """Get upload acknowledgment status for a specific pen in an exam."""
     tenant_db = await _get_tenant_db(db, current_user)
+
+    # Enforce same hub-assignment / tutor-visibility / admin_id rules as
+    # the rest of the stroke-ingest surface.
+    await _resolve_exam_context_for_ingest(
+        tenant_db=tenant_db,
+        exam_id=exam_id,
+        current_user=current_user,
+        body_hub_id=None,  # GET has no body
+    )
+
     pen_mac_upper = pen_mac.upper()
     chunk_col = tenant_db["exampen_stroke_chunks"]
 
@@ -526,6 +773,16 @@ async def dedup_check(
 ) -> DedupCheckResponse:
     """Pre-upload deduplication check so hub can skip already-received chunks."""
     tenant_db = await _get_tenant_db(db, current_user)
+
+    # Enforce same hub-assignment / tutor-visibility / admin_id rules as
+    # the rest of the stroke-ingest surface before touching chunk storage.
+    await _resolve_exam_context_for_ingest(
+        tenant_db=tenant_db,
+        exam_id=exam_id,
+        current_user=current_user,
+        body_hub_id=body.hub_id,
+    )
+
     pen_mac_upper = pen_mac.upper()
     chunk_col = tenant_db["exampen_stroke_chunks"]
 
