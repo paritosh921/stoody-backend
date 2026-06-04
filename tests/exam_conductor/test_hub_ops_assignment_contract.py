@@ -43,17 +43,40 @@ def _admin_user() -> Dict[str, Any]:
     }
 
 
+def _tutor_user(tutor_id: str = "T-1") -> Dict[str, Any]:
+    return {
+        "user_id": tutor_id,
+        "tutor_id": tutor_id,
+        "user_type": "tutor",
+        "db_name": "skb_test",
+        "institution_id": "INST-1",
+    }
+
+
 async def _seed_hub(
     db,
     *,
     hub_id: str = "HUB-1",
     assigned_exam_id: Optional[str] = "EXAM-1",
+    allowed_tutor_ids: Optional[list[str]] = None,
 ) -> None:
     doc: Dict[str, Any] = {
         "hub_id": hub_id,
         "hub_name": "Exam hub",
         "status": "online",
         "hub_credentials": {"status": "active"},
+        "mobile_access": {
+            "access_policy": "selected_only",
+            "allowed_tutor_ids": allowed_tutor_ids or [],
+            "allowed_tutors": [
+                {
+                    "tutor_id": tutor_id,
+                    "username": tutor_id.lower(),
+                    "scopes": ["hub:read", "exampen:control"],
+                }
+                for tutor_id in (allowed_tutor_ids or [])
+            ],
+        },
     }
     if assigned_exam_id is not None:
         doc["assigned_exam_id"] = assigned_exam_id
@@ -98,6 +121,17 @@ async def _call_assign(db, current_user=None, hub_id: str = "HUB-1"):
         return await assign_exam_to_hub(
             hub_id=hub_id,
             body=AssignRequest(exam_id="EXAM-1"),
+            current_user=current_user or _admin_user(),
+            db=None,  # type: ignore[arg-type]
+        )
+
+
+async def _call_clear_assignment(db, current_user=None, hub_id: str = "HUB-1"):
+    from api.v1.hub_ops_async import clear_assignment
+
+    with patch("api.v1.hub_ops_async._get_tenant_db", return_value=db):
+        return await clear_assignment(
+            hub_id=hub_id,
             current_user=current_user or _admin_user(),
             db=None,  # type: ignore[arg-type]
         )
@@ -161,6 +195,137 @@ async def test_assign_returns_same_enriched_assignment_payload():
     assert result.pen_bindings == {"PEN-MAC": "S-7"}
     hub_doc = await db["exampen_hubs"].find_one({"hub_id": "HUB-1"})
     assert hub_doc["assigned_exam_id"] == "EXAM-1"
+
+
+@pytest.mark.asyncio
+async def test_selected_tutor_can_activate_hub_assignment_after_exam_assignment_row_exists():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-1"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id="T-1",
+        teacher_ids=["T-1"],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    result = await _call_assign(db, current_user=_tutor_user("T-1"))
+
+    assert result.assigned_exam_id == "EXAM-1"
+    hub_doc = await db["exampen_hubs"].find_one({"hub_id": "HUB-1"})
+    assert hub_doc["assigned_exam_id"] == "EXAM-1"
+
+
+@pytest.mark.asyncio
+async def test_tutor_hub_assignment_rejects_unselected_tutor():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-2"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id="T-1",
+        teacher_ids=["T-1"],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_assign(db, current_user=_tutor_user("T-1"))
+
+    assert exc_info.value.status_code == 403
+    assert "not authorised for this hub" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_tutor_hub_assignment_rejects_invisible_exam():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-1"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id="T-2",
+        teacher_ids=["T-2"],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_assign(db, current_user=_tutor_user("T-1"))
+
+    assert exc_info.value.status_code == 403
+    assert "not visible" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_tutor_hub_assignment_requires_exam_assignment_row():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-1"])
+    await _seed_exam(db, created_by_tutor_id="T-1", teacher_ids=["T-1"], hub_assignments=[])
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_assign(db, current_user=_tutor_user("T-1"))
+
+    assert exc_info.value.status_code == 409
+    assert "before activating" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_tutor_hub_assignment_rejects_empty_teacher_ids_without_creator_match():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-1"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id=None,
+        teacher_ids=[],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_assign(db, current_user=_tutor_user("T-1"))
+
+    assert exc_info.value.status_code == 403
+    assert "not visible" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_selected_tutor_can_clear_active_hub_assignment():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id="EXAM-1", allowed_tutor_ids=["T-1"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id="T-1",
+        teacher_ids=["T-1"],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    result = await _call_clear_assignment(db, current_user=_tutor_user("T-1"))
+
+    assert result.assigned_exam_id is None
+    hub_doc = await db["exampen_hubs"].find_one({"hub_id": "HUB-1"})
+    assert hub_doc["assigned_exam_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_unselected_tutor_cannot_clear_active_hub_assignment():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id="EXAM-1", allowed_tutor_ids=["T-2"])
+    await _seed_exam(
+        db,
+        created_by_tutor_id="T-1",
+        teacher_ids=["T-1"],
+        hub_assignments=[{"hub_id": "HUB-1", "hub_name": "Exam hub"}],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _call_clear_assignment(db, current_user=_tutor_user("T-1"))
+
+    assert exc_info.value.status_code == 403
+    assert "not authorised for this hub" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_selected_tutor_can_clear_idle_hub_assignment():
+    db = _fresh_db()
+    await _seed_hub(db, assigned_exam_id=None, allowed_tutor_ids=["T-1"])
+
+    result = await _call_clear_assignment(db, current_user=_tutor_user("T-1"))
+
+    assert result.assigned_exam_id is None
 
 
 @pytest.mark.asyncio

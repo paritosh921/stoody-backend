@@ -846,6 +846,66 @@ def _actor_tutor_id(current_user: Dict[str, Any]) -> Optional[str]:
     return str(tutor_id).strip() if tutor_id else None
 
 
+def _is_admin_actor(current_user: Dict[str, Any]) -> bool:
+    return str(current_user.get("user_type") or "").lower() in {"admin", "b2c_admin"}
+
+
+def _is_exam_visible_to_tutor(exam_doc: Dict[str, Any], current_user: Dict[str, Any]) -> bool:
+    tutor_id = _actor_tutor_id(current_user)
+    if not tutor_id:
+        return False
+    if str(exam_doc.get("created_by_tutor_id") or "") == tutor_id:
+        return True
+    teacher_ids = exam_doc.get("teacher_ids")
+    return isinstance(teacher_ids, list) and tutor_id in {str(item) for item in teacher_ids}
+
+
+def _is_hub_selected_for_tutor(hub_doc: Dict[str, Any], current_user: Dict[str, Any]) -> bool:
+    if str(current_user.get("user_type") or "").lower() != "tutor":
+        return False
+
+    tutor_candidates = {
+        str(value).strip()
+        for value in (
+            current_user.get("tutor_id"),
+            current_user.get("user_id"),
+            current_user.get("sub"),
+        )
+        if value
+    }
+    selected_ids = set(_hub_selected_tutor_ids(hub_doc))
+    if selected_ids and tutor_candidates.intersection(selected_ids):
+        return True
+
+    allowed_tutors = list(dict(hub_doc.get("mobile_access") or {}).get("allowed_tutors") or [])
+    return _find_allowed_manifest_tutor(current_user, allowed_tutors) is not None
+
+
+def _require_tutor_hub_exam_assignment_access(
+    hub_doc: Dict[str, Any],
+    exam_doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+) -> None:
+    if _is_admin_actor(current_user):
+        return
+    if not _is_exam_visible_to_tutor(exam_doc, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Exam is not visible to this tutor",
+        )
+    if not _is_hub_selected_for_tutor(hub_doc, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tutor is not authorised for this hub",
+        )
+    hub_assignments = exam_doc.get("hub_assignments") or []
+    if not any(str(item.get("hub_id") or "") == str(hub_doc.get("hub_id") or "") for item in hub_assignments):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Assign the hub to this exam before activating the hub assignment",
+        )
+
+
 def _find_allowed_manifest_tutor(
     current_user: Dict[str, Any],
     allowed_tutors: List[Dict[str, Any]],
@@ -1491,10 +1551,16 @@ async def hub_heartbeat(
 async def assign_exam_to_hub(
     hub_id: str,
     body: AssignRequest,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ) -> AssignmentResponse:
-    """Assign an exam to a hub. The hub will receive this assignment on next heartbeat."""
+    """Assign an exam to a hub. The hub will receive this assignment on next heartbeat.
+
+    Admins retain the provisioning/ops path. Tutors can only activate an exam
+    that is already visible to them and already contains this hub in its
+    exam-level assignment list; this lets mobile complete the RPi poll contract
+    without granting tutor provisioning powers.
+    """
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
     exam_col = tenant_db["exampen_exams"]
@@ -1521,6 +1587,8 @@ async def assign_exam_to_hub(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {body.exam_id} not found",
         )
+
+    _require_tutor_hub_exam_assignment_access(hub_doc, exam_doc, current_user)
 
     now = datetime.now(timezone.utc)
     await hub_col.update_one(
@@ -2670,12 +2738,13 @@ async def session_end(
 )
 async def clear_assignment(
     hub_id: str,
-    current_user: Dict[str, Any] = Depends(require_admin),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ) -> AssignmentResponse:
     """Clear the current exam assignment from a hub."""
     tenant_db = await _get_tenant_db(db, current_user)
     hub_col = tenant_db["exampen_hubs"]
+    exam_col = tenant_db["exampen_exams"]
 
     hub_doc = await hub_col.find_one({"hub_id": hub_id})
     if hub_doc is None:
@@ -2683,6 +2752,22 @@ async def clear_assignment(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Hub {hub_id} not found",
         )
+
+    assigned_exam_id = str(hub_doc.get("assigned_exam_id") or "").strip()
+    if assigned_exam_id and not _is_admin_actor(current_user):
+        exam_doc = await exam_col.find_one({"exam_id": assigned_exam_id})
+        if exam_doc is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Exam {assigned_exam_id} not found",
+            )
+        _require_tutor_hub_exam_assignment_access(hub_doc, exam_doc, current_user)
+    elif not assigned_exam_id and not _is_admin_actor(current_user):
+        if not _is_hub_selected_for_tutor(hub_doc, current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Tutor is not authorised for this hub",
+            )
 
     await hub_col.update_one(
         {"hub_id": hub_id},
