@@ -84,6 +84,21 @@ class GenerateCodeResponse(BaseModel):
     expires_at: str = Field(..., description="ISO-8601 expiration timestamp")
 
 
+class VerifyCodeRequest(BaseModel):
+    """Request body for validating an invigilator code."""
+
+    exam_id: str = Field(..., min_length=1)
+    code: str = Field(..., min_length=_CODE_LENGTH, max_length=_CODE_LENGTH)
+
+
+class VerifyCodeResponse(BaseModel):
+    """Response for a valid invigilator code."""
+
+    valid: bool
+    exam_id: str
+    expires_at: str
+
+
 # ---------------------------------------------------------------------------
 # Helper: resolve tenant DB
 # ---------------------------------------------------------------------------
@@ -106,6 +121,48 @@ async def _get_tenant_db(
             detail="Tenant database not available",
         )
     return tenant_db
+
+
+def _current_tutor_id(current_user: Dict[str, Any]) -> str:
+    return str(current_user.get("tutor_id") or current_user.get("user_id") or "")
+
+
+def _can_access_exam(exam_doc: Dict[str, Any], current_user: Dict[str, Any]) -> bool:
+    user_type = (current_user.get("user_type") or "").lower()
+    if user_type in {"admin", "b2c_admin"}:
+        return True
+    if user_type == "tutor":
+        tutor_id = _current_tutor_id(current_user)
+        teacher_ids = exam_doc.get("teacher_ids")
+        return (
+            exam_doc.get("created_by_tutor_id") == tutor_id
+            or not teacher_ids
+            or (isinstance(teacher_ids, list) and tutor_id in teacher_ids)
+        )
+    if user_type == "hub":
+        hub_id = str(current_user.get("hub_id") or current_user.get("user_id") or "")
+        if not hub_id:
+            return False
+        assignments = exam_doc.get("hub_assignments") or []
+        return any(
+            str(item.get("hub_id") or "") == hub_id
+            and str(item.get("status") or "active") != "inactive"
+            for item in assignments
+            if isinstance(item, dict)
+        )
+    return False
+
+
+def require_admin_tutor_or_hub(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    allowed = {"admin", "tutor", "b2c_admin", "hub"}
+    if current_user.get("user_type") not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin, tutor, or hub access required for invigilator operations",
+        )
+    return current_user
 
 
 # ---------------------------------------------------------------------------
@@ -226,3 +283,47 @@ async def generate_invigilator_code(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate invigilator code",
         )
+
+
+@router.post(
+    "/verify-code",
+    response_model=VerifyCodeResponse,
+    summary="Validate an invigilator code before a hub control action",
+    responses={
+        403: {"description": "Invalid code or no exam access"},
+        404: {"description": "Exam not found"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def verify_invigilator_code(
+    body: VerifyCodeRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_tutor_or_hub),
+    db: DatabaseManager = Depends(get_database),
+) -> VerifyCodeResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": body.exam_id})
+    if not exam:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
+    if not _can_access_exam(exam, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Exam not accessible")
+
+    code = body.code.strip().upper()
+    code_doc = await tenant_db["exampen_invigilator_codes"].find_one(
+        {"exam_id": body.exam_id, "code": code}
+    )
+    if not code_doc or code_doc.get("used"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid invigilator code")
+
+    expires_at = code_doc.get("expires_at")
+    if expires_at is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid invigilator code")
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invigilator code expired")
+
+    return VerifyCodeResponse(
+        valid=True,
+        exam_id=body.exam_id,
+        expires_at=expires_at.isoformat(),
+    )
