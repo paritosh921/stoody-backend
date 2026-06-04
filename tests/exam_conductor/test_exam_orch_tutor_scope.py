@@ -99,6 +99,50 @@ async def test_create_exam_maps_prepared_document_to_tutor_owner():
 
 
 @pytest.mark.asyncio
+async def test_create_exam_persists_pen_bindings_for_hub_assignment():
+    db = _fresh_db()
+    await _seed_document(db)
+
+    result = await _create_exam(
+        db,
+        _tutor_user("tut-1"),
+        roster=["student-1"],
+        pen_bindings={"aa:bb:cc:dd:ee:ff": "student-1"},
+    )
+
+    stored = await db["exampen_exams"].find_one({"exam_id": "exam-1"})
+    fetched = await _get_exam(db, "exam-1", _tutor_user("tut-1"))
+
+    assert result.pen_bindings == {"AA:BB:CC:DD:EE:FF": "student-1"}
+    assert stored["pen_bindings"] == {"AA:BB:CC:DD:EE:FF": "student-1"}
+    assert fetched.pen_bindings == {"AA:BB:CC:DD:EE:FF": "student-1"}
+
+
+@pytest.mark.asyncio
+async def test_create_exam_rejects_invalid_pen_bindings():
+    db = _fresh_db()
+    await _seed_document(db)
+
+    with pytest.raises(HTTPException) as exc:
+        await _create_exam(
+            db,
+            _tutor_user("tut-1"),
+            roster=["student-1"],
+            pen_bindings={"not-a-mac": "student-1"},
+        )
+    assert exc.value.status_code == 400
+
+    with pytest.raises(HTTPException) as exc:
+        await _create_exam(
+            db,
+            _tutor_user("tut-1"),
+            roster=["student-1"],
+            pen_bindings={"AA:BB:CC:DD:EE:FF": "student-2"},
+        )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_prepared_document_duration_rejects_bool_and_uses_total_minutes_fallback():
     db = _fresh_db()
     await _seed_document(db, duration_minutes=True, total_minutes=75)

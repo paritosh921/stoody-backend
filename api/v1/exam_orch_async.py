@@ -29,6 +29,7 @@ API authority:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +64,9 @@ LIFECYCLE_TRANSITIONS = {
     "collection_closed": {"uploading"},
     "uploading": {"ready_for_eval"},
 }
+
+PEN_MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+MAX_PEN_BINDINGS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +142,10 @@ class ExamCreateRequest(BaseModel):
     )
     prepared_document_id: Optional[str] = Field(None, description="Linked prepared document")
     roster: Optional[List[str]] = Field(default_factory=list, description="Student IDs")
+    pen_bindings: Optional[Dict[str, str]] = Field(
+        default_factory=dict,
+        description="Mapping of pen MAC address to student ID for ExamPen capture",
+    )
     duration_minutes: Optional[int] = Field(None, ge=1)
     hub_assignments: Optional[List[HubAssignment]] = Field(default_factory=list)
 
@@ -149,6 +157,7 @@ class ExamDetailResponse(BaseModel):
     lifecycle_state: str
     prepared_document_id: Optional[str] = None
     roster: List[str]
+    pen_bindings: Dict[str, str] = Field(default_factory=dict)
     duration_minutes: Optional[int] = None
     hub_assignments: List[HubAssignment]
     created_by: str
@@ -198,6 +207,7 @@ def _build_exam_doc(
     title: Optional[str] = None,
     prepared_document_id: Optional[str] = None,
     roster: Optional[List[str]] = None,
+    pen_bindings: Optional[Dict[str, str]] = None,
     duration_minutes: Optional[int] = None,
     admin_id: Optional[str] = None,
     teacher_ids: Optional[List[str]] = None,
@@ -211,6 +221,7 @@ def _build_exam_doc(
         "lifecycle_state": "draft",
         "prepared_document_id": prepared_document_id,
         "roster": roster or [],
+        "pen_bindings": _safe_string_dict(pen_bindings),
         "duration_minutes": duration_minutes,
         "hub_assignments": [],
         "created_by": current_user.get("user_id", "unknown"),
@@ -220,6 +231,40 @@ def _build_exam_doc(
         "teacher_ids": teacher_ids or [],
         "created_by_tutor_id": created_by_tutor_id,
     }
+
+
+def _normalize_pen_bindings(
+    pen_bindings: Optional[Dict[str, str]],
+    roster: Optional[List[str]],
+) -> Dict[str, str]:
+    """Validate and normalize pen MAC -> student mappings for an exam."""
+    if not pen_bindings:
+        return {}
+    if len(pen_bindings) > MAX_PEN_BINDINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"pen_bindings cannot exceed {MAX_PEN_BINDINGS} entries",
+        )
+
+    roster_set = {str(student_id) for student_id in (roster or [])}
+    normalized: Dict[str, str] = {}
+    for raw_mac, raw_student_id in pen_bindings.items():
+        mac = str(raw_mac or "").strip().upper()
+        student_id = str(raw_student_id or "").strip()
+        if not PEN_MAC_PATTERN.fullmatch(mac):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid pen MAC in pen_bindings: {raw_mac}",
+            )
+        if not student_id or student_id not in roster_set:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "pen_bindings values must reference students in the exam roster"
+                ),
+            )
+        normalized[mac] = student_id
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +301,7 @@ def _doc_to_response(doc: Dict[str, Any]) -> ExamDetailResponse:
         lifecycle_state=doc.get("lifecycle_state", "draft"),
         prepared_document_id=doc.get("prepared_document_id"),
         roster=doc.get("roster", []),
+        pen_bindings=_safe_string_dict(doc.get("pen_bindings")),
         duration_minutes=doc.get("duration_minutes"),
         hub_assignments=hub_assignments,
         created_by=doc.get("created_by", ""),
@@ -367,6 +413,17 @@ def _prepared_document_duration_minutes(doc: Dict[str, Any]) -> Optional[int]:
 def _is_tutor_admin_role(current_user: Dict[str, Any]) -> bool:
     role = (current_user.get("user_type") or "").lower()
     return role in ("admin", "b2c_admin")
+
+
+def _safe_string_dict(value: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for key, item in value.items():
+        if key is None or item is None:
+            continue
+        result[str(key)] = str(item)
+    return result
 
 
 def _is_exam_visible_to_tutor(
@@ -515,6 +572,11 @@ async def create_exam(
     collection = tenant_db["exampen_exams"]
     await _ensure_indexes(collection)
 
+    normalized_pen_bindings = _normalize_pen_bindings(
+        body.pen_bindings,
+        body.roster,
+    )
+
     doc = _build_exam_doc(
         exam_id=body.exam_id,
         exam_type=derived_exam_type,
@@ -522,6 +584,7 @@ async def create_exam(
         title=derived_title,
         prepared_document_id=body.prepared_document_id,
         roster=body.roster,
+        pen_bindings=normalized_pen_bindings,
         duration_minutes=derived_duration_minutes,
         admin_id=derived_admin_id,
         teacher_ids=derived_teacher_ids,
