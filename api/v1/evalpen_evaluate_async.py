@@ -44,6 +44,19 @@ from api.v1.auth_async import get_current_user, get_database
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_error_detail(prefix: str, exc: Exception) -> str:
+    """Return a bounded error detail without credentials or long payloads."""
+    message = str(exc).replace("\n", " ").replace("\r", " ")
+    for marker in ("sk-", "Bearer ", "password", "secret", "token"):
+        if marker.lower() in message.lower():
+            message = "redacted"
+            break
+    if len(message) > 240:
+        message = message[:240] + "..."
+    return f"{prefix}: {type(exc).__name__}: {message}"
+
+
 # Two routers: ``router`` for /evaluate endpoints, ``evaluations_router``
 # for /evaluations retrieval endpoints.  The integrator should mount them
 # at separate prefixes to match the OpenAPI paths:
@@ -197,6 +210,8 @@ async def _build_eval_core(tenant_db: Any) -> Any:
     question_repo = QuestionRepository(tenant_db)
     solution_repo = SolutionRepository(tenant_db)
     gate = LLMGate(tenant_db)
+    if hasattr(gate, "initialize"):
+        await gate.initialize()
 
     solution_cache = SolutionCache(
         solution_repo=solution_repo,
@@ -405,7 +420,10 @@ async def evaluate_single(
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Evaluation encountered an internal error",
+            detail=_safe_error_detail(
+                "Evaluation encountered an internal error",
+                exc,
+            ),
         )
 
 
