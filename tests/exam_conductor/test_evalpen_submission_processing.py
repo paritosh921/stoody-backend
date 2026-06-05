@@ -153,6 +153,11 @@ class _EmptyTextOCRAdapter:
         )
 
 
+class _FailingVisionGate:
+    async def call(self, *args, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+
 def test_ocr_model_resolver_uses_explicit_ocr_override(monkeypatch):
     from api.v1._exampen_imports import load_exampen
 
@@ -213,6 +218,32 @@ def test_ocr_model_resolver_falls_back_when_provider_import_fails(monkeypatch):
         side_effect=ImportError("missing provider"),
     ):
         assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+
+
+@pytest.mark.asyncio
+async def test_pen_ocr_adapter_raises_when_gate_call_fails():
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+    adapter = ocr_service.LLMVisionPenAdapter(gate=_FailingVisionGate())
+
+    with pytest.raises(RuntimeError, match="LLM Vision OCR failed"):
+        await adapter.recognize_pages(
+            [
+                {
+                    "page_number": 1,
+                    "raw_strokes": [
+                        {
+                            "points": [
+                                {"x": 10, "y": 10, "t": 1},
+                                {"x": 20, "y": 20, "t": 2},
+                            ]
+                        }
+                    ],
+                }
+            ],
+            source="pen",
+        )
 
 
 @pytest.mark.asyncio

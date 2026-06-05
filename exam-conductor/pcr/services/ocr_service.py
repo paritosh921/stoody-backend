@@ -447,12 +447,14 @@ class LLMVisionCameraAdapter:
                     },
                 )
                 llm_content = gate_response.content
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "LLM Vision OCR failed for page %d (camera)",
                     page_number,
                 )
-                llm_content = ""
+                raise RuntimeError(
+                    f"LLM Vision OCR failed for page {page_number} (camera)"
+                ) from exc
 
             # Parse LLM response into TextBlocks
             text_blocks = _parse_ocr_response_to_text_blocks(
@@ -573,12 +575,14 @@ class LLMVisionPenAdapter:
                     },
                 )
                 llm_content = gate_response.content
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "LLM Vision OCR failed for page %d (pen)",
                     page_number,
                 )
-                llm_content = ""
+                raise RuntimeError(
+                    f"LLM Vision OCR failed for page {page_number} (pen)"
+                ) from exc
 
             # Parse LLM response into TextBlocks
             text_blocks = _parse_ocr_response_to_text_blocks(
