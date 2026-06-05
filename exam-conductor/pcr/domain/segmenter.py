@@ -33,7 +33,7 @@ from .clubbed_detector import (
 )
 from .content_classifier import classify_content
 from .flag_registry import FLAG_REGISTRY
-from .marker_parser import QMarker, parse_markers
+from .marker_parser import Q_MARKER_PATTERN, QMarker, parse_markers
 from .response_models import (
     BoundingBox,
     ContentType,
@@ -123,6 +123,71 @@ def _concat_text(blocks: list[TextBlock]) -> str:
     return " ".join(b.text.strip() for b in sorted_blocks if b.text.strip())
 
 
+def _split_blocks_on_multiple_q_markers(pages: list[PageOCR]) -> list[PageOCR]:
+    """Split OCR blocks that contain several Q markers into marker blocks.
+
+    Vision OCR can legitimately return one text block for a whole rendered pen
+    page.  The text is still canonical OCR output, but segmentation needs one
+    block per marker-delimited response so the PCR path can evaluate each
+    answer independently instead of treating the page as a clubbed answer.
+    """
+    normalized_pages: list[PageOCR] = []
+
+    for page in pages:
+        normalized_blocks: list[TextBlock] = []
+        changed = False
+
+        for block in page.text_blocks:
+            matches = list(Q_MARKER_PATTERN.finditer(block.text))
+            if len(matches) <= 1:
+                normalized_blocks.append(block)
+                continue
+
+            changed = True
+            segment_count = len(matches)
+            block_height = max(block.bbox.height, 1.0)
+            slice_height = block_height / segment_count
+
+            for idx, match in enumerate(matches):
+                next_start = (
+                    matches[idx + 1].start()
+                    if idx + 1 < segment_count
+                    else len(block.text)
+                )
+                text = block.text[match.start():next_start].strip()
+                if not text:
+                    continue
+
+                y_min = block.bbox.y_min + idx * slice_height
+                y_max = (
+                    block.bbox.y_min + (idx + 1) * slice_height
+                    if idx + 1 < segment_count
+                    else block.bbox.y_max
+                )
+                normalized_blocks.append(
+                    TextBlock(
+                        text=text,
+                        bbox=BoundingBox(
+                            x_min=block.bbox.x_min,
+                            y_min=y_min,
+                            x_max=block.bbox.x_max,
+                            y_max=max(y_max, y_min + 0.1),
+                        ),
+                        confidence=block.confidence,
+                        source=block.source,
+                    )
+                )
+
+        if changed:
+            normalized_pages.append(
+                page.model_copy(update={"text_blocks": normalized_blocks})
+            )
+        else:
+            normalized_pages.append(page)
+
+    return normalized_pages
+
+
 def _markers_in_range(
     markers: list[QMarker],
     page_number: int,
@@ -135,6 +200,40 @@ def _markers_in_range(
         for m in markers
         if m.page_number == page_number and y_start <= m.y_position <= y_end
     ]
+
+
+def _build_marker_delimited_segments_for_page(
+    page: PageOCR,
+    page_markers: list[QMarker],
+) -> list[_RawSegment]:
+    """Build one segment per Q marker when no boundary lines are present."""
+    segments: list[_RawSegment] = []
+    sorted_markers = sorted(page_markers, key=lambda m: m.y_position)
+
+    for idx, marker in enumerate(sorted_markers):
+        y_start = 0.0 if idx == 0 else marker.y_position
+        y_end = (
+            sorted_markers[idx + 1].y_position
+            if idx + 1 < len(sorted_markers)
+            else page.page_height_mm
+        )
+        if y_end <= y_start:
+            y_end = page.page_height_mm
+
+        seg = _RawSegment(
+            page.page_number,
+            y_start,
+            y_end,
+            page.page_height_mm,
+        )
+        seg.text_blocks.extend(
+            _blocks_in_range(page.text_blocks, y_start, y_end)
+        )
+        seg.markers.append(marker)
+        seg.closed = True
+        segments.append(seg)
+
+    return segments
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +320,14 @@ def _build_segments(
         # If no boundaries on this page
         if not page_boundaries:
             if current_segment is None:
+                if len(page_markers) > 1:
+                    segments.extend(
+                        _build_marker_delimited_segments_for_page(
+                            page, page_markers
+                        )
+                    )
+                    continue
+
                 # Start of a new segment at page top
                 current_segment = _RawSegment(
                     pn, 0.0, page.page_height_mm, page.page_height_mm
@@ -487,7 +594,10 @@ def segment_submission(
             has_blocking_flags=False,
         )
 
-    sorted_pages = sorted(pages, key=lambda p: p.page_number)
+    sorted_pages = sorted(
+        _split_blocks_on_multiple_q_markers(pages),
+        key=lambda p: p.page_number,
+    )
     page_widths = {p.page_number: p.page_width_mm for p in sorted_pages}
 
     # Step 1: Boundary detection

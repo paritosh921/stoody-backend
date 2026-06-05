@@ -123,6 +123,54 @@ class TestUSeg01:
         assert result.total_boundaries_detected == 0
         assert len(result.responses) == 1
 
+    def test_u_seg_01_splits_single_ocr_block_on_multiple_q_markers(self):
+        """One OCR block with multiple Q markers becomes separate responses."""
+        blocks = [
+            _make_text_block(
+                "Q.No 1.Ans Water boils at 100 C. "
+                "Q.No 2.Ans Plants make food by photosynthesis. "
+                "Q.No 3.Ans Force equals mass times acceleration.",
+                y_min=0.0,
+                y_max=297.0,
+            ),
+        ]
+        pages = [_make_page_ocr(1, blocks)]
+
+        result = segment_submission(pages)
+
+        assert result.total_boundaries_detected == 0
+        assert result.total_markers_detected == 3
+        assert len(result.responses) == 3
+        assert [r.question_number for r in result.responses] == [1, 2, 3]
+        assert not any(
+            flag.flag_type == FlagType.CLUBBED_MULTIPLE_MARKERS
+            for response in result.responses
+            for flag in response.flags
+        )
+
+    def test_u_seg_01_marker_split_preserves_content_above_first_marker(self):
+        """Marker-delimited pages keep old page-top coverage for first answer."""
+        blocks = [
+            _make_text_block(
+                "Student rough note",
+                y_min=5.0,
+                y_max=15.0,
+            ),
+            _make_text_block(
+                "Q.No 1.Ans First answer. Q.No 2.Ans Second answer.",
+                y_min=50.0,
+                y_max=250.0,
+            ),
+        ]
+        pages = [_make_page_ocr(1, blocks)]
+
+        result = segment_submission(pages)
+
+        assert len(result.responses) == 2
+        assert result.responses[0].question_number == 1
+        assert "Student rough note" in result.responses[0].detected_text
+        assert "Second answer" in result.responses[1].detected_text
+
     def test_u_seg_01_boundary_detection_pen_path(self):
         """Pen path boundary detection uses stroke geometry.
 
