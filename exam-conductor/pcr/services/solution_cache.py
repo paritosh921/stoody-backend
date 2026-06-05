@@ -20,6 +20,8 @@ Hard constraints: C1 (MongoDB only), C4 (gate), C5 (ownership boundaries)
 from __future__ import annotations
 
 import logging
+import importlib
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Protocol, runtime_checkable
@@ -120,6 +122,25 @@ DEFAULT_WARMUP_MODELS: Dict[str, str] = {
 
 # Fallback model when complexity is unknown
 DEFAULT_WARMUP_MODEL: str = "claude-sonnet-4-20250514"
+
+
+def _get_gate_provider_default_model() -> str:
+    """Resolve the active gate provider's default model."""
+    import_errors: list[str] = []
+    for module_name in (
+        "exam-conductor.llm_gate.provider",
+        "llm_gate.provider",
+    ):
+        try:
+            provider = importlib.import_module(module_name)
+            return provider.get_default_model()
+        except (ImportError, AttributeError) as exc:
+            import_errors.append(f"{module_name}: {exc}")
+            continue
+    raise RuntimeError(
+        "Gate provider default model resolver unavailable: "
+        + "; ".join(import_errors)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +360,13 @@ class SolutionCache:
         """
         # Determine model from complexity tier
         complexity = question_metadata.get("complexity", "L2")
-        model_id = self._warmup_models.get(complexity, DEFAULT_WARMUP_MODEL)
+        active_provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
+        if active_provider != "anthropic":
+            model_id = _get_gate_provider_default_model()
+        else:
+            model_id = self._warmup_models.get(
+                complexity, DEFAULT_WARMUP_MODEL
+            )
 
         # Build generation prompt
         prompt = self._build_generation_prompt(question_metadata)

@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import json
 import logging
+import importlib
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -143,6 +145,25 @@ EVAL_MODEL_MAP: Dict[str, str] = {
 DEFAULT_EVAL_MODEL: str = "claude-sonnet-4-20250514"
 
 
+def _get_gate_provider_default_model() -> str:
+    """Resolve the active gate provider's default model."""
+    import_errors: list[str] = []
+    for module_name in (
+        "exam-conductor.llm_gate.provider",
+        "llm_gate.provider",
+    ):
+        try:
+            provider = importlib.import_module(module_name)
+            return provider.get_default_model()
+        except (ImportError, AttributeError) as exc:
+            import_errors.append(f"{module_name}: {exc}")
+            continue
+    raise RuntimeError(
+        "Gate provider default model resolver unavailable: "
+        + "; ".join(import_errors)
+    )
+
+
 def _select_eval_model(
     complexity: str,
     cache_hit: bool,
@@ -155,6 +176,9 @@ def _select_eval_model(
         L2 miss    → Sonnet-class
         L3 miss    → Sonnet/Opus-class
     """
+    active_provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
+    if active_provider != "anthropic":
+        return _get_gate_provider_default_model()
     if cache_hit:
         return EVAL_MODEL_MAP.get("cache_hit", DEFAULT_EVAL_MODEL)
     return EVAL_MODEL_MAP.get(complexity, DEFAULT_EVAL_MODEL)

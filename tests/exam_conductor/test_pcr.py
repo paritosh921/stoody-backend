@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -693,6 +694,129 @@ class TestUClub01:
 
 class TestUEval01:
     """U-EVAL-01: Eval result parsing and scoring envelope."""
+
+    def test_u_eval_01_eval_model_uses_gate_default_for_openai(self, monkeypatch):
+        """Non-Anthropic gate providers use their configured default model."""
+        from pcr.services import eval_core
+
+        monkeypatch.setenv("AI_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+
+        assert eval_core._select_eval_model("L2", cache_hit=False) == "gpt-5.1"
+
+    def test_u_eval_01_eval_model_defaults_to_openai_provider(self, monkeypatch):
+        """Provider unset follows the gate's OpenAI default model behavior."""
+        from pcr.services import eval_core
+
+        monkeypatch.delenv("AI_PROVIDER", raising=False)
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+
+        assert eval_core._select_eval_model("L2", cache_hit=False) == "gpt-5.1"
+
+    def test_u_eval_01_eval_model_keeps_anthropic_tiers(self, monkeypatch):
+        """Anthropic deployments keep the configured Haiku/Sonnet tiers."""
+        from pcr.services import eval_core
+
+        monkeypatch.setenv("AI_PROVIDER", "anthropic")
+
+        assert (
+            eval_core._select_eval_model("L2", cache_hit=False)
+            == "claude-sonnet-4-20250514"
+        )
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_solution_warmup_uses_gate_default_for_openai(
+        self,
+        monkeypatch,
+    ):
+        """Solution generation uses the active provider default model."""
+        from pcr.services.solution_cache import SolutionCache
+
+        class Store:
+            def __init__(self):
+                self.docs = []
+
+            async def get_latest_solution(self, _question_id):
+                return None
+
+            async def upsert_solution(self, doc):
+                self.docs.append(doc)
+                return doc
+
+        class Gate:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    content="Reference solution",
+                    usage=SimpleNamespace(model="gpt-5.1", total_tokens=10),
+                )
+
+        monkeypatch.setenv("AI_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+        store = Store()
+        gate = Gate()
+        cache = SolutionCache(store, gate)
+
+        result = await cache.lookup(
+            "Q1",
+            {
+                "subject": "Science",
+                "question_type": "subjective",
+                "max_marks": 2,
+                "question_text": "What is boiling point of water?",
+                "complexity": "L2",
+            },
+        )
+
+        assert result.reference_solution == "Reference solution"
+        assert gate.calls[0]["model_id"] == "gpt-5.1"
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_solution_warmup_defaults_to_openai_provider(
+        self,
+        monkeypatch,
+    ):
+        """Provider unset in solution warmup follows the gate OpenAI default."""
+        from pcr.services.solution_cache import SolutionCache
+
+        class Store:
+            async def get_latest_solution(self, _question_id):
+                return None
+
+            async def upsert_solution(self, doc):
+                return doc
+
+        class Gate:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    content="Reference solution",
+                    usage=SimpleNamespace(model="gpt-5.1", total_tokens=10),
+                )
+
+        monkeypatch.delenv("AI_PROVIDER", raising=False)
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+        gate = Gate()
+        cache = SolutionCache(Store(), gate)
+
+        await cache.lookup(
+            "Q1",
+            {
+                "subject": "Science",
+                "question_type": "subjective",
+                "max_marks": 2,
+                "question_text": "What is boiling point of water?",
+                "complexity": "L2",
+            },
+        )
+
+        assert gate.calls[0]["model_id"] == "gpt-5.1"
 
     def test_u_eval_01_eval_result_shape(self):
         """EvalResult has all fields from PCR_EVAL_ENGINE_SPEC section 7.3."""
