@@ -52,13 +52,20 @@ _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 _DEFAULT_OCR_VISION_MODEL = "gpt-4o"
 
 # LLM OCR extraction prompt
+_OCR_PROMPT_VERSION = "exampen-qno-v1"
 _OCR_EXTRACTION_PROMPT = (
-    "Extract all handwritten text from this page. For each detected text "
-    "region, provide the text content. Return a JSON array of objects, each "
-    'with "text" (string: the recognised text) and "confidence" (float 0-1: '
-    "your confidence in the recognition accuracy). "
-    "If no text is detected, return an empty array: []. "
-    "Return ONLY the JSON array, no markdown fences or extra text."
+    "This image is a high-contrast raster rendering of BLE digital pen strokes "
+    "from an ExamPen answer sheet. Extract the visible handwritten or "
+    "stroke-rendered text exactly as written. Pay special attention to exam "
+    "answer markers in the form 'Q.No X.Ans' or close variants; these markers "
+    "identify answer lines and must be preserved in the extracted text. "
+    "Read line by line from top to bottom. For each detected text line or "
+    "region, return one JSON object with \"text\" (string: recognised text) "
+    "and \"confidence\" (float 0-1: recognition confidence). If text is faint "
+    "or partially clipped, return the best visible transcription with lower "
+    "confidence instead of dropping the line. If absolutely no text is "
+    "visible, return an empty array: []. Return ONLY the JSON array, no "
+    "markdown fences or extra text."
 )
 
 # Gate caller identity (already registered in ALLOWED_CALLER_IDS)
@@ -444,6 +451,7 @@ class LLMVisionCameraAdapter:
                     metadata={
                         "pcr_stage": "ocr_camera",
                         "page_number": page_number,
+                        "ocr_prompt_version": _OCR_PROMPT_VERSION,
                     },
                 )
                 llm_content = gate_response.content
@@ -572,6 +580,7 @@ class LLMVisionPenAdapter:
                         "pcr_stage": "ocr_pen",
                         "page_number": page_number,
                         "stroke_count": len(raw_strokes),
+                        "ocr_prompt_version": _OCR_PROMPT_VERSION,
                     },
                 )
                 llm_content = gate_response.content

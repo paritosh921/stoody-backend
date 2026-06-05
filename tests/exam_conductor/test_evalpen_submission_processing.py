@@ -158,6 +158,17 @@ class _FailingVisionGate:
         raise RuntimeError("provider unavailable")
 
 
+class _RecordingVisionGate:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def call(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": kwargs})
+        return SimpleNamespace(
+            content='[{"text":"Q.No 1.Ans Visible answer","confidence":0.91}]'
+        )
+
+
 def test_ocr_model_resolver_uses_explicit_ocr_override(monkeypatch):
     from api.v1._exampen_imports import load_exampen
 
@@ -246,6 +257,39 @@ async def test_pen_ocr_adapter_raises_when_gate_call_fails():
         )
 
 
+@pytest.mark.asyncio
+async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+    monkeypatch.setattr(ocr_service, "_get_ocr_vision_model", lambda: "gpt-4o")
+    gate = _RecordingVisionGate()
+    adapter = ocr_service.LLMVisionPenAdapter(gate=gate)
+
+    result = await adapter.recognize_pages(
+        [
+            {
+                "page_number": 1,
+                "raw_strokes": [
+                    {
+                        "points": [
+                            {"x": 10, "y": 10, "t": 1},
+                            {"x": 20, "y": 20, "t": 2},
+                        ]
+                    }
+                ],
+            }
+        ],
+        source="pen",
+    )
+
+    assert result.pages[0].text_blocks[0].text == "Q.No 1.Ans Visible answer"
+    metadata = gate.calls[0]["kwargs"]["metadata"]
+    assert metadata["pcr_stage"] == "ocr_pen"
+    assert metadata["stroke_count"] == 1
+    assert metadata["ocr_prompt_version"] == "exampen-qno-v1"
+
+
 def test_pen_stroke_renderer_crops_and_upscales_content():
     import base64
     import io
@@ -274,6 +318,19 @@ def test_pen_stroke_renderer_crops_and_upscales_content():
         assert img.height < 1754
         assert img.width > 300
         assert img.height > 200
+
+
+def test_vision_ocr_prompt_preserves_exampen_qno_markers():
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    messages = ocr_service._build_vision_messages("aW1hZ2U=")
+    prompt = messages[0]["content"][0]["text"]
+
+    assert "BLE digital pen strokes" in prompt
+    assert "Q.No X.Ans" in prompt
+    assert "must be preserved" in prompt
 
 
 @pytest.mark.asyncio
