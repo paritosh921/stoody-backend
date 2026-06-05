@@ -214,7 +214,7 @@ async def _build_eval_core(tenant_db: Any) -> Any:
         await gate.initialize()
 
     solution_cache = SolutionCache(
-        solution_repo=solution_repo,
+        solution_store=solution_repo,
         gate=gate,
     )
 

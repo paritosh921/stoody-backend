@@ -621,6 +621,17 @@ async def test_process_submission_route_reports_processor_errors_as_bad_request(
 
 
 @pytest.mark.asyncio
+async def test_eval_route_builds_eval_core_with_solution_cache():
+    from api.v1.evalpen_evaluate_async import _build_eval_core
+
+    db = _fresh_db()
+
+    core = await _build_eval_core(db)
+
+    assert hasattr(core, "evaluate_response")
+
+
+@pytest.mark.asyncio
 async def test_process_submission_route_reads_ingested_artifact_and_writes_detected_response():
     from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_submissions_async import process_submission
