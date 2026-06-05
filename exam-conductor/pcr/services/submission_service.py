@@ -308,6 +308,18 @@ class SubmissionService:
                 page_count=len(answer_pages),
                 error="OCR produced no recognizable pages",
             )
+        if all(not page.text_blocks for page in pages):
+            logger.warning(
+                "OCR produced no text blocks for submission %s", submission_id
+            )
+            await self._ingest.update_segmentation_status(
+                submission_id, "failed"
+            )
+            return SubmissionProcessingResult(
+                submission_id=submission_id,
+                page_count=len(pages),
+                error="OCR produced no text blocks",
+            )
 
         # Step 4: Fetch question metadata for manifest awareness
         questions = await self._question_repo.get_questions_by_exam(exam_id)
@@ -382,7 +394,7 @@ class SubmissionService:
             )
 
         # Step 8: Update submission segmentation status
-        seg_status = "complete" if not seg_result.has_blocking_flags else "complete"
+        seg_status = "complete"
         await self._ingest.update_segmentation_status(
             submission_id, seg_status
         )

@@ -130,6 +130,29 @@ class _FakeOCRAdapter:
         )
 
 
+class _EmptyTextOCRAdapter:
+    async def recognize_pages(self, _pages_data, *, source: str = "pen"):
+        from api.v1._exampen_imports import load_exampen
+
+        models = load_exampen("pcr.domain.response_models")
+        ocr_service = load_exampen("pcr.services.ocr_service")
+
+        return ocr_service.OCRResult(
+            pages=[
+                models.PageOCR(
+                    page_number=1,
+                    page_width_mm=210.0,
+                    page_height_mm=297.0,
+                    text_blocks=[],
+                    source="pen",
+                    mean_ocr_confidence=0.0,
+                )
+            ],
+            source=source,
+            metadata={"adapter": "empty-text"},
+        )
+
+
 @pytest.mark.asyncio
 async def test_tutor_lists_submissions_for_visible_admin_owned_exams():
     from api.v1.evalpen_submissions_async import list_submissions
@@ -487,3 +510,69 @@ async def test_process_submission_route_reads_ingested_artifact_and_writes_detec
     assert responses[0]["exam_id"] == "EXAM-1"
     assert responses[0]["student_id"] == "STU-1"
     assert "forty two" in responses[0]["detected_text"]
+
+
+@pytest.mark.asyncio
+async def test_process_submission_route_fails_when_pen_ocr_produces_no_text_blocks():
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import process_submission
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-EMPTY-OCR",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="ble_pen",
+        pen_mac="AA:BB:CC:DD:EE:FF",
+        hub_id="HUB-1",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": [
+                    {
+                        "points": [
+                            {"x": 10, "y": 10, "t": 1},
+                            {"x": 20, "y": 20, "t": 2},
+                        ]
+                    }
+                ],
+            }
+        ],
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_EmptyTextOCRAdapter(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await process_submission(
+                ingest_result.submission_id,
+                current_user=_admin_user(),
+                db=object(),
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "OCR produced no text blocks"
+
+    stored_submission = await db["evalpen_submissions"].find_one(
+        {"submission_id": ingest_result.submission_id}
+    )
+    assert stored_submission is not None
+    assert stored_submission["segmentation_status"] == "failed"
+
+    responses = await db["evalpen_detected_responses"].find(
+        {"submission_id": ingest_result.submission_id}
+    ).to_list(length=10)
+    assert responses == []
