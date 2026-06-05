@@ -153,6 +153,68 @@ class _EmptyTextOCRAdapter:
         )
 
 
+def test_ocr_model_resolver_uses_explicit_ocr_override(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.setenv("AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("OCR_VISION_MODEL", "gpt-4o")
+
+    assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+
+
+def test_ocr_model_resolver_uses_gate_provider_default(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.delenv("OCR_VISION_MODEL", raising=False)
+    monkeypatch.setenv("AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+
+    assert ocr_service._get_ocr_vision_model() == "gemini-2.5-pro"
+
+
+def test_ocr_model_resolver_ignores_blank_ocr_override(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.setenv("OCR_VISION_MODEL", "   ")
+    monkeypatch.setenv("AI_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    assert ocr_service._get_ocr_vision_model() == "gemini-2.5-flash"
+
+
+def test_ocr_model_resolver_defaults_to_openai_when_provider_unset(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.delenv("OCR_VISION_MODEL", raising=False)
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+
+    assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+
+
+def test_ocr_model_resolver_falls_back_when_provider_import_fails(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.delenv("OCR_VISION_MODEL", raising=False)
+    with patch.object(
+        ocr_service.importlib,
+        "import_module",
+        side_effect=ImportError("missing provider"),
+    ):
+        assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+
+
 @pytest.mark.asyncio
 async def test_tutor_lists_submissions_for_visible_admin_owned_exams():
     from api.v1.evalpen_submissions_async import list_submissions

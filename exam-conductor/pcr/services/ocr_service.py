@@ -21,6 +21,7 @@ Failure modes:  PCR-01 (detection failure -> flags + review)
 from __future__ import annotations
 
 import base64
+import importlib
 import io
 import json
 import logging
@@ -47,7 +48,7 @@ _A4_HEIGHT_MM = 297.0
 _RENDER_WIDTH_PX = 1240   # ~148 DPI at A4 width
 _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 
-# Default LLM model for vision OCR (can be overridden via env)
+# Last-resort OCR model when the shared gate provider default cannot be resolved.
 _DEFAULT_OCR_VISION_MODEL = "gpt-4o"
 
 # LLM OCR extraction prompt
@@ -333,10 +334,32 @@ def _build_vision_messages(image_base64: str, media_type: str = "image/png") -> 
 def _get_ocr_vision_model() -> str:
     """Resolve the model to use for vision OCR calls.
 
-    Reads from ``OCR_VISION_MODEL`` env var, falling back to
-    ``_DEFAULT_OCR_VISION_MODEL``.
+    Reads from ``OCR_VISION_MODEL`` env var when an OCR-specific override is
+    configured. Otherwise, defer to the shared gate provider default so the
+    OCR adapter follows the active ``AI_PROVIDER`` configuration.
     """
-    return os.getenv("OCR_VISION_MODEL", _DEFAULT_OCR_VISION_MODEL)
+    override = os.getenv("OCR_VISION_MODEL", "").strip()
+    if override:
+        return override
+    try:
+        # The package name contains a hyphen, so use importlib just like the
+        # route-layer load_exampen helper.
+        provider = importlib.import_module("exam-conductor.llm_gate.provider")
+        get_default_model = provider.get_default_model
+    except (ImportError, AttributeError):
+        logger.exception(
+            "Failed to import gate provider default resolver; "
+            "falling back to %s",
+            _DEFAULT_OCR_VISION_MODEL,
+        )
+        return _DEFAULT_OCR_VISION_MODEL
+    try:
+        return get_default_model()
+    except Exception:
+        logger.exception(
+            "Failed to resolve OCR model from gate provider defaults"
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
