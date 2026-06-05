@@ -495,6 +495,38 @@ class TestUTamp01:
             assert "not found" in result.error.lower()
         asyncio.run(_run())
 
+    def test_u_tamp_01_evaluate_superseded_response_returns_error(self):
+        """Superseded PCR detections are preserved but not evaluated."""
+        async def _run():
+            stored_response = {
+                "response_id": "RESP-SUPERSEDED",
+                "question_id": "q-001",
+                "student_id": "stu-001",
+                "detected_text": "Old stale answer",
+                "content_type": "TEXT_ONLY",
+                "eval_status": "superseded",
+                "flags": [],
+            }
+            response_repo = MockResponseReader(
+                {"RESP-SUPERSEDED": stored_response}
+            )
+            gate = MockGate()
+
+            core = EvalCore(
+                response_repo=response_repo,
+                eval_repo=MockEvaluationWriter(),
+                question_repo=MockQuestionReader(),
+                solution_cache=MockSolutionCache(),
+                gate=gate,
+            )
+
+            result = await core.evaluate_response("RESP-SUPERSEDED")
+
+            assert result.error == "Response RESP-SUPERSEDED has been superseded"
+            assert gate.calls == []
+            assert response_repo.update_eval_status_calls == []
+        asyncio.run(_run())
+
 
 # ===========================================================================
 # I-TAMP-02: Server-side fetch — eval uses stored text, not request body

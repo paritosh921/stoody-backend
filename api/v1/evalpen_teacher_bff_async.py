@@ -434,7 +434,10 @@ async def list_exams(
 
         # ----- Fetch all responses for these submissions -----
         resp_cursor = tenant_db["evalpen_detected_responses"].find(
-            {"submission_id": {"$in": all_sub_ids}},
+            {
+                "submission_id": {"$in": all_sub_ids},
+                "eval_status": {"$ne": "superseded"},
+            },
             projection={
                 "response_id": 1,
                 "submission_id": 1,
@@ -688,7 +691,10 @@ async def get_exam_queue(
         # ----- Fetch all responses for these submissions -----
         sub_ids = [s.get("submission_id", "") for s in submissions]
         resp_cursor = tenant_db["evalpen_detected_responses"].find(
-            {"submission_id": {"$in": sub_ids}},
+            {
+                "submission_id": {"$in": sub_ids},
+                "eval_status": {"$ne": "superseded"},
+            },
             projection={
                 "response_id": 1,
                 "submission_id": 1,

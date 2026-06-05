@@ -211,16 +211,21 @@ class DetectedResponseRepository:
         )
 
     async def get_responses_by_submission(
-        self, submission_id: str
+        self,
+        submission_id: str,
+        *,
+        include_superseded: bool = False,
     ) -> List[Dict[str, Any]]:
         """Fetch all detected responses for a submission.
 
         Used by the submission detail endpoint
         (``GET /api/v1/evalpen/submissions/{submission_id}/responses``).
         """
-        cursor = self._responses.find(
-            {"submission_id": submission_id}
-        ).sort("question_id", ASCENDING)
+        query: Dict[str, Any] = {"submission_id": submission_id}
+        if not include_superseded:
+            query["eval_status"] = {"$ne": "superseded"}
+
+        cursor = self._responses.find(query).sort("question_id", ASCENDING)
         return await cursor.to_list(length=500)
 
     async def get_responses_by_status(
@@ -259,6 +264,7 @@ class DetectedResponseRepository:
         Used by the review queue.
         """
         query: Dict[str, Any] = {"flags.severity": "blocking"}
+        query["eval_status"] = {"$ne": "superseded"}
         if submission_id is not None:
             query["submission_id"] = submission_id
 
@@ -304,6 +310,73 @@ class DetectedResponseRepository:
             eval_status,
         )
         return False
+
+    async def supersede_responses_for_submission(
+        self,
+        submission_id: str,
+        *,
+        keep_response_ids: List[str],
+        reason: str,
+    ) -> int:
+        """Mark previous detected responses for a submission as superseded.
+
+        Reprocessing a submission may produce new random response IDs after OCR
+        or segmentation improvements.  The previous detected text remains
+        immutable; this method only marks old PCR-derived rows inactive for
+        normal tutor/review/evaluation reads.
+        """
+        now = datetime.now(timezone.utc)
+        query: Dict[str, Any] = {
+            "submission_id": submission_id,
+            "eval_status": {"$ne": "superseded"},
+        }
+        if keep_response_ids:
+            query["response_id"] = {"$nin": keep_response_ids}
+
+        docs = await self._responses.find(
+            query,
+            {"response_id": 1, "eval_status": 1},
+        ).to_list(length=1000)
+
+        modified = 0
+        for doc in docs:
+            response_id = doc.get("response_id")
+            if not response_id:
+                continue
+            result = await self._responses.update_one(
+                {
+                    "response_id": response_id,
+                    "eval_status": doc.get("eval_status"),
+                },
+                {
+                    "$set": {
+                        "eval_status": "superseded",
+                        "superseded_at": now,
+                        "superseded_reason": reason,
+                    },
+                    "$push": {
+                        "audit_trail": {
+                            "actor_id": "system",
+                            "timestamp": now,
+                            "action": "detected_response_superseded",
+                            "before": {
+                                "eval_status": doc.get("eval_status"),
+                            },
+                            "after": {"eval_status": "superseded"},
+                            "reason": reason,
+                        }
+                    },
+                },
+            )
+            modified += int(result.modified_count)
+
+        if modified:
+            logger.info(
+                "Superseded %d previous detected responses for submission %s",
+                modified,
+                submission_id,
+            )
+        return modified
 
     # ------------------------------------------------------------------
     # Immutability enforcement

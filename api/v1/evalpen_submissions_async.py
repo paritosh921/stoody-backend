@@ -668,7 +668,10 @@ async def resolve_flag(
 
         # Find the response containing the flag
         response_doc = await tenant_db["evalpen_detected_responses"].find_one(
-            {"flags.flag_id": flag_id}
+            {
+                "flags.flag_id": flag_id,
+                "eval_status": {"$ne": "superseded"},
+            }
         )
         if response_doc is None:
             raise HTTPException(

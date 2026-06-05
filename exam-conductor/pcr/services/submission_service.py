@@ -89,6 +89,15 @@ class ResponseWriter(Protocol):
     ) -> bool:
         ...  # pragma: no cover
 
+    async def supersede_responses_for_submission(
+        self,
+        submission_id: str,
+        *,
+        keep_response_ids: List[str],
+        reason: str,
+    ) -> int:
+        ...  # pragma: no cover
+
 
 @runtime_checkable
 class QuestionReader(Protocol):
@@ -391,6 +400,15 @@ class SubmissionService:
 
             await self._response_repo.update_eval_status(
                 response.response_id, eval_status
+            )
+
+        if response_docs:
+            await self._response_repo.supersede_responses_for_submission(
+                submission_id,
+                keep_response_ids=[
+                    doc["response_id"] for doc in response_docs
+                ],
+                reason="submission_reprocessed",
             )
 
         # Step 8: Update submission segmentation status

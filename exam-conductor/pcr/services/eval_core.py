@@ -663,6 +663,13 @@ class EvalCore:
                 response_id=response_id,
                 error=f"Response {response_id} not found",
             )
+        if response_doc.get("eval_status") == "superseded":
+            logger.info("Response %s is superseded; skipping evaluation", response_id)
+            return EvalResult(
+                evaluation_id=eval_id,
+                response_id=response_id,
+                error=f"Response {response_id} has been superseded",
+            )
 
         resolved_student_id = student_id or response_doc.get("student_id", "")
         stored_question_id = response_doc.get("question_id")

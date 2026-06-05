@@ -704,6 +704,101 @@ async def test_process_submission_route_reads_ingested_artifact_and_writes_detec
 
 
 @pytest.mark.asyncio
+async def test_reprocessing_submission_supersedes_previous_detected_responses():
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import (
+        get_submission_responses,
+        process_submission,
+    )
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-REPROCESS",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="ble_pen",
+        pen_mac="AA:BB:CC:DD:EE:FF",
+        hub_id="HUB-1",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": [
+                    {
+                        "points": [
+                            {"x": 10, "y": 10, "t": 1},
+                            {"x": 20, "y": 20, "t": 2},
+                        ]
+                    }
+                ],
+            }
+        ],
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-STALE-BLOCKED",
+            "submission_id": ingest_result.submission_id,
+            "question_id": "EXAM-REPROCESS_Q1",
+            "exam_id": "EXAM-REPROCESS",
+            "student_id": "STU-1",
+            "detected_text": "Q.No 1.Ans old Q.No 2.Ans stale",
+            "source_pages": [{"page_number": 1}],
+            "content_type": "TEXT_ONLY",
+            "eval_status": "blocked",
+            "flags": [
+                {
+                    "flag_id": "FLG-OLD",
+                    "source": "clubbed_detector",
+                    "flag_type": "clubbed_multiple_markers",
+                    "severity": "blocking",
+                    "reason": "old segmentation",
+                }
+            ],
+            "_immutable": True,
+        }
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_FakeOCRAdapter(),
+        ),
+    ):
+        response = await process_submission(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+        visible = await get_submission_responses(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+
+    assert response.response_count == 1
+    stale = await db["evalpen_detected_responses"].find_one(
+        {"response_id": "RESP-STALE-BLOCKED"}
+    )
+    assert stale is not None
+    assert stale["detected_text"] == "Q.No 1.Ans old Q.No 2.Ans stale"
+    assert stale["eval_status"] == "superseded"
+    assert stale["audit_trail"][0]["action"] == "detected_response_superseded"
+
+    visible_ids = {item["response_id"] for item in visible["items"]}
+    assert "RESP-STALE-BLOCKED" not in visible_ids
+    assert len(visible_ids) == 1
+
+
+@pytest.mark.asyncio
 async def test_process_submission_route_fails_when_pen_ocr_produces_no_text_blocks():
     from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_submissions_async import process_submission

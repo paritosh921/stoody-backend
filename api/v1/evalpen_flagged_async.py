@@ -554,6 +554,11 @@ async def review_flagged_response(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Response {response_id} not found",
             )
+        if response_doc.get("eval_status") == "superseded":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Response {response_id} has been superseded",
+            )
 
         # Tutor scoping: verify this response's student is visible.
         # Try student_id on the response first, fall back to submission lookup.
@@ -868,7 +873,10 @@ async def get_flag_stats(
 
     try:
         # Build base query
-        base_query: Dict[str, Any] = {"flags": {"$exists": True, "$ne": []}}
+        base_query: Dict[str, Any] = {
+            "flags": {"$exists": True, "$ne": []},
+            "eval_status": {"$ne": "superseded"},
+        }
 
         # Build submission filter from exam_id and/or tutor scoping
         sub_query: Dict[str, Any] = {}
