@@ -246,6 +246,36 @@ async def test_pen_ocr_adapter_raises_when_gate_call_fails():
         )
 
 
+def test_pen_stroke_renderer_crops_and_upscales_content():
+    import base64
+    import io
+
+    from PIL import Image
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+    image_b64 = ocr_service._render_strokes_to_base64(
+        [
+            {
+                "points": [
+                    {"x": 10, "y": 10, "t": 1},
+                    {"x": 30, "y": 11, "t": 2},
+                ],
+                "strokeWidth": 2,
+            }
+        ],
+        210.0,
+        297.0,
+    )
+
+    assert image_b64
+    with Image.open(io.BytesIO(base64.b64decode(image_b64))) as img:
+        assert img.width < 1240
+        assert img.height < 1754
+        assert img.width > 300
+        assert img.height > 200
+
+
 @pytest.mark.asyncio
 async def test_tutor_lists_submissions_for_visible_admin_owned_exams():
     from api.v1.evalpen_submissions_async import list_submissions

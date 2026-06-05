@@ -789,6 +789,10 @@ def _render_strokes_to_base64(
     draw = ImageDraw.Draw(img)
 
     strokes_rendered = 0
+    min_x = width_px
+    min_y = height_px
+    max_x = 0.0
+    max_y = 0.0
 
     for stroke in raw_strokes:
         points = stroke.get("points", [])
@@ -811,10 +815,16 @@ def _render_strokes_to_base64(
             px_points.append((px_x, px_y))
 
         if len(px_points) >= 2:
+            for px_x, px_y in px_points:
+                min_x = min(min_x, px_x)
+                min_y = min(min_y, px_y)
+                max_x = max(max_x, px_x)
+                max_y = max(max_y, px_y)
+
             # Get stroke width (default 2px)
             stroke_width = stroke.get("strokeWidth", 2)
             try:
-                stroke_width = max(1, int(float(stroke_width)))
+                stroke_width = max(2, int(float(stroke_width)))
             except (TypeError, ValueError):
                 stroke_width = 2
 
@@ -829,6 +839,33 @@ def _render_strokes_to_base64(
     if strokes_rendered == 0:
         logger.debug("No renderable strokes found — skipping rasterisation")
         return None
+
+    if max_x > min_x and max_y > min_y:
+        margin_px = 48
+        left = max(0, int(min_x) - margin_px)
+        top = max(0, int(min_y) - margin_px)
+        right = min(width_px, int(max_x) + margin_px)
+        bottom = min(height_px, int(max_y) + margin_px)
+        crop_width = right - left
+        crop_height = bottom - top
+        if crop_width > 0 and crop_height > 0:
+            img = img.crop((left, top, right, bottom))
+            scale = min(
+                4.0,
+                max(
+                    1.0,
+                    min(width_px / crop_width, height_px / crop_height),
+                ),
+            )
+            if scale > 1.0:
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                img = img.resize(
+                    (
+                        max(1, int(crop_width * scale)),
+                        max(1, int(crop_height * scale)),
+                    ),
+                    resampling,
+                )
 
     # Encode as PNG and return base64
     buffer = io.BytesIO()
