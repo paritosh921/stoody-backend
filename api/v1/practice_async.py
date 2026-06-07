@@ -429,6 +429,11 @@ def _normalize_latex_for_render(text: str) -> str:
     out = _re.sub(r"\\\[([\s\S]*?)\\\]", r"$$\1$$", out)
     # Convert inline parens \( ... \) → $ ... $  (single-line preferred but allow multi-line)
     out = _re.sub(r"\\\(([\s\S]*?)\\\)", r"$\1$", out)
+    try:
+        from utils.latex_formatter import format_latex_in_text
+        out = format_latex_in_text(out)
+    except Exception as exc:
+        logger.warning(f"Could not format raw LaTeX for rendering: {exc}")
     return out
 
 
@@ -987,19 +992,19 @@ For case studies, set `teacher_answer_disagreement` to false unless the teacher'
         prompt_parts.append('''
 Return strict JSON (no markdown fences, no commentary):
 {
-  "solution": "the step-by-step derivation, written for a student. Use $...$ for inline math (e.g. $v_0$, $\\frac{1}{2}mv^2$) and $$...$$ for display math. Do NOT use \\(...\\) or \\[...\\]. All math identifiers must be wrapped in $...$.",
-  "final_answer": "the short final answer this derivation produces (e.g. \\"2mv_0^2\\", \\"D\\", \\"Delhi\\"). Wrap any math in $...$.",
+  "solution": "the step-by-step solution, written for a student. Use $...$ for inline math or chemistry notation (e.g. $x_0$, $\\frac{a}{b}$, $\\ce{H2O}$) and $$...$$ for display math. Do NOT use \\(...\\) or \\[...\\]. Formulas and identifiers must be wrapped in $...$.",
+  "final_answer": "the short final answer this derivation produces (e.g. \\"$\\frac{7}{12}$\\", \\"$\\ce{H2O}$\\", \\"D\\", \\"Delhi\\"). Wrap any math or chemistry notation in $...$.",
   "teacher_answer_disagreement": false
 }
 Set `teacher_answer_disagreement` to true ONLY if your honest derivation lands on a value different from the teacher's stated answer. Do not flip the field for minor formatting differences (e.g. \\"7 days\\" vs \\"7\\" when the question is about days). When unsure, default to false.'''.strip())
 
         system_prompt = (
-            "You are an expert tutor writing a model solution. The solution must be mathematically "
+            "You are an expert tutor writing a model solution. The solution must be academically "
             "correct, concise, and pedagogical. It will be cached and shown to every student who "
             "attempts this question, so do NOT mention any specific student or attempt. "
-            "Use $...$ for inline math and $$...$$ for display math; never \\(...\\) or \\[...\\]. "
-            "Wrap every math identifier (single variables, subscripts, fractions) in delimiters so "
-            "the renderer typesets them correctly. "
+            "Use $...$ for inline math or chemistry notation and $$...$$ for display math; never "
+            "\\(...\\) or \\[...\\]. Wrap variables, fractions, formulas, and chemistry expressions "
+            "such as $\\ce{H2O}$ in delimiters so the renderer typesets them correctly. "
             "Output ONLY valid JSON, no markdown code fences, no commentary."
         )
 
@@ -1953,10 +1958,10 @@ OUTPUT — strict JSON only (no markdown fences, no commentary, no text outside 
     parts.append("\nNotes for the JSON:")
     parts.append("  - is_correct must be a boolean (true/false), not a string.")
     parts.append("  - score must be a number 0.0–1.0; clamp it inside that range.")
-    parts.append("  - Math formatting: use $...$ for inline math (e.g. $v_0$, $\\frac{1}{2}mv^2$)")
-    parts.append("    and $$...$$ for display math. Do NOT use \\(...\\) or \\[...\\]. Wrap every")
-    parts.append("    math identifier — even single subscripted variables like $v_0$ — in $...$ so")
-    parts.append("    the renderer typesets them correctly.")
+    parts.append("  - Formatting: use $...$ for inline math or chemistry notation (e.g. $x_0$,")
+    parts.append("    $\\frac{a}{b}$, $\\ce{H2O}$) and $$...$$ for display math. Do NOT use")
+    parts.append("    \\(...\\) or \\[...\\]. Wrap formulas and identifiers in $...$ so the renderer")
+    parts.append("    typesets them correctly.")
     parts.append("  - Use double quotes for all strings; escape internal quotes as \\\".")
     parts.append("  - Do NOT include `correct_solution`, `feedback`, or `reasoning` in the output —")
     parts.append("    those are handled separately and would just waste tokens here.")
@@ -2116,11 +2121,11 @@ def _build_evaluation_system_prompt(detected_language: str) -> str:
         "If the handwriting is genuinely unreadable, do NOT guess what the student wrote based "
         "on what the answer should be — that is confirmation bias. Instead say specifically "
         "what you could see and what was unclear. "
-        "MATH FORMATTING: use $...$ for inline math (e.g. $v_0$, $\\frac{1}{2}mv^2$) and "
-        "$$...$$ for display math. Never use \\(...\\) or \\[...\\]. Wrap every math identifier "
-        "in $...$ — even single variables like $v_0$ or $R_0$ — so the renderer typesets them "
-        "correctly. Use LaTeX commands (\\frac, \\sqrt, \\alpha, \\tau), never raw Unicode "
-        "(τ, α). "
+        "FORMATTING: use $...$ for inline math or chemistry notation (e.g. $x_0$, "
+        "$\\frac{a}{b}$, $\\ce{H2O}$) and $$...$$ for display math. Never use \\(...\\) "
+        "or \\[...\\]. Wrap formulas and identifiers in $...$ so the renderer typesets them "
+        "correctly. Use LaTeX commands (\\frac, \\sqrt, \\alpha, \\ce), not raw Unicode "
+        "for symbols that need typesetting. "
         "OUTPUT: only valid JSON with the five required keys (is_correct, score, "
         "extracted_answer, work_shown, what_went_wrong). No markdown fences, no commentary, "
         "no extra fields."
@@ -2270,6 +2275,8 @@ async def evaluate_submission(
         correct_answer_value = resolved["resolved_value"]   # The actual answer content
         correct_answer_display = resolved["display"]         # Human-readable: "A (7 days)"
         is_option_letter = resolved["is_option_letter"]      # True if answer is A/B/C/D
+        correct_answer_value = _normalize_latex_for_render(str(correct_answer_value or "").strip())
+        correct_answer_display = _normalize_latex_for_render(str(correct_answer_display or "").strip())
 
         # Extract question text and options
         question_text = str(question_doc.get("text", ""))
@@ -2416,8 +2423,8 @@ async def evaluate_submission(
         # post-evaluation; the evaluator only needs the short reference for the verdict.
         if evaluation_mode != EVALUATION_MODE_CASE_STUDY and not has_correct_answer and cached_final_answer:
             correct_answer = cached_final_answer
-            correct_answer_value = cached_final_answer
-            correct_answer_display = cached_final_answer
+            correct_answer_value = _normalize_latex_for_render(cached_final_answer)
+            correct_answer_display = _normalize_latex_for_render(cached_final_answer)
             has_correct_answer = True
 
         # 6. Build the single, unified prompt + system prompt

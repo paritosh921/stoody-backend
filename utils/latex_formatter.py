@@ -13,116 +13,235 @@ logger = logging.getLogger(__name__)
 
 def format_latex_in_text(text: str) -> str:
     """
-    Detect and wrap raw LaTeX expressions with proper delimiters.
-
-    Converts:
-        {\left(1 + \frac{a^{2}}{2}\right)}
-    To:
-        \({\left(1 + \frac{a^{2}}{2}\right)}\)
-
-    Args:
-        text: Raw text potentially containing LaTeX
-
-    Returns:
-        Text with LaTeX expressions properly delimited
+    Wrap raw LaTeX or mhchem snippets in inline math delimiters without touching
+    already-delimited math, code spans, markdown images, or Stoody image tokens.
     """
     if not text or not isinstance(text, str):
         return text
 
-    # Skip if already has delimiters
-    if '\\(' in text or '$$' in text or '$' in text:
-        logger.debug("Text already has LaTeX delimiters, skipping formatting")
-        return text
+    text = text.replace("\\\\\\\\", "\\\\")
+    protected_pattern = re.compile(
+        r"(\$\$[\s\S]*?\$\$|\$[^$\n]+?\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|`[^`]*`|\[\[IMG:[^\]]+\]\]|!\[[^\]]*\]\([^)]+\))"
+    )
 
-    # Patterns that indicate raw LaTeX content
-    latex_patterns = [
-        # {\left(...\right...)}
-        (r'\{\\left\([^}]*\\right\)[^}]*\}', 'inline'),
-        # {\frac{num}{denom}}
-        (r'\{\\frac\{[^}]+\}\{[^}]+\}[^}]*\}', 'inline'),
-        # \frac{num}{denom} without outer braces
-        (r'\\frac\{[^}]+\}\{[^}]+\}', 'inline'),
-        # \left...\right
-        (r'\\left[\(\[\{][^\\]*\\right[\)\]\}]', 'inline'),
-        # \sqrt{content}
-        (r'\\sqrt\{[^}]+\}', 'inline'),
-        # \mathrm{content} or \text{content}
-        (r'\\(?:mathrm|text)\{[^}]+\}', 'inline'),
-        # Variable with superscript: x^{2}
-        (r'[A-Za-z_]\^\{[^}]+\}', 'inline'),
-        # Variable with subscript: x_{0}
-        (r'[A-Za-z_]_\{[^}]+\}', 'inline'),
-        # Generic {content with \command}
-        (r'\{[^}]*\\[a-z]+[^}]*\}', 'inline'),
-    ]
+    parts = []
+    cursor = 0
+    for match in protected_pattern.finditer(text):
+        parts.append(_wrap_raw_latex_segment(text[cursor:match.start()]))
+        parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(_wrap_raw_latex_segment(text[cursor:]))
+    return "".join(parts)
 
-    # Check if text contains raw LaTeX
-    has_raw_latex = False
-    for pattern, _ in latex_patterns:
-        if re.search(pattern, text):
-            has_raw_latex = True
-            logger.info(f"Detected raw LaTeX pattern: {pattern}")
+
+LATEX_COMMANDS = {
+    "alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta", "eta",
+    "theta", "vartheta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron",
+    "pi", "varpi", "rho", "varrho", "sigma", "varsigma", "tau", "upsilon",
+    "phi", "varphi", "chi", "psi", "omega",
+    "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Upsilon",
+    "Phi", "Psi", "Omega",
+    "frac", "dfrac", "tfrac", "sqrt", "binom", "sum", "prod", "int", "oint",
+    "partial", "nabla", "sin", "cos", "tan", "cot", "sec", "csc", "log", "ln",
+    "exp", "lim", "max", "min", "sup", "inf", "arg",
+    "text", "textbf", "textit", "textrm", "mathrm", "mathbf", "mathit",
+    "mathsf", "mathtt", "mathcal", "mathbb", "mathfrak", "bold", "boldsymbol",
+    "hat", "bar", "vec", "dot", "ddot", "tilde", "overline", "underline",
+    "overbrace", "underbrace", "overrightarrow", "overleftarrow",
+    "left", "right", "middle", "big", "Big", "bigg", "Bigg",
+    "quad", "qquad", "hspace", "vspace", "hfill", "vfill",
+    "times", "div", "cdot", "pm", "mp", "leq", "geq", "neq", "approx",
+    "equiv", "sim", "simeq", "cong", "propto", "perp", "parallel",
+    "subset", "supset", "subseteq", "supseteq", "in", "notin", "ni",
+    "cup", "cap", "setminus", "emptyset", "varnothing",
+    "to", "rightarrow", "leftarrow", "leftrightarrow", "Rightarrow",
+    "Leftarrow", "Leftrightarrow", "uparrow", "downarrow", "mapsto",
+    "infty", "angle", "triangle", "square", "circ", "bullet", "star",
+    "forall", "exists", "nexists", "therefore", "because",
+    "ldots", "cdots", "vdots", "ddots", "prime", "degree",
+    "ce", "pu",
+}
+
+
+def _wrap_raw_latex_segment(segment: str) -> str:
+    result = []
+    cursor = 0
+    while cursor < len(segment):
+        found = _find_next_raw_latex(segment, cursor)
+        if not found:
+            result.append(segment[cursor:])
             break
+        start, content, length = found
+        result.append(segment[cursor:start])
+        result.append(f"${content}$")
+        cursor = start + length
+    return "".join(result)
 
-    if not has_raw_latex:
-        return text
 
-    logger.info("Formatting raw LaTeX expressions in text")
-
-    # Split text by existing delimited expressions to avoid double-wrapping
-    # Preserve existing delimited math
-    already_delimited_pattern = r'(\$\$[\s\S]*?\$\$|\$[^$\n]+?\$|\\\ [[\s\S]*?\\\]|\\\([^)]*?\\\)|!\[[^\]]*\]\([^)]*\))'
-    segments = re.split(already_delimited_pattern, text)
-
-    formatted_segments = []
-    for i, segment in enumerate(segments):
-        # Skip already delimited segments (odd indices from split)
-        if i % 2 == 1:
-            formatted_segments.append(segment)
+def _find_next_raw_latex(text: str, from_index: int):
+    for i in range(from_index, max(len(text) - 1, 0)):
+        if text[i] != "\\" or not text[i + 1].isalpha():
             continue
-
-        # Check if this segment has raw LaTeX
-        segment_has_latex = False
-        for pattern, _ in latex_patterns:
-            if re.search(pattern, segment):
-                segment_has_latex = True
-                break
-
-        if not segment_has_latex:
-            formatted_segments.append(segment)
+        if text.startswith("\\(", i) or text.startswith("\\[", i):
             continue
+        match = _match_raw_latex_expression(text, i)
+        if match:
+            content, length = match
+            return i, content, length
+    return None
 
-        # Split by common separators to wrap individual expressions
-        # This prevents wrapping entire sentences
-        parts = re.split(r'(Options:|will be|[.,:;]\s+|\n+)', segment)
 
-        formatted_parts = []
-        for j, part in enumerate(parts):
-            # Keep separators as-is (odd indices)
-            if j % 2 == 1:
-                formatted_parts.append(part)
+def _match_raw_latex_expression(text: str, start: int):
+    if start >= len(text) - 1 or text[start] != "\\" or not text[start + 1].isalpha():
+        return None
+
+    command_end = _read_command_end(text, start + 1)
+    command = text[start + 1:command_end]
+    if command not in LATEX_COMMANDS or command in {"right", "middle"}:
+        return None
+
+    if command == "left":
+        return _match_left_right_expression(text, start)
+
+    end = _consume_command_expression(text, start)
+    if end <= command_end:
+        return None
+    end = _consume_connected_latex_tail(text, end)
+    return text[start:end], end - start
+
+
+def _read_command_end(text: str, cursor: int) -> int:
+    while cursor < len(text) and text[cursor].isalpha():
+        cursor += 1
+    return cursor
+
+
+def _command_starts_at(text: str, index: int, command: str) -> bool:
+    token = f"\\{command}"
+    if not text.startswith(token, index):
+        return False
+    next_index = index + len(token)
+    return next_index >= len(text) or not text[next_index].isalpha()
+
+
+def _match_left_right_expression(text: str, start: int):
+    cursor = _consume_latex_delimiter(text, start + len("\\left"))
+    depth = 1
+    while cursor < len(text):
+        if _command_starts_at(text, cursor, "left"):
+            depth += 1
+            cursor = _consume_latex_delimiter(text, cursor + len("\\left"))
+            continue
+        if _command_starts_at(text, cursor, "right"):
+            cursor = _consume_latex_delimiter(text, cursor + len("\\right"))
+            depth -= 1
+            if depth == 0:
+                return text[start:cursor], cursor - start
+            continue
+        cursor += 1
+    return None
+
+
+def _consume_latex_delimiter(text: str, cursor: int) -> int:
+    while cursor < len(text) and text[cursor] == " ":
+        cursor += 1
+    if cursor >= len(text):
+        return cursor
+    if text[cursor] == "\\" and cursor + 1 < len(text) and text[cursor + 1] in "{}[]|":
+        return cursor + 2
+    return cursor + 1
+
+
+def _consume_command_expression(text: str, start: int) -> int:
+    cursor = _read_command_end(text, start + 1)
+    while cursor < len(text) and text[cursor] == " ":
+        cursor += 1
+    while cursor < len(text) and text[cursor] == "[":
+        close = _find_matching_pair(text, cursor, "[", "]")
+        if close == -1:
+            break
+        cursor = close + 1
+        while cursor < len(text) and text[cursor] == " ":
+            cursor += 1
+    while cursor < len(text) and text[cursor] == "{":
+        close = _find_matching_pair(text, cursor, "{", "}")
+        if close == -1:
+            break
+        cursor = close + 1
+        while cursor < len(text) and text[cursor] == " ":
+            cursor += 1
+    return _consume_scripts(text, cursor)
+
+
+def _consume_connected_latex_tail(text: str, cursor: int) -> int:
+    while cursor < len(text):
+        before = cursor
+        char = text[cursor]
+        if char == "\\":
+            next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+            if next_char in ",;:! ":
+                cursor += 2
                 continue
-
-            # Check if this part has LaTeX
-            part_has_latex = False
-            for pattern, _ in latex_patterns:
-                if re.search(pattern, part):
-                    part_has_latex = True
+            if next_char.isalpha():
+                match = _match_raw_latex_expression(text, cursor)
+                if not match:
                     break
+                _, length = match
+                cursor += length
+                continue
+            break
+        if char.isalnum():
+            while cursor < len(text) and text[cursor].isalnum():
+                cursor += 1
+            cursor = _consume_scripts(text, cursor)
+            continue
+        if char == "{":
+            close = _find_matching_pair(text, cursor, "{", "}")
+            if close == -1:
+                break
+            cursor = close + 1
+            continue
+        if char in "^_+-=*/<>|":
+            cursor += 1
+            cursor = _consume_scripts(text, cursor)
+            continue
+        if char == "." and cursor > 0 and cursor + 1 < len(text) and text[cursor - 1].isdigit() and text[cursor + 1].isdigit():
+            cursor += 1
+            continue
+        if char == " ":
+            lookahead = cursor + 1
+            if lookahead < len(text) and (text[lookahead] == "\\" or text[lookahead] in "+-=*/<>|"):
+                cursor += 1
+                continue
+        if cursor == before:
+            break
+        break
+    return cursor
 
-            if part_has_latex and part.strip() and not part.strip().startswith('-'):
-                # Wrap with inline math delimiters
-                wrapped = f"\\({part.strip()}\\)"
-                logger.debug(f"Wrapped LaTeX: {part.strip()[:50]}... -> {wrapped[:50]}...")
-                formatted_parts.append(wrapped)
-            else:
-                formatted_parts.append(part)
 
-        formatted_segments.append(''.join(formatted_parts))
+def _consume_scripts(text: str, cursor: int) -> int:
+    while cursor < len(text) and text[cursor] in "^_":
+        cursor += 1
+        if cursor < len(text) and text[cursor] == "{":
+            close = _find_matching_pair(text, cursor, "{", "}")
+            if close == -1:
+                break
+            cursor = close + 1
+        elif cursor < len(text) and re.match(r"[0-9a-zA-Z+\-]", text[cursor]):
+            cursor += 1
+    return cursor
 
-    result = ''.join(formatted_segments)
-    logger.info("LaTeX formatting complete")
-    return result
+
+def _find_matching_pair(text: str, open_index: int, open_char: str, close_char: str) -> int:
+    depth = 1
+    for i in range(open_index + 1, len(text)):
+        if text[i] == open_char:
+            depth += 1
+        elif text[i] == close_char:
+            depth -= 1
+        if depth == 0:
+            return i
+    return -1
 
 
 def format_question_latex(question_dict: dict) -> dict:
