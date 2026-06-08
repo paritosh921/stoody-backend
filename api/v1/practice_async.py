@@ -369,7 +369,7 @@ def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
         def _extract_string_field(key: str) -> Optional[str]:
             m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', clean, re.DOTALL)
             if m:
-                return m.group(1).replace('\\"', '"').replace('\\n', '\n')
+                return _decode_text_transport_escapes(m.group(1))
             return None
 
         # Extract is_correct (boolean)
@@ -406,6 +406,67 @@ def robust_json_parse(raw_response: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _repair_latex_escape_damage(text: str) -> str:
+    r"""Repair LaTeX commands damaged by JSON/control-character decoding.
+
+    JSON treats sequences like \t, \r and \f as control characters. If a model
+    emits LaTeX with single backslashes inside JSON, commands such as \text,
+    \right and \frac can reach this layer as tabs/carriage returns/form-feeds
+    or as old cached fragments like `ight)`.
+    """
+    if not text:
+        return text
+
+    import re as _re
+
+    out = text
+
+    control_repairs = [
+        ("\x0c", "rac", "frac"),
+        ("\r", "ight", "right"),
+        ("\r", "angle", "rangle"),
+        ("\r", "ho", "rho"),
+        ("\t", "ext", "text"),
+        ("\t", "heta", "theta"),
+        ("\t", "imes", "times"),
+        ("\t", "an", "tan"),
+        ("\t", "o", "to"),
+        ("\b", "ig", "big"),
+        ("\b", "ar", "bar"),
+        ("\b", "eta", "beta"),
+    ]
+    for control, suffix, command in control_repairs:
+        out = out.replace(f"{control}{suffix}", f"\\{command}")
+
+    # Repair common remnants from older cached solution cleanup.
+    out = _re.sub(r"(?<![A-Za-z\\])ight(?=\s*[\)\]\}\|.,;])", r"\\right", out)
+    out = _re.sub(r"(?<![A-Za-z\\])ext\{([^{}\n]{1,40})\}", r"\\text{\1}", out)
+    out = _re.sub(r"(?<![A-Za-z\\])frac(?=\s*\{)", r"\\frac", out)
+    out = _re.sub(r"(?<![A-Za-z\\])sqrt(?=\s*\{)", r"\\sqrt", out)
+    out = _re.sub(r"(?<![A-Za-z\\])mathrm(?=\s*\{)", r"\\mathrm", out)
+
+    # OCR/model shorthand that appears in generated explanations.
+    out = _re.sub(r"(?<![A-Za-z\\])frac\s*√\s*([A-Za-z0-9])\s*([A-Za-z0-9])", r"\\frac{\\sqrt{\1}}{\2}", out)
+    out = _re.sub(r"(?<![A-Za-z\\])frac\s*([A-Za-z0-9])\s*([A-Za-z0-9])", r"\\frac{\1}{\2}", out)
+    out = _re.sub(r"(?<![A-Za-z\\])sqrt\s*([A-Za-z0-9])", r"\\sqrt{\1}", out)
+
+    return out
+
+
+def _decode_text_transport_escapes(text: str) -> str:
+    """Decode JSON-ish text escapes without turning LaTeX commands into controls."""
+    if not text:
+        return text
+
+    import re as _re
+
+    out = text.replace('\\"', '"').replace("\\/", "/")
+    out = _re.sub(r"\\n(?![A-Za-z])", "\n", out)
+    out = _re.sub(r"\\t(?![A-Za-z])", "\t", out)
+    out = _re.sub(r"\\r(?![A-Za-z])", "", out)
+    return _repair_latex_escape_damage(out)
+
+
 def _normalize_latex_for_render(text: str) -> str:
     """Normalize LaTeX delimiters from any common dialect to the renderer's preferred form.
 
@@ -420,7 +481,7 @@ def _normalize_latex_for_render(text: str) -> str:
     if not text:
         return text
     import re as _re
-    out = text
+    out = _repair_latex_escape_damage(text)
     # Collapse over-escaped backslashes that survive a JSON round-trip:
     #   "\\\\frac" → "\\frac" → "\frac"
     # We only collapse the doubled variant; leaving single \\frac alone is correct LaTeX.
@@ -434,7 +495,7 @@ def _normalize_latex_for_render(text: str) -> str:
         out = format_latex_in_text(out)
     except Exception as exc:
         logger.warning(f"Could not format raw LaTeX for rendering: {exc}")
-    return out
+    return _repair_latex_escape_damage(out)
 
 
 def _clean_model_solution_text(text: str) -> str:
@@ -476,14 +537,7 @@ def _clean_model_solution_text(text: str) -> str:
             try:
                 raw = _json.loads(f'"{encoded}"').strip()
             except Exception:
-                raw = (
-                    encoded
-                    .replace('\\"', '"')
-                    .replace("\\n", "\n")
-                    .replace("\\t", "\t")
-                    .replace("\\r", "")
-                    .strip()
-                )
+                raw = _decode_text_transport_escapes(encoded).strip()
         else:
             truncated = _re.search(r'"solution"\s*:\s*"', raw)
             if truncated:
@@ -495,13 +549,7 @@ def _clean_model_solution_text(text: str) -> str:
         except Exception:
             raw = raw[1:-1].strip()
 
-    raw = (
-        raw
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\r", "")
-        .replace('\\"', '"')
-    )
+    raw = _decode_text_transport_escapes(raw)
     return _normalize_latex_for_render(raw.strip())
 
 
