@@ -1,7 +1,6 @@
-import logging
-from datetime import datetime
 import asyncio
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -38,6 +37,7 @@ logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
 CANVAS_SHARE_REQUESTS_COLLECTION = "online_class_canvas_share_requests"
+CANVAS_SHARE_REQUEST_TTL_SECONDS = 45
 
 
 class CanvasProviderDetails(BaseModel):
@@ -104,6 +104,11 @@ def _canvas_provider_details(
     current_user: Dict[str, Any],
     moderator: bool,
 ) -> CanvasProviderDetails:
+    if not jitsi_provider_service.jwt_available:
+        raise HTTPException(
+            status_code=503,
+            detail="Online class canvas sharing requires Jitsi JWT enforcement",
+        )
     user_id, user_name, user_email = _current_user_identity(current_user)
     details = jitsi_provider_service.get_provider_details_for_room(
         room_name=room_name,
@@ -156,14 +161,34 @@ def _validate_requested_student_ids(
     return sorted(set(requested), key=requested.index)
 
 
+def _canvas_request_is_expired(doc: Dict[str, Any], now: datetime) -> bool:
+    updated_at = doc.get("updated_at")
+    if not isinstance(updated_at, datetime):
+        return True
+    return now - updated_at > timedelta(seconds=CANVAS_SHARE_REQUEST_TTL_SECONDS)
+
+
 async def _get_active_canvas_request(
     db: DatabaseManager,
     meeting_id: str,
 ) -> Optional[Dict[str, Any]]:
-    return await db.mongo_find_one(
+    active = await db.mongo_find_one(
         CANVAS_SHARE_REQUESTS_COLLECTION,
         {"meeting_id": meeting_id, "status": "active"},
     )
+    if not active:
+        return None
+
+    now = datetime.utcnow()
+    if not _canvas_request_is_expired(active, now):
+        return active
+
+    await db.mongo_update_one(
+        CANVAS_SHARE_REQUESTS_COLLECTION,
+        {"meeting_id": meeting_id, "status": "active"},
+        {"$set": {"status": "expired", "ended_at": now}},
+    )
+    return None
 
 
 async def _verify_meeting_active(db: DatabaseManager, meeting_id: str) -> Dict[str, Any]:

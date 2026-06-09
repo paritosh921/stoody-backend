@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -359,6 +359,58 @@ def test_canvas_request_rejects_uninvited_student():
         _validate_requested_student_ids(meeting, ["STU_1", "STU_2"])
     assert exc.value.status_code == 403
     assert "STU_2" in exc.value.detail
+
+
+def test_expired_canvas_request_is_ended_and_ignored():
+    asyncio.run(_test_expired_canvas_request_is_ended_and_ignored())
+
+
+async def _test_expired_canvas_request_is_ended_and_ignored():
+    from api.v1.online_class.router import (
+        CANVAS_SHARE_REQUESTS_COLLECTION,
+        _get_active_canvas_request,
+    )
+
+    db = FakeDb()
+    await db.mongo_insert_one(
+        CANVAS_SHARE_REQUESTS_COLLECTION,
+        {
+            "meeting_id": "MTG1",
+            "status": "active",
+            "requested_student_ids": ["STU_1"],
+            "updated_at": datetime.utcnow() - timedelta(minutes=10),
+        },
+    )
+
+    result = await _get_active_canvas_request(db, "MTG1")
+
+    assert result is None
+    stored = db.collections[CANVAS_SHARE_REQUESTS_COLLECTION][0]
+    assert stored["status"] == "expired"
+    assert stored["ended_at"] is not None
+
+
+def test_canvas_provider_details_requires_jwt_for_private_canvas_rooms(monkeypatch):
+    import importlib
+    from fastapi import HTTPException
+    router_module = importlib.import_module("api.v1.online_class.router")
+
+    monkeypatch.setenv("ONLINE_CLASS_JITSI_DOMAIN", "class.stoody.in")
+    monkeypatch.setenv("ONLINE_CLASS_JITSI_JWT_ENABLED", "false")
+    monkeypatch.delenv("ONLINE_CLASS_JITSI_BASE_URL", raising=False)
+    monkeypatch.delenv("ONLINE_CLASS_JITSI_JWT_SECRET", raising=False)
+    provider = JitsiProviderService()
+    monkeypatch.setattr(router_module, "jitsi_provider_service", provider)
+
+    with pytest.raises(HTTPException) as exc:
+        router_module._canvas_provider_details(
+            "stoody-MTG1-canvas-student-STU-1",
+            {"user_type": "tutor", "tutor_id": "tutor-1", "name": "Tutor"},
+            moderator=True,
+        )
+
+    assert exc.value.status_code == 503
+    assert "JWT" in exc.value.detail
 
 
 class AnalysisFakeDb(FakeDb):
