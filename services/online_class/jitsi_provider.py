@@ -62,6 +62,16 @@ class JitsiProviderService:
         safe_id = "".join(c if c.isalnum() else "-" for c in meeting_id)
         return f"stoody-{safe_id}"
 
+    def generate_canvas_room_name(self, meeting_id: str, kind: str, student_id: str = "") -> str:
+        safe_kind = "".join(c if c.isalnum() else "-" for c in kind).strip("-").lower()
+        if not safe_kind:
+            safe_kind = "canvas"
+        base = f"{self.generate_room_name(meeting_id)}-canvas-{safe_kind}"
+        if student_id:
+            safe_student = "".join(c if c.isalnum() else "-" for c in student_id).strip("-")
+            return f"{base}-{safe_student}"
+        return base
+
     def get_room_url(self, room_name: str) -> str:
         if not self.configured:
             return ""
@@ -109,15 +119,14 @@ class JitsiProviderService:
 
         return jwt.encode(payload, self._jwt_secret, algorithm="HS256")
 
-    def get_provider_details(
+    def get_provider_details_for_room(
         self,
-        meeting_id: str,
+        room_name: str,
         user_id: str = "",
         user_name: str = "",
         user_email: str = "",
         moderator: bool = False,
     ) -> Dict[str, Any]:
-        room_name = self.generate_room_name(meeting_id)
         url = self.get_room_url(room_name)
 
         token = None
@@ -134,9 +143,9 @@ class JitsiProviderService:
                 )
             else:
                 logger.warning(
-                    "Jitsi JWT enabled but secret absent for meeting %s; "
+                    "Jitsi JWT enabled but secret absent for room %s; "
                     "marking provider unconfigured instead of returning a public join path.",
-                    meeting_id,
+                    room_name,
                 )
 
         response_configured = self.configured and (not self._jwt_enabled or bool(token))
@@ -150,6 +159,23 @@ class JitsiProviderService:
             "token": token,
             "configured": response_configured,
         }
+
+    def get_provider_details(
+        self,
+        meeting_id: str,
+        user_id: str = "",
+        user_name: str = "",
+        user_email: str = "",
+        moderator: bool = False,
+    ) -> Dict[str, Any]:
+        room_name = self.generate_room_name(meeting_id)
+        return self.get_provider_details_for_room(
+            room_name=room_name,
+            user_id=user_id,
+            user_name=user_name,
+            user_email=user_email,
+            moderator=moderator,
+        )
 
 
 jitsi_provider_service = JitsiProviderService()

@@ -198,6 +198,36 @@ class TestRoomNameStability:
         )
         assert decoded["room"] == details["room_name"]
 
+    def test_canvas_room_names_are_deterministic_and_scoped(self):
+        provider = _make_provider(jwt_enabled="false")
+        teacher_room = provider.generate_canvas_room_name("MTG 123", "teacher")
+        student_room = provider.generate_canvas_room_name("MTG 123", "student", "STU/A 1")
+
+        assert teacher_room == "stoody-MTG-123-canvas-teacher"
+        assert student_room == "stoody-MTG-123-canvas-student-STU-A-1"
+        assert teacher_room != student_room
+
+    def test_canvas_room_jwt_uses_exact_canvas_room_claim(self):
+        provider = _make_provider(jwt_enabled="true", jwt_secret=TEST_SECRET)
+        room_name = provider.generate_canvas_room_name("MTG-ROOM-01", "student", "STU-1")
+        details = provider.get_provider_details_for_room(
+            room_name,
+            user_id="STU-1",
+            user_name="Student One",
+            moderator=False,
+        )
+
+        decoded = jwt.decode(
+            details["token"],
+            TEST_SECRET,
+            algorithms=["HS256"],
+            audience="jitsi",
+        )
+        assert details["room_name"] == room_name
+        assert decoded["room"] == room_name
+        assert decoded["context"]["user"]["id"] == "STU-1"
+        assert decoded["context"]["user"]["moderator"] is False
+
 
 class TestBuildProviderDetailsIntegration:
     def test_build_provider_details_passes_user_info(self):

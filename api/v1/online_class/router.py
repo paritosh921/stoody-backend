@@ -2,9 +2,10 @@ import logging
 from datetime import datetime
 import asyncio
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -36,6 +37,43 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 limiter = Limiter(key_func=get_remote_address)
 
+CANVAS_SHARE_REQUESTS_COLLECTION = "online_class_canvas_share_requests"
+
+
+class CanvasProviderDetails(BaseModel):
+    provider: Optional[str] = None
+    domain: Optional[str] = None
+    room_name: Optional[str] = None
+    url: Optional[str] = None
+    token_required: bool = False
+    token: Optional[str] = None
+    configured: bool = False
+
+
+class CanvasShareSessionResponse(BaseModel):
+    teacher_room: CanvasProviderDetails
+
+
+class StudentCanvasRequestBody(BaseModel):
+    student_ids: Optional[List[str]] = None
+
+
+class StudentCanvasRoom(BaseModel):
+    student_id: str
+    room: CanvasProviderDetails
+
+
+class StudentCanvasRequestResponse(BaseModel):
+    active: bool
+    requested_student_ids: List[str]
+    monitor_rooms: List[StudentCanvasRoom]
+
+
+class StudentCanvasPublishResponse(BaseModel):
+    requested: bool
+    student_id: str
+    publish_room: Optional[CanvasProviderDetails] = None
+
 
 def _require_tutor(current_user: Dict[str, Any]):
     if current_user.get("user_type") != "tutor":
@@ -47,6 +85,85 @@ def _require_student(current_user: Dict[str, Any]):
     if current_user.get("user_type") != "student":
         raise HTTPException(status_code=403, detail="Student access required")
     return current_user
+
+
+def _current_user_identity(current_user: Dict[str, Any]) -> tuple[str, str, str]:
+    user_id = (
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("student_id")
+        or ""
+    )
+    user_name = current_user.get("name") or current_user.get("username") or "Participant"
+    user_email = current_user.get("email") or ""
+    return str(user_id), str(user_name), str(user_email)
+
+
+def _canvas_provider_details(
+    room_name: str,
+    current_user: Dict[str, Any],
+    moderator: bool,
+) -> CanvasProviderDetails:
+    user_id, user_name, user_email = _current_user_identity(current_user)
+    details = jitsi_provider_service.get_provider_details_for_room(
+        room_name=room_name,
+        user_id=user_id,
+        user_name=user_name,
+        user_email=user_email,
+        moderator=moderator,
+    )
+    provider = CanvasProviderDetails(**details)
+    if not provider.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="Online class canvas video provider is not configured",
+        )
+    return provider
+
+
+def _teacher_canvas_room_name(meeting_id: str) -> str:
+    return jitsi_provider_service.generate_canvas_room_name(meeting_id, "teacher")
+
+
+def _student_canvas_room_name(meeting_id: str, student_id: str) -> str:
+    return jitsi_provider_service.generate_canvas_room_name(
+        meeting_id,
+        "student",
+        student_id=student_id,
+    )
+
+
+def _validate_requested_student_ids(
+    meeting: Dict[str, Any],
+    requested_student_ids: Optional[List[str]],
+) -> List[str]:
+    invited = [str(sid) for sid in meeting.get("invited_student_ids", []) if sid]
+    if not invited:
+        raise HTTPException(status_code=400, detail="No invited students for this meeting")
+
+    requested = [str(sid) for sid in (requested_student_ids or invited) if sid]
+    if not requested:
+        requested = invited
+
+    invited_set = set(invited)
+    invalid = sorted(set(requested) - invited_set)
+    if invalid:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Student(s) not invited to this meeting: {', '.join(invalid)}",
+        )
+
+    return sorted(set(requested), key=requested.index)
+
+
+async def _get_active_canvas_request(
+    db: DatabaseManager,
+    meeting_id: str,
+) -> Optional[Dict[str, Any]]:
+    return await db.mongo_find_one(
+        CANVAS_SHARE_REQUESTS_COLLECTION,
+        {"meeting_id": meeting_id, "status": "active"},
+    )
 
 
 async def _verify_meeting_active(db: DatabaseManager, meeting_id: str) -> Dict[str, Any]:
@@ -74,6 +191,152 @@ async def _verify_student_invited(db: DatabaseManager, meeting_id: str, student_
     if student_id not in meeting.get("invited_student_ids", []):
         raise HTTPException(status_code=403, detail="Student not invited to this meeting")
     return meeting
+
+
+@router.get("/meetings/{meeting_id}/canvas-share/session", response_model=CanvasShareSessionResponse)
+@limiter.limit("30/minute")
+async def api_get_canvas_share_session(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    user_type = current_user.get("user_type")
+    moderator = False
+    if user_type == "tutor":
+        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        moderator = True
+    elif user_type == "student":
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id:
+            raise HTTPException(status_code=403, detail="Could not resolve student identity")
+        await _verify_student_invited(db, meeting_id, student_id)
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    await _verify_meeting_active(db, meeting_id)
+    room_name = _teacher_canvas_room_name(meeting_id)
+    return CanvasShareSessionResponse(
+        teacher_room=_canvas_provider_details(room_name, current_user, moderator=moderator)
+    )
+
+
+@router.post(
+    "/meetings/{meeting_id}/canvas-share/student-requests",
+    response_model=StudentCanvasRequestResponse,
+)
+@limiter.limit("10/minute")
+async def api_request_student_canvas_streams(
+    request: Request,
+    meeting_id: str,
+    body: StudentCanvasRequestBody,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    tutor_id = current_user.get("tutor_id")
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_meeting_active(db, meeting_id)
+    requested_student_ids = _validate_requested_student_ids(meeting, body.student_ids)
+
+    now = datetime.utcnow()
+    doc = {
+        "meeting_id": meeting_id,
+        "tutor_id": tutor_id,
+        "requested_student_ids": requested_student_ids,
+        "status": "active",
+        "updated_at": now,
+    }
+    existing = await _get_active_canvas_request(db, meeting_id)
+    if existing:
+        await db.mongo_update_one(
+            CANVAS_SHARE_REQUESTS_COLLECTION,
+            {"meeting_id": meeting_id, "status": "active"},
+            {"$set": doc},
+        )
+    else:
+        await db.mongo_insert_one(
+            CANVAS_SHARE_REQUESTS_COLLECTION,
+            {**doc, "created_at": now},
+        )
+
+    monitor_rooms = [
+        StudentCanvasRoom(
+            student_id=student_id,
+            room=_canvas_provider_details(
+                _student_canvas_room_name(meeting_id, student_id),
+                current_user,
+                moderator=True,
+            ),
+        )
+        for student_id in requested_student_ids
+    ]
+    return StudentCanvasRequestResponse(
+        active=True,
+        requested_student_ids=requested_student_ids,
+        monitor_rooms=monitor_rooms,
+    )
+
+
+@router.delete(
+    "/meetings/{meeting_id}/canvas-share/student-requests",
+    response_model=StudentCanvasRequestResponse,
+)
+@limiter.limit("10/minute")
+async def api_stop_student_canvas_streams(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    tutor_id = current_user.get("tutor_id")
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await db.mongo_update_one(
+        CANVAS_SHARE_REQUESTS_COLLECTION,
+        {"meeting_id": meeting_id, "status": "active"},
+        {"$set": {"status": "ended", "ended_at": datetime.utcnow()}},
+    )
+    return StudentCanvasRequestResponse(
+        active=False,
+        requested_student_ids=[],
+        monitor_rooms=[],
+    )
+
+
+@router.get(
+    "/meetings/{meeting_id}/canvas-share/student-publish",
+    response_model=StudentCanvasPublishResponse,
+)
+@limiter.limit("30/minute")
+async def api_get_student_canvas_publish_session(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_student(current_user)
+    student_id = await resolve_business_student_id(current_user, db)
+    if not student_id:
+        raise HTTPException(status_code=403, detail="Could not resolve student identity")
+
+    await _verify_student_invited(db, meeting_id, student_id)
+    await _verify_meeting_active(db, meeting_id)
+
+    active_request = await _get_active_canvas_request(db, meeting_id)
+    requested = bool(
+        active_request
+        and student_id in active_request.get("requested_student_ids", [])
+    )
+    if not requested:
+        return StudentCanvasPublishResponse(requested=False, student_id=student_id)
+
+    room_name = _student_canvas_room_name(meeting_id, student_id)
+    return StudentCanvasPublishResponse(
+        requested=True,
+        student_id=student_id,
+        publish_room=_canvas_provider_details(room_name, current_user, moderator=False),
+    )
 
 
 @router.post("/meetings/{meeting_id}/locks", response_model=LockResponse)

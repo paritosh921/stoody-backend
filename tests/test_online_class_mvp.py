@@ -343,6 +343,24 @@ async def _test_notification_recipient_ids_empty_input():
     assert result == []
 
 
+def test_canvas_request_defaults_to_invited_students():
+    from api.v1.online_class.router import _validate_requested_student_ids
+
+    meeting = {"invited_student_ids": ["STU_2", "STU_1"]}
+    assert _validate_requested_student_ids(meeting, None) == ["STU_2", "STU_1"]
+
+
+def test_canvas_request_rejects_uninvited_student():
+    from fastapi import HTTPException
+    from api.v1.online_class.router import _validate_requested_student_ids
+
+    meeting = {"invited_student_ids": ["STU_1"]}
+    with pytest.raises(HTTPException) as exc:
+        _validate_requested_student_ids(meeting, ["STU_1", "STU_2"])
+    assert exc.value.status_code == 403
+    assert "STU_2" in exc.value.detail
+
+
 class AnalysisFakeDb(FakeDb):
     def __init__(self):
         super().__init__()
