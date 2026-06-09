@@ -1,19 +1,18 @@
 """
 Meeting Management API Endpoints
 
-Handles Google Meet integration for online classes.
+Handles Jitsi integration for online classes.
 - Tutors can create, start, end, and cancel meetings
 - Students can view scheduled meetings for their class/section/subject
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime
 from pydantic import BaseModel, Field
 import logging
 
 from models.meeting import Meeting
-from services.google_meet import google_meet_service
 from services.online_class import jitsi_provider_service
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
@@ -167,6 +166,50 @@ def _build_provider_details(
     return ProviderDetails(provider=None, configured=False)
 
 
+def _require_provider_details(
+    meeting_id: str,
+    current_user: Optional[Dict[str, Any]],
+    moderator: bool,
+) -> ProviderDetails:
+    provider = _build_provider_details(
+        meeting_id=meeting_id,
+        current_user=current_user,
+        moderator=moderator,
+    )
+    if provider.configured:
+        return provider
+    raise HTTPException(
+        status_code=503,
+        detail="Online class video provider is not configured",
+    )
+
+
+def _provider_or_none(
+    meeting_id: str,
+    current_user: Optional[Dict[str, Any]],
+    moderator: bool,
+) -> Optional[ProviderDetails]:
+    provider = _build_provider_details(
+        meeting_id=meeting_id,
+        current_user=current_user,
+        moderator=moderator,
+    )
+    return provider if provider.configured else None
+
+
+def _provider_video_fields(provider: Optional[ProviderDetails]) -> tuple[Optional[str], Optional[str]]:
+    if provider and provider.configured:
+        return provider.url, provider.room_name
+    return None, None
+
+
+def _public_video_fields(meeting_id: str) -> tuple[Optional[str], Optional[str]]:
+    if not jitsi_provider_service.configured:
+        return None, None
+    room_name = jitsi_provider_service.generate_room_name(meeting_id)
+    return jitsi_provider_service.get_room_url(room_name), room_name
+
+
 @router.post("/meetings", response_model=MeetingResponse, status_code=201)
 @limiter.limit("10/minute")
 async def create_meeting(
@@ -176,7 +219,7 @@ async def create_meeting(
     db: DatabaseManager = Depends(get_database)
 ):
     """
-    Create a new online class meeting with Google Meet link.
+    Create a new online class meeting backed by Jitsi.
     Only tutors can create meetings.
     """
     tutor_id = current_user.get("tutor_id")
@@ -189,20 +232,9 @@ async def create_meeting(
 
     admin_id = tutor.get("created_by")
 
-    # Create Google Meet link
-    description = f"Online class: {meeting_data.topic}\nSubject: {meeting_data.subject}\nClass: {meeting_data.standard}"
-    if meeting_data.section:
-        description += f" Section: {meeting_data.section}"
-
-    meet_link, meet_code, google_event_id = await google_meet_service.create_meeting(
-        topic=f"[{meeting_data.subject}] {meeting_data.topic}",
-        description=description,
-        scheduled_at=meeting_data.scheduled_at,
-        duration_minutes=meeting_data.duration_minutes,
-    )
-
-    # Generate meeting ID
     meeting_id = Meeting.generate_meeting_id()
+    provider = _require_provider_details(meeting_id, current_user=current_user, moderator=True)
+    meet_link, meet_code = _provider_video_fields(provider)
 
     # Find students to invite based on criteria
     invited_student_ids = await _find_eligible_students(
@@ -229,7 +261,9 @@ async def create_meeting(
         "duration_minutes": meeting_data.duration_minutes,
         "meet_link": meet_link,
         "meet_code": meet_code,
-        "google_event_id": google_event_id,
+        "provider": "jitsi",
+        "jitsi_room_name": provider.room_name,
+        "jitsi_url": provider.url,
         "status": "scheduled",
         "invited_student_ids": invited_student_ids,
         "joined_student_ids": [],
@@ -292,7 +326,7 @@ async def create_meeting(
         created_at=meeting_doc["created_at"],
         started_at=None,
         ended_at=None,
-        provider_details=_build_provider_details(meeting_id, current_user=current_user, moderator=True),
+        provider_details=provider,
     )
 
 
@@ -399,8 +433,16 @@ async def get_tutor_meetings(
     meetings = await db.mongo_find("meetings", query)
     meetings = sorted(meetings, key=lambda m: m.get("scheduled_at", datetime.min), reverse=True)
 
-    return [
-        MeetingResponse(
+    responses: List[MeetingResponse] = []
+    for m in meetings:
+        provider = _provider_or_none(
+            m.get("meeting_id"),
+            current_user=current_user,
+            moderator=True,
+        )
+        meet_link, meet_code = _provider_video_fields(provider)
+        responses.append(
+            MeetingResponse(
             meeting_id=m.get("meeting_id"),
             tutor_id=m.get("tutor_id"),
             tutor_name=m.get("tutor_name"),
@@ -411,18 +453,18 @@ async def get_tutor_meetings(
             course_type=m.get("course_type"),
             scheduled_at=m.get("scheduled_at"),
             duration_minutes=m.get("duration_minutes", 60),
-            meet_link=m.get("meet_link"),
-            meet_code=m.get("meet_code"),
+            meet_link=meet_link,
+            meet_code=meet_code,
             status=m.get("status"),
             invited_student_count=len(m.get("invited_student_ids", [])),
             joined_student_count=len(m.get("joined_student_ids", [])),
             created_at=m.get("created_at"),
             started_at=m.get("started_at"),
             ended_at=m.get("ended_at"),
-            provider_details=_build_provider_details(m.get("meeting_id"), current_user=current_user, moderator=True),
+            provider_details=provider,
+            )
         )
-        for m in meetings
-    ]
+    return responses
 
 
 @router.get("/meetings/student", response_model=List[StudentMeetingResponse])
@@ -452,8 +494,20 @@ async def get_student_meetings(
     meetings = await db.mongo_find("meetings", query)
     meetings = sorted(meetings, key=lambda m: m.get("scheduled_at", datetime.min))
 
-    return [
-        StudentMeetingResponse(
+    responses: List[StudentMeetingResponse] = []
+    for m in meetings:
+        provider = (
+            _provider_or_none(
+                m.get("meeting_id"),
+                current_user=current_user,
+                moderator=False,
+            )
+            if m.get("status") == "active"
+            else None
+        )
+        meet_link, meet_code = _provider_video_fields(provider)
+        responses.append(
+            StudentMeetingResponse(
             meeting_id=m.get("meeting_id"),
             topic=m.get("topic"),
             subject=m.get("subject"),
@@ -462,14 +516,14 @@ async def get_student_meetings(
             tutor_name=m.get("tutor_name"),
             scheduled_at=m.get("scheduled_at"),
             duration_minutes=m.get("duration_minutes", 60),
-            meet_link=m.get("meet_link") if m.get("status") == "active" else None,
-            meet_code=m.get("meet_code") if m.get("status") == "active" else None,
+            meet_link=meet_link,
+            meet_code=meet_code,
             status=m.get("status"),
             started_at=m.get("started_at"),
-            provider_details=_build_provider_details(m.get("meeting_id"), current_user=current_user, moderator=False) if m.get("status") == "active" else None,
+            provider_details=provider,
+            )
         )
-        for m in meetings
-    ]
+    return responses
 
 
 @router.get("/meetings/available")
@@ -494,22 +548,29 @@ async def get_available_meetings_for_student(
     meetings = await db.mongo_find("meetings", query)
     meetings = sorted(meetings, key=lambda m: m.get("scheduled_at", datetime.min))
 
-    return [
-        {
+    response = []
+    for m in meetings:
+        meet_link, meet_code = (
+            _public_video_fields(m.get("meeting_id"))
+            if m.get("status") == "active"
+            else (None, None)
+        )
+        response.append({
             "class_id": m.get("meeting_id"),
             "topic": m.get("topic"),
             "subject": m.get("subject"),
             "standard": m.get("standard"),
             "section": m.get("section"),
             "tutor_name": m.get("tutor_name"),
-            "meet_link": m.get("meet_link") if m.get("status") == "active" else None,
-            "meet_code": m.get("meet_code"),
+            "meet_link": meet_link,
+            "meet_code": meet_code,
+            "provider": "jitsi" if meet_link else None,
+            "requires_authenticated_join": bool(meet_link),
             "status": m.get("status"),
             "student_count": len(m.get("invited_student_ids", [])),
             "started_at": m.get("started_at").isoformat() if m.get("started_at") else None,
-        }
-        for m in meetings
-    ]
+        })
+    return response
 
 
 @router.post("/meetings/{meeting_id}/start")
@@ -537,11 +598,24 @@ async def start_meeting(
     if meeting.get("status") != "scheduled":
         raise HTTPException(status_code=400, detail=f"Meeting is already {meeting.get('status')}")
 
+    provider = _require_provider_details(meeting_id, current_user=current_user, moderator=True)
+    meet_link, meet_code = _provider_video_fields(provider)
+
     # Update meeting status
     await db.mongo_update_one(
         "meetings",
         {"meeting_id": meeting_id},
-        {"$set": {"status": "active", "started_at": datetime.utcnow()}}
+        {
+            "$set": {
+                "status": "active",
+                "started_at": datetime.utcnow(),
+                "provider": "jitsi",
+                "jitsi_room_name": provider.room_name,
+                "jitsi_url": provider.url,
+                "meet_link": meet_link,
+                "meet_code": meet_code,
+            }
+        }
     )
 
     logger.info(f"Meeting {meeting_id} started by tutor {tutor_id}")
@@ -579,8 +653,9 @@ async def start_meeting(
     return {
         "message": "Meeting started",
         "meeting_id": meeting_id,
-        "meet_link": meeting.get("meet_link"),
-        "meet_code": meeting.get("meet_code"),
+        "meet_link": meet_link,
+        "meet_code": meet_code,
+        "provider_details": provider.dict(),
     }
 
 
@@ -630,7 +705,7 @@ async def cancel_meeting(
     db: DatabaseManager = Depends(get_database)
 ):
     """
-    Cancel a scheduled meeting. Also cancels the Google Calendar event.
+    Cancel a scheduled or active meeting.
     """
     tutor_id = current_user.get("tutor_id")
 
@@ -645,11 +720,6 @@ async def cancel_meeting(
 
     if meeting.get("status") not in ["scheduled", "active"]:
         raise HTTPException(status_code=400, detail="Cannot cancel an ended meeting")
-
-    # Cancel Google Calendar event
-    google_event_id = meeting.get("google_event_id")
-    if google_event_id:
-        await google_meet_service.cancel_meeting(google_event_id)
 
     # Update meeting status
     await db.mongo_update_one(
@@ -696,11 +766,14 @@ async def student_join_meeting(
 
     logger.info(f"Student {student_id} joined meeting {meeting_id}")
 
+    meet_link, meet_code = _public_video_fields(meeting_id)
     return {
         "message": "Joined meeting",
         "meeting_id": meeting_id,
-        "meet_link": meeting.get("meet_link"),
-        "meet_code": meeting.get("meet_code"),
+        "meet_link": meet_link,
+        "meet_code": meet_code,
+        "provider": "jitsi" if meet_link else None,
+        "requires_authenticated_join": bool(meet_link),
     }
 
 
@@ -709,13 +782,9 @@ async def student_join_meeting(
 async def student_join_meeting_auth(
     request: Request,
     meeting_id: str,
-    current_user: Dict[str, Any] = Depends(require_student),
+    current_user: Dict[str, Any] = Depends(get_current_user),
     db: DatabaseManager = Depends(get_database)
 ):
-    student_id = await resolve_business_student_id(current_user, db)
-    if not student_id:
-        raise HTTPException(status_code=403, detail="Could not resolve student identity")
-
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -723,22 +792,36 @@ async def student_join_meeting_auth(
     if meeting.get("status") != "active":
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
-    if student_id not in meeting.get("invited_student_ids", []):
-        raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+    user_type = current_user.get("user_type")
+    moderator = False
+    if user_type == "tutor":
+        tutor_id = current_user.get("tutor_id")
+        if meeting.get("tutor_id") != tutor_id:
+            raise HTTPException(status_code=403, detail="Not authorized to join this meeting")
+        moderator = True
+    elif user_type == "student":
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id:
+            raise HTTPException(status_code=403, detail="Could not resolve student identity")
+        if student_id not in meeting.get("invited_student_ids", []):
+            raise HTTPException(status_code=403, detail="Student not invited to this meeting")
 
-    await db.mongo_update_one(
-        "meetings",
-        {"meeting_id": meeting_id},
-        {"$addToSet": {"joined_student_ids": student_id}}
-    )
+        await db.mongo_update_one(
+            "meetings",
+            {"meeting_id": meeting_id},
+            {"$addToSet": {"joined_student_ids": student_id}}
+        )
+        logger.info(f"Student {student_id} joined meeting {meeting_id} via auth endpoint")
+    else:
+        raise HTTPException(status_code=403, detail="Online class access denied")
 
-    logger.info(f"Student {student_id} joined meeting {meeting_id} via auth endpoint")
+    provider = _require_provider_details(meeting_id, current_user=current_user, moderator=moderator)
+    meet_link, meet_code = _provider_video_fields(provider)
 
-    provider = _build_provider_details(meeting_id, current_user=current_user, moderator=False)
     return {
         "message": "Joined meeting",
         "meeting_id": meeting_id,
-        "meet_link": meeting.get("meet_link"),
-        "meet_code": meeting.get("meet_code"),
-        "provider_details": provider.dict() if provider.configured else None,
+        "meet_link": meet_link,
+        "meet_code": meet_code,
+        "provider_details": provider.dict(),
     }

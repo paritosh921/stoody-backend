@@ -183,7 +183,7 @@ except Exception as e:
     _classroom_available = False
     logging.warning(f"Classroom routes disabled: {str(e)}")
 
-# Meeting Management routes (Google Meet integration)
+# Meeting Management routes (online class video integration)
 try:
     from api.v1.meeting_async import router as meeting_router
     _meeting_available = True
@@ -1190,7 +1190,7 @@ if _classroom_available and classroom_router:
 else:
     logger.warning("⚠️ Classroom routes disabled")
 
-# Meeting Management routes (Google Meet integration for online classes)
+# Meeting Management routes (online class video integration)
 if _meeting_available and meeting_router:
     app.include_router(
         meeting_router,

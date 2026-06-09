@@ -28,7 +28,7 @@ class CreateOnlineClassRequest(BaseModel):
     standard: str = Field(..., description="Class/grade level")
     section: Optional[str] = None
     scheduled_at: Optional[datetime] = None
-    meet_link: Optional[str] = None  # Google Meet link
+    meet_link: Optional[str] = None
 
 
 class OnlineClassResponse(BaseModel):

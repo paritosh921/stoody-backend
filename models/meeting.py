@@ -1,5 +1,5 @@
 """
-Meeting Model for Google Meet Integration
+Meeting model for online classes.
 
 Represents scheduled online class meetings created by tutors.
 Students receive meeting invites based on their class/section/subject mapping.
@@ -11,7 +11,7 @@ from bson import ObjectId
 
 
 class Meeting:
-    """Online class meeting model for Google Meet integration"""
+    """Online class meeting model."""
 
     def __init__(
         self,
@@ -27,7 +27,6 @@ class Meeting:
         duration_minutes: int = 60,
         meet_link: Optional[str] = None,
         meet_code: Optional[str] = None,
-        google_event_id: Optional[str] = None,
         status: str = "scheduled",  # scheduled, active, ended, cancelled
         invited_student_ids: Optional[List[str]] = None,
         joined_student_ids: Optional[List[str]] = None,
@@ -50,7 +49,6 @@ class Meeting:
         self.duration_minutes = duration_minutes
         self.meet_link = meet_link
         self.meet_code = meet_code
-        self.google_event_id = google_event_id
         self.status = status
         self.invited_student_ids = invited_student_ids or []
         self.joined_student_ids = joined_student_ids or []
@@ -83,7 +81,6 @@ class Meeting:
             "duration_minutes": self.duration_minutes,
             "meet_link": self.meet_link,
             "meet_code": self.meet_code,
-            "google_event_id": self.google_event_id,
             "status": self.status,
             "invited_student_ids": self.invited_student_ids,
             "joined_student_ids": self.joined_student_ids,
@@ -127,7 +124,6 @@ class Meeting:
             duration_minutes=data.get('duration_minutes', 60),
             meet_link=data.get('meet_link'),
             meet_code=data.get('meet_code'),
-            google_event_id=data.get('google_event_id'),
             status=data.get('status', 'scheduled'),
             invited_student_ids=data.get('invited_student_ids', []),
             joined_student_ids=data.get('joined_student_ids', []),
