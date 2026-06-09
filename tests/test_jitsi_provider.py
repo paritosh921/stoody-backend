@@ -203,8 +203,8 @@ class TestRoomNameStability:
         teacher_room = provider.generate_canvas_room_name("MTG 123", "teacher")
         student_room = provider.generate_canvas_room_name("MTG 123", "student", "STU/A 1")
 
-        assert teacher_room == "stoody-MTG-123-canvas-teacher"
-        assert student_room == "stoody-MTG-123-canvas-student-STU-A-1"
+        assert teacher_room == "stoody-mtg-123-canvas-teacher"
+        assert student_room == "stoody-mtg-123-canvas-student-stu-a-1"
         assert teacher_room != student_room
 
     def test_canvas_room_jwt_uses_exact_canvas_room_claim(self):
@@ -224,6 +224,7 @@ class TestRoomNameStability:
             audience="jitsi",
         )
         assert details["room_name"] == room_name
+        assert details["room_name"] == details["room_name"].lower()
         assert decoded["room"] == room_name
         assert decoded["context"]["user"]["id"] == "STU-1"
         assert decoded["context"]["user"]["moderator"] is False

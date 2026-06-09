@@ -69,8 +69,8 @@ class JitsiProviderService:
         base = f"{self.generate_room_name(meeting_id)}-canvas-{safe_kind}"
         if student_id:
             safe_student = "".join(c if c.isalnum() else "-" for c in student_id).strip("-")
-            return f"{base}-{safe_student}"
-        return base
+            return f"{base}-{safe_student}".lower()
+        return base.lower()
 
     def get_room_url(self, room_name: str) -> str:
         if not self.configured:
