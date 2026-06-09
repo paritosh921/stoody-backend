@@ -146,9 +146,10 @@ def _validate_requested_student_ids(
     if not invited:
         raise HTTPException(status_code=400, detail="No invited students for this meeting")
 
-    requested = [str(sid) for sid in (requested_student_ids or invited) if sid]
-    if not requested:
-        requested = invited
+    if requested_student_ids is None:
+        requested = [str(sid) for sid in meeting.get("joined_student_ids", []) if sid]
+    else:
+        requested = [str(sid) for sid in requested_student_ids if sid]
 
     invited_set = set(invited)
     invalid = sorted(set(requested) - invited_set)

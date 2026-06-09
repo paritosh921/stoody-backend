@@ -343,11 +343,21 @@ async def _test_notification_recipient_ids_empty_input():
     assert result == []
 
 
-def test_canvas_request_defaults_to_invited_students():
+def test_canvas_request_defaults_to_joined_students():
     from api.v1.online_class.router import _validate_requested_student_ids
 
-    meeting = {"invited_student_ids": ["STU_2", "STU_1"]}
-    assert _validate_requested_student_ids(meeting, None) == ["STU_2", "STU_1"]
+    meeting = {
+        "invited_student_ids": ["STU_2", "STU_1", "STU_3"],
+        "joined_student_ids": ["STU_1"],
+    }
+    assert _validate_requested_student_ids(meeting, None) == ["STU_1"]
+
+
+def test_canvas_request_defaults_to_empty_when_no_students_joined():
+    from api.v1.online_class.router import _validate_requested_student_ids
+
+    meeting = {"invited_student_ids": ["STU_2", "STU_1"], "joined_student_ids": []}
+    assert _validate_requested_student_ids(meeting, None) == []
 
 
 def test_canvas_request_rejects_uninvited_student():
