@@ -510,21 +510,55 @@ async def _verify_meeting_active(db: DatabaseManager, meeting_id: str) -> Dict[s
     return meeting
 
 
-async def _verify_tutor_owns_meeting(db: DatabaseManager, meeting_id: str, tutor_id: str) -> Dict[str, Any]:
+def _normalize_scope_id(value: Any) -> Optional[str]:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _verify_meeting_admin_boundary(
+    meeting: Dict[str, Any],
+    current_user: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not current_user:
+        return
+    meeting_admin_id = _normalize_scope_id(meeting.get("admin_id"))
+    user_admin_id = _normalize_scope_id(
+        current_user.get("admin_id") or current_user.get("created_by")
+    )
+    if not meeting_admin_id or not user_admin_id:
+        return
+    if meeting_admin_id != user_admin_id:
+        raise HTTPException(status_code=403, detail="Tenant boundary mismatch for this meeting")
+
+
+async def _verify_tutor_owns_meeting(
+    db: DatabaseManager,
+    meeting_id: str,
+    tutor_id: str,
+    current_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
     if meeting.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized for this meeting")
+    _verify_meeting_admin_boundary(meeting, current_user)
     return meeting
 
 
-async def _verify_student_invited(db: DatabaseManager, meeting_id: str, student_id: str) -> Dict[str, Any]:
+async def _verify_student_invited(
+    db: DatabaseManager,
+    meeting_id: str,
+    student_id: str,
+    current_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
     if student_id not in meeting.get("invited_student_ids", []):
         raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+    _verify_meeting_admin_boundary(meeting, current_user)
     return meeting
 
 
@@ -575,13 +609,13 @@ async def api_get_canvas_share_session(
     user_type = current_user.get("user_type")
     moderator = False
     if user_type == "tutor":
-        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
         moderator = True
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
         if not student_id:
             raise HTTPException(status_code=403, detail="Could not resolve student identity")
-        await _verify_student_invited(db, meeting_id, student_id)
+        await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
     else:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -606,7 +640,7 @@ async def api_request_student_canvas_streams(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    meeting = await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
     requested_student_ids = _validate_requested_student_ids(meeting, body.student_ids)
 
@@ -662,7 +696,7 @@ async def api_stop_student_canvas_streams(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
     await db.mongo_update_one(
         CANVAS_SHARE_REQUESTS_COLLECTION,
         {"meeting_id": meeting_id, "status": "active"},
@@ -691,7 +725,7 @@ async def api_get_student_canvas_publish_session(
     if not student_id:
         raise HTTPException(status_code=403, detail="Could not resolve student identity")
 
-    await _verify_student_invited(db, meeting_id, student_id)
+    await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
 
     active_request = await _get_active_canvas_request(db, meeting_id)
@@ -722,7 +756,7 @@ async def api_get_monitoring_students(
     db: DatabaseManager = Depends(get_database),
 ):
     _require_tutor(current_user)
-    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
 
     invited_ids = [str(student_id) for student_id in meeting.get("invited_student_ids", []) if student_id]
@@ -762,7 +796,7 @@ async def api_get_monitoring_student_pages(
     db: DatabaseManager = Depends(get_database),
 ):
     _require_tutor(current_user)
-    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
     if student_id not in meeting.get("invited_student_ids", []):
         raise HTTPException(status_code=403, detail="Student not invited to this meeting")
@@ -798,7 +832,7 @@ async def api_get_monitoring_student_page(
     db: DatabaseManager = Depends(get_database),
 ):
     _require_tutor(current_user)
-    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
     if student_id not in meeting.get("invited_student_ids", []):
         raise HTTPException(status_code=403, detail="Student not invited to this meeting")
@@ -825,7 +859,7 @@ async def api_get_monitoring_stroke_stream_snapshot(
     db: DatabaseManager = Depends(get_database),
 ):
     _require_tutor(current_user)
-    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
     if student_id not in meeting.get("invited_student_ids", []):
         raise HTTPException(status_code=403, detail="Student not invited to this meeting")
@@ -864,12 +898,12 @@ async def api_get_teacher_canvas_mode(
 ):
     user_type = current_user.get("user_type")
     if user_type == "tutor":
-        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
         if not student_id:
             raise HTTPException(status_code=403, detail="Could not resolve student identity")
-        await _verify_student_invited(db, meeting_id, student_id)
+        await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
     else:
         raise HTTPException(status_code=403, detail="Access denied")
     await _verify_meeting_active(db, meeting_id)
@@ -890,7 +924,7 @@ async def api_set_teacher_canvas_mode(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
     if body.mode == "live":
         await db.mongo_update_one(
@@ -915,13 +949,13 @@ async def api_get_teacher_live_canvas_stream_snapshot(
 ):
     user_type = current_user.get("user_type")
     if user_type == "tutor":
-        meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
         tutor_user = current_user
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
         if not student_id:
             raise HTTPException(status_code=403, detail="Could not resolve student identity")
-        meeting = await _verify_student_invited(db, meeting_id, student_id)
+        meeting = await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
         tutor_user = None
     else:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -963,13 +997,13 @@ async def api_get_teacher_live_canvas_page(
 ):
     user_type = current_user.get("user_type")
     if user_type == "tutor":
-        meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
         tutor_user = current_user
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
         if not student_id:
             raise HTTPException(status_code=403, detail="Could not resolve student identity")
-        meeting = await _verify_student_invited(db, meeting_id, student_id)
+        meeting = await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
         tutor_user = None
     else:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -995,7 +1029,7 @@ async def api_create_lock(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
 
     try:
@@ -1024,10 +1058,10 @@ async def api_get_current_lock(
 ):
     user_type = current_user.get("user_type")
     if user_type == "tutor":
-        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"))
+        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
-        await _verify_student_invited(db, meeting_id, student_id)
+        await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
     else:
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -1048,7 +1082,7 @@ async def api_end_lock(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
 
     try:
         lock = await end_lock(db, meeting_id, lock_id)
@@ -1069,7 +1103,7 @@ async def api_get_lock_results(
 ):
     _require_tutor(current_user)
     tutor_id = current_user.get("tutor_id")
-    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id)
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
 
     lock = await get_lock_by_id(db, meeting_id, lock_id)
     if not lock:
@@ -1108,7 +1142,7 @@ async def api_create_submission(
     student_id = await resolve_business_student_id(current_user, db)
     if not student_id:
         raise HTTPException(status_code=403, detail="Could not resolve student identity")
-    await _verify_student_invited(db, meeting_id, student_id)
+    await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
     await _verify_meeting_active(db, meeting_id)
 
     lock = await get_lock_by_id(db, meeting_id, lock_id)
