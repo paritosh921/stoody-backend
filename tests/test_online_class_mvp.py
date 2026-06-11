@@ -123,6 +123,86 @@ async def _test_end_lock_is_idempotent():
     assert ended_again["lock_id"] == lock["lock_id"]
 
 
+def test_verify_tutor_owns_meeting_allows_only_owner():
+    asyncio.run(_test_verify_tutor_owns_meeting_allows_only_owner())
+
+
+async def _test_verify_tutor_owns_meeting_allows_only_owner():
+    from fastapi import HTTPException
+    from api.v1.online_class.router import _verify_tutor_owns_meeting
+
+    db = FakeDb()
+    await db.mongo_insert_one(
+        "meetings",
+        {
+            "meeting_id": "MTG123",
+            "tutor_id": "tutor-owner",
+            "status": "active",
+        },
+    )
+
+    meeting = await _verify_tutor_owns_meeting(db, "MTG123", "tutor-owner")
+    assert meeting["meeting_id"] == "MTG123"
+
+    with pytest.raises(HTTPException) as exc:
+        await _verify_tutor_owns_meeting(db, "MTG123", "other-tutor")
+
+    assert exc.value.status_code == 403
+    assert "Not authorized" in exc.value.detail
+
+
+def test_verify_student_invited_blocks_other_students():
+    asyncio.run(_test_verify_student_invited_blocks_other_students())
+
+
+async def _test_verify_student_invited_blocks_other_students():
+    from fastapi import HTTPException
+    from api.v1.online_class.router import _verify_student_invited
+
+    db = FakeDb()
+    await db.mongo_insert_one(
+        "meetings",
+        {
+            "meeting_id": "MTG123",
+            "status": "active",
+            "invited_student_ids": ["STU_INVITED_1"],
+        },
+    )
+
+    meeting = await _verify_student_invited(db, "MTG123", "STU_INVITED_1")
+    assert meeting["meeting_id"] == "MTG123"
+
+    with pytest.raises(HTTPException) as exc:
+        await _verify_student_invited(db, "MTG123", "STU_OTHER_2")
+
+    assert exc.value.status_code == 403
+    assert "not invited" in exc.value.detail
+
+
+def test_verify_meeting_active_rejects_inactive_meetings():
+    asyncio.run(_test_verify_meeting_active_rejects_inactive_meetings())
+
+
+async def _test_verify_meeting_active_rejects_inactive_meetings():
+    from fastapi import HTTPException
+    from api.v1.online_class.router import _verify_meeting_active
+
+    db = FakeDb()
+    await db.mongo_insert_one(
+        "meetings",
+        {
+            "meeting_id": "MTG123",
+            "status": "scheduled",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await _verify_meeting_active(db, "MTG123")
+
+    assert exc.value.status_code == 400
+    assert "not active" in exc.value.detail
+
+
 def test_duplicate_submission_updates_existing_record():
     asyncio.run(_test_duplicate_submission_updates_existing_record())
 
