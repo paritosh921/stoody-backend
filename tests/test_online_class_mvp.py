@@ -14,13 +14,45 @@ class FakeDb:
         self.collections = {
             "online_class_locks": [],
             "online_class_submissions": [],
+            "canvas_pages": [],
+            "meetings": [],
+            "students": [],
         }
+
+    def _matches(self, doc, query):
+        for key, value in query.items():
+            current = doc.get(key)
+            if isinstance(value, dict) and "$in" in value:
+                if current not in value["$in"]:
+                    return False
+                continue
+            if isinstance(value, dict) and "$gte" in value:
+                if current is None or current < value["$gte"]:
+                    return False
+                continue
+            if current != value:
+                return False
+        return True
 
     async def mongo_find_one(self, collection, query):
         for doc in self.collections.get(collection, []):
-            if all(doc.get(key) == value for key, value in query.items()):
+            if self._matches(doc, query):
                 return doc.copy()
         return None
+
+    async def mongo_find(self, collection, query, projection=None, sort=None, limit=None, skip=None):
+        docs = [doc.copy() for doc in self.collections.get(collection, []) if self._matches(doc, query)]
+        if projection:
+            excluded = {key for key, value in projection.items() if value == 0}
+            docs = [{key: value for key, value in doc.items() if key not in excluded} for doc in docs]
+        if sort:
+            for key, direction in reversed(sort):
+                docs.sort(key=lambda item: item.get(key) or 0, reverse=direction < 0)
+        if skip:
+            docs = docs[skip:]
+        if limit is not None:
+            docs = docs[:limit]
+        return docs
 
     async def mongo_insert_one(self, collection, doc):
         self.collections.setdefault(collection, []).append(doc.copy())
@@ -421,6 +453,109 @@ def test_canvas_provider_details_requires_jwt_for_private_canvas_rooms(monkeypat
 
     assert exc.value.status_code == 503
     assert "JWT" in exc.value.detail
+
+
+def test_monitoring_page_filter_uses_meeting_start_and_page_key_round_trips():
+    from api.v1.online_class.router import (
+        _build_monitoring_page_meta,
+        _decode_monitoring_page_key,
+        _filter_canvas_pages_since_session_start,
+    )
+
+    started_at = datetime(2026, 6, 12, 9, 0, 0)
+    before_start = started_at - timedelta(minutes=5)
+    after_start = started_at + timedelta(minutes=2)
+    pages = [
+        {
+            "copy_id": "online-MTG1",
+            "book_type": "MS",
+            "page_number": 1,
+            "stroke_count": 2,
+            "first_activity": before_start.timestamp() * 1000,
+            "last_activity": before_start.timestamp() * 1000,
+        },
+        {
+            "copy_id": "online-MTG1",
+            "book_type": "MS",
+            "page_number": 2,
+            "stroke_count": 3,
+            "first_activity": before_start.timestamp() * 1000,
+            "last_activity": after_start.timestamp() * 1000,
+        },
+        {
+            "copy_id": "online-MTG1",
+            "book_type": "LN",
+            "page_number": 3,
+            "stroke_count": 1,
+            "last_modified": after_start,
+        },
+    ]
+
+    filtered = _filter_canvas_pages_since_session_start(pages, started_at)
+
+    assert [page["page_number"] for page in filtered] == [2, 3]
+    meta = _build_monitoring_page_meta(filtered[0])
+    assert meta["page_key"]
+    assert meta["copy_id"] == "online-MTG1"
+    assert meta["book_type"] == "MS"
+    assert meta["page_number"] == 2
+    assert _decode_monitoring_page_key(meta["page_key"]) == {
+        "copy_id": "online-MTG1",
+        "book_type": "MS",
+        "page_number": 2,
+    }
+
+
+def test_resolve_student_canvas_user_ids_includes_backend_identity_variants():
+    asyncio.run(_test_resolve_student_canvas_user_ids())
+
+
+async def _test_resolve_student_canvas_user_ids():
+    from bson import ObjectId
+    from api.v1.online_class.router import _resolve_student_canvas_user_ids
+
+    oid = ObjectId()
+    db = FakeDb()
+    db.collections["students"].append({
+        "_id": oid,
+        "student_id": "STU_Lavyansh_536995",
+        "username": "lavyansh",
+    })
+
+    ids = await _resolve_student_canvas_user_ids(db, "STU_Lavyansh_536995")
+
+    assert "STU_Lavyansh_536995" in ids
+    assert "lavyansh" in ids
+    assert str(oid) in [str(value) for value in ids]
+    assert oid in ids
+
+
+def test_teacher_canvas_mode_defaults_live_and_persists_stream():
+    asyncio.run(_test_teacher_canvas_mode_defaults_live_and_persists_stream())
+
+
+async def _test_teacher_canvas_mode_defaults_live_and_persists_stream():
+    from api.v1.online_class.router import (
+        _get_teacher_canvas_mode,
+        _set_teacher_canvas_mode,
+    )
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+    })
+
+    default_mode = await _get_teacher_canvas_mode(db, "MTG1")
+    assert default_mode["mode"] == "live"
+
+    updated = await _set_teacher_canvas_mode(db, "MTG1", "stream", "tutor-1")
+    assert updated["mode"] == "stream"
+    assert updated["updated_by"] == "tutor-1"
+
+    stored = await _get_teacher_canvas_mode(db, "MTG1")
+    assert stored["mode"] == "stream"
 
 
 class AnalysisFakeDb(FakeDb):
