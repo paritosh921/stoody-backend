@@ -528,6 +528,42 @@ async def _verify_student_invited(db: DatabaseManager, meeting_id: str, student_
     return meeting
 
 
+def _build_submission_result_item(
+    *,
+    submission: Dict[str, Any],
+    lock: Dict[str, Any],
+    meeting_id: str,
+    lock_id: str,
+    student_name: Optional[str] = None,
+) -> SubmissionResultItem:
+    canvas_pages = submission.get("canvas_pages") or []
+    return SubmissionResultItem(
+        submission_id=submission["submission_id"],
+        meeting_id=str(submission.get("meeting_id") or meeting_id),
+        lock_id=str(submission.get("lock_id") or lock_id),
+        student_id=submission["student_id"],
+        student_name=student_name,
+        question_text=lock.get("question_text"),
+        question_page_refs=submission.get("question_page_refs"),
+        canvas_pages=canvas_pages,
+        canvas_image_count=len(canvas_pages),
+        answer_text=submission.get("answer_text"),
+        time_spent=submission.get("time_spent"),
+        analysis_status=submission.get("analysis_status", "pending"),
+        score=submission.get("score"),
+        is_correct=submission.get("is_correct"),
+        student_answer=submission.get("student_answer"),
+        work_shown=submission.get("work_shown"),
+        what_went_wrong=submission.get("what_went_wrong"),
+        correct_solution=submission.get("correct_solution"),
+        analysis_error=submission.get("analysis_error"),
+        analysis_completed_at=submission.get("analysis_completed_at"),
+        analysis_failed_at=submission.get("analysis_failed_at"),
+        created_at=submission.get("created_at"),
+        updated_at=submission.get("updated_at"),
+    )
+
+
 @router.get("/meetings/{meeting_id}/canvas-share/session", response_model=CanvasShareSessionResponse)
 @limiter.limit("30/minute")
 async def api_get_canvas_share_session(
@@ -1047,24 +1083,12 @@ async def api_get_lock_results(
         if student_doc:
             student_name = student_doc.get("name") or student_doc.get("username")
         results.append(
-            SubmissionResultItem(
-                submission_id=sub["submission_id"],
-                student_id=sub["student_id"],
+            _build_submission_result_item(
+                submission=sub,
+                lock=lock,
+                meeting_id=meeting_id,
+                lock_id=lock_id,
                 student_name=student_name,
-                canvas_pages=sub.get("canvas_pages", []),
-                answer_text=sub.get("answer_text"),
-                time_spent=sub.get("time_spent"),
-                analysis_status=sub.get("analysis_status", "pending"),
-                score=sub.get("score"),
-                is_correct=sub.get("is_correct"),
-                student_answer=sub.get("student_answer"),
-                work_shown=sub.get("work_shown"),
-                what_went_wrong=sub.get("what_went_wrong"),
-                correct_solution=sub.get("correct_solution"),
-                analysis_error=sub.get("analysis_error"),
-                analysis_completed_at=sub.get("analysis_completed_at"),
-                analysis_failed_at=sub.get("analysis_failed_at"),
-                created_at=sub.get("created_at"),
             )
         )
     return {"lock": LockResponse(**lock), "submissions": results}

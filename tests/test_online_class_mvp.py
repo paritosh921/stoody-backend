@@ -207,6 +207,50 @@ def test_duplicate_submission_updates_existing_record():
     asyncio.run(_test_duplicate_submission_updates_existing_record())
 
 
+def test_submission_result_item_includes_detail_contract_fields():
+    from api.v1.online_class.router import _build_submission_result_item
+
+    created_at = datetime.utcnow()
+    updated_at = created_at + timedelta(seconds=5)
+    lock = {
+        "question_text": "Solve x + 1 = 2",
+    }
+    submission = {
+        "submission_id": "sub-1",
+        "meeting_id": "MTG123",
+        "lock_id": "lck-1",
+        "student_id": "STU_1",
+        "canvas_pages": ["img-a", "img-b"],
+        "question_page_refs": {"0": {"copyId": "online-MTG123"}},
+        "answer_text": "x = 1",
+        "time_spent": 20,
+        "analysis_status": "completed",
+        "score": 0.75,
+        "is_correct": False,
+        "student_answer": "x = 1",
+        "work_shown": "Moved 1 to the other side",
+        "what_went_wrong": "Arithmetic error",
+        "correct_solution": "x = 1",
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+    result = _build_submission_result_item(
+        submission=submission,
+        lock=lock,
+        meeting_id="MTG123",
+        lock_id="lck-1",
+        student_name="Asha",
+    )
+
+    assert result.meeting_id == "MTG123"
+    assert result.lock_id == "lck-1"
+    assert result.question_text == "Solve x + 1 = 2"
+    assert result.question_page_refs == {"0": {"copyId": "online-MTG123"}}
+    assert result.canvas_image_count == 2
+    assert result.updated_at == updated_at
+
+
 async def _test_duplicate_submission_updates_existing_record():
     db = FakeDb()
 

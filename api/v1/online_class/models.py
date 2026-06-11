@@ -58,9 +58,14 @@ class SubmissionResponse(BaseModel):
 
 class SubmissionResultItem(BaseModel):
     submission_id: str
+    meeting_id: str
+    lock_id: str
     student_id: str
     student_name: Optional[str] = None
+    question_text: Optional[str] = None
+    question_page_refs: Optional[Dict[str, Any]] = None
     canvas_pages: List[str] = Field(default_factory=list)
+    canvas_image_count: int = 0
     answer_text: Optional[str] = None
     time_spent: Optional[float] = None
     analysis_status: str
@@ -74,3 +79,4 @@ class SubmissionResultItem(BaseModel):
     analysis_completed_at: Optional[datetime] = None
     analysis_failed_at: Optional[datetime] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
