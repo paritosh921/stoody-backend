@@ -58,12 +58,17 @@ class FakeDb:
         self.collections.setdefault(collection, []).append(doc.copy())
         return doc.get("lock_id") or doc.get("submission_id")
 
-    async def mongo_update_one(self, collection, query, update):
+    async def mongo_update_one(self, collection, query, update, upsert=False):
         updates = update.get("$set", {})
         for doc in self.collections.get(collection, []):
             if all(doc.get(key) == value for key, value in query.items()):
                 doc.update(updates)
                 return True
+        if upsert:
+            new_doc = query.copy()
+            new_doc.update(updates)
+            self.collections.setdefault(collection, []).append(new_doc)
+            return True
         return False
 
 
@@ -758,6 +763,106 @@ async def _test_teacher_canvas_mode_defaults_live_and_persists_stream():
 
     stored = await _get_teacher_canvas_mode(db, "MTG1")
     assert stored["mode"] == "stream"
+
+
+def test_teacher_live_canvas_events_upsert_through_online_class_facade():
+    asyncio.run(_test_teacher_live_canvas_events_upsert())
+
+
+async def _test_teacher_live_canvas_events_upsert():
+    from api.v1.online_class.router import _upsert_teacher_live_canvas_events
+    from api.v1.strokes_async import CanvasPageUpsert
+
+    db = FakeDb()
+    meeting = {
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+        "admin_id": "admin-1",
+    }
+    current_user = {
+        "user_type": "tutor",
+        "tutor_id": "tutor-1",
+        "user_id": "oid-tutor-1",
+        "username": "tutor_user",
+        "admin_id": "admin-1",
+    }
+    page = CanvasPageUpsert(
+        book_type="ms",
+        page_number=2,
+        copy_id="online-MTG1",
+        strokes=[{
+            "id": "stroke-1",
+            "points": [[1, 2, 0.5], [3, 4, 0.6]],
+            "strokeWidth": 1.5,
+            "color": "#111111",
+            "tool": "pen",
+            "timestamp": 1710000000000,
+        }],
+        client_last_modified=1710000000000,
+        first_activity=1710000000000,
+        last_activity=1710000000100,
+    )
+
+    result = await _upsert_teacher_live_canvas_events(db, meeting, current_user, [page])
+
+    assert result == {
+        "success": True,
+        "upserted": 1,
+        "modified": 0,
+        "count": 1,
+    }
+    assert len(db.collections["canvas_pages"]) == 1
+    stored = db.collections["canvas_pages"][0]
+    assert stored["user_id"] == "tutor_user"
+    assert stored["admin_id"] == "admin-1"
+    assert stored["meeting_id"] == "MTG1"
+    assert stored["copy_id"] == "online-MTG1"
+    assert stored["book_type"] == "MS"
+    assert stored["page_number"] == 2
+    assert stored["source"] == "online_class_teacher_live"
+    assert stored["stroke_count"] == 1
+
+
+def test_teacher_live_canvas_events_merge_duplicate_strokes():
+    asyncio.run(_test_teacher_live_canvas_events_merge_duplicate_strokes())
+
+
+async def _test_teacher_live_canvas_events_merge_duplicate_strokes():
+    from api.v1.online_class.router import _upsert_teacher_live_canvas_events
+    from api.v1.strokes_async import CanvasPageUpsert
+
+    db = FakeDb()
+    meeting = {"meeting_id": "MTG1", "status": "active", "tutor_id": "tutor-1"}
+    current_user = {
+        "user_type": "tutor",
+        "tutor_id": "tutor-1",
+        "user_id": "oid-tutor-1",
+        "username": "tutor_user",
+    }
+    first_page = CanvasPageUpsert(
+        book_type="MS",
+        page_number=1,
+        copy_id="online-MTG1",
+        strokes=[{"id": "same", "points": [[1, 1, 0.5]]}],
+    )
+    second_page = CanvasPageUpsert(
+        book_type="MS",
+        page_number=1,
+        copy_id="online-MTG1",
+        strokes=[
+            {"id": "same", "points": [[1, 1, 0.5]]},
+            {"id": "new", "points": [[2, 2, 0.5]]},
+        ],
+    )
+
+    await _upsert_teacher_live_canvas_events(db, meeting, current_user, [first_page])
+    result = await _upsert_teacher_live_canvas_events(db, meeting, current_user, [second_page])
+
+    assert result["modified"] == 1
+    stored = db.collections["canvas_pages"][0]
+    assert [stroke["id"] for stroke in stored["strokes"]] == ["same", "new"]
+    assert stored["stroke_count"] == 2
 
 
 class AnalysisFakeDb(FakeDb):

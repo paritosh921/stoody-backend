@@ -29,7 +29,15 @@ from api.v1.online_class.submissions import (
     create_or_update_submission,
     get_submissions_for_lock,
 )
+from api.v1.strokes_async import (
+    CanvasPageBatchRequest,
+    CanvasPageUpsert,
+    _build_merged_page_doc,
+    _build_metadata_refresh,
+    _page_doc,
+)
 from core.database import DatabaseManager
+from core.user_identity import canonical_canvas_user_id, canvas_user_id_variants
 from services.online_class import jitsi_provider_service
 
 logger = logging.getLogger(__name__)
@@ -122,6 +130,13 @@ class TeacherCanvasModeResponse(BaseModel):
     mode: Literal["live", "stream"]
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
+
+
+class TeacherLiveCanvasEventsResponse(BaseModel):
+    success: bool
+    upserted: int = 0
+    modified: int = 0
+    count: int = 0
 
 
 def _require_tutor(current_user: Dict[str, Any]):
@@ -476,6 +491,96 @@ async def _get_monitoring_page(
     if not page:
         raise HTTPException(status_code=404, detail="Canvas page not found")
     return _normalize_monitoring_page_doc(page)
+
+
+def _canvas_page_identity_from_existing(existing: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "user_id": existing.get("user_id"),
+        "copy_id": existing.get("copy_id"),
+        "book_type": existing.get("book_type"),
+        "page_number": existing.get("page_number"),
+    }
+
+
+async def _upsert_teacher_live_canvas_events(
+    db: DatabaseManager,
+    meeting: Dict[str, Any],
+    current_user: Dict[str, Any],
+    pages: List[CanvasPageUpsert],
+) -> Dict[str, Any]:
+    meeting_id = str(meeting.get("meeting_id") or "")
+    user_id = canonical_canvas_user_id(current_user)
+    user_ids = canvas_user_id_variants(current_user)
+    if user_id not in user_ids:
+        user_ids.append(user_id)
+    admin_id = current_user.get("admin_id") or meeting.get("admin_id")
+    default_copy_id = f"online-{meeting_id}"
+
+    upserted = 0
+    modified = 0
+    for raw_page in pages:
+        now = datetime.utcnow()
+        page = raw_page.model_copy(update={
+            "copy_id": raw_page.copy_id or default_copy_id,
+            "source": "online_class_teacher_live",
+            "session_id": raw_page.session_id or meeting_id,
+            "stroke_count": raw_page.stroke_count if raw_page.stroke_count is not None else len(raw_page.strokes or []),
+        })
+        page_filter: Dict[str, Any] = {
+            "user_id": {"$in": user_ids},
+            "copy_id": page.copy_id,
+            "book_type": page.book_type.upper(),
+            "page_number": page.page_number,
+        }
+        existing = await db.mongo_find_one("canvas_pages", page_filter)
+
+        if existing is None:
+            doc = _page_doc(user_id, admin_id, page, now, copy_id=page.copy_id)
+            doc["meeting_id"] = meeting_id
+            ok = await db.mongo_update_one(
+                "canvas_pages",
+                {
+                    "user_id": user_id,
+                    "copy_id": page.copy_id,
+                    "book_type": page.book_type.upper(),
+                    "page_number": page.page_number,
+                },
+                {"$set": doc},
+                upsert=True,
+            )
+            if ok:
+                upserted += 1
+            continue
+
+        doc, added_count = _build_merged_page_doc(
+            existing_doc=existing,
+            user_id=user_id,
+            admin_id=admin_id,
+            page=page,
+            now=now,
+            copy_id=page.copy_id,
+        )
+        doc["meeting_id"] = meeting_id
+        update_fields = doc if added_count > 0 else {
+            **_build_metadata_refresh(existing, page, now),
+            "meeting_id": meeting_id,
+            "source": "online_class_teacher_live",
+        }
+        if update_fields:
+            ok = await db.mongo_update_one(
+                "canvas_pages",
+                _canvas_page_identity_from_existing(existing),
+                {"$set": update_fields},
+            )
+            if ok:
+                modified += 1
+
+    return {
+        "success": True,
+        "upserted": upserted,
+        "modified": modified,
+        "count": len(pages),
+    }
 
 
 async def _get_active_canvas_request(
@@ -1016,6 +1121,30 @@ async def api_get_teacher_live_canvas_page(
     if not filtered:
         raise HTTPException(status_code=404, detail="Canvas page not active in this class session")
     return MonitoringPageResponse(page=page)
+
+
+@router.post(
+    "/meetings/{meeting_id}/teacher-canvas/live/events",
+    response_model=TeacherLiveCanvasEventsResponse,
+)
+@limiter.limit("60/minute")
+async def api_post_teacher_live_canvas_events(
+    request: Request,
+    meeting_id: str,
+    body: CanvasPageBatchRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    tutor_id = current_user.get("tutor_id")
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
+    await _verify_meeting_active(db, meeting_id)
+    mode = await _get_teacher_canvas_mode(db, meeting_id)
+    if mode["mode"] != "live":
+        raise HTTPException(status_code=409, detail="Teacher canvas is not in Live Canvas mode")
+    return TeacherLiveCanvasEventsResponse(
+        **await _upsert_teacher_live_canvas_events(db, meeting, current_user, body.pages)
+    )
 
 
 @router.post("/meetings/{meeting_id}/locks", response_model=LockResponse)
