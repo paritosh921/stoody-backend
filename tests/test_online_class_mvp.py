@@ -19,15 +19,48 @@ class FakeDb:
             "students": [],
         }
 
+    def _value_at_path(self, doc, key):
+        current = doc
+        for part in str(key).split("."):
+            if isinstance(current, list):
+                if not part.isdigit():
+                    return None
+                idx = int(part)
+                if idx >= len(current):
+                    return None
+                current = current[idx]
+                continue
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current
+
     def _matches(self, doc, query):
         for key, value in query.items():
-            current = doc.get(key)
+            if key == "$or":
+                if not any(self._matches(doc, clause) for clause in value):
+                    return False
+                continue
+            current = self._value_at_path(doc, key)
             if isinstance(value, dict) and "$in" in value:
                 if current not in value["$in"]:
                     return False
                 continue
+            if isinstance(value, dict) and "$gt" in value:
+                if current is None or current <= value["$gt"]:
+                    return False
+                continue
             if isinstance(value, dict) and "$gte" in value:
                 if current is None or current < value["$gte"]:
+                    return False
+                continue
+            if isinstance(value, dict) and "$exists" in value:
+                exists = current is not None
+                if exists != value["$exists"]:
+                    return False
+                continue
+            if isinstance(current, list):
+                if value not in current:
                     return False
                 continue
             if current != value:
@@ -711,6 +744,158 @@ def test_monitoring_page_filter_uses_meeting_start_and_page_key_round_trips():
         "book_type": "MS",
         "page_number": 2,
     }
+
+
+def test_online_class_notes_list_returns_invited_classes_with_page_counts():
+    asyncio.run(_test_online_class_notes_list_returns_invited_classes_with_page_counts())
+
+
+def test_online_class_copy_id_is_valid_virtual_canvas_scope():
+    asyncio.run(_test_online_class_copy_id_is_valid_virtual_canvas_scope())
+
+
+async def _test_online_class_copy_id_is_valid_virtual_canvas_scope():
+    from api.v1.copy_sets_async import resolve_copy_id
+
+    db = FakeDb()
+    resolved = await resolve_copy_id(
+        "online-MTG3RFZNZYD",
+        {"user_type": "tutor", "user_id": "tutor-1", "tutor_id": "tutor-1"},
+        db,
+    )
+
+    assert resolved == "online-MTG3RFZNZYD"
+
+
+async def _test_online_class_notes_list_returns_invited_classes_with_page_counts():
+    from starlette.requests import Request
+    from api.v1.online_class.router import api_list_online_class_notes
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG1",
+        "status": "ended",
+        "tutor_id": "tutor-1",
+        "tutor_name": "Teacher",
+        "topic": "Algebra class",
+        "subject": "Math",
+        "standard": "10",
+        "section": "A",
+        "admin_id": "admin-1",
+        "invited_student_ids": ["STU_1"],
+        "scheduled_at": datetime(2026, 6, 12, 9, 0, 0),
+        "started_at": datetime(2026, 6, 12, 9, 5, 0),
+        "ended_at": datetime(2026, 6, 12, 10, 0, 0),
+    })
+    db.collections["meetings"].append({
+        "meeting_id": "MTG3",
+        "status": "active",
+        "tutor_id": "tutor-1",
+        "tutor_name": "Teacher",
+        "topic": "Geometry class",
+        "subject": "Math",
+        "standard": "10",
+        "section": "A",
+        "admin_id": "admin-1",
+        "invited_student_ids": ["STU_1"],
+        "scheduled_at": datetime(2026, 6, 12, 8, 0, 0),
+        "started_at": datetime(2026, 6, 12, 8, 5, 0),
+    })
+    db.collections["canvas_pages"].extend([
+        {
+            "user_id": "tutor-1",
+            "copy_id": "online-MTG1",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 2,
+            "first_activity": 1710000000000,
+            "last_activity": 1710000001000,
+            "strokes": [{"id": "s1"}, {"id": "s2"}],
+        },
+        {
+            "user_id": "tutor-1",
+            "copy_id": "online-MTG2",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 5,
+            "strokes": [{"id": "other"}],
+        },
+        {
+            "user_id": "tutor-1",
+            "copy_id": "online-MTG1",
+            "book_type": "MS",
+            "page_number": 1,
+            "stroke_count": 0,
+            "strokes": [],
+        },
+    ])
+    request = Request({
+        "type": "http",
+        "method": "GET",
+        "path": "/api/v1/online-class/notes",
+        "headers": [(b"host", b"testserver")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    })
+
+    response = await api_list_online_class_notes(
+        request=request,
+        current_user={"user_type": "student", "student_id": "STU_1", "admin_id": "admin-1"},
+        db=db,
+    )
+
+    assert len(response.classes) == 2
+    classes_by_id = {item.meeting_id: item for item in response.classes}
+    item = classes_by_id["MTG1"]
+    assert item.meeting_id == "MTG1"
+    assert item.copy_id == "online-MTG1"
+    assert item.topic == "Algebra class"
+    assert item.page_count == 1
+    assert item.stroke_count == 2
+
+    empty_item = classes_by_id["MTG3"]
+    assert empty_item.copy_id == "online-MTG3"
+    assert empty_item.topic == "Geometry class"
+    assert empty_item.page_count == 0
+    assert empty_item.stroke_count == 0
+
+
+def test_online_class_note_page_fetch_scopes_to_teacher_meeting_copy():
+    asyncio.run(_test_online_class_note_page_fetch_scopes_to_teacher_meeting_copy())
+
+
+async def _test_online_class_note_page_fetch_scopes_to_teacher_meeting_copy():
+    from fastapi import HTTPException
+    from api.v1.online_class.router import _build_monitoring_page_meta, _get_teacher_online_class_page
+
+    db = FakeDb()
+    meeting = {"meeting_id": "MTG1", "status": "ended", "tutor_id": "tutor-1"}
+    page = {
+        "user_id": "tutor-1",
+        "copy_id": "online-MTG1",
+        "book_type": "MS",
+        "page_number": 0,
+        "stroke_count": 1,
+        "strokes": [{"id": "s1", "points": [[1, 2, 0.5]]}],
+    }
+    db.collections["canvas_pages"].append(page)
+
+    meta = _build_monitoring_page_meta(page)
+    result = await _get_teacher_online_class_page(db, meeting, meta["page_key"])
+
+    assert result["copy_id"] == "online-MTG1"
+    assert result["page_key"] == meta["page_key"]
+    assert result["strokes"][0]["id"] == "s1"
+
+    wrong_page_key = _build_monitoring_page_meta({
+        "copy_id": "online-MTG2",
+        "book_type": "MS",
+        "page_number": 0,
+    })["page_key"]
+    with pytest.raises(HTTPException) as exc:
+        await _get_teacher_online_class_page(db, meeting, wrong_page_key)
+    assert exc.value.status_code == 404
 
 
 def test_resolve_student_canvas_user_ids_includes_backend_identity_variants():

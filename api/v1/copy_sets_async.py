@@ -38,7 +38,7 @@ DEFAULT_COPY_SET_TITLES = (
     DEFAULT_NEW_COPY_TITLE,
     DEFAULT_PRACTICE_COPY_TITLE,
 )
-CANVAS_ONLY_COPY_ID_RE = re.compile(r"^tally-[A-Za-z0-9_.:-]{1,240}$")
+CANVAS_ONLY_COPY_ID_RE = re.compile(r"^(?:tally|online)-[A-Za-z0-9_.:-]{1,240}$")
 
 
 def _is_canvas_only_copy_id(copy_id: str) -> bool:

@@ -139,6 +139,28 @@ class TeacherLiveCanvasEventsResponse(BaseModel):
     count: int = 0
 
 
+class OnlineClassNoteClassItem(BaseModel):
+    meeting_id: str
+    copy_id: str
+    topic: Optional[str] = None
+    subject: Optional[str] = None
+    standard: Optional[str] = None
+    section: Optional[str] = None
+    tutor_name: Optional[str] = None
+    status: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    page_count: int = 0
+    stroke_count: int = 0
+    first_activity: Optional[float] = None
+    latest_activity: Optional[float] = None
+
+
+class OnlineClassNotesResponse(BaseModel):
+    classes: List[OnlineClassNoteClassItem]
+
+
 def _require_tutor(current_user: Dict[str, Any]):
     if current_user.get("user_type") != "tutor":
         raise HTTPException(status_code=403, detail="Tutor access required")
@@ -200,6 +222,10 @@ def _student_canvas_room_name(meeting_id: str, student_id: str) -> str:
         "student",
         student_id=student_id,
     )
+
+
+def _online_class_copy_id(meeting_id: str) -> str:
+    return f"online-{meeting_id}"
 
 
 def _validate_requested_student_ids(
@@ -474,6 +500,135 @@ async def _find_canvas_pages_for_user_ids(
     )
 
 
+async def _find_teacher_online_class_pages(
+    db: DatabaseManager,
+    meeting: Dict[str, Any],
+    *,
+    tutor_user: Optional[Dict[str, Any]] = None,
+    projection: Optional[Dict[str, Any]] = None,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    tutor_id = str(meeting.get("tutor_id") or "")
+    user_ids = await _resolve_tutor_canvas_user_ids(db, tutor_id, tutor_user)
+    if not user_ids:
+        return []
+    copy_id = _online_class_copy_id(str(meeting.get("meeting_id") or ""))
+    return await db.mongo_find(
+        "canvas_pages",
+        {
+            "user_id": {"$in": user_ids},
+            "copy_id": copy_id,
+            "$or": [
+                {"stroke_count": {"$gt": 0}},
+                {"strokes.0": {"$exists": True}},
+            ],
+        },
+        projection=projection,
+        sort=[("last_modified", -1)],
+        limit=limit,
+    )
+
+
+def _page_activity_min_ms(page: Dict[str, Any]) -> Optional[float]:
+    candidates: List[float] = []
+    for key in ("first_activity", "last_activity", "client_last_modified", "last_modified"):
+        ts = _datetime_to_epoch_ms(page.get(key))
+        if ts is not None:
+            candidates.append(ts)
+
+    for stroke in page.get("strokes") or []:
+        if not isinstance(stroke, dict):
+            continue
+        for key in ("startedAt", "endedAt", "timestamp"):
+            ts = _datetime_to_epoch_ms(stroke.get(key))
+            if ts is not None:
+                candidates.append(ts)
+
+    return min(candidates) if candidates else None
+
+
+def _build_online_class_note_item(
+    meeting: Dict[str, Any],
+    pages: List[Dict[str, Any]],
+) -> OnlineClassNoteClassItem:
+    activity_max_values = [
+        value for value in (_page_activity_max_ms(page) for page in pages) if value is not None
+    ]
+    activity_min_values = [
+        value for value in (_page_activity_min_ms(page) for page in pages) if value is not None
+    ]
+    return OnlineClassNoteClassItem(
+        meeting_id=str(meeting.get("meeting_id") or ""),
+        copy_id=_online_class_copy_id(str(meeting.get("meeting_id") or "")),
+        topic=meeting.get("topic"),
+        subject=meeting.get("subject"),
+        standard=meeting.get("standard"),
+        section=meeting.get("section"),
+        tutor_name=meeting.get("tutor_name"),
+        status=meeting.get("status"),
+        scheduled_at=meeting.get("scheduled_at"),
+        started_at=meeting.get("started_at"),
+        ended_at=meeting.get("ended_at"),
+        page_count=len(pages),
+        stroke_count=sum(int(page.get("stroke_count") or len(page.get("strokes") or []) or 0) for page in pages),
+        first_activity=min(activity_min_values) if activity_min_values else None,
+        latest_activity=max(activity_max_values) if activity_max_values else None,
+    )
+
+
+async def _verify_user_can_read_online_class_notes(
+    db: DatabaseManager,
+    meeting_id: str,
+    current_user: Dict[str, Any],
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    user_type = current_user.get("user_type")
+    if user_type == "tutor":
+        meeting = await _verify_tutor_owns_meeting(
+            db,
+            meeting_id,
+            current_user.get("tutor_id"),
+            current_user=current_user,
+        )
+        return meeting, current_user
+    if user_type == "student":
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id:
+            raise HTTPException(status_code=403, detail="Could not resolve student identity")
+        meeting = await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
+        return meeting, None
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+async def _get_teacher_online_class_page(
+    db: DatabaseManager,
+    meeting: Dict[str, Any],
+    page_key: str,
+    *,
+    tutor_user: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    decoded = _decode_monitoring_page_key(page_key)
+    meeting_id = str(meeting.get("meeting_id") or "")
+    expected_copy_id = _online_class_copy_id(meeting_id)
+    if decoded.get("copy_id") and decoded.get("copy_id") != expected_copy_id:
+        raise HTTPException(status_code=404, detail="Canvas page not found for this class")
+
+    user_ids = await _resolve_tutor_canvas_user_ids(
+        db,
+        str(meeting.get("tutor_id") or ""),
+        tutor_user,
+    )
+    query: Dict[str, Any] = {
+        "user_id": {"$in": user_ids},
+        "copy_id": expected_copy_id,
+        "book_type": decoded["book_type"],
+        "page_number": decoded["page_number"],
+    }
+    page = await db.mongo_find_one("canvas_pages", query)
+    if not page:
+        raise HTTPException(status_code=404, detail="Canvas page not found for this class")
+    return _normalize_monitoring_page_doc(page)
+
+
 async def _get_monitoring_page(
     db: DatabaseManager,
     user_ids: List[Any],
@@ -701,6 +856,98 @@ def _build_submission_result_item(
         created_at=submission.get("created_at"),
         updated_at=submission.get("updated_at"),
     )
+
+
+@router.get("/notes", response_model=OnlineClassNotesResponse)
+@limiter.limit("30/minute")
+async def api_list_online_class_notes(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    user_type = current_user.get("user_type")
+    if user_type == "student":
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id:
+            raise HTTPException(status_code=403, detail="Could not resolve student identity")
+        meeting_query: Dict[str, Any] = {
+            "invited_student_ids": student_id,
+            "status": {"$in": ["active", "ended"]},
+        }
+        tutor_user: Optional[Dict[str, Any]] = None
+    elif user_type == "tutor":
+        meeting_query = {
+            "tutor_id": current_user.get("tutor_id"),
+            "status": {"$in": ["active", "ended"]},
+        }
+        tutor_user = current_user
+    else:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    meetings = await db.mongo_find(
+        "meetings",
+        meeting_query,
+        sort=[("started_at", -1), ("scheduled_at", -1)],
+        limit=100,
+    )
+
+    classes: List[OnlineClassNoteClassItem] = []
+    for meeting in meetings:
+        _verify_meeting_admin_boundary(meeting, current_user)
+        pages = await _find_teacher_online_class_pages(
+            db,
+            meeting,
+            tutor_user=tutor_user,
+            projection={"strokes": 0},
+            limit=500,
+        )
+        classes.append(_build_online_class_note_item(meeting, pages))
+
+    return OnlineClassNotesResponse(classes=classes)
+
+
+@router.get(
+    "/notes/{meeting_id}/pages",
+    response_model=MonitoringPageListResponse,
+)
+@limiter.limit("30/minute")
+async def api_list_online_class_note_pages(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    meeting, tutor_user = await _verify_user_can_read_online_class_notes(db, meeting_id, current_user)
+    pages = await _find_teacher_online_class_pages(
+        db,
+        meeting,
+        tutor_user=tutor_user,
+        projection={"strokes": 0},
+        limit=1000,
+    )
+    metas = [_build_monitoring_page_meta(page) for page in pages]
+    return MonitoringPageListResponse(
+        count=len(metas),
+        pages=metas,
+        server_time=datetime.utcnow().isoformat(),
+    )
+
+
+@router.get(
+    "/notes/{meeting_id}/pages/{page_key}",
+    response_model=MonitoringPageResponse,
+)
+@limiter.limit("60/minute")
+async def api_get_online_class_note_page(
+    request: Request,
+    meeting_id: str,
+    page_key: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    meeting, tutor_user = await _verify_user_can_read_online_class_notes(db, meeting_id, current_user)
+    page = await _get_teacher_online_class_page(db, meeting, page_key, tutor_user=tutor_user)
+    return MonitoringPageResponse(page=page)
 
 
 @router.get("/meetings/{meeting_id}/canvas-share/session", response_model=CanvasShareSessionResponse)
