@@ -53,6 +53,7 @@ from services.full_document_extraction_validator import FullDocumentExtractionVa
 from services.layout_preflight_service import LayoutPreflightService
 from services.option_layout_normalizer import OptionLayoutNormalizer
 from services.region_crop_service import RegionCropService
+from services.tally_question_map_service import build_tally_question_map
 
 logger = logging.getLogger(__name__)
 
@@ -1540,11 +1541,13 @@ async def extract_questions_with_gpt(
         "- Preserve ALL math notation, LaTeX, symbols, superscripts, subscripts exactly as they appear\n"
         "- Preserve Hindi or regional language text exactly as-is\n"
         "- If a question references a figure/diagram/graph/image/table, set has_figure to true\n"
-        "- Report the page number (from the === PAGE N === markers) where each question starts\n\n"
+        "- Report the page number (from the === PAGE N === markers) where each question starts\n"
+        "- If a question's maximum marks are printed near the question or in the section instructions, set max_marks to that numeric value\n"
+        "- If marks are not explicit or not confidently tied to the question, set max_marks to null\n\n"
         "Return ONLY valid JSON in this exact format (no markdown fences, no explanation):\n"
         '{"questions": [\n'
-        '  {"number": "1", "text": "full question text here", "options": ["option a", "option b", "option c", "option d"], "page": 0, "has_figure": false},\n'
-        '  {"number": "27", "text": "(a) first sub-part here\\n(b) second sub-part here", "options": [], "page": 3, "has_figure": true}\n'
+        '  {"number": "1", "text": "full question text here", "options": ["option a", "option b", "option c", "option d"], "page": 0, "has_figure": false, "max_marks": 1},\n'
+        '  {"number": "27", "text": "(a) first sub-part here\\n(b) second sub-part here", "options": [], "page": 3, "has_figure": true, "max_marks": null}\n'
         "]}\n\n"
         "--- DOCUMENT TEXT ---\n"
         f"{full_text}"
@@ -1941,6 +1944,18 @@ async def extract_questions_with_gpt(
         q_page = q.get("page", 0)
         options = q.get("options", [])
         has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
+        extracted_max_marks: Optional[float] = None
+        for marks_key in ("max_marks", "marks", "points"):
+            raw_marks = q.get(marks_key)
+            if raw_marks in (None, ""):
+                continue
+            try:
+                parsed_marks = float(raw_marks)
+            except (TypeError, ValueError):
+                continue
+            if parsed_marks > 0:
+                extracted_max_marks = parsed_marks
+                break
 
         # Image assignment: prefer the deterministic positional map (built from
         # PyMuPDF text-block y-positions) over the cursor heuristic. The
@@ -1989,6 +2004,18 @@ async def extract_questions_with_gpt(
             else:
                 page_image_cursor[q_page] = cursor
 
+        base_metadata = {
+            "subject": subject,
+            "difficulty": difficulty,
+            "page": q_page,
+            "question_number": q_num,
+            "has_figure": has_image,
+            "image_refs": img_refs,
+            "question_image_refs": img_refs,
+            "is_image_based_mcq": False,
+            "max_marks_extracted": extracted_max_marks is not None,
+        }
+
         # For Practice Sets mode, inline options into the question text
         if skip_option_extraction and options:
             inline = q_text + "\n\n"
@@ -1998,15 +2025,9 @@ async def extract_questions_with_gpt(
                 id=str(uuid.uuid4()),
                 text=inline.strip(),
                 options=[],
+                points=extracted_max_marks if extracted_max_marks is not None else 4.0,
                 metadata={
-                    "subject": subject,
-                    "difficulty": difficulty,
-                    "page": q_page,
-                    "question_number": q_num,
-                    "has_figure": has_image,
-                    "image_refs": img_refs,
-                    "question_image_refs": img_refs,
-                    "is_image_based_mcq": False,
+                    **base_metadata,
                     "options_inline": True,
                 },
             ))
@@ -2015,16 +2036,8 @@ async def extract_questions_with_gpt(
                 id=str(uuid.uuid4()),
                 text=q_text,
                 options=[o for o in options if o.strip()],
-                metadata={
-                    "subject": subject,
-                    "difficulty": difficulty,
-                    "page": q_page,
-                    "question_number": q_num,
-                    "has_figure": has_image,
-                    "image_refs": img_refs,
-                    "question_image_refs": img_refs,
-                    "is_image_based_mcq": False,
-                },
+                points=extracted_max_marks if extracted_max_marks is not None else 4.0,
+                metadata=base_metadata,
             ))
 
         q_preview = q_text[:80].replace('\n', ' | ')
@@ -2781,6 +2794,8 @@ async def run_document_ocr_pipeline(
 
         print(f"[OCR-PIPELINE] Storing {len(extracted_questions)} questions for {document_type}...", flush=True)
 
+        saved_question_docs: List[Dict[str, Any]] = []
+
         for question_index, question in enumerate(extracted_questions, start=1):
             question_page_number = int((question.metadata or {}).get("page") or 0) + 1
             extraction_order = int((question.metadata or {}).get("question_number") or question_index)
@@ -3013,6 +3028,7 @@ async def run_document_ocr_pipeline(
                     await db.b2c_insert_one("questions", question_doc)
                 else:
                     await db.mongo_insert_one("questions", question_doc)
+                saved_question_docs.append(question_doc)
             except Exception as db_err:
                 print(f"[OCR-PIPELINE] ERROR saving question {question.id}: {db_err}", flush=True)
 
@@ -3047,6 +3063,47 @@ async def run_document_ocr_pipeline(
             if existing_total is None or existing_total == 0:
                 update_data["total_points"] = total_calculated_points
                 logger.info(f"Auto-calculated total_points for {document_id}: {total_calculated_points}")
+
+        tally_source_mode = str(
+            (document_fresh or document).get("tally_question_source_mode") or ""
+        ).lower()
+        if tally_source_mode == "upload":
+            try:
+                source_document = document_fresh or document
+                tally_map_doc = await build_tally_question_map(
+                    tally_document_id=document_id,
+                    source_document_id=document_id,
+                    questions=saved_question_docs,
+                    subject=source_document.get("subject"),
+                    standard=source_document.get("standard"),
+                    course_plan=source_document.get("course_plan"),
+                    marking_scheme=source_document.get("tally_marking_scheme") or [],
+                    fallback_max_marks=source_document.get("tally_max_marks_per_question"),
+                    generated_by=current_user.get("user_id"),
+                )
+                if is_b2c:
+                    await db.b2c_update_one(
+                        "exam_tally_question_maps",
+                        {"tally_document_id": document_id},
+                        {"$set": tally_map_doc},
+                        upsert=True,
+                    )
+                else:
+                    await db.mongo_update_one(
+                        "exam_tally_question_maps",
+                        {"tally_document_id": document_id},
+                        {"$set": tally_map_doc},
+                        upsert=True,
+                    )
+                update_data["tally_question_source_document_id"] = document_id
+                update_data["tally_question_map_status"] = tally_map_doc.get("status") or "ready"
+                update_data["tally_question_map_updated_at"] = tally_map_doc.get("updated_at")
+                processing_result["tally_question_map_status"] = update_data["tally_question_map_status"]
+                processing_result["tally_question_map_items"] = len(tally_map_doc.get("items") or [])
+            except Exception as map_err:
+                logger.warning("Failed to build tally question map for %s: %s", document_id, map_err)
+                update_data["tally_question_map_status"] = "error"
+                update_data["tally_question_map_error"] = str(map_err)[:300]
 
         if is_b2c:
             await db.b2c_update_one(
@@ -3176,6 +3233,10 @@ class DocumentMetadata(BaseModel):
     tally_marking_scheme: Optional[List[Dict[str, float]]] = None
     tally_validate_paper_set: Optional[bool] = None
     tally_expected_paper_set: Optional[str] = None
+    tally_question_source_mode: Optional[str] = None
+    tally_question_source_document_id: Optional[str] = None
+    tally_question_map_status: Optional[str] = None
+    tally_question_map_updated_at: Optional[datetime] = None
 
 class DocumentListResponse(BaseModel):
     documents: List[DocumentMetadata]
@@ -3299,6 +3360,8 @@ async def upload_pdf(
     tally_marking_scheme: Optional[str] = Form(None),
     tally_validate_paper_set: Optional[bool] = Form(None),
     tally_expected_paper_set: Optional[str] = Form(None),
+    tally_question_source_mode: Optional[str] = Form(None),
+    tally_question_source_document_id: Optional[str] = Form(None),
     orientation_applied: Optional[int] = Form(None),  # Rotation (deg) the client baked into the PDF — audit only
     exam_template_orientation_applied: Optional[int] = Form(None),  # Same for the DCR answer template
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
@@ -3518,6 +3581,29 @@ async def upload_pdf(
                         {"from": from_q, "to": to_q, "marks": marks}
                     )
 
+        tally_question_source_mode_value = (
+            tally_question_source_mode.strip().lower()
+            if isinstance(tally_question_source_mode, str)
+            else None
+        )
+        if tally_question_source_mode_value not in {None, "", "none", "upload", "existing"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid tally question source mode",
+            )
+        if tally_question_source_mode_value in {None, ""}:
+            tally_question_source_mode_value = "none"
+        tally_question_source_document_id_value = (
+            tally_question_source_document_id.strip()
+            if isinstance(tally_question_source_document_id, str) and tally_question_source_document_id.strip()
+            else None
+        )
+        if tally_question_source_mode_value == "existing" and not tally_question_source_document_id_value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Existing tally question source requires a document id",
+            )
+
         # If a tutor is uploading, ensure their ID is in teacher_ids
         if current_user.get("user_type") == "tutor":
             tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
@@ -3643,6 +3729,19 @@ async def upload_pdf(
             "tally_validate_paper_set": tally_validate_paper_set,
             "tally_expected_paper_set": (
                 tally_expected_paper_set.strip() if tally_expected_paper_set else None
+            ),
+            "tally_question_source_mode": tally_question_source_mode_value,
+            "tally_question_source_document_id": (
+                document_id
+                if tally_question_source_mode_value == "upload"
+                else tally_question_source_document_id_value
+            ),
+            "tally_question_map_status": (
+                "pending_ocr"
+                if tally_question_source_mode_value == "upload"
+                else "pending"
+                if tally_question_source_mode_value == "existing"
+                else "none"
             ),
             "orientation_applied": (
                 orientation_applied if orientation_applied in (0, 90, 180, 270) else None
@@ -5123,6 +5222,10 @@ async def get_documents(
                 tally_marking_scheme=doc.get("tally_marking_scheme"),
                 tally_validate_paper_set=doc.get("tally_validate_paper_set"),
                 tally_expected_paper_set=doc.get("tally_expected_paper_set"),
+                tally_question_source_mode=doc.get("tally_question_source_mode"),
+                tally_question_source_document_id=doc.get("tally_question_source_document_id"),
+                tally_question_map_status=doc.get("tally_question_map_status"),
+                tally_question_map_updated_at=doc.get("tally_question_map_updated_at"),
             ))
 
         return DocumentListResponse(
@@ -5651,6 +5754,10 @@ async def get_student_available_options(
                 tally_marking_scheme=doc.get("tally_marking_scheme"),
                 tally_validate_paper_set=doc.get("tally_validate_paper_set"),
                 tally_expected_paper_set=doc.get("tally_expected_paper_set"),
+                tally_question_source_mode=doc.get("tally_question_source_mode"),
+                tally_question_source_document_id=doc.get("tally_question_source_document_id"),
+                tally_question_map_status=doc.get("tally_question_map_status"),
+                tally_question_map_updated_at=doc.get("tally_question_map_updated_at"),
             ))
 
         return DocumentListResponse(
