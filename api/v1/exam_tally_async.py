@@ -948,16 +948,20 @@ def _build_analysis_rows(
     }
     summary_rows: List[Dict[str, Any]] = []
     topic_rows: List[Dict[str, Any]] = []
-    type_rows: List[Dict[str, Any]] = []
+    class_topic_rows: List[Dict[str, Any]] = []
     question_rows: List[Dict[str, Any]] = []
+    class_topic_stats: Dict[str, Dict[str, Any]] = {}
+    class_label = str(document.standard or "").strip()
+    section_label = str(document.section or "").strip()
+    subject_label = str(document.subject or "").strip()
 
     for row_index, row in enumerate(rows):
         student = _student_label(row, row_index)
         student_id = _cell_text(row.get("Selected Student ID"))
+        student_key = student_id or student
         total_obtained = 0.0
         total_max = 0.0
         topic_stats: Dict[str, Dict[str, float]] = {}
-        type_stats: Dict[str, Dict[str, float]] = {}
 
         for question_number in sorted(map_by_number.keys()):
             item = map_by_number[question_number]
@@ -967,7 +971,6 @@ def _build_analysis_rows(
             obtained = float(mark) if mark is not None else 0.0
             max_marks = _question_max_marks(item, document, question_number)
             topic = str(item.get("sub_topic") or "Unmapped").strip() or "Unmapped"
-            question_type = str(item.get("question_type") or "other").strip() or "other"
 
             total_obtained += obtained
             total_max += max_marks
@@ -975,38 +978,44 @@ def _build_analysis_rows(
             topic_bucket["obtained"] += obtained
             topic_bucket["max"] += max_marks
             topic_bucket["questions"] += 1
-            type_bucket = type_stats.setdefault(question_type, {"obtained": 0.0, "max": 0.0, "questions": 0})
-            type_bucket["obtained"] += obtained
-            type_bucket["max"] += max_marks
-            type_bucket["questions"] += 1
+            class_bucket = class_topic_stats.setdefault(
+                topic,
+                {"obtained": 0.0, "max": 0.0, "questions": 0, "students": set()},
+            )
+            class_bucket["obtained"] += obtained
+            class_bucket["max"] += max_marks
+            class_bucket["questions"] += 1
+            class_bucket["students"].add(student_key)
 
             question_rows.append(
                 {
                     "Student": student,
                     "Student ID": student_id,
+                    "Class": class_label,
+                    "Section": section_label,
+                    "Subject": subject_label,
                     "Question": f"Q{question_number}",
                     "Marks Obtained": obtained,
                     "Max Marks": max_marks,
                     "Percentage": _format_percentage(_percentage(obtained, max_marks)),
                     "Sub-topic": topic,
-                    "Question Type": question_type,
                 }
             )
 
         overall_pct = _percentage(total_obtained, total_max)
         weak_topic, strong_topic = _pick_strengths(topic_stats, overall_pct)
-        weak_type, strong_type = _pick_strengths(type_stats, overall_pct)
         summary_rows.append(
             {
                 "Student": student,
                 "Student ID": student_id,
+                "Class": class_label,
+                "Section": section_label,
+                "Subject": subject_label,
                 "Total Obtained": round(total_obtained, 2),
                 "Total Max": round(total_max, 2),
                 "Percentage": _format_percentage(overall_pct),
                 "Weak Sub-topic": weak_topic,
                 "Strong Sub-topic": strong_topic,
-                "Weak Question Type": weak_type,
-                "Strong Question Type": strong_type,
             }
         )
 
@@ -1015,6 +1024,9 @@ def _build_analysis_rows(
                 {
                     "Student": student,
                     "Student ID": student_id,
+                    "Class": class_label,
+                    "Section": section_label,
+                    "Subject": subject_label,
                     "Sub-topic": topic,
                     "Marks Obtained": round(values["obtained"], 2),
                     "Max Marks": round(values["max"], 2),
@@ -1022,20 +1034,33 @@ def _build_analysis_rows(
                     "Questions": int(values["questions"]),
                 }
             )
-        for question_type, values in sorted(type_stats.items()):
-            type_rows.append(
-                {
-                    "Student": student,
-                    "Student ID": student_id,
-                    "Question Type": question_type,
-                    "Marks Obtained": round(values["obtained"], 2),
-                    "Max Marks": round(values["max"], 2),
-                    "Percentage": _format_percentage(_percentage(values["obtained"], values["max"])),
-                    "Questions": int(values["questions"]),
-                }
-            )
 
-    return summary_rows, topic_rows, type_rows, question_rows
+    for topic, values in sorted(class_topic_stats.items()):
+        percentage = _percentage(values["obtained"], values["max"])
+        if percentage is None:
+            status_label = ""
+        elif percentage < 60:
+            status_label = "Needs attention"
+        elif percentage >= 80:
+            status_label = "Strong"
+        else:
+            status_label = "Developing"
+        class_topic_rows.append(
+            {
+                "Class": class_label,
+                "Section": section_label,
+                "Subject": subject_label,
+                "Sub-topic": topic,
+                "Students": len(values["students"]),
+                "Marks Obtained": round(values["obtained"], 2),
+                "Max Marks": round(values["max"], 2),
+                "Percentage": _format_percentage(percentage),
+                "Question Attempts": int(values["questions"]),
+                "Class Status": status_label,
+            }
+        )
+
+    return summary_rows, topic_rows, class_topic_rows, question_rows
 
 
 def _build_prompt(payload: TallyExtractRequest) -> str:
@@ -1852,6 +1877,11 @@ async def save_tally_question_map(
         {
             "$set": {
                 "tally_question_source_document_id": source_document_id,
+                **(
+                    {"tally_question_source_mode": "manual"}
+                    if source_document_id is None and items
+                    else {}
+                ),
                 "tally_question_map_status": map_doc["status"],
                 "tally_question_map_updated_at": now,
             }
@@ -2056,14 +2086,13 @@ async def export_tally(
                 "Question": f"Q{question_number}",
                 "Question ID": item.get("question_id") or "",
                 "Sub-topic": item.get("sub_topic") or "Unmapped",
-                "Question Type": item.get("question_type") or "other",
                 "Max Marks": max_marks if max_marks > 0 else "",
                 "Confidence": item.get("confidence") if item.get("confidence") is not None else "",
                 "Source": item.get("source") or "",
                 "Question Preview": item.get("question_text_preview") or "",
             }
         )
-    summary_rows, topic_rows, type_rows, question_rows = _build_analysis_rows(
+    summary_rows, topic_rows, class_topic_rows, question_rows = _build_analysis_rows(
         normalised_rows,
         ordered_columns,
         question_map_items,
@@ -2097,7 +2126,7 @@ async def export_tally(
         write_sheet("Question Map", question_map_rows)
         write_sheet("Student Summary", summary_rows)
         write_sheet("Topic Analysis", topic_rows)
-        write_sheet("Type Analysis", type_rows)
+        write_sheet("Class Topic Analysis", class_topic_rows)
         write_sheet("Question Analysis", question_rows)
 
     output.seek(0)

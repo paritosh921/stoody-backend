@@ -3586,7 +3586,7 @@ async def upload_pdf(
             if isinstance(tally_question_source_mode, str)
             else None
         )
-        if tally_question_source_mode_value not in {None, "", "none", "upload", "existing"}:
+        if tally_question_source_mode_value not in {None, "", "none", "upload", "existing", "manual"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid tally question source mode",
@@ -3741,6 +3741,8 @@ async def upload_pdf(
                 if tally_question_source_mode_value == "upload"
                 else "pending"
                 if tally_question_source_mode_value == "existing"
+                else "pending"
+                if tally_question_source_mode_value == "manual"
                 else "none"
             ),
             "orientation_applied": (
