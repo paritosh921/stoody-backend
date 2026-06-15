@@ -1420,9 +1420,9 @@ Task:
 3. Pair each value with the correct heading/cell.
 4. If the sheet is a single-student form, return one row.
 5. If the sheet has multiple student rows, return all rows.
-6. Preserve blank cells as empty strings.
+6. Preserve truly blank cells as empty strings.
 7. Normalize question headings to Q1, Q2, Q3... where obvious.
-8. Do not invent marks or names. If uncertain, keep the cell empty and add a warning.{marking_rule}
+8. Do not invent names or header text. For Q mark cells, use best-effort reading: if any handwritten mark is visible, return the closest numeric value and add a warning when confidence is low.{marking_rule}
 
 Question mark grid rules:
 - {question_context}
@@ -1432,7 +1432,8 @@ Question mark grid rules:
 - Valid mark cells normally contain small values like 0, 1, 2, 0.5, or blanks. Preserve the exact numeric value as a string.
 - If a cell's configured max is 1, do not return "10" for a messy single stroke, overwritten stroke, grid-line overlap, or a mark that spills near a border. Return "1" only when the written mark is a one; return "0" only when it is a zero.
 - Never combine strokes from neighboring cells or printed Q labels into a two-digit mark.
-- Return blank only when the cell truly has no handwritten mark.
+- For Q cells, do not leave a visible handwritten mark blank just because it is small, faint, near a border, or slightly messy.
+- Return blank for a Q cell only when there is no visible handwritten mark inside that cell.
 
 Context from the UI, for disambiguation only:
 {json.dumps(context, ensure_ascii=False)}
@@ -1478,8 +1479,9 @@ Critical reading rules:
 - A single black vertical handwritten stroke inside the white mark area is the numeric mark "1".
 - Do not confuse black handwritten "1" marks with blue printed table borders.
 - Do not shift values from neighboring cells. Each value must stay with its own Q heading.
-- If a target cell contains a visible numeric mark, return that numeric mark as a string.
-- If a target cell is genuinely empty or unreadable after careful inspection, return an empty string.
+- If a target cell contains any visible handwritten mark, return the closest numeric value as a string, even if confidence is low.
+- If confidence is low, still return the best visible value and mention the cell in warnings.
+- Return an empty string only when the target cell has no visible handwritten mark.
 - Do not fill cells that are not listed in targets.
 
 Context:
