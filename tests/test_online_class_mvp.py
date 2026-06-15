@@ -922,6 +922,40 @@ async def _test_resolve_student_canvas_user_ids():
     assert oid in ids
 
 
+def test_resolve_student_pen_mac_prefers_active_binding():
+    asyncio.run(_test_resolve_student_pen_mac_prefers_active_binding())
+
+
+async def _test_resolve_student_pen_mac_prefers_active_binding():
+    from api.v1.online_class.router import _resolve_student_pen_mac
+
+    db = FakeDb()
+    db.collections["students"].append({
+        "student_id": "STU_1",
+        "pen_mac": "aa:bb:cc:dd:ee:ff",
+    })
+    db.collections["student_pen_bindings"] = [{
+        "student_id": "STU_1",
+        "pen_mac": "11:22:33:44:55:66",
+        "status": "active",
+    }]
+
+    assert await _resolve_student_pen_mac(db, "STU_1") == "11:22:33:44:55:66"
+
+
+def test_reanalysis_prompt_includes_tutor_comments():
+    from services.online_class.analysis_service import _build_analysis_prompt
+
+    prompt = _build_analysis_prompt(
+        {"question_text": "Find x"},
+        answer_text="x = 4",
+        tutor_comments="Student skipped units; check dimensional consistency.",
+    )
+
+    assert "Tutor re-evaluation comments" in prompt
+    assert "dimensional consistency" in prompt
+
+
 def test_teacher_canvas_mode_defaults_live_and_persists_stream():
     asyncio.run(_test_teacher_canvas_mode_defaults_live_and_persists_stream())
 

@@ -56,6 +56,10 @@ class SubmissionResponse(BaseModel):
     updated_at: datetime
 
 
+class ReanalyzeSubmissionRequest(BaseModel):
+    tutor_comments: Optional[str] = None
+
+
 class SubmissionResultItem(BaseModel):
     submission_id: str
     meeting_id: str

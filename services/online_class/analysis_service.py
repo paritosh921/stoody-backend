@@ -19,7 +19,11 @@ ANALYSIS_SYSTEM_PROMPT = (
 SUBMISSIONS_COLLECTION = "online_class_submissions"
 
 
-def _build_analysis_prompt(lock: Dict[str, Any], answer_text: Optional[str]) -> str:
+def _build_analysis_prompt(
+    lock: Dict[str, Any],
+    answer_text: Optional[str],
+    tutor_comments: Optional[str] = None,
+) -> str:
     parts = []
     q_text = lock.get("question_text")
     if q_text:
@@ -29,6 +33,11 @@ def _build_analysis_prompt(lock: Dict[str, Any], answer_text: Optional[str]) -> 
         parts.append(f"Question region: {q_bbox}")
     if answer_text:
         parts.append(f"Student answer text: {answer_text}")
+    if tutor_comments:
+        parts.append(
+            "Tutor re-evaluation comments: "
+            f"{tutor_comments.strip()[:2000]}"
+        )
     parts.append(
         "Evaluate this student answer. If canvas images are attached, "
         "examine them for handwritten work. Return your analysis as JSON."
@@ -97,6 +106,7 @@ async def run_submission_analysis(
     current_user: Dict[str, Any],
     lock: Dict[str, Any],
     submission: Dict[str, Any],
+    tutor_comments: Optional[str] = None,
 ) -> Dict[str, Any]:
     from api.v1.practice_async import (
         _gate_text_call,
@@ -106,7 +116,7 @@ async def run_submission_analysis(
 
     canvas_pages = submission.get("canvas_pages") or []
     answer_text = submission.get("answer_text")
-    prompt = _build_analysis_prompt(lock, answer_text)
+    prompt = _build_analysis_prompt(lock, answer_text, tutor_comments)
     submission_id = submission["submission_id"]
 
     try:

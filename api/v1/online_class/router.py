@@ -16,6 +16,7 @@ from api.v1.online_class.models import (
     CreateLockRequest,
     LockResponse,
     CreateSubmissionRequest,
+    ReanalyzeSubmissionRequest,
     SubmissionResponse,
     SubmissionResultItem,
 )
@@ -92,6 +93,7 @@ class MonitoringStudentItem(BaseModel):
     student_id: str
     student_name: Optional[str] = None
     username: Optional[str] = None
+    pen_mac: Optional[str] = None
     joined: bool = False
 
 
@@ -411,6 +413,38 @@ async def _resolve_student_canvas_user_ids(
             student_doc.get("user_id"),
         ])
     return _dedupe_identity_values(values)
+
+
+async def _resolve_student_pen_mac(db: DatabaseManager, student_id: str) -> Optional[str]:
+    student_doc = await db.mongo_find_one("students", {"student_id": student_id})
+    candidates = []
+
+    binding = await db.mongo_find_one(
+        "student_pen_bindings",
+        {"user_id": student_id, "status": "active"},
+    )
+    if not binding:
+        binding = await db.mongo_find_one(
+            "student_pen_bindings",
+            {"student_id": student_id, "status": "active"},
+        )
+    if not binding and student_doc:
+        binding = await db.mongo_find_one(
+            "student_pen_bindings",
+            {"user_id": str(student_doc.get("_id")), "status": "active"},
+        )
+    if binding:
+        candidates.append(binding.get("pen_mac"))
+    candidates.extend([
+        student_doc.get("pen_mac") if student_doc else None,
+        student_doc.get("assigned_pen_mac") if student_doc else None,
+        student_doc.get("bluetooth_address") if student_doc else None,
+    ])
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().upper()
+    return None
 
 
 async def _resolve_tutor_canvas_user_ids(
@@ -1118,19 +1152,22 @@ async def api_get_monitoring_students(
 
     student_docs = await db.mongo_find("students", {"student_id": {"$in": invited_ids}})
     by_id = {str(doc.get("student_id")): doc for doc in student_docs}
-    students = [
-        MonitoringStudentItem(
-            student_id=student_id,
-            student_name=(
-                by_id.get(student_id, {}).get("name")
-                or by_id.get(student_id, {}).get("full_name")
-                or by_id.get(student_id, {}).get("username")
-            ),
-            username=by_id.get(student_id, {}).get("username"),
-            joined=student_id in joined_ids,
+    students: List[MonitoringStudentItem] = []
+    for student_id in invited_ids:
+        student_doc = by_id.get(student_id, {})
+        students.append(
+            MonitoringStudentItem(
+                student_id=student_id,
+                student_name=(
+                    student_doc.get("name")
+                    or student_doc.get("full_name")
+                    or student_doc.get("username")
+                ),
+                username=student_doc.get("username"),
+                pen_mac=await _resolve_student_pen_mac(db, student_id),
+                joined=student_id in joined_ids,
+            )
         )
-        for student_id in invited_ids
-    ]
     return MonitoringStudentsResponse(students=students)
 
 
@@ -1502,6 +1539,64 @@ async def api_get_lock_results(
             )
         )
     return {"lock": LockResponse(**lock), "submissions": results}
+
+
+@router.post("/meetings/{meeting_id}/locks/{lock_id}/submissions/{submission_id}/reanalyze", response_model=SubmissionResponse)
+@limiter.limit("10/minute")
+async def api_reanalyze_submission(
+    request: Request,
+    meeting_id: str,
+    lock_id: str,
+    submission_id: str,
+    body: ReanalyzeSubmissionRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    tutor_id = current_user.get("tutor_id")
+    await _verify_tutor_owns_meeting(db, meeting_id, tutor_id, current_user=current_user)
+
+    lock = await get_lock_by_id(db, meeting_id, lock_id)
+    if not lock:
+        raise HTTPException(status_code=404, detail="Lock not found")
+
+    submission = await db.mongo_find_one(
+        "online_class_submissions",
+        {"submission_id": submission_id, "meeting_id": meeting_id, "lock_id": lock_id},
+    )
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    now = datetime.utcnow()
+    reset_fields = {
+        "analysis_status": "pending",
+        "analysis_error": None,
+        "analysis_failed_at": None,
+        "analysis_completed_at": None,
+        "reanalyze_requested_at": now,
+        "reanalyze_requested_by": tutor_id,
+        "reanalyze_comments": body.tutor_comments.strip()[:2000] if body.tutor_comments else None,
+        "updated_at": now,
+    }
+    await db.mongo_update_one(
+        "online_class_submissions",
+        {"submission_id": submission_id},
+        {"$set": reset_fields},
+    )
+    submission.update(reset_fields)
+
+    from services.online_class.analysis_service import run_submission_analysis
+    task = asyncio.create_task(
+        run_submission_analysis(
+            db,
+            current_user,
+            lock,
+            submission.copy(),
+            tutor_comments=body.tutor_comments,
+        )
+    )
+    task.add_done_callback(_log_analysis_task_error)
+    return SubmissionResponse(**submission)
 
 
 @router.post("/meetings/{meeting_id}/locks/{lock_id}/submissions", response_model=SubmissionResponse)
