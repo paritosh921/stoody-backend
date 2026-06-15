@@ -579,9 +579,10 @@ async def login_with_2fa(
         # Check 2FA status
         two_fa_enabled, two_fa_required = _get_effective_2fa_flags(user, user_type)
         
-        if two_fa_enabled:
-            # Enrolled users must verify their authenticator even if the
-            # tenant/user setup requirement has been disabled.
+        if two_fa_enabled and two_fa_required:
+            # Enrolled users verify their authenticator only while the portal
+            # login requirement is enabled. Disabling the requirement preserves
+            # the secret but allows password-only login until it is re-enabled.
             temp_token = create_temp_token(
                 user_id,
                 user_type,
