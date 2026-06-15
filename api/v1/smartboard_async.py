@@ -3,8 +3,8 @@ SmartBoard API - Real-time Pen Monitoring for Teaching
 Handles session management, WebSocket connections, and AI evaluation
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect, status
-from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from typing import List, Optional, Dict, Any, Set
 from datetime import datetime
 from pydantic import BaseModel, Field
 import secrets
@@ -190,6 +190,13 @@ def _display_name(*, student_name: Optional[str], pen_name: Optional[str]) -> Op
     return _safe_str(student_name) or _safe_str(pen_name)
 
 
+def _normalize_pen_mac(value: Any) -> Optional[str]:
+    text = _safe_str(value)
+    if not text:
+        return None
+    return text.upper()
+
+
 async def _smartboard_visible_student_usernames(
     tenant_db,
     current_user: Dict[str, Any],
@@ -263,8 +270,11 @@ async def _smartboard_visible_student_usernames(
 async def _load_smartboard_pen_names(
     tenant_db,
     current_user: Dict[str, Any],
+    requested_pen_macs: Optional[Set[str]] = None,
 ) -> List[SmartboardPenName]:
     query: Dict[str, Any] = {"status": "active"}
+    if requested_pen_macs:
+        query["pen_mac"] = {"$in": sorted(requested_pen_macs)}
     if not _actor_is_admin(current_user):
         visible_usernames = await _smartboard_visible_student_usernames(tenant_db, current_user)
         if not visible_usernames:
@@ -286,7 +296,7 @@ async def _load_smartboard_pen_names(
 
     rows: List[SmartboardPenName] = []
     for pen in pen_docs:
-        pen_mac = _safe_str(pen.get("pen_mac"))
+        pen_mac = _normalize_pen_mac(pen.get("pen_mac"))
         if not pen_mac:
             continue
         student_doc = student_lookup.get(pen.get("user_id")) or {}
@@ -294,7 +304,7 @@ async def _load_smartboard_pen_names(
         pen_name = _safe_str(pen.get("pen_name"))
         rows.append(
             SmartboardPenName(
-                pen_mac=pen_mac.upper(),
+                pen_mac=pen_mac,
                 pen_id=_safe_str(pen.get("pen_id")),
                 name=_display_name(student_name=student_name, pen_name=pen_name),
                 pen_name=pen_name,
@@ -312,6 +322,7 @@ async def _load_smartboard_pen_names(
 
 @router.get("/pen-names", response_model=SmartboardPenNamesResponse)
 async def get_pen_names(
+    pen_macs: Optional[List[str]] = Query(None),
     current_user: Dict[str, Any] = Depends(require_smartboard_cloud_user),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -323,7 +334,17 @@ async def get_pen_names(
     names on locally streamed hub strokes.
     """
     tenant_db = await get_tenant_db_or_403(db, current_user)
-    pens = await _load_smartboard_pen_names(tenant_db, current_user)
+    requested_pen_macs: Set[str] = set()
+    for raw in pen_macs or []:
+        for part in str(raw).split(","):
+            mac = _normalize_pen_mac(part)
+            if mac:
+                requested_pen_macs.add(mac)
+    pens = await _load_smartboard_pen_names(
+        tenant_db,
+        current_user,
+        requested_pen_macs=requested_pen_macs or None,
+    )
     return SmartboardPenNamesResponse(
         pens=pens,
         count=len(pens),
