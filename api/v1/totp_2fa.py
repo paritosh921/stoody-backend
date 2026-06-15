@@ -579,7 +579,27 @@ async def login_with_2fa(
         # Check 2FA status
         two_fa_enabled, two_fa_required = _get_effective_2fa_flags(user, user_type)
         
-        if two_fa_required and not two_fa_enabled:
+        if two_fa_enabled:
+            # Enrolled users must verify their authenticator even if the
+            # tenant/user setup requirement has been disabled.
+            temp_token = create_temp_token(
+                user_id,
+                user_type,
+                "OTP",
+                tenant_id=tenant.get("tenant_id"),
+                db_name=tenant.get("db_name"),
+                institution_id=tenant.get("institution_id"),
+                subdomain=tenant.get("subdomain"),
+                enabled_features=enabled_features,
+                enabled_features_v2=enabled_features_v2,
+            )
+            return LoginResponse(
+                success=True,
+                next="OTP",
+                temp_token=temp_token
+            )
+
+        if two_fa_required:
             # User needs to set up 2FA
             temp_token = create_temp_token(
                 user_id,
@@ -598,26 +618,7 @@ async def login_with_2fa(
                 temp_token=temp_token
             )
         
-        if two_fa_required and two_fa_enabled:
-            # User needs to enter OTP
-            temp_token = create_temp_token(
-                user_id,
-                user_type,
-                "OTP",
-                tenant_id=tenant.get("tenant_id"),
-                db_name=tenant.get("db_name"),
-                institution_id=tenant.get("institution_id"),
-                subdomain=tenant.get("subdomain"),
-                enabled_features=enabled_features,
-                enabled_features_v2=enabled_features_v2,
-            )
-            return LoginResponse(
-                success=True,
-                next="OTP",
-                temp_token=temp_token
-            )
-        
-        # 2FA requirement is disabled for this account - direct login
+        # 2FA is neither enrolled nor required for this account - direct login
         user_data = _build_user_token_data(user, user_id, user_type, tenant=tenant)
 
         session_data = await auth_manager.create_user_session(user_data)
