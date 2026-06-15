@@ -181,11 +181,11 @@ async def _2fa_login_defaults_existing_user_without_2fa_doc_to_setup(auth_depend
     auth_manager.create_user_session.assert_not_awaited()
 
 
-def test_2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies):
-    asyncio.run(_2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies))
+def test_2fa_login_prompts_otp_when_enabled_even_if_requirement_disabled(auth_dependencies):
+    asyncio.run(_2fa_login_prompts_otp_when_enabled_even_if_requirement_disabled(auth_dependencies))
 
 
-async def _2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies):
+async def _2fa_login_prompts_otp_when_enabled_even_if_requirement_disabled(auth_dependencies):
     tutor_doc = {
         "_id": ObjectId(),
         "username": "teacher1",
@@ -217,9 +217,10 @@ async def _2fa_login_allows_done_when_requirement_is_disabled(auth_dependencies)
     )
 
     assert response.success is True
-    assert response.next == "DONE"
-    assert response.access_token == "legacy-token"
-    auth_manager.create_user_session.assert_awaited_once()
+    assert response.next == "OTP"
+    assert response.temp_token
+    assert response.access_token is None
+    auth_manager.create_user_session.assert_not_awaited()
 
 
 def test_2fa_admin_login_returns_password_change_requirement(auth_dependencies):
@@ -522,7 +523,7 @@ async def _2fa_direct_done_updates_last_login_when_requirement_disabled(auth_dep
         "username_lower": "teacher2",
         "password_hash": "hash",
         "is_active": True,
-        "two_fa": {"required": False, "enabled": True, "secret_enc": "secret"},
+        "two_fa": {"required": False, "enabled": False},
     }
     auth_dependencies.tenant_db["tutors"] = _Collection(tutor_doc)
     auth_manager = _AuthManager(
