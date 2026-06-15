@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -539,6 +540,334 @@ def _format_ocr_question_context(document: TallyDocumentContext) -> str:
         f"Configured question cells: {question_range}. "
         f"Allowed mark ranges: {_format_marking_context(document)}."
     )
+
+
+def _line_clusters_from_counts(
+    counts: Any,
+    threshold: int,
+    *,
+    max_gap: int = 3,
+    min_size: int = 1,
+) -> List[Dict[str, int]]:
+    active = [index for index, value in enumerate(counts) if int(value) >= threshold]
+    if not active:
+        return []
+
+    raw_clusters: List[Tuple[int, int]] = []
+    start = previous = active[0]
+    for index in active[1:]:
+        if index - previous <= max_gap + 1:
+            previous = index
+            continue
+        raw_clusters.append((start, previous))
+        start = previous = index
+    raw_clusters.append((start, previous))
+
+    clusters: List[Dict[str, int]] = []
+    for start, end in raw_clusters:
+        if end - start + 1 < min_size:
+            continue
+        weight_sum = 0
+        weighted_position_sum = 0
+        max_count = 0
+        for index in range(start, end + 1):
+            weight = int(counts[index])
+            weight_sum += weight
+            weighted_position_sum += index * weight
+            max_count = max(max_count, weight)
+        center = int(round(weighted_position_sum / weight_sum)) if weight_sum else (start + end) // 2
+        clusters.append(
+            {
+                "start": start,
+                "end": end,
+                "center": center,
+                "max_count": max_count,
+            }
+        )
+    return clusters
+
+
+def _even_line_score(centers: List[int]) -> Optional[float]:
+    if len(centers) < 2:
+        return None
+    gaps = [centers[index + 1] - centers[index] for index in range(len(centers) - 1)]
+    if not gaps or any(gap <= 0 for gap in gaps):
+        return None
+    average = sum(gaps) / len(gaps)
+    if average <= 1:
+        return None
+    return sum(abs(gap - average) for gap in gaps) / len(gaps) / average
+
+
+def _best_even_line_run(
+    clusters: List[Dict[str, int]],
+    desired_count: int,
+    *,
+    min_span: int = 0,
+) -> Optional[List[Dict[str, int]]]:
+    best_run: Optional[List[Dict[str, int]]] = None
+    best_score: Optional[float] = None
+    for start in range(0, len(clusters) - desired_count + 1):
+        run = clusters[start : start + desired_count]
+        centers = [int(item["center"]) for item in run]
+        if min_span and centers[-1] - centers[0] < min_span:
+            continue
+        score = _even_line_score(centers)
+        if score is None:
+            continue
+        if best_score is None or score < best_score:
+            best_score = score
+            best_run = run
+    if best_run is None or best_score is None or best_score > 0.22:
+        return None
+    return best_run
+
+
+def _decode_tally_image_for_mark_detection(image_b64: str) -> Optional[Any]:
+    try:
+        from PIL import Image
+    except Exception as exc:
+        logger.warning("Pillow unavailable for tally mark detection: %s", exc)
+        return None
+
+    try:
+        raw = str(image_b64 or "")
+        if "," in raw:
+            prefix, payload = raw.split(",", 1)
+            if "svg+xml" in prefix:
+                return None
+            raw = payload
+        image_bytes = base64.b64decode(raw, validate=False)
+        return Image.open(BytesIO(image_bytes)).convert("RGB")
+    except Exception as exc:
+        logger.warning("Could not decode tally image for mark detection: %s", exc)
+        return None
+
+
+def _detect_tally_question_grid(image: Any, document: TallyDocumentContext) -> Optional[Dict[str, List[int]]]:
+    try:
+        import numpy as np
+    except Exception as exc:
+        logger.warning("NumPy unavailable for tally mark detection: %s", exc)
+        return None
+
+    arr = np.asarray(image.convert("RGB"))
+    height, width = arr.shape[:2]
+    if width < 300 or height < 240:
+        return None
+
+    rgb = arr.astype("int16")
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    blue_mask = (
+        (blue > 80)
+        & (blue < 240)
+        & (red < 190)
+        & (green < 220)
+        & ((blue - red) > 25)
+    )
+
+    horizontal_clusters = _line_clusters_from_counts(
+        blue_mask.sum(axis=1),
+        max(60, int(width * 0.35)),
+        max_gap=3,
+    )
+    if len(horizontal_clusters) < 3:
+        return None
+
+    question_count = _configured_question_count(document) or 40
+    required_bands = min(4, max(1, (int(question_count) + 9) // 10))
+    required_lines = 1 + required_bands * 2
+    max_window = min(len(horizontal_clusters), max(required_lines, 9))
+    window_lengths = sorted(range(required_lines, max_window + 1), reverse=True)
+
+    best: Optional[Tuple[float, List[int], List[int]]] = None
+    for window_len in window_lengths:
+        for start in range(0, len(horizontal_clusters) - window_len + 1):
+            h_run = horizontal_clusters[start : start + window_len]
+            h_centers = [int(item["center"]) for item in h_run]
+            if h_centers[-1] - h_centers[0] < max(80, int(height * 0.08)):
+                continue
+
+            y0 = max(0, h_centers[0] - 2)
+            y1 = min(height, h_centers[-1] + 2)
+            if y1 <= y0:
+                continue
+
+            vertical_counts = blue_mask[y0:y1, :].sum(axis=0)
+            vertical_threshold = max(18, int((y1 - y0) * 0.24))
+            vertical_clusters = _line_clusters_from_counts(
+                vertical_counts,
+                vertical_threshold,
+                max_gap=3,
+            )
+            strong_vertical_threshold = max(vertical_threshold, int((y1 - y0) * 0.55))
+            strong_vertical_clusters = [
+                cluster
+                for cluster in vertical_clusters
+                if int(cluster.get("max_count") or 0) >= strong_vertical_threshold
+            ]
+            v_run = _best_even_line_run(
+                strong_vertical_clusters,
+                11,
+                min_span=int(width * 0.45),
+            ) or _best_even_line_run(
+                vertical_clusters,
+                11,
+                min_span=int(width * 0.45),
+            )
+            if not v_run:
+                continue
+
+            v_centers = [int(item["center"]) for item in v_run]
+            v_score = _even_line_score(v_centers)
+            h_score = _even_line_score(h_centers)
+            if v_score is None:
+                continue
+            total_score = (
+                v_score
+                + (min(h_score or 0.0, 1.0) * 0.25)
+                + ((window_len - required_lines) * 0.003)
+                + ((h_centers[0] / max(1, height)) * 0.35)
+            )
+            if best is None or total_score < best[0]:
+                best = (total_score, h_centers, v_centers)
+
+    if not best:
+        return None
+
+    horizontal = list(best[1])
+    vertical = list(best[2])
+    channel_range = np.maximum.reduce([red, green, blue]) - np.minimum.reduce([red, green, blue])
+    ink_mask = (
+        (red < 160)
+        & (green < 160)
+        & (blue < 160)
+        & (channel_range < 100)
+    )
+    if len(horizontal) >= required_lines + 1 and len(vertical) >= 2:
+        x0 = max(0, int(vertical[0]) + 5)
+        x1 = min(width, int(vertical[-1]) - 5)
+        for index in range(0, len(horizontal) - required_lines + 1):
+            label_top = int(horizontal[index]) + 3
+            label_bottom = int(horizontal[index + 1]) - 3
+            mark_top = int(horizontal[index + 1]) + 3
+            mark_bottom = int(horizontal[index + 2]) - 3
+            if label_bottom <= label_top or mark_bottom <= mark_top or x1 <= x0:
+                continue
+            label_area = max(1, (label_bottom - label_top) * (x1 - x0))
+            mark_area = max(1, (mark_bottom - mark_top) * (x1 - x0))
+            label_ink_ratio = float(ink_mask[label_top:label_bottom, x0:x1].sum()) / label_area
+            mark_ink_ratio = float(ink_mask[mark_top:mark_bottom, x0:x1].sum()) / mark_area
+            if label_ink_ratio <= 0.004 and mark_ink_ratio >= 0.006:
+                horizontal = horizontal[index:]
+                break
+
+    return {"horizontal": horizontal, "vertical": vertical}
+
+
+def _detect_single_stroke_mark(crop: Any) -> Optional[str]:
+    try:
+        import numpy as np
+    except Exception:
+        return None
+
+    arr = np.asarray(crop.convert("RGB"))
+    if arr.size == 0:
+        return None
+
+    rgb = arr.astype("int16")
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    channel_range = np.maximum.reduce([red, green, blue]) - np.minimum.reduce([red, green, blue])
+    ink_mask = (
+        (red < 160)
+        & (green < 160)
+        & (blue < 160)
+        & (channel_range < 100)
+    )
+
+    ys, xs = np.where(ink_mask)
+    ink_count = int(ink_mask.sum())
+    height, width = ink_mask.shape
+    if ink_count < max(8, int(width * height * 0.006)):
+        return None
+
+    left = int(xs.min())
+    right = int(xs.max())
+    top = int(ys.min())
+    bottom = int(ys.max())
+    bbox_width = max(1, right - left + 1)
+    bbox_height = max(1, bottom - top + 1)
+    density = ink_count / max(1, bbox_width * bbox_height)
+
+    is_single_vertical_stroke = (
+        bbox_height >= max(8, int(height * 0.45))
+        and bbox_width <= max(12, int(width * 0.16))
+        and bbox_height >= bbox_width * 1.5
+        and density >= 0.25
+    )
+    if is_single_vertical_stroke:
+        return "1"
+    return None
+
+
+def _detect_missing_marks_from_image(
+    image_b64: str,
+    document: TallyDocumentContext,
+    missing_by_row: Dict[int, List[int]],
+) -> Dict[int, Dict[int, str]]:
+    if not missing_by_row or 0 not in missing_by_row:
+        return {}
+
+    image = _decode_tally_image_for_mark_detection(image_b64)
+    if image is None:
+        return {}
+    grid = _detect_tally_question_grid(image, document)
+    if not grid:
+        logger.info("Tally mark detector skipped because the question grid was not detected")
+        return {}
+
+    horizontal = grid["horizontal"]
+    vertical = grid["vertical"]
+    detected: Dict[int, Dict[int, str]] = {}
+
+    for question_number in sorted(missing_by_row.get(0, [])):
+        expected_marks = _expected_marks_for_question(document, question_number)
+        if expected_marks is not None and expected_marks < 1:
+            continue
+
+        band_index = (question_number - 1) // 10
+        column_index = (question_number - 1) % 10
+        top_index = 1 + band_index * 2
+        bottom_index = 2 + band_index * 2
+        if bottom_index >= len(horizontal) or column_index + 1 >= len(vertical):
+            continue
+
+        left = int(vertical[column_index])
+        right = int(vertical[column_index + 1])
+        top = int(horizontal[top_index])
+        bottom = int(horizontal[bottom_index])
+        cell_width = max(1, right - left)
+        cell_height = max(1, bottom - top)
+        x_pad = max(2, int(cell_width * 0.05))
+        y_pad = max(2, int(cell_height * 0.10))
+        crop_box = (
+            max(0, left + x_pad),
+            max(0, top + y_pad),
+            min(image.width, right - x_pad),
+            min(image.height, bottom - y_pad),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            continue
+
+        mark = _detect_single_stroke_mark(image.crop(crop_box))
+        if mark:
+            detected.setdefault(0, {})[question_number] = mark
+
+    return detected
 
 
 def _question_column_by_number(
@@ -1101,6 +1430,8 @@ Question mark grid rules:
 - A single black vertical handwritten stroke inside a question mark cell is a valid mark of "1", even when it is close to a blue printed grid line.
 - Blue table borders and printed labels are not marks. Black handwritten strokes inside the white mark area are marks.
 - Valid mark cells normally contain small values like 0, 1, 2, 0.5, or blanks. Preserve the exact numeric value as a string.
+- If a cell's configured max is 1, do not return "10" for a messy single stroke, overwritten stroke, grid-line overlap, or a mark that spills near a border. Return "1" only when the written mark is a one; return "0" only when it is a zero.
+- Never combine strokes from neighboring cells or printed Q labels into a two-digit mark.
 - Return blank only when the cell truly has no handwritten mark.
 
 Context from the UI, for disambiguation only:
@@ -1911,6 +2242,7 @@ async def extract_tally(
             prompt=prompt,
             tenant_db=tenant_db,
             max_tokens=4096,
+            temperature=0.0,
         )
     except Exception as exc:
         logger.exception("Exam tally extraction failed")
@@ -1922,6 +2254,7 @@ async def extract_tally(
     document_context = payload.document or TallyDocumentContext()
     student_context = payload.student or TallyStudentContext()
     warnings = _filter_tally_warnings(warnings, document_context)
+
     if not rows:
         warnings.append("No table rows were confidently detected.")
     validation_issues = _validate_tally_result(columns, rows, document_context, student_context)
@@ -1937,6 +2270,7 @@ async def extract_tally(
                 prompt=_build_missing_marks_recheck_prompt(payload, missing_by_row),
                 tenant_db=tenant_db,
                 max_tokens=2048,
+                temperature=0.0,
             )
             recheck_provider = recheck_result.get("provider")
             recheck_raw_text = recheck_result.get("text", "")
@@ -1964,15 +2298,39 @@ async def extract_tally(
                     document_context,
                     student_context,
                 )
-            else:
-                missing_label = _format_filled_recheck_ranges(missing_by_row)
-                if missing_label:
-                    warnings.append(
-                        f"OCR recheck could not confidently read missing marks for {missing_label}."
-                    )
         except Exception as exc:
             logger.warning("Exam tally missing-mark OCR recheck failed: %s", exc)
             warnings.append("OCR recheck for missing marks failed; please review the flagged cells manually.")
+
+    remaining_missing_by_row = _missing_questions_by_row(columns, rows, document_context)
+    detected_marks = _detect_missing_marks_from_image(
+        payload.image_b64,
+        document_context,
+        remaining_missing_by_row,
+    )
+    if detected_marks:
+        columns, rows, filled_by_row, merge_warnings = _merge_rechecked_marks(
+            columns,
+            rows,
+            detected_marks,
+            remaining_missing_by_row,
+            document_context,
+        )
+        warnings.extend(merge_warnings)
+        filled_label = _format_filled_recheck_ranges(filled_by_row)
+        if filled_label:
+            warnings.append(f"Image mark detector filled missing marks for {filled_label}.")
+            validation_issues = _validate_tally_result(
+                columns,
+                rows,
+                document_context,
+                student_context,
+            )
+
+    final_missing_by_row = _missing_questions_by_row(columns, rows, document_context)
+    missing_label = _format_filled_recheck_ranges(final_missing_by_row)
+    if missing_label:
+        warnings.append(f"OCR could not confidently read missing marks for {missing_label}.")
 
     extraction_id = uuid4().hex
     doc = {

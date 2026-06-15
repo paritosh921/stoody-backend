@@ -238,6 +238,7 @@ class OCRService:
         *,
         tenant_db: Any = None,
         max_tokens: int = 1024,
+        temperature: float = 0.3,
     ) -> dict:
         """
         Analyze an image and extract text/mathematical content.
@@ -246,6 +247,7 @@ class OCRService:
             image_b64: Base64-encoded image data (with or without data URI prefix)
             prompt: Optional custom prompt for the analysis
             tenant_db: Optional Motor database for LLM gate routing (SWM-011)
+            temperature: Sampling temperature forwarded to the vision model
 
         Returns:
             dict with 'text' (extracted text) and 'success' (bool)
@@ -260,13 +262,20 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
         if not image_b64:
             # Text-only path (rare — OCR usually has an image)
             gate_content = await _gate_text_call(
-                tenant_db, analysis_prompt, max_tokens=max_tokens
+                tenant_db,
+                analysis_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
             )
             return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
 
         # Vision path — the common case for OCR
         gate_content = await _gate_vision_call(
-            tenant_db, image_b64, analysis_prompt, max_tokens=max_tokens
+            tenant_db,
+            image_b64,
+            analysis_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
 
