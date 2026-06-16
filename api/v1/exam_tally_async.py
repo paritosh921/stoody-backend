@@ -1410,8 +1410,9 @@ def _build_prompt(payload: TallyExtractRequest) -> str:
         "question_context": question_context,
     }
     return f"""
-You are reading a full-page handwritten exam tally sheet drawn on a digital canvas.
-The sheet may contain hand-drawn table borders and handwritten headings/values.
+You are reading one flattened image exported from a digital canvas.
+The image contains a clean printed/template tally sheet underneath and imperfect black handwritten teacher marks written on top.
+Use the printed/template text, blue grid lines, and Q labels only to locate the correct cells.
 This is an exam tally marks grid, not a generic spreadsheet. The important cells are the evaluator marks under Q1, Q2, Q3... headings.
 
 Task:
@@ -1428,7 +1429,8 @@ Question mark grid rules:
 - {question_context}
 - Read values by the physical cell position below each Q heading. Do not shift marks left or right just because an earlier cell is hard to read.
 - A single black vertical handwritten stroke inside a question mark cell is a valid mark of "1", even when it is close to a blue printed grid line.
-- Blue table borders and printed labels are not marks. Black handwritten strokes inside the white mark area are marks.
+- Printed/template text, blue table borders, and printed Q labels are not marks. Black handwritten strokes inside the white mark area are marks.
+- Extract Q marks only from handwritten content inside each Q cell; never treat template content as a mark value.
 - Valid mark cells normally contain small values like 0, 1, 2, 0.5, or blanks. Preserve the exact numeric value as a string.
 - If a cell's configured max is 1, do not return "10" for a messy single stroke, overwritten stroke, grid-line overlap, or a mark that spills near a border. Return "1" only when the written mark is a one; return "0" only when it is a zero.
 - Never combine strokes from neighboring cells or printed Q labels into a two-digit mark.
@@ -1473,11 +1475,13 @@ def _build_missing_marks_recheck_prompt(
     return f"""
 You are doing a second OCR pass on the same exam tally sheet.
 The first pass left some question mark cells blank. Only inspect the target cells listed below.
+The attached image is one flattened canvas: a clean printed/template tally sheet underneath with imperfect black handwritten teacher marks written on top.
+Use the printed/template text, blue grid lines, and Q labels only to locate the target cells.
 
 Critical reading rules:
 - Read the physical mark cell below each target Q heading in the evaluator marks grid.
 - A single black vertical handwritten stroke inside the white mark area is the numeric mark "1".
-- Do not confuse black handwritten "1" marks with blue printed table borders.
+- Do not confuse black handwritten "1" marks with blue printed table borders, printed Q labels, or any other template content.
 - Do not shift values from neighboring cells. Each value must stay with its own Q heading.
 - If a target cell contains any visible handwritten mark, return the closest numeric value as a string, even if confidence is low.
 - If confidence is low, still return the best visible value and mention the cell in warnings.
