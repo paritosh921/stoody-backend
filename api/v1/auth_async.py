@@ -9,7 +9,7 @@ import mimetypes
 import os
 import re
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta
 from bson import ObjectId
 
 import jwt as pyjwt
@@ -36,17 +36,14 @@ from core.tenant_features import (
     merge_tenant_features,
 )
 from core.security import (
-    PasswordResetTokenManager,
     get_security_logger,
     get_password_validator,
-    SecurityEventType,
-    get_client_ip,
-    get_user_agent,
 )
-from core.email_service import get_email_service
+from core.password_reset_otp import PasswordResetOtpManager
+from core.transactional_email import send_password_reset_otp_email
 from core.cookie_auth import get_current_user_dual_auth, cookie_auth_manager
 from core.observability import record_auth_login
-from config_async import settings, PASSWORD_RESET_TOKEN_EXPIRE_MINUTES, JWT_SECRET_KEY, JWT_ALGORITHM
+from config_async import settings, JWT_SECRET_KEY, JWT_ALGORITHM
 
 # Security logger for audit trail
 security_logger = get_security_logger()
@@ -117,22 +114,26 @@ class TenantLookupResponse(BaseModel):
     institution_name: Optional[str] = None
     status: Optional[str] = None
 
-# Secure Password Reset Models
-class PasswordResetRequestModel(BaseModel):
-    """Request a password reset link via email"""
+class StudentPasswordResetOtpRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    date_of_birth: str
+    phone: str
+    tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
+
+
+class RolePasswordResetOtpRequest(BaseModel):
     email: EmailStr
     tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
-class PasswordResetVerifyRequest(BaseModel):
-    """Verify a password reset token is valid"""
-    token: str = Field(..., min_length=32)
 
-class PasswordResetCompleteRequest(BaseModel):
-    """Complete password reset with new password"""
-    token: str = Field(..., min_length=32)
+class StudentPasswordResetOtpCompleteRequest(StudentPasswordResetOtpRequest):
+    otp: str = Field(..., min_length=6, max_length=8)
     new_password: str = Field(..., min_length=8, max_length=72)
-    institution_name: Optional[str] = None
-    status: Optional[str] = None
+
+
+class RolePasswordResetOtpCompleteRequest(RolePasswordResetOtpRequest):
+    otp: str = Field(..., min_length=6, max_length=8)
+    new_password: str = Field(..., min_length=8, max_length=72)
 
 # Dependency injection
 async def get_database(request: Request) -> DatabaseManager:
@@ -198,6 +199,111 @@ async def _get_tenant_db_from_user(
     if not db_name:
         return None
     return await db.get_tenant_db(db_name)
+
+
+def _password_reset_otp_manager() -> PasswordResetOtpManager:
+    return PasswordResetOtpManager(
+        length=settings.PASSWORD_RESET_OTP_LENGTH,
+        expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
+        max_attempts=settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS,
+    )
+
+
+def _generic_otp_request_response() -> Dict[str, Any]:
+    return {
+        "success": True,
+        "message": "If the account information matches, a password reset code has been sent to the registered email.",
+    }
+
+
+async def _insert_password_reset_otp(
+    tenant_db,
+    *,
+    user: Dict[str, Any],
+    role: str,
+    tenant_id: str,
+    username: str,
+) -> None:
+    user_email = (user.get("email") or "").strip().lower()
+    if not user_email:
+        return
+    if not await _can_issue_password_reset_otp(
+        tenant_db,
+        user_id=str(user["_id"]),
+        role=role,
+        tenant_id=tenant_id,
+    ):
+        return
+    manager = _password_reset_otp_manager()
+    created = manager.create_otp_record(
+        user_id=str(user["_id"]),
+        email=user_email,
+        role=role,
+        tenant_id=tenant_id,
+    )
+    await tenant_db["password_reset_otps"].insert_one(created["record"])
+    await send_password_reset_otp_email(
+        to_email=user_email,
+        otp=created["otp"],
+        username=username,
+        role=role,
+        expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
+    )
+
+
+async def _find_latest_password_reset_otp(tenant_db, *, user_id: str, role: str, tenant_id: str):
+    return await tenant_db["password_reset_otps"].find_one(
+        {
+            "user_id": user_id,
+            "role": role,
+            "tenant_id": tenant_id,
+            "used": False,
+        },
+        sort=[("created_at", -1)],
+    )
+
+
+async def _can_issue_password_reset_otp(tenant_db, *, user_id: str, role: str, tenant_id: str) -> bool:
+    collection = tenant_db["password_reset_otps"]
+    now = datetime.utcnow()
+    base_query = {
+        "user_id": user_id,
+        "role": role,
+        "tenant_id": tenant_id,
+    }
+    latest = await collection.find_one(base_query, sort=[("created_at", -1)])
+    created_at = latest.get("created_at") if latest else None
+    cooldown_seconds = max(0, int(settings.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS))
+    if created_at and cooldown_seconds and now - created_at < timedelta(seconds=cooldown_seconds):
+        return False
+
+    max_per_hour = max(0, int(settings.PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR))
+    if max_per_hour:
+        recent_count = await collection.count_documents({
+            **base_query,
+            "created_at": {"$gte": now - timedelta(hours=1)},
+        })
+        if recent_count >= max_per_hour:
+            return False
+
+    return True
+
+
+async def _mark_otp_attempt(tenant_db, record: Dict[str, Any], *, used: bool = False) -> None:
+    update: Dict[str, Any] = {"$inc": {"attempts": 1}}
+    if used:
+        update["$set"] = {"used": True, "used_at": datetime.utcnow()}
+    await tenant_db["password_reset_otps"].update_one({"_id": record["_id"]}, update)
+
+
+def _validate_new_password(new_password: str) -> None:
+    password_validator = get_password_validator()
+    is_valid, errors = password_validator.validate(new_password)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"message": "Password does not meet requirements", "errors": errors},
+        )
 
 
 async def _get_enabled_features_for_tenant(
@@ -704,6 +810,227 @@ async def admin_change_password(
         )
 
 
+@router.post("/student/password-reset/request")
+@limiter.limit("3/hour")
+async def request_student_password_reset_otp(
+    request: Request,
+    reset_data: StudentPasswordResetOtpRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    """Request a student password reset OTP using student-only identity fields."""
+    tenant_id = normalize_tenant_id(reset_data.tenant_id)
+    tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
+    tenant_db = await _get_tenant_db_or_503(db, tenant)
+    normalized_username = reset_data.username.strip()
+    username_lower = normalized_username.lower()
+
+    student = await tenant_db["students"].find_one({"username_lower": username_lower})
+    if not student:
+        student = await tenant_db["students"].find_one(
+            {"username": normalized_username},
+            collation={"locale": "en", "strength": 2},
+        )
+
+    if (
+        student
+        and student.get("is_active", True)
+        and student.get("date_of_birth") == reset_data.date_of_birth
+        and student.get("phone") == reset_data.phone
+    ):
+        await _insert_password_reset_otp(
+            tenant_db,
+            user=student,
+            role="student",
+            tenant_id=tenant_id,
+            username=student.get("username") or normalized_username,
+        )
+
+    return _generic_otp_request_response()
+
+
+@router.post("/tutor/password-reset/request")
+@limiter.limit("3/hour")
+async def request_tutor_password_reset_otp(
+    request: Request,
+    reset_data: RolePasswordResetOtpRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    """Request a tutor password reset OTP. Searches tutors only."""
+    tenant_id = normalize_tenant_id(reset_data.tenant_id)
+    tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
+    tenant_db = await _get_tenant_db_or_503(db, tenant)
+    email_lower = reset_data.email.lower().strip()
+    tutor = await tenant_db["tutors"].find_one({"email": email_lower, "is_active": True})
+    if tutor:
+        await _insert_password_reset_otp(
+            tenant_db,
+            user=tutor,
+            role="tutor",
+            tenant_id=tenant_id,
+            username=tutor.get("full_name") or tutor.get("username") or email_lower,
+        )
+    return _generic_otp_request_response()
+
+
+@router.post("/admin/password-reset/request")
+@limiter.limit("3/hour")
+async def request_admin_password_reset_otp(
+    request: Request,
+    reset_data: RolePasswordResetOtpRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    """Request an admin password reset OTP. Searches admins only."""
+    tenant_id = normalize_tenant_id(reset_data.tenant_id)
+    tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
+    tenant_db = await _get_tenant_db_or_503(db, tenant)
+    email_lower = reset_data.email.lower().strip()
+    admin = await tenant_db["admins"].find_one({"email": email_lower, "is_active": True})
+    if admin:
+        await _insert_password_reset_otp(
+            tenant_db,
+            user=admin,
+            role="admin",
+            tenant_id=tenant_id,
+            username=admin.get("full_name") or admin.get("username") or email_lower,
+        )
+    return _generic_otp_request_response()
+
+
+@router.post("/student/password-reset/complete")
+@limiter.limit("5/minute")
+async def complete_student_password_reset_otp(
+    request: Request,
+    reset_data: StudentPasswordResetOtpCompleteRequest,
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    """Complete a student password reset with OTP and a new password."""
+    _validate_new_password(reset_data.new_password)
+    tenant_id = normalize_tenant_id(reset_data.tenant_id)
+    tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
+    tenant_db = await _get_tenant_db_or_503(db, tenant)
+    normalized_username = reset_data.username.strip()
+    username_lower = normalized_username.lower()
+    student = await tenant_db["students"].find_one({"username_lower": username_lower})
+    if not student:
+        student = await tenant_db["students"].find_one(
+            {"username": normalized_username},
+            collation={"locale": "en", "strength": 2},
+        )
+    if (
+        not student
+        or not student.get("is_active", True)
+        or student.get("date_of_birth") != reset_data.date_of_birth
+        or student.get("phone") != reset_data.phone
+    ):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+
+    record = await _find_latest_password_reset_otp(
+        tenant_db,
+        user_id=str(student["_id"]),
+        role="student",
+        tenant_id=tenant_id,
+    )
+    manager = _password_reset_otp_manager()
+    valid, reason = manager.validate_record(record, reset_data.otp)
+    if not valid:
+        if record and reason == "invalid_otp":
+            await _mark_otp_attempt(tenant_db, record)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+
+    password_hash = auth_manager.get_password_hash(reset_data.new_password)
+    await tenant_db["students"].update_one(
+        {"_id": student["_id"]},
+        {"$set": {
+            "password_hash": password_hash,
+            "password_changed_at": datetime.utcnow(),
+            "password_reset_requested": False,
+            "requires_password_change": False,
+        }},
+    )
+    await _mark_otp_attempt(tenant_db, record, used=True)
+    return {"success": True, "message": "Password reset successfully"}
+
+
+async def _complete_role_password_reset_otp(
+    *,
+    request: Request,
+    reset_data: RolePasswordResetOtpCompleteRequest,
+    db: DatabaseManager,
+    auth_manager: AuthManager,
+    role: str,
+):
+    _validate_new_password(reset_data.new_password)
+    tenant_id = normalize_tenant_id(reset_data.tenant_id)
+    tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
+    tenant_db = await _get_tenant_db_or_503(db, tenant)
+    collection_name = "tutors" if role == "tutor" else "admins"
+    email_lower = reset_data.email.lower().strip()
+    user = await tenant_db[collection_name].find_one({"email": email_lower, "is_active": True})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+
+    record = await _find_latest_password_reset_otp(
+        tenant_db,
+        user_id=str(user["_id"]),
+        role=role,
+        tenant_id=tenant_id,
+    )
+    manager = _password_reset_otp_manager()
+    valid, reason = manager.validate_record(record, reset_data.otp)
+    if not valid:
+        if record and reason == "invalid_otp":
+            await _mark_otp_attempt(tenant_db, record)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+
+    password_hash = auth_manager.get_password_hash(reset_data.new_password)
+    await tenant_db[collection_name].update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "password_hash": password_hash,
+            "password_changed_at": datetime.utcnow(),
+            "password_reset_requested": False,
+            "requires_password_change": False,
+        }},
+    )
+    await _mark_otp_attempt(tenant_db, record, used=True)
+    return {"success": True, "message": "Password reset successfully"}
+
+
+@router.post("/tutor/password-reset/complete")
+@limiter.limit("5/minute")
+async def complete_tutor_password_reset_otp(
+    request: Request,
+    reset_data: RolePasswordResetOtpCompleteRequest,
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    return await _complete_role_password_reset_otp(
+        request=request,
+        reset_data=reset_data,
+        db=db,
+        auth_manager=auth_manager,
+        role="tutor",
+    )
+
+
+@router.post("/admin/password-reset/complete")
+@limiter.limit("5/minute")
+async def complete_admin_password_reset_otp(
+    request: Request,
+    reset_data: RolePasswordResetOtpCompleteRequest,
+    db: DatabaseManager = Depends(get_database),
+    auth_manager: AuthManager = Depends(get_auth_manager),
+):
+    return await _complete_role_password_reset_otp(
+        request=request,
+        reset_data=reset_data,
+        db=db,
+        auth_manager=auth_manager,
+        role="admin",
+    )
+
+
 @router.post("/student/forgot-password")
 @limiter.limit("3/hour")
 async def student_forgot_password(
@@ -767,445 +1094,6 @@ async def student_forgot_password(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process request"
-        )
-
-
-# =============================================================================
-# SECURE PASSWORD RESET ENDPOINTS (Token-Based)
-# =============================================================================
-
-@router.post("/password-reset/request")
-@limiter.limit("3/hour")
-async def request_password_reset(
-    request: Request,
-    reset_data: PasswordResetRequestModel,
-    db: DatabaseManager = Depends(get_database)
-):
-    """
-    Request a password reset link via email.
-
-    Security features:
-    - Rate limited to 3 requests per hour per IP
-    - Sends email with time-limited, single-use token
-    - Generic response to prevent email enumeration
-    - Logs all reset requests for security audit
-    """
-    ip_address = get_client_ip(request)
-    user_agent = get_user_agent(request)
-
-    try:
-        tenant_id = normalize_tenant_id(reset_data.tenant_id)
-        tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
-        tenant_db = await _get_tenant_db_or_503(db, tenant)
-
-        # Look up user by email (check admins, then students)
-        email_lower = reset_data.email.lower().strip()
-        user = None
-        user_type = None
-        collection_name = None
-
-        # Check admins
-        admin = await tenant_db["admins"].find_one({"email": email_lower, "is_active": True})
-        if admin:
-            user = admin
-            user_type = "admin"
-            collection_name = "admins"
-
-        # Check students if not found in admins
-        if not user:
-            student = await tenant_db["students"].find_one({"email": email_lower, "is_active": True})
-            if student:
-                user = student
-                user_type = "student"
-                collection_name = "students"
-
-        # Check tutors if not found
-        if not user:
-            tutor = await tenant_db["tutors"].find_one({"email": email_lower, "is_active": True})
-            if tutor:
-                user = tutor
-                user_type = "tutor"
-                collection_name = "tutors"
-
-        # Generic response to prevent email enumeration
-        generic_response = {
-            "success": True,
-            "message": "If an account with this email exists, you will receive a password reset link shortly."
-        }
-
-        if not user:
-            # Log failed attempt for security monitoring
-            security_logger.log_event(
-                event_type=SecurityEventType.PASSWORD_RESET_REQUEST,
-                email=reset_data.email,
-                ip_address=ip_address,
-                user_agent=user_agent,
-                tenant_id=tenant_id,
-                success=False,
-                details={"reason": "email_not_found"}
-            )
-            return generic_response
-
-        # Check if user has email
-        user_email = user.get("email")
-        if not user_email:
-            security_logger.log_event(
-                event_type=SecurityEventType.PASSWORD_RESET_REQUEST,
-                user_id=str(user["_id"]),
-                ip_address=ip_address,
-                tenant_id=tenant_id,
-                success=False,
-                details={"reason": "no_email_on_account"}
-            )
-            return generic_response
-
-        # Generate secure reset token
-        token_manager = PasswordResetTokenManager(expire_minutes=PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
-        reset_data = token_manager.create_reset_record(
-            user_id=str(user["_id"]),
-            email=user_email
-        )
-
-        # Store reset record in database
-        reset_record = reset_data["record"]
-        reset_record["user_type"] = user_type
-        reset_record["tenant_id"] = tenant_id
-        reset_record["ip_address"] = ip_address
-        reset_record["user_agent"] = user_agent
-
-        await tenant_db["password_reset_tokens"].insert_one(reset_record)
-
-        # Send reset email
-        email_service = get_email_service()
-        username = user.get("username") or user.get("full_name") or user.get("email", "User")
-
-        frontend_url = tenant.get("frontend_url") or "https://app.stoody.in"
-        email_sent = await email_service.send_password_reset_email(
-            to_email=user_email,
-            reset_token=reset_data["token"],
-            username=username,
-            frontend_url=frontend_url,
-            expire_minutes=PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
-        )
-
-        # Log the request
-        security_logger.log_event(
-            event_type=SecurityEventType.PASSWORD_RESET_REQUEST,
-            user_id=str(user["_id"]),
-            email=user_email,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            tenant_id=tenant_id,
-            success=email_sent,
-            details={"user_type": user_type, "email_sent": email_sent}
-        )
-
-        logger.info(f"Password reset requested for {user_type}: {user_email}")
-
-        return generic_response
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Password reset request error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process password reset request"
-        )
-
-
-@router.post("/password-reset/verify")
-@limiter.limit("10/minute")
-async def verify_password_reset_token(
-    request: Request,
-    verify_data: PasswordResetVerifyRequest,
-    db: DatabaseManager = Depends(get_database)
-):
-    """
-    Verify if a password reset token is valid.
-
-    Used by frontend to check token before showing reset form.
-    """
-    try:
-        # Get master DB to search across tenants (or use request context)
-        subdomain = getattr(request.state, "subdomain", None)
-        tenant = None
-
-        if subdomain:
-            tenant = await get_tenant_by_subdomain(db, subdomain)
-
-        if not tenant:
-            # Try to find token across all tenants (expensive but necessary for email links)
-            master_db = await db.get_master_db()
-            if master_db is None:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Service unavailable"
-                )
-
-            # Get all active tenants and search for the token
-            tenants = await master_db["tenants"].find({"status": "active"}).to_list(length=1000)
-
-            token_manager = PasswordResetTokenManager()
-            token_hash = token_manager.hash_token(verify_data.token)
-
-            for t in tenants:
-                db_name = t.get("db_name")
-                if not db_name:
-                    continue
-
-                tenant_db = await db.get_tenant_db(db_name)
-                if tenant_db is None:
-                    continue
-
-                reset_record = await tenant_db["password_reset_tokens"].find_one({
-                    "token_hash": token_hash
-                })
-
-                if reset_record:
-                    is_valid, reason = token_manager.is_token_valid(reset_record)
-                    if is_valid:
-                        return {
-                            "success": True,
-                            "valid": True,
-                            "message": "Token is valid",
-                            "expires_in_minutes": max(0, int(
-                                (reset_record["expires_at"] - datetime.utcnow()).total_seconds() / 60
-                            ))
-                        }
-                    else:
-                        return {
-                            "success": True,
-                            "valid": False,
-                            "message": reason
-                        }
-
-            return {
-                "success": True,
-                "valid": False,
-                "message": "Invalid or expired reset token"
-            }
-
-        # Tenant found via subdomain
-        tenant_db = await db.get_tenant_db(tenant.get("db_name"))
-        if tenant_db is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Tenant database not available"
-            )
-
-        token_manager = PasswordResetTokenManager()
-        token_hash = token_manager.hash_token(verify_data.token)
-
-        reset_record = await tenant_db["password_reset_tokens"].find_one({
-            "token_hash": token_hash
-        })
-
-        if not reset_record:
-            return {
-                "success": True,
-                "valid": False,
-                "message": "Invalid or expired reset token"
-            }
-
-        is_valid, reason = token_manager.is_token_valid(reset_record)
-
-        return {
-            "success": True,
-            "valid": is_valid,
-            "message": "Token is valid" if is_valid else reason,
-            "expires_in_minutes": max(0, int(
-                (reset_record["expires_at"] - datetime.utcnow()).total_seconds() / 60
-            )) if is_valid else 0
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Token verification error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to verify token"
-        )
-
-
-@router.post("/password-reset/complete")
-@limiter.limit("5/minute")
-async def complete_password_reset(
-    request: Request,
-    reset_data: PasswordResetCompleteRequest,
-    db: DatabaseManager = Depends(get_database),
-    auth_manager: AuthManager = Depends(get_auth_manager)
-):
-    """
-    Complete password reset with new password.
-
-    Security features:
-    - Validates password strength
-    - Marks token as used (single-use)
-    - Sends confirmation email
-    - Logs password change for audit
-    """
-    ip_address = get_client_ip(request)
-    user_agent = get_user_agent(request)
-
-    try:
-        # Validate new password
-        password_validator = get_password_validator()
-        is_valid, errors = password_validator.validate(reset_data.new_password)
-
-        if not is_valid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "message": "Password does not meet requirements",
-                    "errors": errors
-                }
-            )
-
-        # Find the reset token across tenants
-        master_db = await db.get_master_db()
-        if master_db is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Service unavailable"
-            )
-
-        tenants = await master_db["tenants"].find({"status": "active"}).to_list(length=1000)
-
-        token_manager = PasswordResetTokenManager()
-        token_hash = token_manager.hash_token(reset_data.token)
-
-        reset_record = None
-        tenant_db = None
-        tenant_info = None
-
-        for t in tenants:
-            db_name = t.get("db_name")
-            if not db_name:
-                continue
-
-            tdb = await db.get_tenant_db(db_name)
-            if tdb is None:
-                continue
-
-            record = await tdb["password_reset_tokens"].find_one({
-                "token_hash": token_hash
-            })
-
-            if record:
-                reset_record = record
-                tenant_db = tdb
-                tenant_info = t
-                break
-
-        if not reset_record:
-            security_logger.log_event(
-                event_type=SecurityEventType.PASSWORD_RESET_COMPLETE,
-                ip_address=ip_address,
-                success=False,
-                details={"reason": "invalid_token"}
-            )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid or expired reset token"
-            )
-
-        # Validate token
-        is_valid, reason = token_manager.is_token_valid(reset_record)
-        if not is_valid:
-            security_logger.log_event(
-                event_type=SecurityEventType.PASSWORD_RESET_COMPLETE,
-                user_id=reset_record.get("user_id"),
-                ip_address=ip_address,
-                success=False,
-                details={"reason": reason}
-            )
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=reason
-            )
-
-        # Get user info
-        user_id = reset_record["user_id"]
-        user_type = reset_record.get("user_type", "student")
-        collection_name = {
-            "admin": "admins",
-            "student": "students",
-            "tutor": "tutors"
-        }.get(user_type, "students")
-
-        user = await tenant_db[collection_name].find_one({"_id": ObjectId(user_id)})
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="User account not found"
-            )
-
-        # Hash new password
-        new_password_hash = auth_manager.get_password_hash(reset_data.new_password)
-
-        # Update password
-        await tenant_db[collection_name].update_one(
-            {"_id": ObjectId(user_id)},
-            {"$set": {
-                "password_hash": new_password_hash,
-                "password_changed_at": datetime.utcnow(),
-                "password_reset_requested": False,
-                "requires_password_change": False
-            }}
-        )
-
-        # Mark token as used
-        await tenant_db["password_reset_tokens"].update_one(
-            {"_id": reset_record["_id"]},
-            {"$set": {
-                "used": True,
-                "used_at": datetime.utcnow(),
-                "used_ip": ip_address
-            }}
-        )
-
-        # Invalidate any existing sessions for security
-        await auth_manager.invalidate_user_session(user_id)
-
-        # Send confirmation email
-        email_service = get_email_service()
-        user_email = user.get("email")
-        username = user.get("username") or user.get("full_name") or "User"
-
-        if user_email:
-            await email_service.send_password_changed_notification(
-                to_email=user_email,
-                username=username
-            )
-
-        # Log successful reset
-        security_logger.log_event(
-            event_type=SecurityEventType.PASSWORD_RESET_COMPLETE,
-            user_id=user_id,
-            email=user_email,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            tenant_id=tenant_info.get("tenant_id") if tenant_info else None,
-            success=True,
-            details={"user_type": user_type}
-        )
-
-        logger.info(f"Password reset completed for {user_type}: {user_id}")
-
-        return {
-            "success": True,
-            "message": "Password has been reset successfully. You can now log in with your new password."
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Password reset completion error: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to reset password"
         )
 
 

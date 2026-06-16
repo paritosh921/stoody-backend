@@ -282,8 +282,20 @@ class AsyncSettings(BaseSettings):
     PASSWORD_REQUIRE_SPECIAL: bool = os.getenv("PASSWORD_REQUIRE_SPECIAL", "false").lower() == "true"
 
     # Password Reset Configuration
-    PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", 30))
     PASSWORD_RESET_RATE_LIMIT: str = os.getenv("PASSWORD_RESET_RATE_LIMIT", "3/hour")
+    PASSWORD_RESET_OTP_LENGTH: int = int(os.getenv("PASSWORD_RESET_OTP_LENGTH", 6))
+    PASSWORD_RESET_OTP_EXPIRE_MINUTES: int = int(os.getenv("PASSWORD_RESET_OTP_EXPIRE_MINUTES", 10))
+    PASSWORD_RESET_OTP_MAX_ATTEMPTS: int = int(os.getenv("PASSWORD_RESET_OTP_MAX_ATTEMPTS", 3))
+    PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS: int = int(os.getenv("PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS", 60))
+    PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR: int = int(os.getenv("PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR", 3))
+
+    # Transactional Email Provider
+    EMAIL_PROVIDER: str = os.getenv("EMAIL_PROVIDER", "smtp")
+    RESEND_API_KEY: str = os.getenv("RESEND_API_KEY", "")
+    RESEND_API_BASE_URL: str = os.getenv("RESEND_API_BASE_URL", "https://api.resend.com")
+    EMAIL_FROM_ADDRESS: str = os.getenv("EMAIL_FROM_ADDRESS", os.getenv("SMTP_FROM_EMAIL", "noreply@stoody.in"))
+    EMAIL_FROM_NAME: str = os.getenv("EMAIL_FROM_NAME", os.getenv("SMTP_FROM_NAME", "Stoody"))
+    EMAIL_REPLY_TO: str = os.getenv("EMAIL_REPLY_TO", "")
 
     # Super Admin Configuration
     SUPERADMIN_SETUP_KEY: str = os.getenv("SUPERADMIN_SETUP_KEY", "")
@@ -401,8 +413,6 @@ JWT_ALGORITHM = settings.JWT_ALGORITHM
 # Password configuration
 PASSWORD_MIN_LENGTH = settings.PASSWORD_MIN_LENGTH
 PASSWORD_MAX_LENGTH = settings.PASSWORD_MAX_LENGTH
-PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = settings.PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
-
 # Email configuration
 SMTP_HOST = settings.SMTP_HOST
 SMTP_PORT = settings.SMTP_PORT

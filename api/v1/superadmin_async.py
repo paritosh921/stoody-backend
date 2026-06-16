@@ -25,6 +25,8 @@ from pydantic import BaseModel, EmailStr, Field
 from config_async import settings
 from core.auth import AuthManager
 from core.database import DatabaseManager
+from core.password_reset_otp import PasswordResetOtpManager
+from core.transactional_email import send_password_reset_otp_email
 from core.token_blacklist import revoke_user_session
 from core.tenant_features import (
     LEGACY_DEFAULT_TENANT_FEATURES,
@@ -85,6 +87,12 @@ class SuperAdminPasswordResetRequest(BaseModel):
 class SuperAdminPasswordResetRequestResponse(BaseModel):
     success: bool = True
     message: str
+
+
+class SuperAdminPasswordResetCompleteRequest(BaseModel):
+    email: EmailStr
+    otp: str = Field(..., min_length=6, max_length=8)
+    new_password: str = Field(..., min_length=8, max_length=72)
 
 
 class TempTokenRequest(BaseModel):
@@ -741,29 +749,125 @@ async def superadmin_login(
     return await _complete_superadmin_login(master_db, admin)
 
 
-@router.post("/password/request-reset", response_model=SuperAdminPasswordResetRequestResponse)
-async def request_superadmin_password_reset(
+def _superadmin_otp_manager() -> PasswordResetOtpManager:
+    return PasswordResetOtpManager(
+        length=settings.PASSWORD_RESET_OTP_LENGTH,
+        expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
+        max_attempts=settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS,
+    )
+
+
+async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -> bool:
+    collection = master_db["password_reset_otps"]
+    now = datetime.utcnow()
+    base_query = {
+        "user_id": user_id,
+        "role": "superadmin",
+        "tenant_id": None,
+    }
+    latest = await collection.find_one(base_query, sort=[("created_at", -1)])
+    created_at = latest.get("created_at") if latest else None
+    cooldown_seconds = max(0, int(settings.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS))
+    if created_at and cooldown_seconds and now - created_at < timedelta(seconds=cooldown_seconds):
+        return False
+
+    max_per_hour = max(0, int(settings.PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR))
+    if max_per_hour:
+        recent_count = await collection.count_documents({
+            **base_query,
+            "created_at": {"$gte": now - timedelta(hours=1)},
+        })
+        if recent_count >= max_per_hour:
+            return False
+
+    return True
+
+
+@router.post("/password-reset/request", response_model=SuperAdminPasswordResetRequestResponse)
+async def request_superadmin_password_reset_otp(
     request: SuperAdminPasswordResetRequest,
     db: DatabaseManager = Depends(get_database),
 ):
     master_db = await get_master_db_or_503(db)
     email = request.email.strip().lower()
     admin = await master_db["super_admins"].find_one({"email": email})
-    if admin:
-        await master_db["super_admins"].update_one(
-            {"_id": admin["_id"]},
-            {
-                "$set": {
-                    "password_reset_requested": True,
-                    "password_reset_requested_at": datetime.utcnow(),
-                    "updated_at": datetime.utcnow(),
-                }
-            },
+    if admin and admin.get("status", "active") == "active" and admin.get("is_active", True):
+        if not await _can_issue_superadmin_password_reset_otp(master_db, user_id=str(admin["_id"])):
+            return SuperAdminPasswordResetRequestResponse(
+                message="If the account exists, a password reset code has been sent to the registered email."
+            )
+        manager = _superadmin_otp_manager()
+        created = manager.create_otp_record(
+            user_id=str(admin["_id"]),
+            email=admin["email"],
+            role="superadmin",
+            tenant_id=None,
+        )
+        await master_db["password_reset_otps"].insert_one(created["record"])
+        await send_password_reset_otp_email(
+            to_email=admin["email"],
+            otp=created["otp"],
+            username=admin.get("name") or admin.get("email", "Super Admin"),
+            role="superadmin",
+            expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
         )
 
     return SuperAdminPasswordResetRequestResponse(
-        message="If the account exists, the password reset request has been recorded for platform review."
+        message="If the account exists, a password reset code has been sent to the registered email."
     )
+
+
+@router.post("/password-reset/complete", response_model=SuperAdminPasswordResetRequestResponse)
+async def complete_superadmin_password_reset_otp(
+    request: SuperAdminPasswordResetCompleteRequest,
+    db: DatabaseManager = Depends(get_database),
+):
+    master_db = await get_master_db_or_503(db)
+    email = request.email.strip().lower()
+    admin = await master_db["super_admins"].find_one({"email": email})
+    if not admin or admin.get("status", "active") != "active" or not admin.get("is_active", True):
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    record = await master_db["password_reset_otps"].find_one(
+        {
+            "user_id": str(admin["_id"]),
+            "role": "superadmin",
+            "tenant_id": None,
+            "used": False,
+        },
+        sort=[("created_at", -1)],
+    )
+    manager = _superadmin_otp_manager()
+    valid, reason = manager.validate_record(record, request.otp)
+    if not valid:
+        if record and reason == "invalid_otp":
+            await master_db["password_reset_otps"].update_one(
+                {"_id": record["_id"]},
+                {"$inc": {"attempts": 1}},
+            )
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    await master_db["super_admins"].update_one(
+        {"_id": admin["_id"]},
+        {
+            "$set": {
+                "password_hash": pwd_context.hash(request.new_password),
+                "requires_password_change": False,
+                "password_changed_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+                "password_reset_requested": False,
+            },
+            "$unset": {
+                "temp_password": "",
+                "password_reset_requested_at": "",
+            },
+        },
+    )
+    await master_db["password_reset_otps"].update_one(
+        {"_id": record["_id"]},
+        {"$inc": {"attempts": 1}, "$set": {"used": True, "used_at": datetime.utcnow()}},
+    )
+    return SuperAdminPasswordResetRequestResponse(message="Password reset successfully")
 
 
 @router.post("/password/change", response_model=SuperAdminAuthResponse)

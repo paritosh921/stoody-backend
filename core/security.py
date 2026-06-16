@@ -11,11 +11,9 @@ Production-grade security implementations.
 """
 
 import re
-import secrets
-import hashlib
 import hmac
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from functools import wraps
 
@@ -650,95 +648,6 @@ def get_security_logger() -> SecurityLogger:
     """Get configured security logger instance"""
     from config_async import SECURITY_LOG_ENABLED, SECURITY_LOG_FILE
     return SecurityLogger(enabled=SECURITY_LOG_ENABLED, log_file=SECURITY_LOG_FILE)
-
-
-# =============================================================================
-# PASSWORD RESET TOKENS
-# =============================================================================
-
-class PasswordResetTokenManager:
-    """
-    Manages secure password reset tokens.
-
-    Features:
-    - Cryptographically secure token generation
-    - Time-limited validity
-    - One-time use enforcement
-    - Rate limiting per user
-    """
-
-    def __init__(self, expire_minutes: int = 30):
-        self.expire_minutes = expire_minutes
-
-    def generate_token(self) -> str:
-        """
-        Generate a cryptographically secure reset token.
-
-        Returns 64-character URL-safe token (256 bits of entropy)
-        """
-        return secrets.token_urlsafe(48)
-
-    def hash_token(self, token: str) -> str:
-        """
-        Hash a token for secure storage.
-
-        We store the hash, not the plain token, similar to password storage.
-        """
-        return hashlib.sha256(token.encode()).hexdigest()
-
-    def verify_token(self, token: str, stored_hash: str) -> bool:
-        """Verify a token against its stored hash"""
-        return hmac.compare_digest(
-            self.hash_token(token),
-            stored_hash
-        )
-
-    def create_reset_record(self, user_id: str, email: str) -> Dict[str, Any]:
-        """
-        Create a password reset record for database storage.
-
-        Returns:
-            Dict with token (to send to user) and record (to store in DB)
-        """
-        token = self.generate_token()
-        token_hash = self.hash_token(token)
-
-        record = {
-            "user_id": user_id,
-            "email": email,
-            "token_hash": token_hash,
-            "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(minutes=self.expire_minutes),
-            "used": False,
-            "used_at": None,
-        }
-
-        return {
-            "token": token,  # Send this to user (via email)
-            "record": record,  # Store this in database
-        }
-
-    def is_token_valid(self, record: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Check if a reset token record is still valid.
-
-        Returns:
-            Tuple of (is_valid, reason_if_invalid)
-        """
-        if not record:
-            return False, "Invalid reset token"
-
-        if record.get("used"):
-            return False, "Reset token has already been used"
-
-        expires_at = record.get("expires_at")
-        if not expires_at:
-            return False, "Invalid reset token"
-
-        if datetime.utcnow() > expires_at:
-            return False, "Reset token has expired"
-
-        return True, ""
 
 
 # =============================================================================
