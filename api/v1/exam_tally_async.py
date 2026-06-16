@@ -66,11 +66,19 @@ class TallyDocumentContext(BaseModel):
     question_map: List[TallyQuestionMapItem] = Field(default_factory=list)
 
 
+class TallyOcrImage(BaseModel):
+    label: str
+    image_b64: str = Field(..., description="PNG data URL or raw base64")
+    description: Optional[str] = None
+
+
 class TallyExtractRequest(BaseModel):
-    image_b64: str = Field(..., description="Full-page canvas PNG data URL or raw base64")
+    image_b64: Optional[str] = Field(None, description="Legacy full-page canvas PNG data URL or raw base64")
+    images: List[TallyOcrImage] = Field(default_factory=list)
     document: Optional[TallyDocumentContext] = None
     student: Optional[TallyStudentContext] = None
     copy_id: Optional[str] = None
+    debug: bool = False
 
 
 class TallyValidationIssue(BaseModel):
@@ -84,6 +92,16 @@ class TallyValidationIssue(BaseModel):
     actual: Optional[str] = None
 
 
+class TallyExtractDebugResponse(BaseModel):
+    prompt: Optional[str] = None
+    raw_text: Optional[str] = None
+    provider: Optional[str] = None
+    recheck_prompt: Optional[str] = None
+    recheck_raw_text: Optional[str] = None
+    recheck_provider: Optional[str] = None
+    image_labels: List[str] = Field(default_factory=list)
+
+
 class TallyExtractResponse(BaseModel):
     success: bool
     extraction_id: str
@@ -93,6 +111,7 @@ class TallyExtractResponse(BaseModel):
     validation_issues: List[TallyValidationIssue] = Field(default_factory=list)
     confidence: Optional[float] = None
     raw_text: Optional[str] = None
+    debug: Optional[TallyExtractDebugResponse] = None
 
 
 class TallyExportRequest(BaseModel):
@@ -1409,10 +1428,24 @@ def _build_prompt(payload: TallyExtractRequest) -> str:
         "copy_id": payload.copy_id,
         "question_context": question_context,
     }
-    return f"""
+    image_instructions = (
+        """
+You are reading three labeled OCR images from the same exam tally sheet:
+- template: the clean printed tally template. Use it only to understand the layout, headings, blue grid lines, and Q cell positions.
+- filled_sheet: the template plus the teacher's handwritten marks.
+- strokes_only: only the teacher's handwritten strokes on a white background, rendered in high contrast.
+
+Compare filled_sheet against template to identify handwritten content. If a mark is unclear in filled_sheet, use strokes_only to decide what was written. Do not treat anything that exists only in template as a handwritten mark.
+""".strip()
+        if payload.images
+        else """
 You are reading one flattened image exported from a digital canvas.
 The image contains a clean printed/template tally sheet underneath and imperfect black handwritten teacher marks written on top.
 Use the printed/template text, blue grid lines, and Q labels only to locate the correct cells.
+""".strip()
+    )
+    return f"""
+{image_instructions}
 This is an exam tally marks grid, not a generic spreadsheet. The important cells are the evaluator marks under Q1, Q2, Q3... headings.
 
 Task:
@@ -1472,11 +1505,25 @@ def _build_missing_marks_recheck_prompt(
         "question_context": _format_ocr_question_context(document),
         "targets": targets,
     }
+    image_instructions = (
+        """
+The attached OCR inputs are labeled images from the same tally sheet:
+- template: clean printed layout only.
+- filled_sheet: template plus handwritten marks.
+- strokes_only: handwritten strokes only on white background.
+
+Use template to locate the target cells, filled_sheet to read them, and strokes_only to resolve faint or messy handwriting.
+""".strip()
+        if payload.images
+        else """
+The attached image is one flattened canvas: a clean printed/template tally sheet underneath with imperfect black handwritten teacher marks written on top.
+Use the printed/template text, blue grid lines, and Q labels only to locate the target cells.
+""".strip()
+    )
     return f"""
 You are doing a second OCR pass on the same exam tally sheet.
 The first pass left some question mark cells blank. Only inspect the target cells listed below.
-The attached image is one flattened canvas: a clean printed/template tally sheet underneath with imperfect black handwritten teacher marks written on top.
-Use the printed/template text, blue grid lines, and Q labels only to locate the target cells.
+{image_instructions}
 
 Critical reading rules:
 - Read the physical mark cell below each target Q heading in the evaluator marks grid.
@@ -1575,6 +1622,57 @@ def _format_filled_recheck_ranges(filled_by_row: Dict[int, List[int]]) -> str:
         if label:
             parts.append(f"row {row_index + 1}: {label}")
     return "; ".join(parts)
+
+
+def _active_tally_ocr_images(payload: TallyExtractRequest) -> List[Dict[str, Any]]:
+    images: List[Dict[str, Any]] = []
+    for image in payload.images:
+        if image.image_b64:
+            images.append(image.model_dump(exclude_none=True))
+    return images
+
+
+def _primary_tally_ocr_image(payload: TallyExtractRequest) -> Optional[str]:
+    if payload.image_b64:
+        return payload.image_b64
+    preferred_labels = {"filled_sheet", "filled", "combined", "final"}
+    for image in payload.images:
+        if image.label in preferred_labels and image.image_b64:
+            return image.image_b64
+    for image in payload.images:
+        if image.image_b64:
+            return image.image_b64
+    return None
+
+
+async def _analyze_tally_ocr(
+    *,
+    tenant_db: Any,
+    payload: TallyExtractRequest,
+    prompt: str,
+    max_tokens: int,
+) -> Dict[str, Any]:
+    images = _active_tally_ocr_images(payload)
+    if images:
+        return await get_ocr_service().analyze_images(
+            images=images,
+            prompt=prompt,
+            tenant_db=tenant_db,
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+
+    primary_image = _primary_tally_ocr_image(payload)
+    if not primary_image:
+        raise HTTPException(status_code=400, detail="image_b64 or images are required")
+
+    return await get_ocr_service().analyze_image(
+        image_b64=primary_image,
+        prompt=prompt,
+        tenant_db=tenant_db,
+        max_tokens=max_tokens,
+        temperature=0.0,
+    )
 
 
 def _merge_rechecked_marks(
@@ -2234,21 +2332,30 @@ async def extract_tally(
     current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
-    if not payload.image_b64:
-        raise HTTPException(status_code=400, detail="image_b64 is required")
-    if len(payload.image_b64) > 12 * 1024 * 1024:
+    ocr_images = _active_tally_ocr_images(payload)
+    primary_image_b64 = _primary_tally_ocr_image(payload)
+    if not primary_image_b64:
+        raise HTTPException(status_code=400, detail="image_b64 or images are required")
+    if payload.image_b64 and len(payload.image_b64) > 12 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Canvas image too large")
+    total_image_bytes = 0
+    for image in payload.images:
+        image_size = len(image.image_b64 or "")
+        total_image_bytes += image_size
+        if image_size > 12 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"{image.label} image too large")
+    if total_image_bytes > 30 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Exam tally OCR images are too large")
 
     tenant_db = await _tenant_db(db, current_user)
     prompt = _build_prompt(payload)
 
     try:
-        result = await get_ocr_service().analyze_image(
-            image_b64=payload.image_b64,
-            prompt=prompt,
+        result = await _analyze_tally_ocr(
             tenant_db=tenant_db,
+            payload=payload,
+            prompt=prompt,
             max_tokens=4096,
-            temperature=0.0,
         )
     except Exception as exc:
         logger.exception("Exam tally extraction failed")
@@ -2268,15 +2375,16 @@ async def extract_tally(
     recheck_raw_text: Optional[str] = None
     recheck_provider: Optional[str] = None
     recheck_confidence: Optional[float] = None
+    recheck_prompt: Optional[str] = None
 
     if missing_by_row:
         try:
-            recheck_result = await get_ocr_service().analyze_image(
-                image_b64=payload.image_b64,
-                prompt=_build_missing_marks_recheck_prompt(payload, missing_by_row),
+            recheck_prompt = _build_missing_marks_recheck_prompt(payload, missing_by_row)
+            recheck_result = await _analyze_tally_ocr(
                 tenant_db=tenant_db,
+                payload=payload,
+                prompt=recheck_prompt,
                 max_tokens=2048,
-                temperature=0.0,
             )
             recheck_provider = recheck_result.get("provider")
             recheck_raw_text = recheck_result.get("text", "")
@@ -2310,7 +2418,7 @@ async def extract_tally(
 
     remaining_missing_by_row = _missing_questions_by_row(columns, rows, document_context)
     detected_marks = _detect_missing_marks_from_image(
-        payload.image_b64,
+        primary_image_b64,
         document_context,
         remaining_missing_by_row,
     )
@@ -2355,6 +2463,7 @@ async def extract_tally(
         "recheck_raw_text": recheck_raw_text,
         "recheck_provider": recheck_provider,
         "recheck_confidence": recheck_confidence,
+        "image_labels": [image.get("label") for image in ocr_images],
         "provider": result.get("provider"),
         "created_by": current_user.get("user_id"),
         "created_by_type": current_user.get("user_type"),
@@ -2371,6 +2480,15 @@ async def extract_tally(
         validation_issues=validation_issues,
         confidence=confidence,
         raw_text=raw_text,
+        debug=TallyExtractDebugResponse(
+            prompt=prompt,
+            raw_text=raw_text,
+            provider=result.get("provider"),
+            recheck_prompt=recheck_prompt,
+            recheck_raw_text=recheck_raw_text,
+            recheck_provider=recheck_provider,
+            image_labels=[image.get("label", "") for image in ocr_images],
+        ) if payload.debug else None,
     )
 
 

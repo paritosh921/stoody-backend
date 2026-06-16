@@ -212,6 +212,74 @@ async def _gate_vision_call(
     return gate_resp.content
 
 
+async def _gate_vision_images_call(
+    tenant_db: Any,
+    images: List[Dict[str, Any]],
+    prompt: str,
+    max_tokens: int = 1024,
+    temperature: float = 0.3,
+) -> Optional[str]:
+    """Route a multimodal LLM call with multiple labeled images through the shared gate."""
+    gate_mod = _try_load_gate_module()
+    if gate_mod is None:
+        raise RuntimeError(
+            "SWM-011 C4: LLM gate not available — exam-conductor not deployed. "
+            "All LLM calls (including vision) must go through the shared gate (C4)."
+        )
+
+    gate = gate_mod.LLMGate(tenant_db)
+    await gate.initialize()
+
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for index, image in enumerate(images, start=1):
+        image_b64 = str(image.get("image_b64") or "")
+        if not image_b64:
+            continue
+        label = str(image.get("label") or f"image_{index}")
+        description = str(image.get("description") or "")
+        img_raw, mime = await _normalize_image_b64(image_b64)
+        label_text = f"Image {index}: {label}"
+        if description:
+            label_text = f"{label_text} — {description}"
+        content.extend(
+            [
+                {"type": "text", "text": label_text},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{img_raw}",
+                        "detail": "high",
+                    },
+                },
+            ]
+        )
+
+    if len(content) == 1:
+        return await _gate_text_call(
+            tenant_db,
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    messages: List[Dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": content,
+        }
+    ]
+
+    gate_resp = await gate.call(
+        model_id=OPENAI_MODEL,
+        prompt=prompt,
+        caller_id="dcr_ai",
+        messages=messages,
+        max_output_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return gate_resp.content
+
+
 class OCRService:
     """OCR service using OpenAI GPT vision.
 
@@ -273,6 +341,29 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
         gate_content = await _gate_vision_call(
             tenant_db,
             image_b64,
+            analysis_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
+
+    async def analyze_images(
+        self,
+        images: List[Dict[str, Any]],
+        prompt: Optional[str] = None,
+        *,
+        tenant_db: Any = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+    ) -> dict:
+        """Analyze multiple labeled images in one multimodal OCR request."""
+        default_prompt = """Extract all text and mathematical equations from these images exactly as written.
+Return ONLY the extracted text, nothing else. No explanations, no comments, no formatting notes."""
+        analysis_prompt = prompt or default_prompt
+
+        gate_content = await _gate_vision_images_call(
+            tenant_db,
+            images,
             analysis_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
