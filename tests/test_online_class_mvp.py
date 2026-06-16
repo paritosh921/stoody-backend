@@ -943,6 +943,33 @@ async def _test_resolve_student_pen_mac_prefers_active_binding():
     assert await _resolve_student_pen_mac(db, "STU_1") == "11:22:33:44:55:66"
 
 
+def test_monitoring_pen_status_maps_registry_state_by_mac():
+    from api.v1.online_class.router import _monitoring_pen_status_from_registry
+
+    status = _monitoring_pen_status_from_registry(
+        [
+            {"pen_mac": "AA:BB:CC:DD:EE:01", "connected": False, "battery": 12},
+            {
+                "pen_mac": "11:22:33:44:55:66",
+                "connected": True,
+                "battery": 87,
+                "page_no": 4,
+                "book_type": "MS",
+                "last_frame_ts": 1710000000123,
+            },
+        ],
+        "11:22:33:44:55:66",
+    )
+
+    assert status == {
+        "pen_connected": True,
+        "pen_last_frame_ts": 1710000000123,
+        "pen_battery": 87,
+        "pen_page_no": 4,
+        "pen_book_type": "MS",
+    }
+
+
 def test_reanalysis_prompt_includes_tutor_comments():
     from services.online_class.analysis_service import _build_analysis_prompt
 

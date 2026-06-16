@@ -94,6 +94,11 @@ class MonitoringStudentItem(BaseModel):
     student_name: Optional[str] = None
     username: Optional[str] = None
     pen_mac: Optional[str] = None
+    pen_connected: bool = False
+    pen_last_frame_ts: Optional[float] = None
+    pen_battery: Optional[int] = None
+    pen_page_no: Optional[int] = None
+    pen_book_type: Optional[str] = None
     joined: bool = False
 
 
@@ -445,6 +450,46 @@ async def _resolve_student_pen_mac(db: DatabaseManager, student_id: str) -> Opti
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip().upper()
     return None
+
+
+def _normalize_monitoring_pen_mac(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized or None
+
+
+def _monitoring_pen_status_from_registry(
+    pen_states: List[Dict[str, Any]],
+    pen_mac: Optional[str],
+) -> Dict[str, Any]:
+    target_mac = _normalize_monitoring_pen_mac(pen_mac)
+    if not target_mac:
+        return {}
+
+    for pen in pen_states:
+        if _normalize_monitoring_pen_mac(pen.get("pen_mac")) != target_mac:
+            continue
+        return {
+            "pen_connected": bool(pen.get("connected")),
+            "pen_last_frame_ts": pen.get("last_frame_ts"),
+            "pen_battery": pen.get("battery"),
+            "pen_page_no": pen.get("page_no"),
+            "pen_book_type": pen.get("book_type"),
+        }
+    return {}
+
+
+async def _list_monitoring_pen_states() -> List[Dict[str, Any]]:
+    try:
+        from main_async import app
+        registry = getattr(app.state, "dashboard_registry", None)
+        if not registry:
+            return []
+        return await registry.list_pen_states()
+    except Exception as exc:
+        logger.debug("Failed to read dashboard pen registry for monitoring: %s", exc)
+        return []
 
 
 async def _resolve_tutor_canvas_user_ids(
@@ -1152,9 +1197,12 @@ async def api_get_monitoring_students(
 
     student_docs = await db.mongo_find("students", {"student_id": {"$in": invited_ids}})
     by_id = {str(doc.get("student_id")): doc for doc in student_docs}
+    pen_states = await _list_monitoring_pen_states()
     students: List[MonitoringStudentItem] = []
     for student_id in invited_ids:
         student_doc = by_id.get(student_id, {})
+        pen_mac = await _resolve_student_pen_mac(db, student_id)
+        pen_status = _monitoring_pen_status_from_registry(pen_states, pen_mac)
         students.append(
             MonitoringStudentItem(
                 student_id=student_id,
@@ -1164,7 +1212,8 @@ async def api_get_monitoring_students(
                     or student_doc.get("username")
                 ),
                 username=student_doc.get("username"),
-                pen_mac=await _resolve_student_pen_mac(db, student_id),
+                pen_mac=pen_mac,
+                **pen_status,
                 joined=student_id in joined_ids,
             )
         )
