@@ -54,6 +54,10 @@ class FakeDb:
                 if current is None or current < value["$gte"]:
                     return False
                 continue
+            if isinstance(value, dict) and "$ne" in value:
+                if current == value["$ne"]:
+                    return False
+                continue
             if isinstance(value, dict) and "$exists" in value:
                 exists = current is not None
                 if exists != value["$exists"]:
@@ -746,6 +750,68 @@ def test_monitoring_page_filter_uses_meeting_start_and_page_key_round_trips():
     }
 
 
+def test_monitoring_stroke_stream_batch_returns_only_changed_pages():
+    asyncio.run(_test_monitoring_stroke_stream_batch_returns_only_changed_pages())
+
+
+async def _test_monitoring_stroke_stream_batch_returns_only_changed_pages():
+    from api.v1.online_class.router import _get_monitoring_stroke_stream_batch
+
+    db = FakeDb()
+    meeting = {
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+        "invited_student_ids": ["STU1", "STU2"],
+        "started_at": datetime(2026, 6, 12, 8, 0, 0),
+    }
+    base_ms = meeting["started_at"].timestamp() * 1000
+    db.collections["canvas_pages"].extend([
+        {
+            "user_id": "STU1",
+            "copy_id": "copy-a",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 2,
+            "first_activity": base_ms + 1000,
+            "last_activity": base_ms + 2000,
+            "last_modified": datetime(2026, 6, 12, 8, 1, 0),
+        },
+        {
+            "user_id": "STU1",
+            "copy_id": "copy-a",
+            "book_type": "MS",
+            "page_number": 1,
+            "stroke_count": 4,
+            "first_activity": base_ms + 2500,
+            "last_activity": base_ms + 5000,
+            "last_modified": datetime(2026, 6, 12, 8, 2, 0),
+        },
+        {
+            "user_id": "STU2",
+            "copy_id": "copy-b",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 1,
+            "first_activity": base_ms + 900,
+            "last_activity": base_ms + 1100,
+            "last_modified": datetime(2026, 6, 12, 8, 1, 30),
+        },
+    ])
+
+    result = await _get_monitoring_stroke_stream_batch(
+        db,
+        meeting,
+        ["STU1", "STU2"],
+        {"STU1": base_ms + 90000, "STU2": base_ms + 100000},
+    )
+
+    by_student = {item["student_id"]: item for item in result}
+    assert by_student["STU1"]["count"] == 1
+    assert by_student["STU1"]["pages"][0]["page_number"] == 1
+    assert by_student["STU2"]["count"] == 0
+
+
 def test_online_class_notes_list_returns_invited_classes_with_page_counts():
     asyncio.run(_test_online_class_notes_list_returns_invited_classes_with_page_counts())
 
@@ -1057,6 +1123,130 @@ async def _test_meeting_media_policy_defaults_and_persists_student_controls():
     assert stored["allow_student_microphone"] is False
     assert stored["allow_student_camera"] is True
     assert stored["allow_student_screen_share"] is False
+
+
+def test_tutor_meetings_hide_archived_by_default_and_can_include_them():
+    asyncio.run(_test_tutor_meetings_hide_archived_by_default_and_can_include_them())
+
+
+async def _test_tutor_meetings_hide_archived_by_default_and_can_include_them():
+    from starlette.requests import Request
+    from api.v1.meeting_async import get_tutor_meetings
+
+    db = FakeDb()
+    db.collections["meetings"].extend([
+        {
+            "meeting_id": "MTG_VISIBLE",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Visible",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": datetime.utcnow(),
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": datetime.utcnow(),
+            "is_archived": False,
+        },
+        {
+            "meeting_id": "MTG_ARCHIVED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Archived",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": datetime.utcnow(),
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": datetime.utcnow(),
+            "is_archived": True,
+        },
+    ])
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    current_user = {"user_type": "tutor", "tutor_id": "tutor-1"}
+    visible = await get_tutor_meetings(request, current_user=current_user, db=db)
+    included = await get_tutor_meetings(request, include_archived=True, current_user=current_user, db=db)
+
+    assert [meeting.meeting_id for meeting in visible] == ["MTG_VISIBLE"]
+    assert {meeting.meeting_id for meeting in included} == {"MTG_VISIBLE", "MTG_ARCHIVED"}
+    assert next(meeting for meeting in included if meeting.meeting_id == "MTG_ARCHIVED").is_archived is True
+
+
+def test_update_scheduled_meeting_and_archive_past_meeting():
+    asyncio.run(_test_update_scheduled_meeting_and_archive_past_meeting())
+
+
+async def _test_update_scheduled_meeting_and_archive_past_meeting():
+    from starlette.requests import Request
+    from api.v1.meeting_async import UpdateMeetingRequest, archive_meeting, update_meeting
+
+    db = FakeDb()
+    now = datetime.utcnow()
+    db.collections["meetings"].extend([
+        {
+            "meeting_id": "MTG_SCHEDULED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Old topic",
+            "subject": "Math",
+            "standard": "10",
+            "section": "A",
+            "course_type": "CBSE",
+            "scheduled_at": now,
+            "duration_minutes": 60,
+            "status": "scheduled",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": now,
+        },
+        {
+            "meeting_id": "MTG_ENDED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Past topic",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": now,
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": now,
+        },
+    ])
+
+    request = Request({"type": "http", "method": "PATCH", "path": "/", "headers": []})
+    current_user = {"user_type": "tutor", "tutor_id": "tutor-1"}
+    updated = await update_meeting(
+        request,
+        "MTG_SCHEDULED",
+        UpdateMeetingRequest(topic="New topic", duration_minutes=90),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert updated.topic == "New topic"
+    assert updated.duration_minutes == 90
+    stored = await db.mongo_find_one("meetings", {"meeting_id": "MTG_SCHEDULED"})
+    assert stored["topic"] == "New topic"
+    assert stored["duration_minutes"] == 90
+
+    archive_request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    result = await archive_meeting(
+        archive_request,
+        "MTG_ENDED",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert result["meeting_id"] == "MTG_ENDED"
+    archived = await db.mongo_find_one("meetings", {"meeting_id": "MTG_ENDED"})
+    assert archived["is_archived"] is True
 
 
 def test_teacher_live_canvas_events_upsert_through_online_class_facade():
