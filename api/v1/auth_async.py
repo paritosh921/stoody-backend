@@ -212,7 +212,59 @@ def _password_reset_otp_manager() -> PasswordResetOtpManager:
 def _generic_otp_request_response() -> Dict[str, Any]:
     return {
         "success": True,
-        "message": "If the account information matches, a password reset code has been sent to the registered email.",
+        "message": "OTP sent.",
+        "cooldown_seconds": int(settings.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS),
+        "attempts_remaining": int(settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS),
+        "locked_until": None,
+    }
+
+
+def _otp_lockout_message() -> str:
+    return "Too many incorrect codes. Try after 24 hours."
+
+
+def _format_reset_dt(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _otp_attempts_remaining(record: Optional[Dict[str, Any]]) -> int:
+    max_attempts = int((record or {}).get("max_attempts", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS))
+    attempts = int((record or {}).get("attempts", 0))
+    return max(0, max_attempts - attempts)
+
+
+def _otp_locked_until(record: Optional[Dict[str, Any]], *, now: Optional[datetime] = None) -> Optional[datetime]:
+    locked_until = (record or {}).get("locked_until")
+    if not isinstance(locked_until, datetime):
+        return None
+    if locked_until <= (now or datetime.utcnow()):
+        return None
+    return locked_until
+
+
+def _otp_request_response_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    if state.get("locked_until"):
+        return {
+            "success": False,
+            "message": _otp_lockout_message(),
+            "cooldown_seconds": 0,
+            "attempts_remaining": 0,
+            "locked_until": _format_reset_dt(state["locked_until"]),
+        }
+    return {
+        "success": True,
+        "message": "OTP sent.",
+        "cooldown_seconds": int(state.get("cooldown_seconds", 0)),
+        "attempts_remaining": int(state.get("attempts_remaining", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS)),
+        "locked_until": None,
+    }
+
+
+def _otp_failure_detail(record: Optional[Dict[str, Any]], message: str = "Invalid or expired reset code") -> Dict[str, Any]:
+    return {
+        "message": message,
+        "attempts_remaining": _otp_attempts_remaining(record),
+        "locked_until": _format_reset_dt(_otp_locked_until(record)),
     }
 
 
@@ -248,17 +300,23 @@ async def _insert_password_reset_otp(
     role: str,
     tenant_id: str,
     username: str,
-) -> None:
+) -> Dict[str, Any]:
     user_email = (user.get("email") or "").strip().lower()
     if not user_email:
-        return
-    if not await _can_issue_password_reset_otp(
+        return {
+            "can_issue": False,
+            "cooldown_seconds": 0,
+            "attempts_remaining": 0,
+            "locked_until": None,
+        }
+    issue_state = await _get_password_reset_issue_state(
         tenant_db,
         user_id=str(user["_id"]),
         role=role,
         tenant_id=tenant_id,
-    ):
-        return
+    )
+    if not issue_state["can_issue"]:
+        return issue_state
     manager = _password_reset_otp_manager()
     created = manager.create_otp_record(
         user_id=str(user["_id"]),
@@ -274,6 +332,7 @@ async def _insert_password_reset_otp(
         role=role,
         expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
     )
+    return issue_state
 
 
 async def _find_latest_password_reset_otp(tenant_db, *, user_id: str, role: str, tenant_id: str):
@@ -288,7 +347,7 @@ async def _find_latest_password_reset_otp(tenant_db, *, user_id: str, role: str,
     )
 
 
-async def _can_issue_password_reset_otp(tenant_db, *, user_id: str, role: str, tenant_id: str) -> bool:
+async def _get_password_reset_issue_state(tenant_db, *, user_id: str, role: str, tenant_id: str) -> Dict[str, Any]:
     collection = tenant_db["password_reset_otps"]
     now = datetime.utcnow()
     base_query = {
@@ -297,10 +356,25 @@ async def _can_issue_password_reset_otp(tenant_db, *, user_id: str, role: str, t
         "tenant_id": tenant_id,
     }
     latest = await collection.find_one(base_query, sort=[("created_at", -1)])
+    locked_until = _otp_locked_until(latest, now=now)
+    if locked_until:
+        return {
+            "can_issue": False,
+            "cooldown_seconds": 0,
+            "attempts_remaining": 0,
+            "locked_until": locked_until,
+        }
+
     created_at = latest.get("created_at") if latest else None
     cooldown_seconds = max(0, int(settings.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS))
     if created_at and cooldown_seconds and now - created_at < timedelta(seconds=cooldown_seconds):
-        return False
+        cooldown_remaining = max(1, cooldown_seconds - int((now - created_at).total_seconds()))
+        return {
+            "can_issue": False,
+            "cooldown_seconds": cooldown_remaining,
+            "attempts_remaining": _otp_attempts_remaining(latest),
+            "locked_until": None,
+        }
 
     max_per_hour = max(0, int(settings.PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR))
     if max_per_hour:
@@ -309,16 +383,45 @@ async def _can_issue_password_reset_otp(tenant_db, *, user_id: str, role: str, t
             "created_at": {"$gte": now - timedelta(hours=1)},
         })
         if recent_count >= max_per_hour:
-            return False
+            return {
+                "can_issue": False,
+                "cooldown_seconds": 0,
+                "attempts_remaining": _otp_attempts_remaining(latest),
+                "locked_until": None,
+            }
 
-    return True
+    return {
+        "can_issue": True,
+        "cooldown_seconds": cooldown_seconds,
+        "attempts_remaining": int(settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS),
+        "locked_until": None,
+    }
 
 
-async def _mark_otp_attempt(tenant_db, record: Dict[str, Any], *, used: bool = False) -> None:
+async def _can_issue_password_reset_otp(tenant_db, *, user_id: str, role: str, tenant_id: str) -> bool:
+    return bool((await _get_password_reset_issue_state(
+        tenant_db,
+        user_id=user_id,
+        role=role,
+        tenant_id=tenant_id,
+    ))["can_issue"])
+
+
+async def _mark_otp_attempt(tenant_db, record: Dict[str, Any], *, used: bool = False) -> Dict[str, Any]:
     update: Dict[str, Any] = {"$inc": {"attempts": 1}}
+    new_attempts = int(record.get("attempts", 0)) + 1
+    max_attempts = int(record.get("max_attempts", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS))
     if used:
         update["$set"] = {"used": True, "used_at": datetime.utcnow()}
+    elif new_attempts >= max_attempts:
+        update["$set"] = {
+            "locked_until": datetime.utcnow() + timedelta(hours=int(settings.PASSWORD_RESET_OTP_LOCKOUT_HOURS))
+        }
     await tenant_db["password_reset_otps"].update_one({"_id": record["_id"]}, update)
+    record["attempts"] = new_attempts
+    if "$set" in update:
+        record.update(update["$set"])
+    return record
 
 
 def _validate_new_password(new_password: str) -> None:
@@ -854,7 +957,7 @@ async def request_student_password_reset_otp(
     )
     if not student:
         _raise_no_records_found()
-    await _insert_password_reset_otp(
+    issue_state = await _insert_password_reset_otp(
         tenant_db,
         user=student,
         role="student",
@@ -862,7 +965,7 @@ async def request_student_password_reset_otp(
         username=student.get("full_name") or student.get("username") or email_lower,
     )
 
-    return _generic_otp_request_response()
+    return _otp_request_response_from_state(issue_state)
 
 
 @router.post("/tutor/password-reset/request")
@@ -884,14 +987,14 @@ async def request_tutor_password_reset_otp(
     )
     if not tutor:
         _raise_no_records_found()
-    await _insert_password_reset_otp(
+    issue_state = await _insert_password_reset_otp(
         tenant_db,
         user=tutor,
         role="tutor",
         tenant_id=tenant_id,
         username=tutor.get("full_name") or tutor.get("username") or email_lower,
     )
-    return _generic_otp_request_response()
+    return _otp_request_response_from_state(issue_state)
 
 
 @router.post("/admin/password-reset/request")
@@ -913,14 +1016,14 @@ async def request_admin_password_reset_otp(
     )
     if not admin:
         _raise_no_records_found()
-    await _insert_password_reset_otp(
+    issue_state = await _insert_password_reset_otp(
         tenant_db,
         user=admin,
         role="admin",
         tenant_id=tenant_id,
         username=admin.get("full_name") or admin.get("username") or email_lower,
     )
-    return _generic_otp_request_response()
+    return _otp_request_response_from_state(issue_state)
 
 
 @router.post("/student/password-reset/complete")
@@ -951,12 +1054,22 @@ async def complete_student_password_reset_otp(
         role="student",
         tenant_id=tenant_id,
     )
+    if _otp_locked_until(record):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=_otp_failure_detail(record, _otp_lockout_message()),
+        )
     manager = _password_reset_otp_manager()
     valid, reason = manager.validate_record(record, reset_data.otp)
     if not valid:
         if record and reason == "invalid_otp":
             await _mark_otp_attempt(tenant_db, record)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+        if record and _otp_locked_until(record):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=_otp_failure_detail(record, _otp_lockout_message()),
+            )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_otp_failure_detail(record))
 
     password_hash = auth_manager.get_password_hash(reset_data.new_password)
     await tenant_db["students"].update_one(
@@ -1000,12 +1113,22 @@ async def _complete_role_password_reset_otp(
         role=role,
         tenant_id=tenant_id,
     )
+    if _otp_locked_until(record):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=_otp_failure_detail(record, _otp_lockout_message()),
+        )
     manager = _password_reset_otp_manager()
     valid, reason = manager.validate_record(record, reset_data.otp)
     if not valid:
         if record and reason == "invalid_otp":
             await _mark_otp_attempt(tenant_db, record)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+        if record and _otp_locked_until(record):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=_otp_failure_detail(record, _otp_lockout_message()),
+            )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_otp_failure_detail(record))
 
     password_hash = auth_manager.get_password_hash(reset_data.new_password)
     await tenant_db[collection_name].update_one(

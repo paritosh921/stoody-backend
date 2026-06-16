@@ -206,6 +206,87 @@ async def _student_request_respects_existing_otp_cooldown(monkeypatch, auth_asyn
     )
 
     assert response["success"] is True
+    assert response["cooldown_seconds"] > 0
+    assert response["attempts_remaining"] == 3
+    assert sent == []
+    assert tenant_db["password_reset_otps"].inserted == []
+
+
+def test_student_request_blocks_when_latest_otp_is_locked(monkeypatch):
+    from api.v1 import auth_async
+    from core.password_reset_otp import PasswordResetOtpManager
+
+    asyncio.run(_student_request_blocks_when_latest_otp_is_locked(monkeypatch, auth_async, PasswordResetOtpManager))
+
+
+async def _student_request_blocks_when_latest_otp_is_locked(monkeypatch, auth_async, PasswordResetOtpManager):
+    class FakeCollection:
+        def __init__(self, docs):
+            self.docs = docs
+            self.inserted = []
+
+        async def find_one(self, query, *args, **kwargs):
+            for doc in self.docs:
+                if all(doc.get(k) == v for k, v in query.items()):
+                    return doc
+            return None
+
+        async def insert_one(self, doc):
+            self.inserted.append(doc)
+
+        async def count_documents(self, query):
+            return 0
+
+    student_id = ObjectId()
+    student = {
+        "_id": student_id,
+        "username_lower": "student1",
+        "email": "stored-student@example.com",
+        "is_active": True,
+    }
+    existing = PasswordResetOtpManager(max_attempts=3).create_otp_record(
+        user_id=str(student_id),
+        email="stored-student@example.com",
+        role="student",
+        tenant_id="ABCD-1234",
+        otp="123456",
+    )["record"]
+    existing["attempts"] = 3
+    existing["locked_until"] = datetime.utcnow() + timedelta(hours=23)
+    tenant_db = {
+        "students": FakeCollection([student]),
+        "password_reset_otps": FakeCollection([existing]),
+    }
+    sent = []
+
+    async def fake_resolve_tenant(*_args, **_kwargs):
+        return {"tenant_id": "ABCD-1234", "db_name": "tenant"}
+
+    async def fake_get_tenant_db(*_args, **_kwargs):
+        return tenant_db
+
+    async def fake_send_password_reset_otp(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    monkeypatch.setattr(auth_async, "_resolve_tenant_for_auth", fake_resolve_tenant)
+    monkeypatch.setattr(auth_async, "_get_tenant_db_or_503", fake_get_tenant_db)
+    monkeypatch.setattr(auth_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
+
+    response = await auth_async.request_student_password_reset_otp.__wrapped__(
+        request=object(),
+        reset_data=auth_async.StudentPasswordResetOtpRequest(
+            tenant_id="ABCD-1234",
+            username="student1",
+            email="stored-student@example.com",
+        ),
+        db=object(),
+    )
+
+    assert response["success"] is False
+    assert response["message"] == "Too many incorrect codes. Try after 24 hours."
+    assert response["attempts_remaining"] == 0
+    assert response["locked_until"]
     assert sent == []
     assert tenant_db["password_reset_otps"].inserted == []
 
@@ -504,3 +585,87 @@ async def _student_complete_resets_only_student_password_and_consumes_otp(monkey
     assert student["password_reset_requested"] is False
     assert student["requires_password_change"] is False
     assert otp_record["used"] is True
+
+
+def test_student_complete_locks_after_third_invalid_otp(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import auth_async
+    from core.auth import AuthManager
+    from core.password_reset_otp import PasswordResetOtpManager
+
+    asyncio.run(_student_complete_locks_after_third_invalid_otp(monkeypatch, auth_async, AuthManager, PasswordResetOtpManager, HTTPException))
+
+
+async def _student_complete_locks_after_third_invalid_otp(monkeypatch, auth_async, AuthManager, PasswordResetOtpManager, HTTPException):
+    class FakeCollection:
+        def __init__(self, docs):
+            self.docs = docs
+
+        async def find_one(self, query, *args, **kwargs):
+            for doc in self.docs:
+                if all(doc.get(k) == v for k, v in query.items()):
+                    return doc
+            return None
+
+        async def update_one(self, query, update):
+            for doc in self.docs:
+                if all(doc.get(k) == v for k, v in query.items()):
+                    if "$inc" in update:
+                        for key, value in update["$inc"].items():
+                            doc[key] = doc.get(key, 0) + value
+                    if "$set" in update:
+                        doc.update(update["$set"])
+
+    student_id = ObjectId()
+    student = {
+        "_id": student_id,
+        "username_lower": "student1",
+        "email": "student@example.com",
+        "is_active": True,
+        "password_hash": "old",
+    }
+    otp_record = PasswordResetOtpManager(max_attempts=3).create_otp_record(
+        user_id=str(student_id),
+        email="student@example.com",
+        role="student",
+        tenant_id="ABCD-1234",
+        otp="123456",
+    )["record"]
+    otp_record["_id"] = ObjectId()
+    otp_record["attempts"] = 2
+    tenant_db = {
+        "students": FakeCollection([student]),
+        "password_reset_otps": FakeCollection([otp_record]),
+    }
+
+    async def fake_resolve_tenant(*_args, **_kwargs):
+        return {"tenant_id": "ABCD-1234", "db_name": "tenant"}
+
+    async def fake_get_tenant_db(*_args, **_kwargs):
+        return tenant_db
+
+    monkeypatch.setattr(auth_async, "_resolve_tenant_for_auth", fake_resolve_tenant)
+    monkeypatch.setattr(auth_async, "_get_tenant_db_or_503", fake_get_tenant_db)
+
+    try:
+        await auth_async.complete_student_password_reset_otp.__wrapped__(
+            object(),
+            auth_async.StudentPasswordResetOtpCompleteRequest(
+                tenant_id="ABCD-1234",
+                username="student1",
+                email="student@example.com",
+                otp="000000",
+                new_password="new-password-123",
+            ),
+            object(),
+            AuthManager(),
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 429
+        assert exc.detail["message"] == "Too many incorrect codes. Try after 24 hours."
+        assert exc.detail["attempts_remaining"] == 0
+        assert exc.detail["locked_until"]
+
+    assert otp_record["attempts"] == 3
+    assert otp_record["locked_until"] > datetime.utcnow()

@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -126,6 +126,57 @@ async def _superadmin_otp_request_respects_existing_cooldown(monkeypatch, supera
     )
 
     assert response.success is True
+    assert response.cooldown_seconds > 0
+    assert response.attempts_remaining == 3
+    assert sent == []
+    assert db.master_db["password_reset_otps"].inserted == []
+
+
+def test_superadmin_otp_request_blocks_when_latest_otp_is_locked(monkeypatch):
+    from api.v1 import superadmin_async
+    from core.password_reset_otp import PasswordResetOtpManager
+
+    asyncio.run(_superadmin_otp_request_blocks_when_latest_otp_is_locked(monkeypatch, superadmin_async, PasswordResetOtpManager))
+
+
+async def _superadmin_otp_request_blocks_when_latest_otp_is_locked(monkeypatch, superadmin_async, PasswordResetOtpManager):
+    admin_id = ObjectId()
+    superadmin = {
+        "_id": admin_id,
+        "email": "owner@example.com",
+        "username": "owner",
+        "name": "Owner",
+        "is_active": True,
+        "status": "active",
+    }
+    db = _Db(superadmin)
+    existing = PasswordResetOtpManager(max_attempts=3).create_otp_record(
+        user_id=str(admin_id),
+        email="owner@example.com",
+        role="superadmin",
+        tenant_id=None,
+        otp="123456",
+    )["record"]
+    existing["attempts"] = 3
+    existing["locked_until"] = datetime.utcnow() + timedelta(hours=23)
+    db.master_db["password_reset_otps"].docs.append(existing)
+    sent = []
+
+    async def fake_send_password_reset_otp(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    monkeypatch.setattr(superadmin_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
+
+    response = await superadmin_async.request_superadmin_password_reset_otp(
+        superadmin_async.SuperAdminPasswordResetRequest(username="owner", email="owner@example.com"),
+        db=db,
+    )
+
+    assert response.success is False
+    assert response.message == "Too many incorrect codes. Try after 24 hours."
+    assert response.attempts_remaining == 0
+    assert response.locked_until
     assert sent == []
     assert db.master_db["password_reset_otps"].inserted == []
 
@@ -225,3 +276,56 @@ async def _superadmin_complete_consumes_otp(superadmin_async, PasswordResetOtpMa
     assert admin_update["$set"]["password_reset_requested"] is False
     otp_update = db.master_db["password_reset_otps"].update_one.await_args.args[1]
     assert otp_update["$set"]["used"] is True
+
+
+def test_superadmin_complete_locks_after_third_invalid_otp():
+    from fastapi import HTTPException
+    from api.v1 import superadmin_async
+    from core.password_reset_otp import PasswordResetOtpManager
+
+    asyncio.run(_superadmin_complete_locks_after_third_invalid_otp(superadmin_async, PasswordResetOtpManager, HTTPException))
+
+
+async def _superadmin_complete_locks_after_third_invalid_otp(superadmin_async, PasswordResetOtpManager, HTTPException):
+    admin_id = ObjectId()
+    superadmin = {
+        "_id": admin_id,
+        "email": "owner@example.com",
+        "username": "owner",
+        "name": "Owner",
+        "status": "active",
+        "is_active": True,
+        "password_hash": "old",
+    }
+    db = _Db(superadmin)
+    otp_record = PasswordResetOtpManager(max_attempts=3).create_otp_record(
+        user_id=str(admin_id),
+        email="owner@example.com",
+        role="superadmin",
+        tenant_id=None,
+        otp="123456",
+    )["record"]
+    otp_record["_id"] = ObjectId()
+    otp_record["attempts"] = 2
+    db.master_db["password_reset_otps"].docs.append(otp_record)
+
+    try:
+        await superadmin_async.complete_superadmin_password_reset_otp(
+            superadmin_async.SuperAdminPasswordResetCompleteRequest(
+                username="owner",
+                email="owner@example.com",
+                otp="000000",
+                new_password="new-password-123",
+            ),
+            db=db,
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 429
+        assert exc.detail["message"] == "Too many incorrect codes. Try after 24 hours."
+        assert exc.detail["attempts_remaining"] == 0
+        assert exc.detail["locked_until"]
+
+    update = db.master_db["password_reset_otps"].update_one.await_args.args[1]
+    assert update["$inc"]["attempts"] == 1
+    assert update["$set"]["locked_until"] > datetime.utcnow()

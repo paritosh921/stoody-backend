@@ -88,6 +88,9 @@ class SuperAdminPasswordResetRequest(BaseModel):
 class SuperAdminPasswordResetRequestResponse(BaseModel):
     success: bool = True
     message: str
+    cooldown_seconds: int = 0
+    attempts_remaining: int = 0
+    locked_until: Optional[str] = None
 
 
 class SuperAdminPasswordResetCompleteRequest(BaseModel):
@@ -770,7 +773,56 @@ def _superadmin_username_matches(admin: Dict[str, Any], username: str) -> bool:
     return any(str(candidate or "").strip().lower() == username_lower for candidate in candidates)
 
 
-async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -> bool:
+def _superadmin_lockout_message() -> str:
+    return "Too many incorrect codes. Try after 24 hours."
+
+
+def _superadmin_format_dt(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _superadmin_attempts_remaining(record: Optional[Dict[str, Any]]) -> int:
+    max_attempts = int((record or {}).get("max_attempts", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS))
+    attempts = int((record or {}).get("attempts", 0))
+    return max(0, max_attempts - attempts)
+
+
+def _superadmin_locked_until(record: Optional[Dict[str, Any]], *, now: Optional[datetime] = None) -> Optional[datetime]:
+    locked_until = (record or {}).get("locked_until")
+    if not isinstance(locked_until, datetime):
+        return None
+    if locked_until <= (now or datetime.utcnow()):
+        return None
+    return locked_until
+
+
+def _superadmin_failure_detail(record: Optional[Dict[str, Any]], message: str = "Invalid or expired reset code") -> Dict[str, Any]:
+    return {
+        "message": message,
+        "attempts_remaining": _superadmin_attempts_remaining(record),
+        "locked_until": _superadmin_format_dt(_superadmin_locked_until(record)),
+    }
+
+
+def _superadmin_response_from_state(state: Dict[str, Any]) -> SuperAdminPasswordResetRequestResponse:
+    if state.get("locked_until"):
+        return SuperAdminPasswordResetRequestResponse(
+            success=False,
+            message=_superadmin_lockout_message(),
+            cooldown_seconds=0,
+            attempts_remaining=0,
+            locked_until=_superadmin_format_dt(state["locked_until"]),
+        )
+    return SuperAdminPasswordResetRequestResponse(
+        success=True,
+        message="OTP sent.",
+        cooldown_seconds=int(state.get("cooldown_seconds", 0)),
+        attempts_remaining=int(state.get("attempts_remaining", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS)),
+        locked_until=None,
+    )
+
+
+async def _get_superadmin_password_reset_issue_state(master_db, *, user_id: str) -> Dict[str, Any]:
     collection = master_db["password_reset_otps"]
     now = datetime.utcnow()
     base_query = {
@@ -779,10 +831,25 @@ async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -
         "tenant_id": None,
     }
     latest = await collection.find_one(base_query, sort=[("created_at", -1)])
+    locked_until = _superadmin_locked_until(latest, now=now)
+    if locked_until:
+        return {
+            "can_issue": False,
+            "cooldown_seconds": 0,
+            "attempts_remaining": 0,
+            "locked_until": locked_until,
+        }
+
     created_at = latest.get("created_at") if latest else None
     cooldown_seconds = max(0, int(settings.PASSWORD_RESET_OTP_RESEND_COOLDOWN_SECONDS))
     if created_at and cooldown_seconds and now - created_at < timedelta(seconds=cooldown_seconds):
-        return False
+        cooldown_remaining = max(1, cooldown_seconds - int((now - created_at).total_seconds()))
+        return {
+            "can_issue": False,
+            "cooldown_seconds": cooldown_remaining,
+            "attempts_remaining": _superadmin_attempts_remaining(latest),
+            "locked_until": None,
+        }
 
     max_per_hour = max(0, int(settings.PASSWORD_RESET_OTP_MAX_REQUESTS_PER_HOUR))
     if max_per_hour:
@@ -791,9 +858,23 @@ async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -
             "created_at": {"$gte": now - timedelta(hours=1)},
         })
         if recent_count >= max_per_hour:
-            return False
+            return {
+                "can_issue": False,
+                "cooldown_seconds": 0,
+                "attempts_remaining": _superadmin_attempts_remaining(latest),
+                "locked_until": None,
+            }
 
-    return True
+    return {
+        "can_issue": True,
+        "cooldown_seconds": cooldown_seconds,
+        "attempts_remaining": int(settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS),
+        "locked_until": None,
+    }
+
+
+async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -> bool:
+    return bool((await _get_superadmin_password_reset_issue_state(master_db, user_id=user_id))["can_issue"])
 
 
 @router.post("/password-reset/request", response_model=SuperAdminPasswordResetRequestResponse)
@@ -811,10 +892,9 @@ async def request_superadmin_password_reset_otp(
         or not _superadmin_username_matches(admin, request.username)
     ):
         raise HTTPException(status_code=404, detail="No records found")
-    if not await _can_issue_superadmin_password_reset_otp(master_db, user_id=str(admin["_id"])):
-        return SuperAdminPasswordResetRequestResponse(
-            message="If the account exists, a password reset code has been sent to the registered email."
-        )
+    issue_state = await _get_superadmin_password_reset_issue_state(master_db, user_id=str(admin["_id"]))
+    if not issue_state["can_issue"]:
+        return _superadmin_response_from_state(issue_state)
     manager = _superadmin_otp_manager()
     created = manager.create_otp_record(
         user_id=str(admin["_id"]),
@@ -831,9 +911,7 @@ async def request_superadmin_password_reset_otp(
         expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
     )
 
-    return SuperAdminPasswordResetRequestResponse(
-        message="If the account exists, a password reset code has been sent to the registered email."
-    )
+    return _superadmin_response_from_state(issue_state)
 
 
 @router.post("/password-reset/complete", response_model=SuperAdminPasswordResetRequestResponse)
@@ -861,15 +939,29 @@ async def complete_superadmin_password_reset_otp(
         },
         sort=[("created_at", -1)],
     )
+    if _superadmin_locked_until(record):
+        raise HTTPException(status_code=429, detail=_superadmin_failure_detail(record, _superadmin_lockout_message()))
     manager = _superadmin_otp_manager()
     valid, reason = manager.validate_record(record, request.otp)
     if not valid:
         if record and reason == "invalid_otp":
+            new_attempts = int(record.get("attempts", 0)) + 1
+            max_attempts = int(record.get("max_attempts", settings.PASSWORD_RESET_OTP_MAX_ATTEMPTS))
+            update: Dict[str, Any] = {"$inc": {"attempts": 1}}
+            if new_attempts >= max_attempts:
+                update["$set"] = {
+                    "locked_until": datetime.utcnow() + timedelta(hours=int(settings.PASSWORD_RESET_OTP_LOCKOUT_HOURS))
+                }
             await master_db["password_reset_otps"].update_one(
                 {"_id": record["_id"]},
-                {"$inc": {"attempts": 1}},
+                update,
             )
-        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+            record["attempts"] = new_attempts
+            if "$set" in update:
+                record.update(update["$set"])
+        if record and _superadmin_locked_until(record):
+            raise HTTPException(status_code=429, detail=_superadmin_failure_detail(record, _superadmin_lockout_message()))
+        raise HTTPException(status_code=400, detail=_superadmin_failure_detail(record))
 
     await master_db["super_admins"].update_one(
         {"_id": admin["_id"]},
