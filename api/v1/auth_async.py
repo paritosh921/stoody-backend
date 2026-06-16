@@ -116,12 +116,12 @@ class TenantLookupResponse(BaseModel):
 
 class StudentPasswordResetOtpRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
-    date_of_birth: str
-    phone: str
+    email: EmailStr
     tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
 
 class RolePasswordResetOtpRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     tenant_id: str = Field(..., pattern=TENANT_ID_PATTERN)
 
@@ -214,6 +214,31 @@ def _generic_otp_request_response() -> Dict[str, Any]:
         "success": True,
         "message": "If the account information matches, a password reset code has been sent to the registered email.",
     }
+
+
+def _raise_no_records_found() -> None:
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No records found")
+
+
+async def _find_reset_identity_record(collection, *, username: str, email: str):
+    username_clean = username.strip()
+    username_lower = username_clean.lower()
+    email_lower = email.lower().strip()
+    user = await collection.find_one({
+        "email": email_lower,
+        "username_lower": username_lower,
+        "is_active": True,
+    })
+    if user:
+        return user
+    return await collection.find_one(
+        {
+            "email": email_lower,
+            "username": username_clean,
+            "is_active": True,
+        },
+        collation={"locale": "en", "strength": 2},
+    )
 
 
 async def _insert_password_reset_otp(
@@ -817,33 +842,25 @@ async def request_student_password_reset_otp(
     reset_data: StudentPasswordResetOtpRequest,
     db: DatabaseManager = Depends(get_database),
 ):
-    """Request a student password reset OTP using student-only identity fields."""
+    """Request a student password reset OTP. Searches students only."""
     tenant_id = normalize_tenant_id(reset_data.tenant_id)
     tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
     tenant_db = await _get_tenant_db_or_503(db, tenant)
-    normalized_username = reset_data.username.strip()
-    username_lower = normalized_username.lower()
-
-    student = await tenant_db["students"].find_one({"username_lower": username_lower})
+    email_lower = reset_data.email.lower().strip()
+    student = await _find_reset_identity_record(
+        tenant_db["students"],
+        username=reset_data.username,
+        email=email_lower,
+    )
     if not student:
-        student = await tenant_db["students"].find_one(
-            {"username": normalized_username},
-            collation={"locale": "en", "strength": 2},
-        )
-
-    if (
-        student
-        and student.get("is_active", True)
-        and student.get("date_of_birth") == reset_data.date_of_birth
-        and student.get("phone") == reset_data.phone
-    ):
-        await _insert_password_reset_otp(
-            tenant_db,
-            user=student,
-            role="student",
-            tenant_id=tenant_id,
-            username=student.get("username") or normalized_username,
-        )
+        _raise_no_records_found()
+    await _insert_password_reset_otp(
+        tenant_db,
+        user=student,
+        role="student",
+        tenant_id=tenant_id,
+        username=student.get("full_name") or student.get("username") or email_lower,
+    )
 
     return _generic_otp_request_response()
 
@@ -860,15 +877,20 @@ async def request_tutor_password_reset_otp(
     tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
     tenant_db = await _get_tenant_db_or_503(db, tenant)
     email_lower = reset_data.email.lower().strip()
-    tutor = await tenant_db["tutors"].find_one({"email": email_lower, "is_active": True})
-    if tutor:
-        await _insert_password_reset_otp(
-            tenant_db,
-            user=tutor,
-            role="tutor",
-            tenant_id=tenant_id,
-            username=tutor.get("full_name") or tutor.get("username") or email_lower,
-        )
+    tutor = await _find_reset_identity_record(
+        tenant_db["tutors"],
+        username=reset_data.username,
+        email=email_lower,
+    )
+    if not tutor:
+        _raise_no_records_found()
+    await _insert_password_reset_otp(
+        tenant_db,
+        user=tutor,
+        role="tutor",
+        tenant_id=tenant_id,
+        username=tutor.get("full_name") or tutor.get("username") or email_lower,
+    )
     return _generic_otp_request_response()
 
 
@@ -884,15 +906,20 @@ async def request_admin_password_reset_otp(
     tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
     tenant_db = await _get_tenant_db_or_503(db, tenant)
     email_lower = reset_data.email.lower().strip()
-    admin = await tenant_db["admins"].find_one({"email": email_lower, "is_active": True})
-    if admin:
-        await _insert_password_reset_otp(
-            tenant_db,
-            user=admin,
-            role="admin",
-            tenant_id=tenant_id,
-            username=admin.get("full_name") or admin.get("username") or email_lower,
-        )
+    admin = await _find_reset_identity_record(
+        tenant_db["admins"],
+        username=reset_data.username,
+        email=email_lower,
+    )
+    if not admin:
+        _raise_no_records_found()
+    await _insert_password_reset_otp(
+        tenant_db,
+        user=admin,
+        role="admin",
+        tenant_id=tenant_id,
+        username=admin.get("full_name") or admin.get("username") or email_lower,
+    )
     return _generic_otp_request_response()
 
 
@@ -909,21 +936,14 @@ async def complete_student_password_reset_otp(
     tenant_id = normalize_tenant_id(reset_data.tenant_id)
     tenant = await _resolve_tenant_for_auth(db, request, tenant_id, require_active=True)
     tenant_db = await _get_tenant_db_or_503(db, tenant)
-    normalized_username = reset_data.username.strip()
-    username_lower = normalized_username.lower()
-    student = await tenant_db["students"].find_one({"username_lower": username_lower})
+    email_lower = reset_data.email.lower().strip()
+    student = await _find_reset_identity_record(
+        tenant_db["students"],
+        username=reset_data.username,
+        email=email_lower,
+    )
     if not student:
-        student = await tenant_db["students"].find_one(
-            {"username": normalized_username},
-            collation={"locale": "en", "strength": 2},
-        )
-    if (
-        not student
-        or not student.get("is_active", True)
-        or student.get("date_of_birth") != reset_data.date_of_birth
-        or student.get("phone") != reset_data.phone
-    ):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+        _raise_no_records_found()
 
     record = await _find_latest_password_reset_otp(
         tenant_db,
@@ -966,9 +986,13 @@ async def _complete_role_password_reset_otp(
     tenant_db = await _get_tenant_db_or_503(db, tenant)
     collection_name = "tutors" if role == "tutor" else "admins"
     email_lower = reset_data.email.lower().strip()
-    user = await tenant_db[collection_name].find_one({"email": email_lower, "is_active": True})
+    user = await _find_reset_identity_record(
+        tenant_db[collection_name],
+        username=reset_data.username,
+        email=email_lower,
+    )
     if not user:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired reset code")
+        _raise_no_records_found()
 
     record = await _find_latest_password_reset_otp(
         tenant_db,

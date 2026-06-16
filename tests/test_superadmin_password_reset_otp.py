@@ -60,6 +60,7 @@ async def _superadmin_otp_request_searches_superadmins_only(monkeypatch, superad
     superadmin = {
         "_id": ObjectId(),
         "email": "owner@example.com",
+        "username": "owner",
         "name": "Owner",
         "is_active": True,
         "status": "active",
@@ -74,7 +75,7 @@ async def _superadmin_otp_request_searches_superadmins_only(monkeypatch, superad
     monkeypatch.setattr(superadmin_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
 
     response = await superadmin_async.request_superadmin_password_reset_otp(
-        superadmin_async.SuperAdminPasswordResetRequest(email="owner@example.com"),
+        superadmin_async.SuperAdminPasswordResetRequest(username="owner", email="owner@example.com"),
         db=db,
     )
 
@@ -97,6 +98,7 @@ async def _superadmin_otp_request_respects_existing_cooldown(monkeypatch, supera
     superadmin = {
         "_id": admin_id,
         "email": "owner@example.com",
+        "username": "owner",
         "name": "Owner",
         "is_active": True,
         "status": "active",
@@ -119,11 +121,50 @@ async def _superadmin_otp_request_respects_existing_cooldown(monkeypatch, supera
     monkeypatch.setattr(superadmin_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
 
     response = await superadmin_async.request_superadmin_password_reset_otp(
-        superadmin_async.SuperAdminPasswordResetRequest(email="owner@example.com"),
+        superadmin_async.SuperAdminPasswordResetRequest(username="owner", email="owner@example.com"),
         db=db,
     )
 
     assert response.success is True
+    assert sent == []
+    assert db.master_db["password_reset_otps"].inserted == []
+
+
+def test_superadmin_otp_request_no_records_found_does_not_send_email(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import superadmin_async
+
+    asyncio.run(_superadmin_otp_request_no_records_found_does_not_send_email(monkeypatch, superadmin_async, HTTPException))
+
+
+async def _superadmin_otp_request_no_records_found_does_not_send_email(monkeypatch, superadmin_async, HTTPException):
+    superadmin = {
+        "_id": ObjectId(),
+        "email": "owner@example.com",
+        "username": "owner",
+        "name": "Owner",
+        "is_active": True,
+        "status": "active",
+    }
+    db = _Db(superadmin)
+    sent = []
+
+    async def fake_send_password_reset_otp(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    monkeypatch.setattr(superadmin_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
+
+    try:
+        await superadmin_async.request_superadmin_password_reset_otp(
+            superadmin_async.SuperAdminPasswordResetRequest(username="wrong-owner", email="owner@example.com"),
+            db=db,
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert exc.detail == "No records found"
+
     assert sent == []
     assert db.master_db["password_reset_otps"].inserted == []
 
@@ -150,6 +191,7 @@ async def _superadmin_complete_consumes_otp(superadmin_async, PasswordResetOtpMa
     superadmin = {
         "_id": admin_id,
         "email": "owner@example.com",
+        "username": "owner",
         "name": "Owner",
         "status": "active",
         "is_active": True,
@@ -169,6 +211,7 @@ async def _superadmin_complete_consumes_otp(superadmin_async, PasswordResetOtpMa
 
     response = await superadmin_async.complete_superadmin_password_reset_otp(
         superadmin_async.SuperAdminPasswordResetCompleteRequest(
+            username="owner",
             email="owner@example.com",
             otp="123456",
             new_password="new-password-123",

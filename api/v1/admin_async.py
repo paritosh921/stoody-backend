@@ -84,9 +84,17 @@ class CreateStudentRequest(BaseModel):
     stream: Optional[str] = None
     grade: Optional[str] = Field(None, description="Student grade/class")
     phone: Optional[str] = None
-    section: Optional[str] = Field(None, description="Section (e.g. A, B, C)")
+    section: str = Field(..., min_length=1, description="Section (e.g. A, B, C)")
     plan_types: Optional[List[str]] = None
     subjects: Optional[List[str]] = None
+
+    @field_validator("section")
+    @classmethod
+    def validate_required_section(cls, value: str) -> str:
+        section = value.strip()
+        if not section:
+            raise ValueError("Section is required")
+        return section
 
 
 class UpdateStudentRequest(BaseModel):
@@ -103,6 +111,16 @@ class UpdateStudentRequest(BaseModel):
     grade: Optional[str] = Field(None, description="New grade/class for the student")
     section: Optional[str] = Field(None, description="New section for the student")
     is_active: Optional[bool] = None
+
+    @field_validator("section")
+    @classmethod
+    def validate_non_blank_section(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        section = value.strip()
+        if not section:
+            raise ValueError("Section cannot be blank")
+        return section
 
 
 class SessionPromotionRequest(BaseModel):
@@ -1395,7 +1413,7 @@ async def create_student(
             "school": student_data.school,
             "stream": None,  # Stream is removed/fluid
             "grade": student_data.grade,
-            "section": student_data.section or await get_default_section(student_data.grade or "", admin_id, db),
+            "section": student_data.section,
             "phone": student_data.phone,
             "plan_types": assigned_plan_types,
             "subjects": assigned_subjects,

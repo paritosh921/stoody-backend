@@ -51,13 +51,13 @@ def test_wrong_expired_used_and_attempt_exhausted_otps_are_rejected():
     assert manager.validate_record(record, "654321", now=now) == (True, "valid")
 
 
-def test_student_request_searches_students_only_and_sends_to_stored_email(monkeypatch):
+def test_student_request_searches_students_by_username_and_email_and_sends_to_stored_email(monkeypatch):
     from api.v1 import auth_async
 
-    asyncio.run(_student_request_searches_students_only_and_sends_to_stored_email(monkeypatch, auth_async))
+    asyncio.run(_student_request_searches_students_by_username_and_email_and_sends_to_stored_email(monkeypatch, auth_async))
 
 
-async def _student_request_searches_students_only_and_sends_to_stored_email(monkeypatch, auth_async):
+async def _student_request_searches_students_by_username_and_email_and_sends_to_stored_email(monkeypatch, auth_async):
     class FakeCollection:
         def __init__(self, name, docs):
             self.name = name
@@ -86,8 +86,7 @@ async def _student_request_searches_students_only_and_sends_to_stored_email(monk
                     [{
                         "_id": ObjectId(),
                         "username_lower": "student1",
-                        "date_of_birth": "2010-01-01",
-                        "phone": "9999999999",
+                        "username": "Student1",
                         "email": "stored-student@example.com",
                         "is_active": True,
                     }],
@@ -119,9 +118,8 @@ async def _student_request_searches_students_only_and_sends_to_stored_email(monk
         request=object(),
         reset_data=auth_async.StudentPasswordResetOtpRequest(
             tenant_id="ABCD-1234",
-            username="student1",
-            date_of_birth="2010-01-01",
-            phone="9999999999",
+            username="Student1",
+            email="stored-student@example.com",
         ),
         db=object(),
     )
@@ -130,6 +128,9 @@ async def _student_request_searches_students_only_and_sends_to_stored_email(monk
     assert tenant_db["students"].find_one_calls
     assert tenant_db["tutors"].find_one_calls == []
     assert tenant_db["admins"].find_one_calls == []
+    assert tenant_db["students"].find_one_calls == [
+        {"email": "stored-student@example.com", "username_lower": "student1", "is_active": True}
+    ]
     assert sent[0]["to_email"] == "stored-student@example.com"
     assert sent[0]["role"] == "student"
     assert tenant_db["password_reset_otps"].inserted[0]["role"] == "student"
@@ -164,8 +165,6 @@ async def _student_request_respects_existing_otp_cooldown(monkeypatch, auth_asyn
     student = {
         "_id": student_id,
         "username_lower": "student1",
-        "date_of_birth": "2010-01-01",
-        "phone": "9999999999",
         "email": "stored-student@example.com",
         "is_active": True,
     }
@@ -201,8 +200,7 @@ async def _student_request_respects_existing_otp_cooldown(monkeypatch, auth_asyn
         reset_data=auth_async.StudentPasswordResetOtpRequest(
             tenant_id="ABCD-1234",
             username="student1",
-            date_of_birth="2010-01-01",
-            phone="9999999999",
+            email="stored-student@example.com",
         ),
         db=object(),
     )
@@ -210,6 +208,64 @@ async def _student_request_respects_existing_otp_cooldown(monkeypatch, auth_asyn
     assert response["success"] is True
     assert sent == []
     assert tenant_db["password_reset_otps"].inserted == []
+
+
+def test_student_request_no_records_found_does_not_send_email(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import auth_async
+
+    async def run():
+        class FakeCollection:
+            def __init__(self):
+                self.find_one_calls = []
+                self.inserted = []
+
+            async def find_one(self, query, *args, **kwargs):
+                self.find_one_calls.append(query)
+                return None
+
+            async def insert_one(self, doc):
+                self.inserted.append(doc)
+
+        tenant_db = {
+            "students": FakeCollection(),
+            "password_reset_otps": FakeCollection(),
+        }
+        sent = []
+
+        async def fake_resolve_tenant(*_args, **_kwargs):
+            return {"tenant_id": "ABCD-1234", "db_name": "tenant"}
+
+        async def fake_get_tenant_db(*_args, **_kwargs):
+            return tenant_db
+
+        async def fake_send_password_reset_otp(**kwargs):
+            sent.append(kwargs)
+            return True
+
+        monkeypatch.setattr(auth_async, "_resolve_tenant_for_auth", fake_resolve_tenant)
+        monkeypatch.setattr(auth_async, "_get_tenant_db_or_503", fake_get_tenant_db)
+        monkeypatch.setattr(auth_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
+
+        try:
+            await auth_async.request_student_password_reset_otp.__wrapped__(
+                request=object(),
+                reset_data=auth_async.StudentPasswordResetOtpRequest(
+                    tenant_id="ABCD-1234",
+                    username="wrong-student",
+                    email="wrong@example.com",
+                ),
+                db=object(),
+            )
+            assert False, "expected HTTPException"
+        except HTTPException as exc:
+            assert exc.status_code == 404
+            assert exc.detail == "No records found"
+
+        assert sent == []
+        assert tenant_db["password_reset_otps"].inserted == []
+
+    asyncio.run(run())
 
 
 def test_tutor_request_searches_tutors_only(monkeypatch):
@@ -222,6 +278,64 @@ def test_admin_request_searches_admins_only(monkeypatch):
     from api.v1 import auth_async
 
     asyncio.run(_role_email_request_searches_only_target_collection(monkeypatch, auth_async, role="admin"))
+
+
+def test_role_request_no_records_found_does_not_send_email(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import auth_async
+
+    asyncio.run(_role_request_no_records_found_does_not_send_email(monkeypatch, auth_async, role="tutor", HTTPException=HTTPException))
+
+
+async def _role_request_no_records_found_does_not_send_email(monkeypatch, auth_async, role, HTTPException):
+    class FakeCollection:
+        def __init__(self):
+            self.inserted = []
+
+        async def find_one(self, query, *args, **kwargs):
+            return None
+
+        async def insert_one(self, doc):
+            self.inserted.append(doc)
+
+    tenant_db = {
+        "tutors": FakeCollection(),
+        "admins": FakeCollection(),
+        "password_reset_otps": FakeCollection(),
+    }
+    sent = []
+
+    async def fake_resolve_tenant(*_args, **_kwargs):
+        return {"tenant_id": "ABCD-1234", "db_name": "tenant"}
+
+    async def fake_get_tenant_db(*_args, **_kwargs):
+        return tenant_db
+
+    async def fake_send_password_reset_otp(**kwargs):
+        sent.append(kwargs)
+        return True
+
+    monkeypatch.setattr(auth_async, "_resolve_tenant_for_auth", fake_resolve_tenant)
+    monkeypatch.setattr(auth_async, "_get_tenant_db_or_503", fake_get_tenant_db)
+    monkeypatch.setattr(auth_async, "send_password_reset_otp_email", fake_send_password_reset_otp)
+
+    try:
+        await auth_async.request_tutor_password_reset_otp.__wrapped__(
+            object(),
+            auth_async.RolePasswordResetOtpRequest(
+                tenant_id="ABCD-1234",
+                username="wrong-tutor",
+                email="wrong@example.com",
+            ),
+            object(),
+        )
+        assert False, "expected HTTPException"
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert exc.detail == "No records found"
+
+    assert sent == []
+    assert tenant_db["password_reset_otps"].inserted == []
 
 
 async def _role_email_request_searches_only_target_collection(monkeypatch, auth_async, role):
@@ -248,6 +362,7 @@ async def _role_email_request_searches_only_target_collection(monkeypatch, auth_
         "_id": ObjectId(),
         "email": f"{role}@example.com",
         "username": f"{role}1",
+        "username_lower": f"{role}1",
         "full_name": f"{role.title()} User",
         "is_active": True,
     }
@@ -276,6 +391,7 @@ async def _role_email_request_searches_only_target_collection(monkeypatch, auth_
 
     request_model = auth_async.RolePasswordResetOtpRequest(
         tenant_id="ABCD-1234",
+        username=f"{role}1",
         email=f"{role}@example.com",
     )
     if role == "tutor":
@@ -343,8 +459,6 @@ async def _student_complete_resets_only_student_password_and_consumes_otp(monkey
     student = {
         "_id": student_id,
         "username_lower": "student1",
-        "date_of_birth": "2010-01-01",
-        "phone": "9999999999",
         "email": "student@example.com",
         "is_active": True,
         "password_hash": "old",
@@ -377,8 +491,7 @@ async def _student_complete_resets_only_student_password_and_consumes_otp(monkey
         auth_async.StudentPasswordResetOtpCompleteRequest(
             tenant_id="ABCD-1234",
             username="student1",
-            date_of_birth="2010-01-01",
-            phone="9999999999",
+            email="student@example.com",
             otp="123456",
             new_password="new-password-123",
         ),

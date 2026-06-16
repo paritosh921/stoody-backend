@@ -81,6 +81,7 @@ class SuperAdminPasswordChangeRequest(BaseModel):
 
 
 class SuperAdminPasswordResetRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
 
 
@@ -90,6 +91,7 @@ class SuperAdminPasswordResetRequestResponse(BaseModel):
 
 
 class SuperAdminPasswordResetCompleteRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     otp: str = Field(..., min_length=6, max_length=8)
     new_password: str = Field(..., min_length=8, max_length=72)
@@ -757,6 +759,17 @@ def _superadmin_otp_manager() -> PasswordResetOtpManager:
     )
 
 
+def _superadmin_username_matches(admin: Dict[str, Any], username: str) -> bool:
+    username_lower = username.strip().lower()
+    candidates = [
+        admin.get("username_lower"),
+        admin.get("username"),
+        admin.get("name"),
+        admin.get("full_name"),
+    ]
+    return any(str(candidate or "").strip().lower() == username_lower for candidate in candidates)
+
+
 async def _can_issue_superadmin_password_reset_otp(master_db, *, user_id: str) -> bool:
     collection = master_db["password_reset_otps"]
     now = datetime.utcnow()
@@ -791,26 +804,32 @@ async def request_superadmin_password_reset_otp(
     master_db = await get_master_db_or_503(db)
     email = request.email.strip().lower()
     admin = await master_db["super_admins"].find_one({"email": email})
-    if admin and admin.get("status", "active") == "active" and admin.get("is_active", True):
-        if not await _can_issue_superadmin_password_reset_otp(master_db, user_id=str(admin["_id"])):
-            return SuperAdminPasswordResetRequestResponse(
-                message="If the account exists, a password reset code has been sent to the registered email."
-            )
-        manager = _superadmin_otp_manager()
-        created = manager.create_otp_record(
-            user_id=str(admin["_id"]),
-            email=admin["email"],
-            role="superadmin",
-            tenant_id=None,
+    if (
+        not admin
+        or admin.get("status", "active") != "active"
+        or not admin.get("is_active", True)
+        or not _superadmin_username_matches(admin, request.username)
+    ):
+        raise HTTPException(status_code=404, detail="No records found")
+    if not await _can_issue_superadmin_password_reset_otp(master_db, user_id=str(admin["_id"])):
+        return SuperAdminPasswordResetRequestResponse(
+            message="If the account exists, a password reset code has been sent to the registered email."
         )
-        await master_db["password_reset_otps"].insert_one(created["record"])
-        await send_password_reset_otp_email(
-            to_email=admin["email"],
-            otp=created["otp"],
-            username=admin.get("name") or admin.get("email", "Super Admin"),
-            role="superadmin",
-            expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
-        )
+    manager = _superadmin_otp_manager()
+    created = manager.create_otp_record(
+        user_id=str(admin["_id"]),
+        email=admin["email"],
+        role="superadmin",
+        tenant_id=None,
+    )
+    await master_db["password_reset_otps"].insert_one(created["record"])
+    await send_password_reset_otp_email(
+        to_email=admin["email"],
+        otp=created["otp"],
+        username=admin.get("name") or admin.get("username") or admin.get("email", "Super Admin"),
+        role="superadmin",
+        expire_minutes=settings.PASSWORD_RESET_OTP_EXPIRE_MINUTES,
+    )
 
     return SuperAdminPasswordResetRequestResponse(
         message="If the account exists, a password reset code has been sent to the registered email."
@@ -825,8 +844,13 @@ async def complete_superadmin_password_reset_otp(
     master_db = await get_master_db_or_503(db)
     email = request.email.strip().lower()
     admin = await master_db["super_admins"].find_one({"email": email})
-    if not admin or admin.get("status", "active") != "active" or not admin.get("is_active", True):
-        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    if (
+        not admin
+        or admin.get("status", "active") != "active"
+        or not admin.get("is_active", True)
+        or not _superadmin_username_matches(admin, request.username)
+    ):
+        raise HTTPException(status_code=404, detail="No records found")
 
     record = await master_db["password_reset_otps"].find_one(
         {

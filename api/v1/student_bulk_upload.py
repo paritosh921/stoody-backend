@@ -40,7 +40,7 @@ TEMPLATE_COLUMNS = {
     "full_name": {"required": True, "description": "Student's full name (2-100 characters)", "example": "John Doe"},
     "username": {"required": False, "description": "Custom username (optional - auto-generated if empty, format: {school_prefix}{number})", "example": ""},
     "grade": {"required": True, "description": "Grade/Class (6, 7, 8, 9, 10, 11, or 12)", "example": "10"},
-    "section": {"required": False, "description": "Section (A, B, C, D, E, F)", "example": "A"},
+    "section": {"required": True, "description": "Section (A, B, C, D, E, F)", "example": "A"},
     "email": {"required": False, "description": "Email address (unique within institute)", "example": "john@example.com"},
     "phone": {"required": False, "description": "Phone number", "example": "9876543210"},
     "gender": {"required": False, "description": "Gender (male, female, other)", "example": "male"},
@@ -155,7 +155,7 @@ def validate_section_for_class(section: str, grade: str, valid_sections: List[st
                                 class_sections: Dict[str, List[str]] = None) -> bool:
     """Validate section against the class-specific mapping if available, else the global sections list."""
     if not section:
-        return True  # Section is optional
+        return False
     section_upper = section.strip().upper()
     # If per-class mapping exists and has this grade, use it
     if class_sections and grade in class_sections:
@@ -167,7 +167,7 @@ def validate_section_for_class(section: str, grade: str, valid_sections: List[st
 def validate_section(section: str, valid_sections: List[str]) -> bool:
     """Validate section is in allowed list"""
     if not section:
-        return True  # Section is optional
+        return False
     return section.strip().upper() in [s.upper() for s in valid_sections]
 
 
@@ -524,7 +524,10 @@ async def preview_bulk_upload(
                 file_usernames[custom_username.lower()] = row_num
         
         # Validate section against class-specific mapping (if available) or global sections list
-        if section and not validate_section_for_class(section, grade, valid_sections, class_sections):
+        if not section:
+            errors.append(BulkUploadError(row=row_num, field="section", value=section, message="Section is required"))
+            row_valid = False
+        elif not validate_section_for_class(section, grade, valid_sections, class_sections):
             # Build helpful error message showing allowed sections for this class
             if class_sections and grade in class_sections:
                 allowed = ', '.join(class_sections[grade])
@@ -825,8 +828,24 @@ async def import_bulk_students(
         if gender and gender not in ['male', 'female', 'other']:
             gender = ''
         # Validate section against class_sections mapping or global list
-        if section and not validate_section_for_class(section, grade, valid_sections, class_sections):
-            section = ''
+        if not section:
+            errors.append(BulkUploadError(row=row_num, field="section", message="Section is required"))
+            row_valid = False
+        elif not validate_section_for_class(section, grade, valid_sections, class_sections):
+            if class_sections and grade in class_sections:
+                allowed = ', '.join(class_sections[grade])
+                errors.append(BulkUploadError(row=row_num, field="section", message=f"Invalid section for Class {grade}. Allowed: {allowed}"))
+            else:
+                errors.append(BulkUploadError(row=row_num, field="section", message=f"Invalid section: {section}. Must be one of: {', '.join(valid_sections)}"))
+            row_valid = False
+
+        if not row_valid:
+            if not skip_errors:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Validation error in row {row_num}. Use skip_errors=true to skip invalid rows."
+                )
+            continue
         
         # Validate date format
         if date_of_birth:
@@ -846,7 +865,7 @@ async def import_bulk_students(
             "email": email if email else None,
             "phone": phone if phone else None,
             "grade": grade,
-            "section": section if section else (sorted(class_sections.get(grade, []))[0] if class_sections and class_sections.get(grade) else "A"),
+            "section": section,
             "stream": None, # Force stream to None as per new policy
             "gender": gender if gender else None,
             "date_of_birth": date_of_birth if date_of_birth else None,
@@ -868,7 +887,7 @@ async def import_bulk_students(
             username=username,
             password=plain_password,
             grade=grade,
-            section=section if section else None
+            section=section
         ))
     
     # Bulk insert
