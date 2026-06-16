@@ -54,6 +54,10 @@ class FakeDb:
                 if current is None or current < value["$gte"]:
                     return False
                 continue
+            if isinstance(value, dict) and "$ne" in value:
+                if current == value["$ne"]:
+                    return False
+                continue
             if isinstance(value, dict) and "$exists" in value:
                 exists = current is not None
                 if exists != value["$exists"]:
@@ -1119,6 +1123,130 @@ async def _test_meeting_media_policy_defaults_and_persists_student_controls():
     assert stored["allow_student_microphone"] is False
     assert stored["allow_student_camera"] is True
     assert stored["allow_student_screen_share"] is False
+
+
+def test_tutor_meetings_hide_archived_by_default_and_can_include_them():
+    asyncio.run(_test_tutor_meetings_hide_archived_by_default_and_can_include_them())
+
+
+async def _test_tutor_meetings_hide_archived_by_default_and_can_include_them():
+    from starlette.requests import Request
+    from api.v1.meeting_async import get_tutor_meetings
+
+    db = FakeDb()
+    db.collections["meetings"].extend([
+        {
+            "meeting_id": "MTG_VISIBLE",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Visible",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": datetime.utcnow(),
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": datetime.utcnow(),
+            "is_archived": False,
+        },
+        {
+            "meeting_id": "MTG_ARCHIVED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Archived",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": datetime.utcnow(),
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": datetime.utcnow(),
+            "is_archived": True,
+        },
+    ])
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    current_user = {"user_type": "tutor", "tutor_id": "tutor-1"}
+    visible = await get_tutor_meetings(request, current_user=current_user, db=db)
+    included = await get_tutor_meetings(request, include_archived=True, current_user=current_user, db=db)
+
+    assert [meeting.meeting_id for meeting in visible] == ["MTG_VISIBLE"]
+    assert {meeting.meeting_id for meeting in included} == {"MTG_VISIBLE", "MTG_ARCHIVED"}
+    assert next(meeting for meeting in included if meeting.meeting_id == "MTG_ARCHIVED").is_archived is True
+
+
+def test_update_scheduled_meeting_and_archive_past_meeting():
+    asyncio.run(_test_update_scheduled_meeting_and_archive_past_meeting())
+
+
+async def _test_update_scheduled_meeting_and_archive_past_meeting():
+    from starlette.requests import Request
+    from api.v1.meeting_async import UpdateMeetingRequest, archive_meeting, update_meeting
+
+    db = FakeDb()
+    now = datetime.utcnow()
+    db.collections["meetings"].extend([
+        {
+            "meeting_id": "MTG_SCHEDULED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Old topic",
+            "subject": "Math",
+            "standard": "10",
+            "section": "A",
+            "course_type": "CBSE",
+            "scheduled_at": now,
+            "duration_minutes": 60,
+            "status": "scheduled",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": now,
+        },
+        {
+            "meeting_id": "MTG_ENDED",
+            "tutor_id": "tutor-1",
+            "tutor_name": "Tutor",
+            "topic": "Past topic",
+            "subject": "Math",
+            "standard": "10",
+            "scheduled_at": now,
+            "duration_minutes": 60,
+            "status": "ended",
+            "invited_student_ids": ["STU_1"],
+            "joined_student_ids": [],
+            "created_at": now,
+        },
+    ])
+
+    request = Request({"type": "http", "method": "PATCH", "path": "/", "headers": []})
+    current_user = {"user_type": "tutor", "tutor_id": "tutor-1"}
+    updated = await update_meeting(
+        request,
+        "MTG_SCHEDULED",
+        UpdateMeetingRequest(topic="New topic", duration_minutes=90),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert updated.topic == "New topic"
+    assert updated.duration_minutes == 90
+    stored = await db.mongo_find_one("meetings", {"meeting_id": "MTG_SCHEDULED"})
+    assert stored["topic"] == "New topic"
+    assert stored["duration_minutes"] == 90
+
+    archive_request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    result = await archive_meeting(
+        archive_request,
+        "MTG_ENDED",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert result["meeting_id"] == "MTG_ENDED"
+    archived = await db.mongo_find_one("meetings", {"meeting_id": "MTG_ENDED"})
+    assert archived["is_archived"] is True
 
 
 def test_teacher_live_canvas_events_upsert_through_online_class_facade():

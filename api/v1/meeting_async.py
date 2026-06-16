@@ -89,6 +89,16 @@ class CreateMeetingRequest(BaseModel):
     duration_minutes: int = Field(60, ge=15, le=480, description="Duration in minutes")
 
 
+class UpdateMeetingRequest(BaseModel):
+    topic: Optional[str] = Field(None, min_length=3, max_length=200, description="Meeting topic")
+    subject: Optional[str] = Field(None, description="Subject for the class")
+    standard: Optional[str] = Field(None, description="Class/grade (e.g., '10', '11')")
+    section: Optional[str] = Field(None, description="Section (e.g., 'A', 'B')")
+    course_type: Optional[str] = Field(None, description="Plan type (e.g., 'foundation', 'advanced')")
+    scheduled_at: Optional[datetime] = Field(None, description="Scheduled start time")
+    duration_minutes: Optional[int] = Field(None, ge=15, le=480, description="Duration in minutes")
+
+
 class ProviderDetails(BaseModel):
     provider: Optional[str] = None
     domain: Optional[str] = None
@@ -119,6 +129,7 @@ class MeetingResponse(BaseModel):
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     provider_details: Optional[ProviderDetails] = None
+    is_archived: bool = False
 
 
 class StudentMeetingResponse(BaseModel):
@@ -210,6 +221,43 @@ def _public_video_fields(meeting_id: str) -> tuple[Optional[str], Optional[str]]
     return jitsi_provider_service.get_room_url(room_name), room_name
 
 
+def _meeting_response_from_doc(
+    meeting: Dict[str, Any],
+    *,
+    current_user: Optional[Dict[str, Any]] = None,
+    provider: Optional[ProviderDetails] = None,
+) -> MeetingResponse:
+    if provider is None:
+        provider = _provider_or_none(
+            meeting.get("meeting_id"),
+            current_user=current_user,
+            moderator=True,
+        )
+    meet_link, meet_code = _provider_video_fields(provider)
+    return MeetingResponse(
+        meeting_id=meeting.get("meeting_id"),
+        tutor_id=meeting.get("tutor_id"),
+        tutor_name=meeting.get("tutor_name"),
+        topic=meeting.get("topic"),
+        subject=meeting.get("subject"),
+        standard=meeting.get("standard"),
+        section=meeting.get("section"),
+        course_type=meeting.get("course_type"),
+        scheduled_at=meeting.get("scheduled_at"),
+        duration_minutes=meeting.get("duration_minutes", 60),
+        meet_link=meet_link,
+        meet_code=meet_code,
+        status=meeting.get("status"),
+        invited_student_count=len(meeting.get("invited_student_ids", [])),
+        joined_student_count=len(meeting.get("joined_student_ids", [])),
+        created_at=meeting.get("created_at"),
+        started_at=meeting.get("started_at"),
+        ended_at=meeting.get("ended_at"),
+        provider_details=provider,
+        is_archived=bool(meeting.get("is_archived")),
+    )
+
+
 @router.post("/meetings", response_model=MeetingResponse, status_code=201)
 @limiter.limit("10/minute")
 async def create_meeting(
@@ -271,6 +319,7 @@ async def create_meeting(
         "created_at": datetime.utcnow(),
         "started_at": None,
         "ended_at": None,
+        "is_archived": False,
     }
 
     # Insert into database
@@ -307,27 +356,7 @@ async def create_meeting(
         except Exception as e:
             logger.warning(f"Failed to send online-class creation notifications: {e}")
 
-    return MeetingResponse(
-        meeting_id=meeting_id,
-        tutor_id=tutor_id,
-        tutor_name=tutor_name,
-        topic=meeting_data.topic,
-        subject=meeting_data.subject,
-        standard=meeting_data.standard,
-        section=meeting_data.section,
-        course_type=meeting_data.course_type,
-        scheduled_at=meeting_data.scheduled_at,
-        duration_minutes=meeting_data.duration_minutes,
-        meet_link=meet_link,
-        meet_code=meet_code,
-        status="scheduled",
-        invited_student_count=len(invited_student_ids),
-        joined_student_count=0,
-        created_at=meeting_doc["created_at"],
-        started_at=None,
-        ended_at=None,
-        provider_details=provider,
-    )
+    return _meeting_response_from_doc(meeting_doc, current_user=current_user, provider=provider)
 
 
 async def _find_eligible_students(
@@ -416,6 +445,7 @@ async def _find_eligible_students(
 async def get_tutor_meetings(
     request: Request,
     status: Optional[str] = None,
+    include_archived: bool = False,
     current_user: Dict[str, Any] = Depends(require_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -428,6 +458,8 @@ async def get_tutor_meetings(
     query = {"tutor_id": tutor_id}
     if status:
         query["status"] = status
+    if not include_archived:
+        query["is_archived"] = {"$ne": True}
 
     # Get meetings
     meetings = await db.mongo_find("meetings", query)
@@ -435,36 +467,93 @@ async def get_tutor_meetings(
 
     responses: List[MeetingResponse] = []
     for m in meetings:
-        provider = _provider_or_none(
-            m.get("meeting_id"),
-            current_user=current_user,
-            moderator=True,
-        )
-        meet_link, meet_code = _provider_video_fields(provider)
-        responses.append(
-            MeetingResponse(
-            meeting_id=m.get("meeting_id"),
-            tutor_id=m.get("tutor_id"),
-            tutor_name=m.get("tutor_name"),
-            topic=m.get("topic"),
-            subject=m.get("subject"),
-            standard=m.get("standard"),
-            section=m.get("section"),
-            course_type=m.get("course_type"),
-            scheduled_at=m.get("scheduled_at"),
-            duration_minutes=m.get("duration_minutes", 60),
-            meet_link=meet_link,
-            meet_code=meet_code,
-            status=m.get("status"),
-            invited_student_count=len(m.get("invited_student_ids", [])),
-            joined_student_count=len(m.get("joined_student_ids", [])),
-            created_at=m.get("created_at"),
-            started_at=m.get("started_at"),
-            ended_at=m.get("ended_at"),
-            provider_details=provider,
-            )
-        )
+        responses.append(_meeting_response_from_doc(m, current_user=current_user))
     return responses
+
+
+@router.patch("/meetings/{meeting_id}", response_model=MeetingResponse)
+@limiter.limit("20/minute")
+async def update_meeting(
+    request: Request,
+    meeting_id: str,
+    meeting_data: UpdateMeetingRequest,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Update a scheduled meeting. Active, ended, cancelled, or archived meetings are immutable.
+    """
+    tutor_id = current_user.get("tutor_id")
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if meeting.get("tutor_id") != tutor_id:
+        raise HTTPException(status_code=403, detail="Not authorized to update this meeting")
+    if meeting.get("is_archived"):
+        raise HTTPException(status_code=400, detail="Cannot update an archived meeting")
+    if meeting.get("status") != "scheduled":
+        raise HTTPException(status_code=400, detail="Only scheduled meetings can be edited")
+
+    updates = meeting_data.model_dump(exclude_unset=True)
+    if not updates:
+        return _meeting_response_from_doc(meeting, current_user=current_user)
+
+    next_doc = {**meeting, **updates}
+    criteria_fields = {"standard", "section", "subject", "course_type"}
+    if criteria_fields.intersection(updates.keys()):
+        invited_student_ids = await _find_eligible_students(
+            db=db,
+            tutor_id=tutor_id,
+            standard=next_doc.get("standard"),
+            section=next_doc.get("section"),
+            subject=next_doc.get("subject"),
+            course_type=next_doc.get("course_type"),
+            admin_id=meeting.get("admin_id"),
+        )
+        updates["invited_student_ids"] = invited_student_ids
+        next_doc["invited_student_ids"] = invited_student_ids
+
+    updates["updated_at"] = datetime.utcnow()
+    next_doc["updated_at"] = updates["updated_at"]
+
+    await db.mongo_update_one(
+        "meetings",
+        {"meeting_id": meeting_id},
+        {"$set": updates},
+    )
+
+    logger.info(f"Updated meeting {meeting_id} by tutor {tutor_id}")
+    return _meeting_response_from_doc(next_doc, current_user=current_user)
+
+
+@router.post("/meetings/{meeting_id}/archive")
+@limiter.limit("20/minute")
+async def archive_meeting(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Archive an ended or cancelled meeting so it is hidden from the default tutor list.
+    """
+    tutor_id = current_user.get("tutor_id")
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if meeting.get("tutor_id") != tutor_id:
+        raise HTTPException(status_code=403, detail="Not authorized to archive this meeting")
+    if meeting.get("status") not in ["ended", "cancelled"]:
+        raise HTTPException(status_code=400, detail="Only past meetings can be archived")
+
+    await db.mongo_update_one(
+        "meetings",
+        {"meeting_id": meeting_id},
+        {"$set": {"is_archived": True, "archived_at": datetime.utcnow()}},
+    )
+
+    logger.info(f"Archived meeting {meeting_id} by tutor {tutor_id}")
+    return {"message": "Meeting archived", "meeting_id": meeting_id}
 
 
 @router.get("/meetings/student", response_model=List[StudentMeetingResponse])

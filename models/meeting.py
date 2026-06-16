@@ -34,6 +34,7 @@ class Meeting:
         created_at: datetime = None,
         started_at: Optional[datetime] = None,
         ended_at: Optional[datetime] = None,
+        is_archived: bool = False,
         _id: ObjectId = None,
     ):
         self._id = _id
@@ -56,6 +57,7 @@ class Meeting:
         self.created_at = created_at or datetime.utcnow()
         self.started_at = started_at
         self.ended_at = ended_at
+        self.is_archived = is_archived
 
     @staticmethod
     def generate_meeting_id(prefix: str = "MTG") -> str:
@@ -88,6 +90,7 @@ class Meeting:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "ended_at": self.ended_at.isoformat() if self.ended_at else None,
+            "is_archived": self.is_archived,
         }
 
     @classmethod
@@ -131,6 +134,7 @@ class Meeting:
             created_at=created_at,
             started_at=started_at,
             ended_at=ended_at,
+            is_archived=bool(data.get('is_archived', False)),
         )
 
     def to_student_view(self) -> Dict[str, Any]:
