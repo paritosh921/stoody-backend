@@ -52,6 +52,12 @@ CANVAS_SHARE_REQUEST_TTL_SECONDS = 45
 TEACHER_CANVAS_MODE_FIELD = "teacher_canvas_mode"
 TEACHER_CANVAS_MODE_UPDATED_AT_FIELD = "teacher_canvas_mode_updated_at"
 TEACHER_CANVAS_MODE_UPDATED_BY_FIELD = "teacher_canvas_mode_updated_by"
+MEETING_MEDIA_POLICY_FIELD = "online_class_media_policy"
+DEFAULT_MEETING_MEDIA_POLICY = {
+    "allow_student_microphone": True,
+    "allow_student_camera": True,
+    "allow_student_screen_share": True,
+}
 
 
 class CanvasProviderDetails(BaseModel):
@@ -135,6 +141,17 @@ class TeacherCanvasModeRequest(BaseModel):
 
 class TeacherCanvasModeResponse(BaseModel):
     mode: Literal["live", "stream"]
+    updated_at: Optional[str] = None
+    updated_by: Optional[str] = None
+
+
+class MeetingMediaPolicyRequest(BaseModel):
+    allow_student_microphone: bool = True
+    allow_student_camera: bool = True
+    allow_student_screen_share: bool = True
+
+
+class MeetingMediaPolicyResponse(MeetingMediaPolicyRequest):
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
 
@@ -559,6 +576,52 @@ async def _set_teacher_canvas_mode(
         "updated_at": now.isoformat(),
         "updated_by": updated_by,
     }
+
+
+def _normalize_meeting_media_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = dict(DEFAULT_MEETING_MEDIA_POLICY)
+    if isinstance(policy, dict):
+        for key in DEFAULT_MEETING_MEDIA_POLICY:
+            if key in policy:
+                normalized[key] = bool(policy.get(key))
+        normalized["updated_at"] = _serialize_datetime(policy.get("updated_at"))
+        normalized["updated_by"] = policy.get("updated_by")
+    else:
+        normalized["updated_at"] = None
+        normalized["updated_by"] = None
+    return normalized
+
+
+async def _get_meeting_media_policy(
+    db: DatabaseManager,
+    meeting_id: str,
+) -> Dict[str, Any]:
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return _normalize_meeting_media_policy(meeting.get(MEETING_MEDIA_POLICY_FIELD))
+
+
+async def _set_meeting_media_policy(
+    db: DatabaseManager,
+    meeting_id: str,
+    policy: Dict[str, bool],
+    updated_by: str,
+) -> Dict[str, Any]:
+    now = datetime.utcnow()
+    stored_policy = {
+        "allow_student_microphone": bool(policy.get("allow_student_microphone")),
+        "allow_student_camera": bool(policy.get("allow_student_camera")),
+        "allow_student_screen_share": bool(policy.get("allow_student_screen_share")),
+        "updated_at": now,
+        "updated_by": updated_by,
+    }
+    await db.mongo_update_one(
+        "meetings",
+        {"meeting_id": meeting_id},
+        {"$set": {MEETING_MEDIA_POLICY_FIELD: stored_policy}},
+    )
+    return _normalize_meeting_media_policy(stored_policy)
 
 
 async def _find_canvas_pages_for_user_ids(
@@ -1371,6 +1434,52 @@ async def api_set_teacher_canvas_mode(
             {"$set": {"status": "ended", "ended_at": datetime.utcnow()}},
         )
     return TeacherCanvasModeResponse(**await _set_teacher_canvas_mode(db, meeting_id, body.mode, tutor_id))
+
+
+@router.get(
+    "/meetings/{meeting_id}/media-policy",
+    response_model=MeetingMediaPolicyResponse,
+)
+@limiter.limit("60/minute")
+async def api_get_meeting_media_policy(
+    request: Request,
+    meeting_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    user_type = current_user.get("user_type")
+    if user_type == "tutor":
+        await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
+    elif user_type == "student":
+        meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+        if not meeting:
+            raise HTTPException(status_code=404, detail="Meeting not found")
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id or student_id not in meeting.get("invited_student_ids", []):
+            raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+    else:
+        raise HTTPException(status_code=403, detail="Online class access denied")
+    return MeetingMediaPolicyResponse(**await _get_meeting_media_policy(db, meeting_id))
+
+
+@router.post(
+    "/meetings/{meeting_id}/media-policy",
+    response_model=MeetingMediaPolicyResponse,
+)
+@limiter.limit("30/minute")
+async def api_set_meeting_media_policy(
+    request: Request,
+    meeting_id: str,
+    body: MeetingMediaPolicyRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
+    await _verify_meeting_active(db, meeting_id)
+    tutor_id = current_user.get("tutor_id") or meeting.get("tutor_id") or "tutor"
+    updated = await _set_meeting_media_policy(db, meeting_id, body.model_dump(), tutor_id)
+    return MeetingMediaPolicyResponse(**updated)
 
 
 @router.get(

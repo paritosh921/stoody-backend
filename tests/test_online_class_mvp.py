@@ -1011,6 +1011,54 @@ async def _test_teacher_canvas_mode_defaults_live_and_persists_stream():
     assert stored["mode"] == "stream"
 
 
+def test_meeting_media_policy_defaults_and_persists_student_controls():
+    asyncio.run(_test_meeting_media_policy_defaults_and_persists_student_controls())
+
+
+async def _test_meeting_media_policy_defaults_and_persists_student_controls():
+    from api.v1.online_class.router import (
+        _get_meeting_media_policy,
+        _set_meeting_media_policy,
+    )
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+    })
+
+    default_policy = await _get_meeting_media_policy(db, "MTG1")
+    assert default_policy == {
+        "allow_student_microphone": True,
+        "allow_student_camera": True,
+        "allow_student_screen_share": True,
+        "updated_at": None,
+        "updated_by": None,
+    }
+
+    updated = await _set_meeting_media_policy(
+        db,
+        "MTG1",
+        {
+            "allow_student_microphone": False,
+            "allow_student_camera": True,
+            "allow_student_screen_share": False,
+        },
+        "tutor-1",
+    )
+
+    assert updated["allow_student_microphone"] is False
+    assert updated["allow_student_camera"] is True
+    assert updated["allow_student_screen_share"] is False
+    assert updated["updated_by"] == "tutor-1"
+
+    stored = await _get_meeting_media_policy(db, "MTG1")
+    assert stored["allow_student_microphone"] is False
+    assert stored["allow_student_camera"] is True
+    assert stored["allow_student_screen_share"] is False
+
+
 def test_teacher_live_canvas_events_upsert_through_online_class_facade():
     asyncio.run(_test_teacher_live_canvas_events_upsert())
 
