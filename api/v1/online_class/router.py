@@ -131,6 +131,22 @@ class MonitoringPageListResponse(BaseModel):
     server_time: str
 
 
+class MonitoringStrokeStreamBatchRequest(BaseModel):
+    student_ids: List[str]
+    cursors: Dict[str, Optional[float]] = {}
+
+
+class MonitoringStrokeStreamBatchItem(BaseModel):
+    student_id: str
+    count: int
+    pages: List[MonitoringPageMeta]
+
+
+class MonitoringStrokeStreamBatchResponse(BaseModel):
+    students: List[MonitoringStrokeStreamBatchItem]
+    server_time: str
+
+
 class MonitoringPageResponse(BaseModel):
     page: Dict[str, Any]
 
@@ -622,6 +638,49 @@ async def _set_meeting_media_policy(
         {"$set": {MEETING_MEDIA_POLICY_FIELD: stored_policy}},
     )
     return _normalize_meeting_media_policy(stored_policy)
+
+
+async def _get_monitoring_stroke_stream_batch(
+    db: DatabaseManager,
+    meeting: Dict[str, Any],
+    student_ids: List[str],
+    cursors: Optional[Dict[str, Optional[float]]] = None,
+) -> List[Dict[str, Any]]:
+    invited_ids = {str(student_id) for student_id in meeting.get("invited_student_ids", []) if student_id}
+    requested_ids = []
+    for student_id in student_ids:
+        normalized = str(student_id)
+        if normalized and normalized not in requested_ids:
+            requested_ids.append(normalized)
+    if len(requested_ids) > 16:
+        raise HTTPException(status_code=400, detail="Monitoring batch supports up to 16 students")
+    if any(student_id not in invited_ids for student_id in requested_ids):
+        raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+
+    cursor_map = cursors or {}
+    items: List[Dict[str, Any]] = []
+    for student_id in requested_ids:
+        user_ids = await _resolve_student_canvas_user_ids(db, student_id)
+        pages = await _find_canvas_pages_for_user_ids(
+            db,
+            user_ids,
+            projection={"strokes": 0},
+        )
+        pages = _filter_canvas_pages_since_session_start(pages, meeting.get("started_at"))
+        cursor = cursor_map.get(student_id)
+        if cursor is not None:
+            pages = [
+                page
+                for page in pages
+                if (_page_activity_max_ms(page) is not None and _page_activity_max_ms(page) > cursor)
+            ]
+        metas = [_build_monitoring_page_meta(page) for page in pages]
+        items.append({
+            "student_id": student_id,
+            "count": len(metas),
+            "pages": metas,
+        })
+    return items
 
 
 async def _find_canvas_pages_for_user_ids(
@@ -1382,6 +1441,34 @@ async def api_get_monitoring_stroke_stream_snapshot(
     return MonitoringPageListResponse(
         count=len(metas),
         pages=metas,
+        server_time=datetime.utcnow().isoformat(),
+    )
+
+
+@router.post(
+    "/meetings/{meeting_id}/monitoring/strokes/stream/batch",
+    response_model=MonitoringStrokeStreamBatchResponse,
+)
+@limiter.limit("60/minute")
+async def api_get_monitoring_stroke_stream_batch(
+    request: Request,
+    meeting_id: str,
+    body: MonitoringStrokeStreamBatchRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    _require_tutor(current_user)
+    meeting = await _verify_tutor_owns_meeting(db, meeting_id, current_user.get("tutor_id"), current_user=current_user)
+    await _verify_meeting_active(db, meeting_id)
+    items = await _get_monitoring_stroke_stream_batch(
+        db,
+        meeting,
+        body.student_ids,
+        body.cursors,
+    )
+
+    return MonitoringStrokeStreamBatchResponse(
+        students=items,
         server_time=datetime.utcnow().isoformat(),
     )
 

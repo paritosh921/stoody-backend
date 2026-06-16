@@ -746,6 +746,68 @@ def test_monitoring_page_filter_uses_meeting_start_and_page_key_round_trips():
     }
 
 
+def test_monitoring_stroke_stream_batch_returns_only_changed_pages():
+    asyncio.run(_test_monitoring_stroke_stream_batch_returns_only_changed_pages())
+
+
+async def _test_monitoring_stroke_stream_batch_returns_only_changed_pages():
+    from api.v1.online_class.router import _get_monitoring_stroke_stream_batch
+
+    db = FakeDb()
+    meeting = {
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+        "invited_student_ids": ["STU1", "STU2"],
+        "started_at": datetime(2026, 6, 12, 8, 0, 0),
+    }
+    base_ms = meeting["started_at"].timestamp() * 1000
+    db.collections["canvas_pages"].extend([
+        {
+            "user_id": "STU1",
+            "copy_id": "copy-a",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 2,
+            "first_activity": base_ms + 1000,
+            "last_activity": base_ms + 2000,
+            "last_modified": datetime(2026, 6, 12, 8, 1, 0),
+        },
+        {
+            "user_id": "STU1",
+            "copy_id": "copy-a",
+            "book_type": "MS",
+            "page_number": 1,
+            "stroke_count": 4,
+            "first_activity": base_ms + 2500,
+            "last_activity": base_ms + 5000,
+            "last_modified": datetime(2026, 6, 12, 8, 2, 0),
+        },
+        {
+            "user_id": "STU2",
+            "copy_id": "copy-b",
+            "book_type": "MS",
+            "page_number": 0,
+            "stroke_count": 1,
+            "first_activity": base_ms + 900,
+            "last_activity": base_ms + 1100,
+            "last_modified": datetime(2026, 6, 12, 8, 1, 30),
+        },
+    ])
+
+    result = await _get_monitoring_stroke_stream_batch(
+        db,
+        meeting,
+        ["STU1", "STU2"],
+        {"STU1": base_ms + 90000, "STU2": base_ms + 100000},
+    )
+
+    by_student = {item["student_id"]: item for item in result}
+    assert by_student["STU1"]["count"] == 1
+    assert by_student["STU1"]["pages"][0]["page_number"] == 1
+    assert by_student["STU2"]["count"] == 0
+
+
 def test_online_class_notes_list_returns_invited_classes_with_page_counts():
     asyncio.run(_test_online_class_notes_list_returns_invited_classes_with_page_counts())
 
