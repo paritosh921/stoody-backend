@@ -254,6 +254,9 @@ class CanvasPageStroke(BaseModel):
     endedAt: Optional[float] = None
     pageNumber: Optional[int] = None
     bookType: Optional[str] = None
+    practiceSessionId: Optional[str] = None
+    questionId: Optional[str] = None
+    virtualPageOrdinal: Optional[int] = None
 
     @field_validator("points", mode="before")
     @classmethod

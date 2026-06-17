@@ -30,6 +30,145 @@ from slowapi.util import get_remote_address
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 
+_MIN_EPOCH_MS = 946684800000   # 2000-01-01T00:00:00Z
+_MAX_EPOCH_MS = 4102444800000  # 2100-01-01T00:00:00Z
+_QUESTION_INTERVAL_TOLERANCE_MS = 2000
+
+
+def _first_present(source: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if source.get(key) is not None:
+            return source.get(key)
+    return None
+
+
+def _normalize_epoch_ms(raw_ts: Any) -> Optional[int]:
+    if raw_ts is None:
+        return None
+    if isinstance(raw_ts, datetime):
+        return round(raw_ts.timestamp() * 1000)
+
+    try:
+        ts = float(raw_ts)
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            return round(parsed.timestamp() * 1000)
+        except Exception:
+            return None
+
+    if not ts or ts <= 0:
+        return None
+    if _MIN_EPOCH_MS <= ts <= _MAX_EPOCH_MS:
+        return round(ts)
+    if _MIN_EPOCH_MS / 1000 <= ts <= _MAX_EPOCH_MS / 1000:
+        return round(ts * 1000)
+    if _MIN_EPOCH_MS * 1000 <= ts <= _MAX_EPOCH_MS * 1000:
+        return round(ts / 1000)
+    if _MIN_EPOCH_MS * 1_000_000 <= ts <= _MAX_EPOCH_MS * 1_000_000:
+        return round(ts / 1_000_000)
+    return None
+
+
+def _stroke_time_range_ms(
+    stroke: Dict[str, Any],
+) -> tuple[Optional[int], Optional[int]]:
+    start_raw = _first_present(
+        stroke,
+        "startedAt",
+        "started_at",
+        "timestamp",
+        "createdAt",
+        "created_at",
+    )
+    end_raw = _first_present(stroke, "endedAt", "ended_at")
+    if end_raw is None:
+        end_raw = start_raw
+    start_ts = _normalize_epoch_ms(start_raw)
+    end_ts = _normalize_epoch_ms(end_raw)
+    if start_ts is None or end_ts is None:
+        return None, None
+    return start_ts, max(start_ts, end_ts)
+
+
+def _normalize_question_intervals(raw_intervals: Any) -> List[Dict[str, int]]:
+    if not isinstance(raw_intervals, list):
+        return []
+    now_ms = round(datetime.utcnow().timestamp() * 1000)
+    intervals: List[Dict[str, int]] = []
+    for raw in raw_intervals:
+        if not isinstance(raw, dict):
+            continue
+        start_ts = _normalize_epoch_ms(_first_present(raw, "startTs", "start_ts"))
+        end_value = _first_present(raw, "endTs", "end_ts")
+        end_ts = now_ms if end_value is None else _normalize_epoch_ms(end_value)
+        if start_ts is None or end_ts is None:
+            continue
+        if end_ts < start_ts:
+            continue
+        intervals.append({"start": start_ts, "end": end_ts})
+    return intervals
+
+
+def _filter_strokes_by_question_intervals(
+    strokes: List[Dict[str, Any]],
+    raw_intervals: Any,
+) -> List[Dict[str, Any]]:
+    intervals = _normalize_question_intervals(raw_intervals)
+    if not strokes or not intervals:
+        return strokes
+
+    filtered: List[Dict[str, Any]] = []
+    for stroke in strokes:
+        start_ts, end_ts = _stroke_time_range_ms(stroke)
+        if start_ts is None or end_ts is None:
+            filtered.append(stroke)
+            continue
+        if any(
+            end_ts >= interval["start"] - _QUESTION_INTERVAL_TOLERANCE_MS
+            and start_ts <= interval["end"] + _QUESTION_INTERVAL_TOLERANCE_MS
+            for interval in intervals
+        ):
+            filtered.append(stroke)
+    return filtered
+
+
+def _filter_strokes_by_practice_identity(
+    strokes: List[Dict[str, Any]],
+    practice_session_id: Optional[str],
+    question_id: Optional[str],
+    virtual_pages: Any,
+) -> List[Dict[str, Any]]:
+    if not strokes or not practice_session_id or not question_id:
+        return []
+
+    allowed_ordinals = set()
+    if isinstance(virtual_pages, list):
+        for page in virtual_pages:
+            if not isinstance(page, dict):
+                continue
+            ordinal = page.get("ordinal")
+            try:
+                allowed_ordinals.add(int(ordinal))
+            except (TypeError, ValueError):
+                continue
+
+    filtered: List[Dict[str, Any]] = []
+    for stroke in strokes:
+        if stroke.get("practiceSessionId") != practice_session_id:
+            continue
+        if stroke.get("questionId") != question_id:
+            continue
+        if allowed_ordinals:
+            try:
+                stroke_ordinal = int(stroke.get("virtualPageOrdinal"))
+            except (TypeError, ValueError):
+                continue
+            if stroke_ordinal not in allowed_ordinals:
+                continue
+        filtered.append(stroke)
+    return filtered
+
 
 async def _revoke_tutor_sessions(tutor: Dict[str, Any], auth_manager: Optional[AuthManager]) -> None:
     user_id = str(tutor.get("_id") or tutor.get("id") or tutor.get("tutor_id") or "")
@@ -2014,10 +2153,17 @@ async def get_student_document_attempts(
             question_strokes: list = []
             qpr = r.get("question_page_refs")
             if qpr and canvas_col is not None:
-                active_pages = qpr.get("active_pages") or []
-                book_type = qpr.get("book_type", "LS")
-                copy_id_ref = qpr.get("copy_id")
-                time_intervals = qpr.get("time_intervals") or []
+                active_pages = qpr.get("active_pages") or qpr.get("activePages") or []
+                book_type = qpr.get("book_type") or qpr.get("bookType") or "LS"
+                copy_id_ref = qpr.get("copy_id") or qpr.get("copyId")
+                practice_session_id = (
+                    qpr.get("practice_session_id") or qpr.get("practiceSessionId")
+                )
+                qpr_question_id = qpr.get("question_id") or qpr.get("questionId")
+                virtual_pages = qpr.get("virtual_pages") or qpr.get("virtualPages")
+                time_intervals = (
+                    qpr.get("time_intervals") or qpr.get("timeIntervals") or []
+                )
 
                 if active_pages:
                     try:
@@ -2038,12 +2184,24 @@ async def get_student_document_attempts(
 
                         for pg in raw_pages:
                             raw_strokes = pg.get("strokes") or []
+                            if practice_session_id and qpr_question_id:
+                                filtered_strokes = _filter_strokes_by_practice_identity(
+                                    raw_strokes,
+                                    practice_session_id,
+                                    qpr_question_id,
+                                    virtual_pages,
+                                )
+                            else:
+                                filtered_strokes = _filter_strokes_by_question_intervals(
+                                    raw_strokes,
+                                    time_intervals,
+                                )
 
-                            if raw_strokes:
+                            if filtered_strokes:
                                 question_strokes.append({
                                     "page_number": pg.get("page_number", 0),
                                     "book_type": pg.get("book_type", ""),
-                                    "strokes": raw_strokes,
+                                    "strokes": filtered_strokes,
                                 })
                     except Exception as fetch_err:
                         _logger.warning(

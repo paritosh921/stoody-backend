@@ -1725,6 +1725,9 @@ class QuestionPageRefsModel(BaseModel):
     activePages: Optional[List[int]] = None        # Physical notebook page numbers
     bookType: Optional[str] = None                 # e.g. "LS", "MS"
     copyId: Optional[str] = None                   # Copy set ID
+    practiceSessionId: Optional[str] = None        # Client practice session ownership key
+    questionId: Optional[str] = None               # Question ownership key
+    virtualPages: Optional[List[Dict[str, Any]]] = None  # Per-virtual-page metadata
     timeIntervals: Optional[List[Dict[str, Any]]] = None  # [{startTs, endTs}]
 
 
@@ -1814,6 +1817,306 @@ class EvaluateRequest(BaseModel):
 class EvaluateResponse(BaseModel):
     success: bool = True
     evaluation: Dict[str, Any]
+
+
+class PracticeMentorChatMessage(BaseModel):
+    role: str
+    content: str
+
+    @validator("role")
+    def _valid_role(cls, value):
+        role = (value or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            raise ValueError("role must be user or assistant")
+        return role
+
+    @validator("content")
+    def _valid_content(cls, value):
+        text = (value or "").strip()
+        if not text:
+            raise ValueError("content is required")
+        return text
+
+
+class PracticeMentorRequest(BaseModel):
+    questionId: str
+    documentId: Optional[str] = None
+    message: str = Field(..., min_length=1, max_length=2000)
+    conversationHistory: List[PracticeMentorChatMessage] = Field(default_factory=list, max_length=12)
+    canvasPages: Optional[List[str]] = None
+    uploadedImages: Optional[List[UploadedImageFile]] = None
+    evaluation: Optional[Dict[str, Any]] = None
+    sessionId: Optional[str] = None
+
+    @validator('canvasPages', pre=True)
+    def _normalize_canvas_pages(cls, value):
+        if value is None:
+            return value
+        try:
+            items = value if isinstance(value, list) else [value]
+            pages: List[str] = []
+            for item in items:
+                data = None
+                if isinstance(item, str):
+                    data = item
+                elif isinstance(item, dict):
+                    data = (
+                        item.get("dataUrl")
+                        or item.get("url")
+                        or item.get("data")
+                        or item.get("image")
+                        or item.get("src")
+                    )
+                if not data:
+                    continue
+                if not data.startswith("data:image"):
+                    data = f"data:image/png;base64,{data}"
+                pages.append(data)
+            return pages
+        except Exception:
+            return value
+
+
+class PracticeMentorResponse(BaseModel):
+    success: bool = True
+    response: str
+    sessionId: Optional[str] = None
+    usedSavedEvaluation: bool = False
+
+
+def _uploaded_image_file_to_data_url(uploaded_img: UploadedImageFile) -> Optional[str]:
+    data = (uploaded_img.data or "").strip()
+    if not data:
+        return None
+    if data.startswith("data:"):
+        return data
+    body = data.split(",")[-1] if "," in data else data
+    mime_type = uploaded_img.type or "image/jpeg"
+    if not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+    return f"data:{mime_type};base64,{body}"
+
+
+def _prepare_student_answer_images(
+    canvas_pages_raw: Optional[List[str]] = None,
+    uploaded_photos_raw: Optional[List[str]] = None,
+) -> List[str]:
+    """Prepare student work images for vision calls.
+
+    Canvas exports are already crisp white-background renders, so they are only
+    filtered for blank pages. Camera photos get the light enhancement path.
+    """
+    student_images: List[str] = []
+    canvas_pages = [img for img in (canvas_pages_raw or []) if img]
+    uploaded_photos = [img for img in (uploaded_photos_raw or []) if img]
+
+    try:
+        from utils.image_processor import enhance_canvas_images_batch, is_canvas_empty
+    except ImportError as ie:
+        logger.warning(f"Image processor not available: {ie}; using raw images.")
+        enhance_canvas_images_batch = None  # type: ignore
+        is_canvas_empty = None  # type: ignore
+
+    if canvas_pages:
+        if is_canvas_empty:
+            non_empty = [img for img in canvas_pages if not is_canvas_empty(img)]
+            if not non_empty:
+                non_empty = canvas_pages
+        else:
+            non_empty = canvas_pages
+        student_images.extend(non_empty)
+
+    if uploaded_photos:
+        if enhance_canvas_images_batch:
+            try:
+                enhanced_photos = (
+                    enhance_canvas_images_batch(uploaded_photos, target_width=1500)
+                    or uploaded_photos
+                )
+            except Exception as enhance_err:
+                logger.warning(f"Photo enhancement failed: {enhance_err}; using raw images.")
+                enhanced_photos = uploaded_photos
+        else:
+            enhanced_photos = uploaded_photos
+        student_images.extend(enhanced_photos)
+
+    return student_images
+
+
+def _current_student_id(current_user: Dict[str, Any]) -> Optional[str]:
+    user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+    return str(user_id) if user_id is not None else None
+
+
+async def _latest_practice_attempt(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+    *,
+    is_b2c: bool,
+    question_id: str,
+    document_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    user_id = _current_student_id(current_user)
+    if not user_id:
+        return None
+
+    filter_dict: Dict[str, Any] = {
+        "student_id": user_id,
+        "question_id": question_id,
+    }
+    if document_id:
+        filter_dict["document_id"] = document_id
+
+    try:
+        if is_b2c:
+            attempts = await db.b2c_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+                limit=1,
+            )
+        else:
+            attempts = await db.mongo_find(
+                "practice_attempts",
+                filter_dict,
+                sort=[("created_at", -1)],
+                limit=1,
+            )
+        return attempts[0] if attempts else None
+    except Exception as err:
+        logger.warning(f"Could not load latest mentor attempt for Q:{question_id}: {err}")
+        return None
+
+
+def _mentor_eval_value(source: Dict[str, Any], *keys: str, default: str = "") -> Any:
+    for key in keys:
+        if key in source and source.get(key) not in (None, ""):
+            return source.get(key)
+    return default
+
+
+def _format_mentor_evaluation_context(
+    evaluation: Optional[Dict[str, Any]],
+    latest_attempt: Optional[Dict[str, Any]],
+) -> tuple[str, bool]:
+    if latest_attempt:
+        created_at = latest_attempt.get("created_at")
+        created_text = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or "")
+        lines = [
+            "The student has submitted this question. Use this saved backend evaluation for follow-up doubts.",
+            f"- Saved at: {created_text or 'not available'}",
+            f"- Correct: {'yes' if latest_attempt.get('is_correct') else 'no'}",
+            f"- Score: {latest_attempt.get('score', 'not provided')}",
+            f"- Student final answer: {_truncate_for_prompt(str(latest_attempt.get('student_answer') or ''), 700) or 'not provided'}",
+            f"- Work shown by evaluator: {_truncate_for_prompt(str(latest_attempt.get('work_shown') or ''), 1200) or 'not provided'}",
+            f"- What went wrong: {_truncate_for_prompt(str(latest_attempt.get('what_went_wrong') or ''), 1200) or 'not provided'}",
+            f"- Correct answer: {_truncate_for_prompt(str(latest_attempt.get('correct_answer') or ''), 700) or 'not provided'}",
+            f"- Correct solution/reference: {_truncate_for_prompt(str(latest_attempt.get('correct_solution') or ''), 1800) or 'not provided'}",
+        ]
+        return "\n".join(lines), True
+
+    if evaluation:
+        correct = _mentor_eval_value(evaluation, "correct", "is_correct", default=False)
+        lines = [
+            "The student has submitted this question. Use this evaluation returned by the practice evaluator for follow-up doubts.",
+            f"- Correct: {'yes' if bool(correct) else 'no'}",
+            f"- Score: {_mentor_eval_value(evaluation, 'score', default='not provided')}",
+            f"- Student final answer: {_truncate_for_prompt(str(_mentor_eval_value(evaluation, 'extractedAnswer', 'extracted_answer')), 700) or 'not provided'}",
+            f"- Work shown by evaluator: {_truncate_for_prompt(str(_mentor_eval_value(evaluation, 'workShown', 'work_shown')), 1200) or 'not provided'}",
+            f"- What went wrong: {_truncate_for_prompt(str(_mentor_eval_value(evaluation, 'whatWentWrong', 'what_went_wrong')), 1200) or 'not provided'}",
+            f"- Correct answer: {_truncate_for_prompt(str(_mentor_eval_value(evaluation, 'correctAnswer', 'correct_answer')), 700) or 'not provided'}",
+            f"- Correct solution/reference: {_truncate_for_prompt(str(_mentor_eval_value(evaluation, 'correctSolution', 'correct_solution')), 1800) or 'not provided'}",
+        ]
+        return "\n".join(lines), False
+
+    return (
+        "The student has not submitted this question yet, or no saved evaluation is available. "
+        "Guide them without directly revealing the final answer. If they ask how to solve it, "
+        "give only the first useful step and ask them to try the next move.",
+        False,
+    )
+
+
+def _format_mentor_history(history: List[PracticeMentorChatMessage]) -> str:
+    if not history:
+        return "No previous mentor messages for this question."
+    rows: List[str] = []
+    for item in history[-6:]:
+        speaker = "Student" if item.role == "user" else "Mentor"
+        rows.append(f"{speaker}: {_truncate_for_prompt(item.content, 900)}")
+    return "\n".join(rows)
+
+
+def _build_practice_mentor_system_prompt(detected_language: str) -> str:
+    language_line = (
+        "Respond mainly in Hindi if the student's message is in Hindi; otherwise use simple English."
+        if detected_language == "hindi"
+        else "Use simple English unless the student writes in Hindi."
+    )
+    return f"""You are Stoody AI Mentor for one practice question. You are a patient subject teacher in a chat.
+
+Teaching style:
+- {language_line}
+- Sound like a human teacher, not a generated article.
+- Keep the normal reply under 90 words and 2 to 4 short lines.
+- If the student explicitly asks for a full solution, still keep it under 180 words and focus on the key steps.
+- Do not use markdown headings, tables, long bullet lists, or labels like "Comprehensive Analysis".
+- Give one useful next step, then invite the student to try or ask a follow-up.
+- Before submission, do not reveal the final answer directly.
+- After submission, explain one mistake and one correction using the saved evaluation and visible student work.
+
+Image discipline:
+- Question figures and option images are part of the problem statement, not the student's work.
+- Student canvas pages and uploaded photos are the student's work.
+- If the question is image-only, read it from the question image.
+- If a student photo/page is unclear, say exactly what is unclear and ask for a clearer page/photo.
+
+Math formatting:
+- Wrap inline math in \\( ... \\).
+- Wrap display math in \\[ ... \\].
+- Do not write bare LaTeX commands like \\frac or \\sqrt outside delimiters.
+- Do not use code blocks for math."""
+
+
+def _build_practice_mentor_prompt(
+    *,
+    question_text: str,
+    options_text: str,
+    correct_answer_display: str,
+    student_message: str,
+    image_labels: List[str],
+    evaluation_context: str,
+    history_text: str,
+) -> str:
+    image_text = "\n".join(image_labels) if image_labels else "No images are attached."
+    question_block = question_text.strip() or (
+        "Question text is not available as text. Read the question from the attached question image(s)."
+    )
+    options_block = options_text.strip() or "No text options are available."
+    correct_block = correct_answer_display.strip() or "Not provided. Solve from the question context when needed."
+    return f"""QUESTION CONTEXT
+Question:
+{_truncate_for_prompt(question_block, 5000)}
+
+Options:
+{_truncate_for_prompt(options_block, 2500)}
+
+Tutor-only reference answer:
+{_truncate_for_prompt(correct_block, 1500)}
+
+IMAGES IN THIS REQUEST
+{image_text}
+
+EVALUATION / STUDENT-WORK CONTEXT
+{evaluation_context}
+
+RECENT CHAT FOR THIS QUESTION
+{history_text}
+
+STUDENT'S CURRENT MESSAGE
+{_truncate_for_prompt(student_message.strip(), 2000)}
+
+Reply now as the mentor. Be short, conversational, and one step at a time. Use the image labels above when deciding what is question context versus student work."""
 
 
 def _build_evaluation_prompt(
@@ -2271,6 +2574,153 @@ def _parse_evaluation_response(
     return evaluation_data
 
 
+@router.post("/mentor-chat", response_model=PracticeMentorResponse)
+@limiter.limit("60/minute")
+async def practice_mentor_chat(
+    request: Request,
+    payload: PracticeMentorRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Question-scoped AI mentor for student practice.
+
+    The mobile/web clients send only the question id, student work snapshots,
+    and chat history. The backend owns the teacher prompt, loads question
+    images/options from storage, and attaches the latest saved evaluation so
+    follow-up doubts are grounded in the evaluated student solution.
+    """
+    try:
+        qid = payload.questionId
+        student_message = payload.message.strip()
+        if not student_message:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message is required")
+
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        question_doc = await _load_question_doc(db, qid, is_b2c=is_b2c)
+        if not question_doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
+
+        question_text = str(question_doc.get("text", ""))
+        options_text = _options_text_from_question(question_doc)
+        detected_language = detect_language(f"{question_text}\n{student_message}")
+
+        correct_answer_raw = str(
+            question_doc.get("correctAnswer")
+            if question_doc.get("correctAnswer") is not None
+            else (question_doc.get("correct_answer") or "")
+        ).strip()
+        resolved = _resolve_correct_answer(correct_answer_raw, question_doc)
+        correct_answer_display = _normalize_latex_for_render(str(resolved.get("display") or correct_answer_raw or "").strip())
+
+        question_figure_images = await _figure_images_base64(question_doc, db, is_b2c)
+        option_images_data = await _option_images_base64(question_doc, db, is_b2c)
+        option_images = [item["image"] for item in option_images_data if item.get("image")]
+
+        canvas_pages_raw = payload.canvasPages or []
+        uploaded_photos_raw: List[str] = []
+        if payload.uploadedImages:
+            for uploaded_img in payload.uploadedImages:
+                data = _uploaded_image_file_to_data_url(uploaded_img)
+                if data:
+                    uploaded_photos_raw.append(data)
+
+        student_images = _prepare_student_answer_images(
+            canvas_pages_raw=canvas_pages_raw,
+            uploaded_photos_raw=uploaded_photos_raw,
+        )
+
+        latest_attempt = await _latest_practice_attempt(
+            db,
+            current_user,
+            is_b2c=is_b2c,
+            question_id=qid,
+            document_id=payload.documentId,
+        )
+        evaluation_context, used_saved_evaluation = _format_mentor_evaluation_context(
+            payload.evaluation,
+            latest_attempt,
+        )
+
+        image_labels: List[str] = []
+        image_no = 1
+        for idx in range(len(question_figure_images)):
+            image_labels.append(f"Image {image_no} - QUESTION FIGURE {idx + 1}")
+            image_no += 1
+        for idx, option_img in enumerate(option_images_data):
+            option_label = option_img.get("option") or chr(ord("A") + idx)
+            image_labels.append(f"Image {image_no} - OPTION {option_label} IMAGE")
+            image_no += 1
+        for idx in range(len(student_images)):
+            image_labels.append(f"Image {image_no} - STUDENT ANSWER PAGE/PHOTO {idx + 1}")
+            image_no += 1
+
+        system_prompt = _build_practice_mentor_system_prompt(detected_language)
+        prompt = _build_practice_mentor_prompt(
+            question_text=question_text,
+            options_text=options_text,
+            correct_answer_display=correct_answer_display,
+            student_message=student_message,
+            image_labels=image_labels,
+            evaluation_context=evaluation_context,
+            history_text=_format_mentor_history(payload.conversationHistory),
+        )
+
+        all_images = question_figure_images + option_images + student_images
+        if all_images:
+            response = await _gate_vision_call(
+                db,
+                current_user,
+                all_images,
+                prompt,
+                system_prompt=system_prompt,
+                max_tokens=450,
+                temperature=0.35,
+            )
+        else:
+            response = await _gate_text_call(
+                db,
+                current_user,
+                prompt,
+                system_prompt=system_prompt,
+                max_tokens=450,
+                temperature=0.35,
+            )
+
+        mentor_text = (response.get("response") or "").strip()
+        if not mentor_text:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="AI Mentor returned an empty response",
+            )
+
+        logger.info(
+            "Practice mentor response Q:%s images=%s saved_eval=%s history=%s",
+            qid,
+            len(all_images),
+            used_saved_evaluation,
+            len(payload.conversationHistory),
+        )
+
+        session_id = payload.sessionId or f"practice_{payload.documentId or 'set'}_{qid}_mentor"
+        return PracticeMentorResponse(
+            success=True,
+            response=mentor_text,
+            sessionId=session_id,
+            usedSavedEvaluation=used_saved_evaluation,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Practice mentor chat failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate mentor response",
+        )
+
+
 @router.post("/evaluate", response_model=EvaluateResponse)
 @limiter.limit("120/minute")
 async def evaluate_submission(
@@ -2376,45 +2826,15 @@ async def evaluate_submission(
         uploaded_photos_raw: List[str] = []
         if payload.uploadedImages:
             for uploaded_img in payload.uploadedImages:
-                data = uploaded_img.data
-                if not data.startswith("data:"):
-                    body = data.split(",")[-1] if "," in data else data
-                    data = f"data:{uploaded_img.type};base64,{body}"
-                uploaded_photos_raw.append(data)
+                data = _uploaded_image_file_to_data_url(uploaded_img)
+                if data:
+                    uploaded_photos_raw.append(data)
 
         # 4. Filter empty canvas pages; do not enhance them (they're already crisp).
-        student_images: List[str] = []
-        try:
-            from utils.image_processor import enhance_canvas_images_batch, is_canvas_empty
-        except ImportError as ie:
-            logger.warning(f"Image processor not available: {ie}; using raw images.")
-            enhance_canvas_images_batch = None  # type: ignore
-            is_canvas_empty = None  # type: ignore
-
-        if canvas_pages_raw:
-            if is_canvas_empty:
-                non_empty = [img for img in canvas_pages_raw if img and not is_canvas_empty(img)]
-                if not non_empty:
-                    # All blank — keep raw so the LLM can correctly say "no answer".
-                    non_empty = [img for img in canvas_pages_raw if img]
-            else:
-                non_empty = [img for img in canvas_pages_raw if img]
-            student_images.extend(non_empty)
-
-        # Uploaded photos: light enhancement helps (camera-quality variability).
-        if uploaded_photos_raw:
-            if enhance_canvas_images_batch:
-                try:
-                    enhanced_photos = (
-                        enhance_canvas_images_batch(uploaded_photos_raw, target_width=1500)
-                        or uploaded_photos_raw
-                    )
-                except Exception as enhance_err:
-                    logger.warning(f"Photo enhancement failed: {enhance_err}; using raw images.")
-                    enhanced_photos = uploaded_photos_raw
-            else:
-                enhanced_photos = uploaded_photos_raw
-            student_images.extend(enhanced_photos)
+        student_images = _prepare_student_answer_images(
+            canvas_pages_raw=canvas_pages_raw,
+            uploaded_photos_raw=uploaded_photos_raw,
+        )
 
         # 5. Extract text from any uploaded PDFs/DOCX
         uploaded_doc_text = ""
@@ -2565,11 +2985,14 @@ async def evaluate_submission(
             question_page_refs = None
             if payload.questionPageRefs:
                 qpr = payload.questionPageRefs
-                if qpr.activePages:
+                if qpr.activePages or qpr.virtualPages:
                     question_page_refs = {
-                        "active_pages": qpr.activePages,
+                        "active_pages": qpr.activePages or [],
                         "book_type": qpr.bookType,
                         "copy_id": qpr.copyId,
+                        "practice_session_id": qpr.practiceSessionId,
+                        "question_id": qpr.questionId,
+                        "virtual_pages": qpr.virtualPages or [],
                         "time_intervals": qpr.timeIntervals or [],
                     }
 
