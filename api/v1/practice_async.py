@@ -2032,7 +2032,7 @@ def _format_mentor_evaluation_context(
     return (
         "The student has not submitted this question yet, or no saved evaluation is available. "
         "Guide them without directly revealing the final answer. If they ask how to solve it, "
-        "give only the first useful step and ask them to try the next move.",
+        "give only the first useful step and state the next written action.",
         False,
     )
 
@@ -2061,7 +2061,9 @@ Teaching style:
 - Keep the normal reply under 90 words and 2 to 4 short lines.
 - If the student explicitly asks for a full solution, still keep it under 180 words and focus on the key steps.
 - Do not use markdown headings, tables, long bullet lists, or labels like "Comprehensive Analysis".
-- Give one useful next step, then invite the student to try or ask a follow-up.
+- Give one useful next step as an instruction. Do not ask the student to try, confirm, or answer a new question.
+- Do not end with engagement/check-in questions like "want to try more?", "should I continue?", or "can you try this?".
+- The student can ask a follow-up if they want; do not solicit it.
 - Before submission, do not reveal the final answer directly.
 - After submission, explain one mistake and one correction using the saved evaluation and visible student work.
 
@@ -2116,7 +2118,7 @@ RECENT CHAT FOR THIS QUESTION
 STUDENT'S CURRENT MESSAGE
 {_truncate_for_prompt(student_message.strip(), 2000)}
 
-Reply now as the mentor. Be short, conversational, and one step at a time. Use the image labels above when deciding what is question context versus student work."""
+Reply now as the mentor. Be short, conversational, and one step at a time. Use the image labels above when deciding what is question context versus student work. End with a concrete explanation or instruction, not a question."""
 
 
 def _build_evaluation_prompt(
@@ -2675,8 +2677,8 @@ async def practice_mentor_chat(
                 all_images,
                 prompt,
                 system_prompt=system_prompt,
-                max_tokens=450,
-                temperature=0.35,
+                max_tokens=320,
+                temperature=0.25,
             )
         else:
             response = await _gate_text_call(
@@ -2684,8 +2686,8 @@ async def practice_mentor_chat(
                 current_user,
                 prompt,
                 system_prompt=system_prompt,
-                max_tokens=450,
-                temperature=0.35,
+                max_tokens=320,
+                temperature=0.25,
             )
 
         mentor_text = (response.get("response") or "").strip()
