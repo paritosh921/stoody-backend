@@ -1285,15 +1285,25 @@ def _build_analysis_rows(
     question_map_items: List[Dict[str, Any]],
     document: TallyDocumentContext,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    if not question_map_items:
-        return [], [], [], []
-
     question_columns = _find_question_columns(ordered_columns, rows)
     map_by_number = {
         int(item["question_number"]): item
         for item in question_map_items
         if item.get("question_number")
     }
+    if not map_by_number:
+        fallback_numbers = sorted(question_columns.keys())
+        if not fallback_numbers and document.num_questions and document.num_questions > 0:
+            fallback_numbers = list(range(1, int(document.num_questions) + 1))
+        map_by_number = {
+            question_number: {
+                "question_number": question_number,
+                "sub_topic": "Overall",
+                "max_marks": _document_max_marks_for_question(document, question_number),
+                "source": "fallback",
+            }
+            for question_number in fallback_numbers
+        }
     summary_rows: List[Dict[str, Any]] = []
     topic_rows: List[Dict[str, Any]] = []
     class_topic_rows: List[Dict[str, Any]] = []
@@ -1385,6 +1395,9 @@ def _build_analysis_rows(
 
     for topic, values in sorted(class_topic_stats.items()):
         percentage = _percentage(values["obtained"], values["max"])
+        student_count = len(values["students"])
+        average_obtained = values["obtained"] / student_count if student_count else 0.0
+        average_max = values["max"] / student_count if student_count else 0.0
         if percentage is None:
             status_label = ""
         elif percentage < 60:
@@ -1399,9 +1412,11 @@ def _build_analysis_rows(
                 "Section": section_label,
                 "Subject": subject_label,
                 "Sub-topic": topic,
-                "Students": len(values["students"]),
+                "Students": student_count,
                 "Marks Obtained": round(values["obtained"], 2),
                 "Max Marks": round(values["max"], 2),
+                "Average Marks": round(average_obtained, 2),
+                "Average Max Marks": round(average_max, 2),
                 "Percentage": _format_percentage(percentage),
                 "Question Attempts": int(values["questions"]),
                 "Class Status": status_label,
