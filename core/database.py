@@ -910,6 +910,30 @@ class DatabaseManager:
             logger.error(f"B2C MongoDB update_one failed: {str(e)}")
             return False
 
+    async def b2c_count(self, collection_name: str, filter_dict: Dict[str, Any] = None) -> int:
+        """Count documents in a B2C MongoDB collection"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return 0
+            filter_dict = filter_dict or {}
+            return await collection.count_documents(filter_dict)
+        except Exception as e:
+            logger.error(f"B2C MongoDB count failed: {str(e)}")
+            return 0
+
+    async def b2c_aggregate(self, collection_name: str, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Run aggregation pipeline on a B2C MongoDB collection"""
+        try:
+            collection = await self.get_b2c_collection(collection_name)
+            if collection is None:
+                return []
+            cursor = collection.aggregate(pipeline)
+            return await cursor.to_list(length=1000)
+        except Exception as e:
+            logger.error(f"B2C MongoDB aggregate failed: {str(e)}")
+            return []
+
     async def b2c_delete_one(self, collection_name: str, filter_dict: Dict[str, Any]) -> bool:
         """Delete one document from B2C MongoDB database"""
         try:

@@ -3566,6 +3566,24 @@ class PracticeSetStatsResponse(BaseModel):
     summary: Dict[str, Any]
 
 
+class PracticeAttemptQuestionSummary(BaseModel):
+    """Latest persisted attempt status for one practice question"""
+    question_id: str
+    status: str
+    is_correct: bool = False
+    attempt_count: int = 0
+    latest_attempt_at: Optional[str] = None
+    score: float = 0.0
+
+
+class PracticeAttemptSummaryResponse(BaseModel):
+    """Compact per-question attempt summary for a practice set"""
+    success: bool = True
+    document_id: str
+    questions: List[PracticeAttemptQuestionSummary]
+    summary: Dict[str, Any]
+
+
 @router.get("/attempts")
 @limiter.limit("60/minute")
 async def get_practice_attempts(
@@ -3660,6 +3678,103 @@ async def get_practice_attempts(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch practice attempts"
+        )
+
+
+@router.get("/attempts/summary", response_model=PracticeAttemptSummaryResponse)
+@limiter.limit("60/minute")
+async def get_practice_attempt_summary(
+    request: Request,
+    document_id: str = Query(..., description="Practice set document ID"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database)
+):
+    """
+    Return the latest submitted status for each attempted question in a set.
+
+    The mobile overview grid uses this to mark previously attempted questions
+    after reopening a practice set. It is intentionally compact and latest-wins:
+    if a student retries a question, the grid reflects the most recent result.
+    """
+    try:
+        user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
+
+        user_type = current_user.get("user_type", "")
+        is_b2c = current_user.get("is_b2c", False) or user_type == "b2c_user"
+
+        pipeline = [
+            {
+                "$match": {
+                    "student_id": str(user_id),
+                    "document_id": document_id,
+                }
+            },
+            {"$sort": {"created_at": -1}},
+            {
+                "$group": {
+                    "_id": "$question_id",
+                    "attempt_count": {"$sum": 1},
+                    "is_correct": {"$first": "$is_correct"},
+                    "score": {"$first": "$score"},
+                    "latest_attempt_at": {"$first": "$created_at"},
+                }
+            },
+            {"$sort": {"_id": 1}},
+        ]
+
+        if is_b2c:
+            rows = await db.b2c_aggregate("practice_attempts", pipeline)
+        else:
+            rows = await db.mongo_aggregate("practice_attempts", pipeline)
+
+        question_summaries: List[PracticeAttemptQuestionSummary] = []
+        for row in rows:
+            qid = row.get("_id")
+            if not qid:
+                continue
+            is_correct = bool(row.get("is_correct"))
+            latest_attempt_at = row.get("latest_attempt_at")
+            question_summaries.append(
+                PracticeAttemptQuestionSummary(
+                    question_id=str(qid),
+                    status="correct" if is_correct else "wrong",
+                    is_correct=is_correct,
+                    attempt_count=int(row.get("attempt_count") or 0),
+                    latest_attempt_at=(
+                        latest_attempt_at.isoformat()
+                        if hasattr(latest_attempt_at, "isoformat")
+                        else str(latest_attempt_at or "")
+                    ) or None,
+                    score=float(row.get("score") or 0.0),
+                )
+            )
+
+        questions_attempted = len(question_summaries)
+        correct_answers = sum(1 for item in question_summaries if item.is_correct)
+        total_attempts = sum(item.attempt_count for item in question_summaries)
+
+        return PracticeAttemptSummaryResponse(
+            document_id=document_id,
+            questions=question_summaries,
+            summary={
+                "questions_attempted": questions_attempted,
+                "correct_answers": correct_answers,
+                "total_attempts": total_attempts,
+                "latest_accuracy_percentage": (
+                    correct_answers / questions_attempted * 100
+                    if questions_attempted > 0
+                    else 0.0
+                ),
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get practice attempt summary error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch practice attempt summary"
         )
 
 
