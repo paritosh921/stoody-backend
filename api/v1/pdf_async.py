@@ -5554,40 +5554,154 @@ async def get_student_practice_sets(
         # Format response - only include necessary fields for security
         practice_sets_list = []
         user_id = current_user["user_id"]
+        user_id_str = str(user_id)
+        student_id_filter = [user_id_str]
+        if user_id != user_id_str:
+            student_id_filter.append(user_id)
+
+        attempt_stats: Dict[str, Dict[str, Any]] = {}
+        if doc_ids:
+            attempt_pipeline = [
+                {
+                    "$match": {
+                        "student_id": {"$in": student_id_filter},
+                        "document_id": {"$in": doc_ids},
+                    }
+                },
+                {"$sort": {"created_at": -1}},
+                {
+                    "$group": {
+                        "_id": {
+                            "document_id": "$document_id",
+                            "question_id": "$question_id",
+                        },
+                        "latest_is_correct": {"$first": "$is_correct"},
+                        "latest_score": {"$first": "$score"},
+                        "latest_created_at": {"$first": "$created_at"},
+                        "attempt_count": {"$sum": 1},
+                        "time_spent": {"$sum": {"$ifNull": ["$time_spent", 0]}},
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$_id.document_id",
+                        "questions_attempted": {"$sum": 1},
+                        "correct_answers": {
+                            "$sum": {
+                                "$cond": [
+                                    {"$eq": ["$latest_is_correct", True]},
+                                    1,
+                                    0,
+                                ]
+                            }
+                        },
+                        "attempt_count": {"$sum": "$attempt_count"},
+                        "total_time_spent": {"$sum": "$time_spent"},
+                        "latest_attempt_at": {"$max": "$latest_created_at"},
+                    }
+                },
+            ]
+            attempt_results = await db.mongo_aggregate("practice_attempts", attempt_pipeline)
+            for r in attempt_results:
+                if r.get("_id"):
+                    attempt_stats[str(r["_id"])] = r
+
+        session_stats: Dict[str, Dict[str, Any]] = {}
+        if doc_ids:
+            session_pipeline = [
+                {
+                    "$match": {
+                        "student_id": {"$in": student_id_filter},
+                        "document_id": {"$in": doc_ids},
+                    }
+                },
+                {"$sort": {"started_at": -1}},
+                {
+                    "$group": {
+                        "_id": "$document_id",
+                        "session_count": {"$sum": 1},
+                        "completed_count": {
+                            "$sum": {
+                                "$cond": [{"$eq": ["$is_completed", True]}, 1, 0]
+                            }
+                        },
+                        "latest_questions_attempted": {
+                            "$first": {"$ifNull": ["$questions_attempted", 0]}
+                        },
+                        "latest_correct_answers": {
+                            "$first": {"$ifNull": ["$correct_answers", 0]}
+                        },
+                        "latest_started_at": {"$first": "$started_at"},
+                        "latest_is_completed": {
+                            "$first": {"$ifNull": ["$is_completed", False]}
+                        },
+                        "max_questions_attempted": {
+                            "$max": {"$ifNull": ["$questions_attempted", 0]}
+                        },
+                        "max_correct_answers": {
+                            "$max": {"$ifNull": ["$correct_answers", 0]}
+                        },
+                    }
+                },
+            ]
+            session_results = await db.mongo_aggregate("practice_sessions", session_pipeline)
+            for r in session_results:
+                if r.get("_id"):
+                    session_stats[str(r["_id"])] = r
 
         for doc in practice_sets:
             doc_id = doc["document_id"]
+            doc_id_str = str(doc_id)
+            question_count = question_counts.get(doc_id, doc.get("extracted_questions_count", 0)) or 0
+            attempts = attempt_stats.get(doc_id_str, {})
+            sessions = session_stats.get(doc_id_str, {})
 
-            # Check if student has attempted/completed this practice set
-            # For practice sets, we check practice_sessions collection by document_id
-            sessions = await db.mongo_find(
-                "practice_sessions",
-                {
-                    "student_id": user_id,
-                    "document_id": doc_id
-                },
-                sort=[("started_at", -1)],
-                limit=10
+            attempted_questions = int(attempts.get("questions_attempted") or 0)
+            session_questions = int(
+                sessions.get("max_questions_attempted")
+                or sessions.get("latest_questions_attempted")
+                or 0
+            )
+            questions_attempted = max(attempted_questions, session_questions)
+            correct_answers = int(
+                attempts.get("correct_answers")
+                if attempts.get("correct_answers") is not None
+                else (
+                    sessions.get("max_correct_answers")
+                    or sessions.get("latest_correct_answers")
+                    or 0
+                )
+            )
+            attempt_count = int(attempts.get("attempt_count") or 0)
+            session_count = int(sessions.get("session_count") or 0)
+
+            progress_percentage = 0
+            if question_count > 0:
+                progress_percentage = round(
+                    min(100, (questions_attempted / question_count) * 100)
+                )
+            elif questions_attempted > 0 or session_count > 0:
+                progress_percentage = 100
+
+            has_attempted = questions_attempted > 0 or session_count > 0
+            completed = (
+                sessions.get("completed_count", 0) > 0
+                or (question_count > 0 and questions_attempted >= question_count)
             )
 
-            # Consider completed if any session for THIS specific practice set is completed
-            has_attempted = len(sessions) > 0
-            completed = any(s.get("is_completed", False) for s in sessions)
-
-            # Get latest session stats if available
+            latest_at = attempts.get("latest_attempt_at") or sessions.get("latest_started_at")
             latest_session = None
-            if sessions:
-                latest = sessions[0]
+            if has_attempted:
                 accuracy_rate = 0.0
-                if latest.get("questions_attempted", 0) > 0:
-                    accuracy_rate = (latest.get("correct_answers", 0) / latest["questions_attempted"]) * 100
+                if questions_attempted > 0:
+                    accuracy_rate = (correct_answers / questions_attempted) * 100
 
                 latest_session = {
-                    "questions_attempted": latest.get("questions_attempted", 0),
-                    "correct_answers": latest.get("correct_answers", 0),
+                    "questions_attempted": questions_attempted,
+                    "correct_answers": correct_answers,
                     "accuracy_rate": round(accuracy_rate, 1),
-                    "started_at": latest.get("started_at").isoformat() if latest.get("started_at") else None,
-                    "is_completed": latest.get("is_completed", False)
+                    "started_at": latest_at.isoformat() if hasattr(latest_at, "isoformat") else latest_at,
+                    "is_completed": completed
                 }
 
             practice_sets_list.append({
@@ -5597,11 +5711,16 @@ async def get_student_practice_sets(
                 "difficulty": doc.get("difficulty", ""),
                 "course_plan": doc.get("course_plan"),
                 "standard": doc.get("standard"),
-                "extracted_questions_count": question_counts.get(doc_id, doc.get("extracted_questions_count", 0)),
+                "question_count": question_count,
+                "extracted_questions_count": question_count,
+                "questions_attempted": questions_attempted,
+                "correct_answers": correct_answers,
+                "attempt_count": attempt_count,
+                "progress_percentage": progress_percentage,
                 "instructions": doc.get("instructions"),
                 "completed": completed,
                 "attempted": has_attempted,
-                "session_count": len(sessions),
+                "session_count": session_count,
                 "latest_session": latest_session
             })
 
