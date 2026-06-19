@@ -83,6 +83,7 @@ from middleware.security_headers import SecurityHeadersMiddleware
 
 # Import async route modules
 from api.v1.chat_async import router as chat_router
+from api.v1.stoody_book_async import router as stoody_book_router
 from api.v1.auth_async import router as auth_router
 from api.v1.auth_cookie import router as auth_cookie_router
 from api.v1.admin_async import router as admin_router
@@ -863,6 +864,12 @@ app.include_router(
     chat_router,
     prefix=f"{API_V1_PREFIX}/chat",
     tags=["Chat"]
+)
+
+app.include_router(
+    stoody_book_router,
+    prefix=f"{API_V1_PREFIX}/stoody-book",
+    tags=["Stoody Book"]
 )
 
 app.include_router(
