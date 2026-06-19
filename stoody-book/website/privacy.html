@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Privacy Policy — Onhand</title>
+<meta name="description" content="Privacy policy for Onhand, a contextual browser extension for page-grounded learning and research." />
+<meta property="og:title" content="Privacy Policy — Onhand" />
+<meta property="og:description" content="How Onhand handles page content, prompts, voice input, API keys, anonymous diagnostics, and local session data." />
+<meta property="og:type" content="website" />
+<link rel="icon" type="image/png" href="./icons/onhand-128.png" />
+<link rel="apple-touch-icon" href="./icons/onhand-128.png" />
+<link rel="stylesheet" href="./style.css" />
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-JQ159C5BGF"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-JQ159C5BGF');
+</script>
+<script defer src="https://umami.purduehackers.com/script.js" data-website-id="520b31f1-a9de-470f-80aa-0a47bccd12e1"></script>
+<script>
+  window.si = window.si || function () { (window.siq = window.siq || []).push(arguments); };
+</script>
+<script defer src="/_vercel/speed-insights/script.js"></script>
+<script>
+  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+</script>
+<script defer src="/_vercel/insights/script.js"></script>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="nav-brand" href="./">
+      <img src="./icons/onhand-128.png" alt="" />
+      <span>Onhand</span>
+    </a>
+    <div class="nav-links">
+      <a class="nav-link" href="./#features">Features</a>
+      <a class="nav-link" href="./#install">Install</a>
+      <a class="nav-link" href="./support.html">Support</a>
+    </div>
+    <div class="nav-spacer"></div>
+    <button class="nav-ghost theme-toggle" data-theme-toggle data-mode="auto" aria-label="Toggle theme" title="Toggle theme">
+      <span class="mc">◐</span>
+    </button>
+    <a class="nav-ghost" href="https://github.com/Phineas1500/Onhand" target="_blank" rel="noopener" data-onhand-source-link>
+      <span>GitHub</span>
+      <span style="font-size:13px;opacity:0.7">↗</span>
+    </a>
+  </div>
+</nav>
+
+<main class="legal-page">
+  <section class="legal-hero">
+    <div class="container">
+      <div class="section-eyebrow"><span class="mc">☞</span><span>Privacy</span></div>
+      <h1>Privacy Policy</h1>
+      <p>
+        Onhand is a browser extension that helps you ask questions about the page
+        you are reading. Sessions stay on your device, and content only goes to an
+        AI provider when you ask Onhand to help.
+      </p>
+      <p class="legal-updated">Last updated: June 15, 2026</p>
+    </div>
+  </section>
+
+  <section class="legal-body">
+    <div class="container legal-grid">
+      <aside class="legal-toc" aria-label="Privacy sections">
+        <a href="#summary">Summary</a>
+        <a href="#analytics">Analytics and diagnostics</a>
+        <a href="#data">Data Onhand handles</a>
+        <a href="#storage">Local storage</a>
+        <a href="#providers">AI providers</a>
+        <a href="#retention">Retention and security</a>
+        <a href="#permissions">Permissions</a>
+        <a href="#choices">Your choices</a>
+        <a href="#contact">Contact</a>
+      </aside>
+
+      <article class="legal-card">
+        <section id="summary" class="legal-section">
+          <h2>Summary</h2>
+          <p>
+            Onhand does not sell personal information and does not operate a
+            hosted user account database. The extension stores its settings,
+            provider configuration, anonymous free-tier token, and saved study
+            sessions in <code>chrome.storage.local</code> on your device.
+          </p>
+          <p>
+            When you ask Onhand a question, the extension may send the relevant
+            page content, your prompt, selected text, screenshots, voice input,
+            or generated transcript to the AI provider you configured so the model
+            can answer in context.
+          </p>
+        </section>
+
+        <section id="analytics" class="legal-section">
+          <h2>Analytics and diagnostics</h2>
+          <p>
+            The public Onhand website uses Google Analytics and Umami to
+            understand aggregate site traffic, such as page views, referrers,
+            browser/device information, and approximate location derived from
+            network data.
+          </p>
+          <p>
+            These website analytics tools are separate from the Onhand browser
+            extension. Onhand does not send extension prompts, page content,
+            voice input, transcripts, saved sessions, highlights, notes, or
+            provider credentials to Google Analytics or Umami.
+          </p>
+          <p>
+            The extension also includes anonymous diagnostics. Diagnostics are
+            required when you use Onhand Free because Onhand hosts the model
+            endpoint, and are optional for other authentication modes. Onhand may
+            send event names, extension version, runtime revision, selected
+            provider/model category, coarse error categories, and aggregate
+            counts to the Onhand free-tier Worker for reliability, cost, quota,
+            and abuse monitoring. The hosted Worker may use your request IP
+            address for short-lived daily rate limits and may record aggregate
+            network metadata such as country, Cloudflare data center, and
+            user-agent family for operations. When diagnostics are enabled, Onhand may also
+            send redacted crash and exception events to Sentry for issue grouping
+            and stack-trace analysis. Diagnostics do not include prompts, page
+            content, URLs, screenshots, saved sessions, transcripts, or keys.
+            If advanced runtime inspection is used, diagnostics may record only
+            that the constrained JavaScript tool started, succeeded, or failed;
+            they never include the JavaScript expression or page data returned.
+          </p>
+          <p>
+            If Onhand shows an error, you may also choose to send a one-time
+            anonymized error report even when diagnostics are off. Error reports
+            include a redacted error message and stack trace, extension version,
+            runtime revision, selected provider/model category, coarse error
+            category, tool activity names/states, and aggregate counts. They do
+            not include prompts, page content, URLs, page titles, screenshots,
+            saved sessions, transcripts, or keys. The same redacted error may be
+            sent to Sentry so repeated failures can be grouped by release.
+          </p>
+        </section>
+
+        <section id="data" class="legal-section">
+          <h2>Data Onhand handles</h2>
+          <ul>
+            <li>Questions and instructions you type into the Onhand side panel.</li>
+            <li>Voice input and transcripts when you start the voice tutor.</li>
+            <li>Visible page text, selected passages, headings, URLs, and page titles.</li>
+            <li>Personal communications if you choose to use Onhand on pages such as webmail, chat, or messaging apps.</li>
+            <li>Optional screenshots or visible-region captures used for visual grounding.</li>
+            <li>Highlights, margin notes, saved sessions, and replay artifacts.</li>
+            <li>OpenAI Codex sign-in state or provider API keys if you choose to save them.</li>
+            <li>An anonymous Onhand Free token, request IP-derived rate-limit counters, and aggregate location/network metadata if you choose Onhand Free or send diagnostics/error reports.</li>
+          </ul>
+        </section>
+
+        <section id="storage" class="legal-section">
+          <h2>Local storage</h2>
+          <p>
+            Onhand saves extension settings, provider configuration, sessions,
+            highlights, notes, transcripts, and captured artifacts locally in
+            browser extension storage. Removing the extension or clearing its
+            extension storage removes this local data.
+          </p>
+          <p>
+            Onhand does not intentionally upload saved sessions to an Onhand server.
+            Provider credentials are stored by the extension so it can make
+            user-requested model calls. The Onhand Free anonymous token is stored
+            locally so the hosted Worker can enforce daily usage caps without
+            requiring an account.
+          </p>
+        </section>
+
+        <section id="providers" class="legal-section">
+          <h2>AI providers</h2>
+          <p>
+            Onhand uses the provider you configure in the extension options page.
+            Current modes include OpenAI Codex sign-in, direct provider API key
+            calls for OpenAI, Anthropic, Google Gemini, and OpenRouter, the
+            experimental OpenAI Realtime voice path, and Onhand Free.
+          </p>
+          <p>
+            In direct-provider modes, the extension sends the content needed for
+            your request to the provider you configured. In Onhand Free mode, the
+            extension sends the content needed for your request to Onhand's
+            Cloudflare Worker, which forwards the model request to OpenRouter.
+            The hosted Worker streams the response and enforces quota limits; it
+            does not store prompts, page content, screenshots, transcripts, or
+            model responses as part of normal chat handling.
+          </p>
+          <p>
+            Content sent to an AI provider or to Onhand Free is handled under the
+            relevant provider's terms and privacy policy. Do not use Onhand on
+            pages whose contents you do not want sent to your configured provider
+            or, for Onhand Free, through the hosted Onhand Worker.
+          </p>
+        </section>
+
+        <section id="retention" class="legal-section">
+          <h2>Retention and security</h2>
+          <p>
+            Local sessions, highlights, notes, transcripts, screenshots, API keys,
+            and provider settings remain in browser extension storage until you
+            delete them or uninstall the extension.
+          </p>
+          <p>
+            Onhand Free stores anonymous tokens and short-lived quota or abuse
+            counters in Cloudflare storage, including daily counters based on the
+            request IP address for registration, diagnostics, and explicit error
+            report rate limits. Aggregate operations events may include country,
+            Cloudflare data center, and user-agent family. Explicit anonymized
+            error reports are stored for up to 90 days under a report id so they
+            can be inspected for support and reliability work. Redacted Sentry
+            crash and exception events are retained according to the Sentry
+            project retention settings.
+          </p>
+          <p>
+            Extension-to-provider and extension-to-Onhand Free requests use HTTPS.
+            Onhand does not sell user data, use extension content for advertising,
+            or share extension prompts, page content, screenshots, transcripts,
+            saved sessions, or keys with website analytics services.
+          </p>
+        </section>
+
+        <section id="permissions" class="legal-section">
+          <h2>Browser permissions</h2>
+          <p>
+            Onhand requests browser permissions so it can work inside the page you
+            are reading. These permissions support the side panel, active-tab
+            reading, page annotation, PDF support, page screenshots, navigation,
+            and user-invoked browser tools.
+          </p>
+          <p>
+            The extension uses powerful browser APIs, including debugging and
+            scripting APIs, because Onhand needs to inspect and annotate the page
+            directly. The extension should be used only when you want this
+            page-grounded assistance.
+          </p>
+        </section>
+
+        <section id="choices" class="legal-section">
+          <h2>Your choices</h2>
+          <ul>
+            <li>You choose when to open the side panel and ask Onhand a question.</li>
+            <li>You choose when to start or stop the voice tutor.</li>
+            <li>You choose your authentication mode: Onhand Free, OpenAI Codex sign-in, or a provider API key.</li>
+            <li>You can disable anonymous diagnostics unless you are using Onhand Free.</li>
+            <li>You can disable advanced runtime inspection to prevent model-requested JavaScript inspection on active pages.</li>
+            <li>You choose whether to send a one-time anonymized error report after an Onhand error.</li>
+            <li>You can delete saved sessions from the extension UI or by clearing extension storage.</li>
+            <li>You can remove provider credentials from the Onhand options page.</li>
+            <li>You can uninstall the extension at any time from your browser's extensions page.</li>
+          </ul>
+        </section>
+
+        <section id="contact" class="legal-section">
+          <h2>Contact</h2>
+          <p>
+            For privacy questions or support requests, open an issue in the
+            <a href="https://github.com/Phineas1500/Onhand/issues" target="_blank" rel="noopener">Onhand GitHub repository</a>.
+          </p>
+        </section>
+      </article>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="foot-inner">
+    <div class="foot-brand">
+      <span class="mc">☞</span>
+      <span>Onhand</span>
+    </div>
+    <div class="foot-meta">
+      <a href="./">Home</a>
+      ·
+      <a href="./support.html">Support</a>
+      ·
+      <a href="https://github.com/Phineas1500/Onhand" target="_blank" rel="noopener" data-onhand-source-link>GitHub</a>
+      ·
+      © 2026
+    </div>
+  </div>
+</footer>
+
+<script src="./site.js"></script>
+</body>
+</html>

@@ -14,6 +14,7 @@ on:
       - "main_async.py"
       - "config_async.py"
       - "mentorAI/**"
+      - "stoody-book/**"
       - "scripts/run_tui.sh"
       - "requirements.txt"
       - "skillbot_nginx_alb.conf"

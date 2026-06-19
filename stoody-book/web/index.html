@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Stoody Book</title>
+    <link rel="stylesheet" href="/stoody-book/assets/stoody-book.css" />
+  </head>
+  <body>
+    <main class="book-shell">
+      <aside class="source-panel" aria-label="Source material">
+        <div class="brand-block">
+          <p class="eyebrow">Stoody Mentor</p>
+          <h1>Stoody Book</h1>
+          <p>
+            Read, ask, and learn from your current material with page-grounded
+            guidance.
+          </p>
+        </div>
+
+        <label class="field-label" for="sourceText">Source material</label>
+        <textarea
+          id="sourceText"
+          rows="14"
+          placeholder="Paste textbook text, notes, a worksheet question, or a paragraph you want to understand."
+        ></textarea>
+
+        <div class="source-actions">
+          <button id="clearSourceButton" type="button" class="ghost-button">Clear</button>
+          <span id="sourceStatus" class="status-text">Autosaved locally</span>
+        </div>
+      </aside>
+
+      <section class="study-panel" aria-label="Stoody Book chat">
+        <header class="study-header">
+          <div>
+            <p class="eyebrow">Learning workspace</p>
+            <h2>Ask about the material</h2>
+          </div>
+          <button id="newSessionButton" type="button" class="ghost-button">New session</button>
+        </header>
+
+        <div class="quick-prompts" aria-label="Quick prompts">
+          <button type="button" data-prompt="Explain this step by step without giving away final homework answers too quickly.">
+            Explain
+          </button>
+          <button type="button" data-prompt="Ask me one check question from this material and wait for my answer.">
+            Check me
+          </button>
+          <button type="button" data-prompt="Summarize the key idea and point out what I should memorize.">
+            Summarize
+          </button>
+        </div>
+
+        <div id="conversation" class="conversation" aria-live="polite"></div>
+
+        <form id="askForm" class="ask-form">
+          <label class="field-label" for="messageInput">Question</label>
+          <div class="composer">
+            <textarea
+              id="messageInput"
+              rows="3"
+              placeholder="Ask Stoody Book about the pasted material..."
+              required
+            ></textarea>
+            <button id="sendButton" type="submit">Send</button>
+          </div>
+          <p id="formStatus" class="form-status" role="status"></p>
+        </form>
+      </section>
+    </main>
+
+    <script src="/stoody-book/assets/stoody-book.js" type="module"></script>
+  </body>
+</html>

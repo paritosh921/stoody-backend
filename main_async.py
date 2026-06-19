@@ -68,6 +68,8 @@ from config_async import (
     ENABLE_METRICS,
 )
 
+from api.v1.stoody_book_static import mount_stoody_book
+
 # Import async database clients
 from core.database import DatabaseManager
 from core.cache import CacheManager
@@ -1471,6 +1473,7 @@ else:
 _BACKEND_DIR = _Path(__file__).resolve().parent
 app.mount("/images", StaticFiles(directory=str(_BACKEND_DIR / "images")), name="images")
 app.mount("/uploads", StaticFiles(directory=str(_BACKEND_DIR / "uploads")), name="uploads")
+mount_stoody_book(app)
 
 # Health check endpoint
 @app.get("/health")

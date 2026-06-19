@@ -193,7 +193,7 @@ FEATURE_CATALOG: List[Dict[str, Any]] = [
     {
         "key": "student_ai_mentor",
         "label": "AI Mentor",
-        "description": "AI mentor/debugger flows for students",
+        "description": "Stoody Book and AI mentor flows for students",
         "category": FEATURE_CATEGORY_MAX,
         "audience": ["student"],
         "status": STATUS_ACTIVE,
@@ -326,6 +326,7 @@ V2_TO_PRIMARY_LEGACY_MAP: Dict[str, str] = {
 FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
     "student_ai_mentor": (
         "/api/v1/chat",
+        "/stoody-book",
         "/api/v1/debugger",
         "/api/debugger",
     ),
