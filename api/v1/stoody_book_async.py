@@ -11,7 +11,7 @@ import io
 import logging
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
 from bson import Binary, ObjectId
@@ -37,8 +37,10 @@ MAX_MESSAGES_PER_SESSION = 80
 MAX_PAGE_TEXT_CHARS = 12000
 MAX_SEARCH_RESULTS = 12
 MAX_CITATIONS = 3
+MAX_OPEN_CHECKS = 10
 TOKEN_RE = re.compile(r"[A-Za-z0-9]{3,}")
 LEGACY_PAGE_RE = re.compile(r"(?:^|\n\n)Page\s+(\d+):\s*", re.IGNORECASE)
+REVIEW_INTERVALS = {1: 1, 2: 3, 3: 7, 4: 14, 5: 30}
 
 
 class SessionCreateRequest(BaseModel):
@@ -48,10 +50,12 @@ class SessionCreateRequest(BaseModel):
 class SessionUpdateRequest(BaseModel):
     label: Optional[str] = Field(default=None, max_length=120)
     active_pdf_id: Optional[str] = Field(default=None, max_length=64)
+    view_state: Optional[Dict[str, Any]] = None
 
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
+    mode: Optional[str] = Field(default=None, max_length=24)
 
 
 class AnnotationCreateRequest(BaseModel):
@@ -60,6 +64,23 @@ class AnnotationCreateRequest(BaseModel):
     quote: str = Field(..., min_length=1, max_length=500)
     note: Optional[str] = Field(default=None, max_length=1200)
     color: Optional[str] = Field(default="yellow", max_length=24)
+
+
+class LearningModeRequest(BaseModel):
+    mode: str = Field(..., max_length=24)
+
+
+class StudyCheckRequest(BaseModel):
+    concept: Optional[str] = Field(default=None, max_length=120)
+
+
+class LearningEventRequest(BaseModel):
+    concept: str = Field(..., min_length=1, max_length=120)
+    outcome: str = Field(..., max_length=24)
+    check_id: Optional[str] = Field(default=None, max_length=64)
+    page: Optional[int] = Field(default=None, ge=1)
+    quote: Optional[str] = Field(default=None, max_length=500)
+    prompt: Optional[str] = Field(default=None, max_length=500)
 
 
 def _now() -> datetime:
@@ -258,6 +279,55 @@ def _tokens(value: str) -> set[str]:
     return {token.lower() for token in TOKEN_RE.findall(value or "")}
 
 
+def _iso(value: datetime) -> str:
+    return value.isoformat()
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+    return None
+
+
+def _build_view_state(raw: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    pdf_id = str(raw.get("pdf_id") or "").strip()
+    if pdf_id:
+        _object_id(pdf_id, "PDF")
+    try:
+        page = max(1, int(raw.get("page") or 1))
+    except Exception:
+        page = 1
+    try:
+        zoom = float(raw.get("zoom") or 1.05)
+    except Exception:
+        zoom = 1.05
+    focused = raw.get("focused_quote") if isinstance(raw.get("focused_quote"), dict) else None
+    focused_quote = None
+    if focused:
+        try:
+            focused_page = max(1, int(focused.get("page") or page))
+        except Exception:
+            focused_page = page
+        quote = _normalize_text(focused.get("quote"))[:500]
+        if quote:
+            focused_quote = {"page": focused_page, "quote": quote}
+    state = {
+        "pdf_id": pdf_id or None,
+        "page": page,
+        "zoom": max(0.65, min(2.0, round(zoom, 2))),
+    }
+    if focused_quote:
+        state["focused_quote"] = focused_quote
+    return state
+
+
 def _pdf_pages(pdf_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     pages: List[Dict[str, Any]] = []
     stored_pages = pdf_doc.get("page_texts")
@@ -367,6 +437,124 @@ def _suggest_citations(question: str, answer: str, pages: Sequence[Dict[str, Any
     return [{"page": item["page"], "quote": item["quote"]} for item in ranked[:MAX_CITATIONS]]
 
 
+def _normalize_concept(value: Any) -> str:
+    tokens = [token.lower() for token in TOKEN_RE.findall(str(value or ""))]
+    return " ".join(tokens[:8])
+
+
+def _clean_learner_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    raw = state if isinstance(state, dict) else {}
+    mode = raw.get("mode") if raw.get("mode") in {"answer", "learning"} else "answer"
+    concepts = raw.get("concepts") if isinstance(raw.get("concepts"), list) else []
+    open_checks = raw.get("open_checks") if isinstance(raw.get("open_checks"), list) else []
+    return {
+        "mode": mode,
+        "concepts": [item for item in concepts if isinstance(item, dict) and item.get("normalized")],
+        "open_checks": [item for item in open_checks if isinstance(item, dict) and item.get("id")][-MAX_OPEN_CHECKS:],
+    }
+
+
+def _record_learning_event(
+    learner_state: Optional[Dict[str, Any]],
+    event: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    current = now or _now()
+    state = _clean_learner_state(learner_state)
+    label = _normalize_text(event.get("concept"))[:120]
+    normalized = _normalize_concept(label)
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Concept is required")
+
+    outcome = str(event.get("outcome") or "").strip().lower()
+    if outcome not in {"correct", "partial", "incorrect", "skipped"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported learning outcome")
+
+    concepts = state["concepts"]
+    concept = next((item for item in concepts if item.get("normalized") == normalized), None)
+    if not concept:
+        concept = {
+            "label": label,
+            "normalized": normalized,
+            "box": 1,
+            "checks": [],
+            "first_seen_at": _iso(current),
+        }
+        concepts.append(concept)
+
+    box = int(concept.get("box") or 1)
+    if outcome == "correct":
+        box = min(5, box + 1)
+    elif outcome in {"incorrect", "skipped"}:
+        box = 1
+    concept["box"] = box
+    concept["label"] = label
+    concept["page"] = event.get("page") or concept.get("page")
+    concept["quote"] = _normalize_text(event.get("quote"))[:500] or concept.get("quote") or ""
+    concept["last_seen_at"] = _iso(current)
+    concept["due_at"] = _iso(current + timedelta(days=REVIEW_INTERVALS.get(box, 1)))
+    checks = concept.get("checks") if isinstance(concept.get("checks"), list) else []
+    checks.append({
+        "id": str(event.get("check_id") or uuid.uuid4().hex),
+        "outcome": outcome,
+        "prompt": _normalize_text(event.get("prompt"))[:500],
+        "created_at": _iso(current),
+    })
+    concept["checks"] = checks[-20:]
+    check_id = str(event.get("check_id") or "")
+    if check_id:
+        state["open_checks"] = [
+            check for check in state.get("open_checks", [])
+            if check.get("id") != check_id
+        ]
+    state["concepts"] = concepts
+    state["mode"] = state.get("mode") or "learning"
+    return state
+
+
+def _compute_due_reviews(learner_state: Optional[Dict[str, Any]], now: Optional[datetime] = None, limit: int = 5) -> List[Dict[str, Any]]:
+    current = now or _now()
+    state = _clean_learner_state(learner_state)
+    due: List[Dict[str, Any]] = []
+    for concept in state.get("concepts", []):
+        due_at = _parse_iso(concept.get("due_at"))
+        if not due_at or due_at > current:
+            continue
+        due.append({
+            "label": concept.get("label") or concept.get("normalized") or "Concept",
+            "page": int(concept.get("page") or 1),
+            "quote": concept.get("quote") or "",
+            "due_at": concept.get("due_at"),
+        })
+    due.sort(key=lambda item: item.get("due_at") or "")
+    return due[: max(1, min(limit, 12))]
+
+
+def _build_study_check(pages: Sequence[Dict[str, Any]], concept: Optional[str] = None) -> Dict[str, Any]:
+    concept_text = _normalize_text(concept)[:120]
+    selected = None
+    if concept_text:
+        matches = _search_pdf_pages(pages, concept_text, limit=1)
+        selected = matches[0] if matches else None
+    if not selected and pages:
+        page = pages[0]
+        selected = {
+            "page": int(page.get("page") or 1),
+            "snippet": _snippet_around(_normalize_text(page.get("text")), _tokens(_normalize_text(page.get("text"))) or set(), width=220),
+        }
+    if not selected:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No readable PDF text is available")
+    label = concept_text or "this passage"
+    return {
+        "id": uuid.uuid4().hex,
+        "concept": label,
+        "page": int(selected.get("page") or 1),
+        "quote": selected.get("snippet") or "",
+        "prompt": f"Before I explain: what do you already think about {label}?",
+        "created_at": _iso(_now()),
+    }
+
+
 def _validate_annotation_payload(page_text: str, page: int, quote: str, note: Optional[str]) -> Dict[str, Any]:
     clean_quote = _normalize_text(quote)
     clean_note = _normalize_text(note)
@@ -383,17 +571,42 @@ def _validate_annotation_payload(page_text: str, page: int, quote: str, note: Op
     }
 
 
-def _build_system_prompt(pdf_doc: Dict[str, Any], grounding_pages: Optional[Sequence[Dict[str, Any]]] = None) -> str:
+def _learner_state_summary(learner_state: Optional[Dict[str, Any]]) -> str:
+    state = _clean_learner_state(learner_state)
+    concepts = state.get("concepts", [])[-6:]
+    reviews = _compute_due_reviews(state, limit=3)
+    lines = [f"Mode: {state.get('mode')}"]
+    if concepts:
+        lines.append("Covered concepts: " + ", ".join(str(item.get("label") or item.get("normalized")) for item in concepts))
+    if reviews:
+        lines.append("Due reviews: " + ", ".join(str(item.get("label")) for item in reviews))
+    return "\n".join(lines)
+
+
+def _build_system_prompt(
+    pdf_doc: Dict[str, Any],
+    grounding_pages: Optional[Sequence[Dict[str, Any]]] = None,
+    learner_state: Optional[Dict[str, Any]] = None,
+) -> str:
     pages = grounding_pages or []
+    state = _clean_learner_state(learner_state)
     grounding = "\n\n".join([
         f"Page {item.get('page')}: {item.get('snippet') or item.get('text') or ''}"
         for item in pages
     ])
+    learning_guidance = (
+        "Learning Mode is on. Prefer active recall: ask one short prediction or retrieval check before a full explanation when the question is conceptual. "
+        "Resolve any prior check if the student appears to be answering it. Avoid clutter; cite the best page anchor."
+        if state.get("mode") == "learning"
+        else "Answer Mode is on. Answer directly, but keep claims grounded in the PDF."
+    )
     return "\n\n".join([
         "You are Stoody Book. Answer the student's questions using the uploaded PDF content.",
         "If the answer is not supported by the PDF, say that clearly and ask for the relevant page or section.",
         "For homework-style questions, teach the reasoning before giving a final answer.",
         "When useful, mention page numbers from the supplied context.",
+        learning_guidance,
+        f"Learner state:\n{_learner_state_summary(state)}",
         f"PDF: {pdf_doc.get('filename') or 'PDF'}",
         f"Most relevant pages:\n{grounding}" if grounding else "Most relevant pages: none found from the question.",
         f"Extracted PDF text:\n{pdf_doc.get('text') or ''}",
@@ -414,6 +627,9 @@ async def _serialize_session(mongo_db, session: Dict[str, Any], include_messages
         "active_pdf": active_pdf,
         "pdfs": [pdf for pdf in pdfs if pdf],
         "annotations": [_serialize_annotation(annotation) for annotation in session.get("annotations", [])],
+        "learner_state": _clean_learner_state(session.get("learner_state")),
+        "due_reviews": _compute_due_reviews(session.get("learner_state")),
+        "view_state": _build_view_state(session.get("view_state")),
         "message_count": len(session.get("messages") or []),
         "created_at": session.get("created_at").isoformat() if session.get("created_at") else None,
         "updated_at": session.get("updated_at").isoformat() if session.get("updated_at") else None,
@@ -463,6 +679,8 @@ async def create_session(
         "pdf_ids": [],
         "messages": [],
         "annotations": [],
+        "learner_state": {"mode": "answer", "concepts": [], "open_checks": []},
+        "view_state": None,
         "created_at": now,
         "updated_at": now,
         "deleted_at": None,
@@ -502,6 +720,17 @@ async def update_session(
         if pdf_oid not in session.get("pdf_ids", []):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PDF is not attached to this session")
         update["active_pdf_id"] = pdf_oid
+        current_view = _build_view_state(session.get("view_state")) or {}
+        current_view["pdf_id"] = payload.active_pdf_id
+        update["view_state"] = _build_view_state(current_view)
+
+    if payload.view_state is not None:
+        view_state = _build_view_state(payload.view_state)
+        if view_state and view_state.get("pdf_id"):
+            pdf_oid = _object_id(str(view_state["pdf_id"]), "PDF")
+            if pdf_oid not in session.get("pdf_ids", []):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PDF is not attached to this session")
+        update["view_state"] = view_state
 
     await mongo_db[SESSIONS_COLLECTION].update_one({"_id": session["_id"]}, {"$set": update})
     refreshed = await _get_session(mongo_db, current_user, session_id)
@@ -575,6 +804,7 @@ async def upload_pdf(
     update_doc: Dict[str, Any] = {
         "$set": {
             "active_pdf_id": pdf_doc["_id"],
+            "view_state": {"pdf_id": str(pdf_doc["_id"]), "page": 1, "zoom": 1.05},
             "updated_at": now,
         },
         "$addToSet": {"pdf_ids": pdf_doc["_id"]},
@@ -698,6 +928,97 @@ async def delete_annotation(
     return {"success": True, "data": {"session": await _serialize_session(mongo_db, refreshed, True)}}
 
 
+@router.patch("/sessions/{session_id}/learning-mode")
+async def set_learning_mode(
+    session_id: str,
+    payload: LearningModeRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    mode = payload.mode.strip().lower()
+    if mode not in {"answer", "learning"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Learning mode must be answer or learning")
+    mongo_db = await _workspace_db(db, current_user)
+    session = await _get_session(mongo_db, current_user, session_id)
+    learner_state = _clean_learner_state(session.get("learner_state"))
+    learner_state["mode"] = mode
+    await mongo_db[SESSIONS_COLLECTION].update_one(
+        {"_id": session["_id"]},
+        {"$set": {"learner_state": learner_state, "updated_at": _now()}},
+    )
+    refreshed = await _get_session(mongo_db, current_user, session_id)
+    return {"success": True, "data": {"session": await _serialize_session(mongo_db, refreshed, True)}}
+
+
+@router.post("/sessions/{session_id}/study-check", status_code=status.HTTP_201_CREATED)
+async def create_study_check(
+    session_id: str,
+    payload: StudyCheckRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    mongo_db = await _workspace_db(db, current_user)
+    session = await _get_session(mongo_db, current_user, session_id)
+    active_pdf_id = session.get("active_pdf_id")
+    if not isinstance(active_pdf_id, ObjectId):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Upload a PDF before starting a study check")
+    pdf_doc = await _get_pdf(mongo_db, current_user, str(active_pdf_id))
+    check = _build_study_check(_pdf_pages(pdf_doc), payload.concept)
+    learner_state = _clean_learner_state(session.get("learner_state"))
+    learner_state["mode"] = "learning"
+    learner_state["open_checks"] = (learner_state.get("open_checks") or []) + [check]
+    learner_state["open_checks"] = learner_state["open_checks"][-MAX_OPEN_CHECKS:]
+    assistant_message = {
+        "role": "assistant",
+        "content": check["prompt"],
+        "citations": [{"page": check["page"], "quote": check["quote"]}],
+        "learning_check_id": check["id"],
+        "created_at": _now(),
+    }
+    next_messages = (session.get("messages") or []) + [assistant_message]
+    await mongo_db[SESSIONS_COLLECTION].update_one(
+        {"_id": session["_id"]},
+        {
+            "$set": {
+                "learner_state": learner_state,
+                "messages": next_messages[-MAX_MESSAGES_PER_SESSION:],
+                "updated_at": _now(),
+            },
+        },
+    )
+    refreshed = await _get_session(mongo_db, current_user, session_id)
+    return {"success": True, "data": {"check": check, "session": await _serialize_session(mongo_db, refreshed, True)}}
+
+
+@router.post("/sessions/{session_id}/learning-events", status_code=status.HTTP_201_CREATED)
+async def record_learning_event(
+    session_id: str,
+    payload: LearningEventRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    mongo_db = await _workspace_db(db, current_user)
+    session = await _get_session(mongo_db, current_user, session_id)
+    learner_state = _record_learning_event(session.get("learner_state"), payload.model_dump())
+    await mongo_db[SESSIONS_COLLECTION].update_one(
+        {"_id": session["_id"]},
+        {"$set": {"learner_state": learner_state, "updated_at": _now()}},
+    )
+    refreshed = await _get_session(mongo_db, current_user, session_id)
+    return {"success": True, "data": {"session": await _serialize_session(mongo_db, refreshed, True)}}
+
+
+@router.get("/sessions/{session_id}/reviews")
+async def list_due_reviews(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    mongo_db = await _workspace_db(db, current_user)
+    session = await _get_session(mongo_db, current_user, session_id)
+    return {"success": True, "data": {"reviews": _compute_due_reviews(session.get("learner_state"))}}
+
+
 @router.post("/sessions/{session_id}/chat")
 async def chat_with_pdf(
     session_id: str,
@@ -729,7 +1050,10 @@ async def chat_with_pdf(
     ]
     pdf_pages = _pdf_pages(pdf_doc)
     grounding_pages = _select_grounding_pages(payload.message, pdf_pages)
-    messages = [{"role": "system", "content": _build_system_prompt(pdf_doc, grounding_pages)}]
+    learner_state = _clean_learner_state(session.get("learner_state"))
+    if payload.mode in {"answer", "learning"}:
+        learner_state["mode"] = payload.mode
+    messages = [{"role": "system", "content": _build_system_prompt(pdf_doc, grounding_pages, learner_state)}]
     messages.extend(history)
     messages.append({"role": "user", "content": payload.message.strip()})
 
@@ -753,7 +1077,7 @@ async def chat_with_pdf(
     next_messages = next_messages[-MAX_MESSAGES_PER_SESSION:]
     await mongo_db[SESSIONS_COLLECTION].update_one(
         {"_id": session["_id"]},
-        {"$set": {"messages": next_messages, "updated_at": _now()}},
+        {"$set": {"messages": next_messages, "learner_state": learner_state, "updated_at": _now()}},
     )
     refreshed = await _get_session(mongo_db, current_user, session_id)
     return {

@@ -79,3 +79,87 @@ def test_validate_annotation_payload_rejects_cross_document_quote():
 
     assert exc.value.status_code == 400
     assert "quote" in exc.value.detail.lower()
+
+
+def test_build_view_state_keeps_safe_pdf_page_and_zoom():
+    pdf_id = "64f000000000000000000001"
+    state = stoody_book._build_view_state({
+        "pdf_id": pdf_id,
+        "page": 3,
+        "zoom": 5,
+        "focused_quote": {"page": 3, "quote": "  important idea  "},
+    })
+
+    assert state == {
+        "pdf_id": pdf_id,
+        "page": 3,
+        "zoom": 2.0,
+        "focused_quote": {"page": 3, "quote": "important idea"},
+    }
+
+
+def test_record_learning_event_schedules_due_review():
+    now = stoody_book._now()
+    state = stoody_book._record_learning_event(
+        {},
+        {
+            "concept": "Photosynthesis",
+            "outcome": "correct",
+            "page": 2,
+            "quote": "Plants convert light energy.",
+            "prompt": "What does photosynthesis convert?",
+        },
+        now=now,
+    )
+
+    concept = state["concepts"][0]
+    assert concept["label"] == "Photosynthesis"
+    assert concept["box"] == 2
+    assert concept["due_at"] > now.isoformat()
+    assert concept["checks"][0]["outcome"] == "correct"
+
+
+def test_compute_due_reviews_returns_due_concepts_first():
+    state = {
+        "concepts": [
+            {
+                "label": "Late concept",
+                "normalized": "late concept",
+                "page": 4,
+                "quote": "Late concept quote",
+                "due_at": "2999-01-01T00:00:00",
+            },
+            {
+                "label": "Due concept",
+                "normalized": "due concept",
+                "page": 1,
+                "quote": "Due concept quote",
+                "due_at": "2000-01-01T00:00:00",
+            },
+        ],
+    }
+
+    reviews = stoody_book._compute_due_reviews(state, now=stoody_book._now())
+
+    assert reviews == [
+        {
+            "label": "Due concept",
+            "page": 1,
+            "quote": "Due concept quote",
+            "due_at": "2000-01-01T00:00:00",
+        }
+    ]
+
+
+def test_build_study_check_anchors_to_matching_page():
+    check = stoody_book._build_study_check(
+        [
+            {"page": 1, "text": "Mitochondria release energy."},
+            {"page": 2, "text": "Photosynthesis converts light into chemical energy."},
+        ],
+        "photosynthesis energy",
+    )
+
+    assert check["page"] == 2
+    assert check["concept"] == "photosynthesis energy"
+    assert "Before I explain" in check["prompt"]
