@@ -17,6 +17,7 @@ class FakeDb:
             "canvas_pages": [],
             "meetings": [],
             "students": [],
+            "tutors": [],
         }
 
     def _value_at_path(self, doc, key):
@@ -37,12 +38,20 @@ class FakeDb:
 
     def _matches(self, doc, query):
         for key, value in query.items():
+            if key == "$and":
+                if not all(self._matches(doc, clause) for clause in value):
+                    return False
+                continue
             if key == "$or":
                 if not any(self._matches(doc, clause) for clause in value):
                     return False
                 continue
             current = self._value_at_path(doc, key)
             if isinstance(value, dict) and "$in" in value:
+                if isinstance(current, list):
+                    if not any(item in value["$in"] for item in current):
+                        return False
+                    continue
                 if current not in value["$in"]:
                     return False
                 continue
@@ -617,6 +626,78 @@ async def _test_notification_recipient_ids_empty_input():
     db = FakeStudentDb()
     result = await resolve_notification_recipient_ids(db, [])
     assert result == []
+
+
+def test_find_eligible_students_requires_tutor_mapping_and_class_match():
+    asyncio.run(_test_find_eligible_students_requires_tutor_mapping_and_class_match())
+
+
+async def _test_find_eligible_students_requires_tutor_mapping_and_class_match():
+    from bson import ObjectId
+    from api.v1.meeting_async import _find_eligible_students
+
+    admin_oid = ObjectId()
+    db = FakeDb()
+    db.collections["tutors"].append({
+        "tutor_id": "tutor-1",
+        "assigned_student_ids": ["STU_ASSIGNED_MATCH", "STU_ASSIGNED_WRONG_GRADE"],
+    })
+    db.collections["students"].extend([
+        {
+            "student_id": "STU_ASSIGNED_MATCH",
+            "admin_id": admin_oid,
+            "grade": "10",
+            "section": "A",
+            "subjects": ["Math"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_TEACHERIDS_MATCH",
+            "admin_id": admin_oid,
+            "grade": "10",
+            "section": "A",
+            "subjects": ["Math"],
+            "teacher_ids": ["tutor-1"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_CLASS_ONLY",
+            "admin_id": admin_oid,
+            "grade": "10",
+            "section": "A",
+            "subjects": ["Math"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_ASSIGNED_WRONG_GRADE",
+            "admin_id": admin_oid,
+            "grade": "11",
+            "section": "A",
+            "subjects": ["Math"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_INACTIVE",
+            "admin_id": admin_oid,
+            "grade": "10",
+            "section": "A",
+            "subjects": ["Math"],
+            "teacher_ids": ["tutor-1"],
+            "is_active": False,
+        },
+    ])
+
+    invited = await _find_eligible_students(
+        db=db,
+        tutor_id="tutor-1",
+        standard="10",
+        section="A",
+        subject="Math",
+        course_type=None,
+        admin_id=str(admin_oid),
+    )
+
+    assert set(invited) == {"STU_ASSIGNED_MATCH", "STU_TEACHERIDS_MATCH"}
 
 
 def test_canvas_request_defaults_to_joined_students():

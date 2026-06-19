@@ -371,8 +371,18 @@ async def _find_eligible_students(
     """Find students eligible for the meeting based on criteria"""
     from bson import ObjectId
 
+    tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+    assigned_ids = [
+        sid for sid in (tutor.get("assigned_student_ids", []) if tutor else []) if sid
+    ]
+
     # Build query for students
     query_conditions = []
+
+    mapping_conditions: List[Dict[str, Any]] = [{"teacher_ids": {"$in": [tutor_id]}}]
+    if assigned_ids:
+        mapping_conditions.append({"student_id": {"$in": assigned_ids}})
+    query_conditions.append({"$or": mapping_conditions})
 
     # Match by admin (same organization)
     if admin_id:
@@ -415,10 +425,6 @@ async def _find_eligible_students(
             ]
         })
 
-    # Also include students directly assigned to tutor
-    tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
-    assigned_ids = tutor.get("assigned_student_ids", []) if tutor else []
-
     # Build final query
     if query_conditions:
         query = {"$and": query_conditions, "is_active": {"$ne": False}}
@@ -428,14 +434,12 @@ async def _find_eligible_students(
     # Find matching students
     students = await db.mongo_find("students", query)
 
-    # Extract student IDs and add assigned students
+    # Extract mapped student IDs that also match the meeting criteria.
     student_ids = set()
     for student in students:
-        student_ids.add(student.get("student_id"))
-
-    # Add directly assigned students
-    for sid in assigned_ids:
-        student_ids.add(sid)
+        student_id = student.get("student_id")
+        if student_id:
+            student_ids.add(student_id)
 
     return list(student_ids)
 
