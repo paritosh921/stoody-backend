@@ -99,6 +99,10 @@ class UpdateMeetingRequest(BaseModel):
     duration_minutes: Optional[int] = Field(None, ge=15, le=480, description="Duration in minutes")
 
 
+class ExtendMeetingRequest(BaseModel):
+    minutes: int = Field(..., description="Extension in minutes")
+
+
 class ProviderDetails(BaseModel):
     provider: Optional[str] = None
     domain: Optional[str] = None
@@ -219,6 +223,29 @@ def _public_video_fields(meeting_id: str) -> tuple[Optional[str], Optional[str]]
         return None, None
     room_name = jitsi_provider_service.generate_room_name(meeting_id)
     return jitsi_provider_service.get_room_url(room_name), room_name
+
+
+async def _extend_meeting_duration(
+    db: DatabaseManager,
+    meeting_id: str,
+    minutes: int,
+) -> Dict[str, Any]:
+    if minutes not in {10, 20, 30, 60}:
+        raise HTTPException(status_code=400, detail="Extension must be 10, 20, 30, or 60 minutes")
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if meeting.get("status") != "active":
+        raise HTTPException(status_code=400, detail="Meeting is not active")
+    duration = int(meeting.get("duration_minutes") or 60)
+    next_duration = min(480, duration + minutes)
+    await db.mongo_update_one(
+        "meetings",
+        {"meeting_id": meeting_id},
+        {"$set": {"duration_minutes": next_duration, "updated_at": datetime.utcnow()}},
+    )
+    meeting["duration_minutes"] = next_duration
+    return meeting
 
 
 def _meeting_response_from_doc(
@@ -787,6 +814,29 @@ async def end_meeting(
     logger.info(f"Meeting {meeting_id} ended by tutor {tutor_id}")
 
     return {"message": "Meeting ended", "meeting_id": meeting_id}
+
+
+@router.post("/meetings/{meeting_id}/extend")
+@limiter.limit("20/minute")
+async def extend_meeting(
+    request: Request,
+    meeting_id: str,
+    body: ExtendMeetingRequest,
+    current_user: Dict[str, Any] = Depends(require_tutor),
+    db: DatabaseManager = Depends(get_database)
+):
+    tutor_id = current_user.get("tutor_id")
+    meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if meeting.get("tutor_id") != tutor_id:
+        raise HTTPException(status_code=403, detail="Not authorized to extend this meeting")
+    updated = await _extend_meeting_duration(db, meeting_id, body.minutes)
+    return {
+        "message": "Meeting extended",
+        "meeting_id": meeting_id,
+        "duration_minutes": updated.get("duration_minutes", 60),
+    }
 
 
 @router.delete("/meetings/{meeting_id}")

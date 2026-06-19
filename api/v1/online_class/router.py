@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -58,6 +58,7 @@ DEFAULT_MEETING_MEDIA_POLICY = {
     "allow_student_camera": True,
     "allow_student_screen_share": True,
 }
+MEETING_MEDIA_PERMISSION_KEYS = tuple(DEFAULT_MEETING_MEDIA_POLICY.keys())
 
 
 class CanvasProviderDetails(BaseModel):
@@ -165,6 +166,7 @@ class MeetingMediaPolicyRequest(BaseModel):
     allow_student_microphone: bool = True
     allow_student_camera: bool = True
     allow_student_screen_share: bool = True
+    student_permissions: Dict[str, Dict[str, bool]] = Field(default_factory=dict)
 
 
 class MeetingMediaPolicyResponse(MeetingMediaPolicyRequest):
@@ -596,10 +598,21 @@ async def _set_teacher_canvas_mode(
 
 def _normalize_meeting_media_policy(policy: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized = dict(DEFAULT_MEETING_MEDIA_POLICY)
+    normalized["student_permissions"] = {}
     if isinstance(policy, dict):
         for key in DEFAULT_MEETING_MEDIA_POLICY:
             if key in policy:
                 normalized[key] = bool(policy.get(key))
+        student_permissions = policy.get("student_permissions")
+        if isinstance(student_permissions, dict):
+            for student_id, permissions in student_permissions.items():
+                if not student_id or not isinstance(permissions, dict):
+                    continue
+                normalized["student_permissions"][str(student_id)] = {
+                    key: bool(permissions[key])
+                    for key in MEETING_MEDIA_PERMISSION_KEYS
+                    if key in permissions
+                }
         normalized["updated_at"] = _serialize_datetime(policy.get("updated_at"))
         normalized["updated_by"] = policy.get("updated_by")
     else:
@@ -621,14 +634,16 @@ async def _get_meeting_media_policy(
 async def _set_meeting_media_policy(
     db: DatabaseManager,
     meeting_id: str,
-    policy: Dict[str, bool],
+    policy: Dict[str, Any],
     updated_by: str,
 ) -> Dict[str, Any]:
     now = datetime.utcnow()
+    normalized_policy = _normalize_meeting_media_policy(policy)
     stored_policy = {
-        "allow_student_microphone": bool(policy.get("allow_student_microphone")),
-        "allow_student_camera": bool(policy.get("allow_student_camera")),
-        "allow_student_screen_share": bool(policy.get("allow_student_screen_share")),
+        "allow_student_microphone": normalized_policy["allow_student_microphone"],
+        "allow_student_camera": normalized_policy["allow_student_camera"],
+        "allow_student_screen_share": normalized_policy["allow_student_screen_share"],
+        "student_permissions": normalized_policy["student_permissions"],
         "updated_at": now,
         "updated_by": updated_by,
     }
@@ -1544,6 +1559,11 @@ async def api_get_meeting_media_policy(
         student_id = await resolve_business_student_id(current_user, db)
         if not student_id or student_id not in meeting.get("invited_student_ids", []):
             raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+        policy = await _get_meeting_media_policy(db, meeting_id)
+        policy["student_permissions"] = {
+            student_id: policy.get("student_permissions", {}).get(student_id, {})
+        }
+        return MeetingMediaPolicyResponse(**policy)
     else:
         raise HTTPException(status_code=403, detail="Online class access denied")
     return MeetingMediaPolicyResponse(**await _get_meeting_media_policy(db, meeting_id))

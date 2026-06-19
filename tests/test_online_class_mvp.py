@@ -1180,6 +1180,7 @@ async def _test_meeting_media_policy_defaults_and_persists_student_controls():
         "allow_student_microphone": True,
         "allow_student_camera": True,
         "allow_student_screen_share": True,
+        "student_permissions": {},
         "updated_at": None,
         "updated_by": None,
     }
@@ -1204,6 +1205,71 @@ async def _test_meeting_media_policy_defaults_and_persists_student_controls():
     assert stored["allow_student_microphone"] is False
     assert stored["allow_student_camera"] is True
     assert stored["allow_student_screen_share"] is False
+
+
+def test_meeting_media_policy_supports_per_student_screen_share_override():
+    asyncio.run(_test_meeting_media_policy_supports_per_student_screen_share_override())
+
+
+async def _test_meeting_media_policy_supports_per_student_screen_share_override():
+    from api.v1.online_class.router import (
+        _get_meeting_media_policy,
+        _set_meeting_media_policy,
+    )
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG1",
+        "status": "active",
+        "tutor_id": "tutor-1",
+    })
+
+    updated = await _set_meeting_media_policy(
+        db,
+        "MTG1",
+        {
+            "allow_student_microphone": False,
+            "allow_student_camera": False,
+            "allow_student_screen_share": False,
+            "student_permissions": {
+                "STU_ALLOW": {
+                    "allow_student_screen_share": True,
+                },
+                "STU_BLOCK": {
+                    "allow_student_screen_share": False,
+                },
+            },
+        },
+        "tutor-1",
+    )
+
+    assert updated["allow_student_screen_share"] is False
+    assert updated["student_permissions"]["STU_ALLOW"]["allow_student_screen_share"] is True
+    assert updated["student_permissions"]["STU_BLOCK"]["allow_student_screen_share"] is False
+
+    stored = await _get_meeting_media_policy(db, "MTG1")
+    assert stored["student_permissions"]["STU_ALLOW"]["allow_student_screen_share"] is True
+
+
+def test_extend_active_meeting_duration_allows_fixed_increments():
+    asyncio.run(_test_extend_active_meeting_duration_allows_fixed_increments())
+
+
+async def _test_extend_active_meeting_duration_allows_fixed_increments():
+    from api.v1.meeting_async import _extend_meeting_duration
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG1",
+        "status": "active",
+        "duration_minutes": 60,
+    })
+
+    updated = await _extend_meeting_duration(db, "MTG1", 20)
+
+    assert updated["duration_minutes"] == 80
+    stored = await db.mongo_find_one("meetings", {"meeting_id": "MTG1"})
+    assert stored["duration_minutes"] == 80
 
 
 def test_tutor_meetings_hide_archived_by_default_and_can_include_them():
