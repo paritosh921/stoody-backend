@@ -66,6 +66,7 @@ from config_async import (
     WORKER_CONNECTIONS,
     OCR_CONCURRENCY_LIMIT,
     ENABLE_METRICS,
+    METRICS_ACCESS_TOKEN,
     UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT,
     UPLOAD_MAX_REQUEST_BODY_MB,
     UPLOAD_SECURITY_ENABLED,
@@ -78,6 +79,7 @@ from api.v1.stoody_book_static import mount_stoody_book
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
+from core.metrics_access import is_metrics_request_authorized
 from core.observability import (
     set_dependency_health,
     set_upload_freshclam_age_seconds,
@@ -789,8 +791,8 @@ if ENABLE_METRICS and Instrumentator is not None:
         should_group_status_codes=True,
         should_ignore_untemplated=True,
         excluded_handlers=["/metrics", "/api/metrics", "/api/v1/metrics"],
-    ).instrument(app).expose(app, endpoint="/metrics", include_in_schema=DEBUG_MODE)
-    logger.info("✅ Prometheus metrics enabled at /metrics")
+    ).instrument(app)
+    logger.info("✅ Prometheus metrics instrumentation enabled")
 elif ENABLE_METRICS:
     logger.warning("⚠️ Metrics enabled but prometheus-fastapi-instrumentator is unavailable")
 
@@ -1667,9 +1669,15 @@ async def healthz_alias(request: Request):
 
 # Compatibility metrics endpoints for CDN/proxy path routing.
 if ENABLE_METRICS:
-    def _render_metrics() -> Response:
+    def _render_metrics(request: Request) -> Response:
         if generate_latest is None:
             raise HTTPException(status_code=503, detail="prometheus_client unavailable")
+        if not is_metrics_request_authorized(
+            request.headers,
+            access_token=METRICS_ACCESS_TOKEN,
+            debug_mode=DEBUG_MODE,
+        ):
+            raise HTTPException(status_code=403, detail="Metrics access denied")
         _refresh_upload_security_config_metrics()
         return Response(
             content=generate_latest(),
@@ -1682,15 +1690,20 @@ if ENABLE_METRICS:
             },
         )
 
+    @app.get("/metrics", include_in_schema=DEBUG_MODE)
+    @limiter.limit("120/minute")
+    async def metrics_root(request: Request):
+        return _render_metrics(request)
+
     @app.get("/api/metrics", include_in_schema=DEBUG_MODE)
     @limiter.limit("120/minute")
     async def metrics_api_alias(request: Request):
-        return _render_metrics()
+        return _render_metrics(request)
 
     @app.get("/api/v1/metrics", include_in_schema=DEBUG_MODE)
     @limiter.limit("120/minute")
     async def metrics_v1_alias(request: Request):
-        return _render_metrics()
+        return _render_metrics(request)
 
 # Legacy compatibility endpoint for token verification
 @app.get("/verify")

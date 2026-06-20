@@ -245,7 +245,9 @@ Required dashboard groups:
 
 Prometheus and exporter ports must not be public. Grafana must be authenticated
 and served over HTTPS. Backend metrics access should be restricted to the
-monitoring host or another explicitly authorized scraper.
+monitoring host or another explicitly authorized scraper. In production,
+`METRICS_ACCESS_TOKEN` should be set and Prometheus should send it as a bearer
+token from a server-only secret file.
 
 ## Operations Runbook
 

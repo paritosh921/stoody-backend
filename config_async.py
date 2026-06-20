@@ -401,6 +401,7 @@ class AsyncSettings(BaseSettings):
     # Monitoring and logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO" if os.getenv("NODE_ENV", "production") == "development" else "WARNING")
     ENABLE_METRICS: bool = os.getenv("ENABLE_METRICS", "false").lower() == "true"
+    METRICS_ACCESS_TOKEN: str = os.getenv("METRICS_ACCESS_TOKEN", "")
 
     # Security Logging
     SECURITY_LOG_ENABLED: bool = os.getenv("SECURITY_LOG_ENABLED", "true").lower() == "true"
@@ -513,6 +514,7 @@ OCR_TIMEOUT_SECONDS = settings.OCR_TIMEOUT_SECONDS
 OCR_CONCURRENCY_LIMIT = settings.OCR_CONCURRENCY_LIMIT
 LOG_LEVEL = settings.LOG_LEVEL
 ENABLE_METRICS = settings.ENABLE_METRICS
+METRICS_ACCESS_TOKEN = settings.METRICS_ACCESS_TOKEN
 
 # Security logging
 SECURITY_LOG_ENABLED = settings.SECURITY_LOG_ENABLED
