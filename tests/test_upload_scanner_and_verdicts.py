@@ -58,6 +58,47 @@ def test_clamdscan_command_uses_configured_socket(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_clamdscan_timeout_fails_closed(monkeypatch, tmp_path):
+    class SlowProcess:
+        returncode = 0
+        killed = False
+
+        async def communicate(self):
+            import asyncio
+
+            await asyncio.sleep(0.05)
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            return None
+
+    process = SlowProcess()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr("core.upload_security.scanner.settings.UPLOAD_AV_ENABLED", True)
+    monkeypatch.setattr("core.upload_security.scanner.settings.UPLOAD_SCANNER_TIMEOUT_SECONDS", 0.001, raising=False)
+    async def fake_version():
+        return "ClamAV test"
+
+    monkeypatch.setattr("core.upload_security.scanner._get_clamdscan_version", fake_version)
+    monkeypatch.setattr("core.upload_security.scanner.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+
+    upload = tmp_path / "sample.pdf"
+    upload.write_bytes(b"%PDF-1.7\n")
+
+    result = await ClamAVScanner().scan_path(upload, filename="sample.pdf", policy_id="pdf_document")
+
+    assert result.status == "scan_failed"
+    assert "timed out" in (result.error or "").lower()
+    assert process.killed is True
+
+
+@pytest.mark.asyncio
 async def test_verdict_persistence_shape():
     db = FakeDb()
     verdict = build_upload_verdict(

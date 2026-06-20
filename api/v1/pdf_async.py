@@ -32,9 +32,10 @@ from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.observability import observe_ocr_job
 from core.upload_security.service import secure_upload
+from core.upload_security.storage import PrivateUploadStorage, safe_filename
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
-from config_async import OCR_TIMEOUT_SECONDS
+from config_async import OCR_TIMEOUT_SECONDS, settings
 from utils.path_utils import get_relative_path, get_absolute_path
 from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url, download_file
 from services.ai_gateway_service import (
@@ -4010,20 +4011,24 @@ async def _store_exam_template_file(
                 detail=f"Failed to convert PDF template to image: {pdf_err}",
             )
 
-    from pathlib import Path
-    backend_dir = Path(os.getcwd())
-    template_dir = backend_dir / "uploads" / "documents" / "templates"
-    template_dir.mkdir(parents=True, exist_ok=True)
-
     template_filename = f"{document_id}_template.{ext}"
-    template_path = template_dir / template_filename
-    relative_path = f"uploads/documents/templates/{template_filename}"
-
-    import aiofiles
-    async with aiofiles.open(str(template_path), "wb") as f:
-        await f.write(file_content)
-
-    return relative_path
+    content_type = "image/png" if ext == "png" else "image/jpeg"
+    storage = PrivateUploadStorage(released_prefix=settings.UPLOAD_DERIVED_PREFIX)
+    return await storage.write_released_bytes(
+        data=file_content,
+        tenant=actor.get("db_name") or actor.get("tenant_id"),
+        policy_id="exam_template_file",
+        upload_id=clean_upload.upload_id,
+        safe_filename=safe_filename(template_filename),
+        content_type=content_type,
+        metadata={
+            "upload_id": clean_upload.upload_id,
+            "policy_id": "exam_template_file",
+            "source_upload_id": clean_upload.upload_id,
+            "derived_kind": "dcr_exam_template",
+            "document_id": document_id,
+        },
+    )
 
 
 @router.post("/documents/{document_id}/upload-template")

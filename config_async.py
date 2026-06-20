@@ -348,11 +348,13 @@ class AsyncSettings(BaseSettings):
     CLAMD_HOST: str = os.getenv("CLAMD_HOST", "127.0.0.1")
     CLAMD_PORT: int = int(os.getenv("CLAMD_PORT", 3310))
     CLAMAV_SOCKET: str = os.getenv("CLAMAV_SOCKET", os.getenv("CLAMD_SOCKET", ""))
+    UPLOAD_SCANNER_TIMEOUT_SECONDS: float = float(os.getenv("UPLOAD_SCANNER_TIMEOUT_SECONDS", 30))
     UPLOAD_PRIVATE_LOCAL_DIR: Path = Path(
         os.getenv("UPLOAD_PRIVATE_LOCAL_DIR", _default_upload_private_local_dir())
     )
     UPLOAD_QUARANTINE_PREFIX: str = os.getenv("UPLOAD_QUARANTINE_PREFIX", "quarantine")
     UPLOAD_RELEASED_PREFIX: str = os.getenv("UPLOAD_RELEASED_PREFIX", os.getenv("UPLOAD_CLEAN_PREFIX", "clean"))
+    UPLOAD_DERIVED_PREFIX: str = os.getenv("UPLOAD_DERIVED_PREFIX", "derived")
     UPLOAD_REJECTED_PREFIX: str = os.getenv("UPLOAD_REJECTED_PREFIX", "rejected")
     UPLOAD_MAX_REQUEST_BODY_MB: int = int(os.getenv("UPLOAD_MAX_REQUEST_BODY_MB", 64))
     UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK: bool = os.getenv(

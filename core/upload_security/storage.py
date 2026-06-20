@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import json
 import re
 import shutil
 import uuid
@@ -14,6 +16,8 @@ from config_async import settings
 
 
 _SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._-]+")
+PRIVATE_DIRECTORY_MODE = 0o2750
+PRIVATE_FILE_MODE = 0o640
 
 
 def safe_filename(filename: str | None, *, fallback: str = "upload.bin") -> str:
@@ -51,9 +55,10 @@ class PrivateUploadStorage:
         tenant_segment = safe_storage_segment(tenant)
         name = f"{uuid.uuid4().hex}_{safe_filename(original_filename)}"
         path = self.local_root / self.quarantine_prefix / tenant_segment / safe_storage_segment(upload_id) / name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(path.parent, root=self.local_root)
         async with aiofiles.open(path, "wb") as handle:
             await handle.write(data)
+        _chmod_best_effort(path, PRIVATE_FILE_MODE)
         return str(path)
 
     async def release_clean(
@@ -76,8 +81,10 @@ class PrivateUploadStorage:
             / safe_storage_segment(upload_id)
             / safe_filename
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(path.parent, root=self.local_root)
         await _copy_file(Path(quarantine_path), path)
+        _chmod_best_effort(path, PRIVATE_FILE_MODE)
+        await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
         return str(path)
 
     async def write_released_bytes(
@@ -100,9 +107,11 @@ class PrivateUploadStorage:
             / safe_storage_segment(upload_id)
             / safe_filename
         )
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(path.parent, root=self.local_root)
         async with aiofiles.open(path, "wb") as handle:
             await handle.write(data)
+        _chmod_best_effort(path, PRIVATE_FILE_MODE)
+        await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
         return str(path)
 
     async def mark_rejected(self, *, quarantine_path: str, tenant: str | None, upload_id: str) -> str:
@@ -111,8 +120,9 @@ class PrivateUploadStorage:
             return quarantine_path
         tenant_segment = safe_storage_segment(tenant)
         path = self.local_root / self.rejected_prefix / tenant_segment / safe_storage_segment(upload_id) / source.name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(path.parent, root=self.local_root)
         await _copy_file(source, path)
+        _chmod_best_effort(path, PRIVATE_FILE_MODE)
         return str(path)
 
 
@@ -120,3 +130,50 @@ async def _copy_file(source: Path, destination: Path) -> None:
     import asyncio
 
     await asyncio.to_thread(shutil.copyfile, source, destination)
+
+
+async def _write_metadata_sidecar(
+    path: Path,
+    *,
+    content_type: str,
+    metadata: dict[str, Any] | None,
+) -> None:
+    if not metadata:
+        return
+    sidecar = Path(f"{path}.metadata.json")
+    payload = {
+        "content_type": content_type,
+        "metadata": metadata,
+    }
+    async with aiofiles.open(sidecar, "w", encoding="utf-8") as handle:
+        await handle.write(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
+    _chmod_best_effort(sidecar, PRIVATE_FILE_MODE)
+
+
+def _ensure_private_directory(path: Path, *, root: Path | None = None) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for directory in _private_directory_chain(path, root=root):
+        _chmod_best_effort(directory, PRIVATE_DIRECTORY_MODE)
+
+
+def _private_directory_chain(path: Path, *, root: Path | None = None) -> list[Path]:
+    if root is None:
+        return [path]
+    try:
+        relative = path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return [path]
+
+    directories = [root]
+    current = root
+    for part in relative.parts:
+        current = current / part
+        directories.append(current)
+    return directories
+
+
+def _chmod_best_effort(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass

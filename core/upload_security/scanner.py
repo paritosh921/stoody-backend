@@ -130,7 +130,19 @@ class ClamAVScanner:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
             )
-            stdout, stderr = await process.communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=settings.UPLOAD_SCANNER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                return ScanResult.scan_failed(
+                    f"clamdscan timed out after {settings.UPLOAD_SCANNER_TIMEOUT_SECONDS:g} seconds",
+                    scanner_name="clamav",
+                    scanner_version=version,
+                )
         except Exception as exc:
             return ScanResult.scan_failed(str(exc), scanner_name="clamav", scanner_version=version)
         finally:

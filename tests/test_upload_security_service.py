@@ -73,6 +73,29 @@ async def test_secure_upload_clean_flow_persists_verdict_and_releases(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_secure_upload_rejects_fake_extension_before_scan_or_release(tmp_path):
+    db = FakeDb()
+    scanner = FakeScanner(ScanResult.clean(scanner_name="fake-av", scanner_version="1"))
+
+    with pytest.raises(HTTPException) as exc:
+        await secure_upload(
+            file=DummyUpload(make_png(), filename="paper.pdf", content_type="application/pdf"),
+            policy_id="pdf_document",
+            actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+            db=db,
+            purpose_metadata={"purpose": "pdf_document"},
+            authorization_subject="pdf:document:paper",
+            scanner=scanner,
+            storage=PrivateUploadStorage(local_root=tmp_path),
+        )
+
+    assert exc.value.status_code == 400
+    assert "magic" in exc.value.detail.lower()
+    assert scanner.calls == 0
+    assert db.rows == []
+
+
+@pytest.mark.asyncio
 async def test_secure_upload_scanner_rejection_prevents_parser(monkeypatch, tmp_path):
     async def fail_if_called(*args, **kwargs):
         raise AssertionError("parser guard should not run after malware rejection")
