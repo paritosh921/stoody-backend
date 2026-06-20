@@ -82,9 +82,11 @@ class PrivateUploadStorage:
             / safe_filename
         )
         _ensure_private_directory(path.parent, root=self.local_root)
-        await _copy_file(Path(quarantine_path), path)
+        source = Path(quarantine_path)
+        await _copy_file(source, path)
         _chmod_best_effort(path, PRIVATE_FILE_MODE)
         await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
+        await _delete_file_and_empty_parents(source, stop_at=self.local_root / self.quarantine_prefix)
         return str(path)
 
     async def write_released_bytes(
@@ -114,7 +116,14 @@ class PrivateUploadStorage:
         await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
         return str(path)
 
-    async def mark_rejected(self, *, quarantine_path: str, tenant: str | None, upload_id: str) -> str:
+    async def mark_rejected(
+        self,
+        *,
+        quarantine_path: str,
+        tenant: str | None,
+        upload_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
         source = Path(quarantine_path)
         if not source.exists():
             return quarantine_path
@@ -123,6 +132,7 @@ class PrivateUploadStorage:
         _ensure_private_directory(path.parent, root=self.local_root)
         await _copy_file(source, path)
         _chmod_best_effort(path, PRIVATE_FILE_MODE)
+        await _write_metadata_sidecar(path, content_type="application/octet-stream", metadata=metadata)
         return str(path)
 
 
@@ -130,6 +140,32 @@ async def _copy_file(source: Path, destination: Path) -> None:
     import asyncio
 
     await asyncio.to_thread(shutil.copyfile, source, destination)
+
+
+async def _delete_file_and_empty_parents(path: Path, *, stop_at: Path) -> None:
+    import asyncio
+
+    def _delete() -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            return
+        stop = stop_at.resolve(strict=False)
+        current = path.parent
+        while True:
+            try:
+                current_resolved = current.resolve(strict=False)
+            except OSError:
+                break
+            if current_resolved == stop or stop not in current_resolved.parents:
+                break
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
+    await asyncio.to_thread(_delete)
 
 
 async def _write_metadata_sidecar(

@@ -38,6 +38,36 @@ UPLOAD_SECURITY_TOTAL = Counter(
     ["policy_id", "outcome"],
 )
 
+UPLOAD_SECURITY_REJECTIONS_TOTAL = Counter(
+    "skillbot_upload_security_rejections_total",
+    "Upload security rejections by policy and reason.",
+    ["policy_id", "reason"],
+)
+
+UPLOAD_SECURITY_SCAN_DURATION_SECONDS = Histogram(
+    "skillbot_upload_security_scan_duration_seconds",
+    "Upload malware scan duration in seconds.",
+    ["policy_id", "status"],
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60),
+)
+
+UPLOAD_SECURITY_ALERT_ACTIVE = Gauge(
+    "skillbot_upload_security_alert_active",
+    "Upload security alert state where 1=active and 0=inactive.",
+    ["alert_type"],
+)
+
+UPLOAD_STORAGE_BYTES = Gauge(
+    "skillbot_upload_storage_bytes",
+    "Private upload storage bytes by prefix.",
+    ["prefix"],
+)
+
+UPLOAD_FRESHCLAM_AGE_SECONDS = Gauge(
+    "skillbot_upload_freshclam_age_seconds",
+    "Age in seconds of local ClamAV signature metadata.",
+)
+
 OCR_JOB_DURATION_SECONDS = Histogram(
     "skillbot_ocr_job_duration_seconds",
     "OCR job duration in seconds.",
@@ -107,6 +137,34 @@ def record_upload_security_decision(policy_id: str, outcome: str) -> None:
         policy_id=_safe(policy_id),
         outcome=_safe(outcome),
     ).inc()
+
+
+def record_upload_security_rejection(policy_id: str, reason: str) -> None:
+    UPLOAD_SECURITY_REJECTIONS_TOTAL.labels(
+        policy_id=_safe(policy_id),
+        reason=_safe(reason),
+    ).inc()
+
+
+def observe_upload_scan_latency(policy_id: str, status: str, duration_seconds: float) -> None:
+    UPLOAD_SECURITY_SCAN_DURATION_SECONDS.labels(
+        policy_id=_safe(policy_id),
+        status=_safe(status),
+    ).observe(max(duration_seconds, 0.0))
+
+
+def set_upload_security_alert(alert_type: str, active: bool = True) -> None:
+    UPLOAD_SECURITY_ALERT_ACTIVE.labels(alert_type=_safe(alert_type)).set(1 if active else 0)
+
+
+def set_upload_storage_usage(prefix: str, bytes_used: int) -> None:
+    UPLOAD_STORAGE_BYTES.labels(prefix=_safe(prefix)).set(max(int(bytes_used), 0))
+
+
+def set_upload_freshclam_age_seconds(age_seconds: float | int | None) -> None:
+    if age_seconds is None:
+        return
+    UPLOAD_FRESHCLAM_AGE_SECONDS.set(max(float(age_seconds), 0.0))
 
 
 def track_websocket_connection(channel: str, delta: int) -> None:

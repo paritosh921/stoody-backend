@@ -36,6 +36,10 @@ UPLOAD_PRIVATE_LOCAL_DIR=/var/lib/stoody/uploads
 UPLOAD_QUARANTINE_PREFIX=quarantine
 UPLOAD_RELEASED_PREFIX=clean
 UPLOAD_REJECTED_PREFIX=rejected
+UPLOAD_REJECTED_RETENTION_DAYS=30
+UPLOAD_QUARANTINE_RETENTION_HOURS=24
+UPLOAD_SCANNER_TIMEOUT_SECONDS=30
+UPLOAD_FRESHCLAM_MAX_AGE_HOURS=48
 UPLOAD_MAX_REQUEST_BODY_MB=64
 UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK=false
 UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT=false
@@ -75,6 +79,150 @@ upload policy, or lower the affected `UPLOAD_POLICY_*_MAX_SIZE_MB` overrides.
 
 nginx should keep `client_max_body_size 64m` unless a larger backend upload
 policy is explicitly approved and the malware scanner limits are raised with it.
+
+## Retention And Cleanup
+
+Clean releases delete their quarantine copy after the file is copied to private
+`clean/` or `derived/` storage. Rejected uploads remain under `rejected/` with a
+metadata sidecar containing verdict and rejection reason.
+
+Run cleanup in dry-run mode first:
+
+```powershell
+python scripts/cleanup_upload_storage.py
+```
+
+Then execute deletion of expired quarantine/rejected files:
+
+```powershell
+python scripts/cleanup_upload_storage.py --execute
+```
+
+Useful options:
+
+```text
+--root /var/lib/stoody/uploads
+--rejected-retention-days 30
+--quarantine-retention-hours 24
+```
+
+The cleanup command only considers `quarantine/` and `rejected/`. It does not
+delete `clean/` or `derived/` objects.
+
+## Monitoring And Alerts
+
+Prometheus metrics include:
+
+```text
+skillbot_upload_security_total{policy_id,outcome}
+skillbot_upload_security_rejections_total{policy_id,reason}
+skillbot_upload_security_scan_duration_seconds{policy_id,status}
+skillbot_upload_security_alert_active{alert_type}
+skillbot_upload_storage_bytes{prefix}
+skillbot_upload_freshclam_age_seconds
+skillbot_dependency_health{dependency="upload_malware_scanner"}
+```
+
+Expected alert types:
+
+```text
+scanner_unavailable
+scanner_timeout
+freshclam_stale
+```
+
+Alert on scanner unavailable, scanner timeout spikes, stale freshclam age,
+infected/rejected spikes, and private upload storage growth. `/health` updates
+scanner availability, freshclam age, and private storage usage gauges.
+
+## Deployment Validation Gate
+
+Run the deployment validation script after production deploys:
+
+```powershell
+python scripts/validate_upload_security_deploy.py
+```
+
+Set `BACKEND_HEALTH_URL` to the deployed backend health URL before running it.
+The script exits non-zero if upload security is disabled or unhealthy. It
+checks:
+
+```text
+UPLOAD_SCAN_REQUIRED=true
+UPLOAD_AV_FAIL_CLOSED=true
+CLAMAV_SOCKET exists
+CLAMAV socket is not world-accessible
+clamav-daemon active
+clamav-freshclam active
+EICAR is detected
+private quarantine/rejected/clean directories exist
+nginx config does not alias private upload root
+backend health reports upload_malware_scanner.available=true
+```
+
+## ClamAV Socket Hardening
+
+Target production socket posture:
+
+```text
+LocalSocket /var/run/clamav/clamd.ctl
+LocalSocketMode 660
+LocalSocketGroup clamav
+```
+
+The backend service user should be in the scanner-access group:
+
+```bash
+sudo usermod -aG clamav ubuntu
+sudo systemctl restart clamav-daemon
+sudo systemctl restart stoody-backend
+```
+
+Verify:
+
+```bash
+stat -c '%U:%G %a %n' /var/run/clamav/clamd.ctl
+id ubuntu
+clamdscan --fdpass /etc/hosts
+```
+
+Non-service local users should not have access to the ClamAV socket.
+
+## Operations Runbook
+
+Check ClamAV status:
+
+```bash
+systemctl is-active clamav-daemon
+systemctl is-active clamav-freshclam
+journalctl -u clamav-daemon -n 100 --no-pager
+```
+
+Update signatures:
+
+```bash
+sudo freshclam
+systemctl status clamav-freshclam --no-pager
+```
+
+Inspect rejected verdicts in Mongo:
+
+```javascript
+db.upload_security_verdicts.find({status: {$in: ["rejected", "scan_failed"]}})
+  .sort({created_at: -1})
+  .limit(20)
+```
+
+If uploads fail closed, check `/health`, ClamAV socket permissions, daemon
+status, freshclam freshness, and `skillbot_upload_security_alert_active`.
+
+Rotate or repair private upload directory permissions:
+
+```bash
+sudo chown -R ubuntu:clamav /var/lib/stoody/uploads
+sudo find /var/lib/stoody/uploads -type d -exec chmod 2750 {} \;
+sudo find /var/lib/stoody/uploads -type f -exec chmod 0640 {} \;
+```
 
 ## Structured Uploads
 

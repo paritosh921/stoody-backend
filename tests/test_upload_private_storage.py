@@ -26,7 +26,6 @@ async def test_private_storage_writes_quarantine_and_clean_paths(tmp_path):
         metadata={"upload_id": "upload-1"},
     )
 
-    assert pathlib.Path(quarantine).read_bytes() == b"abc"
     assert pathlib.Path(released).read_bytes() == b"abc"
     assert "quarantine" in quarantine
     assert "clean" in released
@@ -34,6 +33,53 @@ async def test_private_storage_writes_quarantine_and_clean_paths(tmp_path):
     sidecar = pathlib.Path(f"{released}.metadata.json")
     assert sidecar.exists()
     assert json.loads(sidecar.read_text(encoding="utf-8"))["metadata"] == {"upload_id": "upload-1"}
+
+
+@pytest.mark.asyncio
+async def test_private_storage_deletes_quarantine_after_clean_release(tmp_path):
+    storage = PrivateUploadStorage(local_root=tmp_path)
+    quarantine = await storage.write_quarantine(
+        data=b"abc",
+        tenant="skb_ciel",
+        upload_id="upload-1",
+        original_filename="paper.pdf",
+    )
+
+    released = await storage.release_clean(
+        quarantine_path=quarantine,
+        tenant="skb_ciel",
+        policy_id="pdf_document",
+        upload_id="upload-1",
+        safe_filename="paper.pdf",
+        content_type="application/pdf",
+        metadata={"upload_id": "upload-1"},
+    )
+
+    assert pathlib.Path(released).exists()
+    assert not pathlib.Path(quarantine).exists()
+
+
+@pytest.mark.asyncio
+async def test_private_storage_writes_rejected_metadata_sidecar(tmp_path):
+    storage = PrivateUploadStorage(local_root=tmp_path)
+    quarantine = await storage.write_quarantine(
+        data=b"malware",
+        tenant="skb_ciel",
+        upload_id="upload-1",
+        original_filename="paper.pdf",
+    )
+
+    rejected = await storage.mark_rejected(
+        quarantine_path=quarantine,
+        tenant="skb_ciel",
+        upload_id="upload-1",
+        metadata={"upload_id": "upload-1", "verdict": "rejected", "rejection_reason": "Eicar"},
+    )
+
+    sidecar = pathlib.Path(f"{rejected}.metadata.json")
+    metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert metadata["metadata"]["verdict"] == "rejected"
+    assert metadata["metadata"]["rejection_reason"] == "Eicar"
 
 
 @pytest.mark.asyncio

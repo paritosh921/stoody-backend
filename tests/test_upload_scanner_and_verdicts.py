@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.upload_security.scanner import ClamAVScanner, ScanResult
+from core.upload_security.scanner import ClamAVScanner, ScanResult, clamav_signature_age_seconds
 from core.upload_security.verdicts import build_upload_verdict, persist_upload_verdict
 
 
@@ -55,6 +55,22 @@ def test_clamdscan_command_uses_configured_socket(monkeypatch):
         assert command[-1] == "/tmp/upload.pdf"
     finally:
         cleanup()
+
+
+def test_clamav_signature_age_uses_newest_signature_file(tmp_path):
+    now = datetime(2026, 6, 20, tzinfo=timezone.utc)
+    old = tmp_path / "main.cvd"
+    fresh = tmp_path / "daily.cld"
+    old.write_bytes(b"old")
+    fresh.write_bytes(b"fresh")
+    old_ts = (now - timedelta(days=3)).timestamp()
+    fresh_ts = (now - timedelta(hours=6)).timestamp()
+    import os
+
+    os.utime(old, (old_ts, old_ts))
+    os.utime(fresh, (fresh_ts, fresh_ts))
+
+    assert clamav_signature_age_seconds(tmp_path, now=now) == 6 * 60 * 60
 
 
 @pytest.mark.asyncio

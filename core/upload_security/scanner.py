@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -92,6 +93,7 @@ class ClamAVScanner:
             "status": result.status,
             "scanner_name": result.scanner_name,
             "scanner_version": result.scanner_version,
+            "freshclam_age_seconds": clamav_signature_age_seconds(),
             "error": result.error,
         }
 
@@ -185,3 +187,28 @@ async def _get_clamdscan_version() -> str | None:
         return None
     output = (stdout + stderr).decode("utf-8", errors="replace").strip()
     return output or None
+
+
+def clamav_signature_age_seconds(
+    database_dir: str | Path = "/var/lib/clamav",
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    signature_dir = Path(database_dir)
+    signature_files = [
+        signature_dir / name
+        for name in ("daily.cvd", "daily.cld", "main.cvd", "main.cld", "bytecode.cvd", "bytecode.cld")
+    ]
+    mtimes = []
+    for path in signature_files:
+        try:
+            mtimes.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    if not mtimes:
+        return None
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    newest_signature = datetime.fromtimestamp(max(mtimes), tz=timezone.utc)
+    return max(int((current_time.astimezone(timezone.utc) - newest_signature).total_seconds()), 0)

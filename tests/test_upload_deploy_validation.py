@@ -1,0 +1,88 @@
+from pathlib import Path
+
+from scripts.validate_upload_security_deploy import run_upload_security_deploy_validation
+
+
+class FakeRunner:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    def __call__(self, command, timeout=10):
+        key = tuple(command)
+        self.calls.append(key)
+        return self.responses.get(key, (0, "OK", ""))
+
+
+def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
+    socket = tmp_path / "clamd.ctl"
+    socket.write_text("socket", encoding="utf-8")
+    socket.chmod(0o660)
+    private_root = tmp_path / "uploads"
+    for prefix in ("quarantine", "rejected", "clean"):
+        (private_root / prefix).mkdir(parents=True)
+    runner = FakeRunner(
+        {
+            ("systemctl", "is-active", "clamav-daemon"): (0, "active\n", ""),
+            ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
+            ("clamdscan", "--fdpass", "--stream"): (1, "stream: Eicar-Test-Signature FOUND\n", ""),
+            ("curl", "-fsS", "https://api.example.test/health"): (
+                0,
+                '{"upload_malware_scanner":{"available":true}}',
+                "",
+            ),
+        }
+    )
+
+    result = run_upload_security_deploy_validation(
+        env={
+            "UPLOAD_SCAN_REQUIRED": "true",
+            "UPLOAD_AV_FAIL_CLOSED": "true",
+            "CLAMAV_SOCKET": str(socket),
+            "UPLOAD_PRIVATE_LOCAL_DIR": str(private_root),
+            "BACKEND_HEALTH_URL": "https://api.example.test/health",
+        },
+        runner=runner,
+        nginx_config_paths=[],
+    )
+
+    assert result.ok is True
+    assert result.failed_checks == []
+
+
+def test_deploy_validation_fails_when_scanner_controls_are_disabled(tmp_path):
+    result = run_upload_security_deploy_validation(
+        env={
+            "UPLOAD_SCAN_REQUIRED": "false",
+            "UPLOAD_AV_FAIL_CLOSED": "false",
+            "CLAMAV_SOCKET": str(tmp_path / "missing.sock"),
+            "UPLOAD_PRIVATE_LOCAL_DIR": str(tmp_path / "uploads"),
+        },
+        runner=FakeRunner({}),
+        nginx_config_paths=[],
+    )
+
+    assert result.ok is False
+    assert "UPLOAD_SCAN_REQUIRED" in result.failed_checks
+    assert "UPLOAD_AV_FAIL_CLOSED" in result.failed_checks
+    assert "CLAMAV_SOCKET_EXISTS" in result.failed_checks
+
+
+def test_deploy_validation_fails_if_nginx_serves_private_upload_root(tmp_path):
+    private_root = tmp_path / "uploads"
+    private_root.mkdir()
+    nginx_conf = tmp_path / "nginx.conf"
+    nginx_conf.write_text(f"location /uploads {{ alias {private_root}; }}", encoding="utf-8")
+
+    result = run_upload_security_deploy_validation(
+        env={
+            "UPLOAD_SCAN_REQUIRED": "true",
+            "UPLOAD_AV_FAIL_CLOSED": "true",
+            "CLAMAV_SOCKET": str(tmp_path / "missing.sock"),
+            "UPLOAD_PRIVATE_LOCAL_DIR": str(private_root),
+        },
+        runner=FakeRunner({}),
+        nginx_config_paths=[Path(nginx_conf)],
+    )
+
+    assert "NGINX_PRIVATE_UPLOAD_NOT_SERVED" in result.failed_checks

@@ -69,6 +69,7 @@ from config_async import (
     UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT,
     UPLOAD_MAX_REQUEST_BODY_MB,
     UPLOAD_SECURITY_ENABLED,
+    UPLOAD_FRESHCLAM_MAX_AGE_HOURS,
 )
 
 from api.v1.stoody_book_static import mount_stoody_book
@@ -77,7 +78,13 @@ from api.v1.stoody_book_static import mount_stoody_book
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
-from core.observability import set_dependency_health
+from core.observability import (
+    set_dependency_health,
+    set_upload_freshclam_age_seconds,
+    set_upload_security_alert,
+    set_upload_storage_usage,
+)
+from core.upload_security.cleanup import collect_upload_storage_usage
 from core.upload_security.scanner import ClamAVScanner
 
 # Import middleware
@@ -1552,9 +1559,23 @@ async def health_check(request: Request):
         try:
             upload_scanner_status = await ClamAVScanner().health()
             set_dependency_health("upload_malware_scanner", bool(upload_scanner_status.get("available")))
+            freshclam_age = upload_scanner_status.get("freshclam_age_seconds")
+            if isinstance(freshclam_age, (int, float)):
+                set_upload_freshclam_age_seconds(freshclam_age)
+                set_upload_security_alert(
+                    "freshclam_stale",
+                    freshclam_age > UPLOAD_FRESHCLAM_MAX_AGE_HOURS * 3600,
+                )
         except Exception as _scanner_err:
             upload_scanner_status = {"enabled": True, "available": False, "error": str(_scanner_err)}
             set_dependency_health("upload_malware_scanner", False)
+            set_upload_security_alert("scanner_unavailable", True)
+
+        try:
+            for prefix, bytes_used in collect_upload_storage_usage().items():
+                set_upload_storage_usage(prefix, bytes_used)
+        except Exception as _storage_usage_err:
+            logger.warning(f"Upload storage usage metrics failed: {str(_storage_usage_err)}")
 
         # Treat cache as optional in all environments; report overall service as running
         # even if one or more dependencies are degraded. Frontend uses this flag to

@@ -1,5 +1,7 @@
 import io
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -118,6 +120,11 @@ async def test_secure_upload_scanner_rejection_prevents_parser(monkeypatch, tmp_
 
     assert exc.value.status_code == 400
     assert db.rows[-1][1]["status"] == "rejected"
+    rejected_sidecars = list(Path(tmp_path).glob("rejected/**/*.metadata.json"))
+    assert rejected_sidecars
+    rejected_metadata = json.loads(rejected_sidecars[0].read_text(encoding="utf-8"))["metadata"]
+    assert rejected_metadata["verdict"] == "rejected"
+    assert rejected_metadata["rejection_reason"] == "Eicar-Test-Signature"
 
 
 @pytest.mark.asyncio

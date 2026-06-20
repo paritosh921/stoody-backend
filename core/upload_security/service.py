@@ -11,7 +11,12 @@ from typing import Any, Callable, Iterable
 
 from fastapi import HTTPException, status
 
-from core.observability import record_upload_security_decision
+from core.observability import (
+    observe_upload_scan_latency,
+    record_upload_security_decision,
+    record_upload_security_rejection,
+    set_upload_security_alert,
+)
 
 from .detection import DetectedFileType, detect_file_type
 from .policies import UploadPolicy, get_upload_policy
@@ -48,7 +53,12 @@ async def secure_upload(
 ) -> CleanUpload:
     policy = get_upload_policy(policy_id)
     _validate_metadata(purpose_metadata, authorization_subject)
-    data = await read_upload_file_limited(file, policy)
+    try:
+        data = await read_upload_file_limited(file, policy)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
+            _record_rejection(policy.policy_id, "oversize")
+        raise
     return await _secure_upload_bytes(
         data=data,
         filename=getattr(file, "filename", None),
@@ -79,14 +89,21 @@ async def secure_upload_many(
     policy = get_upload_policy(policy_id)
     file_list = list(files)
     if policy.max_files is not None and len(file_list) > policy.max_files:
+        _record_rejection(policy.policy_id, "file_count")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Too many files for {policy.policy_id}")
 
     prepared: list[tuple[Any, bytes]] = []
     total = 0
     for file in file_list:
-        data = await read_upload_file_limited(file, policy)
+        try:
+            data = await read_upload_file_limited(file, policy)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
+                _record_rejection(policy.policy_id, "oversize")
+            raise
         total += len(data)
         if policy.max_total_size_bytes is not None and total > policy.max_total_size_bytes:
+            _record_rejection(policy.policy_id, "oversize")
             raise HTTPException(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=f"Total upload size exceeds {policy.max_total_size_bytes} bytes",
@@ -130,7 +147,11 @@ async def _secure_upload_bytes(
     storage: PrivateUploadStorage | None,
     include_bytes: bool,
 ) -> CleanUpload:
-    detected = detect_file_type(data, filename, content_type, policy)
+    try:
+        detected = detect_file_type(data, filename, content_type, policy)
+    except HTTPException as exc:
+        _record_rejection(policy.policy_id, _classify_detection_rejection(exc.detail))
+        raise
     upload_id = str(uuid.uuid4())
     tenant_db = _tenant_db(actor)
     user_id = _user_id(actor)
@@ -148,10 +169,27 @@ async def _secure_upload_bytes(
     scan_started_at = datetime.utcnow()
     scan_result: ScanResult = await scanner.scan_path(quarantine_path, filename=filename or "", policy_id=policy.policy_id)
     scan_finished_at = datetime.utcnow()
+    _observe_scan(policy.policy_id, scan_result.status, (scan_finished_at - scan_started_at).total_seconds())
 
     if scan_result.status != "clean":
-        await storage.mark_rejected(quarantine_path=quarantine_path, tenant=tenant_db, upload_id=upload_id)
         status_value = "rejected" if scan_result.status == "rejected" else "scan_failed"
+        rejection_reason = scan_result.signature or scan_result.error
+        rejection_metric = "infected" if scan_result.status == "rejected" else _classify_scanner_failure(rejection_reason)
+        _record_rejection(policy.policy_id, rejection_metric)
+        if rejection_metric in {"scanner_timeout", "scanner_unavailable"}:
+            _set_alert(rejection_metric, True)
+        await storage.mark_rejected(
+            quarantine_path=quarantine_path,
+            tenant=tenant_db,
+            upload_id=upload_id,
+            metadata={
+                "upload_id": upload_id,
+                "policy_id": policy.policy_id,
+                "sha256": sha256,
+                "verdict": status_value,
+                "rejection_reason": rejection_reason,
+            },
+        )
         _record_decision(policy.policy_id, status_value)
         await _persist_verdict(
             db=db,
@@ -172,7 +210,7 @@ async def _secure_upload_bytes(
             authorization_subject=authorization_subject,
             quarantine_path=quarantine_path,
             released_path=None,
-            rejection_reason=scan_result.signature or scan_result.error,
+            rejection_reason=rejection_reason,
         )
         if scan_result.status == "rejected":
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Malware detected in upload")
@@ -183,7 +221,19 @@ async def _secure_upload_bytes(
         if inspect.isawaitable(guard_result):
             await guard_result
     except HTTPException as exc:
-        await storage.mark_rejected(quarantine_path=quarantine_path, tenant=tenant_db, upload_id=upload_id)
+        _record_rejection(policy.policy_id, "parser_rejected")
+        await storage.mark_rejected(
+            quarantine_path=quarantine_path,
+            tenant=tenant_db,
+            upload_id=upload_id,
+            metadata={
+                "upload_id": upload_id,
+                "policy_id": policy.policy_id,
+                "sha256": sha256,
+                "verdict": "rejected",
+                "rejection_reason": str(exc.detail),
+            },
+        )
         _record_decision(policy.policy_id, "parser_rejected")
         await _persist_verdict(
             db=db,
@@ -239,6 +289,8 @@ async def _secure_upload_bytes(
         rejection_reason=None,
     )
     _record_decision(policy.policy_id, "accepted")
+    _set_alert("scanner_timeout", False)
+    _set_alert("scanner_unavailable", False)
     return CleanUpload(
         upload_id=upload_id,
         original_filename=filename or "",
@@ -322,3 +374,42 @@ def _record_decision(policy_id: str, outcome: str) -> None:
         record_upload_security_decision(policy_id, outcome)
     except Exception:
         pass
+
+
+def _record_rejection(policy_id: str, reason: str) -> None:
+    try:
+        record_upload_security_rejection(policy_id, reason)
+    except Exception:
+        pass
+
+
+def _observe_scan(policy_id: str, status_value: str, duration_seconds: float) -> None:
+    try:
+        observe_upload_scan_latency(policy_id, status_value, duration_seconds)
+    except Exception:
+        pass
+
+
+def _set_alert(alert_type: str, active: bool) -> None:
+    try:
+        set_upload_security_alert(alert_type, active)
+    except Exception:
+        pass
+
+
+def _classify_detection_rejection(detail: Any) -> str:
+    text = str(detail).lower()
+    if "mime" in text:
+        return "mime_mismatch"
+    if "magic" in text or "extension does not match" in text:
+        return "magic_mismatch"
+    if "extension" in text:
+        return "extension_rejected"
+    return "content_rejected"
+
+
+def _classify_scanner_failure(reason: Any) -> str:
+    text = str(reason).lower()
+    if "timeout" in text or "timed out" in text:
+        return "scanner_timeout"
+    return "scanner_unavailable"
