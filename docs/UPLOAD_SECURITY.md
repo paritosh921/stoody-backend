@@ -98,6 +98,30 @@ Then execute deletion of expired quarantine/rejected files:
 python scripts/cleanup_upload_storage.py --execute
 ```
 
+Production deploys install a systemd timer for this cleanup:
+
+```bash
+systemctl is-enabled stoody-upload-cleanup.timer
+systemctl is-active stoody-upload-cleanup.timer
+systemctl list-timers stoody-upload-cleanup.timer
+```
+
+The timer defaults to daily execution around `03:20` with randomized delay and
+runs:
+
+```bash
+python scripts/cleanup_upload_storage.py --execute
+```
+
+Override the timer from deployment with:
+
+```bash
+STOODY_UPLOAD_CLEANUP_ENABLED=true
+STOODY_UPLOAD_CLEANUP_UNIT=stoody-upload-cleanup
+STOODY_UPLOAD_CLEANUP_TIMER="*-*-* 03:20:00"
+STOODY_UPLOAD_CLEANUP_RANDOMIZED_DELAY_SEC=15m
+```
+
 Useful options:
 
 ```text
@@ -144,8 +168,8 @@ python scripts/validate_upload_security_deploy.py
 ```
 
 Set `BACKEND_HEALTH_URL` to the deployed backend health URL before running it.
-The script exits non-zero if upload security is disabled or unhealthy. It
-checks:
+The prod GitHub Actions deploy workflow runs this script after deployment and
+fails the deploy if upload security is disabled or unhealthy. It checks:
 
 ```text
 UPLOAD_SCAN_REQUIRED=true
@@ -157,6 +181,7 @@ clamav-daemon active
 clamav-freshclam active
 EICAR is detected
 private quarantine/rejected/clean directories exist
+stoody-upload-cleanup.timer is enabled and active
 nginx config does not alias private upload root
 backend health reports upload_malware_scanner.available=true
 ```

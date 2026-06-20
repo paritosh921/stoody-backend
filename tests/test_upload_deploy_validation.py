@@ -27,6 +27,8 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
         {
             ("systemctl", "is-active", "clamav-daemon"): (0, "active\n", ""),
             ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
+            ("systemctl", "is-enabled", "stoody-upload-cleanup.timer"): (0, "enabled\n", ""),
+            ("systemctl", "is-active", "stoody-upload-cleanup.timer"): (0, "active\n", ""),
             ("clamdscan", "--fdpass", "<path>"): (1, "Eicar-Test-Signature FOUND\n", ""),
             ("curl", "-fsS", "https://api.example.test/health"): (
                 0,
@@ -46,6 +48,7 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
             "CLAMAV_SOCKET_MODE": "660",
             "BACKEND_SERVICE_USER": "ubuntu",
             "UPLOAD_PRIVATE_LOCAL_DIR": str(private_root),
+            "UPLOAD_CLEANUP_TIMER_UNIT": "stoody-upload-cleanup.timer",
             "BACKEND_HEALTH_URL": "https://api.example.test/health",
         },
         runner=runner,
@@ -136,3 +139,33 @@ def test_backend_deploy_workflows_queue_instead_of_canceling_remote_deploys():
         source = workflow.read_text(encoding="utf-8")
         assert "concurrency:" in source
         assert "cancel-in-progress: false" in source
+
+
+def test_remote_deploy_script_installs_upload_cleanup_timer():
+    source = Path("ops/remote_deploy_python_service.sh").read_text(encoding="utf-8")
+
+    assert "ensure_upload_cleanup_timer" in source
+    assert "STOODY_UPLOAD_CLEANUP_ENABLED" in source
+    assert "STOODY_UPLOAD_CLEANUP_TIMER" in source
+    assert 'STOODY_UPLOAD_CLEANUP_UNIT:-stoody-upload-cleanup' in source
+    assert '${unit_base}.service' in source
+    assert '${unit_base}.timer' in source
+    assert "cleanup_upload_storage.py --execute" in source
+    assert "systemctl enable --now" in source
+    assert "systemctl is-enabled" in source
+    assert "systemctl is-active" in source
+    assert source.index("ensure_upload_cleanup_timer") > source.index("ensure_private_upload_dirs")
+    assert source.rindex("ensure_upload_cleanup_timer") < source.index('echo "Restarting service via $SERVICE_MANAGER"')
+
+
+def test_prod_workflow_runs_upload_security_deploy_validation_after_deploy():
+    source = Path(".github/workflows/deploy-prod-backend.yml").read_text(encoding="utf-8")
+
+    assert "Validate upload security runtime controls" in source
+    assert "scripts/validate_upload_security_deploy.py" in source
+    assert "UPLOAD_SCAN_REQUIRED=true" in source
+    assert "UPLOAD_AV_FAIL_CLOSED=true" in source
+    assert "BACKEND_SERVICE_USER=" in source
+    assert "CLAMAV_SOCKET_MODE=660" in source
+    assert "UPLOAD_CLEANUP_TIMER_UNIT=stoody-upload-cleanup.timer" in source
+    assert source.index("Deploy backend to prod") < source.index("Validate upload security runtime controls")

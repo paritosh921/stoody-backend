@@ -89,6 +89,7 @@ jobs:
             "PROD_MAIN_BACKEND_HOST"
             "PROD_MAIN_BACKEND_USER"
             "PROD_MAIN_BACKEND_PATH"
+            "PROD_MAIN_BACKEND_VENV_PATH"
             "PROD_MAIN_BACKEND_SERVICE_MANAGER"
             "PROD_MAIN_BACKEND_SERVICE_NAME"
             "PROD_MAIN_BACKEND_HEALTHCHECK_URL"
@@ -134,6 +135,26 @@ jobs:
             NGINX_SITE_PATH='${PROD_NGINX_SITE_PATH}' \
             bash /tmp/remote_deploy_python_service.sh \
             '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
+
+      - name: Validate upload security runtime controls
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "cd '${PROD_MAIN_BACKEND_PATH}' && \
+            UPLOAD_SCAN_REQUIRED=true \
+            UPLOAD_AV_FAIL_CLOSED=true \
+            CLAMAV_SOCKET=/var/run/clamav/clamd.ctl \
+            CLAMAV_SOCKET_OWNER=clamav \
+            CLAMAV_SOCKET_GROUP=clamav \
+            CLAMAV_SOCKET_MODE=660 \
+            UPLOAD_PRIVATE_LOCAL_DIR=/var/lib/stoody/uploads \
+            UPLOAD_CLEANUP_TIMER_UNIT=stoody-upload-cleanup.timer \
+            BACKEND_SERVICE_USER='${PROD_MAIN_BACKEND_USER}' \
+            BACKEND_HEALTH_URL='${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' \
+            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_upload_security_deploy.py"
 
       - name: Invalidate existing sessions after prod deploy
         shell: bash

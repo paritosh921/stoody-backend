@@ -29,6 +29,10 @@ Optional environment variables:
   STOODY_CLAMAV_SOCKET_MODE=660
   STOODY_DEPLOY_LOCK_PATH=/tmp/stoody-backend-deploy.lock
   STOODY_DEPLOY_LOCK_TIMEOUT_SECONDS=900
+  STOODY_UPLOAD_CLEANUP_ENABLED=true
+  STOODY_UPLOAD_CLEANUP_UNIT=stoody-upload-cleanup
+  STOODY_UPLOAD_CLEANUP_TIMER=*-*-* 03:20:00
+  STOODY_UPLOAD_CLEANUP_RANDOMIZED_DELAY_SEC=15m
 EOF
 }
 
@@ -424,6 +428,72 @@ ensure_private_upload_dirs() {
   fi
 }
 
+ensure_upload_cleanup_timer() {
+  local enabled="${STOODY_UPLOAD_CLEANUP_ENABLED:-true}"
+  if [[ "$enabled" != "true" ]]; then
+    echo "Skipping upload cleanup timer because STOODY_UPLOAD_CLEANUP_ENABLED=$enabled"
+    return
+  fi
+
+  local unit_base="${STOODY_UPLOAD_CLEANUP_UNIT:-stoody-upload-cleanup}"
+  local timer_calendar="${STOODY_UPLOAD_CLEANUP_TIMER:-*-*-* 03:20:00}"
+  local randomized_delay="${STOODY_UPLOAD_CLEANUP_RANDOMIZED_DELAY_SEC:-15m}"
+  local upload_owner upload_group python_bin
+  upload_owner="$(app_owner)"
+  upload_group="${STOODY_UPLOAD_GROUP:-clamav}"
+
+  if [[ -n "$VENV_PATH" && -x "$VENV_PATH/bin/python" ]]; then
+    python_bin="$VENV_PATH/bin/python"
+  else
+    python_bin="$(command -v python3 || command -v python || true)"
+  fi
+
+  if [[ -z "$python_bin" ]]; then
+    echo "Python interpreter not found for upload cleanup timer" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$APP_PATH/scripts/cleanup_upload_storage.py" ]]; then
+    echo "Upload cleanup script not found: $APP_PATH/scripts/cleanup_upload_storage.py" >&2
+    exit 1
+  fi
+
+  echo "Installing upload cleanup timer: ${unit_base}.timer ($timer_calendar)"
+  sudo tee "/etc/systemd/system/${unit_base}.service" >/dev/null <<SERVICE
+[Unit]
+Description=Stoody private upload storage cleanup
+
+[Service]
+Type=oneshot
+User=$upload_owner
+Group=$upload_group
+WorkingDirectory=$APP_PATH
+EnvironmentFile=-$APP_PATH/.env
+ExecStart=$python_bin $APP_PATH/scripts/cleanup_upload_storage.py --execute
+Nice=10
+IOSchedulingClass=best-effort
+SERVICE
+
+  sudo tee "/etc/systemd/system/${unit_base}.timer" >/dev/null <<TIMER
+[Unit]
+Description=Run Stoody private upload storage cleanup
+
+[Timer]
+OnCalendar=$timer_calendar
+Persistent=true
+RandomizedDelaySec=$randomized_delay
+Unit=${unit_base}.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${unit_base}.timer"
+  systemctl is-enabled "${unit_base}.timer" >/dev/null
+  systemctl is-active "${unit_base}.timer" >/dev/null
+}
+
 acquire_deploy_lock
 sync_git_repo "$APP_PATH" "$BRANCH"
 
@@ -449,6 +519,7 @@ python -m pip install --disable-pip-version-check -r "$REQUIREMENTS_PATH"
 
 ensure_clamav_socket_hardening
 ensure_private_upload_dirs
+ensure_upload_cleanup_timer
 
 echo "Restarting service via $SERVICE_MANAGER"
 case "$SERVICE_MANAGER" in

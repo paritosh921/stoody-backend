@@ -47,6 +47,7 @@ def run_upload_security_deploy_validation(
     _check_systemd_active(checks, run_command, "clamav-freshclam")
     _check_eicar_detection(checks, run_command)
     _check_private_upload_dirs(checks, environment)
+    _check_upload_cleanup_timer(checks, environment, run_command)
     _check_nginx_private_root(checks, environment, nginx_config_paths or _default_nginx_configs())
     _check_backend_health(checks, environment, run_command)
 
@@ -169,6 +170,26 @@ def _check_private_upload_dirs(checks: _CheckAccumulator, env: Mapping[str, str]
             mode = path.stat().st_mode & 0o777
             mode_ok = mode & 0o007 == 0
         checks.record(f"PRIVATE_UPLOAD_DIR_{prefix.upper()}", exists and mode_ok, str(path))
+
+
+def _check_upload_cleanup_timer(
+    checks: _CheckAccumulator,
+    env: Mapping[str, str],
+    runner: CommandRunner,
+) -> None:
+    timer_unit = env.get("UPLOAD_CLEANUP_TIMER_UNIT") or "stoody-upload-cleanup.timer"
+    code, stdout, stderr = runner(["systemctl", "is-enabled", timer_unit], 10)
+    checks.record(
+        "UPLOAD_CLEANUP_TIMER_ENABLED",
+        code == 0 and stdout.strip() == "enabled",
+        (stdout or stderr).strip(),
+    )
+    code, stdout, stderr = runner(["systemctl", "is-active", timer_unit], 10)
+    checks.record(
+        "UPLOAD_CLEANUP_TIMER_ACTIVE",
+        code == 0 and stdout.strip() == "active",
+        (stdout or stderr).strip(),
+    )
 
 
 def _check_nginx_private_root(
