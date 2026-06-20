@@ -11,6 +11,8 @@ class FakeRunner:
     def __call__(self, command, timeout=10):
         key = tuple(command)
         self.calls.append(key)
+        if len(command) == 3 and tuple(command[:2]) == ("clamdscan", "--fdpass"):
+            key = ("clamdscan", "--fdpass", "<path>")
         return self.responses.get(key, (0, "OK", ""))
 
 
@@ -25,7 +27,7 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
         {
             ("systemctl", "is-active", "clamav-daemon"): (0, "active\n", ""),
             ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
-            ("clamdscan", "--fdpass", "--stream"): (1, "stream: Eicar-Test-Signature FOUND\n", ""),
+            ("clamdscan", "--fdpass", "<path>"): (1, "Eicar-Test-Signature FOUND\n", ""),
             ("curl", "-fsS", "https://api.example.test/health"): (
                 0,
                 '{"upload_malware_scanner":{"available":true}}',
@@ -39,6 +41,10 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
             "UPLOAD_SCAN_REQUIRED": "true",
             "UPLOAD_AV_FAIL_CLOSED": "true",
             "CLAMAV_SOCKET": str(socket),
+            "CLAMAV_SOCKET_OWNER": "clamav",
+            "CLAMAV_SOCKET_GROUP": "clamav",
+            "CLAMAV_SOCKET_MODE": "660",
+            "BACKEND_SERVICE_USER": "ubuntu",
             "UPLOAD_PRIVATE_LOCAL_DIR": str(private_root),
             "BACKEND_HEALTH_URL": "https://api.example.test/health",
         },
@@ -86,3 +92,27 @@ def test_deploy_validation_fails_if_nginx_serves_private_upload_root(tmp_path):
     )
 
     assert "NGINX_PRIVATE_UPLOAD_NOT_SERVED" in result.failed_checks
+
+
+def test_deploy_validation_enforces_exact_clamav_socket_hardening_checks():
+    source = Path("scripts/validate_upload_security_deploy.py").read_text(encoding="utf-8")
+
+    assert "CLAMAV_SOCKET_MODE_660" in source
+    assert "CLAMAV_SOCKET_OWNER_GROUP" in source
+    assert "BACKEND_SERVICE_USER_IN_CLAMAV_GROUP" in source
+
+
+def test_remote_deploy_script_hardens_clamav_socket_before_backend_restart():
+    source = Path("ops/remote_deploy_python_service.sh").read_text(encoding="utf-8")
+
+    assert "ensure_clamav_socket_hardening" in source
+    assert "LocalSocketMode" in source
+    assert "LocalSocketGroup" in source
+    assert "clamav-daemon.socket.d/upload-security.conf" in source
+    assert "SocketMode=%s" in source
+    assert "sudo systemctl stop clamav-daemon.service clamav-daemon.socket" in source
+    assert "sudo systemctl start clamav-daemon.socket" in source
+    assert "sudo usermod -aG" in source
+    assert 'sudo -u "$upload_owner" clamdscan --fdpass /etc/hosts' in source
+    assert source.index("ensure_clamav_socket_hardening") < source.index("sudo systemctl restart clamav-daemon")
+    assert source.rindex("ensure_clamav_socket_hardening") < source.rindex("ensure_private_upload_dirs")

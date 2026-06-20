@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -41,10 +42,7 @@ def run_upload_security_deploy_validation(
     checks.require_env_true("UPLOAD_SCAN_REQUIRED", environment.get("UPLOAD_SCAN_REQUIRED"))
     checks.require_env_true("UPLOAD_AV_FAIL_CLOSED", environment.get("UPLOAD_AV_FAIL_CLOSED"))
 
-    socket_path = Path(environment.get("CLAMAV_SOCKET") or environment.get("CLAMD_SOCKET") or "")
-    checks.record("CLAMAV_SOCKET_EXISTS", bool(str(socket_path)) and socket_path.exists(), str(socket_path))
-    checks.record("CLAMAV_SOCKET_NOT_WORLD_ACCESSIBLE", _socket_mode_is_private(socket_path), str(socket_path))
-
+    _check_clamav_socket_permissions(checks, environment)
     _check_systemd_active(checks, run_command, "clamav-daemon")
     _check_systemd_active(checks, run_command, "clamav-freshclam")
     _check_eicar_detection(checks, run_command)
@@ -81,22 +79,84 @@ def _check_systemd_active(checks: _CheckAccumulator, runner: CommandRunner, unit
     checks.record(f"SYSTEMD_{unit}", code == 0 and stdout.strip() == "active", (stdout or stderr).strip())
 
 
-def _socket_mode_is_private(path: Path) -> bool:
-    if not path.exists():
-        return False
+def _check_clamav_socket_permissions(checks: _CheckAccumulator, env: Mapping[str, str]) -> None:
+    socket_path = Path(env.get("CLAMAV_SOCKET") or env.get("CLAMD_SOCKET") or "")
+    expected_owner = env.get("CLAMAV_SOCKET_OWNER") or env.get("STOODY_CLAMAV_OWNER") or "clamav"
+    expected_group = env.get("CLAMAV_SOCKET_GROUP") or env.get("STOODY_CLAMAV_GROUP") or "clamav"
+    expected_mode_text = env.get("CLAMAV_SOCKET_MODE") or env.get("STOODY_CLAMAV_SOCKET_MODE") or "660"
+    backend_user = env.get("BACKEND_SERVICE_USER") or env.get("STOODY_UPLOAD_OWNER") or ""
+
+    exists = bool(str(socket_path)) and socket_path.exists()
+    checks.record("CLAMAV_SOCKET_EXISTS", exists, str(socket_path))
+    if not exists:
+        return
+
     if os.name == "nt":
-        return True
+        checks.record("CLAMAV_SOCKET_NOT_WORLD_ACCESSIBLE", True, "POSIX-only check skipped on Windows")
+        checks.record("CLAMAV_SOCKET_MODE_660", True, "POSIX-only check skipped on Windows")
+        checks.record("CLAMAV_SOCKET_OWNER_GROUP", True, "POSIX-only check skipped on Windows")
+        checks.record("BACKEND_SERVICE_USER_IN_CLAMAV_GROUP", True, "POSIX-only check skipped on Windows")
+        return
+
     try:
-        mode = path.stat().st_mode & 0o777
-    except OSError:
-        return False
-    return mode & 0o007 == 0
+        expected_mode = int(expected_mode_text, 8)
+    except ValueError:
+        checks.record("CLAMAV_SOCKET_MODE_660", False, expected_mode_text)
+        return
+
+    try:
+        import grp
+        import pwd
+
+        stat_result = socket_path.stat()
+        actual_mode = stat_result.st_mode & 0o777
+        actual_owner = pwd.getpwuid(stat_result.st_uid).pw_name
+        actual_group = grp.getgrgid(stat_result.st_gid).gr_name
+    except OSError as exc:
+        checks.record("CLAMAV_SOCKET_NOT_WORLD_ACCESSIBLE", False, str(exc))
+        return
+
+    checks.record("CLAMAV_SOCKET_NOT_WORLD_ACCESSIBLE", actual_mode & 0o007 == 0, oct(actual_mode))
+    checks.record("CLAMAV_SOCKET_MODE_660", actual_mode == expected_mode, oct(actual_mode))
+    checks.record(
+        "CLAMAV_SOCKET_OWNER_GROUP",
+        actual_owner == expected_owner and actual_group == expected_group,
+        f"{actual_owner}:{actual_group}",
+    )
+
+    if not backend_user:
+        checks.record("BACKEND_SERVICE_USER_IN_CLAMAV_GROUP", False, "BACKEND_SERVICE_USER missing")
+        return
+
+    try:
+        user_entry = pwd.getpwnam(backend_user)
+        user_groups = {grp.getgrgid(user_entry.pw_gid).gr_name}
+        user_groups.update(group.gr_name for group in grp.getgrall() if backend_user in group.gr_mem)
+    except KeyError as exc:
+        checks.record("BACKEND_SERVICE_USER_IN_CLAMAV_GROUP", False, str(exc))
+        return
+    checks.record(
+        "BACKEND_SERVICE_USER_IN_CLAMAV_GROUP",
+        expected_group in user_groups,
+        ",".join(sorted(user_groups)),
+    )
 
 
 def _check_eicar_detection(checks: _CheckAccumulator, runner: CommandRunner) -> None:
-    code, stdout, stderr = runner(["clamdscan", "--fdpass", "--stream"], 20)
-    output = f"{stdout}\n{stderr}"
-    checks.record("EICAR_DETECTED", code == 1 and "FOUND" in output, output.strip())
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="eicar-upload-security-", delete=False) as temp_file:
+            temp_file.write(EICAR)
+            temp_path = temp_file.name
+        code, stdout, stderr = runner(["clamdscan", "--fdpass", temp_path], 20)
+        output = f"{stdout}\n{stderr}"
+        checks.record("EICAR_DETECTED", code == 1 and "FOUND" in output, output.strip())
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink()
+            except OSError:
+                pass
 
 
 def _check_private_upload_dirs(checks: _CheckAccumulator, env: Mapping[str, str]) -> None:
@@ -161,7 +221,6 @@ def _default_runner(command: Sequence[str], timeout: int = 10) -> tuple[int, str
     try:
         completed = subprocess.run(
             list(command),
-            input=EICAR if command[:2] == ["clamdscan", "--fdpass"] else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,

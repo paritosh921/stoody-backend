@@ -151,7 +151,8 @@ checks:
 UPLOAD_SCAN_REQUIRED=true
 UPLOAD_AV_FAIL_CLOSED=true
 CLAMAV_SOCKET exists
-CLAMAV socket is not world-accessible
+CLAMAV socket is clamav:clamav, mode 660, and not world-accessible
+backend service user is in the clamav group
 clamav-daemon active
 clamav-freshclam active
 EICAR is detected
@@ -174,9 +175,19 @@ The backend service user should be in the scanner-access group:
 
 ```bash
 sudo usermod -aG clamav ubuntu
+sudo mkdir -p /etc/systemd/system/clamav-daemon.socket.d
+printf '[Socket]\nSocketMode=0660\nSocketUser=clamav\nSocketGroup=clamav\n' \
+  | sudo tee /etc/systemd/system/clamav-daemon.socket.d/upload-security.conf
+sudo systemctl daemon-reload
+sudo systemctl stop clamav-daemon.service clamav-daemon.socket
+sudo systemctl start clamav-daemon.socket
 sudo systemctl restart clamav-daemon
 sudo systemctl restart stoody-backend
 ```
+
+The systemd socket drop-in is required on hosts where
+`clamav-daemon.socket` owns `/run/clamav/clamd.ctl`; otherwise `clamd.conf`
+can say `LocalSocketMode 660` while systemd still creates a `666` socket.
 
 Verify:
 

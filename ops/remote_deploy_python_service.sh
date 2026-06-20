@@ -22,6 +22,11 @@ Optional environment variables:
   STOODY_UPLOAD_ROOT=/var/lib/stoody/uploads
   STOODY_UPLOAD_OWNER=<app owner, defaults to APP_PATH owner>
   STOODY_UPLOAD_GROUP=clamav
+  STOODY_CLAMAV_HARDEN_SOCKET=true
+  STOODY_CLAMAV_CONF=/etc/clamav/clamd.conf
+  STOODY_CLAMAV_SOCKET=/var/run/clamav/clamd.ctl
+  STOODY_CLAMAV_GROUP=clamav
+  STOODY_CLAMAV_SOCKET_MODE=660
 EOF
 }
 
@@ -78,6 +83,104 @@ sync_git_repo() {
   fi
 
   git pull --ff-only origin "$repo_branch"
+}
+
+app_owner() {
+  local upload_owner="${STOODY_UPLOAD_OWNER:-}"
+  if [[ -z "$upload_owner" ]]; then
+    upload_owner="$(stat -c '%U' "$APP_PATH")"
+  fi
+  echo "$upload_owner"
+}
+
+set_clamd_config_value() {
+  local config_path="$1"
+  local key="$2"
+  local value="$3"
+
+  if sudo grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$config_path"; then
+    sudo sed -i -E "s@^[[:space:]]*${key}[[:space:]].*@${key} ${value}@" "$config_path"
+  else
+    printf '%s %s\n' "$key" "$value" | sudo tee -a "$config_path" >/dev/null
+  fi
+}
+
+ensure_clamav_socket_hardening() {
+  local enabled="${STOODY_CLAMAV_HARDEN_SOCKET:-true}"
+  if [[ "$enabled" != "true" ]]; then
+    echo "Skipping ClamAV socket hardening because STOODY_CLAMAV_HARDEN_SOCKET=$enabled"
+    return
+  fi
+
+  local clamav_config="${STOODY_CLAMAV_CONF:-/etc/clamav/clamd.conf}"
+  local clamav_socket="${STOODY_CLAMAV_SOCKET:-/var/run/clamav/clamd.ctl}"
+  local clamav_group="${STOODY_CLAMAV_GROUP:-${STOODY_UPLOAD_GROUP:-clamav}}"
+  local socket_mode="${STOODY_CLAMAV_SOCKET_MODE:-660}"
+  local upload_owner
+  upload_owner="$(app_owner)"
+
+  if [[ ! -f "$clamav_config" ]]; then
+    echo "ClamAV config not found: $clamav_config" >&2
+    exit 1
+  fi
+
+  if ! getent passwd "$upload_owner" >/dev/null; then
+    echo "Backend service user does not exist: $upload_owner" >&2
+    exit 1
+  fi
+
+  if ! getent group "$clamav_group" >/dev/null; then
+    echo "ClamAV group does not exist: $clamav_group" >&2
+    exit 1
+  fi
+
+  echo "Hardening ClamAV socket $clamav_socket with group $clamav_group and mode $socket_mode"
+  set_clamd_config_value "$clamav_config" "LocalSocket" "$clamav_socket"
+  set_clamd_config_value "$clamav_config" "LocalSocketMode" "$socket_mode"
+  set_clamd_config_value "$clamav_config" "LocalSocketGroup" "$clamav_group"
+
+  if systemctl cat clamav-daemon.socket >/dev/null 2>&1; then
+    echo "Configuring systemd ClamAV socket activation permissions"
+    local systemd_socket_mode="$socket_mode"
+    if [[ "$systemd_socket_mode" != 0* ]]; then
+      systemd_socket_mode="0$systemd_socket_mode"
+    fi
+    sudo mkdir -p /etc/systemd/system/clamav-daemon.socket.d
+    printf '[Socket]\nSocketMode=%s\nSocketUser=clamav\nSocketGroup=%s\n' "$systemd_socket_mode" "$clamav_group" \
+      | sudo tee /etc/systemd/system/clamav-daemon.socket.d/upload-security.conf >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl stop clamav-daemon.service clamav-daemon.socket
+    sudo systemctl start clamav-daemon.socket
+  fi
+
+  if ! id -nG "$upload_owner" | tr ' ' '\n' | grep -Fx "$clamav_group" >/dev/null; then
+    echo "Adding $upload_owner to $clamav_group for ClamAV socket access"
+    sudo usermod -aG "$clamav_group" "$upload_owner"
+  fi
+
+  sudo systemctl restart clamav-daemon.service
+
+  for _ in {1..10}; do
+    if [[ -S "$clamav_socket" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ ! -S "$clamav_socket" ]]; then
+    echo "ClamAV socket was not created: $clamav_socket" >&2
+    exit 1
+  fi
+
+  local actual_group actual_mode
+  actual_group="$(stat -c '%G' "$clamav_socket")"
+  actual_mode="$(stat -c '%a' "$clamav_socket")"
+  if [[ "$actual_group" != "$clamav_group" || "$actual_mode" != "$socket_mode" ]]; then
+    echo "Unexpected ClamAV socket permissions: group=$actual_group mode=$actual_mode" >&2
+    exit 1
+  fi
+
+  sudo -u "$upload_owner" clamdscan --fdpass /etc/hosts >/dev/null
 }
 
 ensure_node_runtime() {
@@ -272,12 +375,9 @@ reload_nginx_if_config_provided() {
 
 ensure_private_upload_dirs() {
   local upload_root="${STOODY_UPLOAD_ROOT:-/var/lib/stoody/uploads}"
-  local upload_owner="${STOODY_UPLOAD_OWNER:-}"
+  local upload_owner
   local upload_group="${STOODY_UPLOAD_GROUP:-clamav}"
-
-  if [[ -z "$upload_owner" ]]; then
-    upload_owner="$(stat -c '%U' "$APP_PATH")"
-  fi
+  upload_owner="$(app_owner)"
 
   if ! getent passwd "$upload_owner" >/dev/null; then
     echo "Upload directory owner does not exist: $upload_owner" >&2
@@ -327,6 +427,7 @@ cd "$APP_PATH"
 echo "Installing Python dependencies"
 python -m pip install --disable-pip-version-check -r "$REQUIREMENTS_PATH"
 
+ensure_clamav_socket_hardening
 ensure_private_upload_dirs
 
 echo "Restarting service via $SERVICE_MANAGER"
