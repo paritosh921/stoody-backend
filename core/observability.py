@@ -68,6 +68,30 @@ UPLOAD_FRESHCLAM_AGE_SECONDS = Gauge(
     "Age in seconds of local ClamAV signature metadata.",
 )
 
+UPLOAD_POLICY_LIMIT = Gauge(
+    "skillbot_upload_policy_limit",
+    "Effective upload policy numeric limits where labels identify the policy and field.",
+    ["policy_id", "field"],
+)
+
+UPLOAD_POLICY_INFO = Gauge(
+    "skillbot_upload_policy_info",
+    "Effective upload policy metadata; value is always 1.",
+    ["policy_id", "policy_kind", "allowed_extensions", "allowed_mime_types", "allowed_magic_types"],
+)
+
+UPLOAD_ROUTE_POLICY_INFO = Gauge(
+    "skillbot_upload_route_policy_info",
+    "Upload route to policy mapping; value is always 1.",
+    ["method", "path_template", "policy_id", "owner_note"],
+)
+
+UPLOAD_RUNTIME_CONFIG = Gauge(
+    "skillbot_upload_runtime_config",
+    "Safe effective upload runtime config values where field identifies the setting.",
+    ["field"],
+)
+
 OCR_JOB_DURATION_SECONDS = Histogram(
     "skillbot_ocr_job_duration_seconds",
     "OCR job duration in seconds.",
@@ -165,6 +189,18 @@ def set_upload_freshclam_age_seconds(age_seconds: float | int | None) -> None:
     if age_seconds is None:
         return
     UPLOAD_FRESHCLAM_AGE_SECONDS.set(max(float(age_seconds), 0.0))
+
+
+def set_upload_security_config_metric(metric: str, labels: dict[str, str], value: float) -> None:
+    safe_labels = {key: _safe(val) for key, val in labels.items()}
+    if metric == "policy_limit":
+        UPLOAD_POLICY_LIMIT.labels(**safe_labels).set(value)
+    elif metric == "policy_info":
+        UPLOAD_POLICY_INFO.labels(**safe_labels).set(value)
+    elif metric == "route_policy":
+        UPLOAD_ROUTE_POLICY_INFO.labels(**safe_labels).set(value)
+    elif metric == "runtime_config":
+        UPLOAD_RUNTIME_CONFIG.labels(**safe_labels).set(value)
 
 
 def track_websocket_connection(channel: str, delta: int) -> None:

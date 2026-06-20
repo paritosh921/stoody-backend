@@ -81,10 +81,12 @@ from core.auth import AuthManager
 from core.observability import (
     set_dependency_health,
     set_upload_freshclam_age_seconds,
+    set_upload_security_config_metric,
     set_upload_security_alert,
     set_upload_storage_usage,
 )
 from core.upload_security.cleanup import collect_upload_storage_usage
+from core.upload_security.metrics_exporter import build_upload_security_metric_rows
 from core.upload_security.scanner import ClamAVScanner
 
 # Import middleware
@@ -416,6 +418,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _refresh_upload_security_config_metrics() -> None:
+    try:
+        for row in build_upload_security_metric_rows():
+            set_upload_security_config_metric(
+                metric=row["metric"],
+                labels=row["labels"],
+                value=row["value"],
+            )
+    except Exception as exc:
+        logger.warning("Upload security config metrics refresh failed: %s", exc)
+
+
 # Add rolling file log so Promtail can scrape backend runtime logs.
 try:
     logs_dir = Path("logs")
@@ -525,6 +540,7 @@ async def lifespan(app: FastAPI):
     global db_manager, cache_manager, auth_manager, session_timeout_task
 
     logger.info("🚀 Starting SkillBot Async Backend...")
+    _refresh_upload_security_config_metrics()
 
     try:
         # Initialize database connections
@@ -1521,6 +1537,8 @@ mount_stoody_book(app)
 async def health_check(request: Request):
     """Comprehensive health check"""
     try:
+        _refresh_upload_security_config_metrics()
+
         # Check database connection
         db_healthy = await app.state.db.health_check() if app.state.db else False
 
@@ -1652,6 +1670,7 @@ if ENABLE_METRICS:
     def _render_metrics() -> Response:
         if generate_latest is None:
             raise HTTPException(status_code=503, detail="prometheus_client unavailable")
+        _refresh_upload_security_config_metrics()
         return Response(
             content=generate_latest(),
             media_type=CONTENT_TYPE_LATEST,

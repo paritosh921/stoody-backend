@@ -224,6 +224,29 @@ clamdscan --fdpass /etc/hosts
 
 Non-service local users should not have access to the ClamAV socket.
 
+## Grafana Monitoring
+
+The production monitoring dashboard must show both upload activity and
+effective upload-security configuration.
+
+Required dashboard groups:
+
+- Upload policy catalog from `skillbot_upload_policy_limit` and
+  `skillbot_upload_policy_info`.
+- Route-to-policy coverage from `skillbot_upload_route_policy_info`.
+- Runtime security toggles from `skillbot_upload_runtime_config`.
+- Scanner availability from
+  `skillbot_dependency_health{dependency="upload_malware_scanner"}`.
+- Freshclam age from `skillbot_upload_freshclam_age_seconds`.
+- Rejection and abuse trends from
+  `skillbot_upload_security_rejections_total`.
+- Quarantine, rejected, clean, and derived storage from
+  `skillbot_upload_storage_bytes`.
+
+Prometheus and exporter ports must not be public. Grafana must be authenticated
+and served over HTTPS. Backend metrics access should be restricted to the
+monitoring host or another explicitly authorized scraper.
+
 ## Operations Runbook
 
 Check ClamAV status:
