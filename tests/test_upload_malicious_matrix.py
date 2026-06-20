@@ -8,6 +8,7 @@ from PIL import Image
 from pypdf import PdfWriter
 
 from core.upload_security.policies import DEFAULT_UPLOAD_POLICIES, get_upload_policy
+from core.upload_security.routes import UPLOAD_ROUTE_POLICY_MAP
 from core.upload_security.scanner import ScanResult
 from core.upload_security.service import secure_upload
 from core.upload_security.storage import PrivateUploadStorage
@@ -106,6 +107,28 @@ BINARY_POLICIES = tuple(
     for policy_id, policy in sorted(DEFAULT_UPLOAD_POLICIES.items())
     if policy.policy_kind == "binary"
 )
+
+
+@dataclass(frozen=True)
+class RoutePolicyCase:
+    route_id: str
+    policy_id: str
+
+
+def _route_policy_cases() -> tuple[RoutePolicyCase, ...]:
+    cases: list[RoutePolicyCase] = []
+    for route in UPLOAD_ROUTE_POLICY_MAP:
+        policy_ids = [route.policy_id, *route.field_policies.values()]
+        for policy_id in dict.fromkeys(policy_ids):
+            policy = get_upload_policy(policy_id)
+            if policy.policy_kind != "binary":
+                continue
+            field_suffix = "" if policy_id == route.policy_id else f":{policy_id}"
+            cases.append(RoutePolicyCase(f"{route.method} {route.path_template}{field_suffix}", policy_id))
+    return tuple(cases)
+
+
+BINARY_ROUTE_POLICY_CASES = _route_policy_cases()
 
 
 @pytest.mark.asyncio
@@ -224,6 +247,155 @@ async def test_pdf_upload_policy_fails_closed_before_parser_on_scanner_failure(
             db=FakeDb(),
             purpose_metadata={"purpose": "pdf_document"},
             authorization_subject="upload:pdf_document:scanner-failure",
+            scanner=scanner,
+            storage=PrivateUploadStorage(local_root=tmp_path),
+        )
+
+    assert exc.value.status_code == status_code
+    assert scanner.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    BINARY_ROUTE_POLICY_CASES,
+    ids=lambda case: case.route_id,
+)
+async def test_each_binary_upload_route_accepts_clean_upload(case, tmp_path):
+    data, filename, content_type = _sample_for_policy(case.policy_id)
+    scanner = FakeScanner(ScanResult.clean(scanner_name="fake-av", scanner_version="1"))
+
+    result = await secure_upload(
+        file=DummyUpload(data, filename, content_type),
+        policy_id=case.policy_id,
+        actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+        db=FakeDb(),
+        purpose_metadata={"purpose": case.route_id, "route_policy": case.policy_id},
+        authorization_subject=f"route:{case.route_id}:clean",
+        scanner=scanner,
+        storage=PrivateUploadStorage(local_root=tmp_path),
+        include_bytes=False,
+    )
+
+    assert result.detected_magic_type in get_upload_policy(case.policy_id).allowed_magic_types
+    assert scanner.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    BINARY_ROUTE_POLICY_CASES,
+    ids=lambda case: case.route_id,
+)
+async def test_each_binary_upload_route_rejects_renamed_fake_extension_before_scan(case, tmp_path):
+    data, filename, content_type = _fake_extension_sample(case.policy_id)
+    scanner = FakeScanner(ScanResult.clean(scanner_name="fake-av", scanner_version="1"))
+
+    with pytest.raises(HTTPException) as exc:
+        await secure_upload(
+            file=DummyUpload(data, filename, content_type),
+            policy_id=case.policy_id,
+            actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+            db=FakeDb(),
+            purpose_metadata={"purpose": case.route_id, "route_policy": case.policy_id},
+            authorization_subject=f"route:{case.route_id}:fake-extension",
+            scanner=scanner,
+            storage=PrivateUploadStorage(local_root=tmp_path),
+        )
+
+    assert exc.value.status_code == 400
+    assert scanner.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    BINARY_ROUTE_POLICY_CASES,
+    ids=lambda case: case.route_id,
+)
+async def test_each_binary_upload_route_rejects_mime_mismatch_before_scan(case, tmp_path):
+    data, filename, _ = _sample_for_policy(case.policy_id)
+    scanner = FakeScanner(ScanResult.clean(scanner_name="fake-av", scanner_version="1"))
+
+    with pytest.raises(HTTPException) as exc:
+        await secure_upload(
+            file=DummyUpload(data, filename, "application/x-msdownload"),
+            policy_id=case.policy_id,
+            actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+            db=FakeDb(),
+            purpose_metadata={"purpose": case.route_id, "route_policy": case.policy_id},
+            authorization_subject=f"route:{case.route_id}:mime-mismatch",
+            scanner=scanner,
+            storage=PrivateUploadStorage(local_root=tmp_path),
+        )
+
+    assert exc.value.status_code == 400
+    assert scanner.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    BINARY_ROUTE_POLICY_CASES,
+    ids=lambda case: case.route_id,
+)
+async def test_each_binary_upload_route_rejects_oversize_before_scan(monkeypatch, case, tmp_path):
+    policy = get_upload_policy(case.policy_id).model_copy(update={"max_size_bytes": 3})
+    monkeypatch.setattr("core.upload_security.service.get_upload_policy", lambda requested: policy)
+    _, filename, content_type = _sample_for_policy(case.policy_id)
+    scanner = FakeScanner(ScanResult.clean(scanner_name="fake-av", scanner_version="1"))
+
+    with pytest.raises(HTTPException) as exc:
+        await secure_upload(
+            file=DummyUpload(b"abcd", filename, content_type),
+            policy_id=case.policy_id,
+            actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+            db=FakeDb(),
+            purpose_metadata={"purpose": case.route_id, "route_policy": case.policy_id},
+            authorization_subject=f"route:{case.route_id}:oversize",
+            scanner=scanner,
+            storage=PrivateUploadStorage(local_root=tmp_path),
+        )
+
+    assert exc.value.status_code == 413
+    assert scanner.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,scan_result,status_code",
+    [
+        (case, ScanResult.rejected("Eicar-Test-Signature", scanner_name="fake-av"), 400)
+        for case in BINARY_ROUTE_POLICY_CASES
+    ]
+    + [
+        (case, ScanResult.scan_failed("clamd timeout", scanner_name="fake-av"), 503)
+        for case in BINARY_ROUTE_POLICY_CASES
+    ],
+    ids=lambda value: value.route_id if isinstance(value, RoutePolicyCase) else str(value),
+)
+async def test_each_binary_upload_route_fails_closed_before_parser_on_scanner_failure(
+    monkeypatch,
+    case,
+    scan_result,
+    status_code,
+    tmp_path,
+):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("parser guard should not run unless malware scan is clean")
+
+    monkeypatch.setattr("core.upload_security.service.run_post_scan_parser_guards", fail_if_called)
+    data, filename, content_type = _sample_for_policy(case.policy_id)
+    scanner = FakeScanner(scan_result)
+
+    with pytest.raises(HTTPException) as exc:
+        await secure_upload(
+            file=DummyUpload(data, filename, content_type),
+            policy_id=case.policy_id,
+            actor={"user_id": "admin-1", "db_name": "skb_ciel"},
+            db=FakeDb(),
+            purpose_metadata={"purpose": case.route_id, "route_policy": case.policy_id},
+            authorization_subject=f"route:{case.route_id}:scanner-failure",
             scanner=scanner,
             storage=PrivateUploadStorage(local_root=tmp_path),
         )
