@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from core.ocr_service import get_ocr_service
 from services.tally_question_map_service import build_tally_question_map
 
@@ -2045,15 +2046,19 @@ async def preview_tally_question_source(
     current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
-    filename = file.filename or "question-paper.pdf"
-    if not filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Question source must be a PDF")
-
-    file_content = await file.read()
-    if not file_content:
-        raise HTTPException(status_code=400, detail="Question source PDF is empty")
-    if len(file_content) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="Question source PDF must be 25 MB or smaller")
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="tally_question_source_pdf",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "tally_question_source_pdf",
+            "region_scope": "tally_question_source_preview",
+            "created_by": current_user.get("user_id"),
+        },
+        authorization_subject=f"tally_question_source:{current_user.get('user_id', 'unknown')}",
+    )
+    file_content = clean_upload.bytes or b""
 
     try:
         from api.v1.pdf_async import (

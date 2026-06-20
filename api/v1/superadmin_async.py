@@ -1882,7 +1882,20 @@ async def send_message_to_tenant(
 
     # Upload attachments to S3
     attachment_metadata = await upload_message_attachments(
-        [f for f in attachments if f.filename]
+        [f for f in attachments if f.filename],
+        actor={
+            "user_id": admin["admin_id"],
+            "email": admin.get("email"),
+            "user_type": "superadmin",
+        },
+        db=master_db,
+        purpose_metadata_base={
+            "collection": "superadmin_messages",
+            "tenant_id": tenant_id,
+            "superadmin_id": admin["admin_id"],
+            "created_by": admin["admin_id"],
+        },
+        authorization_subject_base=f"superadmin_to_admin:{tenant_id}:{admin['admin_id']}",
     )
 
     message_doc = {

@@ -1,25 +1,25 @@
 """
-Shared helper for uploading message attachments to S3.
+Shared helper for validating and storing message attachments.
 
 Used by both superadmin_async.py and admin_async.py for bidirectional messaging.
 """
 
-import uuid
 import logging
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import HTTPException, UploadFile
-from utils.s3_storage import upload_file as s3_upload_file
+from core.upload_security.service import secure_upload_many
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_MESSAGE_FILE_TYPES = {"application/pdf", "image/png", "image/jpeg", "image/jpg"}
-MAX_MESSAGE_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20MB per file
-MAX_MESSAGE_TOTAL_SIZE_BYTES = 100 * 1024 * 1024  # 100MB total per message
-MAX_MESSAGE_FILES = 10
-
-
-async def upload_message_attachments(files: List[UploadFile]) -> List[dict]:
+async def upload_message_attachments(
+    files: List[UploadFile],
+    *,
+    actor: Dict[str, Any] | None,
+    db: Any,
+    purpose_metadata_base: Dict[str, Any],
+    authorization_subject_base: str,
+) -> List[dict]:
     """
     Validate and upload message attachments to S3.
 
@@ -31,63 +31,28 @@ async def upload_message_attachments(files: List[UploadFile]) -> List[dict]:
     if not files:
         return []
 
-    if len(files) > MAX_MESSAGE_FILES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Too many files. Maximum {MAX_MESSAGE_FILES} files per message.",
-        )
+    clean_uploads = await secure_upload_many(
+        files=files,
+        policy_id="support_message_attachment",
+        actor=actor,
+        db=db,
+        purpose_metadata_factory=lambda upload, index: {
+            **purpose_metadata_base,
+            "purpose": "support_message_attachment",
+            "index": index,
+        },
+        authorization_subject_factory=lambda upload, index: f"{authorization_subject_base}:attachment:{index}",
+        include_bytes=False,
+    )
 
-    attachment_metadata = []
-    total_size = 0
-
-    for file in files:
-        # Validate content type
-        content_type = (file.content_type or "").lower()
-        if content_type not in ALLOWED_MESSAGE_FILE_TYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File '{file.filename}' has unsupported type '{content_type}'. "
-                       f"Allowed: PDF, PNG, JPG.",
-            )
-
-        # Read file data
-        file_data = await file.read()
-        file_size = len(file_data)
-
-        # Validate individual file size
-        if file_size > MAX_MESSAGE_FILE_SIZE_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File '{file.filename}' is {file_size / (1024*1024):.1f}MB. "
-                       f"Maximum is 20MB per file.",
-            )
-
-        total_size += file_size
-        if total_size > MAX_MESSAGE_TOTAL_SIZE_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Total attachment size exceeds 100MB limit.",
-            )
-
-        # Upload to S3
-        safe_filename = (file.filename or "attachment").replace("/", "_").replace("\\", "_")
-        s3_path = f"uploads/message-attachments/{uuid.uuid4()}_{safe_filename}"
-
-        success, storage_path = await s3_upload_file(
-            file_data, s3_path, content_type=content_type
-        )
-
-        if not success:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload file '{file.filename}'.",
-            )
-
-        attachment_metadata.append({
-            "filename": file.filename or "attachment",
-            "content_type": content_type,
-            "size_bytes": file_size,
-            "storage_path": storage_path,
-        })
-
-    return attachment_metadata
+    return [
+        {
+            "filename": clean_upload.original_filename or "attachment",
+            "content_type": clean_upload.content_type,
+            "size_bytes": clean_upload.size_bytes,
+            "storage_path": clean_upload.released_storage_path,
+            "upload_id": clean_upload.upload_id,
+            "sha256": clean_upload.sha256,
+        }
+        for clean_upload in clean_uploads
+    ]

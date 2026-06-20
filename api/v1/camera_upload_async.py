@@ -34,6 +34,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database
 
 logger = logging.getLogger(__name__)
@@ -193,15 +194,23 @@ async def upload_camera_page(
             detail=f"Student {student_id} not found in exam roster",
         )
 
-    # Read image content
-    image_bytes = await image.read()
-    if not image_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Empty image file",
-        )
+    clean_upload = await secure_upload(
+        file=image,
+        policy_id="camera_answer_image",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "camera_answer_image",
+            "collection": "exampen_camera_uploads",
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "page_number": page_num,
+            "created_by": current_user.get("user_id", "unknown"),
+        },
+        authorization_subject=f"camera:{exam_id}:{student_id}:{page_num}",
+    )
 
-    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    content_hash = clean_upload.sha256
 
     camera_col = tenant_db["exampen_camera_uploads"]
     await _ensure_indexes(camera_col)
@@ -240,9 +249,11 @@ async def upload_camera_page(
         "source": source,
         "captured_by": "mobile",
         "content_hash": content_hash,
-        "content_type": image.content_type or "image/jpeg",
-        "file_size_bytes": len(image_bytes),
-        "original_filename": image.filename,
+        "content_type": clean_upload.content_type or "image/jpeg",
+        "file_size_bytes": clean_upload.size_bytes,
+        "original_filename": clean_upload.original_filename,
+        "upload_id": clean_upload.upload_id,
+        "storage_path": clean_upload.released_storage_path,
         "uploaded_by": current_user.get("user_id", "unknown"),
         "uploaded_at": now,
         "routed_engine": "pcr",

@@ -27,14 +27,17 @@ Hard constraints:
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
+from core.upload_security.policies import get_upload_policy
 from api.v1.auth_async import get_current_user, get_database
 
 logger = logging.getLogger(__name__)
@@ -112,6 +115,30 @@ class StrokeChunkUpload(BaseModel):
         description="Optional SHA-256 of the base64-encoded payload string; verified when supplied",
     )
 
+    @field_validator("exam_type")
+    @classmethod
+    def validate_exam_type(cls, value: str) -> str:
+        normalized = str(value or "").lower()
+        if normalized not in {"dcr", "pcr"}:
+            raise ValueError("exam_type must be dcr or pcr")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_chunk_policy(self) -> "StrokeChunkUpload":
+        policy = get_upload_policy("hub_stroke_chunk")
+        if policy.max_total_chunks is not None and self.total_chunks > policy.max_total_chunks:
+            raise ValueError(f"total_chunks exceeds {policy.max_total_chunks}")
+        encoded = self.payload_base64 or ""
+        if policy.max_payload_base64_bytes is not None and len(encoded.encode("ascii", errors="ignore")) > policy.max_payload_base64_bytes:
+            raise ValueError(f"payload_base64 exceeds {policy.max_payload_base64_bytes} bytes")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("payload_base64 is not valid base64") from exc
+        if policy.max_decoded_payload_bytes is not None and len(decoded) > policy.max_decoded_payload_bytes:
+            raise ValueError(f"decoded payload exceeds {policy.max_decoded_payload_bytes} bytes")
+        return self
+
 
 class IngestAck(BaseModel):
     artifact_id: str
@@ -129,6 +156,32 @@ class FinalizeRequest(BaseModel):
         default_factory=list,
         description="Page-level metadata extracted from pen data: [{page_number, raw_strokes}]",
     )
+
+    @model_validator(mode="after")
+    def validate_finalize_policy(self) -> "FinalizeRequest":
+        policy = get_upload_policy("hub_stroke_finalize")
+        if policy.max_total_chunks is not None and self.total_chunks > policy.max_total_chunks:
+            raise ValueError(f"total_chunks exceeds {policy.max_total_chunks}")
+        if len(self.expected_checksum or "") != 64:
+            raise ValueError("expected_checksum must be a SHA-256 hex digest")
+        try:
+            int(self.expected_checksum, 16)
+        except ValueError as exc:
+            raise ValueError("expected_checksum must be hex") from exc
+        if policy.max_pages is not None and len(self.pages) > policy.max_pages:
+            raise ValueError(f"pages exceeds {policy.max_pages}")
+        for page in self.pages:
+            raw_strokes = page.get("raw_strokes") or []
+            if policy.max_strokes_per_page is not None and isinstance(raw_strokes, list):
+                if len(raw_strokes) > policy.max_strokes_per_page:
+                    raise ValueError(f"raw_strokes exceeds {policy.max_strokes_per_page} per page")
+            page_number = page.get("page_number")
+            try:
+                if page_number is not None and int(page_number) < 1:
+                    raise ValueError("page_number must be positive")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("page_number must be positive") from exc
+        return self
 
 
 class FinalizeResponse(BaseModel):

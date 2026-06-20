@@ -23,6 +23,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403, check_registration_limit
 
@@ -178,10 +179,29 @@ def parse_list_field(value: str) -> List[str]:
     return [item.strip() for item in str(value).split(',') if item.strip()]
 
 
-async def parse_upload_file(file: UploadFile) -> pd.DataFrame:
+async def parse_upload_file(
+    file: UploadFile,
+    *,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    purpose: str,
+) -> pd.DataFrame:
     """Parse uploaded CSV or Excel file into DataFrame"""
-    content = await file.read()
-    file_name = file.filename.lower()
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="bulk_students",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "bulk_students",
+            "collection": "students",
+            "operation": purpose,
+            "created_by": current_user.get("user_id"),
+        },
+        authorization_subject=f"bulk_students:{purpose}:{current_user.get('user_id', 'unknown')}",
+    )
+    content = clean_upload.bytes or b""
+    file_name = clean_upload.original_filename.lower()
     
     try:
         if file_name.endswith('.csv'):
@@ -393,26 +413,9 @@ async def preview_bulk_upload(
     Preview and validate a bulk upload file before importing.
     Parses the file, validates each row, and returns a summary with errors.
     """
-    # Validate file type
-    file_name = file.filename.lower()
-    if not file_name.endswith(('.csv', '.xlsx', '.xls')):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) file."
-        )
-    
-    # Check file size (max 5MB)
-    content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File too large. Maximum size is 5MB."
-        )
-    await file.seek(0)  # Reset file pointer
-    
     # Parse file
     try:
-        df = await parse_upload_file(file)
+        df = await parse_upload_file(file, current_user=current_user, db=db, purpose="preview")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     
@@ -635,26 +638,9 @@ async def import_bulk_students(
     Import students from a bulk upload file.
     Creates student accounts with auto-generated usernames and passwords.
     """
-    # Validate file type
-    file_name = file.filename.lower()
-    if not file_name.endswith(('.csv', '.xlsx', '.xls')):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) file."
-        )
-    
-    # Check file size
-    content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File too large. Maximum size is 5MB."
-        )
-    await file.seek(0)
-    
     # Parse file
     try:
-        df = await parse_upload_file(file)
+        df = await parse_upload_file(file, current_user=current_user, db=db, purpose="import")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     

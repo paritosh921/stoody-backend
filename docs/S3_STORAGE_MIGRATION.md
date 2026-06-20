@@ -219,6 +219,18 @@ For faster global delivery:
 4. **Enable server-side encryption** (SSE-S3 or SSE-KMS)
 5. **Keep bucket private** - Use presigned URLs for access
 
+## Upload Security Note
+
+Generated derivatives can still use the legacy S3/local abstraction where the
+calling route proves they are not raw user uploads. Raw user-controlled uploads
+must go through `core/upload_security.secure_upload()` first and release clean
+objects to private storage.
+
+Production local fallback to public `backend/uploads` is disabled by default.
+Only set `UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK=true` for an explicit development
+or emergency procedure, and do not serve raw uploads through `/uploads` in
+production.
+
 ## ✅ Testing Checklist
 
 - [ ] S3 bucket created and configured
@@ -237,5 +249,6 @@ For faster global delivery:
 If issues occur:
 
 1. Set `USE_S3_STORAGE=false` to revert to local storage
-2. Keep local `uploads/` folder as backup until migration is verified
+2. Keep local `uploads/` folder as a temporary backup until migration is verified, but do not use it as a production fallback for new raw user uploads.
+   Production S3 upload failures fail closed unless `UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK=true` is explicitly set.
 3. The storage module will automatically fall back to local if S3 fails

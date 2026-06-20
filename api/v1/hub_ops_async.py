@@ -27,6 +27,7 @@ Hard constraints:
 from __future__ import annotations
 
 import logging
+import gzip
 import hashlib
 import hmac
 import json
@@ -38,9 +39,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.database import DatabaseManager
+from core.upload_security.policies import get_upload_policy
+from core.upload_security.storage import PrivateUploadStorage, safe_filename
 from api.v1.auth_async import get_current_user, get_database
 
 logger = logging.getLogger(__name__)
@@ -544,19 +547,49 @@ class HubCommandPollResponse(BaseModel):
 
 
 class HubRawSessionUpload(BaseModel):
-    raw_session_key: str
-    session_id: str
+    raw_session_key: str = Field(..., max_length=512)
+    session_id: str = Field(..., max_length=160)
     pen_mac: Optional[str] = None
     started_at: Optional[str] = None
     frame_count: int = 0
     file_size: int = 0
     frames: List[Dict[str, Any]] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_frame_limits(self) -> "HubRawSessionUpload":
+        policy = get_upload_policy("hub_raw_data_batch")
+        frame_total = len(self.frames)
+        declared_total = int(self.frame_count or 0)
+        max_frames = policy.max_frames_per_session or 0
+        if max_frames and frame_total > max_frames:
+            raise ValueError(f"raw session exceeds {max_frames} frames")
+        if max_frames and declared_total > max_frames:
+            raise ValueError(f"declared frame_count exceeds {max_frames}")
+        max_frame_json_bytes = policy.max_frame_json_bytes or 0
+        if max_frame_json_bytes:
+            for frame in self.frames:
+                encoded = json.dumps(frame, separators=(",", ":"), default=str).encode("utf-8")
+                if len(encoded) > max_frame_json_bytes:
+                    raise ValueError(f"frame JSON exceeds {max_frame_json_bytes} bytes")
+        return self
+
 
 class HubDataUploadRequest(BaseModel):
     command_id: Optional[str] = None
     upload_batch_id: Optional[str] = None
     sessions: List[HubRawSessionUpload] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_batch_limits(self) -> "HubDataUploadRequest":
+        policy = get_upload_policy("hub_raw_data_batch")
+        if policy.max_sessions is not None and len(self.sessions) > policy.max_sessions:
+            raise ValueError(f"batch exceeds {policy.max_sessions} sessions")
+        total_frames = sum(len(session.frames) for session in self.sessions)
+        declared_frames = sum(int(session.frame_count or 0) for session in self.sessions)
+        effective_frames = max(total_frames, declared_frames)
+        if policy.max_frames_per_batch is not None and effective_frames > policy.max_frames_per_batch:
+            raise ValueError(f"batch exceeds {policy.max_frames_per_batch} frames")
+        return self
 
 
 class HubDataActionRequest(BaseModel):
@@ -2166,11 +2199,18 @@ async def request_hub_data_fetch(
     tenant_db = await _get_tenant_db(db, current_user)
     if not await tenant_db["exampen_hubs"].find_one({"hub_id": hub_id}):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Hub {hub_id} not found")
+    policy = get_upload_policy("hub_raw_data_batch")
     command = await _create_hub_command(
         tenant_db,
         hub_id,
         command_type="fetch_data",
-        payload={"scope": "all_raw_sessions"},
+        payload={
+            "scope": "all_raw_sessions",
+            "max_sessions": policy.max_sessions,
+            "max_frames_per_session": policy.max_frames_per_session,
+            "max_frames_per_batch": policy.max_frames_per_batch,
+            "max_frame_json_bytes": policy.max_frame_json_bytes,
+        },
         actor=current_user,
     )
     await _log_hub_audit(
@@ -2258,8 +2298,30 @@ async def upload_hub_data(
     now = datetime.now(timezone.utc)
     batch_id = body.upload_batch_id or f"hub_upload_{uuid.uuid4().hex}"
     upserts = 0
+    storage = PrivateUploadStorage()
     for session in body.sessions:
         data_id = f"{hub_id}:{session.raw_session_key}"
+        frames_ndjson = "\n".join(
+            json.dumps(frame, sort_keys=True, separators=(",", ":"), default=str)
+            for frame in session.frames
+        ).encode("utf-8")
+        frames_sha256 = hashlib.sha256(frames_ndjson).hexdigest()
+        compressed_frames = gzip.compress(frames_ndjson)
+        session_upload_id = uuid.uuid4().hex
+        frames_storage_path = await storage.write_released_bytes(
+            data=compressed_frames,
+            tenant=current_user.get("db_name"),
+            policy_id="hub_raw_data_batch",
+            upload_id=session_upload_id,
+            safe_filename=safe_filename(f"{session.session_id or session_upload_id}.frames.ndjson.gz"),
+            content_type="application/gzip",
+            metadata={
+                "policy_id": "hub_raw_data_batch",
+                "hub_id": hub_id,
+                "data_id": data_id,
+                "sha256": frames_sha256,
+            },
+        )
         doc = {
             "data_id": data_id,
             "hub_id": hub_id,
@@ -2267,9 +2329,12 @@ async def upload_hub_data(
             "session_id": session.session_id,
             "pen_mac": session.pen_mac,
             "started_at": session.started_at,
-            "frame_count": session.frame_count,
-            "file_size": session.file_size,
-            "frames": session.frames,
+            "frame_count": max(int(session.frame_count or 0), len(session.frames)),
+            "file_size": len(compressed_frames),
+            "frames_storage_path": frames_storage_path,
+            "frames_sha256": frames_sha256,
+            "frames_upload_id": session_upload_id,
+            "validation_status": "validated",
             "upload_batch_id": batch_id,
             "command_id": body.command_id,
             "status": "uploaded",
@@ -2279,7 +2344,7 @@ async def upload_hub_data(
         }
         await tenant_db["hub_data_uploads"].update_one(
             {"data_id": data_id},
-            {"$set": doc, "$setOnInsert": {"created_at": now}},
+            {"$set": doc, "$unset": {"frames": ""}, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
         upserts += 1

@@ -31,6 +31,7 @@ from bson import ObjectId as BsonObjectId
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.observability import observe_ocr_job
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS
@@ -3377,18 +3378,6 @@ async def upload_pdf(
     - Stores metadata in MongoDB
     """
     try:
-        # Validate file type
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only PDF files are supported"
-            )
-        if answer_sheet is not None and not (answer_sheet.filename or "").endswith('.pdf'):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only PDF files are supported for answer sheet uploads"
-            )
-
         # Validate document_id (alphanumeric only, no spaces or special chars)
         if not document_id.isalnum():
             raise HTTPException(
@@ -3478,9 +3467,22 @@ async def upload_pdf(
                 detail="Document title must not exceed 100 characters"
             )
 
-        # Read file content
-        file_content = await file.read()
-        file_size = len(file_content)
+        clean_document_upload = await secure_upload(
+            file=file,
+            policy_id="pdf_document",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "pdf_document",
+                "collection": "documents",
+                "document_id": document_id,
+                "document_type": document_type,
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject=f"document:{document_id}:{current_user.get('user_id', 'unknown')}",
+        )
+        file_content = clean_document_upload.bytes or b""
+        file_size = clean_document_upload.size_bytes
         
         # Count PDF pages using pypdf (already in requirements.txt)
         pages_count = 0
@@ -3494,42 +3496,7 @@ async def upload_pdf(
             logger.warning(f"Failed to count PDF pages for {document_id}: {pdf_err}")
 
         logger.info(f"Uploading document: {document_id}, Title: {title}, Type: {document_type}, Size: {file_size} bytes")
-
-        # Create folder structure based on document type
-        # Use Path for consistent path handling across Windows/Linux
-        from pathlib import Path
-        backend_dir = Path(os.getcwd())
-        upload_dir = backend_dir / "uploads" / "documents" / document_type
-        file_path = upload_dir / f"{document_id}.pdf"
-        
-        # Store relative path with forward slashes (universal format)
-        local_relative_path = f"uploads/documents/{document_type}/{document_id}.pdf"
-
-        # Use S3 storage if enabled, otherwise save locally
-        if is_s3_enabled():
-            # Upload PDF to S3
-            success, storage_path = await s3_upload_file(
-                file_data=file_content,
-                local_path=str(file_path),
-                content_type="application/pdf"
-            )
-            if success:
-                relative_path = storage_path  # s3://bucket/documents/...
-                logger.info(f"✅ Uploaded PDF to S3: {storage_path}")
-            else:
-                # Fallback to local if S3 fails
-                logger.warning("S3 upload failed, falling back to local storage")
-                upload_dir.mkdir(parents=True, exist_ok=True)
-                async with aiofiles.open(str(file_path), "wb") as f:
-                    await f.write(file_content)
-                relative_path = local_relative_path
-        else:
-            # Save file locally
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            async with aiofiles.open(str(file_path), "wb") as f:
-                await f.write(file_content)
-            relative_path = local_relative_path
-            logger.info(f"Saved PDF locally: {file_path}")
+        relative_path = clean_document_upload.released_storage_path
 
         # Validate total_points for Test Series
         if document_type == "Test Series" and total_points is not None:
@@ -3625,6 +3592,8 @@ async def upload_pdf(
             exam_template_path = await _store_exam_template_file(
                 document_id=document_id,
                 upload=exam_template,
+                actor=current_user,
+                db=db,
             )
 
         answer_sheet_path = None
@@ -3632,11 +3601,30 @@ async def upload_pdf(
         answer_sheet_file_size = None
         answer_sheet_pages_count = None
         answer_sheet_uploaded_at = None
+        answer_sheet_upload_id = None
+        answer_sheet_sha256 = None
         if answer_sheet is not None:
-            answer_sheet_content = await answer_sheet.read()
-            answer_sheet_file_size = len(answer_sheet_content)
-            answer_sheet_filename = answer_sheet.filename
+            clean_answer_sheet_upload = await secure_upload(
+                file=answer_sheet,
+                policy_id="answer_sheet_pdf",
+                actor=current_user,
+                db=db,
+                purpose_metadata={
+                    "purpose": "answer_sheet_pdf",
+                    "collection": "documents",
+                    "document_id": document_id,
+                    "document_type": document_type,
+                    "created_by": current_user.get("user_id"),
+                },
+                authorization_subject=f"answer_sheet:{document_id}:{current_user.get('user_id', 'unknown')}",
+            )
+            answer_sheet_content = clean_answer_sheet_upload.bytes or b""
+            answer_sheet_file_size = clean_answer_sheet_upload.size_bytes
+            answer_sheet_filename = clean_answer_sheet_upload.original_filename
             answer_sheet_uploaded_at = datetime.utcnow()
+            answer_sheet_path = clean_answer_sheet_upload.released_storage_path
+            answer_sheet_upload_id = clean_answer_sheet_upload.upload_id
+            answer_sheet_sha256 = clean_answer_sheet_upload.sha256
 
             try:
                 import io
@@ -3646,34 +3634,6 @@ async def upload_pdf(
                 logger.info(f"Answer sheet for {document_id} has {answer_sheet_pages_count} pages")
             except Exception as pdf_err:
                 logger.warning(f"Failed to count answer sheet pages for {document_id}: {pdf_err}")
-
-            answer_sheet_dir = upload_dir / "answer_sheets"
-            answer_sheet_file_path = answer_sheet_dir / f"{document_id}_answer_sheet.pdf"
-            local_answer_sheet_relative_path = (
-                f"uploads/documents/{document_type}/answer_sheets/{document_id}_answer_sheet.pdf"
-            )
-
-            if is_s3_enabled():
-                success, storage_path = await s3_upload_file(
-                    file_data=answer_sheet_content,
-                    local_path=str(answer_sheet_file_path),
-                    content_type="application/pdf",
-                )
-                if success:
-                    answer_sheet_path = storage_path
-                    logger.info(f"✅ Uploaded answer sheet to S3: {storage_path}")
-                else:
-                    logger.warning("S3 answer sheet upload failed, falling back to local storage")
-                    answer_sheet_dir.mkdir(parents=True, exist_ok=True)
-                    async with aiofiles.open(str(answer_sheet_file_path), "wb") as f:
-                        await f.write(answer_sheet_content)
-                    answer_sheet_path = local_answer_sheet_relative_path
-            else:
-                answer_sheet_dir.mkdir(parents=True, exist_ok=True)
-                async with aiofiles.open(str(answer_sheet_file_path), "wb") as f:
-                    await f.write(answer_sheet_content)
-                answer_sheet_path = local_answer_sheet_relative_path
-                logger.info(f"Saved answer sheet locally: {answer_sheet_file_path}")
 
         document_metadata = {
             "document_id": document_id,
@@ -3686,8 +3646,10 @@ async def upload_pdf(
             "section": section,  # Section A-F for filtering
             "teacher_ids": teacher_ids_list,  # Array of teacher IDs for filtering
             "file_path": relative_path,
-            "filename": file.filename,
+            "filename": clean_document_upload.original_filename,
             "file_size": file_size,
+            "upload_id": clean_document_upload.upload_id,
+            "sha256": clean_document_upload.sha256,
             "uploaded_by": current_user.get("user_id"),
             "admin_id": admin_oid,
             "uploaded_at": datetime.utcnow(),
@@ -3706,12 +3668,14 @@ async def upload_pdf(
             ),  # DCR papers are objective-only by contract
             "instructions": instructions.strip() if instructions else None,  # Paper instructions
             "is_active": False,  # Default to inactive until admin enables
-            "is_s3": is_s3_enabled(),  # Track storage location
+            "is_s3": str(relative_path).startswith("s3://"),  # Track storage location
             "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
             "exam_template_path": exam_template_path,
             "answer_sheet_path": answer_sheet_path,
             "answer_sheet_filename": answer_sheet_filename,
             "answer_sheet_file_size": answer_sheet_file_size,
+            "answer_sheet_upload_id": answer_sheet_upload_id,
+            "answer_sheet_sha256": answer_sheet_sha256,
             "answer_sheet_uploaded_at": answer_sheet_uploaded_at,
             "answer_sheet_pages_count": answer_sheet_pages_count,
             "answer_sheet_ocr_status": "not_processed" if answer_sheet_path else None,
@@ -3982,9 +3946,28 @@ async def finalize_exam(
         )
 
 
-async def _store_exam_template_file(document_id: str, upload: UploadFile) -> str:
+async def _store_exam_template_file(
+    document_id: str,
+    upload: UploadFile,
+    *,
+    actor: Dict[str, Any],
+    db: DatabaseManager,
+) -> str:
     """Persist a DCR answer template as a raster overlay asset and return its relative path."""
-    filename = upload.filename or ""
+    clean_upload = await secure_upload(
+        file=upload,
+        policy_id="exam_template_file",
+        actor=actor,
+        db=db,
+        purpose_metadata={
+            "purpose": "exam_template_file",
+            "collection": "documents",
+            "document_id": document_id,
+            "created_by": actor.get("user_id"),
+        },
+        authorization_subject=f"exam_template:{document_id}:{actor.get('user_id', 'unknown')}",
+    )
+    filename = clean_upload.original_filename or ""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ("png", "jpg", "jpeg", "pdf"):
         raise HTTPException(
@@ -3992,7 +3975,7 @@ async def _store_exam_template_file(document_id: str, upload: UploadFile) -> str
             detail="Template must be PNG, JPG, or PDF",
         )
 
-    file_content = await upload.read()
+    file_content = clean_upload.bytes or b""
     if not file_content:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -4077,7 +4060,12 @@ async def upload_exam_template(
                 detail="Cannot modify a finalized exam document",
             )
 
-        relative_path = await _store_exam_template_file(document_id=document_id, upload=file)
+        relative_path = await _store_exam_template_file(
+            document_id=document_id,
+            upload=file,
+            actor=current_user,
+            db=db,
+        )
 
         update_set: Dict[str, Any] = {"exam_template_path": relative_path}
         if orientation_applied in (0, 90, 180, 270):
@@ -4956,13 +4944,19 @@ async def perform_direct_ocr(
     """Direct OCR processing for authenticated users (no document persistence)."""
     ocr_started_at = datetime.utcnow()
     try:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Only PDF files are supported"
-            )
-
-        file_content = await file.read()
+        clean_upload = await secure_upload(
+            file=file,
+            policy_id="direct_ocr_pdf",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "direct_ocr_pdf",
+                "region_scope": "direct",
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject=f"direct_ocr:{current_user.get('user_id', 'unknown')}",
+        )
+        file_content = clean_upload.bytes or b""
 
         async def _run_ocr() -> Dict[str, Any]:
             return await call_sarvam_ocr(
@@ -4984,7 +4978,7 @@ async def perform_direct_ocr(
 
         result = {
             "success": True,
-            "filename": file.filename,
+            "filename": clean_upload.original_filename,
             "subject": subject or "General",
             "difficulty": difficulty or "medium",
             "pages": ocr_result.get("pages", []),
@@ -6951,6 +6945,36 @@ async def create_question(
         if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
             normalized_evaluation_mode = "auto"
 
+        manual_image_entries = []
+        if question_image and question_image.filename:
+            manual_image_entries.append({"kind": "question", "file": question_image})
+        for index, option_image in enumerate(option_images):
+            if option_image and option_image.filename:
+                manual_image_entries.append({"kind": "option", "option_image_index": index, "file": option_image})
+
+        clean_manual_images = await secure_upload_many(
+            files=[entry["file"] for entry in manual_image_entries],
+            policy_id="manual_question_image",
+            actor=current_user,
+            db=db,
+            purpose_metadata_factory=lambda upload, index: {
+                "purpose": "manual_question_image",
+                "collection": "questions",
+                "question_id": full_question_id,
+                "document_id": document_id,
+                "image_kind": manual_image_entries[index]["kind"],
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject_factory=lambda upload, index: f"manual_question_image:{full_question_id}:{index}",
+        )
+        question_clean_upload = None
+        option_clean_uploads = []
+        for entry, clean_upload in zip(manual_image_entries, clean_manual_images):
+            if entry["kind"] == "question":
+                question_clean_upload = clean_upload
+            else:
+                option_clean_uploads.append(clean_upload)
+
         # Prepare question document
         question_doc = {
             "id": full_question_id,
@@ -6973,9 +6997,9 @@ async def create_question(
         }
 
         # Handle question image if provided
-        if question_image and question_image.filename:
-            logger.info(f"Uploading question image: {question_image.filename}")
-            image_data = await question_image.read()
+        if question_clean_upload:
+            logger.info(f"Uploading question image: {question_clean_upload.original_filename}")
+            image_data = question_clean_upload.bytes or b""
 
             # Convert to base64 for save_image_to_disk function and storage
             image_base64 = base64.b64encode(image_data).decode('utf-8')
@@ -7001,6 +7025,8 @@ async def create_question(
                     "type": "diagram",
                     "metadata": {
                         "source": "manual_upload",
+                        "upload_id": question_clean_upload.upload_id,
+                        "sha256": question_clean_upload.sha256,
                         "uploadedAt": datetime.utcnow().isoformat()
                     }
                 })
@@ -7012,13 +7038,13 @@ async def create_question(
                 question_doc["options"].append(opt_meta.get("content", ""))
             elif opt_meta.get("type") == "image":
                 # Get the corresponding image file
-                if option_image_index < len(option_images):
-                    opt_image = option_images[option_image_index]
+                if option_image_index < len(option_clean_uploads):
+                    opt_image = option_clean_uploads[option_image_index]
                     option_image_index += 1
 
-                    if opt_image and opt_image.filename:
-                        logger.info(f"Uploading option {i} image: {opt_image.filename}")
-                        image_data = await opt_image.read()
+                    if opt_image and opt_image.original_filename:
+                        logger.info(f"Uploading option {i} image: {opt_image.original_filename}")
+                        image_data = opt_image.bytes or b""
 
                         # Convert to base64 for save_image_to_disk function and storage
                         image_base64 = base64.b64encode(image_data).decode('utf-8')
@@ -7045,6 +7071,8 @@ async def create_question(
                                 "option_index": i,
                                 "metadata": {
                                     "source": "manual_upload",
+                                    "upload_id": opt_image.upload_id,
+                                    "sha256": opt_image.sha256,
                                     "uploadedAt": datetime.utcnow().isoformat()
                                 }
                             })

@@ -4,7 +4,6 @@ Accepts support messages submitted from Stoody desktop agent Help tab.
 """
 
 import logging
-import os
 import re
 import uuid
 from datetime import datetime
@@ -16,23 +15,12 @@ from slowapi.util import get_remote_address
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
-from utils.s3_storage import upload_file
+from core.upload_security.service import secure_upload_many
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
-
-ALLOWED_IMAGE_TYPES = {
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "image/webp",
-    "image/bmp",
-}
-MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB total
-MAX_ATTACHMENTS = 8
-
 
 def _safe_filename(value: str) -> str:
     name = (value or "").strip()
@@ -75,55 +63,34 @@ async def submit_desktop_bug_report(
     now = datetime.utcnow()
     ticket_id = f"bug_{uuid.uuid4().hex[:12]}"
     uploads = [f for f in attachments if f and f.filename]
-    if len(uploads) > MAX_ATTACHMENTS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Too many images. Maximum {MAX_ATTACHMENTS} files allowed.",
-        )
+
+    clean_uploads = await secure_upload_many(
+        files=uploads,
+        policy_id="desktop_bug_image",
+        actor=current_user,
+        db=tenant_db,
+        purpose_metadata_factory=lambda upload, index: {
+            "purpose": "desktop_bug_image",
+            "collection": "desktop_bug_reports",
+            "ticket_id": ticket_id,
+            "index": index,
+            "created_by": user_id,
+        },
+        authorization_subject_factory=lambda upload, index: f"desktop_bug:{db_name}:{ticket_id}:{index}",
+        include_bytes=False,
+    )
 
     attachment_docs: List[Dict[str, Any]] = []
-    total_bytes = 0
-    for upload in uploads:
-        content_type = (upload.content_type or "").strip().lower()
-        if content_type not in ALLOWED_IMAGE_TYPES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported attachment type: {upload.content_type}. Images only.",
-            )
-        file_data = await upload.read()
-        file_size = len(file_data)
-        total_bytes += file_size
-        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Total image size exceeds 20MB limit ({MAX_TOTAL_ATTACHMENT_BYTES} bytes).",
-            )
-
-        safe_name = _safe_filename(upload.filename or "image")
-        local_path = os.path.join(
-            "uploads",
-            "desktop-bug-reports",
-            db_name,
-            user_id,
-            ticket_id,
-            safe_name,
-        )
-        success, storage_path = await upload_file(
-            file_data=file_data,
-            local_path=local_path,
-            content_type=content_type,
-        )
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to store attachment '{safe_name}'",
-            )
+    for clean_upload in clean_uploads:
+        safe_name = _safe_filename(clean_upload.original_filename or "image")
         attachment_docs.append(
             {
                 "filename": safe_name,
-                "content_type": content_type,
-                "size_bytes": file_size,
-                "storage_path": storage_path,
+                "content_type": clean_upload.content_type,
+                "size_bytes": clean_upload.size_bytes,
+                "storage_path": clean_upload.released_storage_path,
+                "upload_id": clean_upload.upload_id,
+                "sha256": clean_upload.sha256,
             }
         )
 

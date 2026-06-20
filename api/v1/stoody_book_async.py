@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from api.v1.auth_async import get_current_user, get_database
 from config_async import settings
 from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from services.async_openai_service import AsyncOpenAIService
 
 logger = logging.getLogger(__name__)
@@ -761,18 +762,24 @@ async def upload_pdf(
 ):
     mongo_db = await _workspace_db(db, current_user)
     session = await _get_session(mongo_db, current_user, session_id)
-    filename = (file.filename or "uploaded.pdf").strip() or "uploaded.pdf"
-    if not filename.lower().endswith(".pdf") or file.content_type not in {"application/pdf", "application/octet-stream", "", None}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF files are allowed")
-
-    content = await file.read(MAX_PDF_BYTES + 1)
-    if len(content) > MAX_PDF_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF must be 10 MB or smaller")
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This file is not a valid PDF")
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="stoody_book_pdf",
+        actor=current_user,
+        db=mongo_db,
+        purpose_metadata={
+            "purpose": "stoody_book_pdf",
+            "collection": PDFS_COLLECTION,
+            "session_id": session_id,
+            "created_by": current_user.get("user_id"),
+        },
+        authorization_subject=f"stoody_book:{session_id}:{current_user.get('user_id', 'unknown')}",
+    )
+    filename = (clean_upload.original_filename or "uploaded.pdf").strip() or "uploaded.pdf"
+    content = clean_upload.bytes or b""
 
     storage_used = await _storage_used_bytes(mongo_db, current_user)
-    digest = hashlib.sha256(content).hexdigest()
+    digest = clean_upload.sha256
     pdf_doc = await mongo_db[PDFS_COLLECTION].find_one({**_owner_filter(current_user), "sha256": digest, "deleted_at": None})
 
     if not pdf_doc:
@@ -787,8 +794,10 @@ async def upload_pdf(
             "admin_id": scope.get("admin_id"),
             "filename": filename[:220],
             "content_type": "application/pdf",
-            "size": len(content),
+            "size": clean_upload.size_bytes,
             "sha256": digest,
+            "upload_id": clean_upload.upload_id,
+            "storage_path": clean_upload.released_storage_path,
             "pages": extracted["pages"],
             "text": extracted["text"],
             "page_texts": extracted["page_texts"],

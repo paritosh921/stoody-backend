@@ -32,6 +32,12 @@ OCR_JOB_TOTAL = Counter(
     ["job_type", "status"],
 )
 
+UPLOAD_SECURITY_TOTAL = Counter(
+    "skillbot_upload_security_total",
+    "Upload security decisions by policy and outcome.",
+    ["policy_id", "outcome"],
+)
+
 OCR_JOB_DURATION_SECONDS = Histogram(
     "skillbot_ocr_job_duration_seconds",
     "OCR job duration in seconds.",
@@ -96,10 +102,16 @@ def observe_ocr_job(job_type: str, status: str, duration_seconds: float) -> None
     ).observe(max(duration_seconds, 0.0))
 
 
+def record_upload_security_decision(policy_id: str, outcome: str) -> None:
+    UPLOAD_SECURITY_TOTAL.labels(
+        policy_id=_safe(policy_id),
+        outcome=_safe(outcome),
+    ).inc()
+
+
 def track_websocket_connection(channel: str, delta: int) -> None:
     WEBSOCKET_CONNECTIONS.labels(channel=_safe(channel)).inc(delta)
 
 
 def set_dependency_health(dependency: str, healthy: bool) -> None:
     DEPENDENCY_HEALTH.labels(dependency=_safe(dependency)).set(1 if healthy else 0)
-

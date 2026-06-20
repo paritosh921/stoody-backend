@@ -25,6 +25,7 @@ from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
 from core.pen_tokens import create_pen_token
+from core.upload_security.service import secure_upload_many
 from core.tenant_registry import (
     get_tenant_by_subdomain,
     get_tenant_by_tenant_id,
@@ -1408,8 +1409,6 @@ async def register_admin(
                 )
 
             uploads = [upload for upload in attachments if upload and upload.filename]
-            if len(uploads) > MAX_REGISTRATION_FILES:
-                raise HTTPException(status_code=400, detail=f"Maximum {MAX_REGISTRATION_FILES} files allowed")
 
             if uploads and len(attachment_types) != len(uploads):
                 raise HTTPException(
@@ -1417,38 +1416,46 @@ async def register_admin(
                     detail="Please provide a document type for every uploaded file"
                 )
 
-            for index, upload in enumerate(uploads):
-                if not upload.filename:
-                    continue
+            master_db = await db.get_master_db()
+            if master_db is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Tenant registry not available",
+                )
+            clean_uploads = await secure_upload_many(
+                files=uploads,
+                policy_id="registration_document",
+                actor=None,
+                db=master_db,
+                purpose_metadata_factory=lambda upload, index: {
+                    "purpose": "registration_document",
+                    "collection": "tenant_application_files",
+                    "admin_email": str(email),
+                    "institution_name": institution_name_value,
+                    "document_type": attachment_types[index].strip() if index < len(attachment_types) else "",
+                },
+                authorization_subject_factory=lambda upload, index: f"registration:{email}:attachment:{index}",
+            )
 
-                content_type = (upload.content_type or "").lower().strip()
-                if content_type == "application/octet-stream" or not content_type:
-                    guessed_type, _ = mimetypes.guess_type(upload.filename)
-                    if guessed_type:
-                        content_type = guessed_type.lower()
-
-                if content_type not in ALLOWED_SUPPORTING_FILE_TYPES:
-                    raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.content_type or upload.filename}")
-
-                content = await upload.read()
-                if len(content) > MAX_REGISTRATION_FILE_SIZE_BYTES:
-                    raise HTTPException(status_code=400, detail=f"File too large: {upload.filename}")
-
+            for index, clean_upload in enumerate(clean_uploads):
                 document_type = attachment_types[index].strip() if index < len(attachment_types) else ""
                 if not document_type:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Document type missing for file: {upload.filename}"
+                        detail=f"Document type missing for file: {clean_upload.original_filename}"
                     )
 
                 prepared_file_docs.append({
                     "admin_email": email,
                     "institution_name": institution_name_value,
                     "document_type": document_type[:80],
-                    "filename": upload.filename,
-                    "content_type": content_type,
-                    "size_bytes": len(content),
-                    "data_base64": base64.b64encode(content).decode("utf-8"),
+                    "filename": clean_upload.original_filename,
+                    "content_type": clean_upload.content_type,
+                    "size_bytes": clean_upload.size_bytes,
+                    "data_base64": base64.b64encode(clean_upload.bytes or b"").decode("utf-8"),
+                    "upload_id": clean_upload.upload_id,
+                    "sha256": clean_upload.sha256,
+                    "storage_path": clean_upload.released_storage_path,
                 })
 
         tenant_doc = {
@@ -1877,38 +1884,34 @@ async def send_registration_status_message(
         super_admin = await master_db["super_admins"].find_one({"_id": superadmin_oid})
 
         uploads = [upload for upload in attachments if upload and upload.filename]
-        if len(uploads) > MAX_STATUS_REPLY_FILES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Maximum {MAX_STATUS_REPLY_FILES} attachments are allowed"
-            )
-
         serialized_attachments: List[Dict[str, Any]] = []
-        for upload in uploads:
-            content_type = (upload.content_type or "").lower().strip()
-            if content_type == "application/octet-stream" or not content_type:
-                guessed_type, _ = mimetypes.guess_type(upload.filename)
-                if guessed_type:
-                    content_type = guessed_type.lower()
-
-            if content_type not in ALLOWED_SUPPORTING_FILE_TYPES:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unsupported file type: {upload.content_type or upload.filename}"
-                )
-
-            content = await upload.read()
-            if len(content) > MAX_REGISTRATION_FILE_SIZE_BYTES:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File too large: {upload.filename}"
-                )
-
+        clean_uploads = await secure_upload_many(
+            files=uploads,
+            policy_id="registration_reply_attachment",
+            actor={
+                "user_id": str(tenant.get("_id")),
+                "email": str(email),
+                "user_type": "pending_admin",
+            },
+            db=master_db,
+            purpose_metadata_factory=lambda upload, index: {
+                "purpose": "registration_reply_attachment",
+                "collection": "superadmin_messages",
+                "tenant_id": str(tenant.get("_id")),
+                "admin_email": str(email),
+                "index": index,
+            },
+            authorization_subject_factory=lambda upload, index: f"registration_reply:{tenant.get('_id')}:attachment:{index}",
+        )
+        for clean_upload in clean_uploads:
             serialized_attachments.append({
-                "filename": upload.filename,
-                "content_type": content_type,
-                "size_bytes": len(content),
-                "data_base64": base64.b64encode(content).decode("utf-8"),
+                "filename": clean_upload.original_filename,
+                "content_type": clean_upload.content_type,
+                "size_bytes": clean_upload.size_bytes,
+                "data_base64": base64.b64encode(clean_upload.bytes or b"").decode("utf-8"),
+                "upload_id": clean_upload.upload_id,
+                "sha256": clean_upload.sha256,
+                "storage_path": clean_upload.released_storage_path,
             })
 
         message_doc = {

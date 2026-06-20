@@ -24,6 +24,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403, check_registration_limit
 from models.tutor import Tutor
@@ -129,10 +130,29 @@ def parse_sections(value: str) -> List[str]:
     return [s.strip().upper() for s in str(value).split(',') if s.strip()]
 
 
-async def parse_upload_file(file: UploadFile) -> pd.DataFrame:
+async def parse_upload_file(
+    file: UploadFile,
+    *,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    purpose: str,
+) -> pd.DataFrame:
     """Parse uploaded CSV or Excel file into DataFrame"""
-    content = await file.read()
-    file_name = file.filename.lower()
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="bulk_tutors",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "bulk_tutors",
+            "collection": "tutors",
+            "operation": purpose,
+            "created_by": current_user.get("user_id"),
+        },
+        authorization_subject=f"bulk_tutors:{purpose}:{current_user.get('user_id', 'unknown')}",
+    )
+    content = clean_upload.bytes or b""
+    file_name = clean_upload.original_filename.lower()
 
     try:
         if file_name.endswith('.csv'):
@@ -311,23 +331,8 @@ async def preview_teacher_bulk_upload(
     Multiple rows for the same teacher (by username or full_name+email) are
     merged into multiple teaching assignments.
     """
-    file_name = file.filename.lower()
-    if not file_name.endswith(('.csv', '.xlsx', '.xls')):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) file."
-        )
-
-    content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File too large. Maximum size is 5MB."
-        )
-    await file.seek(0)
-
     try:
-        df = await parse_upload_file(file)
+        df = await parse_upload_file(file, current_user=current_user, db=db, purpose="preview")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -568,23 +573,8 @@ async def import_bulk_teachers(
     Creates teacher accounts with auto-generated passwords.
     Multiple rows for the same teacher are merged into multiple teaching assignments.
     """
-    file_name = file.filename.lower()
-    if not file_name.endswith(('.csv', '.xlsx', '.xls')):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) file."
-        )
-
-    content = await file.read()
-    if len(content) > 5 * 1024 * 1024:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File too large. Maximum size is 5MB."
-        )
-    await file.seek(0)
-
     try:
-        df = await parse_upload_file(file)
+        df = await parse_upload_file(file, current_user=current_user, db=db, purpose="import")
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 

@@ -14,6 +14,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
 
@@ -355,20 +356,22 @@ async def upload_school_logo(
         if not admin_id:
             raise HTTPException(status_code=401, detail="Invalid user session")
         
-        # Validate file type
-        allowed_types = ["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"]
-        if file.content_type not in allowed_types:
-            raise HTTPException(status_code=400, detail="Invalid file type. Only PNG, JPEG, GIF, and WebP are allowed.")
-        
-        # Read file content
-        content = await file.read()
-        
-        # Check file size (max 3MB)
-        if len(content) > 3 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 3MB.")
+        clean_upload = await secure_upload(
+            file=file,
+            policy_id="school_logo",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "school_logo",
+                "collection": "school_settings",
+                "admin_id": admin_id,
+                "created_by": admin_id,
+            },
+            authorization_subject=f"school_logo:{admin_id}",
+        )
         
         # Convert to base64
-        base64_logo = f"data:{file.content_type};base64,{base64.b64encode(content).decode('utf-8')}"
+        base64_logo = f"data:{clean_upload.content_type};base64,{base64.b64encode(clean_upload.bytes or b'').decode('utf-8')}"
         
         # Update settings with new logo
         await db.mongo_update_one(

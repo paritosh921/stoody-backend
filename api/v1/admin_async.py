@@ -4026,7 +4026,16 @@ async def send_message_to_superadmin(
 
         # Upload attachments to S3
         attachment_metadata = await upload_message_attachments(
-            [f for f in attachments if f.filename]
+            [f for f in attachments if f.filename],
+            actor=current_user,
+            db=master_db,
+            purpose_metadata_base={
+                "collection": "superadmin_messages",
+                "tenant_id": str(tenant_doc["_id"]),
+                "admin_id": current_user.get("user_id"),
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject_base=f"admin_to_superadmin:{tenant_doc['_id']}:{current_user.get('user_id', 'unknown')}",
         )
 
         message_doc = {

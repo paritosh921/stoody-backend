@@ -32,6 +32,7 @@ from slowapi.util import get_remote_address
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from utils.s3_storage import (
     upload_file as s3_upload_file,
     delete_file as s3_delete_file,
@@ -165,15 +166,23 @@ async def upload_material(
 
     _validate_type_mime(material_type, file.content_type or "", file.filename or "untitled")
 
-    file_bytes = await file.read()
-    size = len(file_bytes)
-    if size > MAX_FILE_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({size} bytes). Max {MAX_FILE_SIZE_BYTES} bytes."
-        )
-    if size <= 0:
-        raise HTTPException(status_code=400, detail="Empty file")
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="teaching_material",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "teaching_material",
+            "collection": COLLECTION,
+            "material_type": material_type,
+            "tutor_id": tutor_id,
+            "tenant_id": tenant_id,
+            "created_by": tutor_id,
+        },
+        authorization_subject=f"teaching_material:{tenant_id}:{tutor_id}",
+    )
+    file_bytes = clean_upload.bytes or b""
+    size = clean_upload.size_bytes
 
     used = await _tutor_quota_used(db, tutor_id, tenant_id)
     if used + size > TUTOR_QUOTA_BYTES:
@@ -188,7 +197,7 @@ async def upload_material(
     success, storage_path = await s3_upload_file(
         file_data=file_bytes,
         local_path=s3_key,
-        content_type=file.content_type or "application/octet-stream",
+        content_type=clean_upload.content_type or "application/octet-stream",
     )
     if not success:
         raise HTTPException(status_code=502, detail="Upload to storage failed")
@@ -207,10 +216,13 @@ async def upload_material(
         "tutor_id": tutor_id,
         "tenant_id": tenant_id,
         "type": material_type,
-        "filename": file.filename or f"{material_type}-{mat_id}",
-        "mime_type": file.content_type or "application/octet-stream",
+        "filename": clean_upload.original_filename or f"{material_type}-{mat_id}",
+        "mime_type": clean_upload.content_type or "application/octet-stream",
         "size_bytes": size,
         "s3_key": storage_path,
+        "upload_id": clean_upload.upload_id,
+        "sha256": clean_upload.sha256,
+        "released_storage_path": clean_upload.released_storage_path,
         "thumbnail_s3_key": None,   # TODO: generate thumbnails for video/pdf in a follow-up
         "page_count": page_count,
         "uploaded_at": now,

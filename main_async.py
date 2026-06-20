@@ -66,6 +66,9 @@ from config_async import (
     WORKER_CONNECTIONS,
     OCR_CONCURRENCY_LIMIT,
     ENABLE_METRICS,
+    UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT,
+    UPLOAD_MAX_REQUEST_BODY_MB,
+    UPLOAD_SECURITY_ENABLED,
 )
 
 from api.v1.stoody_book_static import mount_stoody_book
@@ -75,11 +78,13 @@ from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
 from core.observability import set_dependency_health
+from core.upload_security.scanner import ClamAVScanner
 
 # Import middleware
 from middleware.subdomain import subdomain_middleware
 from middleware.tenant_middleware import TenantMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
+from middleware.request_size_limit import RequestSizeLimitMiddleware
 
 # Import async route modules
 from api.v1.chat_async import router as chat_router
@@ -158,6 +163,8 @@ from api.v1.language_async import router as language_router
 from api.v1.settings_async import router as settings_router
 from api.v1.totp_2fa import router as totp_2fa_router
 from api.v1.pen_settings import router as pen_settings_router
+from api.v1.upload_downloads_async import router as upload_downloads_router
+from api.v1.upload_policies_async import router as upload_policies_router
 
 # B2C Authentication routes (Google OAuth for B2C users using stoody-b2c database)
 try:
@@ -778,6 +785,12 @@ app.add_middleware(
     allowed_hosts=["*"]  # Configure appropriately for production
 )
 
+app.add_middleware(
+    RequestSizeLimitMiddleware,
+    default_max_body_bytes=UPLOAD_MAX_REQUEST_BODY_MB * 1024 * 1024,
+    enabled=UPLOAD_SECURITY_ENABLED,
+)
+
 # Subdomain extraction middleware (MUST be before other middlewares)
 app.middleware("http")(subdomain_middleware)
 
@@ -1023,6 +1036,18 @@ app.include_router(
     pen_settings_router,
     prefix=f"{API_V1_PREFIX}/pen-settings",
     tags=["Pen Settings"]
+)
+
+app.include_router(
+    upload_policies_router,
+    prefix=API_V1_PREFIX,
+    tags=["Upload Policies"],
+)
+
+app.include_router(
+    upload_downloads_router,
+    prefix=API_V1_PREFIX,
+    tags=["Upload Downloads"],
 )
 
 app.include_router(
@@ -1479,7 +1504,8 @@ else:
 # Static file serving
 _BACKEND_DIR = _Path(__file__).resolve().parent
 app.mount("/images", StaticFiles(directory=str(_BACKEND_DIR / "images")), name="images")
-app.mount("/uploads", StaticFiles(directory=str(_BACKEND_DIR / "uploads")), name="uploads")
+if UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT:
+    app.mount("/uploads", StaticFiles(directory=str(_BACKEND_DIR / "uploads")), name="uploads")
 mount_stoody_book(app)
 
 # Health check endpoint
@@ -1523,6 +1549,13 @@ async def health_check(request: Request):
             s3_status = {"enabled": False, "error": str(_s3_err)}
             set_dependency_health("s3_storage", False)
 
+        try:
+            upload_scanner_status = await ClamAVScanner().health()
+            set_dependency_health("upload_malware_scanner", bool(upload_scanner_status.get("available")))
+        except Exception as _scanner_err:
+            upload_scanner_status = {"enabled": True, "available": False, "error": str(_scanner_err)}
+            set_dependency_health("upload_malware_scanner", False)
+
         # Treat cache as optional in all environments; report overall service as running
         # even if one or more dependencies are degraded. Frontend uses this flag to
         # detect whether the backend is reachable.
@@ -1540,7 +1573,8 @@ async def health_check(request: Request):
             "services": {
                 "database": "healthy" if db_healthy else "unhealthy",
                 "cache": cache_status,
-                "s3_storage": s3_status
+                "s3_storage": s3_status,
+                "upload_malware_scanner": upload_scanner_status,
             },
             "mongodb": {
                 "connected": db_healthy,
@@ -1548,6 +1582,7 @@ async def health_check(request: Request):
                 "active_tenants": active_tenants_count
             },
             "s3_storage": s3_status,
+            "upload_malware_scanner": upload_scanner_status,
             "version": "2.0.0",
             "mode": "development" if DEBUG_MODE else "production"
         }

@@ -18,6 +18,7 @@ import logging
 import io
 
 from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user
 from models.timetable import ClassTimetable, TimetablePeriod
 from slowapi import Limiter
@@ -44,6 +45,29 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     if current_user.get("user_type") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+
+async def _read_clean_timetable_upload(
+    file: UploadFile,
+    *,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    purpose: str,
+) -> tuple[bytes, str]:
+    clean_upload = await secure_upload(
+        file=file,
+        policy_id="bulk_timetable",
+        actor=current_user,
+        db=db,
+        purpose_metadata={
+            "purpose": "bulk_timetable",
+            "collection": COL_TIMETABLES,
+            "operation": purpose,
+            "created_by": current_user.get("user_id"),
+        },
+        authorization_subject=f"bulk_timetable:{purpose}:{current_user.get('user_id', 'unknown')}",
+    )
+    return clean_upload.bytes or b"", clean_upload.original_filename
 
 
 def _parse_file(file_bytes: bytes, filename: str) -> List[Dict[str, str]]:
@@ -176,11 +200,13 @@ async def preview_timetable_upload(
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
-    file_bytes = await file.read()
-    if len(file_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
-    rows = _parse_file(file_bytes, file.filename)
+    file_bytes, clean_filename = await _read_clean_timetable_upload(
+        file,
+        current_user=current_user,
+        db=db,
+        purpose="preview",
+    )
+    rows = _parse_file(file_bytes, clean_filename)
     if not rows:
         raise HTTPException(status_code=400, detail="File is empty")
 
@@ -223,7 +249,7 @@ async def preview_timetable_upload(
 
     return {
         "success": True,
-        "file_name": file.filename,
+        "file_name": clean_filename,
         "total_rows": len(rows),
         "valid_rows": len(valid_rows),
         "error_rows": len(rows) - len(valid_rows),
@@ -247,8 +273,13 @@ async def import_timetable_upload(
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
-    file_bytes = await file.read()
-    rows = _parse_file(file_bytes, file.filename)
+    file_bytes, clean_filename = await _read_clean_timetable_upload(
+        file,
+        current_user=current_user,
+        db=db,
+        purpose="import",
+    )
+    rows = _parse_file(file_bytes, clean_filename)
     if not rows:
         raise HTTPException(status_code=400, detail="File is empty")
 

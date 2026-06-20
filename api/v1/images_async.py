@@ -18,6 +18,7 @@ import aiofiles
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
+from core.upload_security.service import secure_upload
 from config_async import settings
 from utils.path_utils import get_absolute_path
 from utils.s3_storage import download_file as s3_download_file, upload_file as s3_upload_file, delete_file as s3_delete_file, is_s3_enabled, get_public_url
@@ -82,81 +83,43 @@ async def upload_image(
 ):
     """Upload an image file"""
     try:
-        # Validate file
         if not file.filename:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No file provided"
             )
 
-        # Check file extension
-        file_ext = os.path.splitext(file.filename)[1].lower()
-        if file_ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
-            )
+        clean_upload = await secure_upload(
+            file=file,
+            policy_id="generic_image_upload",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "generic_image_upload",
+                "collection": "images",
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject=f"image:{current_user.get('user_id', 'unknown')}",
+        )
 
-        # Check file size
-        file_size = 0
-        file_content = await file.read()
-        file_size = len(file_content)
-
-        if file_size > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File too large. Maximum size is 10MB"
-            )
-
-        # Generate unique filename
-        file_id = str(uuid.uuid4())
+        file_ext = os.path.splitext(clean_upload.original_filename)[1].lower()
+        file_id = clean_upload.upload_id
         unique_filename = f"{file_id}{file_ext}"
-
-        # Define the local path (used for S3 key generation)
-        local_path = os.path.join(os.getcwd(), "uploads", "images", unique_filename)
-
-        # Detect content type
-        content_type = file.content_type or "application/octet-stream"
-
-        # Use S3 storage if enabled, otherwise save locally
-        if is_s3_enabled():
-            # Upload to S3
-            success, storage_path = await s3_upload_file(
-                file_data=file_content,
-                local_path=local_path,
-                content_type=content_type
-            )
-            if success:
-                logger.info(f"✅ Uploaded image to S3: {storage_path}")
-            else:
-                # Fallback to local if S3 fails
-                logger.warning("S3 upload failed, falling back to local storage")
-                upload_dir = os.path.join(os.getcwd(), "uploads", "images")
-                os.makedirs(upload_dir, exist_ok=True)
-                async with aiofiles.open(local_path, "wb") as f:
-                    await f.write(file_content)
-                storage_path = local_path
-        else:
-            # Save file locally
-            upload_dir = os.path.join(os.getcwd(), "uploads", "images")
-            os.makedirs(upload_dir, exist_ok=True)
-            async with aiofiles.open(local_path, "wb") as f:
-                await f.write(file_content)
-            storage_path = local_path
-            logger.info(f"Saved image locally: {local_path}")
 
         # Save metadata to database
         image_metadata = {
             "_id": file_id,
             "filename": unique_filename,
-            "original_filename": file.filename,
-            "size": file_size,
-            "content_type": content_type,
+            "original_filename": clean_upload.original_filename,
+            "size": clean_upload.size_bytes,
+            "content_type": clean_upload.content_type,
             "uploaded_by": current_user["user_id"],
             "uploaded_at": datetime.utcnow(),
             "is_processed": False,
-            "file_path": storage_path,
-            "is_s3": is_s3_enabled(),  # Track storage location
+            "file_path": clean_upload.released_storage_path,
+            "is_s3": clean_upload.released_storage_path.startswith("s3://"),
+            "upload_id": clean_upload.upload_id,
+            "sha256": clean_upload.sha256,
             "tags": []
         }
 
@@ -166,8 +129,8 @@ async def upload_image(
             id=file_id,
             filename=unique_filename,
             url=f"/api/v1/images/{file_id}",
-            size=file_size,
-            content_type=content_type,
+            size=clean_upload.size_bytes,
+            content_type=clean_upload.content_type,
             uploaded_at=image_metadata["uploaded_at"]
         )
 

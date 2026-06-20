@@ -26,6 +26,26 @@ load_dotenv()
 # SECURITY HELPER FUNCTIONS
 # =============================================================================
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _backend_debug_mode_from_env() -> bool:
+    debug_raw = os.getenv("DEBUG_MODE")
+    if debug_raw is not None:
+        return debug_raw.strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv("NODE_ENV", "production") == "development"
+
+
+def _default_upload_private_local_dir() -> str:
+    if _backend_debug_mode_from_env():
+        return str(BASE_DIR_PATH / "data" / "private_uploads")
+    return "/var/lib/stoody/uploads"
+
+
 def _get_cors_origins() -> List[str]:
     """
     Build CORS origins list based on environment.
@@ -35,7 +55,7 @@ def _get_cors_origins() -> List[str]:
     - In production: Only allow explicitly configured HTTPS origins
     - Never allow wildcards (*) or placeholder domains
     """
-    is_dev = os.getenv("NODE_ENV", "production") == "development"
+    is_dev = _backend_debug_mode_from_env()
 
     # Production origins (always included when valid)
     production_origins: List[str] = []
@@ -219,7 +239,7 @@ class AsyncSettings(BaseSettings):
     # Server configuration
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", 5001))
-    DEBUG_MODE: bool = os.getenv("NODE_ENV", "production") == "development"
+    DEBUG_MODE: bool = _backend_debug_mode_from_env()
 
     # API Configuration
     API_V1_PREFIX: str = "/api/v1"
@@ -247,7 +267,7 @@ class AsyncSettings(BaseSettings):
     VAPID_CLAIMS_EMAIL: str = os.getenv("VAPID_CLAIMS_EMAIL", "")
 
     # Allow disabling MongoDB in dev, but default to enabled if URI is present
-    _dev_default = "true" if os.getenv("NODE_ENV", "production") == "development" else "false"
+    _dev_default = "true" if _backend_debug_mode_from_env() else "false"
     _default_disable = "false" if os.getenv("MONGODB_URI") else _dev_default
     DISABLE_MONGODB: bool = os.getenv("DISABLE_MONGODB", _default_disable).lower() == "true"
 
@@ -314,6 +334,35 @@ class AsyncSettings(BaseSettings):
     IMAGES_DIR: Path = BASE_DIR / "images"
     MAX_IMAGE_SIZE: int = 10 * 1024 * 1024  # 10MB
     ALLOWED_IMAGE_EXTENSIONS: set = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+
+    # Upload security
+    UPLOAD_SECURITY_ENABLED: bool = os.getenv("UPLOAD_SECURITY_ENABLED", "true").lower() == "true"
+    UPLOAD_AV_ENABLED: bool = os.getenv(
+        "UPLOAD_AV_ENABLED",
+        os.getenv("UPLOAD_SCAN_REQUIRED", "false"),
+    ).lower() == "true"
+    UPLOAD_AV_FAIL_CLOSED: bool = os.getenv(
+        "UPLOAD_AV_FAIL_CLOSED",
+        "false" if _backend_debug_mode_from_env() else "true",
+    ).lower() == "true"
+    CLAMD_HOST: str = os.getenv("CLAMD_HOST", "127.0.0.1")
+    CLAMD_PORT: int = int(os.getenv("CLAMD_PORT", 3310))
+    CLAMAV_SOCKET: str = os.getenv("CLAMAV_SOCKET", os.getenv("CLAMD_SOCKET", ""))
+    UPLOAD_PRIVATE_LOCAL_DIR: Path = Path(
+        os.getenv("UPLOAD_PRIVATE_LOCAL_DIR", _default_upload_private_local_dir())
+    )
+    UPLOAD_QUARANTINE_PREFIX: str = os.getenv("UPLOAD_QUARANTINE_PREFIX", "quarantine")
+    UPLOAD_RELEASED_PREFIX: str = os.getenv("UPLOAD_RELEASED_PREFIX", os.getenv("UPLOAD_CLEAN_PREFIX", "clean"))
+    UPLOAD_REJECTED_PREFIX: str = os.getenv("UPLOAD_REJECTED_PREFIX", "rejected")
+    UPLOAD_MAX_REQUEST_BODY_MB: int = int(os.getenv("UPLOAD_MAX_REQUEST_BODY_MB", 64))
+    UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK: bool = os.getenv(
+        "UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK",
+        "true" if _backend_debug_mode_from_env() else "false",
+    ).lower() == "true"
+    UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT: bool = os.getenv(
+        "UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT",
+        "true" if _backend_debug_mode_from_env() else "false",
+    ).lower() == "true"
 
     # OpenAI Configuration
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
@@ -426,6 +475,19 @@ SMTP_USE_TLS = settings.SMTP_USE_TLS
 IMAGES_DIR = settings.IMAGES_DIR
 MAX_IMAGE_SIZE = settings.MAX_IMAGE_SIZE
 ALLOWED_IMAGE_EXTENSIONS = settings.ALLOWED_IMAGE_EXTENSIONS
+UPLOAD_SECURITY_ENABLED = settings.UPLOAD_SECURITY_ENABLED
+UPLOAD_AV_ENABLED = settings.UPLOAD_AV_ENABLED
+UPLOAD_AV_FAIL_CLOSED = settings.UPLOAD_AV_FAIL_CLOSED
+CLAMD_HOST = settings.CLAMD_HOST
+CLAMD_PORT = settings.CLAMD_PORT
+CLAMAV_SOCKET = settings.CLAMAV_SOCKET
+UPLOAD_PRIVATE_LOCAL_DIR = settings.UPLOAD_PRIVATE_LOCAL_DIR
+UPLOAD_QUARANTINE_PREFIX = settings.UPLOAD_QUARANTINE_PREFIX
+UPLOAD_RELEASED_PREFIX = settings.UPLOAD_RELEASED_PREFIX
+UPLOAD_REJECTED_PREFIX = settings.UPLOAD_REJECTED_PREFIX
+UPLOAD_MAX_REQUEST_BODY_MB = settings.UPLOAD_MAX_REQUEST_BODY_MB
+UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK = settings.UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK
+UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT = settings.UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 OPENAI_MODEL = settings.OPENAI_MODEL
 

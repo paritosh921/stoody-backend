@@ -25,6 +25,8 @@ from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 import mimetypes
 
+from config_async import settings
+
 # Load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -153,8 +155,11 @@ async def _upload_to_s3(
     try:
         s3_client = _get_s3_client()
         if not s3_client:
-            logger.warning("S3 client not available, falling back to local storage")
-            return await _upload_to_local(file_data, local_path)
+            if settings.UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK:
+                logger.warning("S3 client not available, falling back to local storage")
+                return await _upload_to_local(file_data, local_path)
+            logger.error("S3 client not available and public local fallback is disabled")
+            return False, ""
         
         s3_key = _local_path_to_s3_key(local_path)
         
@@ -186,9 +191,10 @@ async def _upload_to_s3(
         
     except Exception as e:
         logger.error(f"❌ S3 upload failed for {local_path}: {e}")
-        # Fallback to local storage
-        logger.info("Falling back to local storage...")
-        return await _upload_to_local(file_data, local_path)
+        if settings.UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK:
+            logger.info("Falling back to local storage...")
+            return await _upload_to_local(file_data, local_path)
+        return False, ""
 
 
 async def _upload_to_local(file_data: bytes, local_path: str) -> Tuple[bool, str]:

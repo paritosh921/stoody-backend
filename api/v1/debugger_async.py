@@ -9,12 +9,15 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, status, UploadFile, File, Form
+from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, status, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from api.v1.auth_async import get_current_user, get_database
+from core.database import DatabaseManager
+from core.upload_security.service import secure_upload
 from services.langchain_debugger_service import get_langchain_debugger_service
 
 logger = logging.getLogger(__name__)
@@ -220,7 +223,9 @@ async def debugger_chat(
 async def upload_document(
     request: Request,
     sessionId: str = Form(..., description="Session identifier"),
-    file: UploadFile = File(..., description="Document file (PDF, Word, Image)")
+    file: UploadFile = File(..., description="Document file (PDF, Word, Image)"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
 ):
     """
     Upload a document for RAG (Retrieval-Augmented Generation)
@@ -255,17 +260,18 @@ async def upload_document(
         if len(sessionId) < 5:
             raise HTTPException(status_code=400, detail="Invalid session ID")
 
-        # Read file content
-        file_content = await file.read()
-
-        if len(file_content) == 0:
-            raise HTTPException(status_code=400, detail="Empty file")
-
-        if len(file_content) > 10 * 1024 * 1024:  # 10MB limit
-            raise HTTPException(
-                status_code=400,
-                detail=f"File too large: {len(file_content)/(1024*1024):.2f}MB (max 10MB)"
-            )
+        clean_upload = await secure_upload(
+            file=file,
+            policy_id="debugger_document",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "debugger_document",
+                "session_id": sessionId,
+                "created_by": current_user.get("user_id"),
+            },
+            authorization_subject=f"debugger:{sessionId}:{current_user.get('user_id', 'unknown')}",
+        )
 
         # Get service
         service = await get_langchain_debugger_service()
@@ -273,9 +279,9 @@ async def upload_document(
         # Upload and process document
         result = await service.upload_document(
             session_id=sessionId,
-            file_content=file_content,
-            filename=file.filename,
-            mime_type=file.content_type or "application/octet-stream"
+            file_content=clean_upload.bytes or b"",
+            filename=clean_upload.original_filename,
+            mime_type=clean_upload.content_type or "application/octet-stream"
         )
 
         if not result['success']:
