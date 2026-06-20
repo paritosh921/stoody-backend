@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.validate_upload_security_deploy import run_upload_security_deploy_validation
+from scripts.validate_upload_security_deploy import _write_status_output, run_upload_security_deploy_validation
 
 
 class FakeRunner:
@@ -57,6 +57,15 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
 
     assert result.ok is True
     assert result.failed_checks == []
+
+    status_output = tmp_path / "status" / "upload_deploy_validation_status.json"
+    _write_status_output(status_output, result)
+    status_text = status_output.read_text(encoding="utf-8")
+    assert "generated_at_epoch" in status_text
+    assert "passed_checks" in status_text
+    assert "failed_checks" in status_text
+    assert "password" not in status_text.lower()
+    assert "token" not in status_text.lower()
 
 
 def test_deploy_validation_fails_when_scanner_controls_are_disabled(tmp_path):
@@ -168,4 +177,6 @@ def test_prod_workflow_runs_upload_security_deploy_validation_after_deploy():
     assert "BACKEND_SERVICE_USER=" in source
     assert "CLAMAV_SOCKET_MODE=660" in source
     assert "UPLOAD_CLEANUP_TIMER_UNIT=stoody-upload-cleanup.timer" in source
+    assert "--status-output" in source
+    assert "upload_deploy_validation_status.json" in source
     assert source.index("Deploy backend to prod") < source.index("Validate upload security runtime controls")

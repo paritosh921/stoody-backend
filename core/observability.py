@@ -92,6 +92,18 @@ UPLOAD_RUNTIME_CONFIG = Gauge(
     ["field"],
 )
 
+UPLOAD_DEPLOY_VALIDATION = Gauge(
+    "skillbot_upload_deploy_validation",
+    "Last upload-security deployment validation state by safe field.",
+    ["field"],
+)
+
+UPLOAD_DEPLOY_VALIDATION_CHECK = Gauge(
+    "skillbot_upload_deploy_validation_check",
+    "Last upload-security deployment validation check result; value is always 1.",
+    ["check", "status"],
+)
+
 OCR_JOB_DURATION_SECONDS = Histogram(
     "skillbot_ocr_job_duration_seconds",
     "OCR job duration in seconds.",
@@ -201,6 +213,10 @@ def set_upload_security_config_metric(metric: str, labels: dict[str, str], value
         UPLOAD_ROUTE_POLICY_INFO.labels(**safe_labels).set(value)
     elif metric == "runtime_config":
         UPLOAD_RUNTIME_CONFIG.labels(**safe_labels).set(value)
+    elif metric == "deploy_validation":
+        UPLOAD_DEPLOY_VALIDATION.labels(**safe_labels).set(value)
+    elif metric == "deploy_validation_check":
+        UPLOAD_DEPLOY_VALIDATION_CHECK.labels(**safe_labels).set(value)
 
 
 def track_websocket_connection(channel: str, delta: int) -> None:

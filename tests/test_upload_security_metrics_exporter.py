@@ -1,3 +1,7 @@
+import json
+import time
+
+import config_async
 from core.upload_security.metrics_exporter import build_upload_security_metric_rows
 
 
@@ -39,3 +43,36 @@ def test_upload_security_metric_rows_do_not_export_secrets():
     ]
     for fragment in forbidden_fragments:
         assert fragment not in rendered
+
+
+def test_upload_security_metric_rows_include_deploy_validation_status(tmp_path, monkeypatch):
+    status_file = tmp_path / "deploy-validation.json"
+    status_file.write_text(
+        json.dumps(
+            {
+                "generated_at_epoch": time.time(),
+                "result": {
+                    "ok": True,
+                    "passed_checks": ["UPLOAD_SCAN_REQUIRED"],
+                    "failed_checks": [],
+                    "details": {"UPLOAD_SCAN_REQUIRED": "true"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_async, "UPLOAD_DEPLOY_VALIDATION_STATUS_FILE", status_file)
+
+    rows = build_upload_security_metric_rows()
+
+    assert any(
+        row["metric"] == "deploy_validation"
+        and row["labels"]["field"] == "ok"
+        and row["value"] == 1.0
+        for row in rows
+    )
+    assert any(
+        row["metric"] == "deploy_validation_check"
+        and row["labels"] == {"check": "UPLOAD_SCAN_REQUIRED", "status": "passed"}
+        for row in rows
+    )

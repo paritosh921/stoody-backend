@@ -41,6 +41,7 @@ UPLOAD_QUARANTINE_RETENTION_HOURS=24
 UPLOAD_SCANNER_TIMEOUT_SECONDS=30
 UPLOAD_FRESHCLAM_MAX_AGE_HOURS=48
 UPLOAD_MAX_REQUEST_BODY_MB=64
+UPLOAD_DEPLOY_VALIDATION_STATUS_FILE=/home/ubuntu/backend/data/upload_deploy_validation_status.json
 UPLOAD_ALLOW_PUBLIC_LOCAL_FALLBACK=false
 UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT=false
 ```
@@ -242,6 +243,9 @@ Required dashboard groups:
   `skillbot_upload_security_rejections_total`.
 - Quarantine, rejected, clean, and derived storage from
   `skillbot_upload_storage_bytes`.
+- Last production deploy validation result from
+  `skillbot_upload_deploy_validation` and
+  `skillbot_upload_deploy_validation_check`.
 
 Prometheus and exporter ports must not be public. Grafana must be authenticated
 and served over HTTPS. Backend metrics access should be restricted to the

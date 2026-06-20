@@ -154,7 +154,8 @@ jobs:
             UPLOAD_CLEANUP_TIMER_UNIT=stoody-upload-cleanup.timer \
             BACKEND_SERVICE_USER='${PROD_MAIN_BACKEND_USER}' \
             BACKEND_HEALTH_URL='${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' \
-            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_upload_security_deploy.py"
+            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_upload_security_deploy.py \
+            --status-output '${PROD_MAIN_BACKEND_PATH}/data/upload_deploy_validation_status.json'"
 
       - name: Invalidate existing sessions after prod deploy
         shell: bash

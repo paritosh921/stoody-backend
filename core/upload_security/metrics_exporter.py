@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import time
+from pathlib import Path
 from typing import Any
 
 import config_async as settings
@@ -95,4 +98,63 @@ def build_upload_security_metric_rows() -> list[dict[str, Any]]:
             }
         )
 
+    rows.extend(_build_deploy_validation_rows(Path(settings.UPLOAD_DEPLOY_VALIDATION_STATUS_FILE)))
+
     return rows
+
+
+def _build_deploy_validation_rows(status_path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = [
+        {
+            "metric": "deploy_validation",
+            "labels": {"field": "status_file_present"},
+            "value": 0.0,
+        },
+        {
+            "metric": "deploy_validation",
+            "labels": {"field": "ok"},
+            "value": 0.0,
+        },
+    ]
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return rows
+
+    rows[0]["value"] = 1.0
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    generated_at = _coerce_float(payload.get("generated_at_epoch"))
+    if generated_at is not None:
+        rows.append(
+            {
+                "metric": "deploy_validation",
+                "labels": {"field": "age_seconds"},
+                "value": max(time.time() - generated_at, 0.0),
+            }
+        )
+
+    rows[1]["value"] = 1.0 if bool(result.get("ok")) else 0.0
+    for check in result.get("passed_checks") or ():
+        rows.append(
+            {
+                "metric": "deploy_validation_check",
+                "labels": {"check": str(check), "status": "passed"},
+                "value": 1.0,
+            }
+        )
+    for check in result.get("failed_checks") or ():
+        rows.append(
+            {
+                "metric": "deploy_validation_check",
+                "labels": {"check": str(check), "status": "failed"},
+                "value": 1.0,
+            }
+        )
+    return rows
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

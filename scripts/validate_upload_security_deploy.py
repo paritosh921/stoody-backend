@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -259,10 +260,24 @@ def _default_runner(command: Sequence[str], timeout: int = 10) -> tuple[int, str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate deployed upload-security runtime controls.")
     parser.add_argument("--nginx-config", action="append", type=Path, default=[])
+    parser.add_argument("--status-output", type=Path, default=None)
     args = parser.parse_args(argv)
     result = run_upload_security_deploy_validation(nginx_config_paths=args.nginx_config)
+    if args.status_output is not None:
+        _write_status_output(args.status_output, result)
     print(json.dumps(result.to_dict(), sort_keys=True))
     return 0 if result.ok else 1
+
+
+def _write_status_output(path: Path, result: DeployValidationResult) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at_epoch": time.time(),
+        "result": result.to_dict(),
+    }
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    temp_path.replace(path)
 
 
 if __name__ == "__main__":
