@@ -27,6 +27,8 @@ Optional environment variables:
   STOODY_CLAMAV_SOCKET=/var/run/clamav/clamd.ctl
   STOODY_CLAMAV_GROUP=clamav
   STOODY_CLAMAV_SOCKET_MODE=660
+  STOODY_DEPLOY_LOCK_PATH=/tmp/stoody-backend-deploy.lock
+  STOODY_DEPLOY_LOCK_TIMEOUT_SECONDS=900
 EOF
 }
 
@@ -48,6 +50,23 @@ if [[ ! -d "$APP_PATH" ]]; then
   echo "App path does not exist: $APP_PATH" >&2
   exit 1
 fi
+
+acquire_deploy_lock() {
+  local lock_path="${STOODY_DEPLOY_LOCK_PATH:-/tmp/stoody-backend-deploy.lock}"
+  local lock_timeout="${STOODY_DEPLOY_LOCK_TIMEOUT_SECONDS:-900}"
+
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "flock is required to serialize deploys on this host" >&2
+    exit 1
+  fi
+
+  echo "Acquiring deploy lock: $lock_path"
+  exec 9>"$lock_path"
+  if ! flock -w "$lock_timeout" 9; then
+    echo "Timed out waiting ${lock_timeout}s for deploy lock: $lock_path" >&2
+    exit 1
+  fi
+}
 
 is_git_dirty() {
   [[ -n "$(git diff --name-only)" || -n "$(git diff --cached --name-only)" ]]
@@ -405,6 +424,7 @@ ensure_private_upload_dirs() {
   fi
 }
 
+acquire_deploy_lock
 sync_git_repo "$APP_PATH" "$BRANCH"
 
 if [[ ! -f "$APP_PATH/$REQUIREMENTS_PATH" ]]; then

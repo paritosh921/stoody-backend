@@ -116,3 +116,23 @@ def test_remote_deploy_script_hardens_clamav_socket_before_backend_restart():
     assert 'sudo -u "$upload_owner" clamdscan --fdpass /etc/hosts' in source
     assert source.index("ensure_clamav_socket_hardening") < source.index("sudo systemctl restart clamav-daemon")
     assert source.rindex("ensure_clamav_socket_hardening") < source.rindex("ensure_private_upload_dirs")
+
+
+def test_remote_deploy_script_serializes_full_host_deploy():
+    source = Path("ops/remote_deploy_python_service.sh").read_text(encoding="utf-8")
+
+    assert "STOODY_DEPLOY_LOCK_PATH" in source
+    assert "STOODY_DEPLOY_LOCK_TIMEOUT_SECONDS" in source
+    assert "flock -w" in source
+    assert "acquire_deploy_lock" in source
+    assert source.rindex("acquire_deploy_lock") < source.index('sync_git_repo "$APP_PATH" "$BRANCH"')
+
+
+def test_backend_deploy_workflows_queue_instead_of_canceling_remote_deploys():
+    for workflow in (
+        Path(".github/workflows/deploy-prod-backend.yml"),
+        Path(".github/workflows/deploy-dev-backend.yml"),
+    ):
+        source = workflow.read_text(encoding="utf-8")
+        assert "concurrency:" in source
+        assert "cancel-in-progress: false" in source

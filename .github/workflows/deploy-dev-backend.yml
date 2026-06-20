@@ -33,7 +33,7 @@ permissions:
 
 concurrency:
   group: deploy-dev-backend
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:

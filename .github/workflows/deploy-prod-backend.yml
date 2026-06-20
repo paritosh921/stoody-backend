@@ -27,7 +27,7 @@ permissions:
 
 concurrency:
   group: deploy-prod-backend
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
