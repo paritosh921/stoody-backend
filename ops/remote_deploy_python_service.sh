@@ -19,6 +19,9 @@ Optional environment variables:
   MENTOR_AI_PORT=3000
   MENTOR_AI_HEALTHCHECK_URL=http://127.0.0.1:3000/mentor-ai/api/health
   NGINX_SITE_PATH=/etc/nginx/sites-available/skillbot_nginx_alb.conf
+  STOODY_UPLOAD_ROOT=/var/lib/stoody/uploads
+  STOODY_UPLOAD_OWNER=<app owner, defaults to APP_PATH owner>
+  STOODY_UPLOAD_GROUP=clamav
 EOF
 }
 
@@ -267,6 +270,41 @@ reload_nginx_if_config_provided() {
   sudo systemctl reload nginx
 }
 
+ensure_private_upload_dirs() {
+  local upload_root="${STOODY_UPLOAD_ROOT:-/var/lib/stoody/uploads}"
+  local upload_owner="${STOODY_UPLOAD_OWNER:-}"
+  local upload_group="${STOODY_UPLOAD_GROUP:-clamav}"
+
+  if [[ -z "$upload_owner" ]]; then
+    upload_owner="$(stat -c '%U' "$APP_PATH")"
+  fi
+
+  if ! getent passwd "$upload_owner" >/dev/null; then
+    echo "Upload directory owner does not exist: $upload_owner" >&2
+    exit 1
+  fi
+
+  if ! getent group "$upload_group" >/dev/null; then
+    echo "Upload directory group does not exist: $upload_group" >&2
+    exit 1
+  fi
+
+  echo "Ensuring private upload directories under $upload_root ($upload_owner:$upload_group)"
+  sudo install -d -o "$upload_owner" -g "$upload_group" -m 2750 \
+    "$upload_root" \
+    "$upload_root/quarantine" \
+    "$upload_root/clean" \
+    "$upload_root/rejected"
+
+  sudo find "$upload_root" -type d -exec chmod 2750 {} +
+  sudo chown -R "$upload_owner:$upload_group" "$upload_root"
+
+  if sudo nginx -T 2>/dev/null | grep -Eq "^[[:space:]]*(root|alias)[[:space:]]+$upload_root(/|;)|/var/lib/stoody"; then
+    echo "Nginx appears to expose private upload storage; refusing to continue" >&2
+    exit 1
+  fi
+}
+
 sync_git_repo "$APP_PATH" "$BRANCH"
 
 if [[ ! -f "$APP_PATH/$REQUIREMENTS_PATH" ]]; then
@@ -288,6 +326,8 @@ cd "$APP_PATH"
 
 echo "Installing Python dependencies"
 python -m pip install --disable-pip-version-check -r "$REQUIREMENTS_PATH"
+
+ensure_private_upload_dirs
 
 echo "Restarting service via $SERVICE_MANAGER"
 case "$SERVICE_MANAGER" in
