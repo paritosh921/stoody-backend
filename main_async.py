@@ -81,6 +81,7 @@ from core.cache import CacheManager
 from core.auth import AuthManager
 from core.metrics_access import is_metrics_request_authorized
 from core.observability import (
+    clear_upload_deploy_validation_check_metrics,
     set_dependency_health,
     set_upload_freshclam_age_seconds,
     set_upload_security_config_metric,
@@ -423,6 +424,7 @@ logger = logging.getLogger(__name__)
 
 def _refresh_upload_security_config_metrics() -> None:
     try:
+        clear_upload_deploy_validation_check_metrics()
         for row in build_upload_security_metric_rows():
             set_upload_security_config_metric(
                 metric=row["metric"],

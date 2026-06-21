@@ -219,6 +219,10 @@ def set_upload_security_config_metric(metric: str, labels: dict[str, str], value
         UPLOAD_DEPLOY_VALIDATION_CHECK.labels(**safe_labels).set(value)
 
 
+def clear_upload_deploy_validation_check_metrics() -> None:
+    UPLOAD_DEPLOY_VALIDATION_CHECK.clear()
+
+
 def track_websocket_connection(channel: str, delta: int) -> None:
     WEBSOCKET_CONNECTIONS.labels(channel=_safe(channel)).inc(delta)
 

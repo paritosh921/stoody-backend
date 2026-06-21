@@ -2,6 +2,7 @@ import json
 import time
 
 import config_async
+from core import observability
 from core.upload_security.metrics_exporter import build_upload_security_metric_rows
 
 
@@ -76,3 +77,24 @@ def test_upload_security_metric_rows_include_deploy_validation_status(tmp_path, 
         and row["labels"] == {"check": "UPLOAD_SCAN_REQUIRED", "status": "passed"}
         for row in rows
     )
+
+
+def test_deploy_validation_check_gauge_can_be_cleared_between_snapshots():
+    observability.set_upload_security_config_metric(
+        "deploy_validation_check",
+        {"check": "UPLOAD_SCAN_REQUIRED", "status": "failed"},
+        1.0,
+    )
+    assert _has_deploy_validation_check_sample("UPLOAD_SCAN_REQUIRED", "failed")
+
+    observability.clear_upload_deploy_validation_check_metrics()
+
+    assert not _has_deploy_validation_check_sample("UPLOAD_SCAN_REQUIRED", "failed")
+
+
+def _has_deploy_validation_check_sample(check: str, status: str) -> bool:
+    for metric in observability.UPLOAD_DEPLOY_VALIDATION_CHECK.collect():
+        for sample in metric.samples:
+            if sample.labels.get("check") == check and sample.labels.get("status") == status:
+                return True
+    return False
