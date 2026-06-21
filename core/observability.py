@@ -123,6 +123,42 @@ DEPENDENCY_HEALTH = Gauge(
     ["dependency"],
 )
 
+AI_USAGE_TOKENS = Gauge(
+    "skillbot_ai_usage_tokens",
+    "General backend AI usage tokens from ai_usage_events.",
+    ["period", "provider", "model", "stage", "status", "token_type"],
+)
+
+AI_USAGE_CALLS = Gauge(
+    "skillbot_ai_usage_calls",
+    "General backend AI usage calls from ai_usage_events.",
+    ["period", "provider", "model", "stage", "status"],
+)
+
+AI_USAGE_TOP_USER_TOKENS = Gauge(
+    "skillbot_ai_usage_top_user_tokens",
+    "Top-N general backend AI token usage by hashed user reference.",
+    ["period", "rank", "user_ref"],
+)
+
+AI_USAGE_TOP_TENANT_TOKENS = Gauge(
+    "skillbot_ai_usage_top_tenant_tokens",
+    "Top-N general backend AI token usage by hashed tenant reference.",
+    ["period", "rank", "tenant_ref"],
+)
+
+EXAMPEN_AI_USAGE_TOKENS = Gauge(
+    "skillbot_exampen_ai_usage_tokens",
+    "ExamPen LLM gate usage tokens from llm_token_usage_log.",
+    ["period", "caller", "model", "token_type"],
+)
+
+EXAMPEN_AI_USAGE_CALLS = Gauge(
+    "skillbot_exampen_ai_usage_calls",
+    "ExamPen LLM gate usage calls from llm_token_usage_log.",
+    ["period", "caller", "model"],
+)
+
 
 def _safe(value: str | None, fallback: str = "unknown") -> str:
     if value is None:
@@ -221,6 +257,31 @@ def set_upload_security_config_metric(metric: str, labels: dict[str, str], value
 
 def clear_upload_deploy_validation_check_metrics() -> None:
     UPLOAD_DEPLOY_VALIDATION_CHECK.clear()
+
+
+def set_ai_usage_metric(metric: str, labels: dict[str, str], value: float) -> None:
+    safe_labels = {key: _safe(val) for key, val in labels.items()}
+    if metric == "general_tokens":
+        AI_USAGE_TOKENS.labels(**safe_labels).set(value)
+    elif metric == "general_calls":
+        AI_USAGE_CALLS.labels(**safe_labels).set(value)
+    elif metric == "general_top_user_tokens":
+        AI_USAGE_TOP_USER_TOKENS.labels(**safe_labels).set(value)
+    elif metric == "general_top_tenant_tokens":
+        AI_USAGE_TOP_TENANT_TOKENS.labels(**safe_labels).set(value)
+    elif metric == "exampen_tokens":
+        EXAMPEN_AI_USAGE_TOKENS.labels(**safe_labels).set(value)
+    elif metric == "exampen_calls":
+        EXAMPEN_AI_USAGE_CALLS.labels(**safe_labels).set(value)
+
+
+def clear_ai_usage_metrics() -> None:
+    AI_USAGE_TOKENS.clear()
+    AI_USAGE_CALLS.clear()
+    AI_USAGE_TOP_USER_TOKENS.clear()
+    AI_USAGE_TOP_TENANT_TOKENS.clear()
+    EXAMPEN_AI_USAGE_TOKENS.clear()
+    EXAMPEN_AI_USAGE_CALLS.clear()
 
 
 def track_websocket_connection(channel: str, delta: int) -> None:

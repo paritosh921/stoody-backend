@@ -81,13 +81,16 @@ from core.cache import CacheManager
 from core.auth import AuthManager
 from core.metrics_access import is_metrics_request_authorized
 from core.observability import (
+    clear_ai_usage_metrics,
     clear_upload_deploy_validation_check_metrics,
     set_dependency_health,
+    set_ai_usage_metric,
     set_upload_freshclam_age_seconds,
     set_upload_security_config_metric,
     set_upload_security_alert,
     set_upload_storage_usage,
 )
+from core.ai_usage.metrics_exporter import build_ai_usage_metric_rows
 from core.upload_security.cleanup import collect_upload_storage_usage
 from core.upload_security.metrics_exporter import build_upload_security_metric_rows
 from core.upload_security.scanner import ClamAVScanner
@@ -433,6 +436,21 @@ def _refresh_upload_security_config_metrics() -> None:
             )
     except Exception as exc:
         logger.warning("Upload security config metrics refresh failed: %s", exc)
+
+
+async def _refresh_ai_usage_metrics(db_manager: DatabaseManager | None) -> None:
+    if db_manager is None:
+        return
+    try:
+        clear_ai_usage_metrics()
+        for row in await build_ai_usage_metric_rows(db_manager):
+            set_ai_usage_metric(
+                metric=row["metric"],
+                labels=row["labels"],
+                value=row["value"],
+            )
+    except Exception as exc:
+        logger.warning("AI usage metrics refresh failed: %s", exc)
 
 
 # Add rolling file log so Promtail can scrape backend runtime logs.
@@ -1671,7 +1689,7 @@ async def healthz_alias(request: Request):
 
 # Compatibility metrics endpoints for CDN/proxy path routing.
 if ENABLE_METRICS:
-    def _render_metrics(request: Request) -> Response:
+    async def _render_metrics(request: Request) -> Response:
         if generate_latest is None:
             raise HTTPException(status_code=503, detail="prometheus_client unavailable")
         if not is_metrics_request_authorized(
@@ -1681,6 +1699,7 @@ if ENABLE_METRICS:
         ):
             raise HTTPException(status_code=403, detail="Metrics access denied")
         _refresh_upload_security_config_metrics()
+        await _refresh_ai_usage_metrics(getattr(app.state, "db", None))
         return Response(
             content=generate_latest(),
             media_type=CONTENT_TYPE_LATEST,
@@ -1695,17 +1714,17 @@ if ENABLE_METRICS:
     @app.get("/metrics", include_in_schema=DEBUG_MODE)
     @limiter.limit("120/minute")
     async def metrics_root(request: Request):
-        return _render_metrics(request)
+        return await _render_metrics(request)
 
     @app.get("/api/metrics", include_in_schema=DEBUG_MODE)
     @limiter.limit("120/minute")
     async def metrics_api_alias(request: Request):
-        return _render_metrics(request)
+        return await _render_metrics(request)
 
     @app.get("/api/v1/metrics", include_in_schema=DEBUG_MODE)
     @limiter.limit("120/minute")
     async def metrics_v1_alias(request: Request):
-        return _render_metrics(request)
+        return await _render_metrics(request)
 
 # Legacy compatibility endpoint for token verification
 @app.get("/verify")
