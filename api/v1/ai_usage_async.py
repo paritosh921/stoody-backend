@@ -7,8 +7,11 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from bson import ObjectId
 
 from api.v1.auth_async import get_current_user, get_database
+from core.ai_usage.metrics_exporter import public_identity_ref
+from core.ai_usage.user_lookup import build_user_ref_lookup_response
 from core.database import DatabaseManager
 
 
@@ -32,6 +35,17 @@ def _is_admin(user: Dict[str, Any]) -> bool:
 
 def _user_id(user: Dict[str, Any]) -> str:
     return str(user.get("user_id") or user.get("_id") or "")
+
+
+def _period_bounds(period: str) -> tuple[datetime, datetime]:
+    now = datetime.utcnow()
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "7d":
+        start = now - timedelta(days=7)
+    else:
+        start = now - timedelta(days=30)
+    return start, now
 
 
 async def _collection(db: DatabaseManager, user: Dict[str, Any], name: str):
@@ -163,6 +177,58 @@ async def get_ai_usage_summary(
     return {"group_by": group_by, "items": await collection.aggregate(pipeline).to_list(length=500)}
 
 
+@router.get("/user-refs/{user_ref}")
+async def lookup_ai_usage_user_ref(
+    user_ref: str,
+    period: str = Query("30d", pattern="^(today|7d|30d)$"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    collection = await _collection(db, current_user, "ai_usage_events")
+    if collection is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unavailable")
+
+    start, end = _period_bounds(period)
+    distinct_user_ids = await collection.distinct("user_id", {"user_id": {"$exists": True, "$nin": ["", None]}})
+    matching_user_ids = [
+        str(user_id)
+        for user_id in distinct_user_ids
+        if public_identity_ref(user_id, prefix="user") == user_ref
+    ]
+    if not matching_user_ids:
+        return build_user_ref_lookup_response(user_ref, events=[], profiles={}) | {
+            "period": period,
+            "from": start,
+            "to": end,
+        }
+
+    projection = {
+        "_id": 0,
+        "user_id": 1,
+        "provider": 1,
+        "model": 1,
+        "stage": 1,
+        "status": 1,
+        "estimated_total_tokens": 1,
+        "actual_input_tokens": 1,
+        "actual_output_tokens": 1,
+        "created_at": 1,
+    }
+    cursor = collection.find(
+        {"user_id": {"$in": matching_user_ids}, **_date_filter(start, end)},
+        projection,
+    ).sort("created_at", -1).limit(10000)
+    events = await cursor.to_list(length=10000)
+    profiles = await _lookup_user_profiles(db, current_user, matching_user_ids)
+    return build_user_ref_lookup_response(user_ref, events=events, profiles=profiles) | {
+        "period": period,
+        "from": start,
+        "to": end,
+    }
+
+
 @router.patch("/users/{user_id}/limits")
 async def patch_user_limits(
     user_id: str,
@@ -205,6 +271,60 @@ async def _patch_limits(
         upsert=True,
     )
     return {"success": True, "scope": scope, "subject_id": subject_id, "limits": updates}
+
+
+async def _lookup_user_profiles(
+    db: DatabaseManager,
+    user: Dict[str, Any],
+    user_ids: List[str],
+) -> Dict[str, Dict[str, Any]]:
+    if user.get("user_type") == "b2c_admin":
+        context_db = await db.get_b2c_db()
+    else:
+        context_db = await db.get_context_db()
+    if context_db is None:
+        return {}
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for user_id in user_ids:
+        for collection_name, role in (
+            ("students", "student"),
+            ("tutors", "tutor"),
+            ("admins", "admin"),
+            ("users", "user"),
+        ):
+            doc = await context_db[collection_name].find_one(_profile_query(user_id))
+            if doc:
+                profiles[user_id] = _safe_profile(doc, role)
+                break
+    return profiles
+
+
+def _profile_query(user_id: str) -> Dict[str, Any]:
+    candidates: List[Any] = [user_id]
+    if ObjectId.is_valid(user_id):
+        candidates.append(ObjectId(user_id))
+    return {
+        "$or": [
+            {"_id": {"$in": candidates}},
+            {"user_id": user_id},
+            {"student_id": user_id},
+            {"tutor_id": user_id},
+            {"admin_id": user_id},
+            {"username": user_id},
+        ]
+    }
+
+
+def _safe_profile(doc: Dict[str, Any], role: str) -> Dict[str, Any]:
+    name = doc.get("name") or doc.get("full_name") or doc.get("student_name") or doc.get("tutor_name") or doc.get("admin_name")
+    return {
+        "role": role,
+        "name": name,
+        "username": doc.get("username"),
+        "email": doc.get("email"),
+        "phone": doc.get("phone") or doc.get("mobile"),
+    }
 
 
 async def _summary(
