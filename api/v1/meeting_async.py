@@ -8,7 +8,7 @@ Handles Jitsi integration for online classes.
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
 import logging
 
@@ -24,6 +24,55 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
+
+STUDENT_JOIN_EARLY_WINDOW = timedelta(minutes=5)
+STUDENT_JOIN_NOT_OPEN_DETAIL = (
+    "Class is not open for joining yet. Students can join 5 minutes before "
+    "the scheduled start time."
+)
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _student_join_opens_at(meeting: Dict[str, Any]) -> Optional[datetime]:
+    scheduled_at = _parse_datetime(meeting.get("scheduled_at"))
+    if not scheduled_at:
+        return None
+    return _to_naive_utc(scheduled_at) - STUDENT_JOIN_EARLY_WINDOW
+
+
+def _is_student_joinable(meeting: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    if meeting.get("status") not in {"scheduled", "active"}:
+        return False
+
+    opens_at = _student_join_opens_at(meeting)
+    if opens_at is None:
+        return meeting.get("status") == "active"
+
+    current_time = _to_naive_utc(now or datetime.now(timezone.utc))
+    return current_time >= opens_at
+
+
+def _student_visible_status(meeting: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    status = meeting.get("status")
+    if status == "active" and not _is_student_joinable(meeting, now=now):
+        return "scheduled"
+    return status
 
 
 # Helper dependency functions
@@ -149,6 +198,7 @@ class StudentMeetingResponse(BaseModel):
     meet_link: Optional[str] = None
     meet_code: Optional[str] = None
     status: str
+    can_join: bool = False
     started_at: Optional[datetime] = None
     provider_details: Optional[ProviderDetails] = None
 
@@ -622,32 +672,35 @@ async def get_student_meetings(
     meetings = sorted(meetings, key=lambda m: m.get("scheduled_at", datetime.min))
 
     responses: List[StudentMeetingResponse] = []
+    now = datetime.now(timezone.utc)
     for m in meetings:
+        can_join = _is_student_joinable(m, now=now)
         provider = (
             _provider_or_none(
                 m.get("meeting_id"),
                 current_user=current_user,
                 moderator=False,
             )
-            if m.get("status") == "active"
+            if can_join
             else None
         )
         meet_link, meet_code = _provider_video_fields(provider)
         responses.append(
             StudentMeetingResponse(
-            meeting_id=m.get("meeting_id"),
-            topic=m.get("topic"),
-            subject=m.get("subject"),
-            standard=m.get("standard"),
-            section=m.get("section"),
-            tutor_name=m.get("tutor_name"),
-            scheduled_at=m.get("scheduled_at"),
-            duration_minutes=m.get("duration_minutes", 60),
-            meet_link=meet_link,
-            meet_code=meet_code,
-            status=m.get("status"),
-            started_at=m.get("started_at"),
-            provider_details=provider,
+                meeting_id=m.get("meeting_id"),
+                topic=m.get("topic"),
+                subject=m.get("subject"),
+                standard=m.get("standard"),
+                section=m.get("section"),
+                tutor_name=m.get("tutor_name"),
+                scheduled_at=m.get("scheduled_at"),
+                duration_minutes=m.get("duration_minutes", 60),
+                meet_link=meet_link,
+                meet_code=meet_code,
+                status=_student_visible_status(m, now=now),
+                can_join=can_join,
+                started_at=m.get("started_at"),
+                provider_details=provider,
             )
         )
     return responses
@@ -676,10 +729,12 @@ async def get_available_meetings_for_student(
     meetings = sorted(meetings, key=lambda m: m.get("scheduled_at", datetime.min))
 
     response = []
+    now = datetime.now(timezone.utc)
     for m in meetings:
+        can_join = _is_student_joinable(m, now=now)
         meet_link, meet_code = (
             _public_video_fields(m.get("meeting_id"))
-            if m.get("status") == "active"
+            if can_join
             else (None, None)
         )
         response.append({
@@ -693,7 +748,8 @@ async def get_available_meetings_for_student(
             "meet_code": meet_code,
             "provider": "jitsi" if meet_link else None,
             "requires_authenticated_join": bool(meet_link),
-            "status": m.get("status"),
+            "status": _student_visible_status(m, now=now),
+            "can_join": can_join,
             "student_count": len(m.get("invited_student_ids", [])),
             "started_at": m.get("started_at").isoformat() if m.get("started_at") else None,
         })
@@ -900,8 +956,8 @@ async def student_join_meeting(
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if meeting.get("status") != "active":
-        raise HTTPException(status_code=400, detail="Meeting is not active")
+    if not _is_student_joinable(meeting):
+        raise HTTPException(status_code=400, detail=STUDENT_JOIN_NOT_OPEN_DETAIL)
 
     # Verify student was invited
     if student_id not in meeting.get("invited_student_ids", []):
@@ -939,15 +995,14 @@ async def student_join_meeting_auth(
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if meeting.get("status") != "active":
-        raise HTTPException(status_code=400, detail="Meeting is not active")
-
     user_type = current_user.get("user_type")
     moderator = False
     if user_type == "tutor":
         tutor_id = current_user.get("tutor_id")
         if meeting.get("tutor_id") != tutor_id:
             raise HTTPException(status_code=403, detail="Not authorized to join this meeting")
+        if meeting.get("status") != "active":
+            raise HTTPException(status_code=400, detail="Meeting is not active")
         moderator = True
     elif user_type == "student":
         student_id = await resolve_business_student_id(current_user, db)
@@ -955,6 +1010,8 @@ async def student_join_meeting_auth(
             raise HTTPException(status_code=403, detail="Could not resolve student identity")
         if student_id not in meeting.get("invited_student_ids", []):
             raise HTTPException(status_code=403, detail="Student not invited to this meeting")
+        if not _is_student_joinable(meeting):
+            raise HTTPException(status_code=400, detail=STUDENT_JOIN_NOT_OPEN_DETAIL)
 
         await db.mongo_update_one(
             "meetings",

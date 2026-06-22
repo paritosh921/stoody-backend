@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -106,13 +106,22 @@ class FakeDb:
 
     async def mongo_update_one(self, collection, query, update, upsert=False):
         updates = update.get("$set", {})
+        add_to_set = update.get("$addToSet", {})
         for doc in self.collections.get(collection, []):
             if all(doc.get(key) == value for key, value in query.items()):
                 doc.update(updates)
+                for key, value in add_to_set.items():
+                    values = doc.setdefault(key, [])
+                    if value not in values:
+                        values.append(value)
                 return True
         if upsert:
             new_doc = query.copy()
             new_doc.update(updates)
+            for key, value in add_to_set.items():
+                new_doc.setdefault(key, [])
+                if value not in new_doc[key]:
+                    new_doc[key].append(value)
             self.collections.setdefault(collection, []).append(new_doc)
             return True
         return False
@@ -748,6 +757,115 @@ async def _test_find_eligible_students_includes_tutor_class_assignment_for_all_s
     )
 
     assert set(invited) == {"STU_11A"}
+
+
+def test_student_meetings_hide_early_started_class_until_join_window():
+    asyncio.run(_test_student_meetings_hide_early_started_class_until_join_window())
+
+
+async def _test_student_meetings_hide_early_started_class_until_join_window():
+    from api.v1 import meeting_async
+
+    now = datetime.now(timezone.utc)
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_EARLY",
+        "topic": "Future Physics",
+        "subject": "Physics",
+        "standard": "11",
+        "section": "A",
+        "tutor_name": "Tutor One",
+        "scheduled_at": now + timedelta(minutes=30),
+        "duration_minutes": 60,
+        "status": "active",
+        "started_at": now,
+        "invited_student_ids": ["STU_1"],
+    })
+
+    meetings = await meeting_async.get_student_meetings.__wrapped__(
+        request=None,
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert len(meetings) == 1
+    assert meetings[0].status == "scheduled"
+    assert meetings[0].can_join is False
+    assert meetings[0].provider_details is None
+
+
+def test_student_join_auth_allows_scheduled_class_inside_five_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_allows_scheduled_class_inside_five_minute_window(monkeypatch))
+
+
+async def _test_student_join_auth_allows_scheduled_class_inside_five_minute_window(monkeypatch):
+    from api.v1 import meeting_async
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_JOIN",
+        "scheduled_at": datetime.now(timezone.utc) + timedelta(minutes=4),
+        "status": "scheduled",
+        "invited_student_ids": ["STU_1"],
+        "joined_student_ids": [],
+    })
+
+    def fake_provider(meeting_id, current_user, moderator):
+        assert meeting_id == "MTG_JOIN"
+        assert moderator is False
+        return meeting_async.ProviderDetails(
+            provider="jitsi",
+            domain="class.example.com",
+            room_name="stoody-MTG_JOIN",
+            url="https://class.example.com/stoody-MTG_JOIN",
+            configured=True,
+        )
+
+    monkeypatch.setattr(meeting_async, "_require_provider_details", fake_provider)
+
+    result = await meeting_async.student_join_meeting_auth.__wrapped__(
+        request=None,
+        meeting_id="MTG_JOIN",
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert result["meet_link"] == "https://class.example.com/stoody-MTG_JOIN"
+    assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
+
+
+def test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch))
+
+
+async def _test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import meeting_async
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_TOO_EARLY",
+        "scheduled_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+        "status": "active",
+        "invited_student_ids": ["STU_1"],
+        "joined_student_ids": [],
+    })
+
+    def fail_if_provider_requested(*args, **kwargs):
+        raise AssertionError("student should be blocked before provider session is created")
+
+    monkeypatch.setattr(meeting_async, "_require_provider_details", fail_if_provider_requested)
+
+    with pytest.raises(HTTPException) as exc:
+        await meeting_async.student_join_meeting_auth.__wrapped__(
+            request=None,
+            meeting_id="MTG_TOO_EARLY",
+            current_user={"user_type": "student", "student_id": "STU_1"},
+            db=db,
+        )
+
+    assert exc.value.status_code == 400
+    assert "5 minutes" in exc.value.detail
 
 
 def test_canvas_request_defaults_to_joined_students():
