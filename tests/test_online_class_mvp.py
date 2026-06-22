@@ -700,6 +700,56 @@ async def _test_find_eligible_students_requires_tutor_mapping_and_class_match():
     assert set(invited) == {"STU_ASSIGNED_MATCH", "STU_TEACHERIDS_MATCH"}
 
 
+def test_find_eligible_students_includes_tutor_class_assignment_for_all_sections():
+    asyncio.run(_test_find_eligible_students_includes_tutor_class_assignment_for_all_sections())
+
+
+async def _test_find_eligible_students_includes_tutor_class_assignment_for_all_sections():
+    from bson import ObjectId
+    from api.v1.meeting_async import _find_eligible_students
+
+    admin_oid = ObjectId()
+    db = FakeDb()
+    db.collections["tutors"].append({
+        "tutor_id": "tutor-11",
+        "assigned_student_ids": [],
+        "teaching_assignments": [
+            {"standard": "11", "subject": "Physics", "sections": ["A"]}
+        ],
+        "created_by": str(admin_oid),
+    })
+    db.collections["students"].extend([
+        {
+            "student_id": "STU_11A",
+            "admin_id": admin_oid,
+            "grade": "11",
+            "section": "A",
+            "subjects": ["Physics"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_11B",
+            "admin_id": admin_oid,
+            "grade": "11",
+            "section": "B",
+            "subjects": ["Physics"],
+            "is_active": True,
+        },
+    ])
+
+    invited = await _find_eligible_students(
+        db=db,
+        tutor_id="tutor-11",
+        standard="11",
+        section=None,
+        subject="Physics",
+        course_type=None,
+        admin_id=str(admin_oid),
+    )
+
+    assert set(invited) == {"STU_11A"}
+
+
 def test_canvas_request_defaults_to_joined_students():
     from api.v1.online_class.router import _validate_requested_student_ids
 

@@ -397,11 +397,18 @@ async def _find_eligible_students(
 ) -> List[str]:
     """Find students eligible for the meeting based on criteria"""
     from bson import ObjectId
+    from utils.tutor_scoping import build_tutor_class_criteria
 
     tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
     assigned_ids = [
         sid for sid in (tutor.get("assigned_student_ids", []) if tutor else []) if sid
     ]
+    admin_oid = None
+    if admin_id:
+        try:
+            admin_oid = ObjectId(admin_id)
+        except Exception:
+            admin_oid = None
 
     # Build query for students
     query_conditions = []
@@ -409,15 +416,15 @@ async def _find_eligible_students(
     mapping_conditions: List[Dict[str, Any]] = [{"teacher_ids": {"$in": [tutor_id]}}]
     if assigned_ids:
         mapping_conditions.append({"student_id": {"$in": assigned_ids}})
+    if tutor and admin_oid is not None:
+        class_criteria = build_tutor_class_criteria(tutor, admin_oid)
+        if class_criteria:
+            mapping_conditions.append(class_criteria)
     query_conditions.append({"$or": mapping_conditions})
 
     # Match by admin (same organization)
-    if admin_id:
-        try:
-            admin_oid = ObjectId(admin_id)
-            query_conditions.append({"admin_id": admin_oid})
-        except Exception:
-            pass
+    if admin_oid is not None:
+        query_conditions.append({"admin_id": admin_oid})
 
     # Match by standard/grade
     if standard:
