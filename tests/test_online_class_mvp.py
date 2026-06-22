@@ -759,11 +759,11 @@ async def _test_find_eligible_students_includes_tutor_class_assignment_for_all_s
     assert set(invited) == {"STU_11A"}
 
 
-def test_student_meetings_hide_early_started_class_until_join_window():
-    asyncio.run(_test_student_meetings_hide_early_started_class_until_join_window())
+def test_student_meetings_show_started_class_as_joinable_even_before_schedule():
+    asyncio.run(_test_student_meetings_show_started_class_as_joinable_even_before_schedule())
 
 
-async def _test_student_meetings_hide_early_started_class_until_join_window():
+async def _test_student_meetings_show_started_class_as_joinable_even_before_schedule():
     from api.v1 import meeting_async
 
     now = datetime.now(timezone.utc)
@@ -789,9 +789,8 @@ async def _test_student_meetings_hide_early_started_class_until_join_window():
     )
 
     assert len(meetings) == 1
-    assert meetings[0].status == "scheduled"
-    assert meetings[0].can_join is False
-    assert meetings[0].provider_details is None
+    assert meetings[0].status == "active"
+    assert meetings[0].can_join is True
 
 
 def test_student_join_auth_allows_scheduled_class_inside_five_minute_window(monkeypatch):
@@ -834,12 +833,11 @@ async def _test_student_join_auth_allows_scheduled_class_inside_five_minute_wind
     assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
 
 
-def test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch):
-    asyncio.run(_test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch))
+def test_student_join_auth_allows_started_class_before_five_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_allows_started_class_before_five_minute_window(monkeypatch))
 
 
-async def _test_student_join_auth_blocks_started_class_before_five_minute_window(monkeypatch):
-    from fastapi import HTTPException
+async def _test_student_join_auth_allows_started_class_before_five_minute_window(monkeypatch):
     from api.v1 import meeting_async
 
     db = FakeDb()
@@ -847,6 +845,47 @@ async def _test_student_join_auth_blocks_started_class_before_five_minute_window
         "meeting_id": "MTG_TOO_EARLY",
         "scheduled_at": datetime.now(timezone.utc) + timedelta(minutes=30),
         "status": "active",
+        "invited_student_ids": ["STU_1"],
+        "joined_student_ids": [],
+    })
+
+    def fake_provider(meeting_id, current_user, moderator):
+        assert meeting_id == "MTG_TOO_EARLY"
+        assert moderator is False
+        return meeting_async.ProviderDetails(
+            provider="jitsi",
+            domain="class.example.com",
+            room_name="stoody-MTG_TOO_EARLY",
+            url="https://class.example.com/stoody-MTG_TOO_EARLY",
+            configured=True,
+        )
+
+    monkeypatch.setattr(meeting_async, "_require_provider_details", fake_provider)
+
+    result = await meeting_async.student_join_meeting_auth.__wrapped__(
+        request=None,
+        meeting_id="MTG_TOO_EARLY",
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert result["meet_link"] == "https://class.example.com/stoody-MTG_TOO_EARLY"
+    assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
+
+
+def test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch))
+
+
+async def _test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch):
+    from fastapi import HTTPException
+    from api.v1 import meeting_async
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_SCHEDULED_TOO_EARLY",
+        "scheduled_at": datetime.now(timezone.utc) + timedelta(minutes=30),
+        "status": "scheduled",
         "invited_student_ids": ["STU_1"],
         "joined_student_ids": [],
     })
@@ -859,7 +898,7 @@ async def _test_student_join_auth_blocks_started_class_before_five_minute_window
     with pytest.raises(HTTPException) as exc:
         await meeting_async.student_join_meeting_auth.__wrapped__(
             request=None,
-            meeting_id="MTG_TOO_EARLY",
+            meeting_id="MTG_SCHEDULED_TOO_EARLY",
             current_user={"user_type": "student", "student_id": "STU_1"},
             db=db,
         )

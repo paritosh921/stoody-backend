@@ -59,10 +59,12 @@ def _student_join_opens_at(meeting: Dict[str, Any]) -> Optional[datetime]:
 def _is_student_joinable(meeting: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if meeting.get("status") not in {"scheduled", "active"}:
         return False
+    if meeting.get("status") == "active":
+        return True
 
     opens_at = _student_join_opens_at(meeting)
     if opens_at is None:
-        return meeting.get("status") == "active"
+        return False
 
     current_time = _to_naive_utc(now or datetime.now(timezone.utc))
     return current_time >= opens_at
