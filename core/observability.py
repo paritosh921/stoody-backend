@@ -63,6 +63,30 @@ UPLOAD_STORAGE_BYTES = Gauge(
     ["prefix"],
 )
 
+BACKEND_STORAGE_BYTES = Gauge(
+    "skillbot_backend_storage_bytes",
+    "Backend storage bytes by storage area and kind.",
+    ["storage", "kind"],
+)
+
+TENANT_STORAGE_BYTES = Gauge(
+    "skillbot_tenant_storage_bytes",
+    "Tenant-scoped storage bytes by hashed tenant reference, storage area, prefix, and kind.",
+    ["tenant_ref", "storage", "prefix", "kind"],
+)
+
+MONGODB_STORAGE_BYTES = Gauge(
+    "skillbot_mongodb_storage_bytes",
+    "MongoDB storage bytes by database role, hashed tenant reference, and kind.",
+    ["database_role", "tenant_ref", "kind"],
+)
+
+STORAGE_USAGE_COLLECTOR = Gauge(
+    "skillbot_storage_usage_collector",
+    "Storage usage collector status fields.",
+    ["field"],
+)
+
 UPLOAD_FRESHCLAM_AGE_SECONDS = Gauge(
     "skillbot_upload_freshclam_age_seconds",
     "Age in seconds of local ClamAV signature metadata.",
@@ -257,6 +281,25 @@ def set_upload_security_config_metric(metric: str, labels: dict[str, str], value
 
 def clear_upload_deploy_validation_check_metrics() -> None:
     UPLOAD_DEPLOY_VALIDATION_CHECK.clear()
+
+
+def set_storage_usage_metric(metric: str, labels: dict[str, str], value: float) -> None:
+    safe_labels = {key: _safe(val) for key, val in labels.items()}
+    if metric == "backend_storage":
+        BACKEND_STORAGE_BYTES.labels(**safe_labels).set(value)
+    elif metric == "tenant_storage":
+        TENANT_STORAGE_BYTES.labels(**safe_labels).set(value)
+    elif metric == "mongodb_storage":
+        MONGODB_STORAGE_BYTES.labels(**safe_labels).set(value)
+    elif metric == "storage_collector":
+        STORAGE_USAGE_COLLECTOR.labels(**safe_labels).set(value)
+
+
+def clear_storage_usage_metrics() -> None:
+    BACKEND_STORAGE_BYTES.clear()
+    TENANT_STORAGE_BYTES.clear()
+    MONGODB_STORAGE_BYTES.clear()
+    STORAGE_USAGE_COLLECTOR.clear()
 
 
 def set_ai_usage_metric(metric: str, labels: dict[str, str], value: float) -> None:

@@ -82,15 +82,18 @@ from core.auth import AuthManager
 from core.metrics_access import is_metrics_request_authorized
 from core.observability import (
     clear_ai_usage_metrics,
+    clear_storage_usage_metrics,
     clear_upload_deploy_validation_check_metrics,
     set_dependency_health,
     set_ai_usage_metric,
+    set_storage_usage_metric,
     set_upload_freshclam_age_seconds,
     set_upload_security_config_metric,
     set_upload_security_alert,
     set_upload_storage_usage,
 )
 from core.ai_usage.metrics_exporter import build_ai_usage_metric_rows
+from core.storage_usage.metrics_exporter import build_storage_usage_metric_rows
 from core.upload_security.cleanup import collect_upload_storage_usage
 from core.upload_security.metrics_exporter import build_upload_security_metric_rows
 from core.upload_security.scanner import ClamAVScanner
@@ -451,6 +454,19 @@ async def _refresh_ai_usage_metrics(db_manager: DatabaseManager | None) -> None:
             )
     except Exception as exc:
         logger.warning("AI usage metrics refresh failed: %s", exc)
+
+
+async def _refresh_storage_usage_metrics(db_manager: DatabaseManager | None) -> None:
+    try:
+        clear_storage_usage_metrics()
+        for row in await build_storage_usage_metric_rows(db_manager):
+            set_storage_usage_metric(
+                metric=row["metric"],
+                labels=row["labels"],
+                value=row["value"],
+            )
+    except Exception as exc:
+        logger.warning("Storage usage metrics refresh failed: %s", exc)
 
 
 # Add rolling file log so Promtail can scrape backend runtime logs.
@@ -1700,6 +1716,7 @@ if ENABLE_METRICS:
             raise HTTPException(status_code=403, detail="Metrics access denied")
         _refresh_upload_security_config_metrics()
         await _refresh_ai_usage_metrics(getattr(app.state, "db", None))
+        await _refresh_storage_usage_metrics(getattr(app.state, "db", None))
         return Response(
             content=generate_latest(),
             media_type=CONTENT_TYPE_LATEST,
