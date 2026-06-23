@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -82,3 +84,21 @@ def test_cleanup_refuses_clean_deletion_without_explicit_configuration(tmp_path)
 
     assert result.deleted_files == 0
     assert clean.exists()
+
+
+def test_cleanup_script_runs_directly_from_repo_root(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/cleanup_upload_storage.py",
+            "--root",
+            str(tmp_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert '"dry_run": true' in result.stdout

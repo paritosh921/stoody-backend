@@ -159,6 +159,7 @@ def test_remote_deploy_script_installs_upload_cleanup_timer():
     assert 'STOODY_UPLOAD_CLEANUP_UNIT:-stoody-upload-cleanup' in source
     assert '${unit_base}.service' in source
     assert '${unit_base}.timer' in source
+    assert "Environment=PYTHONPATH=$APP_PATH" in source
     assert "cleanup_upload_storage.py --execute" in source
     assert "systemctl enable --now" in source
     assert "systemctl is-enabled" in source

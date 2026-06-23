@@ -469,6 +469,7 @@ User=$upload_owner
 Group=$upload_group
 WorkingDirectory=$APP_PATH
 EnvironmentFile=-$APP_PATH/.env
+Environment=PYTHONPATH=$APP_PATH
 ExecStart=$python_bin $APP_PATH/scripts/cleanup_upload_storage.py --execute
 Nice=10
 IOSchedulingClass=best-effort
