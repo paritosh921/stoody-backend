@@ -50,6 +50,7 @@ def run_upload_security_deploy_validation(
     _check_eicar_detection(checks, run_command)
     _check_private_upload_dirs(checks, environment)
     _check_upload_cleanup_timer(checks, environment, run_command)
+    _check_upload_cleanup_service_not_failed(checks, environment, run_command)
     _check_upload_cleanup_script_dry_run(checks, environment, run_command)
     _check_nginx_private_root(checks, environment, nginx_config_paths or _default_nginx_configs())
     _check_backend_health(checks, environment, run_command)
@@ -214,6 +215,26 @@ def _check_upload_cleanup_script_dry_run(
         except json.JSONDecodeError:
             ok = False
     checks.record("UPLOAD_CLEANUP_SCRIPT_DRY_RUN", ok, output)
+
+
+def _check_upload_cleanup_service_not_failed(
+    checks: _CheckAccumulator,
+    env: Mapping[str, str],
+    runner: CommandRunner,
+) -> None:
+    timer_unit = env.get("UPLOAD_CLEANUP_TIMER_UNIT") or "stoody-upload-cleanup.timer"
+    service_unit = env.get("UPLOAD_CLEANUP_SERVICE_UNIT") or _service_unit_for_timer(timer_unit)
+    code, stdout, stderr = runner(["systemctl", "is-failed", service_unit], 10)
+    state = (stdout or stderr).strip()
+    normalized = state.lower()
+    ok = code != 0 and normalized not in {"failed", "not-found"} and "could not be found" not in normalized
+    checks.record("UPLOAD_CLEANUP_SERVICE_NOT_FAILED", ok, state)
+
+
+def _service_unit_for_timer(timer_unit: str) -> str:
+    if timer_unit.endswith(".timer"):
+        return f"{timer_unit[:-6]}.service"
+    return f"{timer_unit}.service"
 
 
 def _check_nginx_private_root(

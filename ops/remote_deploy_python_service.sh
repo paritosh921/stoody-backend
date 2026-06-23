@@ -490,6 +490,7 @@ WantedBy=timers.target
 TIMER
 
   sudo systemctl daemon-reload
+  sudo systemctl reset-failed "${unit_base}.service" || true
   sudo systemctl enable --now "${unit_base}.timer"
   systemctl is-enabled "${unit_base}.timer" >/dev/null
   systemctl is-active "${unit_base}.timer" >/dev/null

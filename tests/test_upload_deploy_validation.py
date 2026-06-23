@@ -30,6 +30,7 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
             ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
             ("systemctl", "is-enabled", "stoody-upload-cleanup.timer"): (0, "enabled\n", ""),
             ("systemctl", "is-active", "stoody-upload-cleanup.timer"): (0, "active\n", ""),
+            ("systemctl", "is-failed", "stoody-upload-cleanup.service"): (1, "inactive\n", ""),
             ("clamdscan", "--fdpass", "<path>"): (1, "Eicar-Test-Signature FOUND\n", ""),
             (
                 sys.executable,
@@ -64,6 +65,7 @@ def test_deploy_validation_passes_with_required_runtime_controls(tmp_path):
 
     assert result.ok is True
     assert result.failed_checks == []
+    assert "UPLOAD_CLEANUP_SERVICE_NOT_FAILED" in result.passed_checks
     assert "UPLOAD_CLEANUP_SCRIPT_DRY_RUN" in result.passed_checks
 
     status_output = tmp_path / "status" / "upload_deploy_validation_status.json"
@@ -127,6 +129,7 @@ def test_deploy_validation_fails_when_cleanup_script_cannot_run(tmp_path):
             ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
             ("systemctl", "is-enabled", "stoody-upload-cleanup.timer"): (0, "enabled\n", ""),
             ("systemctl", "is-active", "stoody-upload-cleanup.timer"): (0, "active\n", ""),
+            ("systemctl", "is-failed", "stoody-upload-cleanup.service"): (1, "inactive\n", ""),
             ("clamdscan", "--fdpass", "<path>"): (1, "Eicar-Test-Signature FOUND\n", ""),
             (
                 sys.executable,
@@ -161,6 +164,56 @@ def test_deploy_validation_fails_when_cleanup_script_cannot_run(tmp_path):
 
     assert result.ok is False
     assert "UPLOAD_CLEANUP_SCRIPT_DRY_RUN" in result.failed_checks
+
+
+def test_deploy_validation_fails_when_cleanup_service_is_failed(tmp_path):
+    socket = tmp_path / "clamd.ctl"
+    socket.write_text("socket", encoding="utf-8")
+    socket.chmod(0o660)
+    private_root = tmp_path / "uploads"
+    for prefix in ("quarantine", "rejected", "clean"):
+        (private_root / prefix).mkdir(parents=True)
+    runner = FakeRunner(
+        {
+            ("systemctl", "is-active", "clamav-daemon"): (0, "active\n", ""),
+            ("systemctl", "is-active", "clamav-freshclam"): (0, "active\n", ""),
+            ("systemctl", "is-enabled", "stoody-upload-cleanup.timer"): (0, "enabled\n", ""),
+            ("systemctl", "is-active", "stoody-upload-cleanup.timer"): (0, "active\n", ""),
+            ("systemctl", "is-failed", "stoody-upload-cleanup.service"): (0, "failed\n", ""),
+            ("clamdscan", "--fdpass", "<path>"): (1, "Eicar-Test-Signature FOUND\n", ""),
+            (
+                sys.executable,
+                "scripts/cleanup_upload_storage.py",
+                "--root",
+                str(private_root),
+            ): (0, '{"dry_run": true}\n', ""),
+            ("curl", "-fsS", "https://api.example.test/health"): (
+                0,
+                '{"upload_malware_scanner":{"available":true}}',
+                "",
+            ),
+        }
+    )
+
+    result = run_upload_security_deploy_validation(
+        env={
+            "UPLOAD_SCAN_REQUIRED": "true",
+            "UPLOAD_AV_FAIL_CLOSED": "true",
+            "CLAMAV_SOCKET": str(socket),
+            "CLAMAV_SOCKET_OWNER": "clamav",
+            "CLAMAV_SOCKET_GROUP": "clamav",
+            "CLAMAV_SOCKET_MODE": "660",
+            "BACKEND_SERVICE_USER": "ubuntu",
+            "UPLOAD_PRIVATE_LOCAL_DIR": str(private_root),
+            "UPLOAD_CLEANUP_TIMER_UNIT": "stoody-upload-cleanup.timer",
+            "BACKEND_HEALTH_URL": "https://api.example.test/health",
+        },
+        runner=runner,
+        nginx_config_paths=[],
+    )
+
+    assert result.ok is False
+    assert "UPLOAD_CLEANUP_SERVICE_NOT_FAILED" in result.failed_checks
 
 
 def test_deploy_validation_enforces_exact_clamav_socket_hardening_checks():
@@ -228,6 +281,7 @@ def test_remote_deploy_script_installs_upload_cleanup_timer():
     assert '${unit_base}.timer' in source
     assert "Environment=PYTHONPATH=$APP_PATH" in source
     assert "cleanup_upload_storage.py --execute" in source
+    assert 'systemctl reset-failed "${unit_base}.service"' in source
     assert "systemctl enable --now" in source
     assert "systemctl is-enabled" in source
     assert "systemctl is-active" in source
