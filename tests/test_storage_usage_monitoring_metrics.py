@@ -180,6 +180,56 @@ def test_mongodb_storage_rows_include_total_and_per_tenant_without_raw_db_names(
     assert "tenant_b_private_db" not in rendered
 
 
+def test_mongodb_storage_rows_export_cluster_capacity_when_db_stats_exposes_it(tmp_path):
+    master = FakeDatabase(
+        stats={
+            "dataSize": 100,
+            "storageSize": 200,
+            "indexSize": 50,
+            "fsUsedSize": 4096,
+            "fsTotalSize": 8192,
+        },
+        tenants=[],
+    )
+
+    rows = asyncio.run(
+        build_storage_usage_metric_rows(
+            FakeDbManager(master_db=master),
+            local_root=tmp_path,
+            now=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            cache_ttl_seconds=0,
+        )
+    )
+
+    assert {
+        "metric": "mongodb_storage",
+        "labels": {
+            "database_role": "cluster",
+            "tenant_ref": "platform",
+            "kind": "filesystem_used",
+        },
+        "value": 4096.0,
+    } in rows
+    assert {
+        "metric": "mongodb_storage",
+        "labels": {
+            "database_role": "cluster",
+            "tenant_ref": "platform",
+            "kind": "filesystem_capacity",
+        },
+        "value": 8192.0,
+    } in rows
+    assert {
+        "metric": "mongodb_storage",
+        "labels": {
+            "database_role": "cluster",
+            "tenant_ref": "platform",
+            "kind": "filesystem_free",
+        },
+        "value": 4096.0,
+    } in rows
+
+
 def test_storage_usage_gauges_can_be_cleared_between_scrapes():
     observability.set_storage_usage_metric(
         "tenant_storage",

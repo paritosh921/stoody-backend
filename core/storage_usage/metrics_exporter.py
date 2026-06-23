@@ -168,16 +168,26 @@ async def _mongodb_storage_rows(db_manager: Any) -> tuple[list[dict[str, Any]], 
 
     master_db = await _maybe_await(getattr(db_manager, "get_master_db", lambda: None)())
     b2c_db = await _maybe_await(getattr(db_manager, "get_b2c_db", lambda: None)())
+    cluster_filesystem_exported = False
 
     if master_db is not None:
         stats, failed = await _db_stats(master_db)
         errors += failed
         rows.extend(_mongodb_rows_for_stats(database_role="master", tenant_ref=PLATFORM_REF, stats=stats))
+        filesystem_rows = _mongodb_cluster_filesystem_rows(stats)
+        if filesystem_rows:
+            rows.extend(filesystem_rows)
+            cluster_filesystem_exported = True
 
     if b2c_db is not None:
         stats, failed = await _db_stats(b2c_db)
         errors += failed
         rows.extend(_mongodb_rows_for_stats(database_role="b2c", tenant_ref=B2C_REF, stats=stats))
+        if not cluster_filesystem_exported:
+            filesystem_rows = _mongodb_cluster_filesystem_rows(stats)
+            if filesystem_rows:
+                rows.extend(filesystem_rows)
+                cluster_filesystem_exported = True
 
     if master_db is None:
         return rows, errors
@@ -196,6 +206,11 @@ async def _mongodb_storage_rows(db_manager: Any) -> tuple[list[dict[str, Any]], 
         errors += failed
         tenant_ref = public_identity_ref(tenant.get("tenant_id") or tenant.get("_id") or db_name, prefix="tenant")
         rows.extend(_mongodb_rows_for_stats(database_role="tenant", tenant_ref=tenant_ref, stats=stats))
+        if not cluster_filesystem_exported:
+            filesystem_rows = _mongodb_cluster_filesystem_rows(stats)
+            if filesystem_rows:
+                rows.extend(filesystem_rows)
+                cluster_filesystem_exported = True
 
     return rows, errors
 
@@ -220,6 +235,36 @@ def _mongodb_rows_for_stats(*, database_role: str, tenant_ref: str, stats: dict[
                 "labels": {
                     "database_role": _safe_label(database_role),
                     "tenant_ref": _safe_label(tenant_ref),
+                    "kind": kind,
+                },
+                "value": value,
+            }
+        )
+    return rows
+
+
+def _mongodb_cluster_filesystem_rows(stats: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not stats:
+        return []
+    capacity = _float(stats.get("fsTotalSize"))
+    used = _float(stats.get("fsUsedSize"))
+    if capacity <= 0 or used <= 0:
+        return []
+    free = _float(stats.get("freeStorageSize"))
+    if free <= 0:
+        free = max(capacity - used, 0.0)
+    rows = []
+    for kind, value in (
+        ("filesystem_used", used),
+        ("filesystem_capacity", capacity),
+        ("filesystem_free", free),
+    ):
+        rows.append(
+            {
+                "metric": "mongodb_storage",
+                "labels": {
+                    "database_role": "cluster",
+                    "tenant_ref": PLATFORM_REF,
                     "kind": kind,
                 },
                 "value": value,
