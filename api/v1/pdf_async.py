@@ -6360,6 +6360,42 @@ async def update_document_metadata(
                 )
             update_data["document_type"] = doc_type
 
+        if "question_type" in metadata:
+            question_type = str(metadata["question_type"] or "").strip().lower()
+            valid_question_types = {"mcq", "subjective", "mixed"}
+            if question_type not in valid_question_types:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid question category. Must be one of: mcq, subjective, mixed",
+                )
+
+            merged_document_type = update_data.get(
+                "document_type",
+                existing_doc.get("document_type"),
+            )
+            exam_mode = str(existing_doc.get("exam_mode") or "").strip().lower()
+            if question_type == "mixed" and (
+                merged_document_type not in {"Practice Sets", "Test Series"}
+                or exam_mode in {"dcr", "pcr", "tally"}
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Mixed question category is only supported for online Practice Sets and Test Series",
+                )
+
+            if exam_mode == "dcr" and question_type != "mcq":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="DCR documents must remain objective",
+                )
+            if exam_mode == "pcr" and question_type != "subjective":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="PCR documents must remain subjective",
+                )
+
+            update_data["question_type"] = question_type
+
         # Difficulty with validation
         if "difficulty" in metadata:
             difficulty = metadata["difficulty"]
@@ -6396,51 +6432,64 @@ async def update_document_metadata(
                 )
             update_data["total_minutes"] = total_minutes
 
+        desired_active = (
+            bool(metadata["is_active"])
+            if "is_active" in metadata
+            else bool(existing_doc.get("is_active", False))
+        )
         if "is_active" in metadata:
-            desired_active = bool(metadata["is_active"])
-            if desired_active:
-                merged_doc = {**existing_doc, **update_data, "is_active": desired_active}
-                questions = await db.mongo_find("questions", {"document_id": document_id})
-                answer_coverage: Optional[Dict[str, Any]] = None
-
-                if _has_uploaded_answer_sheet(merged_doc):
-                    mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
-                    coverage_document = {**merged_doc, "answer_solution_mode": "upload"}
-                    answer_coverage = AnswerSolutionCoverageService().compute(
-                        document=coverage_document,
-                        questions=questions or [],
-                        mappings=mappings or [],
-                    )
-                    update_data.update(answer_coverage)
-
-                activation_errors = _build_test_series_activation_errors(
-                    document=merged_doc,
-                    questions=questions or [],
-                    answer_coverage=answer_coverage,
-                )
-                if activation_errors:
-                    missing_category_numbers = _missing_question_category_numbers(
-                        questions or [],
-                        merged_doc,
-                    )
-                    missing_correct_numbers = _missing_correct_answer_question_numbers(
-                        questions or [],
-                        merged_doc,
-                    )
-                    detail = {
-                        "message": "Cannot activate this content yet.",
-                        "errors": activation_errors,
-                    }
-                    if missing_category_numbers:
-                        detail["missing_question_category_numbers"] = missing_category_numbers
-                    if missing_correct_numbers:
-                        detail["missing_correct_question_numbers"] = missing_correct_numbers
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail=detail,
-                    )
-
             update_data["is_active"] = desired_active
+
+        activation_relevant_fields = {
+            "document_type",
+            "question_type",
+            "total_minutes",
+            "is_active",
+        }
+        should_validate_activation = desired_active and any(
+            field in update_data for field in activation_relevant_fields
+        )
+        if should_validate_activation:
+            merged_doc = {**existing_doc, **update_data, "is_active": desired_active}
+            questions = await db.mongo_find("questions", {"document_id": document_id})
+            answer_coverage: Optional[Dict[str, Any]] = None
+
+            if _has_uploaded_answer_sheet(merged_doc):
+                mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+                coverage_document = {**merged_doc, "answer_solution_mode": "upload"}
+                answer_coverage = AnswerSolutionCoverageService().compute(
+                    document=coverage_document,
+                    questions=questions or [],
+                    mappings=mappings or [],
+                )
+                update_data.update(answer_coverage)
+
+            activation_errors = _build_test_series_activation_errors(
+                document=merged_doc,
+                questions=questions or [],
+                answer_coverage=answer_coverage,
+            )
+            if activation_errors:
+                missing_category_numbers = _missing_question_category_numbers(
+                    questions or [],
+                    merged_doc,
+                )
+                missing_correct_numbers = _missing_correct_answer_question_numbers(
+                    questions or [],
+                    merged_doc,
+                )
+                detail = {
+                    "message": "Cannot activate this content yet.",
+                    "errors": activation_errors,
+                }
+                if missing_category_numbers:
+                    detail["missing_question_category_numbers"] = missing_category_numbers
+                if missing_correct_numbers:
+                    detail["missing_correct_question_numbers"] = missing_correct_numbers
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=detail,
+                )
 
         if not update_data:
             raise HTTPException(
@@ -6538,7 +6587,7 @@ async def duplicate_document(
 
         # Update metadata fields from request
         update_fields = ["title", "subject", "course_plan", "standard", "section",
-                        "difficulty", "document_type", "teacher_ids", "total_minutes"]
+                        "difficulty", "document_type", "question_type", "teacher_ids", "total_minutes"]
         for field in update_fields:
             if field in metadata and metadata[field] is not None:
                 new_doc[field] = metadata[field]
