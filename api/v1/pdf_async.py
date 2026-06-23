@@ -2175,7 +2175,28 @@ def _has_uploaded_answer_sheet(document: Dict[str, Any]) -> bool:
 
 
 def _is_objective_question_type(value: Any) -> bool:
-    return str(value or "mcq").strip().lower() != "subjective"
+    question_type = str(value or "mcq").strip().lower()
+    return question_type in {"mcq", "integer", "objective"}
+
+
+def _is_mixed_question_document(document: Dict[str, Any]) -> bool:
+    return (
+        document.get("document_type") in {"Practice Sets", "Test Series"}
+        and str(document.get("question_type") or "").strip().lower() == "mixed"
+    )
+
+
+def _has_question_category_selected(question: Dict[str, Any], document: Dict[str, Any]) -> bool:
+    if not _is_mixed_question_document(document):
+        return True
+    question_type = str(question.get("question_type") or "").strip().lower()
+    return question_type in {"mcq", "integer", "objective", "subjective"}
+
+
+def _default_extracted_question_type(document: Dict[str, Any]) -> str:
+    if _is_mixed_question_document(document):
+        return "unclassified"
+    return str(document.get("question_type") or "mcq").strip().lower() or "mcq"
 
 
 def _is_activation_checked_document(document: Dict[str, Any]) -> bool:
@@ -2183,14 +2204,16 @@ def _is_activation_checked_document(document: Dict[str, Any]) -> bool:
     if doc_type == "Test Series":
         return True
     if doc_type == "Practice Sets":
-        return _is_objective_question_type(document.get("question_type"))
+        question_type = str(document.get("question_type") or "mcq").strip().lower()
+        return question_type == "mixed" or _is_objective_question_type(question_type)
     return False
 
 
 def _requires_correct_answers_for_activation(document: Dict[str, Any]) -> bool:
-    return document.get("document_type") in {"Practice Sets", "Test Series"} and _is_objective_question_type(
-        document.get("question_type")
-    )
+    if document.get("document_type") not in {"Practice Sets", "Test Series"}:
+        return False
+    question_type = str(document.get("question_type") or "mcq").strip().lower()
+    return question_type == "mixed" or _is_objective_question_type(question_type)
 
 
 def _question_activation_number(question: Dict[str, Any], fallback: int) -> int:
@@ -2211,13 +2234,26 @@ def _missing_correct_answer_question_numbers(
     questions: List[Dict[str, Any]],
     document: Optional[Dict[str, Any]] = None,
 ) -> List[int]:
+    document = document or {}
     return [
         _question_activation_number(question, index)
         for index, question in enumerate(questions or [], start=1)
-        if _is_objective_question_type(
-            question.get("question_type") or (document or {}).get("question_type")
-        )
+        if _is_objective_question_type(question.get("question_type") or document.get("question_type"))
         if not str(question.get("correct_answer") or "").strip()
+    ]
+
+
+def _missing_question_category_numbers(
+    questions: List[Dict[str, Any]],
+    document: Optional[Dict[str, Any]] = None,
+) -> List[int]:
+    document = document or {}
+    if not _is_mixed_question_document(document):
+        return []
+    return [
+        _question_activation_number(question, index)
+        for index, question in enumerate(questions or [], start=1)
+        if not _has_question_category_selected(question, document)
     ]
 
 
@@ -2235,6 +2271,13 @@ def _build_test_series_activation_errors(
     if not questions:
         errors.append("No questions found. Run question OCR before activating this content.")
         return errors
+
+    missing_category_numbers = _missing_question_category_numbers(questions, document)
+    if missing_category_numbers:
+        errors.append(
+            "Question category is not selected for: "
+            + ", ".join(str(number) for number in missing_category_numbers)
+        )
 
     if _requires_correct_answers_for_activation(document):
         missing_correct_numbers = _missing_correct_answer_question_numbers(questions, document)
@@ -3006,7 +3049,7 @@ async def run_document_ocr_pipeline(
                     "text": question.text,
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
-                    "question_type": document.get("question_type", "mcq"),
+                    "question_type": _default_extracted_question_type(document),
                     "document_type": document_type,
                     "question_number": extraction_order,
                     "extraction_order": extraction_order,
@@ -3044,7 +3087,7 @@ async def run_document_ocr_pipeline(
                     "text": question.text,
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
-                    "question_type": document.get("question_type", "mcq"),
+                    "question_type": _default_extracted_question_type(document),
                     "document_type": document_type,
                     "question_number": extraction_order,
                     "extraction_order": extraction_order,
@@ -3240,6 +3283,7 @@ class DocumentMetadata(BaseModel):
     file_exists: bool = True  # Whether the physical file exists on disk
     is_active: bool = True  # Whether the document is enabled for students
     instructions: Optional[str] = None
+    question_type: Optional[str] = None
     exam_mode: Optional[str] = None
     exam_template_path: Optional[str] = None
     answer_sheet_path: Optional[str] = None
@@ -3393,7 +3437,7 @@ async def upload_pdf(
     teacher_ids: Optional[str] = Form(None),  # Comma-separated teacher IDs for filtering
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
-    question_type: Optional[str] = Form(None),  # "mcq" or "subjective" - default type for all questions
+    question_type: Optional[str] = Form(None),  # "mcq", "subjective", or "mixed" - default type for questions
     instructions: Optional[str] = Form(None),  # Paper instructions for practice/test
     exam_mode: Optional[str] = Form(None),  # "dcr" or "pcr" — offline exam conduction mode
     answer_solution_mode: Optional[str] = Form(None),  # none, upload, or auto
@@ -3448,6 +3492,27 @@ async def upload_pdf(
                 detail=f"Invalid document type. Allowed: {', '.join(allowed_types)}"
             )
 
+        question_type = (question_type or "").strip().lower() or None
+        if question_type and question_type not in {"mcq", "subjective", "mixed"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid question type. Allowed: mcq, subjective, mixed",
+            )
+        if question_type == "mixed" and (
+            document_type == "Chapter Notes" or exam_mode in {"dcr", "pcr"}
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mixed question type is only allowed for online Practice Sets and Test Series",
+            )
+        effective_document_question_type = (
+            "mcq"
+            if exam_mode == "dcr"
+            else "subjective"
+            if exam_mode == "pcr"
+            else question_type or "mcq"
+        )
+
         # Validate exam_mode
         if exam_mode:
             if exam_mode not in ("dcr", "pcr"):
@@ -3477,10 +3542,10 @@ async def upload_pdf(
             )
 
         if answer_sheet is not None:
-            if document_type != "Test Series" or exam_mode or question_type == "subjective":
+            if document_type != "Test Series" or exam_mode:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Answer sheet upload is only allowed for online objective Test Series documents",
+                    detail="Answer sheet upload is only allowed for online Test Series documents",
                 )
 
         answer_solution_mode = (answer_solution_mode or ("upload" if answer_sheet is not None else "none")).strip().lower()
@@ -3495,7 +3560,7 @@ async def upload_pdf(
                 detail="Upload mode requires an answer sheet PDF",
             )
         if answer_solution_mode == "auto":
-            if document_type != "Test Series" or exam_mode or question_type == "subjective":
+            if document_type != "Test Series" or exam_mode or effective_document_question_type != "mcq":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Auto-generated solutions are only allowed for online objective Test Series documents",
@@ -3703,9 +3768,7 @@ async def upload_pdf(
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
             "question_type": (
-                "mcq"
-                if exam_mode == "dcr"
-                else question_type if question_type in ["mcq", "subjective"] else "mcq"
+                effective_document_question_type
             ),  # DCR papers are objective-only by contract
             "instructions": instructions.strip() if instructions else None,  # Paper instructions
             "is_active": False,  # Default to inactive until admin enables
@@ -5232,6 +5295,7 @@ async def get_documents(
                 file_exists=file_exists,
                 is_active=doc.get("is_active", True),
                 instructions=doc.get("instructions"),
+                question_type=doc.get("question_type"),
                 exam_mode=doc.get("exam_mode"),
                 exam_template_path=doc.get("exam_template_path"),
                 answer_sheet_path=None,
@@ -5883,6 +5947,7 @@ async def get_student_available_options(
                 file_exists=file_exists,
                 is_active=doc.get("is_active", True),
                 instructions=doc.get("instructions"),
+                question_type=doc.get("question_type"),
                 exam_mode=doc.get("exam_mode"),
                 exam_template_path=doc.get("exam_template_path"),
                 answer_sheet_path=None,
@@ -6354,6 +6419,10 @@ async def update_document_metadata(
                     answer_coverage=answer_coverage,
                 )
                 if activation_errors:
+                    missing_category_numbers = _missing_question_category_numbers(
+                        questions or [],
+                        merged_doc,
+                    )
                     missing_correct_numbers = _missing_correct_answer_question_numbers(
                         questions or [],
                         merged_doc,
@@ -6362,6 +6431,8 @@ async def update_document_metadata(
                         "message": "Cannot activate this content yet.",
                         "errors": activation_errors,
                     }
+                    if missing_category_numbers:
+                        detail["missing_question_category_numbers"] = missing_category_numbers
                     if missing_correct_numbers:
                         detail["missing_correct_question_numbers"] = missing_correct_numbers
                     raise HTTPException(
@@ -7302,7 +7373,7 @@ async def update_question(
         # Support question_type (mcq or integer) - accept both snake_case and camelCase
         question_type = question_data.get("question_type") or question_data.get("questionType")
         if question_type:
-            if question_type not in ["mcq", "integer", "subjective"]:
+            if question_type not in ["mcq", "integer", "subjective", "unclassified"]:
                 question_type = "mcq"  # Default to MCQ
             if _parent_doc and _parent_doc.get("exam_mode") == "dcr" and question_type == "subjective":
                 raise HTTPException(
@@ -9614,7 +9685,7 @@ async def process_regions_ocr(
                     "text": question_text,  # For Practice Sets, this includes the full text with options
                     "subject": document.get("subject", "General"),
                     "difficulty": document.get("difficulty", "medium"),
-                    "question_type": document.get("question_type", "mcq"),
+                    "question_type": _default_extracted_question_type(document),
                     "document_type": document.get("document_type", "Practice Sets"),
                     "extracted_at": datetime.utcnow(),
                     "pdf_source": document.get("filename", ""),
