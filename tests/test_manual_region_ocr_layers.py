@@ -1770,6 +1770,33 @@ def test_test_series_activation_requires_correct_answers():
     assert errors == ["2, 3"]
 
 
+def test_objective_practice_set_activation_requires_correct_answers():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={"document_type": "Practice Sets", "question_type": "mcq"},
+        questions=[
+            {"id": "q1", "correct_answer": "A"},
+            {"id": "q2", "correct_answer": ""},
+        ],
+    )
+
+    assert errors == ["2"]
+
+
+def test_subjective_practice_set_activation_does_not_require_correct_answers():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={"document_type": "Practice Sets", "question_type": "subjective"},
+        questions=[
+            {"id": "q1", "question_type": "subjective", "correct_answer": ""},
+        ],
+    )
+
+    assert errors == []
+
+
 def test_test_series_activation_allows_saved_answer_candidate_mismatch():
     from api.v1.pdf_async import _build_test_series_activation_errors
 

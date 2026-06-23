@@ -2174,6 +2174,25 @@ def _has_uploaded_answer_sheet(document: Dict[str, Any]) -> bool:
     return bool(document.get("answer_sheet_path") or document.get("has_answer_sheet"))
 
 
+def _is_objective_question_type(value: Any) -> bool:
+    return str(value or "mcq").strip().lower() != "subjective"
+
+
+def _is_activation_checked_document(document: Dict[str, Any]) -> bool:
+    doc_type = document.get("document_type")
+    if doc_type == "Test Series":
+        return True
+    if doc_type == "Practice Sets":
+        return _is_objective_question_type(document.get("question_type"))
+    return False
+
+
+def _requires_correct_answers_for_activation(document: Dict[str, Any]) -> bool:
+    return document.get("document_type") in {"Practice Sets", "Test Series"} and _is_objective_question_type(
+        document.get("question_type")
+    )
+
+
 def _question_activation_number(question: Dict[str, Any], fallback: int) -> int:
     for field in ("question_number", "extraction_order"):
         value = question.get(field)
@@ -2188,10 +2207,16 @@ def _question_activation_number(question: Dict[str, Any], fallback: int) -> int:
     return fallback
 
 
-def _missing_correct_answer_question_numbers(questions: List[Dict[str, Any]]) -> List[int]:
+def _missing_correct_answer_question_numbers(
+    questions: List[Dict[str, Any]],
+    document: Optional[Dict[str, Any]] = None,
+) -> List[int]:
     return [
         _question_activation_number(question, index)
         for index, question in enumerate(questions or [], start=1)
+        if _is_objective_question_type(
+            question.get("question_type") or (document or {}).get("question_type")
+        )
         if not str(question.get("correct_answer") or "").strip()
     ]
 
@@ -2202,22 +2227,24 @@ def _build_test_series_activation_errors(
     questions: List[Dict[str, Any]],
     answer_coverage: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
-    """Return concise reasons why a Test Series cannot be activated."""
-    if document.get("document_type") != "Test Series":
+    """Return concise reasons why objective content cannot be activated."""
+    if not _is_activation_checked_document(document):
         return []
 
     errors: List[str] = []
     if not questions:
-        errors.append("No questions found. Run question OCR before activating this test series.")
+        errors.append("No questions found. Run question OCR before activating this content.")
         return errors
 
-    missing_correct_numbers = _missing_correct_answer_question_numbers(questions)
-    if missing_correct_numbers:
-        errors.append(", ".join(str(number) for number in missing_correct_numbers))
+    if _requires_correct_answers_for_activation(document):
+        missing_correct_numbers = _missing_correct_answer_question_numbers(questions, document)
+        if missing_correct_numbers:
+            errors.append(", ".join(str(number) for number in missing_correct_numbers))
 
-    total_minutes = document.get("total_minutes") or 0
-    if total_minutes <= 0:
-        errors.append("Test duration is not set. Set total minutes before activating.")
+    if document.get("document_type") == "Test Series":
+        total_minutes = document.get("total_minutes") or 0
+        if total_minutes <= 0:
+            errors.append("Test duration is not set. Set total minutes before activating.")
 
     if _has_uploaded_answer_sheet(document):
         coverage_summary = (answer_coverage or {}).get("answer_solution_coverage_summary") or {}
@@ -6327,9 +6354,12 @@ async def update_document_metadata(
                     answer_coverage=answer_coverage,
                 )
                 if activation_errors:
-                    missing_correct_numbers = _missing_correct_answer_question_numbers(questions or [])
+                    missing_correct_numbers = _missing_correct_answer_question_numbers(
+                        questions or [],
+                        merged_doc,
+                    )
                     detail = {
-                        "message": "Cannot activate this test series yet.",
+                        "message": "Cannot activate this content yet.",
                         "errors": activation_errors,
                     }
                     if missing_correct_numbers:
