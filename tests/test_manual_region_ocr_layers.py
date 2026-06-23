@@ -1767,9 +1767,26 @@ def test_test_series_activation_requires_correct_answers():
         ],
     )
 
-    assert len(errors) == 1
-    assert "2 question(s) do not have a correct answer selected" in errors[0]
-    assert "Question 2" not in errors[0]
+    assert errors == ["2, 3"]
+
+
+def test_test_series_activation_allows_saved_answer_candidate_mismatch():
+    from api.v1.pdf_async import _build_test_series_activation_errors
+
+    errors = _build_test_series_activation_errors(
+        document={"document_type": "Test Series", "total_minutes": 30},
+        questions=[
+            {
+                "id": "q1",
+                "correct_answer": "A",
+                "answer_key_candidate": {"correct_answer": "B"},
+                "mapped_worked_answer": {"correct_answer_candidate": "B"},
+            },
+            {"id": "q2", "correct_answer": "C"},
+        ],
+    )
+
+    assert errors == []
 
 
 def test_test_series_activation_requires_uploaded_answer_sheet_full_mapping():

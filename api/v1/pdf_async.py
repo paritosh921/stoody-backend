@@ -2174,6 +2174,28 @@ def _has_uploaded_answer_sheet(document: Dict[str, Any]) -> bool:
     return bool(document.get("answer_sheet_path") or document.get("has_answer_sheet"))
 
 
+def _question_activation_number(question: Dict[str, Any], fallback: int) -> int:
+    for field in ("question_number", "extraction_order"):
+        value = question.get(field)
+        if value is None:
+            continue
+        try:
+            number = int(value)
+            if number > 0:
+                return number
+        except (TypeError, ValueError):
+            continue
+    return fallback
+
+
+def _missing_correct_answer_question_numbers(questions: List[Dict[str, Any]]) -> List[int]:
+    return [
+        _question_activation_number(question, index)
+        for index, question in enumerate(questions or [], start=1)
+        if not str(question.get("correct_answer") or "").strip()
+    ]
+
+
 def _build_test_series_activation_errors(
     *,
     document: Dict[str, Any],
@@ -2189,18 +2211,9 @@ def _build_test_series_activation_errors(
         errors.append("No questions found. Run question OCR before activating this test series.")
         return errors
 
-    missing_correct_count = len(
-        [
-            q
-            for q in questions
-            if not str(q.get("correct_answer") or "").strip()
-        ]
-    )
-    if missing_correct_count:
-        errors.append(
-            f"{missing_correct_count} question(s) do not have a correct answer selected. "
-            "Select a correct answer for every question before activating."
-        )
+    missing_correct_numbers = _missing_correct_answer_question_numbers(questions)
+    if missing_correct_numbers:
+        errors.append(", ".join(str(number) for number in missing_correct_numbers))
 
     total_minutes = document.get("total_minutes") or 0
     if total_minutes <= 0:
@@ -6314,12 +6327,16 @@ async def update_document_metadata(
                     answer_coverage=answer_coverage,
                 )
                 if activation_errors:
+                    missing_correct_numbers = _missing_correct_answer_question_numbers(questions or [])
+                    detail = {
+                        "message": "Cannot activate this test series yet.",
+                        "errors": activation_errors,
+                    }
+                    if missing_correct_numbers:
+                        detail["missing_correct_question_numbers"] = missing_correct_numbers
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                        detail={
-                            "message": "Cannot activate this test series yet.",
-                            "errors": activation_errors,
-                        },
+                        detail=detail,
                     )
 
             update_data["is_active"] = desired_active
