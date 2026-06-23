@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -49,6 +50,7 @@ def run_upload_security_deploy_validation(
     _check_eicar_detection(checks, run_command)
     _check_private_upload_dirs(checks, environment)
     _check_upload_cleanup_timer(checks, environment, run_command)
+    _check_upload_cleanup_script_dry_run(checks, environment, run_command)
     _check_nginx_private_root(checks, environment, nginx_config_paths or _default_nginx_configs())
     _check_backend_health(checks, environment, run_command)
 
@@ -191,6 +193,27 @@ def _check_upload_cleanup_timer(
         code == 0 and stdout.strip() == "active",
         (stdout or stderr).strip(),
     )
+
+
+def _check_upload_cleanup_script_dry_run(
+    checks: _CheckAccumulator,
+    env: Mapping[str, str],
+    runner: CommandRunner,
+) -> None:
+    root = Path(env.get("UPLOAD_PRIVATE_LOCAL_DIR") or "/var/lib/stoody/uploads")
+    code, stdout, stderr = runner(
+        [sys.executable, "scripts/cleanup_upload_storage.py", "--root", str(root)],
+        60,
+    )
+    output = (stdout or stderr).strip()
+    ok = False
+    if code == 0:
+        try:
+            payload = json.loads(stdout)
+            ok = payload.get("dry_run") is True
+        except json.JSONDecodeError:
+            ok = False
+    checks.record("UPLOAD_CLEANUP_SCRIPT_DRY_RUN", ok, output)
 
 
 def _check_nginx_private_root(
