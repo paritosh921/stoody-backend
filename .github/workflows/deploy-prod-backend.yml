@@ -15,6 +15,8 @@ on:
       - "config_async.py"
       - "mentorAI/**"
       - "stoody-book/**"
+      - "scripts/cleanup_upload_storage.py"
+      - "scripts/validate_upload_security_deploy.py"
       - "scripts/run_tui.sh"
       - "requirements.txt"
       - "skillbot_nginx_alb.conf"

@@ -207,6 +207,16 @@ def test_backend_deploy_workflows_queue_instead_of_canceling_remote_deploys():
         assert "cancel-in-progress: false" in source
 
 
+def test_backend_deploy_workflows_include_upload_security_scripts_in_path_filters():
+    for workflow in (
+        Path(".github/workflows/deploy-prod-backend.yml"),
+        Path(".github/workflows/deploy-dev-backend.yml"),
+    ):
+        source = workflow.read_text(encoding="utf-8")
+        assert '"scripts/cleanup_upload_storage.py"' in source
+        assert '"scripts/validate_upload_security_deploy.py"' in source
+
+
 def test_remote_deploy_script_installs_upload_cleanup_timer():
     source = Path("ops/remote_deploy_python_service.sh").read_text(encoding="utf-8")
 
@@ -229,6 +239,7 @@ def test_prod_workflow_runs_upload_security_deploy_validation_after_deploy():
     source = Path(".github/workflows/deploy-prod-backend.yml").read_text(encoding="utf-8")
 
     assert "Validate upload security runtime controls" in source
+    assert '"scripts/cleanup_upload_storage.py"' in source
     assert "scripts/validate_upload_security_deploy.py" in source
     assert "UPLOAD_SCAN_REQUIRED=true" in source
     assert "UPLOAD_AV_FAIL_CLOSED=true" in source
