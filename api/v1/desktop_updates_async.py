@@ -25,11 +25,13 @@ limiter = Limiter(key_func=get_remote_address)
 GITHUB_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
 
-def _download_url(request: Request, asset_id: int | str) -> str:
+def _download_url(request: Request, asset_id: int | str, platform: str | None = None) -> str:
+    normalized_platform = desktop_updates.normalize_platform(platform)
+    query = "" if normalized_platform == desktop_updates.PLATFORM_WINDOWS else f"?platform={normalized_platform}"
     base_url = desktop_updates.public_base_url()
     if base_url:
-        return f"{base_url}/desktop/download/{asset_id}"
-    return str(request.url_for("download_desktop_update", asset_id=str(asset_id)))
+        return f"{base_url}/desktop/download/{asset_id}{query}"
+    return f"{request.url_for('download_desktop_update', asset_id=str(asset_id))}{query}"
 
 
 def _safe_download_name(value: str) -> str:
@@ -37,24 +39,40 @@ def _safe_download_name(value: str) -> str:
     return name[:150] or "Stoody_Client_Update.exe"
 
 
-async def _latest_desktop_asset(client: httpx.AsyncClient) -> dict | None:
+async def _latest_desktop_release_and_asset(
+    client: httpx.AsyncClient,
+    platform: str | None = None,
+) -> tuple[dict, dict] | None:
     response = await client.get(
-        desktop_updates.latest_release_url(),
+        desktop_updates.releases_url(100),
         headers=desktop_updates.github_headers(),
     )
     if response.status_code >= 400:
-        logger.warning("Desktop update latest release validation returned HTTP %s", response.status_code)
+        logger.warning("Desktop update release validation returned HTTP %s", response.status_code)
         return None
-    release = response.json()
-    latest_version = desktop_updates.normalize_release_version(str(release.get("tag_name") or ""))
-    if not desktop_updates.is_semver(latest_version):
+    releases = response.json()
+    if not isinstance(releases, list):
         return None
-    return desktop_updates.select_windows_asset(release)
+    return desktop_updates.select_latest_release(releases, platform)
 
 
-async def _validated_latest_desktop_asset(client: httpx.AsyncClient) -> dict:
+async def _latest_desktop_asset(
+    client: httpx.AsyncClient,
+    platform: str | None = None,
+) -> dict | None:
+    selected = await _latest_desktop_release_and_asset(client, platform)
+    if selected is None:
+        return None
+    _release, asset = selected
+    return asset
+
+
+async def _validated_latest_desktop_asset(
+    client: httpx.AsyncClient,
+    platform: str | None = None,
+) -> dict:
     try:
-        allowed_asset = await _latest_desktop_asset(client)
+        allowed_asset = await _latest_desktop_asset(client, platform)
     except httpx.RequestError as exc:
         await client.aclose()
         logger.warning("Desktop update asset validation failed: %s", exc)
@@ -128,12 +146,15 @@ async def _stream_desktop_asset(client: httpx.AsyncClient, asset_id: int | str) 
 
 @router.get("/latest")
 @limiter.limit("60/minute")
-async def latest_desktop_update(request: Request):
+async def latest_desktop_update(
+    request: Request,
+    platform: str = Query(default=desktop_updates.PLATFORM_WINDOWS),
+):
     """Return latest desktop release metadata without exposing GitHub secrets."""
     try:
         async with httpx.AsyncClient(timeout=GITHUB_TIMEOUT) as client:
             response = await client.get(
-                desktop_updates.latest_release_url(),
+                desktop_updates.releases_url(100),
                 headers=desktop_updates.github_headers(),
             )
     except httpx.RequestError as exc:
@@ -143,8 +164,6 @@ async def latest_desktop_update(request: Request):
             detail="Update service temporarily unavailable",
         ) from exc
 
-    if response.status_code == 404:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Desktop release not found")
     if response.status_code >= 400:
         logger.warning("Desktop update GitHub lookup returned HTTP %s", response.status_code)
         raise HTTPException(
@@ -152,15 +171,28 @@ async def latest_desktop_update(request: Request):
             detail="Update service returned an error",
         )
 
-    release = response.json()
-    asset = desktop_updates.select_windows_asset(release)
+    releases = response.json()
+    if not isinstance(releases, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Update service returned invalid data",
+        )
+
+    selected = desktop_updates.select_latest_release(releases, platform)
+    if selected is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Desktop release not found")
+    release, asset = selected
     if not asset or not asset.get("id"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No desktop installer asset found in latest release",
         )
 
-    payload = desktop_updates.latest_payload(release, _download_url(request, asset["id"]))
+    payload = desktop_updates.latest_payload(
+        release,
+        _download_url(request, asset["id"], platform),
+        platform,
+    )
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -171,7 +203,11 @@ async def latest_desktop_update(request: Request):
 
 @router.get("/releases")
 @limiter.limit("30/minute")
-async def desktop_release_notes(request: Request, limit: int = Query(default=10, ge=1, le=25)):
+async def desktop_release_notes(
+    request: Request,
+    limit: int = Query(default=10, ge=1, le=25),
+    platform: str = Query(default=desktop_updates.PLATFORM_WINDOWS),
+):
     """Return recent desktop release notes without exposing GitHub credentials."""
     try:
         async with httpx.AsyncClient(timeout=GITHUB_TIMEOUT) as client:
@@ -202,25 +238,33 @@ async def desktop_release_notes(request: Request, limit: int = Query(default=10,
 
     return {
         "success": True,
-        "releases": desktop_updates.release_notes_payload(releases, limit),
+        "platform": desktop_updates.normalize_platform(platform),
+        "releases": desktop_updates.release_notes_payload(releases, limit, platform),
     }
 
 
 @router.get("/latest/download", name="download_latest_desktop_update")
 @limiter.limit("20/minute")
-async def download_latest_desktop_update(request: Request):
+async def download_latest_desktop_update(
+    request: Request,
+    platform: str = Query(default=desktop_updates.PLATFORM_WINDOWS),
+):
     """Stream the latest GitHub desktop release asset through the backend."""
     client = httpx.AsyncClient(timeout=GITHUB_TIMEOUT, follow_redirects=True)
-    allowed_asset = await _validated_latest_desktop_asset(client)
+    allowed_asset = await _validated_latest_desktop_asset(client, platform)
     return await _stream_desktop_asset(client, allowed_asset["id"])
 
 
 @router.get("/download/{asset_id}", name="download_desktop_update")
 @limiter.limit("20/minute")
-async def download_desktop_update(request: Request, asset_id: int):
+async def download_desktop_update(
+    request: Request,
+    asset_id: int,
+    platform: str = Query(default=desktop_updates.PLATFORM_WINDOWS),
+):
     """Stream a GitHub release asset through the backend."""
     client = httpx.AsyncClient(timeout=GITHUB_TIMEOUT, follow_redirects=True)
-    allowed_asset = await _validated_latest_desktop_asset(client)
+    allowed_asset = await _validated_latest_desktop_asset(client, platform)
 
     if not allowed_asset or str(allowed_asset.get("id") or "") != str(asset_id):
         await client.aclose()

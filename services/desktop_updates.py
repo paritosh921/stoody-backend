@@ -8,7 +8,10 @@ from typing import Any
 
 DEFAULT_OWNER = "ashuein"
 DEFAULT_REPO = "stoody-ble-agent"
-DEFAULT_ASSET_PATTERN = r"\.exe$"
+PLATFORM_WINDOWS = "windows"
+PLATFORM_MACOS = "macos"
+DEFAULT_WINDOWS_ASSET_PATTERN = r"\.exe$"
+DEFAULT_MACOS_ASSET_PATTERN = r"\.dmg$"
 
 
 def github_owner() -> str:
@@ -31,8 +34,27 @@ def public_base_url() -> str:
     return os.getenv("DESKTOP_UPDATE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
-def asset_pattern() -> str:
-    return os.getenv("DESKTOP_UPDATE_ASSET_PATTERN", DEFAULT_ASSET_PATTERN).strip() or DEFAULT_ASSET_PATTERN
+def normalize_platform(platform: str | None = None) -> str:
+    value = (platform or "").strip().lower()
+    if value in {"mac", "macos", "darwin", "osx"}:
+        return PLATFORM_MACOS
+    return PLATFORM_WINDOWS
+
+
+def asset_pattern(platform: str | None = None) -> str:
+    normalized = normalize_platform(platform)
+    if normalized == PLATFORM_MACOS:
+        return (
+            os.getenv("DESKTOP_UPDATE_MACOS_ASSET_PATTERN", DEFAULT_MACOS_ASSET_PATTERN).strip()
+            or DEFAULT_MACOS_ASSET_PATTERN
+        )
+    return (
+        os.getenv(
+            "DESKTOP_UPDATE_WINDOWS_ASSET_PATTERN",
+            os.getenv("DESKTOP_UPDATE_ASSET_PATTERN", DEFAULT_WINDOWS_ASSET_PATTERN),
+        ).strip()
+        or DEFAULT_WINDOWS_ASSET_PATTERN
+    )
 
 
 def latest_release_url() -> str:
@@ -40,7 +62,7 @@ def latest_release_url() -> str:
 
 
 def releases_url(limit: int) -> str:
-    per_page = max(1, min(limit, 25))
+    per_page = max(1, min(limit, 100))
     return f"https://api.github.com/repos/{github_owner()}/{github_repo()}/releases?per_page={per_page}"
 
 
@@ -60,16 +82,26 @@ def github_headers(*, accept: str = "application/vnd.github+json") -> dict[str, 
     return headers
 
 
-def normalize_release_version(tag_name: str) -> str:
-    return (tag_name or "").strip().lstrip("vV")
+def normalize_release_version(tag_name: str, platform: str | None = None) -> str:
+    value = (tag_name or "").strip()
+    if normalize_platform(platform) == PLATFORM_MACOS:
+        value = re.sub(r"^mac-v", "", value, flags=re.IGNORECASE)
+    else:
+        value = re.sub(r"^v", "", value, flags=re.IGNORECASE)
+    return value
 
 
 def is_semver(value: str) -> bool:
     return bool(re.match(r"^\d+\.\d+\.\d+$", value or ""))
 
 
-def select_windows_asset(release: dict[str, Any]) -> dict[str, Any] | None:
-    pattern = re.compile(asset_pattern(), re.IGNORECASE)
+def release_matches_platform(release: dict[str, Any], platform: str | None = None) -> bool:
+    version = normalize_release_version(str(release.get("tag_name") or ""), platform)
+    return is_semver(version)
+
+
+def select_platform_asset(release: dict[str, Any], platform: str | None = None) -> dict[str, Any] | None:
+    pattern = re.compile(asset_pattern(platform), re.IGNORECASE)
     for asset in release.get("assets") or []:
         name = str(asset.get("name") or "")
         if pattern.search(name):
@@ -77,17 +109,34 @@ def select_windows_asset(release: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def latest_payload(release: dict[str, Any], download_url: str) -> dict[str, Any] | None:
-    latest_version = normalize_release_version(str(release.get("tag_name") or ""))
+def select_windows_asset(release: dict[str, Any]) -> dict[str, Any] | None:
+    return select_platform_asset(release, PLATFORM_WINDOWS)
+
+
+def select_latest_release(releases: list[dict[str, Any]], platform: str | None = None) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        if not release_matches_platform(release, platform):
+            continue
+        asset = select_platform_asset(release, platform)
+        if asset and asset.get("id"):
+            return release, asset
+    return None
+
+
+def latest_payload(release: dict[str, Any], download_url: str, platform: str | None = None) -> dict[str, Any] | None:
+    latest_version = normalize_release_version(str(release.get("tag_name") or ""), platform)
     if not is_semver(latest_version):
         return None
 
-    asset = select_windows_asset(release)
+    asset = select_platform_asset(release, platform)
     if not asset:
         return None
 
     return {
         "success": True,
+        "platform": normalize_platform(platform),
         "latest_version": latest_version,
         "version": latest_version,
         "download_url": download_url,
@@ -100,10 +149,12 @@ def latest_payload(release: dict[str, Any], download_url: str) -> dict[str, Any]
     }
 
 
-def release_notes_payload(releases: list[dict[str, Any]], limit: int) -> list[dict[str, str]]:
+def release_notes_payload(releases: list[dict[str, Any]], limit: int, platform: str | None = None) -> list[dict[str, str]]:
     notes: list[dict[str, str]] = []
-    for release in releases[: max(1, min(limit, 25))]:
-        version = normalize_release_version(str(release.get("tag_name") or ""))
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        version = normalize_release_version(str(release.get("tag_name") or ""), platform)
         if not is_semver(version):
             continue
         notes.append(
@@ -114,4 +165,6 @@ def release_notes_payload(releases: list[dict[str, Any]], limit: int) -> list[di
                 "published_at": str(release.get("published_at") or ""),
             }
         )
+        if len(notes) >= max(1, min(limit, 25)):
+            break
     return notes
