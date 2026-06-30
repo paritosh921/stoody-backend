@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ReplaceOne, UpdateOne
 from pymongo.errors import BulkWriteError, DuplicateKeyError
 
@@ -26,6 +26,8 @@ from core.user_identity import canonical_canvas_user_id
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/strokes", tags=["strokes"])
+
+CANONICAL_STROKE_PROCESSING_VERSION = "ble-canonical-v1"
 
 
 class StrokeItem(BaseModel):
@@ -250,6 +252,8 @@ class CanvasPageStroke(BaseModel):
     svgPath: Optional[str] = None
     baseWidthMm: Optional[float] = None
     sourceMode: Optional[str] = None
+    processingVersion: Optional[str] = None
+    qualityFlags: List[str] = Field(default_factory=list)
     startedAt: Optional[float] = None
     endedAt: Optional[float] = None
     pageNumber: Optional[int] = None
@@ -280,6 +284,20 @@ class CanvasPageStroke(BaseModel):
             else:
                 out.append(pt)
         return out
+
+    @model_validator(mode="after")
+    def _validate_canonical_contract(self) -> "CanvasPageStroke":
+        if not self.processingVersion:
+            return self
+        if self.processingVersion != CANONICAL_STROKE_PROCESSING_VERSION:
+            raise ValueError(f"unsupported processingVersion: {self.processingVersion}")
+        for index, point in enumerate(self.points):
+            if not isinstance(point, (list, tuple)) or len(point) < 6:
+                raise ValueError(f"canonical point {index} must have at least 6 fields")
+            for value in point[:6]:
+                if not isinstance(value, (int, float)):
+                    raise ValueError(f"canonical point {index} contains non-numeric data")
+        return self
 
 
 class CanvasPageUpsert(BaseModel):
