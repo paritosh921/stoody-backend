@@ -1,0 +1,199 @@
+{
+  "version": "ble-canonical-v1",
+  "units": "raw_coordinate_units",
+  "cases": [
+    {
+      "case_id": "normal_stroke",
+      "description": "Two pen-down samples followed by pen-up complete one stroke.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 7, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 108, "y": 103, "pressure": 42, "page_no": 7, "book_type": "MS", "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 108, "y": 103, "pressure": 0, "page_no": 7, "book_type": "MS", "pen_ts": 16}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed"], "quality_flags": []}
+    },
+    {
+      "case_id": "fragmented_notification",
+      "description": "One P05 frame split across BLE notifications is one packet boundary after reassembly.",
+      "input_kind": "transport_fragments",
+      "input": [
+        {"fragment_id": "f1", "frame_id": "A", "complete": false, "coordinate_records": 0},
+        {"fragment_id": "f2", "frame_id": "A", "complete": true, "coordinate_records": 2}
+      ],
+      "expected": {"decoded_coordinate_records": 2, "accepted_count": 2, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": []}
+    },
+    {
+      "case_id": "coalesced_notification",
+      "description": "Two complete frames delivered in one BLE callback remain two packet frames, not one stroke.",
+      "input_kind": "transport_fragments",
+      "input": [
+        {"fragment_id": "f1", "frame_id": "A+B", "complete": true, "coordinate_records": 4, "coalesced_frames": 2}
+      ],
+      "expected": {"decoded_coordinate_records": 4, "accepted_count": 4, "completed_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed"], "quality_flags": []}
+    },
+    {
+      "case_id": "large_mtu_multi_coordinate_payload",
+      "description": "A larger-MTU P05 payload with multiple 14-byte coordinate records decodes every record.",
+      "input_kind": "transport_fragments",
+      "input": [
+        {"fragment_id": "f1", "frame_id": "L", "complete": true, "coordinate_records": 8, "mtu": 247}
+      ],
+      "expected": {"decoded_coordinate_records": 8, "accepted_count": 8, "completed_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed"], "quality_flags": []}
+    },
+    {
+      "case_id": "duplicate_packet",
+      "description": "A duplicate packet/frame is acknowledged or ignored without duplicating canonical points.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 10, "packet_id": "D1", "pen_id": "P1", "x": 100, "y": 100, "pressure": 35, "page_no": 2, "book_type": "MS", "pen_ts": 0},
+        {"seq": 10, "packet_id": "D1", "pen_id": "P1", "x": 100, "y": 100, "pressure": 35, "page_no": 2, "book_type": "MS", "pen_ts": 0},
+        {"seq": 11, "packet_id": "D2", "pen_id": "P1", "x": 104, "y": 101, "pressure": 36, "page_no": 2, "book_type": "MS", "pen_ts": 8}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": ["duplicate_ignored"]}
+    },
+    {
+      "case_id": "out_of_order_packet",
+      "description": "Out-of-order packet sequence is reordered or replay-requested, not committed as a new stroke.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 21, "pen_id": "P1", "x": 110, "y": 100, "pressure": 35, "page_no": 2, "book_type": "MS", "pen_ts": 8},
+        {"seq": 20, "pen_id": "P1", "x": 100, "y": 100, "pressure": 35, "page_no": 2, "book_type": "MS", "pen_ts": 0}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": ["out_of_order"]}
+    },
+    {
+      "case_id": "impossible_coordinate",
+      "description": "Coordinate far outside valid paper bounds is rejected.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 999999, "y": 999999, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 108, "y": 104, "pressure": 41, "page_no": 1, "book_type": "MS", "pen_ts": 16}
+      ],
+      "expected": {"accepted_count": 2, "rejected_count": 1, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": ["impossible_coordinate_rejected"]}
+    },
+    {
+      "case_id": "transient_jump",
+      "description": "One far jump followed by a return to the prior path is quarantined and dropped.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 105, "y": 102, "pressure": 41, "page_no": 1, "book_type": "MS", "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 900, "y": 900, "pressure": 42, "page_no": 1, "book_type": "MS", "pen_ts": 16},
+        {"seq": 4, "pen_id": "P1", "x": 111, "y": 104, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 24}
+      ],
+      "expected": {"accepted_count": 3, "rejected_count": 1, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": ["transient_jump_dropped"]}
+    },
+    {
+      "case_id": "confirmed_jump_split",
+      "description": "A far jump followed by continuation near the new location splits the stroke.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 105, "y": 102, "pressure": 41, "page_no": 1, "book_type": "MS", "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 900, "y": 900, "pressure": 42, "page_no": 1, "book_type": "MS", "pen_ts": 16},
+        {"seq": 4, "pen_id": "P1", "x": 906, "y": 903, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 24}
+      ],
+      "expected": {"accepted_count": 4, "completed_strokes": 1, "active_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed", "stroke_started"], "quality_flags": ["confirmed_jump_split"]}
+    },
+    {
+      "case_id": "low_pressure_tail",
+      "description": "Low pressure completes the stroke without adding a travel line.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 3, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 110, "y": 103, "pressure": 3, "page_no": 3, "book_type": "MS", "pen_ts": 8}
+      ],
+      "expected": {"accepted_count": 1, "completed_strokes": 1, "events": ["stroke_started", "stroke_completed"], "quality_flags": ["low_pressure_tail"]}
+    },
+    {
+      "case_id": "short_fast_valid_stroke",
+      "description": "A short fast stroke with plausible timing is retained.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 200, "y": 200, "pressure": 50, "page_no": 4, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 230, "y": 205, "pressure": 52, "page_no": 4, "book_type": "MS", "pen_ts": 5},
+        {"seq": 3, "pen_id": "P1", "x": 238, "y": 207, "pressure": 0, "page_no": 4, "book_type": "MS", "pen_ts": 10}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed"], "quality_flags": []}
+    },
+    {
+      "case_id": "page_detection_delay",
+      "description": "First one or two accepted points are reassigned when valid page scope arrives late.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": null, "book_type": null, "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 105, "y": 101, "pressure": 41, "page_no": null, "book_type": null, "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 110, "y": 102, "pressure": 42, "page_no": 9, "book_type": "MS", "pen_ts": 16}
+      ],
+      "expected": {"accepted_count": 3, "completed_strokes": 0, "page_no": 9, "book_type": "MS", "events": ["stroke_started", "stroke_points"], "quality_flags": ["scope_reassigned"]}
+    },
+    {
+      "case_id": "late_page_switch",
+      "description": "A scope change after more than two points splits instead of reassigning the stroke.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 8, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P1", "x": 105, "y": 101, "pressure": 41, "page_no": 8, "book_type": "MS", "pen_ts": 8},
+        {"seq": 3, "pen_id": "P1", "x": 110, "y": 102, "pressure": 42, "page_no": 8, "book_type": "MS", "pen_ts": 16},
+        {"seq": 4, "pen_id": "P1", "x": 115, "y": 103, "pressure": 42, "page_no": 9, "book_type": "MS", "pen_ts": 24}
+      ],
+      "expected": {"accepted_count": 4, "completed_strokes": 1, "active_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed", "stroke_started"], "quality_flags": ["scope_changed_stroke_split"]}
+    },
+    {
+      "case_id": "missing_timestamp",
+      "description": "Missing pen timestamp uses ingress timestamp fallback and marks provenance.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": null, "ingress_rx_ts": 1000},
+        {"seq": 2, "pen_id": "P1", "x": 104, "y": 101, "pressure": 42, "page_no": 1, "book_type": "MS", "pen_ts": null, "ingress_rx_ts": 1016}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 0, "ordering_basis": "ingress_rx_ts", "events": ["stroke_started", "stroke_points"], "quality_flags": ["timestamp_fallback"]}
+    },
+    {
+      "case_id": "timestamp_rollback",
+      "description": "Non-monotonic pen timestamp falls back to sequence/ingress ordering.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 20, "ingress_rx_ts": 1000},
+        {"seq": 2, "pen_id": "P1", "x": 104, "y": 101, "pressure": 42, "page_no": 1, "book_type": "MS", "pen_ts": 10, "ingress_rx_ts": 1016}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 0, "ordering_basis": "sequence", "events": ["stroke_started", "stroke_points"], "quality_flags": ["timestamp_rollback"]}
+    },
+    {
+      "case_id": "multi_pen_interleaving",
+      "description": "Two pens interleaved in the same stream keep independent stroke state.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 1, "book_type": "MS", "pen_ts": 0},
+        {"seq": 2, "pen_id": "P2", "x": 300, "y": 300, "pressure": 44, "page_no": 2, "book_type": "MS", "pen_ts": 0},
+        {"seq": 3, "pen_id": "P1", "x": 106, "y": 101, "pressure": 42, "page_no": 1, "book_type": "MS", "pen_ts": 8},
+        {"seq": 4, "pen_id": "P2", "x": 306, "y": 301, "pressure": 43, "page_no": 2, "book_type": "MS", "pen_ts": 8}
+      ],
+      "expected": {"accepted_count": 4, "active_strokes": 2, "events": ["stroke_started", "stroke_started", "stroke_points", "stroke_points"], "quality_flags": []}
+    },
+    {
+      "case_id": "offline_replay_gap",
+      "description": "Offline replay burst uses pen timing/source mode rather than wall-clock arrival timing.",
+      "input_kind": "coordinate_samples",
+      "input": [
+        {"seq": 1, "pen_id": "P1", "x": 100, "y": 100, "pressure": 40, "page_no": 5, "book_type": "MS", "pen_ts": 0, "source_mode": "offlineReplay"},
+        {"seq": 2, "pen_id": "P1", "x": 130, "y": 110, "pressure": 42, "page_no": 5, "book_type": "MS", "pen_ts": 40, "source_mode": "offlineReplay"}
+      ],
+      "expected": {"accepted_count": 2, "completed_strokes": 0, "events": ["stroke_started", "stroke_points"], "quality_flags": ["offline_replay_timing"]}
+    },
+    {
+      "case_id": "reconnect_replay",
+      "description": "Duplicate canonical events after reconnect are idempotent.",
+      "input_kind": "canonical_events",
+      "input": [
+        {"type": "stroke_started", "stream_id": "S1", "stroke_id": "ST1", "event_seq": 1, "point_seq_start": 0, "point_seq_end": 1},
+        {"type": "stroke_points", "stream_id": "S1", "stroke_id": "ST1", "event_seq": 2, "point_seq_start": 2, "point_seq_end": 3},
+        {"type": "stroke_points", "stream_id": "S1", "stroke_id": "ST1", "event_seq": 2, "point_seq_start": 2, "point_seq_end": 3},
+        {"type": "stroke_completed", "stream_id": "S1", "stroke_id": "ST1", "event_seq": 3, "point_seq_start": 0, "point_seq_end": 3}
+      ],
+      "expected": {"applied_events": 3, "duplicate_events_ignored": 1, "committed_strokes": 1, "events": ["stroke_started", "stroke_points", "stroke_completed"], "quality_flags": ["duplicate_event_ignored"]}
+    }
+  ]
+}

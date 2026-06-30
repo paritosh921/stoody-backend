@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -8,6 +11,42 @@ from api.v1.strokes_async import (
     _incoming_stroke_docs,
     _merge_stroke_docs,
 )
+
+
+CORPUS_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "ble-stroke-replay-corpus"
+    / "cases.json"
+)
+
+
+def load_corpus_case(case_id):
+    corpus = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
+    for item in corpus["cases"]:
+        if item["case_id"] == case_id:
+            return item
+    raise KeyError(f"Corpus case not found: {case_id}")
+
+
+def canonical_points_from_case(case_id):
+    test_case = load_corpus_case(case_id)
+    points = []
+    for sample in test_case["input"]:
+        pressure = int(sample["pressure"])
+        if pressure <= 0:
+            continue
+        points.append(
+            [
+                float(sample["x"]),
+                float(sample["y"]),
+                float(sample["pen_ts"] if sample.get("pen_ts") is not None else sample.get("ingress_rx_ts", 0)),
+                pressure,
+                round(pressure / 255, 4),
+                0,
+            ]
+        )
+    return points
 
 
 def test_canvas_stroke_preserves_canonical_geometry_and_metadata():
@@ -29,6 +68,23 @@ def test_canvas_stroke_preserves_canonical_geometry_and_metadata():
     assert stored["points"] == canonical_points
     assert stored["processingVersion"] == CANONICAL_STROKE_PROCESSING_VERSION
     assert stored["qualityFlags"] == ["offline_replay_gap"]
+
+
+def test_canvas_stroke_preserves_replay_corpus_canonical_geometry():
+    canonical_points = canonical_points_from_case("normal_stroke")
+    stroke = CanvasPageStroke(
+        id="corpus-normal-stroke",
+        points=canonical_points,
+        processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
+        qualityFlags=[],
+        sourceMode="live",
+    )
+    page = CanvasPageUpsert(book_type="MS", page_number=7, strokes=[stroke])
+
+    stored = _incoming_stroke_docs(page)[0]
+
+    assert stored["points"] == canonical_points
+    assert stored["processingVersion"] == CANONICAL_STROKE_PROCESSING_VERSION
 
 
 def test_canonical_stroke_rejects_non_canonical_point_shape():
