@@ -60,6 +60,10 @@ def test_canvas_stroke_preserves_canonical_geometry_and_metadata():
         processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
         qualityFlags=["offline_replay_gap"],
         sourceMode="offlineReplay",
+        pageNumber=4,
+        bookType="MS",
+        startedAt=0,
+        endedAt=24,
     )
     page = CanvasPageUpsert(book_type="MS", page_number=4, strokes=[stroke])
 
@@ -78,6 +82,10 @@ def test_canvas_stroke_preserves_replay_corpus_canonical_geometry():
         processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
         qualityFlags=[],
         sourceMode="live",
+        pageNumber=7,
+        bookType="MS",
+        startedAt=canonical_points[0][2],
+        endedAt=canonical_points[-1][2],
     )
     page = CanvasPageUpsert(book_type="MS", page_number=7, strokes=[stroke])
 
@@ -93,6 +101,33 @@ def test_canonical_stroke_rejects_non_canonical_point_shape():
             id="bad-canonical-1",
             points=[[1, 2, 0.5]],
             processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
+        )
+
+
+def test_canonical_stroke_requires_transport_metadata():
+    with pytest.raises(ValidationError):
+        CanvasPageStroke(
+            id="missing-canonical-metadata",
+            points=[[1, 2, 0, 120, 0.47, 0]],
+            processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
+            qualityFlags=[],
+            sourceMode="live",
+            pageNumber=4,
+            bookType="MS",
+            startedAt=10.0,
+        )
+
+    with pytest.raises(ValidationError):
+        CanvasPageStroke(
+            id="bad-source-mode",
+            points=[[1, 2, 0, 120, 0.47, 0]],
+            processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
+            qualityFlags=[],
+            sourceMode="renderer",
+            pageNumber=4,
+            bookType="MS",
+            startedAt=10.0,
+            endedAt=20.0,
         )
 
 

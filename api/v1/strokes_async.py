@@ -291,6 +291,18 @@ class CanvasPageStroke(BaseModel):
             return self
         if self.processingVersion != CANONICAL_STROKE_PROCESSING_VERSION:
             raise ValueError(f"unsupported processingVersion: {self.processingVersion}")
+        if self.sourceMode not in {"live", "offlineReplay"}:
+            raise ValueError("canonical stroke requires sourceMode live or offlineReplay")
+        if self.pageNumber is None or not isinstance(self.pageNumber, int):
+            raise ValueError("canonical stroke requires pageNumber")
+        if not isinstance(self.bookType, str) or not self.bookType.strip():
+            raise ValueError("canonical stroke requires bookType")
+        if self.startedAt is None or not isinstance(self.startedAt, (int, float)):
+            raise ValueError("canonical stroke requires startedAt")
+        if self.endedAt is None or not isinstance(self.endedAt, (int, float)):
+            raise ValueError("canonical stroke requires endedAt")
+        if any(not isinstance(flag, str) for flag in self.qualityFlags):
+            raise ValueError("canonical stroke qualityFlags must be strings")
         for index, point in enumerate(self.points):
             if not isinstance(point, (list, tuple)) or len(point) < 6:
                 raise ValueError(f"canonical point {index} must have at least 6 fields")
