@@ -612,6 +612,7 @@ async def preview_bulk_upload(
                     auto_username=preview_username
                 ))
     
+    file_name = (file.filename or "").lower()
     file_type = "Excel" if file_name.endswith(('.xlsx', '.xls')) else "CSV"
     
     return BulkPreviewResponse(

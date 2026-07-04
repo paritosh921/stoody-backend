@@ -3,7 +3,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from inspect import signature, getsource
+from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from pydantic import ValidationError
 
@@ -74,3 +76,52 @@ def test_bulk_student_upload_does_not_accept_default_class_section_or_subject():
     import_source = getsource(bulk.import_bulk_students)
     assert "settings_subjects" not in import_source
     assert "If subjects is empty, assign ALL valid subjects from settings" not in import_source
+
+
+@pytest.mark.asyncio
+async def test_bulk_student_preview_derives_excel_file_type_from_upload_filename(monkeypatch):
+    from api.v1 import student_bulk_upload as bulk
+
+    class FakeSettingsCollection:
+        async def find_one(self, query):
+            return {
+                "classes": ["X", "10"],
+                "sections": ["A", "B"],
+                "class_sections": {"X": ["A"], "10": ["A", "B"]},
+                "subjects": [],
+                "plan_types": [],
+                "school_info": {"school_name": "CIEL"},
+            }
+
+    class FakeTenantDB:
+        def __getitem__(self, name):
+            assert name == "school_settings"
+            return FakeSettingsCollection()
+
+    class FakeDB:
+        async def mongo_find(self, *args, **kwargs):
+            return []
+
+    async def fake_parse_upload_file(file, *, current_user, db, purpose):
+        return pd.DataFrame(
+            [
+                {"full_name": "Rahul Sharma", "username": "Rahul", "grade": "X", "section": "A"},
+                {"full_name": "Priya Patel", "username": "Priya", "grade": "10", "section": "A"},
+            ]
+        )
+
+    async def fake_get_tenant_db_or_403(db, current_user):
+        return FakeTenantDB()
+
+    monkeypatch.setattr(bulk, "parse_upload_file", fake_parse_upload_file)
+    monkeypatch.setattr(bulk, "get_tenant_db_or_403", fake_get_tenant_db_or_403)
+
+    response = await bulk.preview_bulk_upload.__wrapped__(
+        request=SimpleNamespace(),
+        file=SimpleNamespace(filename="bulk_upload.xlsx"),
+        current_user={"user_id": "690c55fd3c6e1a875ea134e8"},
+        db=FakeDB(),
+    )
+
+    assert response.file_type == "Excel"
+    assert response.valid_rows == 2
