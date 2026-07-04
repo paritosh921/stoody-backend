@@ -491,6 +491,161 @@ async def _get_enabled_features_for_tenant(
 
     return merge_tenant_features(None)
 
+
+def _object_id_or_none(value: Any) -> Optional[ObjectId]:
+    try:
+        return ObjectId(str(value))
+    except Exception:
+        return None
+
+
+def _append_unique_clause(clauses: List[Dict[str, Any]], clause: Dict[str, Any]) -> None:
+    if clause not in clauses:
+        clauses.append(clause)
+
+
+def _profile_lookup_query(user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    user_type = user.get("user_type")
+    user_id = str(user.get("user_id") or "").strip()
+    username = str(user.get("username") or "").strip()
+    email = str(user.get("email") or "").strip()
+    clauses: List[Dict[str, Any]] = []
+
+    oid = _object_id_or_none(user_id)
+    if oid:
+        _append_unique_clause(clauses, {"_id": oid})
+
+    if user_type == "tutor":
+        tutor_id = str(user.get("tutor_id") or "").strip()
+        if tutor_id:
+            _append_unique_clause(clauses, {"tutor_id": tutor_id})
+        if user_id:
+            _append_unique_clause(clauses, {"tutor_id": user_id})
+        if username:
+            _append_unique_clause(clauses, {"username": username})
+            _append_unique_clause(clauses, {"username_lower": username.lower()})
+        if email:
+            _append_unique_clause(clauses, {"email": email})
+    elif user_type == "student":
+        student_id = str(user.get("student_id") or "").strip()
+        if student_id:
+            _append_unique_clause(clauses, {"student_id": student_id})
+        if user_id:
+            _append_unique_clause(clauses, {"student_id": user_id})
+        if username:
+            _append_unique_clause(clauses, {"username": username})
+            _append_unique_clause(clauses, {"username_lower": username.lower()})
+    elif user_type == "admin":
+        admin_id = str(user.get("admin_id") or "").strip()
+        if admin_id:
+            admin_oid = _object_id_or_none(admin_id)
+            if admin_oid:
+                _append_unique_clause(clauses, {"_id": admin_oid})
+        if email:
+            _append_unique_clause(clauses, {"email": email})
+        if username:
+            _append_unique_clause(clauses, {"username": username})
+
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$or": clauses}
+
+
+async def _hydrate_verified_user_profile(
+    db: DatabaseManager,
+    user: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Load role-specific profile fields for /auth/verify responses.
+
+    /auth/verify is exempt from tenant middleware, so this uses the token's
+    db_name explicitly instead of relying on TenantContext.
+    """
+    hydrated = dict(user)
+    user_type = hydrated.get("user_type")
+    db_name = str(hydrated.get("db_name") or "").strip()
+    collection_name = {
+        "admin": "admins",
+        "student": "students",
+        "tutor": "tutors",
+    }.get(user_type)
+    if not db_name or not collection_name:
+        return hydrated
+
+    query = _profile_lookup_query(hydrated)
+    if not query:
+        return hydrated
+
+    collection = await db.get_tenant_collection(db_name, collection_name)
+    if collection is None:
+        return hydrated
+
+    profile = await collection.find_one(query)
+    if not profile:
+        return hydrated
+
+    if user_type == "tutor":
+        tutor_id = profile.get("tutor_id") or hydrated.get("tutor_id")
+        if tutor_id:
+            hydrated["tutor_id"] = tutor_id
+            hydrated["teacher_id"] = tutor_id
+        if profile.get("_id"):
+            hydrated["user_id"] = str(profile["_id"])
+        if profile.get("created_by") and not hydrated.get("admin_id"):
+            hydrated["admin_id"] = str(profile["created_by"])
+        hydrated.update({
+            "username": profile.get("username") or hydrated.get("username"),
+            "email": profile.get("email") or hydrated.get("email"),
+            "full_name": profile.get("name") or profile.get("full_name") or hydrated.get("full_name"),
+            "standards": profile.get("standards", []),
+            "sections": profile.get("sections", []),
+            "subjects": profile.get("subjects", []),
+            "plan_types": profile.get("plan_types", []),
+            "teaching_assignments": profile.get("teaching_assignments", []),
+            "can_edit_students": profile.get("can_edit_students", False),
+            "requires_password_change": profile.get(
+                "requires_password_change",
+                hydrated.get("requires_password_change", False),
+            ),
+        })
+    elif user_type == "student":
+        student_id = profile.get("student_id") or hydrated.get("student_id")
+        if student_id:
+            hydrated["student_id"] = student_id
+        if profile.get("_id"):
+            hydrated["user_id"] = str(profile["_id"])
+        hydrated.update({
+            "username": profile.get("username") or hydrated.get("username"),
+            "email": profile.get("email") or hydrated.get("email"),
+            "full_name": profile.get("full_name") or profile.get("name") or hydrated.get("full_name"),
+            "grade": profile.get("grade"),
+            "standard": profile.get("standard"),
+            "section": profile.get("section"),
+            "school": profile.get("school") or profile.get("school_name"),
+            "subjects": profile.get("subjects", []),
+            "plan_types": profile.get("plan_types", []),
+            "requires_password_change": profile.get(
+                "requires_password_change",
+                hydrated.get("requires_password_change", False),
+            ),
+        })
+    elif user_type == "admin":
+        if profile.get("_id"):
+            hydrated["user_id"] = str(profile["_id"])
+            hydrated["admin_id"] = str(profile["_id"])
+        hydrated.update({
+            "username": profile.get("username") or hydrated.get("username"),
+            "email": profile.get("email") or hydrated.get("email"),
+            "full_name": profile.get("full_name") or profile.get("name") or hydrated.get("full_name"),
+            "admin_role": profile.get("role") or hydrated.get("admin_role"),
+            "permissions": profile.get("permissions") or hydrated.get("permissions"),
+            "requires_password_change": profile.get(
+                "requires_password_change",
+                hydrated.get("requires_password_change", False),
+            ),
+        })
+
+    return hydrated
+
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -1294,6 +1449,8 @@ async def verify_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    current_user = await _hydrate_verified_user_profile(db, current_user)
+
     enabled_features = await _get_enabled_features_for_tenant(
         db,
         tenant=current_user,
@@ -1312,6 +1469,19 @@ async def verify_token(
             "email": current_user.get("email"),
             "username": current_user.get("username"),
             "full_name": current_user.get("full_name"),
+            "student_id": current_user.get("student_id"),
+            "tutor_id": current_user.get("tutor_id"),
+            "teacher_id": current_user.get("teacher_id") or current_user.get("tutor_id"),
+            "grade": current_user.get("grade"),
+            "standard": current_user.get("standard"),
+            "section": current_user.get("section"),
+            "school": current_user.get("school"),
+            "can_edit_students": current_user.get("can_edit_students", False),
+            "standards": current_user.get("standards") or [],
+            "sections": current_user.get("sections") or [],
+            "subjects": current_user.get("subjects") or [],
+            "plan_types": current_user.get("plan_types") or [],
+            "teaching_assignments": current_user.get("teaching_assignments") or [],
             "requires_password_change": current_user.get("requires_password_change", False),
             "enabled_features": enabled_features,
             "enabled_features_v2": enabled_features_v2,

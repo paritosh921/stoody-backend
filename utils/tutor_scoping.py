@@ -20,6 +20,40 @@ _logger = logging.getLogger(__name__)
 # Query builder
 # ---------------------------------------------------------------------------
 
+def _standard_condition(standard: str) -> Dict[str, Any]:
+    return {
+        "$or": [
+            {"grade": standard},
+            {"standard": standard},
+        ]
+    }
+
+
+def _subject_values(source: Any) -> List[str]:
+    if isinstance(source, list):
+        return [str(value) for value in source if value]
+    if source:
+        return [str(source)]
+    return []
+
+
+def _subject_condition(subjects: List[str]) -> Optional[Dict[str, Any]]:
+    if not subjects:
+        return None
+    return {
+        "$or": [
+            {"subjects": {"$in": subjects}},
+            {"subject": {"$in": subjects}},
+        ]
+    }
+
+
+def _combine_conditions(conditions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
+
+
 def build_tutor_class_criteria(
     tutor_doc: Dict[str, Any],
     admin_oid: Any,
@@ -40,7 +74,7 @@ def build_tutor_class_criteria(
         return None
 
     or_conditions: List[Dict[str, Any]] = []
-    seen_pairs: set = set()  # (grade, frozenset(sections))
+    seen_pairs: set = set()  # (grade, frozenset(sections), frozenset(subjects))
 
     # 1) Detailed teaching_assignments — most precise
     teaching_assignments = tutor_doc.get("teaching_assignments") or []
@@ -49,15 +83,21 @@ def build_tutor_class_criteria(
         if not standard:
             continue
         assignment_sections = [s for s in (assignment.get("sections") or []) if s]
-        pair_key = (standard, frozenset(assignment_sections))
+        assignment_subjects = _subject_values(assignment.get("subject")) + _subject_values(
+            assignment.get("subjects")
+        )
+        pair_key = (standard, frozenset(assignment_sections), frozenset(assignment_subjects))
         if pair_key in seen_pairs:
             continue
         seen_pairs.add(pair_key)
 
-        condition: Dict[str, Any] = {"grade": standard}
+        conditions: List[Dict[str, Any]] = [_standard_condition(standard)]
         if assignment_sections:
-            condition["section"] = {"$in": assignment_sections}
-        or_conditions.append(condition)
+            conditions.append({"section": {"$in": assignment_sections}})
+        subject_condition = _subject_condition(assignment_subjects)
+        if subject_condition:
+            conditions.append(subject_condition)
+        or_conditions.append(_combine_conditions(conditions))
 
     # 2) class_teacher_of  (e.g. {"standard": "11", "section": "A"})
     class_teacher_of = tutor_doc.get("class_teacher_of") or {}
@@ -68,23 +108,33 @@ def build_tutor_class_criteria(
             if class_teacher_of.get("section")
             else []
         )
-        ct_key = (ct_standard, frozenset(ct_sections))
+        ct_key = (ct_standard, frozenset(ct_sections), frozenset())
         if ct_key not in seen_pairs:
             seen_pairs.add(ct_key)
-            ct_condition: Dict[str, Any] = {"grade": ct_standard}
+            ct_conditions: List[Dict[str, Any]] = [_standard_condition(ct_standard)]
             if ct_sections:
-                ct_condition["section"] = ct_sections[0]
-            or_conditions.append(ct_condition)
+                ct_conditions.append({"section": ct_sections[0]})
+            or_conditions.append(_combine_conditions(ct_conditions))
 
     # 3) Fallback to flat standards/sections when nothing above matched
     if not or_conditions:
         standards = [s for s in (tutor_doc.get("standards") or []) if s]
         sections = [s for s in (tutor_doc.get("sections") or []) if s]
         if standards:
-            condition = {"grade": {"$in": standards}}
+            conditions = [
+                {
+                    "$or": [
+                        {"grade": {"$in": standards}},
+                        {"standard": {"$in": standards}},
+                    ]
+                }
+            ]
             if sections:
-                condition["section"] = {"$in": sections}
-            or_conditions.append(condition)
+                conditions.append({"section": {"$in": sections}})
+            subject_condition = _subject_condition(_subject_values(tutor_doc.get("subjects")))
+            if subject_condition:
+                conditions.append(subject_condition)
+            or_conditions.append(_combine_conditions(conditions))
 
     if not or_conditions:
         return None

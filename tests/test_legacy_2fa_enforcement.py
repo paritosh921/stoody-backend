@@ -48,6 +48,41 @@ class _FeatureDb:
         return self.collection
 
 
+class _VerifyCollection:
+    def __init__(self, documents: list[dict]):
+        self.documents = documents
+        self.seen_queries: list[dict] = []
+
+    def _matches(self, document: dict, query: dict) -> bool:
+        if "$or" in query:
+            return any(self._matches(document, clause) for clause in query["$or"])
+        return all(document.get(key) == value for key, value in query.items())
+
+    async def find_one(self, query, projection=None):
+        self.seen_queries.append(query)
+        for document in self.documents:
+            if self._matches(document, query):
+                return document.copy()
+        return None
+
+
+class _VerifyDb:
+    def __init__(self, tenant_document: dict, tenant_collections: dict[str, list[dict]]):
+        self.master_collection = _FeatureTenantCollection(tenant_document)
+        self.tenant_collections = {
+            name: _VerifyCollection(documents)
+            for name, documents in tenant_collections.items()
+        }
+
+    async def get_master_collection(self, name: str):
+        assert name == "tenants"
+        return self.master_collection
+
+    async def get_tenant_collection(self, db_name: str, collection_name: str):
+        assert db_name == "skb_abcd_1234"
+        return self.tenant_collections[collection_name]
+
+
 class _AuthManager:
     def __init__(
         self,
@@ -118,6 +153,73 @@ def test_legacy_admin_tutor_login_routes_are_not_registered():
     assert "/tutor/login" not in _route_paths(auth_async.router)
     assert "/admin/cookie-login" not in _route_paths(auth_cookie.router)
     assert "/tutor/cookie-login" not in _route_paths(auth_cookie.router)
+
+
+def test_verify_token_hydrates_tutor_profile_for_agent_sso(monkeypatch):
+    asyncio.run(_test_verify_token_hydrates_tutor_profile_for_agent_sso(monkeypatch))
+
+
+async def _test_verify_token_hydrates_tutor_profile_for_agent_sso(monkeypatch):
+    tutor_oid = ObjectId()
+    admin_oid = ObjectId()
+    monkeypatch.setattr(
+        auth_async,
+        "get_current_user_dual_auth",
+        AsyncMock(return_value={
+            "user_id": str(tutor_oid),
+            "user_type": "tutor",
+            "username": "TutorOne",
+            "tutor_id": "TUT-1",
+            "tenant_id": "ABCD-1234",
+            "db_name": "skb_abcd_1234",
+        }),
+    )
+    db = _VerifyDb(
+        {
+            "tenant_id": "ABCD-1234",
+            "db_name": "skb_abcd_1234",
+            "enabled_features": {"tutor_portal_access": True},
+        },
+        {
+            "tutors": [{
+                "_id": tutor_oid,
+                "tutor_id": "TUT-1",
+                "username": "TutorOne",
+                "email": "tutor@example.com",
+                "name": "Tutor One",
+                "created_by": admin_oid,
+                "standards": ["11"],
+                "sections": ["A"],
+                "subjects": ["Physics"],
+                "plan_types": ["JEE"],
+                "teaching_assignments": [
+                    {"standard": "11", "subject": "Physics", "sections": ["A"]},
+                ],
+                "can_edit_students": True,
+                "requires_password_change": True,
+            }],
+        },
+    )
+
+    response = await auth_async.verify_token(
+        _request(),
+        auth_manager=_AuthManager(),
+        db=db,
+    )
+
+    data = response["data"]
+    assert data["user_type"] == "tutor"
+    assert data["tutor_id"] == "TUT-1"
+    assert data["teacher_id"] == "TUT-1"
+    assert data["standards"] == ["11"]
+    assert data["sections"] == ["A"]
+    assert data["subjects"] == ["Physics"]
+    assert data["plan_types"] == ["JEE"]
+    assert data["teaching_assignments"] == [
+        {"standard": "11", "subject": "Physics", "sections": ["A"]},
+    ]
+    assert data["can_edit_students"] is True
+    assert data["requires_password_change"] is True
 
 
 def test_legacy_admin_tutor_login_paths_are_not_tenant_middleware_exempt():
@@ -235,6 +337,39 @@ async def _2fa_login_defaults_existing_user_without_2fa_doc_to_setup(auth_depend
 
 def test_2fa_login_bypasses_otp_when_requirement_disabled(auth_dependencies):
     asyncio.run(_2fa_login_bypasses_otp_when_requirement_disabled(auth_dependencies))
+
+
+def test_2fa_tutor_login_rejects_when_tutor_portal_disabled(auth_dependencies):
+    asyncio.run(_2fa_tutor_login_rejects_when_tutor_portal_disabled(auth_dependencies))
+
+
+async def _2fa_tutor_login_rejects_when_tutor_portal_disabled(auth_dependencies):
+    auth_dependencies.tenant["enabled_features"] = {}
+    auth_dependencies.tenant["enabled_features_v2"] = {
+        "version": 2,
+        "tier": "custom",
+        "overrides": {"tutor_portal_access": False},
+    }
+    auth_manager = _AuthManager(tutor_data={"user_id": "tutor-1"})
+
+    with pytest.raises(totp_2fa.HTTPException) as exc_info:
+        await _call(
+            totp_2fa.login_with_2fa,
+            _request(),
+            totp_2fa.LoginRequest(
+                username="teacher1",
+                password="secret1",
+                user_type="tutor",
+                tenant_id="ABCD-1234",
+            ),
+            db=object(),
+            auth_manager=auth_manager,
+        )
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Tutor panel is disabled for this institution"
+    auth_manager.authenticate_tutor.assert_not_awaited()
+    auth_manager.create_user_session.assert_not_awaited()
 
 
 async def _2fa_login_bypasses_otp_when_requirement_disabled(auth_dependencies):

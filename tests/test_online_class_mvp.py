@@ -759,6 +759,160 @@ async def _test_find_eligible_students_includes_tutor_class_assignment_for_all_s
     assert set(invited) == {"STU_11A"}
 
 
+def test_find_eligible_students_matches_tutor_assignment_when_student_uses_standard_field():
+    asyncio.run(_test_find_eligible_students_matches_tutor_assignment_when_student_uses_standard_field())
+
+
+async def _test_find_eligible_students_matches_tutor_assignment_when_student_uses_standard_field():
+    from bson import ObjectId
+    from api.v1.meeting_async import _find_eligible_students
+
+    admin_oid = ObjectId()
+    db = FakeDb()
+    db.collections["tutors"].append({
+        "tutor_id": "tutor-physics",
+        "assigned_student_ids": [],
+        "teaching_assignments": [
+            {"standard": "11", "subject": "Physics", "sections": ["A"]},
+        ],
+        "created_by": str(admin_oid),
+    })
+    db.collections["students"].extend([
+        {
+            "student_id": "STU_STANDARD_MATCH",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Physics"],
+            "is_active": True,
+        },
+        {
+            "student_id": "STU_STANDARD_OTHER_SUBJECT",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Chemistry"],
+            "is_active": True,
+        },
+    ])
+
+    invited = await _find_eligible_students(
+        db=db,
+        tutor_id="tutor-physics",
+        standard="11",
+        section="A",
+        subject="Physics",
+        course_type=None,
+        admin_id=str(admin_oid),
+    )
+
+    assert invited == ["STU_STANDARD_MATCH"]
+
+
+def test_tutor_scoped_students_match_standard_section_and_subject_assignment():
+    asyncio.run(_test_tutor_scoped_students_match_standard_section_and_subject_assignment())
+
+
+async def _test_tutor_scoped_students_match_standard_section_and_subject_assignment():
+    from bson import ObjectId
+    from utils.tutor_scoping import get_tutor_scoped_students
+
+    admin_oid = ObjectId()
+    db = FakeDb()
+    tutor = {
+        "tutor_id": "tutor-physics",
+        "assigned_student_ids": [],
+        "teaching_assignments": [
+            {"standard": "11", "subject": "Physics", "sections": ["A"]},
+        ],
+    }
+    db.collections["students"].extend([
+        {
+            "_id": ObjectId(),
+            "student_id": "STU_STANDARD_MATCH",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Physics"],
+        },
+        {
+            "_id": ObjectId(),
+            "student_id": "STU_OTHER_SUBJECT",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Chemistry"],
+        },
+        {
+            "_id": ObjectId(),
+            "student_id": "STU_OTHER_SECTION",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "B",
+            "subjects": ["Physics"],
+        },
+    ])
+
+    students = await get_tutor_scoped_students(
+        "tutor-physics",
+        admin_oid,
+        db,
+        tutor_doc=tutor,
+    )
+
+    assert [student["student_id"] for student in students] == ["STU_STANDARD_MATCH"]
+
+
+def test_tutor_scoped_students_keep_multiple_subject_assignments_for_same_class_section():
+    asyncio.run(_test_tutor_scoped_students_keep_multiple_subject_assignments_for_same_class_section())
+
+
+async def _test_tutor_scoped_students_keep_multiple_subject_assignments_for_same_class_section():
+    from bson import ObjectId
+    from utils.tutor_scoping import get_tutor_scoped_students
+
+    admin_oid = ObjectId()
+    db = FakeDb()
+    tutor = {
+        "tutor_id": "tutor-science",
+        "assigned_student_ids": [],
+        "teaching_assignments": [
+            {"standard": "11", "subject": "Physics", "sections": ["A"]},
+            {"standard": "11", "subject": "Chemistry", "sections": ["A"]},
+        ],
+    }
+    db.collections["students"].extend([
+        {
+            "_id": ObjectId(),
+            "student_id": "STU_PHYSICS",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Physics"],
+        },
+        {
+            "_id": ObjectId(),
+            "student_id": "STU_CHEMISTRY",
+            "admin_id": admin_oid,
+            "standard": "11",
+            "section": "A",
+            "subjects": ["Chemistry"],
+        },
+    ])
+
+    students = await get_tutor_scoped_students(
+        "tutor-science",
+        admin_oid,
+        db,
+        tutor_doc=tutor,
+    )
+
+    assert {student["student_id"] for student in students} == {
+        "STU_PHYSICS",
+        "STU_CHEMISTRY",
+    }
+
+
 def test_student_meetings_show_started_class_as_joinable_even_before_schedule():
     asyncio.run(_test_student_meetings_show_started_class_as_joinable_even_before_schedule())
 
@@ -791,6 +945,55 @@ async def _test_student_meetings_show_started_class_as_joinable_even_before_sche
     assert len(meetings) == 1
     assert meetings[0].status == "active"
     assert meetings[0].can_join is True
+
+
+def test_student_meetings_include_cancelled_and_ended_logs_by_default():
+    asyncio.run(_test_student_meetings_include_cancelled_and_ended_logs_by_default())
+
+
+async def _test_student_meetings_include_cancelled_and_ended_logs_by_default():
+    from api.v1 import meeting_async
+
+    now = datetime.now(timezone.utc)
+    db = FakeDb()
+    for status in ("scheduled", "active", "ended", "cancelled"):
+        db.collections["meetings"].append({
+            "meeting_id": f"MTG_{status.upper()}",
+            "topic": status.title(),
+            "subject": "Physics",
+            "standard": "11",
+            "section": "A",
+            "tutor_name": "Tutor One",
+            "scheduled_at": now,
+            "duration_minutes": 60,
+            "status": status,
+            "started_at": now if status in {"active", "ended", "cancelled"} else None,
+            "invited_student_ids": ["STU_1"],
+            "is_archived": False,
+        })
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_ARCHIVED",
+        "topic": "Archived",
+        "subject": "Physics",
+        "standard": "11",
+        "section": "A",
+        "tutor_name": "Tutor One",
+        "scheduled_at": now,
+        "duration_minutes": 60,
+        "status": "ended",
+        "started_at": now,
+        "invited_student_ids": ["STU_1"],
+        "is_archived": True,
+    })
+
+    meetings = await meeting_async.get_student_meetings.__wrapped__(
+        request=None,
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert {meeting.status for meeting in meetings} == {"scheduled", "active", "ended", "cancelled"}
+    assert "MTG_ARCHIVED" not in {meeting.meeting_id for meeting in meetings}
 
 
 def test_student_join_auth_allows_scheduled_class_inside_five_minute_window(monkeypatch):
@@ -830,6 +1033,46 @@ async def _test_student_join_auth_allows_scheduled_class_inside_five_minute_wind
     )
 
     assert result["meet_link"] == "https://class.example.com/stoody-MTG_JOIN"
+    assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
+
+
+def test_student_join_auth_allows_scheduled_class_inside_ten_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_allows_scheduled_class_inside_ten_minute_window(monkeypatch))
+
+
+async def _test_student_join_auth_allows_scheduled_class_inside_ten_minute_window(monkeypatch):
+    from api.v1 import meeting_async
+
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_JOIN_TEN",
+        "scheduled_at": datetime.now(timezone.utc) + timedelta(minutes=9),
+        "status": "scheduled",
+        "invited_student_ids": ["STU_1"],
+        "joined_student_ids": [],
+    })
+
+    def fake_provider(meeting_id, current_user, moderator):
+        assert meeting_id == "MTG_JOIN_TEN"
+        assert moderator is False
+        return meeting_async.ProviderDetails(
+            provider="jitsi",
+            domain="class.example.com",
+            room_name="stoody-MTG_JOIN_TEN",
+            url="https://class.example.com/stoody-MTG_JOIN_TEN",
+            configured=True,
+        )
+
+    monkeypatch.setattr(meeting_async, "_require_provider_details", fake_provider)
+
+    result = await meeting_async.student_join_meeting_auth.__wrapped__(
+        request=None,
+        meeting_id="MTG_JOIN_TEN",
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert result["meet_link"] == "https://class.example.com/stoody-MTG_JOIN_TEN"
     assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
 
 
@@ -873,11 +1116,11 @@ async def _test_student_join_auth_allows_started_class_before_five_minute_window
     assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
 
 
-def test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch):
-    asyncio.run(_test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch))
+def test_student_join_auth_blocks_scheduled_class_before_ten_minute_window(monkeypatch):
+    asyncio.run(_test_student_join_auth_blocks_scheduled_class_before_ten_minute_window(monkeypatch))
 
 
-async def _test_student_join_auth_blocks_scheduled_class_before_five_minute_window(monkeypatch):
+async def _test_student_join_auth_blocks_scheduled_class_before_ten_minute_window(monkeypatch):
     from fastapi import HTTPException
     from api.v1 import meeting_async
 
@@ -901,10 +1144,10 @@ async def _test_student_join_auth_blocks_scheduled_class_before_five_minute_wind
             meeting_id="MTG_SCHEDULED_TOO_EARLY",
             current_user={"user_type": "student", "student_id": "STU_1"},
             db=db,
-        )
+    )
 
     assert exc.value.status_code == 400
-    assert "5 minutes" in exc.value.detail
+    assert "10 minutes" in exc.value.detail
 
 
 def test_canvas_request_defaults_to_joined_students():
@@ -1481,6 +1724,66 @@ async def _test_extend_active_meeting_duration_allows_fixed_increments():
 
 def test_tutor_meetings_hide_archived_by_default_and_can_include_them():
     asyncio.run(_test_tutor_meetings_hide_archived_by_default_and_can_include_them())
+
+
+def test_tutor_meeting_create_and_list_resolves_tutor_from_user_id(monkeypatch):
+    asyncio.run(_test_tutor_meeting_create_and_list_resolves_tutor_from_user_id(monkeypatch))
+
+
+async def _test_tutor_meeting_create_and_list_resolves_tutor_from_user_id(monkeypatch):
+    from bson import ObjectId
+    from starlette.requests import Request
+    from api.v1 import meeting_async
+
+    db = FakeDb()
+    admin_oid = ObjectId()
+    db.collections["tutors"].append({
+        "tutor_id": "tutor-1",
+        "username": "mentor",
+        "created_by": str(admin_oid),
+    })
+
+    def fake_provider(meeting_id, current_user, moderator):
+        assert current_user["user_id"] == "tutor-1"
+        assert moderator is True
+        return meeting_async.ProviderDetails(
+            provider="jitsi",
+            domain="class.example.com",
+            room_name=f"stoody-{meeting_id}",
+            url=f"https://class.example.com/stoody-{meeting_id}",
+            configured=True,
+        )
+
+    monkeypatch.setattr(meeting_async, "_require_provider_details", fake_provider)
+
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    current_user = {
+        "user_type": "tutor",
+        "user_id": "tutor-1",
+        "username": "mentor",
+    }
+
+    created = await meeting_async.create_meeting(
+        request,
+        meeting_async.CreateMeetingRequest(
+            topic="Physics revision",
+            subject="Physics",
+            standard="11",
+            section="A",
+            scheduled_at=datetime.utcnow() + timedelta(hours=1),
+            duration_minutes=60,
+        ),
+        current_user=current_user,
+        db=db,
+    )
+    listed = await meeting_async.get_tutor_meetings(
+        request,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert created.tutor_id == "tutor-1"
+    assert [meeting.meeting_id for meeting in listed] == [created.meeting_id]
 
 
 async def _test_tutor_meetings_hide_archived_by_default_and_can_include_them():

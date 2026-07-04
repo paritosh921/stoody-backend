@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 limiter = Limiter(key_func=get_remote_address)
 
-STUDENT_JOIN_EARLY_WINDOW = timedelta(minutes=5)
+STUDENT_JOIN_EARLY_WINDOW = timedelta(minutes=10)
 STUDENT_JOIN_NOT_OPEN_DETAIL = (
-    "Class is not open for joining yet. Students can join 5 minutes before "
+    "Class is not open for joining yet. Students can join 10 minutes before "
     "the scheduled start time."
 )
 
@@ -111,6 +111,52 @@ async def resolve_business_student_id(
     if student and student.get("student_id"):
         return student["student_id"]
     return raw
+
+
+async def _resolve_current_tutor(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> tuple[str, Dict[str, Any]]:
+    tutor_id = current_user.get("tutor_id")
+    if tutor_id:
+        tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+        if tutor:
+            return str(tutor_id), tutor
+        return str(tutor_id), {}
+
+    from bson import ObjectId
+
+    lookup_clauses: List[Dict[str, Any]] = []
+    user_id = current_user.get("user_id")
+    if user_id:
+        user_id_str = str(user_id)
+        lookup_clauses.append({"tutor_id": user_id_str})
+        try:
+            lookup_clauses.append({"_id": ObjectId(user_id_str)})
+        except Exception:
+            pass
+
+    username = current_user.get("username")
+    if username:
+        username_str = str(username).strip()
+        if username_str:
+            lookup_clauses.append({"username": username_str})
+            lookup_clauses.append({"username_lower": username_str.lower()})
+
+    if lookup_clauses:
+        tutor = await db.mongo_find_one("tutors", {"$or": lookup_clauses})
+        if tutor and tutor.get("tutor_id"):
+            return str(tutor["tutor_id"]), tutor
+
+    raise HTTPException(status_code=404, detail="Tutor not found")
+
+
+async def _resolve_current_tutor_id(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> str:
+    tutor_id, _ = await _resolve_current_tutor(current_user, db)
+    return tutor_id
 
 
 async def resolve_notification_recipient_ids(
@@ -349,11 +395,9 @@ async def create_meeting(
     Create a new online class meeting backed by Jitsi.
     Only tutors can create meetings.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id, tutor = await _resolve_current_tutor(current_user, db)
     tutor_name = current_user.get("name") or current_user.get("username", "Tutor")
 
-    # Get tutor info for admin_id
-    tutor = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
     if not tutor:
         raise HTTPException(status_code=404, detail="Tutor not found")
 
@@ -496,6 +540,7 @@ async def _find_eligible_students(
         query_conditions.append({
             "$or": [
                 {"subjects": subject},
+                {"subject": subject},
                 {"subjects": {"$exists": False}},  # Include students without subjects filter
             ]
         })
@@ -542,7 +587,7 @@ async def get_tutor_meetings(
     """
     Get all meetings for the current tutor.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
 
     # Build query
     query = {"tutor_id": tutor_id}
@@ -573,7 +618,7 @@ async def update_meeting(
     """
     Update a scheduled meeting. Active, ended, cancelled, or archived meetings are immutable.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -627,7 +672,7 @@ async def archive_meeting(
     """
     Archive an ended or cancelled meeting so it is hidden from the default tutor list.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -662,12 +707,12 @@ async def get_student_meetings(
         raise HTTPException(status_code=403, detail="Could not resolve student identity")
 
     # Build query - find meetings where student is invited
-    query = {"invited_student_ids": student_id}
+    query = {
+        "invited_student_ids": student_id,
+        "is_archived": {"$ne": True},
+    }
     if status:
         query["status"] = status
-    else:
-        # By default, only show scheduled or active meetings
-        query["status"] = {"$in": ["scheduled", "active"]}
 
     # Get meetings
     meetings = await db.mongo_find("meetings", query)
@@ -769,7 +814,7 @@ async def start_meeting(
     """
     Start a scheduled meeting. Updates status to 'active'.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
 
     # Find meeting
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
@@ -855,7 +900,7 @@ async def end_meeting(
     """
     End an active meeting. Updates status to 'ended'.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
 
     # Find meeting
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
@@ -890,7 +935,7 @@ async def extend_meeting(
     current_user: Dict[str, Any] = Depends(require_tutor),
     db: DatabaseManager = Depends(get_database)
 ):
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -915,7 +960,7 @@ async def cancel_meeting(
     """
     Cancel a scheduled or active meeting.
     """
-    tutor_id = current_user.get("tutor_id")
+    tutor_id = await _resolve_current_tutor_id(current_user, db)
 
     # Find meeting
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
@@ -1000,7 +1045,7 @@ async def student_join_meeting_auth(
     user_type = current_user.get("user_type")
     moderator = False
     if user_type == "tutor":
-        tutor_id = current_user.get("tutor_id")
+        tutor_id = await _resolve_current_tutor_id(current_user, db)
         if meeting.get("tutor_id") != tutor_id:
             raise HTTPException(status_code=403, detail="Not authorized to join this meeting")
         if meeting.get("status") != "active":
