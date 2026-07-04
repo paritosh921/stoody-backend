@@ -291,6 +291,7 @@ class AsyncSettings(BaseSettings):
 
     # JWT Configuration - SECURE: No fallback, validated at runtime
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 60))
+    MOBILE_SESSION_EXPIRE_MINUTES: int = int(os.getenv("MOBILE_SESSION_EXPIRE_MINUTES", 14 * 24 * 60))
     JWT_ALGORITHM: str = "HS256"
 
     # Password Configuration
@@ -466,6 +467,7 @@ RATE_LIMIT_UPLOAD = settings.RATE_LIMIT_UPLOAD
 JWT_SECRET_KEY = _validated_jwt_secret
 SUPERADMIN_JWT_SECRET = _validated_superadmin_secret
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+MOBILE_SESSION_EXPIRE_MINUTES = settings.MOBILE_SESSION_EXPIRE_MINUTES
 JWT_ALGORITHM = settings.JWT_ALGORITHM
 
 # Password configuration

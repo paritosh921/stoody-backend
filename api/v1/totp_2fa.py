@@ -33,6 +33,7 @@ from bson import ObjectId
 
 from core.database import DatabaseManager
 from core.auth import AuthManager
+from core.mobile_auth import mobile_session_delta_for_request
 from core.tenant_registry import (
     get_tenant_by_subdomain,
     get_tenant_by_tenant_id,
@@ -470,8 +471,11 @@ def _build_user_token_data(user: Dict[str, Any], user_id: str, user_type: str,
     return data
 
 
-def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any]) -> str:
-    """Create an access token with 6-hour expiry for 2FA users"""
+def _create_access_token_with_delta(
+    auth_manager: AuthManager,
+    user_data: Dict[str, Any],
+    expires_delta: timedelta,
+) -> str:
     token_data = {
         "sub": str(user_data.get("user_id") or user_data.get("_id")),
         "user_type": user_data.get("user_type"),
@@ -490,8 +494,29 @@ def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any])
     }
     return auth_manager.create_access_token(
         token_data, 
-        expires_delta=timedelta(minutes=TWO_FA_TOKEN_EXPIRE_MINUTES)
+        expires_delta=expires_delta,
     )
+
+
+def create_6h_access_token(auth_manager: AuthManager, user_data: Dict[str, Any]) -> str:
+    """Create an access token with 6-hour expiry for 2FA web users."""
+    return _create_access_token_with_delta(
+        auth_manager,
+        user_data,
+        timedelta(minutes=TWO_FA_TOKEN_EXPIRE_MINUTES),
+    )
+
+
+def create_access_token_for_auth_request(
+    auth_manager: AuthManager,
+    user_data: Dict[str, Any],
+    request: Request,
+) -> str:
+    """Create a 2FA access token using the request's auth session policy."""
+    expires_delta = mobile_session_delta_for_request(request) or timedelta(
+        minutes=TWO_FA_TOKEN_EXPIRE_MINUTES
+    )
+    return _create_access_token_with_delta(auth_manager, user_data, expires_delta)
 
 
 # ============================================================================
@@ -622,7 +647,14 @@ async def login_with_2fa(
         # 2FA is neither enrolled nor required for this account - direct login
         user_data = _build_user_token_data(user, user_id, user_type, tenant=tenant)
 
-        session_data = await auth_manager.create_user_session(user_data)
+        mobile_session_delta = mobile_session_delta_for_request(request)
+        if mobile_session_delta is not None:
+            session_data = await auth_manager.create_user_session(
+                user_data,
+                expires_delta=mobile_session_delta,
+            )
+        else:
+            session_data = await auth_manager.create_user_session(user_data)
         await mark_successful_login(tenant_db, user_id, user_type)
 
         # Clear any user-level revocation so the new token is accepted
@@ -794,7 +826,11 @@ async def verify_2fa_setup(
         
         # Create access token with 6h expiry
         user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
-        access_token = create_6h_access_token(auth_manager, user_data)
+        access_token = create_access_token_for_auth_request(
+            auth_manager,
+            user_data,
+            request,
+        )
 
         # Clear any user-level revocation so the new token is accepted
         from core.token_blacklist import clear_user_session_revocation
@@ -859,7 +895,11 @@ async def verify_otp(
 
         if _is_2fa_bypass_user(user, user_type):
             user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
-            access_token = create_6h_access_token(auth_manager, user_data)
+            access_token = create_access_token_for_auth_request(
+                auth_manager,
+                user_data,
+                request,
+            )
             await mark_successful_login(tenant_db, user_id, user_type)
 
             from core.token_blacklist import clear_user_session_revocation
@@ -894,7 +934,11 @@ async def verify_otp(
         
         # Create access token with 6h expiry
         user_data = _build_user_token_data(user, user_id, user_type, payload=payload)
-        access_token = create_6h_access_token(auth_manager, user_data)
+        access_token = create_access_token_for_auth_request(
+            auth_manager,
+            user_data,
+            request,
+        )
 
         # Clear any user-level revocation so the new token is accepted
         from core.token_blacklist import clear_user_session_revocation

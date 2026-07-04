@@ -213,7 +213,11 @@ class AuthManager:
             return None
 
     # Session management with caching
-    async def create_user_session(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def create_user_session(
+        self,
+        user_data: Dict[str, Any],
+        expires_delta: Optional[timedelta] = None,
+    ) -> Dict[str, Any]:
         """Create user session with caching"""
         user_id = str(user_data.get("user_id") or user_data.get("id") or user_data.get("_id"))
         user_type = user_data.get("user_type", "student")
@@ -236,7 +240,12 @@ class AuthManager:
             "enabled_features_v2": user_data.get("enabled_features_v2"),
         }
 
-        access_token = self.create_access_token(token_data)
+        access_token = self.create_access_token(token_data, expires_delta=expires_delta)
+        session_ttl_seconds = (
+            int(expires_delta.total_seconds())
+            if expires_delta is not None
+            else JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        )
 
         # Cache session data
         session_data = {
@@ -267,13 +276,13 @@ class AuthManager:
 
         if self.cache_manager:
             await self.cache_manager.cache_user_session(
-                user_id, session_data, JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60
+                user_id, session_data, session_ttl_seconds
             )
 
         return {
             "access_token": access_token,
             "token_type": "bearer",
-            "expires_in": JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            "expires_in": session_ttl_seconds,
             "user": session_data
         }
 

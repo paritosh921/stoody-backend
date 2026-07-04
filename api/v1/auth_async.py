@@ -24,6 +24,7 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.auth import AuthManager
+from core.mobile_auth import mobile_session_delta_for_request
 from core.pen_tokens import create_pen_token
 from core.upload_security.service import secure_upload_many
 from core.tenant_registry import (
@@ -793,7 +794,14 @@ async def student_login(
             "enabled_features_v2": enabled_features_v2,
         }
 
-        session_data = await auth_manager.create_user_session(student_data)
+        mobile_session_delta = mobile_session_delta_for_request(request)
+        if mobile_session_delta is not None:
+            session_data = await auth_manager.create_user_session(
+                student_data,
+                expires_delta=mobile_session_delta,
+            )
+        else:
+            session_data = await auth_manager.create_user_session(student_data)
         record_auth_login("student", True)
         login_recorded = True
 
