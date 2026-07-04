@@ -440,6 +440,46 @@ async def _get_enabled_features_for_tenant(
     tenant: Optional[Dict[str, Any]] = None,
     tenant_id: Optional[str] = None,
 ) -> Dict[str, bool]:
+    tenants = await db.get_master_collection("tenants")
+    tenant_data = tenant or {}
+
+    lookup_clauses: List[Dict[str, Any]] = []
+
+    def add_lookup_clause(clause: Dict[str, Any]) -> None:
+        if clause not in lookup_clauses:
+            lookup_clauses.append(clause)
+
+    def add_public_id_lookup(raw_value: Any) -> None:
+        value = str(raw_value or "").strip()
+        if not value:
+            return
+        candidates = {value.upper()}
+        normalized_tenant_id = normalize_tenant_id(value)
+        if normalized_tenant_id:
+            candidates.add(normalized_tenant_id.upper())
+        for candidate in candidates:
+            add_lookup_clause({"tenant_id": candidate})
+            add_lookup_clause({"institution_id": candidate})
+
+    add_public_id_lookup(tenant_id)
+    add_public_id_lookup(tenant_data.get("tenant_id"))
+    add_public_id_lookup(tenant_data.get("institution_id"))
+
+    db_name = str(tenant_data.get("db_name") or "").strip()
+    if db_name:
+        add_lookup_clause({"db_name": db_name})
+
+    if tenants is not None and lookup_clauses:
+        tenant_doc = await tenants.find_one(
+            {"$or": lookup_clauses},
+            {"enabled_features": 1, "enabled_features_v2": 1},
+        )
+        if tenant_doc:
+            return merge_tenant_features(
+                tenant_doc.get("enabled_features"),
+                tenant_doc.get("enabled_features_v2"),
+            )
+
     if tenant and (
         isinstance(tenant.get("enabled_features"), dict)
         or isinstance(tenant.get("enabled_features_v2"), dict)
@@ -449,22 +489,7 @@ async def _get_enabled_features_for_tenant(
             tenant.get("enabled_features_v2"),
         )
 
-    tenant_lookup_id = (tenant_id or (tenant or {}).get("tenant_id") or "").strip().upper()
-    if not tenant_lookup_id:
-        return merge_tenant_features(None)
-
-    tenants = await db.get_master_collection("tenants")
-    if tenants is None:
-        return merge_tenant_features(None)
-
-    tenant_doc = await tenants.find_one(
-        {"$or": [{"tenant_id": tenant_lookup_id}, {"institution_id": tenant_lookup_id}]},
-        {"enabled_features": 1, "enabled_features_v2": 1},
-    )
-    return merge_tenant_features(
-        (tenant_doc or {}).get("enabled_features"),
-        (tenant_doc or {}).get("enabled_features_v2"),
-    )
+    return merge_tenant_features(None)
 
 async def get_current_user(
     request: Request,
@@ -1271,6 +1296,7 @@ async def verify_token(
 
     enabled_features = await _get_enabled_features_for_tenant(
         db,
+        tenant=current_user,
         tenant_id=current_user.get("tenant_id"),
     )
     enabled_features_v2 = build_enabled_features_v2(

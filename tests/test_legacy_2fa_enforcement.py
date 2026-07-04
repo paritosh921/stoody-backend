@@ -25,6 +25,29 @@ class _TenantDb(dict):
         self["tutors"] = _Collection(tutor_doc)
 
 
+class _FeatureTenantCollection:
+    def __init__(self, document: dict):
+        self.document = document
+        self.seen_queries: list[dict] = []
+
+    async def find_one(self, query, projection=None):
+        self.seen_queries.append(query)
+        clauses = query.get("$or", [query])
+        for clause in clauses:
+            if all(self.document.get(key) == value for key, value in clause.items()):
+                return self.document
+        return None
+
+
+class _FeatureDb:
+    def __init__(self, tenant_document: dict):
+        self.collection = _FeatureTenantCollection(tenant_document)
+
+    async def get_master_collection(self, name: str):
+        assert name == "tenants"
+        return self.collection
+
+
 class _AuthManager:
     def __init__(
         self,
@@ -100,6 +123,35 @@ def test_legacy_admin_tutor_login_routes_are_not_registered():
 def test_legacy_admin_tutor_login_paths_are_not_tenant_middleware_exempt():
     assert "/api/v1/auth/admin/login" not in TenantMiddleware.EXEMPT_PATHS
     assert "/api/v1/auth/tutor/login" not in TenantMiddleware.EXEMPT_PATHS
+
+
+def test_verify_feature_lookup_uses_db_name_when_tenant_id_missing():
+    asyncio.run(_verify_feature_lookup_uses_db_name_when_tenant_id_missing())
+
+
+async def _verify_feature_lookup_uses_db_name_when_tenant_id_missing():
+    tenant_doc = {
+        "tenant_id": "ABCD-1234",
+        "db_name": "skb_abcd_1234",
+        "institution_id": "INST-1",
+        "enabled_features_v2": {
+            "version": 2,
+            "tier": "advanced",
+            "overrides": {},
+        },
+    }
+    db = _FeatureDb(tenant_doc)
+
+    features = await auth_async._get_enabled_features_for_tenant(
+        db,
+        tenant={"db_name": "skb_abcd_1234"},
+    )
+
+    assert features["tutor_online_class"] is True
+    assert any(
+        {"db_name": "skb_abcd_1234"} in query.get("$or", [])
+        for query in db.collection.seen_queries
+    )
 
 
 def test_2fa_login_has_no_legacy_admin_email_exemption(auth_dependencies):
