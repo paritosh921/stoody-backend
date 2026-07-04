@@ -38,3 +38,21 @@ def test_bulk_student_section_validation_rejects_missing_section():
 
     assert validate_section_for_class("", "10", ["A", "B"], {"10": ["A", "B"]}) is False
     assert validate_section_for_class("A", "10", ["A", "B"], {"10": ["A", "B"]}) is True
+
+
+def test_bulk_student_grade_validation_requires_exact_settings_format():
+    from api.v1 import student_bulk_upload as bulk
+
+    assert bulk.validate_grade("IV", ["IV"]) is True
+    assert bulk.validate_grade("4", ["IV"]) is False
+    assert bulk.validate_grade("IV", ["4"]) is False
+
+    formatter = getattr(bulk, "format_invalid_grade_message", None)
+    assert callable(formatter), "format_invalid_grade_message should explain exact class format"
+
+    message = formatter("4", ["IV"])
+    assert "Invalid grade '4'" in message
+    assert "Allowed classes: IV" in message
+    assert "exact class format configured in Settings" in message
+    assert "roman numerals" in message
+    assert "numeric values" in message

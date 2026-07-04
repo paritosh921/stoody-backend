@@ -152,6 +152,17 @@ def validate_grade(grade: str, valid_grades: List[str] = None) -> bool:
     return str(grade).strip() in allowed
 
 
+def format_invalid_grade_message(grade: str, valid_grades: List[str]) -> str:
+    """Build a clear class-format error for exact settings-backed grade validation."""
+    allowed = ', '.join(str(item) for item in valid_grades)
+    return (
+        f"Invalid grade '{grade}'. Allowed classes: {allowed}. "
+        "Use the exact class format configured in Settings. "
+        "If Settings uses roman numerals (for example IV), upload IV; "
+        "if it uses numeric values (for example 4), upload 4."
+    )
+
+
 def validate_section_for_class(section: str, grade: str, valid_sections: List[str],
                                 class_sections: Dict[str, List[str]] = None) -> bool:
     """Validate section against the class-specific mapping if available, else the global sections list."""
@@ -509,7 +520,7 @@ async def preview_bulk_upload(
             errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message="Grade is required"))
             row_valid = False
         elif not validate_grade(grade, valid_classes):
-            errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message=f"Invalid grade. Must be one of: {', '.join(valid_classes)}"))
+            errors.append(BulkUploadError(row=row_num, field="grade", value=grade, message=format_invalid_grade_message(grade, valid_classes)))
             row_valid = False
         
         # Validate custom username if provided
@@ -730,8 +741,11 @@ async def import_bulk_students(
             errors.append(BulkUploadError(row=row_num, field="full_name", message="Invalid full name"))
             row_valid = False
         
-        if not grade or not validate_grade(grade, valid_classes):
-            errors.append(BulkUploadError(row=row_num, field="grade", message=f"Invalid grade: {grade}. Must be one of: {', '.join(valid_classes)}"))
+        if not grade:
+            errors.append(BulkUploadError(row=row_num, field="grade", message="Grade is required"))
+            row_valid = False
+        elif not validate_grade(grade, valid_classes):
+            errors.append(BulkUploadError(row=row_num, field="grade", message=format_invalid_grade_message(grade, valid_classes)))
             row_valid = False
         
         # Validate custom username if provided
