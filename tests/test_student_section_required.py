@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from inspect import signature, getsource
 
 import pytest
 from pydantic import ValidationError
@@ -56,3 +57,20 @@ def test_bulk_student_grade_validation_requires_exact_settings_format():
     assert "exact class format configured in Settings" in message
     assert "roman numerals" in message
     assert "numeric values" in message
+
+
+def test_bulk_student_upload_does_not_accept_default_class_section_or_subject():
+    from api.v1 import student_bulk_upload as bulk
+
+    preview_params = signature(bulk.preview_bulk_upload).parameters
+    import_params = signature(bulk.import_bulk_students).parameters
+
+    for params in (preview_params, import_params):
+        assert "default_grade" not in params
+        assert "default_section" not in params
+        assert "default_stream" not in params
+        assert "default_subject" not in params
+
+    import_source = getsource(bulk.import_bulk_students)
+    assert "settings_subjects" not in import_source
+    assert "If subjects is empty, assign ALL valid subjects from settings" not in import_source

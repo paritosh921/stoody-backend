@@ -414,9 +414,6 @@ async def download_bulk_template(
 async def preview_bulk_upload(
     request: Request,
     file: UploadFile = File(...),
-    default_grade: Optional[str] = Query(None, description="Default grade for rows without grade"),
-    default_section: Optional[str] = Query(None, description="Default section for rows without section"),
-    default_stream: Optional[str] = Query(None, description="Default stream for rows without stream"),
     current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database)
 ):
@@ -498,11 +495,11 @@ async def preview_bulk_upload(
         row_num = idx + 2  # Excel/CSV row number (1-indexed + header)
         row_valid = True
         
-        # Get values with defaults
+        # Get values from uploaded sheet only
         full_name = str(row.get('full_name', '')).strip()
         custom_username = str(row.get('username', '')).strip() if row.get('username') else ''
-        grade = str(row.get('grade', default_grade or '')).strip()
-        section = str(row.get('section', default_section or '')).strip().upper() if row.get('section') or default_section else ''
+        grade = str(row.get('grade', '')).strip()
+        section = str(row.get('section', '')).strip().upper() if row.get('section') else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip()
         gender = str(row.get('gender', '')).strip().lower() if row.get('gender') else ''
@@ -637,9 +634,6 @@ async def preview_bulk_upload(
 async def import_bulk_students(
     request: Request,
     file: UploadFile = File(...),
-    default_grade: Optional[str] = Query(None, description="Default grade for rows without grade"),
-    default_section: Optional[str] = Query(None, description="Default section for rows without section"),
-    default_stream: Optional[str] = Query(None, description="Default stream for rows without stream"),
     skip_errors: bool = Query(True, description="Skip rows with errors and import valid ones"),
     current_user: Dict[str, Any] = Depends(require_admin_permission("manage_students")),
     db: DatabaseManager = Depends(get_database),
@@ -724,8 +718,8 @@ async def import_bulk_students(
         # Get values
         full_name = str(row.get('full_name', '')).strip()
         custom_username = str(row.get('username', '')).strip() if row.get('username') else ''  # Custom username from file
-        grade = str(row.get('grade', default_grade or '')).strip()
-        section = str(row.get('section', default_section or '')).strip().upper() if row.get('section') or default_section else ''
+        grade = str(row.get('grade', '')).strip()
+        section = str(row.get('section', '')).strip().upper() if row.get('section') else ''
         email = str(row.get('email', '')).strip().lower() if row.get('email') else ''
         phone = str(row.get('phone', '')).strip()
         stream = None  # Stream is removed/fluid - always None
@@ -813,12 +807,6 @@ async def import_bulk_students(
             if settings_plan_types:
                 plan_types = settings_plan_types
                 
-        # If subjects is empty, assign ALL valid subjects from settings
-        if not subjects and settings_doc:
-            settings_subjects = settings_doc.get("subjects", [])
-            if settings_subjects:
-                subjects = settings_subjects
-        
         # Normalize fields
         if stream and stream not in ['science', 'commerce', 'arts', 'other']:
             stream = None # Invalid stream becomes None
