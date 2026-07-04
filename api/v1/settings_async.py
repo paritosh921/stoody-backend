@@ -14,6 +14,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.school_settings_format import clean_class_sections, clean_class_values, validate_class_values
 from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
@@ -161,7 +162,7 @@ async def get_school_settings(
         is_b2c = is_b2c_admin(current_user)
         
         # Try to get from cache first
-        cache_key = f"school_settings:{'b2c' if is_b2c else admin_id}"
+        cache_key = f"school_settings:v2:{'b2c' if is_b2c else admin_id}"
         cached_settings = await cache.get(cache_key)
         if cached_settings:
             return cached_settings
@@ -191,13 +192,21 @@ async def get_school_settings(
             await cache.set(cache_key, default_response, ttl=3600)
             return default_response
         
+        classes = clean_class_values(settings_doc.get("classes", DEFAULT_SETTINGS["classes"]))
+        sections = settings_doc.get("sections", DEFAULT_SETTINGS["sections"])
+        class_sections = clean_class_sections(
+            settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
+            classes=classes,
+            sections=sections,
+        )
+
         # Convert MongoDB document to response
         response = {
             "admin_id": admin_id,
             "school_info": SchoolInfo(**settings_doc.get("school_info", DEFAULT_SETTINGS["school_info"])).dict(),
-            "classes": settings_doc.get("classes", DEFAULT_SETTINGS["classes"]),
-            "sections": settings_doc.get("sections", DEFAULT_SETTINGS["sections"]),
-            "class_sections": settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
+            "classes": classes,
+            "sections": sections,
+            "class_sections": class_sections,
             "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
             "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
             "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"]),
@@ -260,9 +269,23 @@ async def update_school_settings(
         else:
             update_doc["school_info"] = existing_settings.get("school_info", DEFAULT_SETTINGS["school_info"]) if existing_settings else DEFAULT_SETTINGS["school_info"]
         
-        # Update lists if provided
-        # Update lists if provided
-        update_doc["classes"] = settings_data.classes if settings_data.classes is not None else (existing_settings.get("classes", DEFAULT_SETTINGS["classes"]) if existing_settings else DEFAULT_SETTINGS["classes"])
+        raw_classes = (
+            settings_data.classes
+            if settings_data.classes is not None
+            else (
+                existing_settings.get("classes", DEFAULT_SETTINGS["classes"])
+                if existing_settings
+                else DEFAULT_SETTINGS["classes"]
+            )
+        )
+        try:
+            update_doc["classes"] = (
+                validate_class_values(raw_classes)
+                if settings_data.classes is not None
+                else clean_class_values(raw_classes)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         
         # Get master sections list
         master_sections = settings_data.sections if settings_data.sections is not None else (existing_settings.get("sections", DEFAULT_SETTINGS["sections"]) if existing_settings else DEFAULT_SETTINGS["sections"])
@@ -293,7 +316,11 @@ async def update_school_settings(
                 else:
                     sanitized_class_sections[cls] = []
         
-        update_doc["class_sections"] = sanitized_class_sections
+        update_doc["class_sections"] = clean_class_sections(
+            sanitized_class_sections,
+            classes=update_doc["classes"],
+            sections=master_sections,
+        )
         update_doc["subjects"] = settings_data.subjects if settings_data.subjects is not None else (existing_settings.get("subjects", DEFAULT_SETTINGS["subjects"]) if existing_settings else DEFAULT_SETTINGS["subjects"])
         update_doc["plan_types"] = settings_data.plan_types if settings_data.plan_types is not None else (existing_settings.get("plan_types", DEFAULT_SETTINGS["plan_types"]) if existing_settings else DEFAULT_SETTINGS["plan_types"])
         update_doc["streams"] = settings_data.streams if settings_data.streams is not None else (existing_settings.get("streams", DEFAULT_SETTINGS["streams"]) if existing_settings else DEFAULT_SETTINGS["streams"])
@@ -313,8 +340,9 @@ async def update_school_settings(
         )
         
         # Invalidate cache
-        cache_key = f"school_settings:{admin_id}"
+        cache_key = f"school_settings:v2:{admin_id}"
         await cache.delete(cache_key)
+        await cache.delete(f"school_settings_public:v2:{admin_id}")
         
         # Return updated settings
         response = {
@@ -467,7 +495,7 @@ async def get_public_school_settings(
     """Get public school settings (for student-facing features)"""
     try:
         # Try to get from cache first
-        cache_key = f"school_settings_public:{admin_id}"
+        cache_key = f"school_settings_public:v2:{admin_id}"
         cached_settings = await cache.get(cache_key)
         if cached_settings:
             return cached_settings
@@ -492,12 +520,18 @@ async def get_public_school_settings(
             }
         else:
             school_info = settings_doc.get("school_info", {})
+            classes = clean_class_values(settings_doc.get("classes", DEFAULT_SETTINGS["classes"]))
+            sections = settings_doc.get("sections", DEFAULT_SETTINGS["sections"])
             response = {
                 "school_name": school_info.get("school_name", ""),
                 "school_logo": school_info.get("school_logo", ""),
-                "classes": settings_doc.get("classes", DEFAULT_SETTINGS["classes"]),
-                "sections": settings_doc.get("sections", DEFAULT_SETTINGS["sections"]),
-                "class_sections": settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
+                "classes": classes,
+                "sections": sections,
+                "class_sections": clean_class_sections(
+                    settings_doc.get("class_sections", DEFAULT_SETTINGS["class_sections"]),
+                    classes=classes,
+                    sections=sections,
+                ),
                 "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
                 "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
                 "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"])

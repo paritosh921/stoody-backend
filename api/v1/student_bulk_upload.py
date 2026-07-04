@@ -23,6 +23,7 @@ from slowapi.util import get_remote_address
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
+from core.school_settings_format import clean_class_sections, clean_class_values
 from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.admin_async import require_admin_permission, get_tenant_db_or_403, check_registration_limit
@@ -190,6 +191,41 @@ def parse_list_field(value: str) -> List[str]:
     return [item.strip() for item in str(value).split(',') if item.strip()]
 
 
+async def find_school_settings_for_admin(tenant_db: Any, admin_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not admin_id:
+        return None
+
+    settings = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+    if settings:
+        return settings
+
+    try:
+        return await tenant_db["school_settings"].find_one({"admin_id": ObjectId(str(admin_id))})
+    except Exception:
+        return None
+
+
+def get_bulk_upload_settings(settings_doc: Optional[Dict[str, Any]]):
+    if settings_doc and settings_doc.get("classes"):
+        valid_classes = clean_class_values(settings_doc.get("classes"))
+        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS)
+        class_sections = clean_class_sections(
+            settings_doc.get("class_sections"),
+            classes=valid_classes,
+            sections=valid_sections,
+        )
+        valid_subjects = settings_doc.get("subjects", [])
+        valid_plan_types = settings_doc.get("plan_types", [])
+    else:
+        valid_classes = FALLBACK_GRADES
+        valid_sections = FALLBACK_SECTIONS
+        class_sections = None
+        valid_subjects = []
+        valid_plan_types = []
+
+    return valid_classes, valid_sections, class_sections, valid_subjects, valid_plan_types
+
+
 async def parse_upload_file(
     file: UploadFile,
     *,
@@ -259,10 +295,10 @@ async def download_bulk_template(
     try:
         tenant_db = await get_tenant_db_or_403(db, current_user)
         admin_id = current_user.get("admin_id", current_user.get("user_id"))
-        settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id})
+        settings_doc = await find_school_settings_for_admin(tenant_db, admin_id)
 
         valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS) if settings_doc else FALLBACK_SECTIONS
-        valid_classes = settings_doc.get("classes", FALLBACK_GRADES) if settings_doc else FALLBACK_GRADES
+        valid_classes = clean_class_values(settings_doc.get("classes", FALLBACK_GRADES)) if settings_doc else FALLBACK_GRADES
         valid_streams = settings_doc.get("streams", ["science", "commerce", "arts", "other"]) if settings_doc else ["science", "commerce", "arts", "other"]
         valid_plan_types = settings_doc.get("plan_types", []) if settings_doc else []
         valid_subjects = settings_doc.get("subjects", []) if settings_doc else []
@@ -445,21 +481,8 @@ async def preview_bulk_upload(
     tenant_db = await get_tenant_db_or_403(db, current_user)
     admin_id_str = current_user.get("admin_id", current_user.get("user_id"))
     admin_id = ObjectId(admin_id_str) if admin_id_str else ObjectId(current_user["user_id"])
-    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id_str})
-
-    # If settings not configured, validation will produce per-row errors in preview
-    if settings_doc and settings_doc.get("classes"):
-        valid_classes = settings_doc.get("classes")
-        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS)
-        class_sections = settings_doc.get("class_sections")
-        valid_subjects = settings_doc.get("subjects", [])
-        valid_plan_types = settings_doc.get("plan_types", [])
-    else:
-        valid_classes = FALLBACK_GRADES
-        valid_sections = FALLBACK_SECTIONS
-        class_sections = None
-        valid_subjects = []
-        valid_plan_types = []
+    settings_doc = await find_school_settings_for_admin(tenant_db, admin_id_str)
+    valid_classes, valid_sections, class_sections, valid_subjects, valid_plan_types = get_bulk_upload_settings(settings_doc)
 
     # Get school prefix for username generation
     school_name = ""
@@ -671,19 +694,8 @@ async def import_bulk_students(
     admin_id = ObjectId(admin_id_str) if admin_id_str else ObjectId(current_user["user_id"])
 
     # Get school settings — admin_id stored as string in school_settings
-    settings_doc = await tenant_db["school_settings"].find_one({"admin_id": admin_id_str})
-    if settings_doc and settings_doc.get("classes"):
-        valid_classes = settings_doc.get("classes")
-        valid_sections = settings_doc.get("sections", FALLBACK_SECTIONS)
-        class_sections = settings_doc.get("class_sections")
-        valid_subjects = settings_doc.get("subjects", [])
-        valid_plan_types = settings_doc.get("plan_types", [])
-    else:
-        valid_classes = FALLBACK_GRADES
-        valid_sections = FALLBACK_SECTIONS
-        class_sections = None
-        valid_subjects = []
-        valid_plan_types = []
+    settings_doc = await find_school_settings_for_admin(tenant_db, admin_id_str)
+    valid_classes, valid_sections, class_sections, valid_subjects, valid_plan_types = get_bulk_upload_settings(settings_doc)
 
     # Get existing emails and usernames
     existing_students = await db.mongo_find("students", {"admin_id": admin_id}, projection={"email": 1, "username_lower": 1})
