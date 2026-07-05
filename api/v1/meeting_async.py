@@ -769,16 +769,11 @@ async def get_student_meetings(
     now = datetime.now(timezone.utc)
     for m in meetings:
         can_join = _is_student_joinable(m, now=now)
-        provider = (
-            _provider_or_none(
-                m.get("meeting_id"),
-                current_user=current_user,
-                moderator=False,
-            )
+        meet_link, meet_code = (
+            _public_video_fields(m.get("meeting_id"))
             if can_join
-            else None
+            else (None, None)
         )
-        meet_link, meet_code = _provider_video_fields(provider)
         responses.append(
             StudentMeetingResponse(
                 meeting_id=m.get("meeting_id"),
@@ -794,7 +789,7 @@ async def get_student_meetings(
                 status=_student_visible_status(m, now=now),
                 can_join=can_join,
                 started_at=m.get("started_at"),
-                provider_details=provider,
+                provider_details=None,
             )
         )
     return responses

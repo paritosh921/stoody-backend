@@ -952,6 +952,55 @@ async def _test_student_meetings_show_started_class_as_joinable_even_before_sche
     assert meetings[0].can_join is True
 
 
+def test_student_meeting_list_does_not_mint_jitsi_provider_sessions(monkeypatch):
+    asyncio.run(_test_student_meeting_list_does_not_mint_jitsi_provider_sessions(monkeypatch))
+
+
+async def _test_student_meeting_list_does_not_mint_jitsi_provider_sessions(monkeypatch):
+    from api.v1 import meeting_async
+
+    now = datetime.now(timezone.utc)
+    db = FakeDb()
+    db.collections["meetings"].append({
+        "meeting_id": "MTG_ACTIVE",
+        "topic": "Live Physics",
+        "subject": "Physics",
+        "standard": "11",
+        "section": "A",
+        "tutor_name": "Tutor One",
+        "scheduled_at": now - timedelta(minutes=5),
+        "duration_minutes": 60,
+        "status": "active",
+        "started_at": now - timedelta(minutes=2),
+        "invited_student_ids": ["STU_1"],
+    })
+
+    def fail_if_signed_provider_requested(*args, **kwargs):
+        raise AssertionError("student meeting list must not mint a signed Jitsi provider session")
+
+    monkeypatch.setattr(meeting_async, "_provider_or_none", fail_if_signed_provider_requested)
+    monkeypatch.setattr(
+        meeting_async,
+        "_public_video_fields",
+        lambda meeting_id: (
+            f"https://class.example.com/stoody-{meeting_id}",
+            f"stoody-{meeting_id}",
+        ),
+    )
+
+    meetings = await meeting_async.get_student_meetings.__wrapped__(
+        request=None,
+        current_user={"user_type": "student", "student_id": "STU_1"},
+        db=db,
+    )
+
+    assert len(meetings) == 1
+    assert meetings[0].can_join is True
+    assert meetings[0].meet_link == "https://class.example.com/stoody-MTG_ACTIVE"
+    assert meetings[0].meet_code == "stoody-MTG_ACTIVE"
+    assert meetings[0].provider_details is None
+
+
 def test_student_meetings_include_cancelled_and_ended_logs_by_default():
     asyncio.run(_test_student_meetings_include_cancelled_and_ended_logs_by_default())
 
