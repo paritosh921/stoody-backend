@@ -2,11 +2,13 @@ import asyncio
 import base64
 import json
 import logging
+import uuid
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Literal
+from collections import deque
+from typing import Deque, Dict, Any, List, Optional, Literal, Set
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from pydantic import BaseModel, Field, ValidationError
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -32,12 +34,16 @@ from api.v1.online_class.submissions import (
 )
 from api.v1.strokes_async import (
     CanvasPageBatchRequest,
+    CanvasPageStroke,
     CanvasPageUpsert,
     _build_merged_page_doc,
     _build_metadata_refresh,
     _page_doc,
 )
+from config_async import MONGODB_DB_STOODY
 from core.database import DatabaseManager
+from core.cookie_auth import COOKIE_NAME as AUTH_COOKIE_NAME
+from core.tenant import TenantContext
 from core.user_identity import canonical_canvas_user_id, canvas_user_id_variants
 from services.online_class import jitsi_provider_service
 
@@ -53,6 +59,10 @@ TEACHER_CANVAS_MODE_FIELD = "teacher_canvas_mode"
 TEACHER_CANVAS_MODE_UPDATED_AT_FIELD = "teacher_canvas_mode_updated_at"
 TEACHER_CANVAS_MODE_UPDATED_BY_FIELD = "teacher_canvas_mode_updated_by"
 MEETING_MEDIA_POLICY_FIELD = "online_class_media_policy"
+TEACHER_LIVE_CANVAS_REDIS_PREFIX = "online_class:teacher_live_canvas"
+TEACHER_LIVE_CANVAS_REPLAY_LIMIT = 5000
+TEACHER_LIVE_CANVAS_REPLAY_TTL_SECONDS = 6 * 60 * 60
+TEACHER_LIVE_CANVAS_ORIGIN = uuid.uuid4().hex
 DEFAULT_MEETING_MEDIA_POLICY = {
     "allow_student_microphone": True,
     "allow_student_camera": True,
@@ -181,6 +191,27 @@ class TeacherLiveCanvasEventsResponse(BaseModel):
     count: int = 0
 
 
+class TeacherLiveCanvasDeltaPage(BaseModel):
+    book_type: str = Field(..., min_length=1, max_length=10)
+    page_number: int = Field(..., ge=0)
+    copy_id: Optional[str] = None
+    page_style: Optional[str] = None
+    canvas_background: Optional[str] = None
+    stroke_count: Optional[int] = None
+    client_last_modified: Optional[float] = None
+    version: Optional[int] = None
+    first_activity: Optional[float] = None
+    last_activity: Optional[float] = None
+    device_id: Optional[str] = None
+
+
+class TeacherLiveCanvasDeltaRequest(BaseModel):
+    type: Literal["teacher_canvas_delta"] = "teacher_canvas_delta"
+    page: TeacherLiveCanvasDeltaPage
+    strokes: List[CanvasPageStroke] = Field(default_factory=list, max_length=500)
+    sent_at: Optional[float] = None
+
+
 class OnlineClassNoteClassItem(BaseModel):
     meeting_id: str
     copy_id: str
@@ -201,6 +232,229 @@ class OnlineClassNoteClassItem(BaseModel):
 
 class OnlineClassNotesResponse(BaseModel):
     classes: List[OnlineClassNoteClassItem]
+
+
+class _TeacherLiveCanvasRoom:
+    def __init__(self) -> None:
+        self.seq = 0
+        self.teacher_sockets: Set[WebSocket] = set()
+        self.student_sockets: Set[WebSocket] = set()
+        self.replay: Deque[Dict[str, Any]] = deque(maxlen=5000)
+        self.lock = asyncio.Lock()
+        self.redis_task: Optional[asyncio.Task] = None
+
+
+class _TeacherLiveCanvasHub:
+    def __init__(self) -> None:
+        self._rooms: Dict[str, _TeacherLiveCanvasRoom] = {}
+        self._rooms_lock = asyncio.Lock()
+
+    async def room(self, meeting_id: str) -> _TeacherLiveCanvasRoom:
+        async with self._rooms_lock:
+            room = self._rooms.get(meeting_id)
+            if room is None:
+                room = _TeacherLiveCanvasRoom()
+                self._rooms[meeting_id] = room
+            return room
+
+    async def add(self, meeting_id: str, role: Literal["teacher", "student"], websocket: WebSocket) -> int:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            if role == "teacher":
+                room.teacher_sockets.add(websocket)
+            else:
+                room.student_sockets.add(websocket)
+            return room.seq
+
+    async def remove(self, meeting_id: str, websocket: WebSocket) -> None:
+        room = await self.room(meeting_id)
+        redis_task: Optional[asyncio.Task] = None
+        async with room.lock:
+            room.teacher_sockets.discard(websocket)
+            room.student_sockets.discard(websocket)
+            empty = not room.teacher_sockets and not room.student_sockets
+            if empty and room.redis_task:
+                redis_task = room.redis_task
+                room.redis_task = None
+        if empty:
+            if redis_task:
+                redis_task.cancel()
+            async with self._rooms_lock:
+                current = self._rooms.get(meeting_id)
+                if current is room and not current.teacher_sockets and not current.student_sockets:
+                    self._rooms.pop(meeting_id, None)
+
+    async def replay_after(self, meeting_id: str, after_seq: int) -> List[Dict[str, Any]]:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            return [event for event in room.replay if int(event.get("seq") or 0) > after_seq]
+
+    async def _append_replay(self, meeting_id: str, event: Dict[str, Any]) -> None:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            room.replay.append(event)
+
+    async def deliver_local(self, meeting_id: str, event: Dict[str, Any]) -> None:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            targets = list(room.student_sockets)
+
+        dead: List[WebSocket] = []
+        for websocket in targets:
+            try:
+                await websocket.send_json(event)
+            except Exception:
+                dead.append(websocket)
+
+        for websocket in dead:
+            await self.remove(meeting_id, websocket)
+
+    async def publish(self, meeting_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            room.seq += 1
+            seq = room.seq
+            event = {
+                **event,
+                "seq": seq,
+                "meeting_id": meeting_id,
+                "origin": TEACHER_LIVE_CANVAS_ORIGIN,
+                "server_time": datetime.utcnow().isoformat(),
+            }
+            room.replay.append(event)
+        await self.deliver_local(meeting_id, event)
+        return event
+
+    async def ensure_redis_subscription(self, meeting_id: str, redis_client: Any) -> None:
+        room = await self.room(meeting_id)
+        async with room.lock:
+            if room.redis_task and not room.redis_task.done():
+                return
+            room.redis_task = asyncio.create_task(self._redis_listener(meeting_id, redis_client))
+
+    async def _redis_listener(self, meeting_id: str, redis_client: Any) -> None:
+        channel = _teacher_live_canvas_redis_channel(meeting_id)
+        pubsub = redis_client.pubsub()
+        try:
+            await pubsub.subscribe(channel)
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if not message:
+                    await asyncio.sleep(0.05)
+                    continue
+                event = _load_teacher_live_canvas_redis_event(message.get("data"))
+                if not event:
+                    continue
+                if event.get("origin") == TEACHER_LIVE_CANVAS_ORIGIN:
+                    continue
+                await self._append_replay(meeting_id, event)
+                await self.deliver_local(meeting_id, event)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("Online class live canvas Redis listener stopped for %s: %s", meeting_id, exc)
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
+
+
+teacher_live_canvas_hub = _TeacherLiveCanvasHub()
+
+
+def _teacher_live_canvas_redis_channel(meeting_id: str) -> str:
+    return f"{TEACHER_LIVE_CANVAS_REDIS_PREFIX}:channel:{meeting_id}"
+
+
+def _teacher_live_canvas_redis_seq_key(meeting_id: str) -> str:
+    return f"{TEACHER_LIVE_CANVAS_REDIS_PREFIX}:seq:{meeting_id}"
+
+
+def _teacher_live_canvas_redis_replay_key(meeting_id: str) -> str:
+    return f"{TEACHER_LIVE_CANVAS_REDIS_PREFIX}:replay:{meeting_id}"
+
+
+def _load_teacher_live_canvas_redis_event(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if isinstance(value, str):
+            parsed = json.loads(value)
+        elif isinstance(value, dict):
+            parsed = value
+        else:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _get_live_canvas_redis_client(websocket: WebSocket) -> Optional[Any]:
+    cache = getattr(websocket.app.state, "cache", None)
+    redis_client = getattr(cache, "redis_client", None)
+    return redis_client
+
+
+async def _get_teacher_live_canvas_redis_latest_seq(redis_client: Any, meeting_id: str) -> int:
+    raw = await redis_client.get(_teacher_live_canvas_redis_seq_key(meeting_id))
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _replay_teacher_live_canvas_redis(
+    redis_client: Any,
+    meeting_id: str,
+    after_seq: int,
+) -> List[Dict[str, Any]]:
+    raw_events = await redis_client.lrange(
+        _teacher_live_canvas_redis_replay_key(meeting_id),
+        0,
+        TEACHER_LIVE_CANVAS_REPLAY_LIMIT - 1,
+    )
+    events = [
+        event
+        for event in (_load_teacher_live_canvas_redis_event(raw) for raw in raw_events)
+        if event and int(event.get("seq") or 0) > after_seq
+    ]
+    return sorted(events, key=lambda event: int(event.get("seq") or 0))
+
+
+async def _publish_teacher_live_canvas_redis(
+    redis_client: Any,
+    meeting_id: str,
+    event: Dict[str, Any],
+) -> Dict[str, Any]:
+    seq = int(await redis_client.incr(_teacher_live_canvas_redis_seq_key(meeting_id)))
+    published = {
+        **event,
+        "seq": seq,
+        "meeting_id": meeting_id,
+        "origin": TEACHER_LIVE_CANVAS_ORIGIN,
+        "server_time": datetime.utcnow().isoformat(),
+    }
+    payload = json.dumps(published, separators=(",", ":"), default=str)
+    replay_key = _teacher_live_canvas_redis_replay_key(meeting_id)
+    seq_key = _teacher_live_canvas_redis_seq_key(meeting_id)
+
+    pipe = redis_client.pipeline()
+    pipe.lpush(replay_key, payload)
+    pipe.ltrim(replay_key, 0, TEACHER_LIVE_CANVAS_REPLAY_LIMIT - 1)
+    pipe.expire(replay_key, TEACHER_LIVE_CANVAS_REPLAY_TTL_SECONDS)
+    pipe.expire(seq_key, TEACHER_LIVE_CANVAS_REPLAY_TTL_SECONDS)
+    pipe.publish(_teacher_live_canvas_redis_channel(meeting_id), payload)
+    await pipe.execute()
+
+    await teacher_live_canvas_hub._append_replay(meeting_id, published)
+    await teacher_live_canvas_hub.deliver_local(meeting_id, published)
+    return published
 
 
 def _require_tutor(current_user: Dict[str, Any]):
@@ -418,6 +672,33 @@ def _build_monitoring_page_meta(page: Dict[str, Any]) -> Dict[str, Any]:
         "last_modified": _serialize_datetime(page.get("last_modified")),
         "client_last_modified": page.get("client_last_modified"),
         "version": int(page.get("version") or 1),
+    }
+
+
+def _build_teacher_live_delta_page_payload(
+    meeting_id: str,
+    page: TeacherLiveCanvasDeltaPage,
+) -> Dict[str, Any]:
+    expected_copy_id = _online_class_copy_id(meeting_id)
+    copy_id = page.copy_id or expected_copy_id
+    if copy_id != expected_copy_id:
+        raise ValueError("Live canvas deltas must use this class copy scope")
+
+    book_type = page.book_type.upper()
+    page_number = int(page.page_number)
+    return {
+        "page_key": _encode_monitoring_page_key(copy_id, book_type, page_number),
+        "copy_id": copy_id,
+        "book_type": book_type,
+        "page_number": page_number,
+        "page_style": page.page_style,
+        "canvas_background": page.canvas_background,
+        "stroke_count": int(page.stroke_count or 0),
+        "first_activity": page.first_activity,
+        "last_activity": page.last_activity,
+        "client_last_modified": page.client_last_modified,
+        "version": int(page.version or 1),
+        "device_id": page.device_id,
     }
 
 
@@ -1038,6 +1319,95 @@ async def _verify_student_invited(
     return meeting
 
 
+def _set_websocket_tenant_context(current_user: Dict[str, Any]) -> bool:
+    user_type = current_user.get("user_type")
+    is_b2c = current_user.get("is_b2c") or user_type in ("b2c_user", "b2c_admin")
+    db_name = current_user.get("db_name") or (MONGODB_DB_STOODY if is_b2c else None)
+    if not db_name and not is_b2c:
+        return False
+
+    admin_id = current_user.get("admin_id")
+    if user_type == "admin":
+        admin_id = admin_id or current_user.get("user_id")
+
+    TenantContext.set(
+        admin_id=admin_id,
+        user_type=user_type,
+        user_id=current_user.get("user_id"),
+        tutor_id=current_user.get("tutor_id"),
+        db_name=db_name,
+        tenant_id=current_user.get("tenant_id"),
+        institution_id=current_user.get("institution_id"),
+    )
+    return True
+
+
+async def _authenticate_online_class_websocket(websocket: WebSocket) -> Optional[Dict[str, Any]]:
+    token = websocket.query_params.get("token") or websocket.cookies.get(AUTH_COOKIE_NAME)
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication required")
+        return None
+
+    try:
+        from core.token_blacklist import is_user_session_revoked, token_blacklist
+
+        if token_blacklist.is_revoked(token):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Token revoked")
+            return None
+
+        auth_manager = getattr(websocket.app.state, "auth", None)
+        if auth_manager is None:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Auth unavailable")
+            return None
+
+        current_user = await auth_manager.verify_token_and_get_user(token)
+        if not current_user:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
+            return None
+
+        uid = current_user.get("user_id")
+        if uid and await is_user_session_revoked(auth_manager.cache_manager, uid):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Session revoked")
+            return None
+
+        if not _set_websocket_tenant_context(current_user):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Tenant database missing")
+            return None
+
+        return current_user
+    except Exception as exc:
+        logger.warning("Online class websocket auth rejected: %s", exc)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication failed")
+        return None
+
+
+async def _verify_live_canvas_websocket_access(
+    db: DatabaseManager,
+    meeting_id: str,
+    current_user: Dict[str, Any],
+) -> tuple[Dict[str, Any], Literal["teacher", "student"]]:
+    user_type = current_user.get("user_type")
+    if user_type == "tutor":
+        meeting = await _verify_tutor_owns_meeting(
+            db,
+            meeting_id,
+            current_user.get("tutor_id"),
+            current_user=current_user,
+        )
+        await _verify_meeting_active(db, meeting_id)
+        return meeting, "teacher"
+
+    if user_type == "student":
+        student_id = await resolve_business_student_id(current_user, db)
+        if not student_id:
+            raise HTTPException(status_code=403, detail="Could not resolve student identity")
+        meeting = await _verify_student_invited(db, meeting_id, student_id, current_user=current_user)
+        await _verify_meeting_active(db, meeting_id)
+        return meeting, "student"
+
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
 def _build_submission_result_item(
     *,
     submission: Dict[str, Any],
@@ -1589,6 +1959,156 @@ async def api_set_meeting_media_policy(
     return MeetingMediaPolicyResponse(**updated)
 
 
+@router.websocket("/meetings/{meeting_id}/teacher-canvas/live/ws")
+async def api_teacher_live_canvas_delta_ws(websocket: WebSocket, meeting_id: str):
+    TenantContext.clear()
+    current_user = await _authenticate_online_class_websocket(websocket)
+    if not current_user:
+        TenantContext.clear()
+        return
+
+    db: DatabaseManager = websocket.app.state.db
+    role: Literal["teacher", "student"]
+    try:
+        _meeting, role = await _verify_live_canvas_websocket_access(db, meeting_id, current_user)
+        mode = await _get_teacher_canvas_mode(db, meeting_id)
+        if mode["mode"] != "live":
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="Teacher canvas is not in Live Canvas mode",
+            )
+            TenantContext.clear()
+            return
+    except HTTPException as exc:
+        await websocket.close(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason=str(exc.detail or "Not authorized"),
+        )
+        TenantContext.clear()
+        return
+    except Exception as exc:
+        logger.warning("Online class live canvas websocket rejected: %s", exc)
+        await websocket.close(code=1011, reason="Live canvas unavailable")
+        TenantContext.clear()
+        return
+
+    await websocket.accept()
+    redis_client = _get_live_canvas_redis_client(websocket)
+    latest_seq = await teacher_live_canvas_hub.add(meeting_id, role, websocket)
+    if redis_client and role == "student":
+        await teacher_live_canvas_hub.ensure_redis_subscription(meeting_id, redis_client)
+    if redis_client:
+        try:
+            latest_seq = max(latest_seq, await _get_teacher_live_canvas_redis_latest_seq(redis_client, meeting_id))
+        except Exception as exc:
+            logger.warning("Online class live canvas Redis seq lookup failed for %s: %s", meeting_id, exc)
+
+    try:
+        after_seq_raw = websocket.query_params.get("after")
+        after_seq = int(after_seq_raw) if after_seq_raw else 0
+    except ValueError:
+        after_seq = 0
+
+    try:
+        await websocket.send_json({
+            "type": "teacher_canvas_live_ready",
+            "role": role,
+            "meeting_id": meeting_id,
+            "latest_seq": latest_seq,
+            "server_time": datetime.utcnow().isoformat(),
+        })
+
+        if role == "student":
+            replay_events: List[Dict[str, Any]] = []
+            if redis_client:
+                try:
+                    replay_events = await _replay_teacher_live_canvas_redis(redis_client, meeting_id, after_seq)
+                except Exception as exc:
+                    logger.warning("Online class live canvas Redis replay failed for %s: %s", meeting_id, exc)
+            if not replay_events:
+                replay_events = await teacher_live_canvas_hub.replay_after(meeting_id, after_seq)
+            for event in replay_events:
+                await websocket.send_json(event)
+            await websocket.send_json({
+                "type": "teacher_canvas_replay_complete",
+                "meeting_id": meeting_id,
+                "count": len(replay_events),
+                "latest_seq": latest_seq,
+                "server_time": datetime.utcnow().isoformat(),
+            })
+
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+
+            if msg_type == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "server_time": datetime.utcnow().isoformat(),
+                })
+                continue
+
+            if role != "teacher":
+                continue
+
+            if msg_type != "teacher_canvas_delta":
+                await websocket.send_json({
+                    "type": "teacher_canvas_error",
+                    "detail": "Unsupported live canvas message type",
+                })
+                continue
+
+            try:
+                delta = TeacherLiveCanvasDeltaRequest.model_validate(data)
+                page_payload = _build_teacher_live_delta_page_payload(meeting_id, delta.page)
+            except (ValidationError, ValueError) as exc:
+                await websocket.send_json({
+                    "type": "teacher_canvas_error",
+                    "detail": str(exc),
+                })
+                continue
+
+            strokes = [stroke.model_dump() for stroke in delta.strokes]
+            if not strokes:
+                await websocket.send_json({
+                    "type": "teacher_canvas_delta_ack",
+                    "accepted_strokes": 0,
+                    "latest_seq": latest_seq,
+                    "server_time": datetime.utcnow().isoformat(),
+                })
+                continue
+
+            event_payload = {
+                "type": "teacher_canvas_delta",
+                "page": page_payload,
+                "strokes": strokes,
+                "sent_at": delta.sent_at,
+            }
+            if redis_client:
+                try:
+                    published = await _publish_teacher_live_canvas_redis(redis_client, meeting_id, event_payload)
+                except Exception as exc:
+                    logger.warning("Online class live canvas Redis publish failed for %s: %s", meeting_id, exc)
+                    published = await teacher_live_canvas_hub.publish(meeting_id, event_payload)
+            else:
+                published = await teacher_live_canvas_hub.publish(meeting_id, event_payload)
+            latest_seq = int(published.get("seq") or latest_seq)
+            await websocket.send_json({
+                "type": "teacher_canvas_delta_ack",
+                "accepted_strokes": len(strokes),
+                "seq": latest_seq,
+                "latest_seq": latest_seq,
+                "server_time": published.get("server_time"),
+            })
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("Online class live canvas websocket failed: %s", exc)
+    finally:
+        await teacher_live_canvas_hub.remove(meeting_id, websocket)
+        TenantContext.clear()
+
+
 @router.get(
     "/meetings/{meeting_id}/teacher-canvas/live/stream",
     response_model=MonitoringPageListResponse,
@@ -1615,14 +2135,12 @@ async def api_get_teacher_live_canvas_stream_snapshot(
         raise HTTPException(status_code=403, detail="Access denied")
     await _verify_meeting_active(db, meeting_id)
 
-    tutor_id = str(meeting.get("tutor_id") or "")
-    user_ids = await _resolve_tutor_canvas_user_ids(db, tutor_id, tutor_user)
-    pages = await _find_canvas_pages_for_user_ids(
+    pages = await _find_teacher_online_class_pages(
         db,
-        user_ids,
+        meeting,
+        tutor_user=tutor_user,
         projection={"strokes": 0},
     )
-    pages = _filter_canvas_pages_since_session_start(pages, meeting.get("started_at"))
     if after is not None:
         pages = [
             page
@@ -1663,12 +2181,7 @@ async def api_get_teacher_live_canvas_page(
         raise HTTPException(status_code=403, detail="Access denied")
     await _verify_meeting_active(db, meeting_id)
 
-    tutor_id = str(meeting.get("tutor_id") or "")
-    user_ids = await _resolve_tutor_canvas_user_ids(db, tutor_id, tutor_user)
-    page = await _get_monitoring_page(db, user_ids, page_key)
-    filtered = _filter_canvas_pages_since_session_start([page], meeting.get("started_at"))
-    if not filtered:
-        raise HTTPException(status_code=404, detail="Canvas page not active in this class session")
+    page = await _get_teacher_online_class_page(db, meeting, page_key, tutor_user=tutor_user)
     return MonitoringPageResponse(page=page)
 
 
