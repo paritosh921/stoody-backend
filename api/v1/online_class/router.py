@@ -207,6 +207,7 @@ class TeacherLiveCanvasDeltaPage(BaseModel):
 
 class TeacherLiveCanvasDeltaRequest(BaseModel):
     type: Literal["teacher_canvas_delta"] = "teacher_canvas_delta"
+    client_batch_id: Optional[str] = None
     page: TeacherLiveCanvasDeltaPage
     strokes: List[CanvasPageStroke] = Field(default_factory=list, max_length=500)
     sent_at: Optional[float] = None
@@ -2073,6 +2074,7 @@ async def api_teacher_live_canvas_delta_ws(websocket: WebSocket, meeting_id: str
                 await websocket.send_json({
                     "type": "teacher_canvas_delta_ack",
                     "accepted_strokes": 0,
+                    "client_batch_id": delta.client_batch_id,
                     "latest_seq": latest_seq,
                     "server_time": datetime.utcnow().isoformat(),
                 })
@@ -2096,6 +2098,7 @@ async def api_teacher_live_canvas_delta_ws(websocket: WebSocket, meeting_id: str
             await websocket.send_json({
                 "type": "teacher_canvas_delta_ack",
                 "accepted_strokes": len(strokes),
+                "client_batch_id": delta.client_batch_id,
                 "seq": latest_seq,
                 "latest_seq": latest_seq,
                 "server_time": published.get("server_time"),

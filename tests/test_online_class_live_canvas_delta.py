@@ -5,6 +5,7 @@ import pytest
 
 def test_live_canvas_delta_page_payload_is_scoped_to_online_class_copy():
     from api.v1.online_class.router import (
+        TeacherLiveCanvasDeltaRequest,
         TeacherLiveCanvasDeltaPage,
         _decode_monitoring_page_key,
         _build_teacher_live_delta_page_payload,
@@ -34,6 +35,14 @@ def test_live_canvas_delta_page_payload_is_scoped_to_online_class_copy():
     )
     with pytest.raises(ValueError, match="Live canvas deltas must use this class copy scope"):
         _build_teacher_live_delta_page_payload("meeting-1", bad_page)
+
+    request = TeacherLiveCanvasDeltaRequest(
+        client_batch_id="batch-1",
+        page=page,
+        strokes=[],
+        sent_at=1234,
+    )
+    assert request.client_batch_id == "batch-1"
 
 
 @pytest.mark.asyncio
