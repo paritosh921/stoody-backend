@@ -18,6 +18,7 @@ on:
       - "stoody-book/**"
       - "scripts/cleanup_upload_storage.py"
       - "scripts/validate_upload_security_deploy.py"
+      - "scripts/validate_jitsi_runtime.py"
       - "scripts/run_tui.sh"
       - "requirements.txt"
       - "skillbot_nginx_alb.conf"
@@ -91,6 +92,7 @@ jobs:
             "DEV_MAIN_BACKEND_HOST"
             "DEV_MAIN_BACKEND_USER"
             "DEV_MAIN_BACKEND_PATH"
+            "DEV_MAIN_BACKEND_VENV_PATH"
             "DEV_MAIN_BACKEND_SERVICE_MANAGER"
             "DEV_MAIN_BACKEND_SERVICE_NAME"
             "DEV_MAIN_BACKEND_HEALTHCHECK_URL"
@@ -136,3 +138,14 @@ jobs:
             NGINX_SITE_PATH='${DEV_NGINX_SITE_PATH}' \
             bash /tmp/remote_deploy_python_service.sh \
             '${DEV_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${DEV_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${DEV_MAIN_BACKEND_SERVICE_MANAGER}' '${DEV_MAIN_BACKEND_SERVICE_NAME}' '${DEV_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
+
+      - name: Validate Jitsi runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
+            "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}" \
+            "cd '${DEV_MAIN_BACKEND_PATH}' && \
+            '${DEV_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_jitsi_runtime.py \
+            --env-file .env --require-jwt --check-public-assets --timeout-seconds 10"

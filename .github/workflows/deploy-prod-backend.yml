@@ -17,6 +17,7 @@ on:
       - "stoody-book/**"
       - "scripts/cleanup_upload_storage.py"
       - "scripts/validate_upload_security_deploy.py"
+      - "scripts/validate_jitsi_runtime.py"
       - "scripts/run_tui.sh"
       - "requirements.txt"
       - "skillbot_nginx_alb.conf"
@@ -137,6 +138,17 @@ jobs:
             NGINX_SITE_PATH='${PROD_NGINX_SITE_PATH}' \
             bash /tmp/remote_deploy_python_service.sh \
             '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
+
+      - name: Validate Jitsi runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "cd '${PROD_MAIN_BACKEND_PATH}' && \
+            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_jitsi_runtime.py \
+            --env-file .env --require-jwt --check-public-assets --timeout-seconds 10"
 
       - name: Validate upload security runtime controls
         shell: bash
