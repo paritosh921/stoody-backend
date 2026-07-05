@@ -2296,12 +2296,7 @@ def _build_test_series_activation_errors(
         mapped_count = coverage_summary.get("mapped_answer_count") or 0
         manual_review_count = coverage_summary.get("manual_review_count") or 0
 
-        if coverage_status != "ready":
-            errors.append(
-                "Uploaded answer sheet is not fully mapped. "
-                f"{mapped_count}/{question_count} question(s) have mapped solutions."
-            )
-        elif mapped_count < question_count:
+        if mapped_count < question_count:
             errors.append(
                 "Uploaded answer sheet is not fully mapped. "
                 f"{mapped_count}/{question_count} question(s) have mapped solutions."

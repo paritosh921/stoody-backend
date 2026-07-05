@@ -5,7 +5,12 @@ import pytest
 
 from api.v1.online_class.locks import create_lock, end_lock
 from api.v1.online_class.submissions import create_or_update_submission
-from api.v1.meeting_async import resolve_business_student_id, resolve_notification_recipient_ids
+from api.v1.meeting_async import (
+    _is_student_joinable,
+    _student_visible_status,
+    resolve_business_student_id,
+    resolve_notification_recipient_ids,
+)
 from services.online_class.jitsi_provider import JitsiProviderService
 
 
@@ -1114,6 +1119,34 @@ async def _test_student_join_auth_allows_started_class_before_five_minute_window
 
     assert result["meet_link"] == "https://class.example.com/stoody-MTG_TOO_EARLY"
     assert db.collections["meetings"][0]["joined_student_ids"] == ["STU_1"]
+
+
+def test_scheduled_meeting_join_window_closes_after_duration():
+    scheduled_at = datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc)
+    meeting = {
+        "scheduled_at": scheduled_at,
+        "duration_minutes": 60,
+        "status": "scheduled",
+    }
+
+    assert _is_student_joinable(meeting, now=scheduled_at - timedelta(minutes=11)) is False
+    assert _is_student_joinable(meeting, now=scheduled_at - timedelta(minutes=10)) is True
+    assert _is_student_joinable(meeting, now=scheduled_at + timedelta(minutes=59)) is True
+    assert _is_student_joinable(meeting, now=scheduled_at + timedelta(minutes=60)) is False
+
+
+def test_active_meeting_join_window_closes_after_started_duration():
+    started_at = datetime(2026, 7, 5, 10, 0, tzinfo=timezone.utc)
+    meeting = {
+        "scheduled_at": started_at - timedelta(minutes=30),
+        "started_at": started_at,
+        "duration_minutes": 45,
+        "status": "active",
+    }
+
+    assert _is_student_joinable(meeting, now=started_at + timedelta(minutes=44)) is True
+    assert _is_student_joinable(meeting, now=started_at + timedelta(minutes=45)) is False
+    assert _student_visible_status(meeting, now=started_at + timedelta(minutes=45)) == "ended"
 
 
 def test_student_join_auth_blocks_scheduled_class_before_ten_minute_window(monkeypatch):

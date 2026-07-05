@@ -56,8 +56,58 @@ def _student_join_opens_at(meeting: Dict[str, Any]) -> Optional[datetime]:
     return _to_naive_utc(scheduled_at) - STUDENT_JOIN_EARLY_WINDOW
 
 
+def _meeting_duration_minutes(meeting: Dict[str, Any]) -> int:
+    try:
+        duration = int(meeting.get("duration_minutes") or 60)
+    except (TypeError, ValueError):
+        duration = 60
+    return max(1, duration)
+
+
+def _meeting_start_reference(meeting: Dict[str, Any]) -> Optional[datetime]:
+    started_at = _parse_datetime(meeting.get("started_at"))
+    if meeting.get("status") == "active" and started_at:
+        return _to_naive_utc(started_at)
+    scheduled_at = _parse_datetime(meeting.get("scheduled_at"))
+    if scheduled_at:
+        return _to_naive_utc(scheduled_at)
+    return None
+
+
+def _meeting_ends_at(meeting: Dict[str, Any]) -> Optional[datetime]:
+    start_reference = _meeting_start_reference(meeting)
+    if not start_reference:
+        return None
+    return start_reference + timedelta(minutes=_meeting_duration_minutes(meeting))
+
+
+def _is_meeting_time_complete(
+    meeting: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> bool:
+    if meeting.get("status") not in {"scheduled", "active"}:
+        return False
+    ends_at = _meeting_ends_at(meeting)
+    if not ends_at:
+        return False
+    current_time = _to_naive_utc(now or datetime.now(timezone.utc))
+    return current_time >= ends_at
+
+
+def _meeting_current_status(
+    meeting: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> str:
+    status = meeting.get("status")
+    if status in {"scheduled", "active"} and _is_meeting_time_complete(meeting, now=now):
+        return "ended"
+    return status
+
+
 def _is_student_joinable(meeting: Dict[str, Any], now: Optional[datetime] = None) -> bool:
     if meeting.get("status") not in {"scheduled", "active"}:
+        return False
+    if _is_meeting_time_complete(meeting, now=now):
         return False
     if meeting.get("status") == "active":
         return True
@@ -71,10 +121,7 @@ def _is_student_joinable(meeting: Dict[str, Any], now: Optional[datetime] = None
 
 
 def _student_visible_status(meeting: Dict[str, Any], now: Optional[datetime] = None) -> str:
-    status = meeting.get("status")
-    if status == "active" and not _is_student_joinable(meeting, now=now):
-        return "scheduled"
-    return status
+    return _meeting_current_status(meeting, now=now)
 
 
 # Helper dependency functions
@@ -333,7 +380,7 @@ async def _extend_meeting_duration(
     meeting = await db.mongo_find_one("meetings", {"meeting_id": meeting_id})
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
-    if meeting.get("status") != "active":
+    if _meeting_current_status(meeting) != "active":
         raise HTTPException(status_code=400, detail="Meeting is not active")
     duration = int(meeting.get("duration_minutes") or 60)
     next_duration = min(480, duration + minutes)
@@ -372,7 +419,7 @@ def _meeting_response_from_doc(
         duration_minutes=meeting.get("duration_minutes", 60),
         meet_link=meet_link,
         meet_code=meet_code,
-        status=meeting.get("status"),
+        status=_meeting_current_status(meeting),
         invited_student_count=len(meeting.get("invited_student_ids", [])),
         joined_student_count=len(meeting.get("joined_student_ids", [])),
         created_at=meeting.get("created_at"),
@@ -825,8 +872,9 @@ async def start_meeting(
     if meeting.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized to start this meeting")
 
-    if meeting.get("status") != "scheduled":
-        raise HTTPException(status_code=400, detail=f"Meeting is already {meeting.get('status')}")
+    current_status = _meeting_current_status(meeting)
+    if current_status != "scheduled":
+        raise HTTPException(status_code=400, detail=f"Meeting is already {current_status}")
 
     provider = _require_provider_details(meeting_id, current_user=current_user, moderator=True)
     meet_link, meet_code = _provider_video_fields(provider)
@@ -911,7 +959,8 @@ async def end_meeting(
     if meeting.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized to end this meeting")
 
-    if meeting.get("status") == "ended":
+    current_status = _meeting_current_status(meeting)
+    if current_status == "ended":
         raise HTTPException(status_code=400, detail="Meeting is already ended")
 
     # Update meeting status
@@ -971,7 +1020,8 @@ async def cancel_meeting(
     if meeting.get("tutor_id") != tutor_id:
         raise HTTPException(status_code=403, detail="Not authorized to cancel this meeting")
 
-    if meeting.get("status") not in ["scheduled", "active"]:
+    current_status = _meeting_current_status(meeting)
+    if current_status not in ["scheduled", "active"]:
         raise HTTPException(status_code=400, detail="Cannot cancel an ended meeting")
 
     # Update meeting status
@@ -1048,7 +1098,7 @@ async def student_join_meeting_auth(
         tutor_id = await _resolve_current_tutor_id(current_user, db)
         if meeting.get("tutor_id") != tutor_id:
             raise HTTPException(status_code=403, detail="Not authorized to join this meeting")
-        if meeting.get("status") != "active":
+        if _meeting_current_status(meeting) != "active":
             raise HTTPException(status_code=400, detail="Meeting is not active")
         moderator = True
     elif user_type == "student":
