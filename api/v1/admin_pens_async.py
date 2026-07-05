@@ -43,6 +43,9 @@ router = APIRouter()
 
 
 _MAC_PATTERN = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+_BLE_UUID_PATTERN = re.compile(
+    r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$"
+)
 
 
 def _normalize_mac(value: str) -> str:
@@ -53,6 +56,34 @@ def _normalize_mac(value: str) -> str:
             detail="pen_mac must be 6 hex octets separated by colons (e.g. AA:BB:CC:DD:EE:01)",
         )
     return mac
+
+
+def _normalize_pen_identifier(value: str) -> str:
+    """Normalize stored pen identifiers used by the agent.
+
+    Windows agents usually register a BLE MAC. macOS CoreBluetooth exposes a
+    stable UUID instead of the hardware MAC, and existing tenant rows can
+    already contain that UUID in the historical `pen_mac` field.
+    """
+    identifier = (value or "").strip().upper()
+    if _MAC_PATTERN.match(identifier) or _BLE_UUID_PATTERN.match(identifier):
+        return identifier
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "pen identifier must be a BLE MAC (AA:BB:CC:DD:EE:01) "
+            "or macOS BLE UUID (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)"
+        ),
+    )
+
+
+def _pen_identifier_lookup_values(value: str) -> List[str]:
+    normalized = _normalize_pen_identifier(value)
+    raw = (value or "").strip()
+    values = {normalized}
+    if raw:
+        values.add(raw)
+    return sorted(values)
 
 
 class PenBindingOut(BaseModel):
@@ -248,13 +279,14 @@ async def _resolve_student_username_for_actor(
 async def _require_pen_manage_access_for_mac(
     tenant_db,
     current_user: Dict[str, Any],
-    pen_mac: str,
+    pen_identifier: str,
 ) -> None:
     if _actor_is_admin(current_user):
         return
+    lookup_values = _pen_identifier_lookup_values(pen_identifier)
     visible_usernames = await _get_tutor_visible_student_usernames(tenant_db, current_user)
     binding = await tenant_db["pens"].find_one(
-        {"pen_mac": pen_mac, "status": "active"},
+        {"pen_mac": {"$in": lookup_values}, "status": "active"},
         {"user_id": 1},
     )
     if not binding:
@@ -320,11 +352,12 @@ async def admin_unbind_pen(
     The agent server's `register_pen` will then accept a re-claim from any
     student in the tenant. Audit trail is preserved by keeping the row.
     """
-    mac = _normalize_mac(pen_mac)
+    pen_identifier = _normalize_pen_identifier(pen_mac)
+    lookup_values = _pen_identifier_lookup_values(pen_mac)
     tenant_db = await get_tenant_db_or_403(db, current_user)
-    await _require_pen_manage_access_for_mac(tenant_db, current_user, mac)
+    await _require_pen_manage_access_for_mac(tenant_db, current_user, pen_mac)
     result = await tenant_db["pens"].update_one(
-        {"pen_mac": mac, "status": "active"},
+        {"pen_mac": {"$in": lookup_values}, "status": "active"},
         {
             "$set": {
                 "status": "deregistered",
@@ -337,9 +370,9 @@ async def admin_unbind_pen(
     if result.matched_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No active binding found for pen {mac}",
+            detail=f"No active binding found for pen {pen_identifier}",
         )
-    return {"pen_mac": mac, "status": "deregistered"}
+    return {"pen_mac": pen_identifier, "status": "deregistered"}
 
 
 @router.post(

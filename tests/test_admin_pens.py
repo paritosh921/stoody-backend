@@ -47,6 +47,26 @@ async def test_normalize_mac_rejects_garbage():
 
 
 @pytest.mark.asyncio
+async def test_normalize_pen_identifier_accepts_macos_ble_uuid():
+    from api.v1.admin_pens_async import _normalize_pen_identifier
+
+    assert (
+        _normalize_pen_identifier("25f130c0-e0a2-036b-31bf-665c5b5726bd")
+        == "25F130C0-E0A2-036B-31BF-665C5B5726BD"
+    )
+
+
+@pytest.mark.asyncio
+async def test_normalize_pen_identifier_rejects_unknown_format():
+    from fastapi import HTTPException
+    from api.v1.admin_pens_async import _normalize_pen_identifier
+
+    with pytest.raises(HTTPException) as exc:
+        _normalize_pen_identifier("not-a-pen")
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_attach_student_metadata_joins_username():
     from api.v1.admin_pens_async import _attach_student_metadata
 
@@ -108,7 +128,11 @@ async def _call_admin_assign(student_id: str, pen_mac: str, pen_name: str, *, db
             student_id=student_id,
             payload=AdminAssignPenRequest(pen_mac=pen_mac, pen_name=pen_name),
             db=None,  # type: ignore[arg-type]
-            current_user={"db_name": "skb_test", "user_id": "admin-1"},
+            current_user={
+                "db_name": "skb_test",
+                "user_id": "admin-1",
+                "user_type": "admin",
+            },
         )
 
 
@@ -128,6 +152,22 @@ async def _call_tutor_assign(student_id: str, pen_mac: str, pen_name: str, *, db
                 "tutor_id": "TUT-1",
                 "admin_id": "507f1f77bcf86cd799439011",
                 "can_edit_students": can_edit_students,
+            },
+        )
+
+
+async def _call_admin_unbind(pen_identifier: str, *, db):
+    from unittest.mock import patch
+    from api.v1.admin_pens_async import admin_unbind_pen
+
+    with patch("api.v1.admin_pens_async.get_tenant_db_or_403", return_value=db):
+        return await admin_unbind_pen(
+            pen_mac=pen_identifier,
+            db=None,  # type: ignore[arg-type]
+            current_user={
+                "db_name": "skb_test",
+                "user_id": "admin-1",
+                "user_type": "admin",
             },
         )
 
@@ -193,6 +233,44 @@ async def test_admin_assign_after_unbind_succeeds():
     assert result.status == "active"
 
 
+@pytest.mark.asyncio
+async def test_admin_unbind_accepts_macos_ble_uuid_identifier(mongo_db):
+    pen_identifier = "25F130C0-E0A2-036B-31BF-665C5B5726BD"
+    await mongo_db["pens"].insert_one(
+        {
+            "user_id": "alice",
+            "pen_mac": pen_identifier,
+            "pen_name": "Love",
+            "status": "active",
+        }
+    )
+
+    result = await _call_admin_unbind(pen_identifier, db=mongo_db)
+
+    assert result == {"pen_mac": pen_identifier, "status": "deregistered"}
+    fresh = await mongo_db["pens"].find_one({"pen_mac": pen_identifier})
+    assert fresh["status"] == "deregistered"
+    assert fresh["deregistered_by_admin"] == "admin-1"
+
+
+@pytest.mark.asyncio
+async def test_admin_unbind_still_accepts_ble_mac_identifier(mongo_db):
+    await mongo_db["pens"].insert_one(
+        {
+            "user_id": "alice",
+            "pen_mac": "AA:BB:CC:DD:EE:01",
+            "pen_name": "Windows pen",
+            "status": "active",
+        }
+    )
+
+    result = await _call_admin_unbind("aa:bb:cc:dd:ee:01", db=mongo_db)
+
+    assert result == {"pen_mac": "AA:BB:CC:DD:EE:01", "status": "deregistered"}
+    fresh = await mongo_db["pens"].find_one({"pen_mac": "AA:BB:CC:DD:EE:01"})
+    assert fresh["status"] == "deregistered"
+
+
 async def _call_admin_set_pen_limit(student_id: str, allowed: int, *, db):
     from unittest.mock import patch
     from api.v1.admin_pens_async import (
@@ -205,7 +283,11 @@ async def _call_admin_set_pen_limit(student_id: str, allowed: int, *, db):
             student_id=student_id,
             payload=AdminSetPenLimitRequest(allowed_pen_count=allowed),
             db=None,  # type: ignore[arg-type]
-            current_user={"db_name": "skb_test", "user_id": "admin-1"},
+            current_user={
+                "db_name": "skb_test",
+                "user_id": "admin-1",
+                "user_type": "admin",
+            },
         )
 
 
