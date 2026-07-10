@@ -3150,6 +3150,17 @@ async def run_document_ocr_pipeline(
         if tally_source_mode == "upload":
             try:
                 source_document = document_fresh or document
+                existing_tally_map = (
+                    await db.b2c_find_one(
+                        "exam_tally_question_maps",
+                        {"tally_document_id": document_id},
+                    )
+                    if is_b2c
+                    else await db.mongo_find_one(
+                        "exam_tally_question_maps",
+                        {"tally_document_id": document_id},
+                    )
+                )
                 tally_map_doc = await build_tally_question_map(
                     tally_document_id=document_id,
                     source_document_id=document_id,
@@ -3160,6 +3171,7 @@ async def run_document_ocr_pipeline(
                     marking_scheme=source_document.get("tally_marking_scheme") or [],
                     fallback_max_marks=source_document.get("tally_max_marks_per_question"),
                     generated_by=current_user.get("user_id"),
+                    reviewed_items=(existing_tally_map or {}).get("items") or [],
                 )
                 if is_b2c:
                     await db.b2c_update_one(

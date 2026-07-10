@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
+import math
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -45,6 +48,7 @@ class TallyQuestionMapItem(BaseModel):
     question_id: Optional[str] = None
     question_text: Optional[str] = None
     question_text_preview: Optional[str] = None
+    topic: Optional[str] = None
     sub_topic: Optional[str] = None
     question_type: Optional[str] = None
     max_marks: Optional[float] = None
@@ -93,6 +97,95 @@ class TallyValidationIssue(BaseModel):
     actual: Optional[str] = None
 
 
+class TallyQuestionEvidence(BaseModel):
+    row_index: int = 0
+    question_number: int
+    column: str
+    crop_hash: Optional[str] = None
+    crop_box: Dict[str, int] = Field(default_factory=dict)
+
+
+class TallyTargetedRecheck(BaseModel):
+    id: str
+    row_index: int = 0
+    question_number: int
+    column: str
+    original_value: Optional[str] = None
+    configured_max: Optional[str] = None
+    candidate_value: Optional[str] = None
+    confidence: Optional[float] = None
+    status: str
+    reason: Optional[str] = None
+    crop_hash: Optional[str] = None
+    crop_box: Dict[str, int] = Field(default_factory=dict)
+
+
+class TallyAppliedCorrection(BaseModel):
+    row_index: int = 0
+    question_number: int
+    column: str
+    original_ocr_value: Optional[str] = None
+    approved_value: Optional[str] = None
+    decision: str = "set"
+    crop_hash: Optional[str] = None
+    evidence_scope: str = "cell"
+    source_extraction_id: Optional[str] = None
+    targeted_candidate: Optional[str] = None
+    reason: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    approved_by: Optional[str] = None
+    resolution_source: str = "teacher_override"
+
+
+class TallyAutoResolvedMark(BaseModel):
+    row_index: int = 0
+    question_number: int
+    column: str
+    original_ocr_value: Optional[str] = None
+    resolved_value: Optional[str] = None
+    crop_hash: Optional[str] = None
+    evidence_scope: str = "cell"
+    confidence: Optional[float] = None
+    reason: Optional[str] = None
+    source_extraction_id: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolution_source: str = "focused_ocr"
+
+
+class TallyMarkCorrectionSaveRequest(BaseModel):
+    source_extraction_id: str
+    row_index: int = Field(0, ge=0)
+    question_number: int = Field(..., ge=1)
+    crop_hash: str = Field(..., min_length=16, max_length=128)
+    evidence_scope: str = "cell"
+    decision: str = "set"
+    approved_value: Optional[float] = None
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+class TallyMarkCorrectionResponse(BaseModel):
+    success: bool
+    document_id: str
+    student_id: str
+    revision: int = 0
+    corrections: List[TallyAppliedCorrection] = Field(default_factory=list)
+    applied_corrections: List[TallyAppliedCorrection] = Field(default_factory=list)
+    stale_corrections: List[TallyAppliedCorrection] = Field(default_factory=list)
+    auto_resolved_marks: List[TallyAutoResolvedMark] = Field(default_factory=list)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    validation_issues: List[TallyValidationIssue] = Field(default_factory=list)
+
+
+class TallyTargetedRecheckDebug(BaseModel):
+    id: str
+    row_index: int = 0
+    question_number: int
+    prompt: Optional[str] = None
+    raw_text: Optional[str] = None
+    provider: Optional[str] = None
+    images: List[TallyOcrImage] = Field(default_factory=list)
+
+
 class TallyExtractDebugResponse(BaseModel):
     prompt: Optional[str] = None
     raw_text: Optional[str] = None
@@ -101,6 +194,7 @@ class TallyExtractDebugResponse(BaseModel):
     recheck_raw_text: Optional[str] = None
     recheck_provider: Optional[str] = None
     image_labels: List[str] = Field(default_factory=list)
+    targeted_rechecks: List[TallyTargetedRecheckDebug] = Field(default_factory=list)
 
 
 class TallyExtractResponse(BaseModel):
@@ -112,6 +206,13 @@ class TallyExtractResponse(BaseModel):
     validation_issues: List[TallyValidationIssue] = Field(default_factory=list)
     confidence: Optional[float] = None
     raw_text: Optional[str] = None
+    raw_rows: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence_hash: Optional[str] = None
+    question_evidence: List[TallyQuestionEvidence] = Field(default_factory=list)
+    targeted_rechecks: List[TallyTargetedRecheck] = Field(default_factory=list)
+    auto_resolved_marks: List[TallyAutoResolvedMark] = Field(default_factory=list)
+    applied_corrections: List[TallyAppliedCorrection] = Field(default_factory=list)
+    stale_corrections: List[TallyAppliedCorrection] = Field(default_factory=list)
     debug: Optional[TallyExtractDebugResponse] = None
 
 
@@ -123,6 +224,7 @@ class TallyExportRequest(BaseModel):
     document: Optional[TallyDocumentContext] = None
     student: Optional[TallyStudentContext] = None
     allow_validation_errors: bool = False
+    corrections: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class TallyValidateRequest(BaseModel):
@@ -200,6 +302,8 @@ class TallyQuestionSourcePreviewItem(BaseModel):
     max_marks_source: str = "default"
     question_type: Optional[str] = None
     text_preview: Optional[str] = None
+    topic: Optional[str] = None
+    sub_topic: Optional[str] = None
 
 
 class TallyQuestionSourcePreviewResponse(BaseModel):
@@ -233,6 +337,52 @@ async def _tenant_db(db: DatabaseManager, current_user: Dict[str, Any]) -> Any:
             detail="Tenant database not available",
         )
     return tenant_db
+
+
+async def _assert_tally_context_access(
+    tenant_db: Any,
+    current_user: Dict[str, Any],
+    document: Optional[TallyDocumentContext],
+    student: Optional[TallyStudentContext],
+) -> None:
+    if current_user.get("user_type") != "tutor":
+        return
+
+    tutor_id = str(current_user.get("tutor_id") or "")
+    user_id = str(current_user.get("user_id") or "")
+    if not tutor_id and not user_id:
+        raise HTTPException(status_code=403, detail="Tutor identity is missing")
+
+    if document and document.document_id:
+        tally_document = await tenant_db["documents"].find_one(
+            {"document_id": document.document_id}
+        )
+        if not tally_document:
+            raise HTTPException(status_code=404, detail="Tally document not found")
+        teacher_ids = {str(value) for value in (tally_document.get("teacher_ids") or [])}
+        if teacher_ids and tutor_id not in teacher_ids and user_id not in teacher_ids:
+            raise HTTPException(status_code=403, detail="Tutor is not assigned to this tally document")
+
+    student_id = _tally_student_identity(student)
+    if not student_id:
+        return
+    student_doc = await tenant_db["students"].find_one({"student_id": student_id})
+    if not student_doc:
+        raise HTTPException(status_code=404, detail="Selected student was not found")
+    teacher_ids = {str(value) for value in (student_doc.get("teacher_ids") or [])}
+    if tutor_id in teacher_ids or user_id in teacher_ids:
+        return
+
+    tutor_doc = await tenant_db["tutors"].find_one({"tutor_id": tutor_id}) if tutor_id else None
+    assigned_student_ids = {
+        str(value) for value in ((tutor_doc or {}).get("assigned_student_ids") or [])
+    }
+    # Some tenants scope tutors by class/section rather than explicit mappings;
+    # do not reject those legacy records when neither relation is configured.
+    if not teacher_ids and not assigned_student_ids:
+        return
+    if student_id not in assigned_student_ids:
+        raise HTTPException(status_code=403, detail="Tutor is not assigned to this student")
 
 
 def _strip_code_fence(text: str) -> str:
@@ -536,6 +686,86 @@ def _configured_question_numbers(document: TallyDocumentContext) -> List[int]:
     return sorted(set(question_numbers))
 
 
+def _normalise_uncertain_question_cells(
+    parsed: Dict[str, Any],
+) -> Dict[int, List[int]]:
+    uncertain_by_row: Dict[int, List[int]] = {}
+
+    def add(row_index: Any, column: Any) -> None:
+        try:
+            resolved_row_index = max(0, int(row_index or 0))
+        except (TypeError, ValueError):
+            resolved_row_index = 0
+        question_number = _question_number_from_label(column)
+        if question_number is not None and question_number > 0:
+            uncertain_by_row.setdefault(resolved_row_index, []).append(question_number)
+
+    raw_uncertain = parsed.get("uncertain_cells") or []
+    if isinstance(raw_uncertain, list):
+        for item in raw_uncertain:
+            if isinstance(item, dict):
+                add(item.get("row_index", item.get("row", 0)), item.get("column") or item.get("question"))
+            else:
+                add(0, item)
+
+    return {
+        row_index: sorted(set(question_numbers))
+        for row_index, question_numbers in uncertain_by_row.items()
+    }
+
+
+def _uncertain_question_validation_issues(
+    uncertain_by_row: Dict[int, List[int]],
+    document: TallyDocumentContext,
+) -> List[TallyValidationIssue]:
+    issues: List[TallyValidationIssue] = []
+    for row_index, question_numbers in sorted(uncertain_by_row.items()):
+        for question_number in question_numbers:
+            expected_max = _expected_marks_for_question(document, question_number)
+            issues.append(
+                TallyValidationIssue(
+                    severity="error",
+                    code="ocr_uncertain",
+                    message=f"Q{question_number} contains handwriting that OCR could not read unambiguously.",
+                    row_index=row_index,
+                    column=f"Q{question_number}",
+                    question_number=question_number,
+                    expected=_format_marks(expected_max) if expected_max is not None else None,
+                )
+            )
+    return issues
+
+
+def _tally_mark_review_issues(
+    validation_issues: List[TallyValidationIssue],
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+    document: TallyDocumentContext,
+) -> List[TallyValidationIssue]:
+    review_issues = [
+        issue
+        for issue in validation_issues
+        if issue.code in {"mark_above_max", "mark_unreadable", "ocr_uncertain"}
+        and issue.question_number is not None
+    ]
+    for row_index, question_numbers in _missing_questions_by_row(columns, rows, document).items():
+        for question_number in question_numbers:
+            expected_max = _expected_marks_for_question(document, question_number)
+            review_issues.append(
+                TallyValidationIssue(
+                    severity="error",
+                    code="missing_mark",
+                    message=f"Q{question_number} did not have a readable OCR mark.",
+                    row_index=row_index,
+                    column=f"Q{question_number}",
+                    question_number=question_number,
+                    expected=_format_marks(expected_max) if expected_max is not None else None,
+                    actual="",
+                )
+            )
+    return review_issues
+
+
 def _format_marking_context(document: TallyDocumentContext) -> str:
     ranges: List[str] = []
     for item in document.marking_scheme:
@@ -787,107 +1017,518 @@ def _detect_tally_question_grid(image: Any, document: TallyDocumentContext) -> O
     return {"horizontal": horizontal, "vertical": vertical}
 
 
-def _detect_single_stroke_mark(crop: Any) -> Optional[str]:
-    try:
-        import numpy as np
-    except Exception:
+def _tally_ocr_layer_sources(payload: TallyExtractRequest) -> Dict[str, str]:
+    sources: Dict[str, str] = {}
+    for image in payload.images:
+        label = str(image.label or "").strip().lower().replace("-", "_")
+        if not label or not image.image_b64:
+            continue
+        if label == "template":
+            sources.setdefault("template", image.image_b64)
+        elif label in {"filled_sheet", "filled", "combined", "final"}:
+            sources.setdefault("filled_sheet", image.image_b64)
+        elif label in {"strokes_only", "strokes", "ink", "handwriting"}:
+            sources.setdefault("strokes_only", image.image_b64)
+
+    if payload.image_b64:
+        sources.setdefault("filled_sheet", payload.image_b64)
+    return sources
+
+
+def _decode_tally_ocr_layers(payload: TallyExtractRequest) -> Dict[str, Any]:
+    decoded: Dict[str, Any] = {}
+    for label, image_b64 in _tally_ocr_layer_sources(payload).items():
+        image = _decode_tally_image_for_mark_detection(image_b64)
+        if image is not None:
+            decoded[label] = image
+    return decoded
+
+
+def _clip_tally_crop_box(
+    box: Dict[str, int],
+    *,
+    width: int,
+    height: int,
+) -> Optional[Dict[str, int]]:
+    left = max(0, min(width, int(box.get("left", 0))))
+    top = max(0, min(height, int(box.get("top", 0))))
+    right = max(0, min(width, int(box.get("right", 0))))
+    bottom = max(0, min(height, int(box.get("bottom", 0))))
+    if right <= left or bottom <= top:
+        return None
+    return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+
+def _tally_question_crop_boxes(
+    grid: Dict[str, List[int]],
+    question_number: int,
+    *,
+    width: int,
+    height: int,
+) -> Optional[Tuple[Dict[str, int], Dict[str, int]]]:
+    horizontal = grid.get("horizontal") or []
+    vertical = grid.get("vertical") or []
+    if question_number <= 0:
         return None
 
-    arr = np.asarray(crop.convert("RGB"))
-    if arr.size == 0:
+    band_index = (question_number - 1) // 10
+    column_index = (question_number - 1) % 10
+    question_top_index = band_index * 2
+    mark_top_index = question_top_index + 1
+    mark_bottom_index = question_top_index + 2
+    if (
+        mark_bottom_index >= len(horizontal)
+        or column_index + 1 >= len(vertical)
+    ):
         return None
 
-    rgb = arr.astype("int16")
-    red = rgb[:, :, 0]
-    green = rgb[:, :, 1]
-    blue = rgb[:, :, 2]
-    channel_range = np.maximum.reduce([red, green, blue]) - np.minimum.reduce([red, green, blue])
-    ink_mask = (
-        (red < 160)
-        & (green < 160)
-        & (blue < 160)
-        & (channel_range < 100)
+    left = int(vertical[column_index])
+    right = int(vertical[column_index + 1])
+    mark_top = int(horizontal[mark_top_index])
+    mark_bottom = int(horizontal[mark_bottom_index])
+    cell_width = max(1, right - left)
+    cell_height = max(1, mark_bottom - mark_top)
+    tight_x_pad = max(2, int(cell_width * 0.07))
+    tight_y_pad = max(2, int(cell_height * 0.12))
+
+    tight = _clip_tally_crop_box(
+        {
+            "left": left + tight_x_pad,
+            "top": mark_top + tight_y_pad,
+            "right": right - tight_x_pad,
+            "bottom": mark_bottom - tight_y_pad,
+        },
+        width=width,
+        height=height,
     )
-
-    ys, xs = np.where(ink_mask)
-    ink_count = int(ink_mask.sum())
-    height, width = ink_mask.shape
-    if ink_count < max(8, int(width * height * 0.006)):
+    if tight is None:
         return None
 
-    left = int(xs.min())
-    right = int(xs.max())
-    top = int(ys.min())
-    bottom = int(ys.max())
-    bbox_width = max(1, right - left + 1)
-    bbox_height = max(1, bottom - top + 1)
-    density = ink_count / max(1, bbox_width * bbox_height)
-
-    is_single_vertical_stroke = (
-        bbox_height >= max(8, int(height * 0.45))
-        and bbox_width <= max(12, int(width * 0.16))
-        and bbox_height >= bbox_width * 1.5
-        and density >= 0.25
+    context_x_pad = max(2, int(cell_width * 0.08))
+    context_y_pad = max(2, int(cell_height * 0.12))
+    context = _clip_tally_crop_box(
+        {
+            "left": left - context_x_pad,
+            "top": int(horizontal[question_top_index]) - context_y_pad,
+            "right": right + context_x_pad,
+            "bottom": mark_bottom + context_y_pad,
+        },
+        width=width,
+        height=height,
     )
-    if is_single_vertical_stroke:
-        return "1"
-    return None
+    return tight, context
 
 
-def _detect_missing_marks_from_image(
-    image_b64: str,
+def _scale_tally_crop_box(
+    box: Dict[str, int],
+    *,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> Optional[Dict[str, int]]:
+    if source_width <= 0 or source_height <= 0:
+        return None
+    scaled = {
+        "left": round(int(box["left"]) * target_width / source_width),
+        "top": round(int(box["top"]) * target_height / source_height),
+        "right": round(int(box["right"]) * target_width / source_width),
+        "bottom": round(int(box["bottom"]) * target_height / source_height),
+    }
+    return _clip_tally_crop_box(scaled, width=target_width, height=target_height)
+
+
+def _tally_crop_hash(image: Any, box: Dict[str, int]) -> str:
+    crop = image.crop((box["left"], box["top"], box["right"], box["bottom"]))
+    digest = hashlib.sha256()
+    digest.update(f"{crop.mode}:{crop.width}x{crop.height}".encode("ascii"))
+    digest.update(crop.tobytes())
+    return digest.hexdigest()
+
+
+def _tally_image_hash(image: Any) -> str:
+    digest = hashlib.sha256()
+    digest.update(f"{image.mode}:{image.width}x{image.height}".encode("ascii"))
+    digest.update(image.tobytes())
+    return digest.hexdigest()
+
+
+def _combine_tally_evidence_hash(*parts: Optional[str]) -> Optional[str]:
+    clean_parts = [str(part) for part in parts if part]
+    if not clean_parts:
+        return None
+    return hashlib.sha256("|".join(clean_parts).encode("ascii")).hexdigest()
+
+
+def _tally_crop_data_url(
+    image: Any,
+    box: Dict[str, int],
+    *,
+    max_dimension: int = 960,
+) -> str:
+    crop = image.crop((box["left"], box["top"], box["right"], box["bottom"]))
+    if max(crop.width, crop.height) > max_dimension:
+        crop.thumbnail((max_dimension, max_dimension))
+    output = BytesIO()
+    crop.save(output, format="PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def _build_tally_question_evidence(
+    payload: TallyExtractRequest,
     document: TallyDocumentContext,
-    missing_by_row: Dict[int, List[int]],
-) -> Dict[int, Dict[int, str]]:
-    if not missing_by_row or 0 not in missing_by_row:
-        return {}
+    columns: List[str],
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[TallyQuestionEvidence], Dict[int, Dict[str, Any]], Optional[str]]:
+    question_numbers = _configured_question_numbers(document)
+    if not question_numbers:
+        question_numbers = sorted(_question_column_by_number(columns, rows).keys())
+    question_columns = _question_column_by_number(columns, rows)
+    layers = _decode_tally_ocr_layers(payload)
+    reference = layers.get("template") or layers.get("filled_sheet")
+    hash_layer = layers.get("strokes_only") or layers.get("filled_sheet")
+    template_layer = layers.get("template") or reference
+    full_evidence_hash = _combine_tally_evidence_hash(
+        _tally_image_hash(hash_layer) if hash_layer is not None else None,
+        _tally_image_hash(template_layer) if template_layer is not None else None,
+    )
+    evidence: List[TallyQuestionEvidence] = []
+    crop_assets: Dict[int, Dict[str, Any]] = {}
 
-    image = _decode_tally_image_for_mark_detection(image_b64)
-    if image is None:
-        return {}
-    grid = _detect_tally_question_grid(image, document)
+    if reference is None:
+        return [
+            TallyQuestionEvidence(
+                question_number=question_number,
+                column=question_columns.get(question_number, f"Q{question_number}"),
+            )
+            for question_number in question_numbers
+        ], crop_assets, full_evidence_hash
+
+    grid = _detect_tally_question_grid(reference, document)
     if not grid:
-        logger.info("Tally mark detector skipped because the question grid was not detected")
-        return {}
+        logger.info("Question-cell evidence unavailable because the tally grid was not detected")
+        return [
+            TallyQuestionEvidence(
+                question_number=question_number,
+                column=question_columns.get(question_number, f"Q{question_number}"),
+            )
+            for question_number in question_numbers
+        ], crop_assets, full_evidence_hash
 
-    horizontal = grid["horizontal"]
-    vertical = grid["vertical"]
-    detected: Dict[int, Dict[int, str]] = {}
-
-    for question_number in sorted(missing_by_row.get(0, [])):
-        expected_marks = _expected_marks_for_question(document, question_number)
-        if expected_marks is not None and expected_marks < 1:
-            continue
-
-        band_index = (question_number - 1) // 10
-        column_index = (question_number - 1) % 10
-        top_index = 1 + band_index * 2
-        bottom_index = 2 + band_index * 2
-        if bottom_index >= len(horizontal) or column_index + 1 >= len(vertical):
-            continue
-
-        left = int(vertical[column_index])
-        right = int(vertical[column_index + 1])
-        top = int(horizontal[top_index])
-        bottom = int(horizontal[bottom_index])
-        cell_width = max(1, right - left)
-        cell_height = max(1, bottom - top)
-        x_pad = max(2, int(cell_width * 0.05))
-        y_pad = max(2, int(cell_height * 0.10))
-        crop_box = (
-            max(0, left + x_pad),
-            max(0, top + y_pad),
-            min(image.width, right - x_pad),
-            min(image.height, bottom - y_pad),
+    for question_number in question_numbers:
+        boxes = _tally_question_crop_boxes(
+            grid,
+            question_number,
+            width=reference.width,
+            height=reference.height,
         )
-        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        if not boxes:
+            evidence.append(
+                TallyQuestionEvidence(
+                    question_number=question_number,
+                    column=question_columns.get(question_number, f"Q{question_number}"),
+                )
+            )
             continue
 
-        mark = _detect_single_stroke_mark(image.crop(crop_box))
-        if mark:
-            detected.setdefault(0, {})[question_number] = mark
+        tight_box, context_box = boxes
+        hash_box = (
+            _scale_tally_crop_box(
+                context_box,
+                source_width=reference.width,
+                source_height=reference.height,
+                target_width=hash_layer.width,
+                target_height=hash_layer.height,
+            )
+            if hash_layer is not None
+            else None
+        )
+        template_hash_box = (
+            _scale_tally_crop_box(
+                context_box,
+                source_width=reference.width,
+                source_height=reference.height,
+                target_width=template_layer.width,
+                target_height=template_layer.height,
+            )
+            if template_layer is not None
+            else None
+        )
+        crop_hash = _combine_tally_evidence_hash(
+            _tally_crop_hash(hash_layer, hash_box) if hash_layer is not None and hash_box else None,
+            _tally_crop_hash(template_layer, template_hash_box)
+            if template_layer is not None and template_hash_box
+            else None,
+        )
+        evidence.append(
+            TallyQuestionEvidence(
+                question_number=question_number,
+                column=question_columns.get(question_number, f"Q{question_number}"),
+                crop_hash=crop_hash,
+                crop_box=context_box,
+            )
+        )
+        crop_assets[question_number] = {
+            "reference_width": reference.width,
+            "reference_height": reference.height,
+            "tight_box": tight_box,
+            "context_box": context_box,
+            "layers": layers,
+        }
 
-    return detected
+    return evidence, crop_assets, full_evidence_hash
+
+
+def _targeted_recheck_images(
+    question_number: int,
+    crop_asset: Dict[str, Any],
+) -> List[TallyOcrImage]:
+    images: List[TallyOcrImage] = []
+    reference_width = int(crop_asset["reference_width"])
+    reference_height = int(crop_asset["reference_height"])
+    descriptions = {
+        "template": "Clean printed template. Use only for the Q label, cell boundary, and layout.",
+        "filled_sheet": "The printed tally sheet with the handwritten mark in this exact question cell.",
+        "strokes_only": "Only the teacher's handwritten strokes for this exact question cell.",
+    }
+    for layer_name in ("template", "filled_sheet", "strokes_only"):
+        image = crop_asset.get("layers", {}).get(layer_name)
+        if image is None:
+            continue
+        for crop_kind in ("context", "mark"):
+            source_box = crop_asset["context_box"] if crop_kind == "context" else crop_asset["tight_box"]
+            box = _scale_tally_crop_box(
+                source_box,
+                source_width=reference_width,
+                source_height=reference_height,
+                target_width=image.width,
+                target_height=image.height,
+            )
+            if not box:
+                continue
+            images.append(
+                TallyOcrImage(
+                    label=f"q{question_number}_{layer_name}_{crop_kind}",
+                    image_b64=_tally_crop_data_url(image, box),
+                    description=f"{descriptions[layer_name]} {crop_kind.title()} crop.",
+                )
+            )
+    return images
+
+
+def _strict_ocr_mark_value(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        text = str(value).strip()
+        if not re.fullmatch(r"\d+(?:\.\d+)?", text):
+            return None
+        try:
+            numeric = float(text)
+        except ValueError:
+            return None
+    if not math.isfinite(numeric) or numeric < 0:
+        return None
+    return _format_marks(numeric)
+
+
+def _build_targeted_mark_recheck_prompt(
+    *,
+    question_number: int,
+    original_value: str,
+    configured_max: Optional[str],
+) -> str:
+    return f"""
+You are reviewing one exact handwritten exam-tally mark cell: Q{question_number}.
+The attached crops are grouped by label: template, filled_sheet, and strokes_only. The context crops include the printed Q label; the mark crops contain only the answer area.
+
+Read only the handwriting visible inside this exact Q{question_number} mark cell. The first full-sheet OCR read it as {json.dumps(original_value)}. The configured maximum is {json.dumps(configured_max)} and is validation information only: it is never evidence of what was written.
+
+Rules:
+- Do not change a visible digit merely because it is above the configured maximum.
+- Do not combine a border, printed text, neighbouring cell, erased stroke, or crossed-out stroke into a mark.
+- If the remaining strokes could mean more than one number, or an overwritten correction cannot be read unambiguously, return unreadable. Do not guess the teacher's intended correction.
+- Return a numeric value only when the visible handwriting itself clearly supports one exact non-negative number.
+
+Return ONLY strict JSON:
+{{
+  "status": "readable" | "unreadable",
+  "value": null,
+  "confidence": 0.0,
+  "reason": "short visual reason"
+}}
+""".strip()
+
+
+def _parse_targeted_mark_recheck(raw_text: str) -> Tuple[Optional[str], Optional[float], str, str]:
+    parsed = _parse_llm_json(raw_text)
+    status_value = str(parsed.get("status") or "").strip().lower()
+    reason = str(parsed.get("reason") or "").strip()[:500]
+    try:
+        confidence = float(parsed.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = None
+    if confidence is not None:
+        confidence = max(0.0, min(1.0, confidence))
+
+    candidate = _strict_ocr_mark_value(parsed.get("value"))
+    if status_value != "readable" or candidate is None:
+        return None, confidence, "unreadable", reason or "The focused OCR pass could not read one unambiguous value."
+    return candidate, confidence, "resolved", reason or "Focused OCR resolved one exact visible mark."
+
+
+async def _run_targeted_mark_rechecks(
+    *,
+    tenant_db: Any,
+    document: TallyDocumentContext,
+    raw_rows: List[Dict[str, Any]],
+    issues: List[TallyValidationIssue],
+    crop_assets: Dict[int, Dict[str, Any]],
+    evidence_by_question: Dict[int, TallyQuestionEvidence],
+    include_debug: bool,
+) -> Tuple[List[TallyTargetedRecheck], List[TallyTargetedRecheckDebug]]:
+    targeted: List[TallyTargetedRecheck] = []
+    debug_entries: List[TallyTargetedRecheckDebug] = []
+    seen_targets = set()
+    # Every invalid Q-cell gets its own focused evidence pass. The sheet's
+    # actual unresolved cells, not an arbitrary cap, determine the work.
+    max_rechecks = len(
+        {
+            (int(issue.row_index or 0), int(issue.question_number))
+            for issue in issues
+            if issue.question_number is not None
+            and issue.code in {"mark_above_max", "mark_unreadable", "missing_mark", "ocr_uncertain"}
+        }
+    )
+
+    for issue in issues:
+        if issue.code not in {"mark_above_max", "mark_unreadable", "missing_mark", "ocr_uncertain"} or issue.question_number is None:
+            continue
+        row_index = int(issue.row_index or 0)
+        question_number = int(issue.question_number)
+        target_key = (row_index, question_number)
+        if target_key in seen_targets:
+            continue
+        seen_targets.add(target_key)
+        column = issue.column or f"Q{question_number}"
+        original_value = issue.actual or (
+            _cell_text(raw_rows[row_index].get(column))
+            if 0 <= row_index < len(raw_rows)
+            else ""
+        )
+        evidence = evidence_by_question.get(question_number)
+        crop_asset = crop_assets.get(question_number) if row_index == 0 else None
+        recheck_id = uuid4().hex
+
+        if len(targeted) >= max_rechecks:
+            targeted.append(
+                TallyTargetedRecheck(
+                    id=recheck_id,
+                    row_index=row_index,
+                    question_number=question_number,
+                    column=column,
+                    original_value=original_value,
+                    configured_max=issue.expected,
+                    status="manual_review_required",
+                    reason="Focused OCR recheck limit reached; inspect and confirm this cell manually.",
+                    crop_hash=evidence.crop_hash if evidence else None,
+                    crop_box=evidence.crop_box if evidence else {},
+                )
+            )
+            continue
+
+        if not crop_asset or not evidence or not evidence.crop_hash:
+            targeted.append(
+                TallyTargetedRecheck(
+                    id=recheck_id,
+                    row_index=row_index,
+                    question_number=question_number,
+                    column=column,
+                    original_value=original_value,
+                    configured_max=issue.expected,
+                    status="crop_unavailable",
+                    reason="The Q-cell grid could not be isolated. Review this mark manually; no value was assumed.",
+                    crop_hash=evidence.crop_hash if evidence else None,
+                    crop_box=evidence.crop_box if evidence else {},
+                )
+            )
+            continue
+
+        images = _targeted_recheck_images(question_number, crop_asset)
+        if not images:
+            targeted.append(
+                TallyTargetedRecheck(
+                    id=recheck_id,
+                    row_index=row_index,
+                    question_number=question_number,
+                    column=column,
+                    original_value=original_value,
+                    configured_max=issue.expected,
+                    status="crop_unavailable",
+                    reason="No readable image crop could be made for this cell.",
+                    crop_hash=evidence.crop_hash,
+                    crop_box=evidence.crop_box,
+                )
+            )
+            continue
+
+        prompt = _build_targeted_mark_recheck_prompt(
+            question_number=question_number,
+            original_value=original_value,
+            configured_max=issue.expected,
+        )
+        raw_text = ""
+        provider: Optional[str] = None
+        try:
+            response = await get_ocr_service().analyze_images(
+                images=[image.model_dump(exclude_none=True) for image in images],
+                prompt=prompt,
+                tenant_db=tenant_db,
+                max_tokens=512,
+                temperature=0.0,
+            )
+            raw_text = str(response.get("text") or "")
+            provider = response.get("provider")
+            candidate, confidence, recheck_status, reason = _parse_targeted_mark_recheck(raw_text)
+        except Exception as exc:
+            logger.warning("Targeted tally mark recheck failed for Q%s: %s", question_number, exc)
+            candidate = None
+            confidence = None
+            recheck_status = "recheck_failed"
+            reason = "Focused OCR recheck failed. Review this cell manually; no value was assumed."
+
+        targeted.append(
+            TallyTargetedRecheck(
+                id=recheck_id,
+                row_index=row_index,
+                question_number=question_number,
+                column=column,
+                original_value=original_value,
+                configured_max=issue.expected,
+                candidate_value=candidate,
+                confidence=confidence,
+                status=recheck_status,
+                reason=reason,
+                crop_hash=evidence.crop_hash,
+                crop_box=evidence.crop_box,
+            )
+        )
+        if include_debug:
+            debug_entries.append(
+                TallyTargetedRecheckDebug(
+                    id=recheck_id,
+                    row_index=row_index,
+                    question_number=question_number,
+                    prompt=prompt,
+                    raw_text=raw_text,
+                    provider=provider,
+                    images=images,
+                )
+            )
+
+    return targeted, debug_entries
 
 
 def _question_column_by_number(
@@ -1109,13 +1750,14 @@ def _validate_tally_result(
                 )
                 continue
 
-            mark = _parse_mark_value(raw_value)
+            strict_mark = _strict_ocr_mark_value(raw_value)
+            mark = float(strict_mark) if strict_mark is not None else None
             if mark is None:
                 issues.append(
                     TallyValidationIssue(
-                        severity="warning",
-                        code="mark_not_numeric",
-                        message=f"{column} value '{raw_value}' is not a readable numeric mark.",
+                        severity="error",
+                        code="mark_unreadable",
+                        message=f"{column} value '{raw_value}' is not one exact readable numeric mark.",
                         row_index=row_index,
                         column=column,
                         question_number=question_number,
@@ -1285,7 +1927,15 @@ def _build_analysis_rows(
     ordered_columns: List[str],
     question_map_items: List[Dict[str, Any]],
     document: TallyDocumentContext,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     question_columns = _find_question_columns(ordered_columns, rows)
     map_by_number = {
         int(item["question_number"]): item
@@ -1299,6 +1949,7 @@ def _build_analysis_rows(
         map_by_number = {
             question_number: {
                 "question_number": question_number,
+                "topic": "Overall",
                 "sub_topic": "Overall",
                 "max_marks": _document_max_marks_for_question(document, question_number),
                 "source": "fallback",
@@ -1307,9 +1958,13 @@ def _build_analysis_rows(
         }
     summary_rows: List[Dict[str, Any]] = []
     topic_rows: List[Dict[str, Any]] = []
+    subtopic_rows: List[Dict[str, Any]] = []
     class_topic_rows: List[Dict[str, Any]] = []
+    class_subtopic_rows: List[Dict[str, Any]] = []
     question_rows: List[Dict[str, Any]] = []
+    intervention_rows: List[Dict[str, Any]] = []
     class_topic_stats: Dict[str, Dict[str, Any]] = {}
+    class_subtopic_stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
     class_label = str(document.standard or "").strip()
     section_label = str(document.section or "").strip()
     subject_label = str(document.subject or "").strip()
@@ -1321,15 +1976,18 @@ def _build_analysis_rows(
         total_obtained = 0.0
         total_max = 0.0
         topic_stats: Dict[str, Dict[str, float]] = {}
+        subtopic_stats: Dict[Tuple[str, str], Dict[str, float]] = {}
 
         for question_number in sorted(map_by_number.keys()):
             item = map_by_number[question_number]
             column = question_columns.get(question_number) or f"Q{question_number}"
             raw_value = row.get(column, "")
-            mark = _parse_mark_value(raw_value)
+            strict_mark = _strict_ocr_mark_value(raw_value)
+            mark = float(strict_mark) if strict_mark is not None else None
             obtained = float(mark) if mark is not None else 0.0
             max_marks = _question_max_marks(item, document, question_number)
-            topic = str(item.get("sub_topic") or "Unmapped").strip() or "Unmapped"
+            topic = str(item.get("topic") or "Unmapped").strip() or "Unmapped"
+            sub_topic = str(item.get("sub_topic") or "General").strip() or "General"
 
             total_obtained += obtained
             total_max += max_marks
@@ -1337,14 +1995,31 @@ def _build_analysis_rows(
             topic_bucket["obtained"] += obtained
             topic_bucket["max"] += max_marks
             topic_bucket["questions"] += 1
+            subtopic_bucket = subtopic_stats.setdefault(
+                (topic, sub_topic),
+                {"obtained": 0.0, "max": 0.0, "questions": 0},
+            )
+            subtopic_bucket["obtained"] += obtained
+            subtopic_bucket["max"] += max_marks
+            subtopic_bucket["questions"] += 1
             class_bucket = class_topic_stats.setdefault(
                 topic,
-                {"obtained": 0.0, "max": 0.0, "questions": 0, "students": set()},
+                {"obtained": 0.0, "max": 0.0, "questions": 0, "students": set(), "question_numbers": set()},
             )
             class_bucket["obtained"] += obtained
             class_bucket["max"] += max_marks
             class_bucket["questions"] += 1
             class_bucket["students"].add(student_key)
+            class_bucket["question_numbers"].add(question_number)
+            class_subtopic_bucket = class_subtopic_stats.setdefault(
+                (topic, sub_topic),
+                {"obtained": 0.0, "max": 0.0, "questions": 0, "students": set(), "question_numbers": set()},
+            )
+            class_subtopic_bucket["obtained"] += obtained
+            class_subtopic_bucket["max"] += max_marks
+            class_subtopic_bucket["questions"] += 1
+            class_subtopic_bucket["students"].add(student_key)
+            class_subtopic_bucket["question_numbers"].add(question_number)
 
             question_rows.append(
                 {
@@ -1356,13 +2031,19 @@ def _build_analysis_rows(
                     "Question": f"Q{question_number}",
                     "Marks Obtained": obtained,
                     "Max Marks": max_marks,
-                    "Percentage": _format_percentage(_percentage(obtained, max_marks)),
-                    "Sub-topic": topic,
+                    "Percentage": _percentage(obtained, max_marks),
+                    "Mark Status": "Recorded" if mark is not None else "Not recorded",
+                    "Topic": topic,
+                    "Sub-topic": sub_topic,
                 }
             )
 
         overall_pct = _percentage(total_obtained, total_max)
         weak_topic, strong_topic = _pick_strengths(topic_stats, overall_pct)
+        weak_subtopic, strong_subtopic = _pick_strengths(
+            {f"{topic} - {sub_topic}": values for (topic, sub_topic), values in subtopic_stats.items()},
+            overall_pct,
+        )
         summary_rows.append(
             {
                 "Student": student,
@@ -1372,9 +2053,11 @@ def _build_analysis_rows(
                 "Subject": subject_label,
                 "Total Obtained": round(total_obtained, 2),
                 "Total Max": round(total_max, 2),
-                "Percentage": _format_percentage(overall_pct),
-                "Weak Sub-topic": weak_topic,
-                "Strong Sub-topic": strong_topic,
+                "Percentage": overall_pct,
+                "Weak Topic": weak_topic,
+                "Weak Sub-topic": weak_subtopic,
+                "Strong Topic": strong_topic,
+                "Strong Sub-topic": strong_subtopic,
             }
         )
 
@@ -1386,45 +2069,95 @@ def _build_analysis_rows(
                     "Class": class_label,
                     "Section": section_label,
                     "Subject": subject_label,
-                    "Sub-topic": topic,
+                    "Topic": topic,
                     "Marks Obtained": round(values["obtained"], 2),
                     "Max Marks": round(values["max"], 2),
-                    "Percentage": _format_percentage(_percentage(values["obtained"], values["max"])),
-                    "Questions": int(values["questions"]),
+                    "Percentage": _percentage(values["obtained"], values["max"]),
+                    "Question Count": int(values["questions"]),
                 }
             )
 
-    for topic, values in sorted(class_topic_stats.items()):
-        percentage = _percentage(values["obtained"], values["max"])
-        student_count = len(values["students"])
-        average_obtained = values["obtained"] / student_count if student_count else 0.0
-        average_max = values["max"] / student_count if student_count else 0.0
-        if percentage is None:
-            status_label = ""
-        elif percentage < 60:
-            status_label = "Needs attention"
-        elif percentage >= 80:
-            status_label = "Strong"
-        else:
-            status_label = "Developing"
-        class_topic_rows.append(
-            {
+        for (topic, sub_topic), values in sorted(subtopic_stats.items()):
+            percentage = _percentage(values["obtained"], values["max"])
+            subtopic_rows.append(
+                {
+                    "Student": student,
+                    "Student ID": student_id,
+                    "Class": class_label,
+                    "Section": section_label,
+                    "Subject": subject_label,
+                    "Topic": topic,
+                    "Sub-topic": sub_topic,
+                    "Marks Obtained": round(values["obtained"], 2),
+                    "Max Marks": round(values["max"], 2),
+                    "Percentage": percentage,
+                    "Question Count": int(values["questions"]),
+                }
+            )
+            if percentage is not None and percentage < 60:
+                intervention_rows.append(
+                    {
+                        "Student": student,
+                        "Student ID": student_id,
+                        "Class": class_label,
+                        "Section": section_label,
+                        "Subject": subject_label,
+                        "Topic": topic,
+                        "Sub-topic": sub_topic,
+                        "Percentage": percentage,
+                        "Priority": "High" if percentage < 40 else "Medium",
+                        "Suggested Action": "Re-teach and assign targeted practice",
+                    }
+                )
+
+    def append_class_rows(
+        stats: Dict[Any, Dict[str, Any]],
+        target_rows: List[Dict[str, Any]],
+        include_sub_topic: bool,
+    ) -> None:
+        for key, values in sorted(stats.items()):
+            topic, sub_topic = key if include_sub_topic else (key, None)
+            percentage = _percentage(values["obtained"], values["max"])
+            student_count = len(values["students"])
+            average_obtained = values["obtained"] / student_count if student_count else 0.0
+            average_max = values["max"] / student_count if student_count else 0.0
+            status_label = (
+                "Needs attention" if percentage is not None and percentage < 60
+                else "Strong" if percentage is not None and percentage >= 80
+                else "Developing" if percentage is not None
+                else ""
+            )
+            row = {
                 "Class": class_label,
                 "Section": section_label,
                 "Subject": subject_label,
-                "Sub-topic": topic,
+                "Topic": topic,
                 "Students": student_count,
                 "Marks Obtained": round(values["obtained"], 2),
                 "Max Marks": round(values["max"], 2),
                 "Average Marks": round(average_obtained, 2),
                 "Average Max Marks": round(average_max, 2),
-                "Percentage": _format_percentage(percentage),
-                "Question Attempts": int(values["questions"]),
+                "Percentage": percentage,
+                "Question Count": len(values["question_numbers"]),
+                "Scored Opportunities": int(values["questions"]),
                 "Class Status": status_label,
             }
-        )
+            if include_sub_topic:
+                row["Sub-topic"] = sub_topic
+            target_rows.append(row)
 
-    return summary_rows, topic_rows, class_topic_rows, question_rows
+    append_class_rows(class_topic_stats, class_topic_rows, False)
+    append_class_rows(class_subtopic_stats, class_subtopic_rows, True)
+
+    return (
+        summary_rows,
+        topic_rows,
+        subtopic_rows,
+        class_topic_rows,
+        class_subtopic_rows,
+        question_rows,
+        intervention_rows,
+    )
 
 
 def _build_prompt(payload: TallyExtractRequest) -> str:
@@ -1462,173 +2195,43 @@ Use the printed/template text, blue grid lines, and Q labels only to locate the 
     )
     return f"""
 {image_instructions}
-This is an exam tally marks grid, not a generic spreadsheet. The important cells are the evaluator marks under Q1, Q2, Q3... headings.
+This is an exam tally marks grid, not a generic spreadsheet. The important cells are the evaluator marks under the printed question headings.
 
 Task:
 1. Detect the table structure from the image.
-2. Read all headings exactly as intended, including labels like NAME, ROLL NO., PAPER SET, Q1, Q01, Q2, TOTAL, MAX MARKS.
+2. Read all headings exactly as intended, including student details, question labels, totals, and maximum-marks labels.
 3. Pair each value with the correct heading/cell.
 4. If the sheet is a single-student form, return one row.
 5. If the sheet has multiple student rows, return all rows.
 6. Preserve truly blank cells as empty strings.
-7. Normalize question headings to Q1, Q2, Q3... where obvious.
-8. Do not invent names or header text. For Q mark cells, use best-effort reading: if any handwritten mark is visible, return the closest numeric value and add a warning when confidence is low.{marking_rule}
+7. Normalize question headings to the Q<number> form where obvious.
+8. Do not invent names or header text. For each Q mark cell, return a numeric value only when the visible handwriting supports one exact value. If a visible mark is ambiguous, return an empty string and include that exact Q label in uncertain_cells. Do not choose a closest value.{marking_rule}
 
 Question mark grid rules:
 - {question_context}
 - Read values by the physical cell position below each Q heading. Do not shift marks left or right just because an earlier cell is hard to read.
-- A single black vertical handwritten stroke inside a question mark cell is a valid mark of "1", even when it is close to a blue printed grid line.
+- Interpret a handwritten mark only from the digit shape visibly written inside its own cell, even when it is close to a blue printed grid line.
 - Printed/template text, blue table borders, and printed Q labels are not marks. Black handwritten strokes inside the white mark area are marks.
 - Extract Q marks only from handwritten content inside each Q cell; never treat template content as a mark value.
-- Valid mark cells normally contain small values like 0, 1, 2, 0.5, or blanks. Preserve the exact numeric value as a string.
-- If a cell's configured max is 1, do not return "10" for a messy single stroke, overwritten stroke, grid-line overlap, or a mark that spills near a border. Return "1" only when the written mark is a one; return "0" only when it is a zero.
+- Preserve the exact numeric value as a string only when the written digit sequence is clear. The configured maximum must never turn an unclear mark into a value.
+- Do not turn a messy stroke, overwritten correction, grid-line overlap, or border-adjacent mark into a different value. Mark it uncertain instead when the written value is not exact.
 - Never combine strokes from neighboring cells or printed Q labels into a two-digit mark.
-- For Q cells, do not leave a visible handwritten mark blank just because it is small, faint, near a border, or slightly messy.
-- Return blank for a Q cell only when there is no visible handwritten mark inside that cell.
+- For Q cells, do not leave a visible handwritten mark blank just because it is small, faint, near a border, or slightly messy when it is still clearly readable.
+- Return blank and list the cell in uncertain_cells when a visible mark could mean more than one value, is overwritten, or cannot be read exactly. Return blank without uncertain_cells only when there is no visible handwritten mark inside that cell.
 
 Context from the UI, for disambiguation only:
 {json.dumps(context, ensure_ascii=False)}
 
 Return ONLY strict JSON in this shape:
 {{
-  "columns": ["NAME", "ROLL NO.", "PAPER SET", "Q1", "Q2"],
-  "rows": [
-    {{"NAME": "", "ROLL NO.": "", "PAPER SET": "", "Q1": "", "Q2": ""}}
-  ],
-  "cell_confidence": {{"Q1": 0.0, "Q2": 0.0}},
-  "uncertain_cells": ["Q1"],
+  "columns": [],
+  "rows": [],
+  "cell_confidence": {{}},
+  "uncertain_cells": [],
   "warnings": [],
   "confidence": 0.0
 }}
 """.strip()
-
-
-def _build_missing_marks_recheck_prompt(
-    payload: TallyExtractRequest,
-    missing_by_row: Dict[int, List[int]],
-) -> str:
-    document = payload.document or TallyDocumentContext()
-    student = payload.student or TallyStudentContext()
-    targets = [
-        {
-            "row_index": row_index,
-            "questions": [f"Q{number}" for number in question_numbers],
-        }
-        for row_index, question_numbers in sorted(missing_by_row.items())
-    ]
-    context = {
-        "selected_student": student.model_dump(exclude_none=True),
-        "question_context": _format_ocr_question_context(document),
-        "targets": targets,
-    }
-    image_instructions = (
-        """
-The attached OCR inputs are labeled images from the same tally sheet:
-- template: clean printed layout only.
-- filled_sheet: template plus handwritten marks.
-- strokes_only: handwritten strokes only on white background.
-
-Use template to locate the target cells, filled_sheet to read them, and strokes_only to resolve faint or messy handwriting.
-""".strip()
-        if payload.images
-        else """
-The attached image is one flattened canvas: a clean printed/template tally sheet underneath with imperfect black handwritten teacher marks written on top.
-Use the printed/template text, blue grid lines, and Q labels only to locate the target cells.
-""".strip()
-    )
-    return f"""
-You are doing a second OCR pass on the same exam tally sheet.
-The first pass left some question mark cells blank. Only inspect the target cells listed below.
-{image_instructions}
-
-Critical reading rules:
-- Read the physical mark cell below each target Q heading in the evaluator marks grid.
-- A single black vertical handwritten stroke inside the white mark area is the numeric mark "1".
-- Do not confuse black handwritten "1" marks with blue printed table borders, printed Q labels, or any other template content.
-- Do not shift values from neighboring cells. Each value must stay with its own Q heading.
-- If a target cell contains any visible handwritten mark, return the closest numeric value as a string, even if confidence is low.
-- If confidence is low, still return the best visible value and mention the cell in warnings.
-- Return an empty string only when the target cell has no visible handwritten mark.
-- Do not fill cells that are not listed in targets.
-
-Context:
-{json.dumps(context, ensure_ascii=False)}
-
-Return ONLY strict JSON in this shape:
-{{
-  "rows": [
-    {{"row_index": 0, "values": {{"Q1": "1", "Q2": ""}}}}
-  ],
-  "warnings": [],
-  "confidence": 0.0
-}}
-""".strip()
-
-
-def _coerce_recheck_row_index(
-    row: Dict[str, Any],
-    fallback_index: int,
-    target_rows: List[int],
-) -> int:
-    for key in ("row_index", "row"):
-        if key in row:
-            try:
-                return int(row.get(key))
-            except (TypeError, ValueError):
-                break
-
-    if "row_number" in row:
-        try:
-            row_number = int(row.get("row_number"))
-            return max(0, row_number - 1)
-        except (TypeError, ValueError):
-            pass
-
-    if len(target_rows) == 1:
-        return target_rows[0]
-    return fallback_index
-
-
-def _parse_rechecked_marks(
-    parsed: Dict[str, Any],
-    missing_by_row: Dict[int, List[int]],
-) -> Tuple[Dict[int, Dict[int, Any]], List[str], Optional[float]]:
-    target_rows = sorted(missing_by_row.keys())
-    rechecked: Dict[int, Dict[int, Any]] = {}
-
-    def collect_values(row_index: int, values: Dict[str, Any]) -> None:
-        target_questions = set(missing_by_row.get(row_index, []))
-        if not target_questions:
-            return
-        for key, value in values.items():
-            question_number = _question_number_from_label(key)
-            if question_number in target_questions:
-                rechecked.setdefault(row_index, {})[question_number] = value
-
-    raw_rows = parsed.get("rows")
-    if isinstance(raw_rows, list):
-        for fallback_index, raw_row in enumerate(raw_rows):
-            if not isinstance(raw_row, dict):
-                continue
-            row_index = _coerce_recheck_row_index(raw_row, fallback_index, target_rows)
-            raw_values = raw_row.get("values")
-            values = raw_values if isinstance(raw_values, dict) else raw_row
-            collect_values(row_index, values)
-    else:
-        raw_values = parsed.get("values")
-        values = raw_values if isinstance(raw_values, dict) else parsed
-        if isinstance(values, dict) and target_rows:
-            collect_values(target_rows[0], values)
-
-    warnings = parsed.get("warnings") if isinstance(parsed.get("warnings"), list) else []
-    warnings = [str(warning) for warning in warnings if str(warning).strip()]
-    confidence = parsed.get("confidence")
-    try:
-        confidence = float(confidence) if confidence is not None else None
-    except (TypeError, ValueError):
-        confidence = None
-
-    return rechecked, warnings, confidence
 
 
 def _format_filled_recheck_ranges(filled_by_row: Dict[int, List[int]]) -> str:
@@ -1691,70 +2294,6 @@ async def _analyze_tally_ocr(
     )
 
 
-def _merge_rechecked_marks(
-    columns: List[str],
-    rows: List[Dict[str, Any]],
-    rechecked: Dict[int, Dict[int, Any]],
-    missing_by_row: Dict[int, List[int]],
-    document: TallyDocumentContext,
-) -> Tuple[List[str], List[Dict[str, Any]], Dict[int, List[int]], List[str]]:
-    next_columns = list(columns)
-    next_rows = [dict(row) for row in rows]
-    question_columns = _question_column_by_number(next_columns, next_rows)
-    filled_by_row: Dict[int, List[int]] = {}
-    warnings: List[str] = []
-
-    for row_index, values in sorted(rechecked.items()):
-        if row_index < 0 or row_index >= len(next_rows):
-            continue
-        row = next_rows[row_index]
-        target_questions = set(missing_by_row.get(row_index, []))
-        if not target_questions:
-            continue
-
-        for question_number, raw_value in sorted(values.items()):
-            if question_number not in target_questions:
-                continue
-            raw_text = _cell_text(raw_value)
-            if not raw_text:
-                continue
-            mark = _parse_mark_value(raw_text)
-            if mark is None:
-                warnings.append(
-                    f"OCR recheck saw Q{question_number} as '{raw_text}', but it was not numeric."
-                )
-                continue
-            if mark < 0:
-                warnings.append(
-                    f"OCR recheck saw Q{question_number} as {_format_marks(mark)}, but negative marks are invalid."
-                )
-                continue
-
-            expected_marks = _expected_marks_for_question(document, question_number)
-            if expected_marks is not None and mark > expected_marks + 1e-6:
-                warnings.append(
-                    "OCR recheck saw "
-                    f"Q{question_number} as {_format_marks(mark)}, "
-                    f"above configured max {_format_marks(expected_marks)}."
-                )
-                continue
-
-            column = question_columns.get(question_number)
-            if not column:
-                column = f"Q{question_number}"
-                question_columns[question_number] = column
-                if column not in next_columns:
-                    next_columns.append(column)
-
-            if _cell_text(row.get(column)):
-                continue
-
-            row[column] = _format_marks(mark)
-            filled_by_row.setdefault(row_index, []).append(question_number)
-
-    return next_columns, next_rows, filled_by_row, warnings
-
-
 def _safe_filename(value: Optional[str], fallback: str) -> str:
     base = (value or fallback).strip() or fallback
     base = re.sub(r"[^a-zA-Z0-9_.-]+", "-", base).strip("-")
@@ -1768,6 +2307,331 @@ def _safe_document_id(value: str) -> str:
     if len(document_id) > 240 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", document_id):
         raise HTTPException(status_code=400, detail="Invalid document_id")
     return document_id
+
+
+def _safe_tally_student_id(value: str) -> str:
+    student_id = (value or "").strip()
+    if not student_id:
+        raise HTTPException(status_code=400, detail="student_id is required")
+    if len(student_id) > 240 or "/" in student_id or "\\" in student_id:
+        raise HTTPException(status_code=400, detail="Invalid student_id")
+    return student_id
+
+
+def _tally_student_identity(student: Any) -> str:
+    if isinstance(student, TallyStudentContext):
+        values = (student.student_id, student.username, student.roll_no, student.name)
+    elif isinstance(student, dict):
+        values = (
+            student.get("student_id"),
+            student.get("username"),
+            student.get("roll_no"),
+            student.get("name"),
+        )
+    else:
+        values = ()
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _tally_review_id(document_id: str, student_id: str) -> str:
+    source = f"{document_id}\x00{student_id}".encode("utf-8")
+    return f"tally-review-{hashlib.sha256(source).hexdigest()}"
+
+
+def _correction_key(row_index: int, question_number: int) -> str:
+    return f"{int(row_index)}:Q{int(question_number)}"
+
+
+def _correction_as_response(record: Dict[str, Any]) -> TallyAppliedCorrection:
+    approved_value = record.get("approved_value")
+    if approved_value is not None:
+        approved_value = _strict_ocr_mark_value(approved_value)
+    return TallyAppliedCorrection(
+        row_index=int(record.get("row_index") or 0),
+        question_number=int(record.get("question_number") or 0),
+        column=str(record.get("column") or f"Q{record.get('question_number') or ''}"),
+        original_ocr_value=(
+            str(record.get("original_ocr_value"))
+            if record.get("original_ocr_value") is not None
+            else None
+        ),
+        approved_value=approved_value,
+        decision=str(record.get("decision") or "set"),
+        crop_hash=record.get("crop_hash"),
+        evidence_scope=str(record.get("evidence_scope") or "cell"),
+        source_extraction_id=record.get("source_extraction_id"),
+        targeted_candidate=(
+            str(record.get("targeted_candidate"))
+            if record.get("targeted_candidate") is not None
+            else None
+        ),
+        reason=record.get("reason"),
+        approved_at=record.get("approved_at"),
+        approved_by=record.get("approved_by"),
+        resolution_source=str(record.get("resolution_source") or "teacher_override"),
+    )
+
+
+def _auto_resolution_as_response(record: Dict[str, Any]) -> Optional[TallyAutoResolvedMark]:
+    resolved_value = _strict_ocr_mark_value(
+        record.get("resolved_value", record.get("approved_value"))
+    )
+    if resolved_value is None:
+        return None
+    try:
+        row_index = int(record.get("row_index") or 0)
+        question_number = int(record.get("question_number") or 0)
+    except (TypeError, ValueError):
+        return None
+    if row_index < 0 or question_number <= 0:
+        return None
+    confidence = record.get("confidence")
+    try:
+        confidence = float(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+    if confidence is not None:
+        confidence = max(0.0, min(1.0, confidence))
+    return TallyAutoResolvedMark(
+        row_index=row_index,
+        question_number=question_number,
+        column=str(record.get("column") or f"Q{question_number}"),
+        original_ocr_value=(
+            str(record.get("original_ocr_value"))
+            if record.get("original_ocr_value") is not None
+            else None
+        ),
+        resolved_value=resolved_value,
+        crop_hash=record.get("crop_hash"),
+        evidence_scope=str(record.get("evidence_scope") or "cell"),
+        confidence=confidence,
+        reason=record.get("reason"),
+        source_extraction_id=record.get("source_extraction_id"),
+        resolved_at=record.get("resolved_at"),
+        resolution_source=str(record.get("resolution_source") or "focused_ocr"),
+    )
+
+
+def _focused_rechecks_to_auto_resolutions(
+    rechecks: List[TallyTargetedRecheck],
+    *,
+    document: TallyDocumentContext,
+    copy_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    resolutions: List[Dict[str, Any]] = []
+    seen_keys = set()
+    now = datetime.utcnow()
+    for recheck in rechecks:
+        if recheck.status != "resolved" or not recheck.crop_hash:
+            continue
+        resolved_value = _strict_ocr_mark_value(recheck.candidate_value)
+        if resolved_value is None:
+            continue
+        expected_max = _expected_marks_for_question(document, recheck.question_number)
+        if expected_max is not None and float(resolved_value) > expected_max + 1e-6:
+            continue
+        key = (int(recheck.row_index), int(recheck.question_number))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        resolutions.append(
+            {
+                "row_index": recheck.row_index,
+                "question_number": recheck.question_number,
+                "column": recheck.column,
+                "original_ocr_value": recheck.original_value,
+                "resolved_value": resolved_value,
+                "crop_hash": recheck.crop_hash,
+                "evidence_scope": "cell",
+                "confidence": recheck.confidence,
+                "reason": recheck.reason or "Focused OCR resolved one exact visible mark.",
+                "copy_id": copy_id,
+                "resolved_at": now,
+                "resolution_source": "focused_ocr",
+            }
+        )
+    return resolutions
+
+
+def _apply_tally_auto_resolutions(
+    *,
+    columns: List[str],
+    raw_rows: List[Dict[str, Any]],
+    resolutions: List[Dict[str, Any]],
+    document: TallyDocumentContext,
+    question_evidence: List[TallyQuestionEvidence],
+    copy_id: Optional[str],
+    full_evidence_hash: Optional[str] = None,
+) -> Tuple[List[str], List[Dict[str, Any]], List[TallyAutoResolvedMark]]:
+    correction_records: List[Dict[str, Any]] = []
+    resolution_by_key: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for raw_resolution in resolutions:
+        response = _auto_resolution_as_response(raw_resolution)
+        if response is None:
+            continue
+        expected_max = _expected_marks_for_question(document, response.question_number)
+        if expected_max is not None and float(response.resolved_value or 0) > expected_max + 1e-6:
+            continue
+        key = (response.row_index, response.question_number)
+        if key in resolution_by_key:
+            continue
+        resolution = {
+            **raw_resolution,
+            "row_index": response.row_index,
+            "question_number": response.question_number,
+            "column": response.column,
+            "approved_value": response.resolved_value,
+            "decision": "set",
+            "crop_hash": response.crop_hash,
+            "evidence_scope": response.evidence_scope,
+            "copy_id": raw_resolution.get("copy_id", copy_id),
+        }
+        correction_records.append(resolution)
+        resolution_by_key[key] = resolution
+
+    effective_columns, effective_rows, applied, _ = _apply_tally_mark_corrections(
+        columns=columns,
+        raw_rows=raw_rows,
+        corrections=correction_records,
+        question_evidence=question_evidence,
+        copy_id=copy_id,
+        full_evidence_hash=full_evidence_hash,
+    )
+    applied_keys = {(item.row_index, item.question_number) for item in applied}
+    applied_resolutions = [
+        response
+        for key, record in resolution_by_key.items()
+        if key in applied_keys
+        for response in [_auto_resolution_as_response(record)]
+        if response is not None
+    ]
+    return effective_columns, effective_rows, applied_resolutions
+
+
+def _active_tally_corrections(review: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not review:
+        return []
+    corrections_by_key = review.get("active_corrections_by_key")
+    if isinstance(corrections_by_key, dict):
+        return [
+            dict(corrections_by_key[key])
+            for key in sorted(corrections_by_key)
+            if isinstance(corrections_by_key.get(key), dict)
+        ]
+    corrections = review.get("active_corrections") or []
+    if not isinstance(corrections, list):
+        return []
+    return [item for item in corrections if isinstance(item, dict)]
+
+
+def _apply_tally_mark_corrections(
+    *,
+    columns: List[str],
+    raw_rows: List[Dict[str, Any]],
+    corrections: List[Dict[str, Any]],
+    question_evidence: List[TallyQuestionEvidence],
+    copy_id: Optional[str],
+    full_evidence_hash: Optional[str] = None,
+) -> Tuple[List[str], List[Dict[str, Any]], List[TallyAppliedCorrection], List[TallyAppliedCorrection]]:
+    effective_columns = list(columns)
+    effective_rows = [dict(row) for row in raw_rows]
+    question_columns = _question_column_by_number(effective_columns, effective_rows)
+    evidence_by_key = {
+        (int(item.row_index), int(item.question_number)): item
+        for item in question_evidence
+        if item.question_number > 0
+    }
+    applied: List[TallyAppliedCorrection] = []
+    stale: List[TallyAppliedCorrection] = []
+
+    for correction in corrections:
+        try:
+            row_index = int(correction.get("row_index") or 0)
+            question_number = int(correction.get("question_number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if row_index < 0 or question_number <= 0 or row_index >= len(effective_rows):
+            continue
+
+        response = _correction_as_response(correction)
+        evidence = evidence_by_key.get((row_index, question_number))
+        saved_hash = str(correction.get("crop_hash") or "")
+        evidence_scope = str(correction.get("evidence_scope") or "cell").lower()
+        saved_copy_id = str(correction.get("copy_id") or "")
+        current_copy_id = str(copy_id or "")
+        evidence_matches = (
+            bool(full_evidence_hash)
+            and bool(saved_hash)
+            and full_evidence_hash == saved_hash
+            if evidence_scope == "full_sheet"
+            else bool(evidence and evidence.crop_hash and saved_hash and evidence.crop_hash == saved_hash)
+        )
+        if not evidence_matches or (saved_copy_id and current_copy_id and saved_copy_id != current_copy_id):
+            stale.append(response)
+            continue
+
+        column = question_columns.get(question_number) or response.column or f"Q{question_number}"
+        if column not in effective_columns:
+            effective_columns.append(column)
+        question_columns[question_number] = column
+        decision = str(correction.get("decision") or "set").lower()
+        if decision == "clear":
+            effective_rows[row_index][column] = ""
+            applied.append(response)
+            continue
+
+        approved_value = _strict_ocr_mark_value(correction.get("approved_value"))
+        if approved_value is None:
+            stale.append(response)
+            continue
+        effective_rows[row_index][column] = approved_value
+        applied.append(response)
+
+    return effective_columns, effective_rows, applied, stale
+
+
+def _validate_tally_mark_correction(
+    *,
+    request: TallyMarkCorrectionSaveRequest,
+    document: TallyDocumentContext,
+) -> Optional[str]:
+    decision = str(request.decision or "").strip().lower()
+    if decision not in {"set", "clear"}:
+        raise HTTPException(status_code=422, detail="Correction decision must be 'set' or 'clear'")
+
+    configured_question_count = _configured_question_count(document)
+    if configured_question_count and request.question_number > configured_question_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Q{request.question_number} is outside the configured question range",
+        )
+    if decision == "clear":
+        if request.approved_value is not None:
+            raise HTTPException(status_code=422, detail="A cleared mark cannot include a numeric value")
+        return None
+
+    approved_value = _strict_ocr_mark_value(request.approved_value)
+    if approved_value is None:
+        raise HTTPException(status_code=422, detail="Approved mark must be one exact non-negative number")
+    expected_max = _expected_marks_for_question(document, request.question_number)
+    if expected_max is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No configured maximum marks found for Q{request.question_number}",
+        )
+    if float(approved_value) > expected_max + 1e-6:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Approved mark {_format_marks(float(approved_value))} exceeds the configured "
+                f"maximum {_format_marks(expected_max)} for Q{request.question_number}"
+            ),
+        )
+    return approved_value
 
 
 def _question_sort_key(question: Dict[str, Any]) -> Tuple[int, int, str]:
@@ -1928,6 +2792,7 @@ def _normalise_question_map_items(items: List[Any]) -> List[Dict[str, Any]]:
                 "question_id": str(data.get("question_id") or ""),
                 "question_text": str(data.get("question_text") or ""),
                 "question_text_preview": str(data.get("question_text_preview") or data.get("question_text") or "")[:240],
+                "topic": str(data.get("topic") or "").strip()[:80],
                 "sub_topic": str(data.get("sub_topic") or "General").strip()[:80] or "General",
                 "question_type": str(data.get("question_type") or "other").strip()[:40] or "other",
                 "max_marks": max_marks,
@@ -2043,6 +2908,8 @@ async def preview_tally_question_source(
     file: UploadFile = File(...),
     subject: Optional[str] = Form(None),
     difficulty: Optional[str] = Form("medium"),
+    standard: Optional[str] = Form(None),
+    course_plan: Optional[str] = Form(None),
     current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
@@ -2115,6 +2982,30 @@ async def preview_tally_question_source(
         ) from exc
 
     marking_scheme, items, warnings = _preview_marking_scheme(questions)
+    preview_questions = [
+        question.model_dump() if hasattr(question, "model_dump") else dict(question)
+        for question in questions
+        if isinstance(question, dict) or hasattr(question, "model_dump")
+    ]
+    if preview_questions:
+        preview_map = await build_tally_question_map(
+            tally_document_id=preview_document_id,
+            source_document_id=preview_document_id,
+            questions=preview_questions,
+            subject=subject,
+            standard=standard,
+            course_plan=course_plan,
+        )
+        classifications = {
+            int(item["question_number"]): item
+            for item in preview_map.get("items") or []
+            if item.get("question_number")
+        }
+        for item in items:
+            classification = classifications.get(item.question_number)
+            if classification:
+                item.topic = classification.get("topic") or "Unmapped"
+                item.sub_topic = classification.get("sub_topic") or "General"
     question_count = max([item.question_number for item in items], default=0)
     return TallyQuestionSourcePreviewResponse(
         success=True,
@@ -2345,6 +3236,303 @@ async def save_tally_question_map(
     return _question_map_response(safe_document_id, map_doc)
 
 
+@router.get(
+    "/mark-corrections/{document_id}/{student_id}",
+    response_model=TallyMarkCorrectionResponse,
+)
+async def get_tally_mark_corrections(
+    document_id: str,
+    student_id: str,
+    current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    safe_document_id = _safe_document_id(document_id)
+    safe_student_id = _safe_tally_student_id(student_id)
+    tenant_db = await _tenant_db(db, current_user)
+    await _assert_tally_context_access(
+        tenant_db,
+        current_user,
+        TallyDocumentContext(document_id=safe_document_id),
+        TallyStudentContext(student_id=safe_student_id),
+    )
+    review = await tenant_db["exam_tally_mark_reviews"].find_one(
+        {"_id": _tally_review_id(safe_document_id, safe_student_id)}
+    )
+    return TallyMarkCorrectionResponse(
+        success=True,
+        document_id=safe_document_id,
+        student_id=safe_student_id,
+        revision=int((review or {}).get("revision") or 0),
+        corrections=[_correction_as_response(item) for item in _active_tally_corrections(review)],
+    )
+
+
+@router.put(
+    "/mark-corrections/{document_id}/{student_id}",
+    response_model=TallyMarkCorrectionResponse,
+)
+async def save_tally_mark_correction(
+    document_id: str,
+    student_id: str,
+    payload: TallyMarkCorrectionSaveRequest,
+    current_user: Dict[str, Any] = Depends(_require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    safe_document_id = _safe_document_id(document_id)
+    safe_student_id = _safe_tally_student_id(student_id)
+    tenant_db = await _tenant_db(db, current_user)
+    extraction = await tenant_db["exam_tally_extractions"].find_one(
+        {"_id": payload.source_extraction_id}
+    )
+    if not extraction:
+        raise HTTPException(status_code=404, detail="OCR extraction evidence was not found")
+
+    raw_document = extraction.get("document") or {}
+    try:
+        document_context = TallyDocumentContext.model_validate(raw_document)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="OCR extraction has invalid document context") from exc
+    extraction_document_id = str(document_context.document_id or raw_document.get("document_id") or "")
+    if extraction_document_id != safe_document_id:
+        raise HTTPException(status_code=409, detail="OCR extraction belongs to a different tally document")
+    try:
+        student_context = TallyStudentContext.model_validate(extraction.get("student") or {})
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail="OCR extraction has invalid student context") from exc
+    extraction_student_id = _tally_student_identity(student_context)
+    if extraction_student_id != safe_student_id:
+        raise HTTPException(status_code=409, detail="OCR extraction belongs to a different student")
+    await _assert_tally_context_access(
+        tenant_db,
+        current_user,
+        document_context,
+        student_context,
+    )
+
+    evidence_items: List[TallyQuestionEvidence] = []
+    for item in extraction.get("question_evidence") or []:
+        try:
+            evidence_items.append(TallyQuestionEvidence.model_validate(item))
+        except Exception:
+            continue
+    evidence = next(
+        (
+            item
+            for item in evidence_items
+            if item.row_index == payload.row_index and item.question_number == payload.question_number
+        ),
+        None,
+    )
+    evidence_scope = str(payload.evidence_scope or "").strip().lower()
+    if evidence_scope not in {"cell", "full_sheet"}:
+        raise HTTPException(status_code=422, detail="Evidence scope must be 'cell' or 'full_sheet'")
+    if evidence_scope == "cell":
+        if not evidence or not evidence.crop_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="The handwritten Q-cell evidence is unavailable. Use the audited full-sheet review path or re-run OCR with a detectable tally grid.",
+            )
+        expected_evidence_hash = evidence.crop_hash
+    else:
+        expected_evidence_hash = str(extraction.get("full_evidence_hash") or "")
+        if not expected_evidence_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Full-sheet handwriting evidence is unavailable. Re-run review before confirming a mark.",
+            )
+    if not hmac.compare_digest(expected_evidence_hash, payload.crop_hash):
+        raise HTTPException(
+            status_code=409,
+            detail="This correction does not match the current handwritten evidence. Re-run review first.",
+        )
+
+    approved_value = _validate_tally_mark_correction(
+        request=payload,
+        document=document_context,
+    )
+    raw_columns = [str(column) for column in extraction.get("columns") or []]
+    raw_rows = [dict(row) for row in extraction.get("rows") or [] if isinstance(row, dict)]
+    if payload.row_index >= len(raw_rows):
+        raise HTTPException(status_code=422, detail="Correction row is outside the OCR extraction")
+    question_columns = _question_column_by_number(raw_columns, raw_rows)
+    column = question_columns.get(payload.question_number, f"Q{payload.question_number}")
+    original_ocr_value = _cell_text(raw_rows[payload.row_index].get(column)) or None
+    targeted_record = next(
+        (
+            item
+            for item in extraction.get("targeted_rechecks") or []
+            if isinstance(item, dict)
+            and int(item.get("row_index") or 0) == payload.row_index
+            and int(item.get("question_number") or 0) == payload.question_number
+        ),
+        None,
+    )
+
+    review_id = _tally_review_id(safe_document_id, safe_student_id)
+    review = await tenant_db["exam_tally_mark_reviews"].find_one({"_id": review_id})
+    if not review:
+        now = datetime.utcnow()
+        await tenant_db["exam_tally_mark_reviews"].update_one(
+            {"_id": review_id},
+            {
+                "$setOnInsert": {
+                    "document_id": safe_document_id,
+                    "student_id": safe_student_id,
+                    "active_corrections_by_key": {},
+                    "revision": 0,
+                    "created_at": now,
+                    "created_by": str(current_user.get("user_id") or ""),
+                }
+            },
+            upsert=True,
+        )
+        review = await tenant_db["exam_tally_mark_reviews"].find_one({"_id": review_id})
+    active_by_key = {
+        _correction_key(int(item.get("row_index") or 0), int(item.get("question_number") or 0)): dict(item)
+        for item in _active_tally_corrections(review)
+    }
+    now = datetime.utcnow()
+    correction_key = _correction_key(payload.row_index, payload.question_number)
+    previous_correction = active_by_key.get(correction_key)
+    correction = {
+        "row_index": payload.row_index,
+        "question_number": payload.question_number,
+        "column": column,
+        "original_ocr_value": original_ocr_value,
+        "approved_value": approved_value,
+        "decision": str(payload.decision).strip().lower(),
+        "crop_hash": expected_evidence_hash,
+        "evidence_scope": evidence_scope,
+        "crop_box": evidence.crop_box if evidence else {},
+        "source_extraction_id": payload.source_extraction_id,
+        "targeted_candidate": (targeted_record or {}).get("candidate_value"),
+        "reason": (payload.reason or "teacher_confirmed").strip() or "teacher_confirmed",
+        "copy_id": extraction.get("copy_id"),
+        "approved_at": now,
+        "approved_by": str(current_user.get("user_id") or ""),
+        "approved_by_type": current_user.get("user_type"),
+        "resolution_source": "teacher_override",
+    }
+    active_by_key[correction_key] = correction
+    expected_revision = int((review or {}).get("revision") or 0)
+    revision = expected_revision + 1
+    audit_event = {
+        "event_id": uuid4().hex,
+        "event_type": "mark_correction_confirmed",
+        "revision": revision,
+        "correction": correction,
+        "previous_correction": previous_correction,
+        "created_at": now,
+        "created_by": str(current_user.get("user_id") or ""),
+        "created_by_type": current_user.get("user_type"),
+    }
+    review_update_fields = {
+        "document_id": safe_document_id,
+        "student_id": safe_student_id,
+        "copy_id": extraction.get("copy_id"),
+        "updated_at": now,
+        "updated_by": str(current_user.get("user_id") or ""),
+        "updated_by_type": current_user.get("user_type"),
+    }
+    if isinstance((review or {}).get("active_corrections_by_key"), dict):
+        review_update_fields[f"active_corrections_by_key.{correction_key}"] = correction
+    else:
+        # One-time migration from the older list representation. Later writes
+        # Update only one map key, so concurrent Q-cell confirmations cannot
+        # erase one another.
+        review_update_fields["active_corrections_by_key"] = active_by_key
+
+    await tenant_db["exam_tally_mark_reviews"].update_one(
+        {"_id": review_id},
+        {
+            "$set": review_update_fields,
+            "$setOnInsert": {"created_at": now, "created_by": str(current_user.get("user_id") or "")},
+            "$inc": {"revision": 1},
+            "$push": {"audit_events": audit_event},
+        },
+        upsert=True,
+    )
+    persisted_review = await tenant_db["exam_tally_mark_reviews"].find_one({"_id": review_id})
+    active_corrections = _active_tally_corrections(persisted_review)
+    revision = int((persisted_review or {}).get("revision") or revision)
+
+    stored_auto_resolutions = [
+        dict(item)
+        for item in extraction.get("auto_resolved_marks") or []
+        if isinstance(item, dict)
+    ]
+    auto_columns, auto_rows, auto_resolved_marks = _apply_tally_auto_resolutions(
+        columns=raw_columns,
+        raw_rows=raw_rows,
+        resolutions=stored_auto_resolutions,
+        document=document_context,
+        question_evidence=evidence_items,
+        copy_id=extraction.get("copy_id"),
+        full_evidence_hash=extraction.get("full_evidence_hash"),
+    )
+    effective_columns, effective_rows, applied, stale = _apply_tally_mark_corrections(
+        columns=auto_columns,
+        raw_rows=auto_rows,
+        corrections=active_corrections,
+        question_evidence=evidence_items,
+        copy_id=extraction.get("copy_id"),
+        full_evidence_hash=extraction.get("full_evidence_hash"),
+    )
+    validation_issues = _validate_tally_result(
+        effective_columns,
+        effective_rows,
+        document_context,
+        student_context,
+    )
+    applied_correction_keys = {
+        (item.row_index, item.question_number) for item in applied
+    }
+    auto_resolved_keys = {
+        (item.row_index, item.question_number) for item in auto_resolved_marks
+    }
+    resolved_question_keys = applied_correction_keys.union(auto_resolved_keys)
+    for issue_data in extraction.get("raw_validation_issues") or []:
+        try:
+            issue = TallyValidationIssue.model_validate(issue_data)
+        except Exception:
+            continue
+        if issue.code != "ocr_uncertain":
+            continue
+        if (int(issue.row_index or 0), int(issue.question_number or 0)) not in resolved_question_keys:
+            validation_issues.append(issue)
+    await tenant_db["exam_tally_extractions"].update_one(
+        {"_id": payload.source_extraction_id},
+        {
+            "$set": {
+                "effective_columns": effective_columns,
+                "effective_rows": effective_rows,
+                "validation_issues": [
+                    issue.model_dump(exclude_none=True) for issue in validation_issues
+                ],
+                "applied_corrections": [
+                    item.model_dump(exclude_none=True) for item in applied
+                ],
+                "auto_resolved_marks": [
+                    item.model_dump(exclude_none=True) for item in auto_resolved_marks
+                ],
+                "effective_updated_at": now,
+            }
+        },
+    )
+    return TallyMarkCorrectionResponse(
+        success=True,
+        document_id=safe_document_id,
+        student_id=safe_student_id,
+        revision=revision,
+        corrections=[_correction_as_response(item) for item in active_corrections],
+        applied_corrections=applied,
+        stale_corrections=stale,
+        auto_resolved_marks=auto_resolved_marks,
+        rows=effective_rows,
+        validation_issues=validation_issues,
+    )
+
+
 @router.post("/extract", response_model=TallyExtractResponse)
 async def extract_tally(
     request: Request,
@@ -2368,6 +3556,7 @@ async def extract_tally(
         raise HTTPException(status_code=400, detail="Exam tally OCR images are too large")
 
     tenant_db = await _tenant_db(db, current_user)
+    await _assert_tally_context_access(tenant_db, current_user, payload.document, payload.student)
     prompt = _build_prompt(payload)
 
     try:
@@ -2387,96 +3576,177 @@ async def extract_tally(
     document_context = payload.document or TallyDocumentContext()
     student_context = payload.student or TallyStudentContext()
     warnings = _filter_tally_warnings(warnings, document_context)
+    initial_ocr_columns = list(columns)
+    initial_ocr_rows = [dict(row) for row in rows]
+    uncertain_by_row = _normalise_uncertain_question_cells(parsed)
 
     if not rows:
         warnings.append("No table rows were confidently detected.")
-    validation_issues = _validate_tally_result(columns, rows, document_context, student_context)
     missing_by_row = _missing_questions_by_row(columns, rows, document_context)
     recheck_raw_text: Optional[str] = None
     recheck_provider: Optional[str] = None
     recheck_confidence: Optional[float] = None
     recheck_prompt: Optional[str] = None
-
-    if missing_by_row:
-        try:
-            recheck_prompt = _build_missing_marks_recheck_prompt(payload, missing_by_row)
-            recheck_result = await _analyze_tally_ocr(
-                tenant_db=tenant_db,
-                payload=payload,
-                prompt=recheck_prompt,
-                max_tokens=2048,
-            )
-            recheck_provider = recheck_result.get("provider")
-            recheck_raw_text = recheck_result.get("text", "")
-            recheck_parsed = _parse_llm_json(recheck_raw_text)
-            rechecked, recheck_warnings, recheck_confidence = _parse_rechecked_marks(
-                recheck_parsed,
-                missing_by_row,
-            )
-            columns, rows, filled_by_row, merge_warnings = _merge_rechecked_marks(
-                columns,
-                rows,
-                rechecked,
-                missing_by_row,
-                document_context,
-            )
-
-            warnings.extend(recheck_warnings)
-            warnings.extend(merge_warnings)
-            filled_label = _format_filled_recheck_ranges(filled_by_row)
-            if filled_label:
-                warnings.append(f"OCR recheck filled missing marks for {filled_label}.")
-                validation_issues = _validate_tally_result(
-                    columns,
-                    rows,
-                    document_context,
-                    student_context,
-                )
-        except Exception as exc:
-            logger.warning("Exam tally missing-mark OCR recheck failed: %s", exc)
-            warnings.append("OCR recheck for missing marks failed; please review the flagged cells manually.")
-
-    remaining_missing_by_row = _missing_questions_by_row(columns, rows, document_context)
-    detected_marks = _detect_missing_marks_from_image(
-        primary_image_b64,
-        document_context,
-        remaining_missing_by_row,
-    )
-    if detected_marks:
-        columns, rows, filled_by_row, merge_warnings = _merge_rechecked_marks(
-            columns,
-            rows,
-            detected_marks,
-            remaining_missing_by_row,
-            document_context,
-        )
-        warnings.extend(merge_warnings)
-        filled_label = _format_filled_recheck_ranges(filled_by_row)
-        if filled_label:
-            warnings.append(f"Image mark detector filled missing marks for {filled_label}.")
-            validation_issues = _validate_tally_result(
-                columns,
-                rows,
-                document_context,
-                student_context,
-            )
-
-    final_missing_by_row = _missing_questions_by_row(columns, rows, document_context)
-    missing_label = _format_filled_recheck_ranges(final_missing_by_row)
+    missing_label = _format_filled_recheck_ranges(missing_by_row)
     if missing_label:
-        warnings.append(f"OCR could not confidently read missing marks for {missing_label}.")
+        warnings.append(
+            f"Initial full-sheet OCR left marks unresolved for {missing_label}; focused cell evidence was reviewed."
+        )
 
+    # The initial OCR result remains immutable evidence. A focused recheck may
+    # resolve one exact cell only when its own image evidence is readable; a
+    # teacher correction remains the final override when one exists.
+    raw_rows = initial_ocr_rows
+    raw_columns = initial_ocr_columns
+    raw_validation_issues = _validate_tally_result(
+        raw_columns,
+        raw_rows,
+        document_context,
+        student_context,
+    )
+    uncertain_validation_issues = _uncertain_question_validation_issues(
+        uncertain_by_row,
+        document_context,
+    )
+    raw_validation_issues.extend(uncertain_validation_issues)
+    question_evidence, crop_assets, full_evidence_hash = _build_tally_question_evidence(
+        payload,
+        document_context,
+        raw_columns,
+        raw_rows,
+    )
+
+    review: Optional[Dict[str, Any]] = None
+    active_corrections: List[Dict[str, Any]] = []
+    student_identity = _tally_student_identity(student_context)
+    if document_context.document_id and student_identity:
+        review = await tenant_db["exam_tally_mark_reviews"].find_one(
+            {"_id": _tally_review_id(document_context.document_id, student_identity)}
+        )
+        active_corrections = _active_tally_corrections(review)
+
+    _, _, initially_applied_corrections, _ = _apply_tally_mark_corrections(
+        columns=raw_columns,
+        raw_rows=raw_rows,
+        corrections=active_corrections,
+        question_evidence=question_evidence,
+        copy_id=payload.copy_id,
+        full_evidence_hash=full_evidence_hash,
+    )
+    initially_applied_correction_keys = {
+        (item.row_index, item.question_number) for item in initially_applied_corrections
+    }
+    targeted_rechecks, targeted_recheck_debug = await _run_targeted_mark_rechecks(
+        tenant_db=tenant_db,
+        document=document_context,
+        raw_rows=raw_rows,
+        issues=[
+            issue
+            for issue in _tally_mark_review_issues(
+                raw_validation_issues,
+                raw_columns,
+                raw_rows,
+                document_context,
+            )
+            if (int(issue.row_index or 0), int(issue.question_number or 0))
+            not in initially_applied_correction_keys
+        ],
+        crop_assets=crop_assets,
+        evidence_by_question={item.question_number: item for item in question_evidence},
+        include_debug=payload.debug,
+    )
     extraction_id = uuid4().hex
+    auto_resolution_records = _focused_rechecks_to_auto_resolutions(
+        targeted_rechecks,
+        document=document_context,
+        copy_id=payload.copy_id,
+    )
+    for record in auto_resolution_records:
+        record["source_extraction_id"] = extraction_id
+    auto_columns, auto_rows, auto_resolved_marks = _apply_tally_auto_resolutions(
+        columns=raw_columns,
+        raw_rows=raw_rows,
+        resolutions=auto_resolution_records,
+        document=document_context,
+        question_evidence=question_evidence,
+        copy_id=payload.copy_id,
+        full_evidence_hash=full_evidence_hash,
+    )
+    effective_columns, effective_rows, applied_corrections, stale_corrections = _apply_tally_mark_corrections(
+        columns=auto_columns,
+        raw_rows=auto_rows,
+        corrections=active_corrections,
+        question_evidence=question_evidence,
+        copy_id=payload.copy_id,
+        full_evidence_hash=full_evidence_hash,
+    )
+    applied_correction_keys = {
+        (item.row_index, item.question_number) for item in applied_corrections
+    }
+    auto_resolved_keys = {
+        (item.row_index, item.question_number) for item in auto_resolved_marks
+    }
+    overridden_auto_keys = applied_correction_keys.intersection(auto_resolved_keys)
+    if overridden_auto_keys:
+        auto_resolved_marks = [
+            item
+            for item in auto_resolved_marks
+            if (item.row_index, item.question_number) not in overridden_auto_keys
+        ]
+        auto_resolved_keys -= overridden_auto_keys
+    if stale_corrections:
+        stale_labels = _format_question_ranges(
+            [item.question_number for item in stale_corrections]
+        )
+        if stale_labels:
+            warnings.append(
+                f"Previous teacher correction is stale because its handwritten cell changed: {stale_labels}."
+            )
+    resolved_question_keys = applied_correction_keys.union(auto_resolved_keys)
+    validation_issues = _validate_tally_result(
+        effective_columns,
+        effective_rows,
+        document_context,
+        student_context,
+    )
+    validation_issues.extend(
+        issue
+        for issue in uncertain_validation_issues
+        if (int(issue.row_index or 0), int(issue.question_number or 0))
+        not in resolved_question_keys
+    )
+
     doc = {
         "_id": extraction_id,
         "document": document_context.model_dump(exclude_none=True, by_alias=True),
         "student": student_context.model_dump(exclude_none=True),
         "copy_id": payload.copy_id,
-        "columns": columns,
-        "rows": rows,
+        "columns": raw_columns,
+        "rows": raw_rows,
+        "effective_columns": effective_columns,
+        "effective_rows": effective_rows,
         "warnings": warnings,
         "validation_issues": [
             issue.model_dump(exclude_none=True) for issue in validation_issues
+        ],
+        "raw_validation_issues": [
+            issue.model_dump(exclude_none=True) for issue in raw_validation_issues
+        ],
+        "question_evidence": [
+            item.model_dump(exclude_none=True) for item in question_evidence
+        ],
+        "full_evidence_hash": full_evidence_hash,
+        "targeted_rechecks": [
+            item.model_dump(exclude_none=True) for item in targeted_rechecks
+        ],
+        "auto_resolved_marks": [
+            item.model_dump(exclude_none=True) for item in auto_resolved_marks
+        ],
+        "applied_corrections": [
+            item.model_dump(exclude_none=True) for item in applied_corrections
+        ],
+        "stale_corrections": [
+            item.model_dump(exclude_none=True) for item in stale_corrections
         ],
         "confidence": confidence,
         "raw_text": raw_text,
@@ -2494,12 +3764,21 @@ async def extract_tally(
     return TallyExtractResponse(
         success=True,
         extraction_id=extraction_id,
-        columns=columns,
-        rows=rows,
+        columns=effective_columns,
+        rows=effective_rows,
         warnings=warnings,
         validation_issues=validation_issues,
         confidence=confidence,
         raw_text=raw_text,
+        raw_rows=raw_rows,
+        evidence_hash=full_evidence_hash,
+        question_evidence=question_evidence,
+        targeted_rechecks=[
+            item for item in targeted_rechecks if item.status != "resolved"
+        ],
+        auto_resolved_marks=auto_resolved_marks,
+        applied_corrections=applied_corrections,
+        stale_corrections=stale_corrections,
         debug=TallyExtractDebugResponse(
             prompt=prompt,
             raw_text=raw_text,
@@ -2508,6 +3787,7 @@ async def extract_tally(
             recheck_raw_text=recheck_raw_text,
             recheck_provider=recheck_provider,
             image_labels=[image.get("label", "") for image in ocr_images],
+            targeted_rechecks=targeted_recheck_debug,
         ) if payload.debug else None,
     )
 
@@ -2537,14 +3817,25 @@ async def export_tally(
     columns = payload.columns
     rows = payload.rows
     validation_issues: List[Any] = []
+    correction_rows = [dict(item) for item in payload.corrections if isinstance(item, dict)]
 
     if payload.extraction_id and not rows:
         saved = await tenant_db["exam_tally_extractions"].find_one({"_id": payload.extraction_id})
         if not saved:
             raise HTTPException(status_code=404, detail="Extraction not found")
-        columns = saved.get("columns") or []
-        rows = saved.get("rows") or []
+        columns = saved.get("effective_columns") or saved.get("columns") or []
+        rows = saved.get("effective_rows") or saved.get("rows") or []
         validation_issues = saved.get("validation_issues") or []
+        if not correction_rows:
+            correction_rows = [
+                dict(item)
+                for item in saved.get("auto_resolved_marks") or []
+                if isinstance(item, dict)
+            ] + [
+                dict(item)
+                for item in saved.get("applied_corrections") or []
+                if isinstance(item, dict)
+            ]
 
     if not rows:
         raise HTTPException(status_code=400, detail="No rows available to export")
@@ -2587,6 +3878,7 @@ async def export_tally(
             {
                 "Question": f"Q{question_number}",
                 "Question ID": item.get("question_id") or "",
+                "Topic": item.get("topic") or "Unmapped",
                 "Sub-topic": item.get("sub_topic") or "Unmapped",
                 "Max Marks": max_marks if max_marks > 0 else "",
                 "Confidence": item.get("confidence") if item.get("confidence") is not None else "",
@@ -2594,42 +3886,163 @@ async def export_tally(
                 "Question Preview": item.get("question_text_preview") or "",
             }
         )
-    summary_rows, topic_rows, class_topic_rows, question_rows = _build_analysis_rows(
+    (
+        summary_rows,
+        topic_rows,
+        subtopic_rows,
+        class_topic_rows,
+        class_subtopic_rows,
+        question_rows,
+        intervention_rows,
+    ) = _build_analysis_rows(
         normalised_rows,
         ordered_columns,
         question_map_items,
         document_context,
     )
+    student_percentages = [
+        row["Percentage"]
+        for row in summary_rows
+        if isinstance(row.get("Percentage"), (int, float))
+    ]
+    correction_audit_rows = []
+    for correction in correction_rows:
+        is_focused_ocr = (
+            str(correction.get("resolution_source") or "").strip().lower() == "focused_ocr"
+            or "resolved_value" in correction
+        )
+        resolution_source = "Focused OCR" if is_focused_ocr else "Teacher Override"
+        resolved_mark = (
+            correction.get("resolved_value")
+            if is_focused_ocr
+            else correction.get("approved_value")
+        )
+        question_number = correction.get("question_number")
+        question_label = (
+            f"Q{int(question_number)}"
+            if isinstance(question_number, (int, float)) or str(question_number or "").isdigit()
+            else str(correction.get("column") or "")
+        )
+        correction_audit_rows.append(
+            {
+                "Student": correction.get("Selected Student") or correction.get("student_name") or "",
+                "Student ID": correction.get("Selected Student ID") or correction.get("student_id") or "",
+                "Question": question_label,
+                "OCR Reading": correction.get("original_ocr_value") or "",
+                "Resolution Source": resolution_source,
+                "Resolved Mark": resolved_mark if resolved_mark is not None else "",
+                "Focused OCR Candidate": (
+                    correction.get("resolved_value")
+                    if is_focused_ocr
+                    else correction.get("targeted_candidate") or ""
+                ),
+                "Reason": correction.get("reason") or "",
+                "Recorded At": correction.get("resolved_at") or correction.get("approved_at") or "",
+                "Evidence Hash": correction.get("crop_hash") or "",
+            }
+        )
+    focused_ocr_count = sum(
+        1
+        for correction in correction_rows
+        if str(correction.get("resolution_source") or "").strip().lower() == "focused_ocr"
+        or "resolved_value" in correction
+    )
+    teacher_override_count = len(correction_rows) - focused_ocr_count
+    overview_rows = [
+        {"Metric": "Exam", "Value": document_context.title or "Exam Tally"},
+        {"Metric": "Subject", "Value": document_context.subject or ""},
+        {"Metric": "Class", "Value": document_context.standard or ""},
+        {"Metric": "Section", "Value": document_context.section or ""},
+        {"Metric": "Students", "Value": len(summary_rows)},
+        {"Metric": "Questions", "Value": len(question_map_items) or len(_find_question_columns(ordered_columns, normalised_rows))},
+        {
+            "Metric": "Class Average (%)",
+            "Value": round(sum(student_percentages) / len(student_percentages), 2) if student_percentages else "",
+        },
+        {"Metric": "Students Needing Support", "Value": len({row["Student ID"] or row["Student"] for row in intervention_rows})},
+        {"Metric": "Focused OCR resolutions", "Value": focused_ocr_count},
+        {"Metric": "Teacher overrides", "Value": teacher_override_count},
+    ]
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df = pd.DataFrame(normalised_rows, columns=ordered_columns)
-        df.to_excel(writer, sheet_name="Exam Tally", index=False)
         workbook = writer.book
-        worksheet = writer.sheets["Exam Tally"]
-        header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7", "border": 1})
-        for col_idx, col_name in enumerate(ordered_columns):
-            worksheet.write(0, col_idx, col_name, header_format)
-            max_len = max([len(str(col_name))] + [len(str(row.get(col_name, ""))) for row in normalised_rows])
-            worksheet.set_column(col_idx, col_idx, min(max(max_len + 2, 10), 32))
+        header_format = workbook.add_format(
+            {"bold": True, "font_color": "#FFFFFF", "bg_color": "#1F4E78", "border": 0}
+        )
+        percentage_format = workbook.add_format({"num_format": '0.0"%"'})
+        sheet_index = 0
 
         def write_sheet(sheet_name: str, sheet_rows: List[Dict[str, Any]]) -> None:
+            nonlocal sheet_index
             if not sheet_rows:
+                sheet = workbook.add_worksheet(sheet_name)
+                sheet.write(0, 0, "No data available")
                 return
             sheet_columns = list(sheet_rows[0].keys())
             sheet_df = pd.DataFrame(sheet_rows, columns=sheet_columns)
             sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
             sheet = writer.sheets[sheet_name]
+            sheet.freeze_panes(1, 0)
             for col_idx, col_name in enumerate(sheet_columns):
                 sheet.write(0, col_idx, col_name, header_format)
                 max_len = max([len(str(col_name))] + [len(str(row.get(col_name, ""))) for row in sheet_rows])
-                sheet.set_column(col_idx, col_idx, min(max(max_len + 2, 10), 42))
+                cell_format = percentage_format if col_name == "Percentage" else None
+                sheet.set_column(col_idx, col_idx, min(max(max_len + 2, 10), 42), cell_format)
+                if col_name == "Percentage":
+                    sheet.conditional_format(
+                        1,
+                        col_idx,
+                        len(sheet_rows),
+                        col_idx,
+                        {
+                            "type": "3_color_scale",
+                            "min_color": "#F4CCCC",
+                            "mid_color": "#FFF2CC",
+                            "max_color": "#D9EAD3",
+                            "min_value": 0,
+                            "mid_value": 60,
+                            "max_value": 100,
+                        },
+                    )
+            sheet.add_table(
+                0,
+                0,
+                len(sheet_rows),
+                len(sheet_columns) - 1,
+                {
+                    "name": f"TallyTable{sheet_index}",
+                    "columns": [{"header": column} for column in sheet_columns],
+                    "style": "Table Style Medium 2",
+                },
+            )
+            sheet_index += 1
 
-        write_sheet("Question Map", question_map_rows)
+        write_sheet("Overview", overview_rows)
         write_sheet("Student Summary", summary_rows)
-        write_sheet("Topic Analysis", topic_rows)
         write_sheet("Class Topic Analysis", class_topic_rows)
+        write_sheet("Class Sub-topic Analysis", class_subtopic_rows)
+        write_sheet("Intervention Plan", intervention_rows)
+        write_sheet("Topic Analysis", topic_rows)
+        write_sheet("Sub-topic Analysis", subtopic_rows)
         write_sheet("Question Analysis", question_rows)
+        write_sheet("Question Map", question_map_rows)
+        write_sheet("OCR Corrections", correction_audit_rows)
+        write_sheet("Exam Tally", normalised_rows)
+
+        if class_topic_rows:
+            chart = workbook.add_chart({"type": "column"})
+            chart.add_series(
+                {
+                    "name": "Class performance by topic",
+                    "categories": ["Class Topic Analysis", 1, 3, len(class_topic_rows), 3],
+                    "values": ["Class Topic Analysis", 1, 9, len(class_topic_rows), 9],
+                }
+            )
+            chart.set_title({"name": "Class performance by topic"})
+            chart.set_y_axis({"name": "Percentage", "min": 0, "max": 100})
+            chart.set_legend({"none": True})
+            writer.sheets["Overview"].insert_chart("D2", chart, {"x_scale": 1.35, "y_scale": 1.2})
 
     output.seek(0)
     title = payload.filename or (payload.document.title if payload.document else None)

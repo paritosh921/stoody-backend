@@ -186,13 +186,14 @@ async def _classify_with_llm(
         )
 
     prompt = (
-        "Classify each exam question into the most specific sub-topic visible from the question text. "
-        "Do not return broad chapter names when a narrower concept is clear. "
-        "Use concise 2-5 word sub-topic labels.\n\n"
+        "Classify each exam question into a parent topic/chapter and its most specific sub-topic. "
+        "The topic must be a meaningful syllabus-level chapter or unit; the sub-topic must be the narrower concept. "
+        "Use concise 2-5 word labels and keep equivalent questions under exactly the same labels.\n\n"
         f"Subject: {subject or 'General'}\n"
         f"Class/standard: {standard or 'Unknown'}\n\n"
         "Return ONLY JSON in this shape:\n"
-        '{"items":[{"question_number":1,"sub_topic":"Dimensional Analysis",'
+        '{"items":[{"question_number":1,"topic":"Units and Measurements",'
+        '"sub_topic":"Dimensional Analysis",'
         '"question_type":"numerical","confidence":0.0}]}\n\n'
         "Allowed question_type values: objective, numerical, subjective, short_answer, "
         "case_study, assertion_reason, diagram_based, other.\n\n"
@@ -218,8 +219,9 @@ async def _classify_with_llm(
         number = _safe_int(item.get("question_number"))
         if number is None:
             continue
+        topic = str(item.get("topic") or "").strip()[:80]
         sub_topic = str(item.get("sub_topic") or "").strip()[:80]
-        if not sub_topic:
+        if not topic or not sub_topic:
             continue
         confidence = item.get("confidence")
         try:
@@ -227,6 +229,7 @@ async def _classify_with_llm(
         except (TypeError, ValueError):
             confidence_value = 0.0
         by_number[number] = {
+            "topic": topic,
             "sub_topic": sub_topic,
             "question_type": _normalise_question_type(item.get("question_type")),
             "confidence": confidence_value,
@@ -246,6 +249,7 @@ async def build_tally_question_map(
     marking_scheme: Optional[List[Dict[str, Any]]] = None,
     fallback_max_marks: Optional[float] = None,
     generated_by: Optional[str] = None,
+    reviewed_items: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     ordered_questions = sorted(
         questions or [],
@@ -256,6 +260,13 @@ async def build_tally_question_map(
         subject=subject,
         standard=standard,
     )
+    reviewed_by_number = {
+        number: item
+        for item in reviewed_items or []
+        if isinstance(item, dict)
+        for number in [_safe_int(item.get("question_number"))]
+        if number is not None and str(item.get("source") or "").lower() in {"manual", "reviewed"}
+    }
 
     items: List[Dict[str, Any]] = []
     warnings: List[str] = []
@@ -267,7 +278,17 @@ async def build_tally_question_map(
         seen_numbers.add(number)
 
         classification = classifications.get(number) or {}
-        sub_topic = classification.get("sub_topic") or _fallback_subtopic(question)
+        reviewed = reviewed_by_number.get(number) or {}
+        sub_topic = (
+            str(reviewed.get("sub_topic") or "").strip()
+            or classification.get("sub_topic")
+            or _fallback_subtopic(question)
+        )
+        topic = (
+            str(reviewed.get("topic") or "").strip()
+            or classification.get("topic")
+            or str(question.get("topic") or question.get("chapter") or "").strip()
+        )
         question_type = classification.get("question_type") or _normalise_question_type(
             question.get("question_type"),
             question,
@@ -287,11 +308,12 @@ async def build_tally_question_map(
                 "question_id": str(question.get("id") or question.get("_id") or ""),
                 "question_text": text,
                 "question_text_preview": text[:240],
+                "topic": str(topic or "Unmapped")[:80],
                 "sub_topic": str(sub_topic or "General")[:80],
                 "question_type": _normalise_question_type(question_type, question),
                 "max_marks": max_marks,
                 "confidence": float(classification.get("confidence") or 0.0),
-                "source": classification.get("source") or "fallback",
+                "source": reviewed.get("source") or classification.get("source") or "fallback",
             }
         )
 
