@@ -332,4 +332,7 @@ def test_prod_workflow_enables_and_validates_exampen_processing_workers():
     assert "stoody-exampen-worker.service" in source
     assert "stoody-exampen-beat.service" in source
     assert "celery' -A celery_app inspect ping" in source
+    assert "for attempt in $(seq 1 15)" in source
+    assert "waiting 3 seconds" in source
+    assert "did not become ready after 45 seconds" in source
     assert source.index("Deploy backend to prod") < source.index("Validate ExamPen PCR worker runtime")
