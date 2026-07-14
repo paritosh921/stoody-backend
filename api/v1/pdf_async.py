@@ -133,6 +133,17 @@ class PCRMarkingPolicyRequest(BaseModel):
     strictness: str = Field(default="balanced")
     temperature: float = Field(default=0.10, ge=0.0, le=0.20)
 
+
+class PCRMarkingPlanDraftRequest(BaseModel):
+    """Select the mapped worked answer used to draft a PCR marking plan.
+
+    This request never finalises a paper or writes the generated draft.  The
+    teacher must review the returned criterion rows and explicitly save the
+    question before those rows become part of the paper.
+    """
+
+    mappingId: Optional[str] = Field(default=None, max_length=512)
+
 class QuestionImage(BaseModel):
     id: str
     filename: str
@@ -2583,6 +2594,168 @@ async def generate_worked_solution_batch(
     }
 
 
+def _parse_pcr_marking_plan_draft(
+    raw_response: str,
+    *,
+    question_marks: float,
+) -> Dict[str, Any]:
+    """Parse and validate a non-persistent, teacher-reviewable rubric draft.
+
+    The model is never trusted with mark totals.  It may suggest criterion
+    wording, but the server normalises IDs and rejects a draft unless its rows
+    exactly account for the existing question marks.
+    """
+
+    cleaned = str(raw_response or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1]
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3].strip()
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError("The AI returned an invalid marking-plan draft") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("The AI returned an invalid marking-plan draft")
+
+    raw_criteria = payload.get("marking_criteria", payload.get("criteria", []))
+    policy_module = _pcr_marking_policy_module()
+    try:
+        criteria = policy_module.normalize_marking_criteria(raw_criteria, assign_missing_ids=True)
+    except ValueError as exc:
+        raise ValueError(f"The AI returned invalid criterion rows: {exc}") from exc
+
+    errors = policy_module.validate_marking_criteria(criteria, question_marks)
+    if errors:
+        raise ValueError("The AI draft needs regeneration: " + "; ".join(errors[:3]))
+
+    reference_solution = str(
+        payload.get("reference_solution") or payload.get("teacher_reference_solution") or ""
+    ).strip()
+    return {
+        "reference_solution": reference_solution,
+        "marking_criteria": criteria,
+    }
+
+
+async def generate_pcr_marking_plan_draft(
+    *,
+    document: Dict[str, Any],
+    question: Dict[str, Any],
+    mapped_solution: str,
+    gateway_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Ask the configured model for a *draft* criterion rubric.
+
+    This is intentionally an authoring assistant, not an evaluation path:
+    nothing is persisted here and the caller must present the result to a
+    teacher for review.  The immutable-policy validator is used before the
+    draft leaves the server, which keeps AI from inventing extra marks.
+    """
+
+    from openai import AsyncOpenAI
+
+    question_text = str(question.get("question_text") or question.get("text") or "").strip()
+    try:
+        question_marks = float(question.get("points") or question.get("max_marks") or 0)
+    except (TypeError, ValueError):
+        question_marks = 0.0
+    if not question_text:
+        raise ValueError("The question text is empty")
+    if question_marks <= 0:
+        raise ValueError("Set question marks before drafting marking criteria")
+    if not mapped_solution.strip():
+        raise ValueError("The mapped solution is empty")
+
+    policy_module = _pcr_marking_policy_module()
+    policy = policy_module.normalize_marking_policy(
+        document.get("pcr_marking_policy"),
+        default_structured=True,
+    )
+    strictness = str(policy.get("strictness") or "balanced")
+    temperature = float(policy.get("temperature") or 0.10)
+    temperature = max(0.0, min(0.20, temperature))
+
+    if GROQ_API_KEY:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        model = GROQ_MODEL
+        provider = "groq"
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise ValueError("No AI provider is configured to draft PCR marking criteria")
+        client = AsyncOpenAI(api_key=openai_key)
+        model = OCR_FALLBACK_MODEL
+        provider = "openai"
+
+    prompt = (
+        "You are assisting a teacher to author a subjective-exam marking plan.\n"
+        "This is a DRAFT only. Do not award a student score.\n\n"
+        "Use only the supplied question and teacher-uploaded worked solution.\n"
+        "Create clear, independently assessable criterion rows for the required method, intermediate work, "
+        "and final answer. Do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
+        f"The question is worth exactly {question_marks:g} marks. The sum of all criterion max_marks MUST be exactly {question_marks:g}.\n"
+        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence may contain valid alternatives.\n"
+        f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
+        "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
+        '{"reference_solution":"teacher-ready cleaned solution", "marking_criteria":['
+        '{"criterion_id":"criterion_1","description":"...","max_marks":1,"acceptable_evidence":"..."}'
+        "]}\n\n"
+        f"Document: {document.get('title') or document.get('document_id') or ''}\n"
+        f"Subject: {document.get('subject') or question.get('subject') or 'General'}\n"
+        f"Question marks: {question_marks:g}\n"
+        "--- QUESTION ---\n"
+        f"{question_text[:12000]}\n\n"
+        "--- MAPPED TEACHER SOLUTION ---\n"
+        f"{mapped_solution[:16000]}"
+    )
+
+    async def _raw_call():
+        return await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_completion_tokens=4096,
+        )
+
+    gateway = AIGatewayService(
+        gateway_context.get("db"),
+        is_b2c=bool(gateway_context.get("is_b2c")),
+    )
+    response = await gateway.call(
+        user_id=str(gateway_context.get("user_id") or "unknown"),
+        tenant_id=gateway_context.get("tenant_id"),
+        document_id=gateway_context.get("document_id"),
+        region_id=gateway_context.get("region_id"),
+        region_scope="pcr_marking_plan_draft",
+        stage="pcr_marking_plan_draft",
+        provider=provider,
+        model=model,
+        input_kind="text",
+        estimated_input_tokens=estimate_text_tokens(prompt),
+        estimated_output_tokens=1200,
+        max_output_tokens=4096,
+        input_units={"questions": 1, "marks": question_marks},
+        call_fn=_raw_call,
+    )
+    raw_response = str(response.choices[0].message.content or "")
+    draft = _parse_pcr_marking_plan_draft(raw_response, question_marks=question_marks)
+    if not draft["reference_solution"]:
+        draft["reference_solution"] = mapped_solution.strip()
+    draft.update(
+        {
+            "provider": provider,
+            "model": model,
+            "strictness": strictness,
+            "temperature": temperature,
+        }
+    )
+    return draft
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenCV + LLM Figure Detection Pipeline — DISABLED
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4000,6 +4173,150 @@ async def update_pcr_marking_policy(
         "document_id": document_id,
         "pcr_marking_policy": policy,
         "message": "PCR marking policy saved. It will be locked when the paper is finalized.",
+    }
+
+
+@router.post("/documents/{document_id}/questions/{question_id}/draft-pcr-marking-plan")
+@limiter.limit("10/minute")
+async def draft_pcr_marking_plan(
+    request: Request,
+    document_id: str,
+    question_id: str,
+    body: PCRMarkingPlanDraftRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Create a review-only criterion-rubric draft from a mapped answer.
+
+    A mapped answer sheet is OCR evidence, not an automatic marking key.  This
+    endpoint exposes an explicit bridge: it creates a non-persistent draft for
+    the teacher to inspect, edit, and save.  It never accepts the mapping,
+    changes the authoring question, or finalizes the paper by itself.
+    """
+
+    is_b2c = is_b2c_admin(current_user)
+    document = (
+        await db.b2c_find_one("documents", {"document_id": document_id})
+        if is_b2c
+        else await db.mongo_find_one("documents", {"document_id": document_id})
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    # Keep this authoring-assistant route scoped exactly like the existing
+    # mapping and solution-generation routes. A valid admin/tutor token from
+    # another school must not be able to ask the model to read this paper's
+    # mapped solution.
+    if not is_b2c:
+        from config_async import DEBUG_MODE as _DEBUG_MODE
+
+        document_admin_id = document.get("admin_id")
+        document_admin_id_str = (
+            str(document_admin_id) if document_admin_id is not None else None
+        )
+        user_type = current_user.get("user_type")
+        if user_type == "admin":
+            actor_admin_id = (
+                str(current_user.get("user_id"))
+                if current_user.get("user_id") is not None
+                else None
+            )
+        else:
+            actor_admin_id = (
+                str(current_user.get("admin_id"))
+                if current_user.get("admin_id") is not None
+                else None
+            )
+        if actor_admin_id != document_admin_id_str and not _DEBUG_MODE:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have access to this document",
+            )
+
+    if document.get("exam_mode") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Marking-plan drafts are available only for PCR papers",
+        )
+    if document.get("exam_finalized"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This PCR paper is finalized and its marking plan is locked",
+        )
+
+    tenant_db = db.b2c_db if is_b2c else await db.get_tenant_db(current_user.get("db_name"))
+    question = await tenant_db["questions"].find_one(
+        {
+            "document_id": document_id,
+            "$or": [{"id": question_id}, {"question_id": question_id}],
+        }
+    )
+    if question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found")
+
+    mapping_query: Dict[str, Any] = {
+        "document_id": document_id,
+        "$or": [{"question_id": question_id}, {"question_region_id": question_id}],
+    }
+    mapping_id = str(body.mappingId or "").strip()
+    if mapping_id:
+        mapping_query["mapping_id"] = mapping_id
+    mappings = await tenant_db["answer_question_mappings"].find(mapping_query).to_list(length=20)
+    if not mappings:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No mapped answer-sheet solution is available for this question",
+        )
+    mapping = max(mappings, key=_answer_mapping_rank)
+    if str(mapping.get("review_status") or "").strip().lower() == "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The selected mapped answer was rejected and cannot be used as a draft source",
+        )
+    mapped_solution = str(
+        mapping.get("final_answer_text") or mapping.get("answer_text") or ""
+    ).strip()
+    if not mapped_solution:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The selected mapped answer has no usable worked solution text",
+        )
+
+    try:
+        draft = await generate_pcr_marking_plan_draft(
+            document=document,
+            question=question,
+            mapped_solution=mapped_solution,
+            gateway_context=_build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_id=question_id,
+                region_scope="pcr_marking_plan_draft",
+                is_b2c=is_b2c,
+            ),
+        )
+    except (ImportError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except AIUsageLimitExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to draft PCR marking plan for %s / %s", document_id, question_id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not draft marking criteria. Please try again or use the mapped solution manually.",
+        ) from exc
+
+    return {
+        "document_id": document_id,
+        "question_id": question_id,
+        "source_mapping": _serialize_answer_mapping(mapping),
+        "draft": draft,
+        "requires_teacher_review": True,
+        "message": "Draft created from the mapped solution. Review and save it before finalizing the paper.",
     }
 
 

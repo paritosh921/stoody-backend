@@ -1049,6 +1049,27 @@ class TestUEval01:
 
         assert errors == []
 
+    def test_u_eval_01_mapped_solution_draft_cannot_change_question_marks(self):
+        """Authoring AI may draft wording but cannot invent or lose locked marks."""
+        from api.v1.pdf_async import _parse_pcr_marking_plan_draft
+
+        valid = _parse_pcr_marking_plan_draft(
+            '{"reference_solution":"Use the stated equation.","marking_criteria":['
+            '{"criterion_id":"method","description":"Uses the correct method","max_marks":1},'
+            '{"criterion_id":"result","description":"Calculates the final result","max_marks":3}'
+            ']}',
+            question_marks=4,
+        )
+        assert sum(item["max_marks"] for item in valid["marking_criteria"]) == 4
+
+        with pytest.raises(ValueError, match="total 3"):
+            _parse_pcr_marking_plan_draft(
+                '{"marking_criteria":['
+                '{"criterion_id":"method","description":"Uses the method","max_marks":3}'
+                ']}',
+                question_marks=4,
+            )
+
     @pytest.mark.asyncio
     async def test_u_eval_01_structured_rubric_scores_only_locked_criteria(self):
         """PCR recomputes a criterion-rubric total and honours its low temperature."""
