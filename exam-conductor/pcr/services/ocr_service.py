@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from config_async import settings
+from utils.s3_storage import PrivateObjectStorageError, download_private_object
 
 from ..domain.response_models import (
     BoundingBox,
@@ -420,7 +421,7 @@ class LLMVisionCameraAdapter:
             image_height_px = page_data.get("image_height_px")
 
             # Get image as base64
-            image_b64 = _resolve_image_base64(raw_image_ref)
+            image_b64 = await _resolve_image_base64(raw_image_ref)
             if image_b64 is None:
                 logger.warning(
                     "Page %d: could not resolve image from %s — skipping",
@@ -669,14 +670,14 @@ def create_ocr_adapter(source: str, gate: VisionGateProtocol) -> OCRAdapter:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
+async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
     """Resolve a raw_image_ref to a base64-encoded string.
 
     Handles:
     - Already base64 data (starts with ``/9j/`` for JPEG, ``iVBOR`` for PNG,
       or is a data URI ``data:image/...;base64,...``)
-    - released local upload paths (read only inside the private upload root)
-    - S3 keys (not configured in this adapter yet)
+    - private ``s3://`` answer-copy artefacts (the production source of truth)
+    - released local upload paths only for legacy artefacts during migration
 
     Returns ``None`` if the reference cannot be resolved.
     """
@@ -706,6 +707,24 @@ def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
         except Exception:
             pass
 
+    # New student answer copies are immutable private S3 objects.  The worker
+    # reads the object directly with its AWS role/credentials; it never needs
+    # a public URL or a shared EC2 filesystem path.
+    if ref.startswith("s3://"):
+        try:
+            image_bytes = await download_private_object(
+                ref,
+                allowed_key_prefix="private/exampen/",
+                max_bytes=25 * 1024 * 1024,
+            )
+        except PrivateObjectStorageError as exc:
+            logger.warning(
+                "Could not resolve private S3 answer-copy image for OCR: %s",
+                exc,
+            )
+            return None
+        return base64.b64encode(image_bytes).decode("ascii")
+
     # Released uploads use absolute local paths in the current deployment.
     # Only resolve files inside the configured private upload root; a database
     # reference must never become an arbitrary file-read primitive.
@@ -722,9 +741,6 @@ def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
                 logger.warning("Refusing OCR image outside safe size limit: %s", candidate)
     except OSError:
         logger.warning("Could not read protected camera image reference: %s", ref[:120])
-
-    # S3-backed deployments should provide a storage resolver before camera
-    # OCR is enabled.  Do not attempt unauthenticated URL retrieval here.
 
     logger.debug(
         "raw_image_ref does not appear to be base64 or data URI: %s...",
@@ -759,6 +775,9 @@ def _detect_media_type(raw_image_ref: str) -> str:
     # JPEG magic in base64
     if ref.startswith("/9j/"):
         return "image/jpeg"
+
+    if ref.lower().split("?", 1)[0].endswith(".png"):
+        return "image/png"
 
     return "image/jpeg"
 

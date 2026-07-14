@@ -169,6 +169,110 @@ async def test_review_summary_keeps_full_paper_denominator_and_shows_blank_quest
 
 
 @pytest.mark.asyncio
+async def test_failed_ocr_does_not_look_like_a_zero_mark_blank_paper():
+    """A storage/OCR failure must remain retryable, not become ten fake zeros."""
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-OCR-FAILED",
+            "exam_id": "EXAM-OCR-FAILED",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "failed",
+        }
+    )
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-OCR-FAILED::Q-{number}",
+                "exam_id": "EXAM-OCR-FAILED",
+                "question_number": number,
+                "max_marks": 4,
+            }
+            for number in (1, 2, 3)
+        ]
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "submission_id": "SUB-OCR-FAILED",
+            "status": "failed",
+            "last_error": "OCR produced no text blocks",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-OCR-FAILED",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.score_state == "unavailable"
+    assert result.processing_status == "failed"
+    assert result.processing_error == "OCR produced no text blocks"
+    assert result.responses == []
+    assert result.evaluated_count == 0
+    assert result.total_max_score == 12.0
+
+
+@pytest.mark.asyncio
+async def test_staff_page_preview_uses_short_lived_private_s3_url():
+    from api.v1.evalpen_review_async import get_submission_pages
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-PREVIEW",
+            "student_id": "STU-1",
+        }
+    )
+    await db["evalpen_answer_pages"].insert_one(
+        {
+            "page_id": "PAGE-1",
+            "submission_id": "SUB-PREVIEW",
+            "page_number": 1,
+            "raw_image_ref": (
+                "s3://stoody-test/private/exampen/student-answer-copies/"
+                "tenant/exam/attempt/page-1.png"
+            ),
+            "image_width_px": 1200,
+            "image_height_px": 1600,
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+        patch(
+            "api.v1.evalpen_review_async.create_private_download_url",
+            return_value="https://private.test/signed-preview",
+        ) as presign,
+    ):
+        result = await get_submission_pages(
+            submission_id="SUB-PREVIEW",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.total_pages == 1
+    assert result.pages[0].image_url == "https://private.test/signed-preview"
+    assert result.pages[0].width == 1200
+    assert presign.call_count == 1
+    assert presign.call_args.kwargs["allowed_key_prefix"] == "private/exampen/"
+
+
+@pytest.mark.asyncio
 async def test_teacher_criterion_review_recomputes_total_and_keeps_audit_history():
     """Teachers can adjust only frozen criterion awards, never the rubric itself."""
     import os

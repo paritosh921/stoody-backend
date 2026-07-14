@@ -44,6 +44,7 @@ from pydantic import BaseModel, Field, field_validator
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
 from utils.tutor_scoping import get_tutor_scoped_students
+from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,14 @@ class SubmissionSummaryReviewAPI(BaseModel):
     student_id: str
     source: str = "camera"
     segmentation_status: str = "pending"
+    processing_status: Optional[str] = None
+    # Staff-only diagnostic.  Students continue to receive the safe status
+    # surface from their BFF and are never shown worker/storage internals.
+    processing_error: Optional[str] = None
+    # ``available`` means OCR completed (a genuinely blank paper can score
+    # zero); ``processing`` and ``unavailable`` must never be rendered as a
+    # 0-mark attempt.
+    score_state: str = "processing"
     publication_status: Optional[str] = None
     responses: List[ResponseSummaryAPI] = Field(default_factory=list)
     total_score: float = 0.0
@@ -183,6 +192,23 @@ class SubmissionSummaryReviewAPI(BaseModel):
     evaluated_count: int = 0
     blocked_count: int = 0
     pending_count: int = 0
+
+
+class SubmissionPageThumbnailAPI(BaseModel):
+    """A staff-authorized, short-lived preview of one private answer page."""
+
+    page_id: str
+    page_index: int
+    image_url: Optional[str] = None
+    width: int = 0
+    height: int = 0
+    regions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class SubmissionPagesAPI(BaseModel):
+    submission_id: str
+    total_pages: int = 0
+    pages: List[SubmissionPageThumbnailAPI] = Field(default_factory=list)
 
 
 class ExamResultStudentAPI(BaseModel):
@@ -422,6 +448,32 @@ async def get_submission_summary(
         )
 
         sub_dict = _sub_dict_for_scope
+        segmentation_status = str(sub_dict.get("segmentation_status") or "pending")
+        processing_job = await tenant_db["exampen_processing_jobs"].find_one(
+            {"submission_id": submission_id}
+        )
+        processing_status = (
+            str(processing_job.get("status"))
+            if isinstance(processing_job, dict) and processing_job.get("status")
+            else None
+        )
+        processing_error = (
+            str(processing_job.get("last_error"))[:500]
+            if isinstance(processing_job, dict) and processing_job.get("last_error")
+            else None
+        )
+        processing_failed = segmentation_status == "failed" or processing_status in {
+            "failed",
+            "retryable_error",
+            "enqueue_failed",
+        }
+        score_state = (
+            "available"
+            if segmentation_status == "complete"
+            else "unavailable"
+            if processing_failed
+            else "processing"
+        )
         question_catalog = await _get_pcr_question_catalog(
             tenant_db,
             str(sub_dict.get("exam_id") or ""),
@@ -573,31 +625,33 @@ async def get_submission_summary(
             )
 
         # Older submissions may have been processed before answer slots were
-        # introduced.  Keep their review surface and total correct immediately
-        # instead of requiring a re-upload: add an explicit read-only blank
-        # row for every unseen immutable question.
-        for question in question_catalog:
-            question_id = question["question_id"]
-            if question_id in observed_question_ids:
-                continue
-            response_summaries.append(
-                ResponseSummaryAPI(
-                    response_id=f"UNANSWERED-{submission_id}-{question_id}",
-                    question_id=question_id,
-                    question_number=question["question_number"],
-                    content_type="TEXT_ONLY",
-                    eval_status="not_attempted",
-                    total_score=0.0,
-                    max_score=question["max_marks"],
-                    overall_feedback=(
-                        "No answer was detected for this question, so 0 marks were awarded."
-                    ),
-                    has_blocking_flags=False,
-                    is_missing_response=True,
-                    answer_state="not_attempted",
+        # introduced.  Backfill explicit blank rows only after OCR completed.
+        # A failed job used to look like ten deliberately blank answers and
+        # falsely award 0/40.  Keep a failed or running job visibly unresolved
+        # until it is reprocessed instead.
+        if score_state == "available":
+            for question in question_catalog:
+                question_id = question["question_id"]
+                if question_id in observed_question_ids:
+                    continue
+                response_summaries.append(
+                    ResponseSummaryAPI(
+                        response_id=f"UNANSWERED-{submission_id}-{question_id}",
+                        question_id=question_id,
+                        question_number=question["question_number"],
+                        content_type="TEXT_ONLY",
+                        eval_status="not_attempted",
+                        total_score=0.0,
+                        max_score=question["max_marks"],
+                        overall_feedback=(
+                            "No answer was detected for this question, so 0 marks were awarded."
+                        ),
+                        has_blocking_flags=False,
+                        is_missing_response=True,
+                        answer_state="not_attempted",
+                    )
                 )
-            )
-            evaluated_count += 1
+                evaluated_count += 1
 
         response_summaries.sort(
             key=lambda item: (
@@ -618,9 +672,10 @@ async def get_submission_summary(
             exam_id=sub_dict.get("exam_id", ""),
             student_id=sub_dict.get("student_id", ""),
             source=sub_dict.get("source", "camera"),
-            segmentation_status=sub_dict.get(
-                "segmentation_status", "pending"
-            ),
+            segmentation_status=segmentation_status,
+            processing_status=processing_status,
+            processing_error=processing_error,
+            score_state=score_state,
             publication_status=sub_dict.get("publication_status"),
             responses=response_summaries,
             total_score=total_score,
@@ -649,6 +704,76 @@ async def get_submission_summary(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve submission summary",
         )
+
+
+@router.get(
+    "/submissions/{submission_id}/pages",
+    response_model=SubmissionPagesAPI,
+    summary="Get staff-authorized private answer-page previews",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Submission not found"},
+    },
+)
+async def get_submission_pages(
+    submission_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> SubmissionPagesAPI:
+    """Return temporary S3 previews only after role and tutor-scope checks.
+
+    Raw ``s3://`` references are never returned to the browser.  The client
+    receives a five-minute presigned URL for each page, generated only after
+    the same staff authorization used by the score review endpoint.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id},
+        projection={"student_id": 1},
+    )
+    if submission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Submission {submission_id} not found",
+        )
+    _check_student_in_scope(str(submission.get("student_id") or ""), scoped_ids)
+
+    page_docs = await tenant_db["evalpen_answer_pages"].find(
+        {"submission_id": submission_id}
+    ).sort("page_number", 1).to_list(length=100)
+    pages: List[SubmissionPageThumbnailAPI] = []
+    for index, page_doc in enumerate(page_docs):
+        raw_image_ref = str(page_doc.get("raw_image_ref") or "")
+        image_url: Optional[str] = None
+        if raw_image_ref.startswith("s3://"):
+            try:
+                image_url = create_private_download_url(
+                    raw_image_ref,
+                    allowed_key_prefix="private/exampen/",
+                    expires_in=300,
+                )
+            except PrivateObjectStorageError:
+                logger.warning(
+                    "Could not create private answer-page preview: submission=%s page=%s",
+                    submission_id,
+                    page_doc.get("page_id"),
+                )
+
+        pages.append(
+            SubmissionPageThumbnailAPI(
+                page_id=str(page_doc.get("page_id") or f"{submission_id}-{index + 1}"),
+                page_index=max(0, int(page_doc.get("page_number") or index + 1) - 1),
+                image_url=image_url,
+                width=int(page_doc.get("image_width_px") or 0),
+                height=int(page_doc.get("image_height_px") or 0),
+            )
+        )
+    return SubmissionPagesAPI(
+        submission_id=submission_id,
+        total_pages=len(pages),
+        pages=pages,
+    )
 
 
 @router.get(

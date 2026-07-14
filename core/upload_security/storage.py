@@ -116,6 +116,31 @@ class PrivateUploadStorage:
         await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
         return str(path)
 
+    async def delete_released_path(self, released_path: str) -> bool:
+        """Delete a released local artefact after durable object-store transfer.
+
+        The path is constrained to this storage instance's released prefix so
+        an upload record can never turn this cleanup into arbitrary deletion.
+        """
+        if not released_path:
+            return False
+        try:
+            candidate = Path(released_path).resolve(strict=False)
+            released_root = (self.local_root / self.released_prefix).resolve(
+                strict=False
+            )
+        except OSError:
+            return False
+        if candidate == released_root or released_root not in candidate.parents:
+            return False
+
+        await _delete_file_and_empty_parents(candidate, stop_at=released_root)
+        await _delete_file_and_empty_parents(
+            Path(f"{candidate}.metadata.json"),
+            stop_at=released_root,
+        )
+        return True
+
     async def mark_rejected(
         self,
         *,

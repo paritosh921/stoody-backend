@@ -14,6 +14,7 @@ they continue to read ``evalpen_submissions`` and PCR evaluation records.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -26,7 +27,12 @@ from api.v1.auth_async import get_database
 from api.v1.evalpen_student_bff_async import _get_student_identity_ids, require_student
 from core.database import DatabaseManager
 from core.upload_security.service import CleanUpload, secure_upload, secure_upload_many
-from core.upload_security.storage import PrivateUploadStorage
+from core.upload_security.storage import PrivateUploadStorage, safe_storage_segment
+from utils.s3_storage import (
+    PrivateObjectStorageError,
+    delete_private_object,
+    upload_private_object,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +41,7 @@ router = APIRouter()
 STUDENT_COPY_UPLOADS_COLLECTION = "exampen_student_copy_uploads"
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 ALLOWED_UPLOAD_LIFECYCLE_STATES = {"in_progress", "collection_closed", "uploading"}
+PRIVATE_STUDENT_COPY_S3_PREFIX = "private/exampen/student-answer-copies"
 
 
 class StudentCopyStatus(BaseModel):
@@ -69,6 +76,149 @@ class StudentCopySubmissionAck(BaseModel):
     processing_job_id: Optional[str] = None
     processing_status: Optional[str] = None
     accepted_at: str
+
+
+def _student_copy_object_key(
+    *,
+    db_name: str,
+    exam_id: str,
+    attempt_id: str,
+    filename: str,
+) -> str:
+    """Build an opaque, private S3 key for answer-copy evidence.
+
+    A random attempt id, not a student name or browser filename, identifies the
+    object.  The key is used only by authenticated backend services and never
+    exposed as a public URL.
+    """
+    return "/".join(
+        (
+            PRIVATE_STUDENT_COPY_S3_PREFIX,
+            safe_storage_segment(db_name),
+            safe_storage_segment(exam_id),
+            safe_storage_segment(attempt_id),
+            safe_storage_segment(filename),
+        )
+    )
+
+
+def _image_extension_for_content_type(content_type: str) -> str:
+    normalized = (content_type or "").lower()
+    return "png" if normalized == "image/png" else "jpg"
+
+
+async def _store_student_copy_object(
+    *,
+    data: bytes,
+    db_name: str,
+    exam_id: str,
+    attempt_id: str,
+    filename: str,
+    content_type: str,
+    artifact_kind: str,
+    page_number: int | None = None,
+) -> str:
+    """Persist one clean answer-copy artefact to private S3 only."""
+    metadata = {
+        "purpose": "exam_answer_copy",
+        "artifact": artifact_kind,
+        "tenant": safe_storage_segment(db_name),
+        "exam": safe_storage_segment(exam_id),
+        "attempt": safe_storage_segment(attempt_id),
+    }
+    if page_number is not None:
+        metadata["page"] = str(page_number)
+    try:
+        return await upload_private_object(
+            data,
+            object_key=_student_copy_object_key(
+                db_name=db_name,
+                exam_id=exam_id,
+                attempt_id=attempt_id,
+                filename=filename,
+            ),
+            content_type=content_type,
+            metadata=metadata,
+        )
+    except PrivateObjectStorageError as exc:
+        logger.error(
+            "Private S3 storage failed for student answer copy: exam=%s attempt=%s: %s",
+            exam_id,
+            attempt_id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Private answer-copy storage is temporarily unavailable. "
+                "No answer copy was submitted; please try again."
+            ),
+        ) from exc
+
+
+async def _delete_private_student_copy_objects(storage_paths: List[str]) -> None:
+    """Remove partially uploaded answer-copy objects after a failed handoff."""
+    for storage_path in storage_paths:
+        try:
+            await delete_private_object(
+                storage_path,
+                allowed_key_prefix=PRIVATE_STUDENT_COPY_S3_PREFIX,
+            )
+        except PrivateObjectStorageError:
+            logger.exception(
+                "Could not clean up private answer-copy object after failed handoff: %s",
+                storage_path,
+            )
+
+
+async def _cleanup_released_student_copy_paths(released_paths: List[str]) -> List[str]:
+    """Delete scan-stage EC2 artefacts once S3 is the canonical copy."""
+    storage = PrivateUploadStorage()
+    failed_paths: List[str] = []
+    for released_path in released_paths:
+        try:
+            deleted = await storage.delete_released_path(released_path)
+            if not deleted:
+                failed_paths.append(released_path)
+        except Exception:
+            logger.exception(
+                "Could not clean local student answer-copy scan artefact: %s",
+                released_path,
+            )
+            failed_paths.append(released_path)
+    return failed_paths
+
+
+async def _update_upload_verdict_storage(
+    tenant_db: Any,
+    *,
+    transfers: List[Dict[str, str]],
+    status_value: str,
+) -> None:
+    """Keep upload-security audit records pointing at the canonical S3 object."""
+    if not transfers:
+        return
+    now = datetime.now(timezone.utc)
+    for transfer in transfers:
+        update: Dict[str, Any] = {
+            "storage_backend": "s3",
+            "storage_transfer_status": status_value,
+            "storage_transfer_updated_at": now,
+        }
+        if status_value == "complete":
+            update["released_storage_path"] = transfer["storage_path"]
+        else:
+            update["released_storage_path"] = None
+        try:
+            await tenant_db["upload_security_verdicts"].update_one(
+                {"upload_id": transfer["upload_id"]},
+                {"$set": update},
+            )
+        except Exception:
+            logger.exception(
+                "Could not update storage audit for student answer-copy upload %s",
+                transfer["upload_id"],
+            )
 
 
 async def _get_tenant_db(
@@ -413,8 +563,9 @@ async def _prepare_pdf_pages(
     clean_pdf: CleanUpload,
     db_name: str,
     exam_id: str,
-    student_id: str,
+    attempt_id: str,
     max_pages: int,
+    uploaded_storage_paths: List[str],
 ) -> List[Dict[str, Any]]:
     if not clean_pdf.bytes:
         raise HTTPException(
@@ -427,24 +578,19 @@ async def _prepare_pdf_pages(
         clean_pdf.bytes,
         max_pages=max_pages,
     )
-    storage = PrivateUploadStorage()
     pages: List[Dict[str, Any]] = []
     for page_number, (image_bytes, width, height) in enumerate(rendered, start=1):
-        storage_path = await storage.write_released_bytes(
+        storage_path = await _store_student_copy_object(
             data=image_bytes,
-            tenant=db_name,
-            policy_id="student_answer_copy_pdf",
-            upload_id=f"{clean_pdf.upload_id}-page-{page_number}",
-            safe_filename=f"answer-copy-page-{page_number}.png",
+            db_name=db_name,
+            exam_id=exam_id,
+            attempt_id=attempt_id,
+            filename=f"page-{page_number}.png",
             content_type="image/png",
-            metadata={
-                "purpose": "student_answer_copy_rendered_page",
-                "exam_id": exam_id,
-                "student_id": student_id,
-                "source_upload_id": clean_pdf.upload_id,
-                "page_number": str(page_number),
-            },
+            artifact_kind="rendered_page",
+            page_number=page_number,
         )
+        uploaded_storage_paths.append(storage_path)
         pages.append(
             {
                 "page_number": page_number,
@@ -453,8 +599,10 @@ async def _prepare_pdf_pages(
                 "image_height_px": height,
                 "original_filename": clean_pdf.original_filename,
                 "upload_id": clean_pdf.upload_id,
-                "content_hash": clean_pdf.sha256,
+                "content_hash": hashlib.sha256(image_bytes).hexdigest(),
                 "storage_path": storage_path,
+                "content_type": "image/png",
+                "file_size_bytes": len(image_bytes),
             }
         )
     return pages
@@ -471,83 +619,174 @@ async def _secure_student_copy_pages(
     student_id: str,
     attempt_id: str,
     max_pages: int,
-) -> tuple[List[Dict[str, Any]], str, Optional[Dict[str, Any]]]:
-    """Scan/store either a complete image batch or one scanned PDF copy."""
-    if answer_pdf is not None and answer_pdf.filename:
-        clean_pdf = await secure_upload(
-            file=answer_pdf,
-            policy_id="student_answer_copy_pdf",
-            actor=current_user,
-            db=tenant_db,
-            purpose_metadata={
-                "purpose": "student_answer_copy_pdf",
-                "collection": STUDENT_COPY_UPLOADS_COLLECTION,
-                "exam_id": exam_id,
-                "student_id": student_id,
-                "attempt_id": attempt_id,
-                "created_by": student_id,
-            },
-            authorization_subject=f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:pdf",
-            include_bytes=True,
-        )
-        page_records = await _prepare_pdf_pages(
-            clean_pdf=clean_pdf,
-            db_name=db_name,
-            exam_id=exam_id,
-            student_id=student_id,
-            max_pages=max_pages,
-        )
-        original_asset: Optional[Dict[str, Any]] = {
-            "upload_id": clean_pdf.upload_id,
-            "storage_path": clean_pdf.released_storage_path,
-            "filename": clean_pdf.original_filename,
-            "content_type": clean_pdf.content_type,
-            "size_bytes": clean_pdf.size_bytes,
-            "sha256": clean_pdf.sha256,
-        }
-        source_format = "pdf"
-    else:
-        clean_pages = await secure_upload_many(
-            files=image_files,
-            policy_id="student_answer_copy_image",
-            actor=current_user,
-            db=tenant_db,
-            purpose_metadata_factory=lambda upload, index: {
-                "purpose": "student_answer_copy_image",
-                "collection": STUDENT_COPY_UPLOADS_COLLECTION,
-                "exam_id": exam_id,
-                "student_id": student_id,
-                "attempt_id": attempt_id,
-                "page_number": index + 1,
-                "created_by": student_id,
-            },
-            authorization_subject_factory=lambda upload, index: (
-                f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:page-{index + 1}"
-            ),
-            include_bytes=False,
-        )
-        page_records = [
-            {
-                "page_number": index,
-                "raw_image_ref": clean_upload.released_storage_path,
-                "original_filename": clean_upload.original_filename,
-                "upload_id": clean_upload.upload_id,
-                "content_hash": clean_upload.sha256,
-                "storage_path": clean_upload.released_storage_path,
-                "content_type": clean_upload.content_type,
-                "file_size_bytes": clean_upload.size_bytes,
-            }
-            for index, clean_upload in enumerate(clean_pages, start=1)
-        ]
-        original_asset = None
-        source_format = "images"
+) -> tuple[
+    List[Dict[str, Any]],
+    str,
+    Optional[Dict[str, Any]],
+    List[str],
+    List[str],
+    List[Dict[str, str]],
+]:
+    """Scan then transfer a full copy to private S3 before PCR ingest.
 
-    if not page_records:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Upload at least one readable answer page",
+    The upload-security scanner has a short-lived local quarantine/release
+    stage.  S3 is the only canonical evidence location returned from this
+    function; callers remove those local scan artefacts after a successful
+    handoff (and on failed handoffs as well).
+    """
+    uploaded_storage_paths: List[str] = []
+    released_local_paths: List[str] = []
+    verdict_transfers: List[Dict[str, str]] = []
+
+    try:
+        if answer_pdf is not None and answer_pdf.filename:
+            clean_pdf = await secure_upload(
+                file=answer_pdf,
+                policy_id="student_answer_copy_pdf",
+                actor=current_user,
+                db=tenant_db,
+                purpose_metadata={
+                    "purpose": "student_answer_copy_pdf",
+                    "collection": STUDENT_COPY_UPLOADS_COLLECTION,
+                    "exam_id": exam_id,
+                    "student_id": student_id,
+                    "attempt_id": attempt_id,
+                    "created_by": student_id,
+                },
+                authorization_subject=f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:pdf",
+                include_bytes=True,
+            )
+            released_local_paths.append(clean_pdf.released_storage_path)
+            if not clean_pdf.bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="The uploaded answer-copy PDF was not available for transfer",
+                )
+
+            original_storage_path = await _store_student_copy_object(
+                data=clean_pdf.bytes,
+                db_name=db_name,
+                exam_id=exam_id,
+                attempt_id=attempt_id,
+                filename="original.pdf",
+                content_type=clean_pdf.content_type or "application/pdf",
+                artifact_kind="original_pdf",
+            )
+            uploaded_storage_paths.append(original_storage_path)
+            verdict_transfers.append(
+                {
+                    "upload_id": clean_pdf.upload_id,
+                    "storage_path": original_storage_path,
+                }
+            )
+            page_records = await _prepare_pdf_pages(
+                clean_pdf=clean_pdf,
+                db_name=db_name,
+                exam_id=exam_id,
+                attempt_id=attempt_id,
+                max_pages=max_pages,
+                uploaded_storage_paths=uploaded_storage_paths,
+            )
+            original_asset: Optional[Dict[str, Any]] = {
+                "upload_id": clean_pdf.upload_id,
+                "storage_path": original_storage_path,
+                "filename": clean_pdf.original_filename,
+                "content_type": clean_pdf.content_type,
+                "size_bytes": clean_pdf.size_bytes,
+                "sha256": clean_pdf.sha256,
+            }
+            source_format = "pdf"
+        else:
+            clean_pages = await secure_upload_many(
+                files=image_files,
+                policy_id="student_answer_copy_image",
+                actor=current_user,
+                db=tenant_db,
+                purpose_metadata_factory=lambda upload, index: {
+                    "purpose": "student_answer_copy_image",
+                    "collection": STUDENT_COPY_UPLOADS_COLLECTION,
+                    "exam_id": exam_id,
+                    "student_id": student_id,
+                    "attempt_id": attempt_id,
+                    "page_number": index + 1,
+                    "created_by": student_id,
+                },
+                authorization_subject_factory=lambda upload, index: (
+                    f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:page-{index + 1}"
+                ),
+                include_bytes=True,
+            )
+            page_records = []
+            for page_number, clean_upload in enumerate(clean_pages, start=1):
+                released_local_paths.append(clean_upload.released_storage_path)
+                if not clean_upload.bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="The uploaded answer page was not available for transfer",
+                    )
+                content_type = clean_upload.content_type or "image/jpeg"
+                storage_path = await _store_student_copy_object(
+                    data=clean_upload.bytes,
+                    db_name=db_name,
+                    exam_id=exam_id,
+                    attempt_id=attempt_id,
+                    filename=(
+                        f"page-{page_number}."
+                        f"{_image_extension_for_content_type(content_type)}"
+                    ),
+                    content_type=content_type,
+                    artifact_kind="answer_page",
+                    page_number=page_number,
+                )
+                uploaded_storage_paths.append(storage_path)
+                verdict_transfers.append(
+                    {
+                        "upload_id": clean_upload.upload_id,
+                        "storage_path": storage_path,
+                    }
+                )
+                page_records.append(
+                    {
+                        "page_number": page_number,
+                        "raw_image_ref": storage_path,
+                        "original_filename": clean_upload.original_filename,
+                        "upload_id": clean_upload.upload_id,
+                        "content_hash": clean_upload.sha256,
+                        "storage_path": storage_path,
+                        "content_type": content_type,
+                        "file_size_bytes": clean_upload.size_bytes,
+                    }
+                )
+            original_asset = None
+            source_format = "images"
+
+        if not page_records:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Upload at least one readable answer page",
+            )
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="complete",
         )
-    return page_records, source_format, original_asset
+        return (
+            page_records,
+            source_format,
+            original_asset,
+            released_local_paths,
+            uploaded_storage_paths,
+            verdict_transfers,
+        )
+    except Exception:
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _cleanup_released_student_copy_paths(released_local_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
+        raise
 
 
 @router.get(
@@ -739,8 +978,18 @@ async def submit_answer_copy(
         admin_id=admin_id,
     )
 
+    released_local_paths: List[str] = []
+    uploaded_storage_paths: List[str] = []
+    verdict_transfers: List[Dict[str, str]] = []
     try:
-        page_records, source_format, original_asset = await _secure_student_copy_pages(
+        (
+            page_records,
+            source_format,
+            original_asset,
+            released_local_paths,
+            uploaded_storage_paths,
+            verdict_transfers,
+        ) = await _secure_student_copy_pages(
             image_files=image_files,
             answer_pdf=answer_pdf if has_pdf else None,
             current_user=current_user,
@@ -779,6 +1028,8 @@ async def submit_answer_copy(
         "submitted_by": student_id,
         "submission_channel": "student_web",
         "source_format": source_format,
+        "storage_backend": "s3",
+        "storage_handoff_status": "complete",
         "original_asset": original_asset,
         "pages": [
             {
@@ -810,6 +1061,13 @@ async def submit_answer_copy(
         projection={"submission_id": 1},
     )
     if canonical_after_upload is not None:
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _cleanup_released_student_copy_paths(released_local_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
         await upload_collection.update_one(
             {"attempt_id": attempt_id},
             {
@@ -842,6 +1100,13 @@ async def submit_answer_copy(
         )
     except Exception as exc:
         logger.exception("Student answer-copy ingest failed: exam=%s student=%s", exam_id, student_id)
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _cleanup_released_student_copy_paths(released_local_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
         await upload_collection.update_one(
             {"attempt_id": attempt_id},
             {"$set": {"status": "ingest_failed", "last_error": str(exc)[:500], "updated_at": datetime.now(timezone.utc)}},
@@ -852,6 +1117,13 @@ async def submit_answer_copy(
         ) from exc
 
     if getattr(result, "already_existed", False):
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _cleanup_released_student_copy_paths(released_local_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
         await upload_collection.update_one(
             {"attempt_id": attempt_id},
             {
@@ -865,6 +1137,38 @@ async def submit_answer_copy(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A final answer copy was received for this exam while your upload was being prepared",
+        )
+
+    # The immutable submission now points exclusively to private S3 objects.
+    # Remove the scanner's local release artefacts; OCR workers will only read
+    # the durable S3 references persisted above.
+    cleanup_failures = await _cleanup_released_student_copy_paths(released_local_paths)
+    if cleanup_failures:
+        logger.error(
+            "Student answer-copy local cleanup incomplete: exam=%s attempt=%s count=%d",
+            exam_id,
+            attempt_id,
+            len(cleanup_failures),
+        )
+        await upload_collection.update_one(
+            {"attempt_id": attempt_id},
+            {
+                "$set": {
+                    "local_scan_cleanup_status": "failed",
+                    "local_scan_cleanup_failed_count": len(cleanup_failures),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+    else:
+        await upload_collection.update_one(
+            {"attempt_id": attempt_id},
+            {
+                "$set": {
+                    "local_scan_cleanup_status": "complete",
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
         )
 
     processing_job: Optional[Dict[str, Any]] = None

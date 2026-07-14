@@ -121,6 +121,7 @@ async def test_student_copy_submission_derives_identity_and_queues_existing_pcr_
         sha256="a" * 64,
         content_type="image/jpeg",
         size_bytes=1200,
+        bytes=b"clean-jpeg-page",
     )
     ingest_result = SimpleNamespace(submission_id="submission-1")
     queue_result = {"job_id": "job-1", "status": "queued"}
@@ -131,6 +132,10 @@ async def test_student_copy_submission_derives_identity_and_queues_existing_pcr_
             "api.v1.evalpen_student_submission_async.secure_upload_many",
             new=AsyncMock(return_value=[clean_page]),
         ) as upload_many,
+        patch(
+            "api.v1.evalpen_student_submission_async.upload_private_object",
+            new=AsyncMock(return_value="s3://stoody-test/private/exampen/student-answer-copies/page-1.jpg"),
+        ) as upload_private,
         patch(
             "api.v1.evalpen_student_submission_async._canonical_ingest",
             new=AsyncMock(return_value=ingest_result),
@@ -153,6 +158,8 @@ async def test_student_copy_submission_derives_identity_and_queues_existing_pcr_
     assert ack.page_count == 1
     assert ack.processing_status == "queued"
     assert upload_many.await_args.kwargs["policy_id"] == "student_answer_copy_image"
+    assert upload_many.await_args.kwargs["include_bytes"] is True
+    assert upload_private.await_count == 1
     assert canonical_ingest.await_args.kwargs["student_id"] == "student-1"
     assert canonical_ingest.await_args.kwargs["admin_id"] == "admin-1"
     assert queue_processing.await_args.kwargs["student_id"] == "student-1"
@@ -161,6 +168,8 @@ async def test_student_copy_submission_derives_identity_and_queues_existing_pcr_
     assert attempt["submission_channel"] == "student_web"
     assert attempt["status"] == "queued"
     assert attempt["submission_id"] == "submission-1"
+    assert attempt["storage_backend"] == "s3"
+    assert attempt["pages"][0]["storage_path"].startswith("s3://")
 
 
 @pytest.mark.asyncio
@@ -185,6 +194,7 @@ async def test_student_copy_submission_writes_the_student_db_id_not_the_login_ac
         sha256="a" * 64,
         content_type="image/jpeg",
         size_bytes=1200,
+        bytes=b"clean-jpeg-page",
     )
     ingest_result = SimpleNamespace(submission_id="submission-1")
     legacy_login_session = {
@@ -199,6 +209,10 @@ async def test_student_copy_submission_writes_the_student_db_id_not_the_login_ac
         patch(
             "api.v1.evalpen_student_submission_async.secure_upload_many",
             new=AsyncMock(return_value=[clean_page]),
+        ),
+        patch(
+            "api.v1.evalpen_student_submission_async.upload_private_object",
+            new=AsyncMock(return_value="s3://stoody-test/private/exampen/student-answer-copies/page-1.jpg"),
         ),
         patch(
             "api.v1.evalpen_student_submission_async._canonical_ingest",
@@ -366,6 +380,7 @@ async def test_student_copy_does_not_claim_a_canonical_submission_created_concur
         sha256="a" * 64,
         content_type="image/jpeg",
         size_bytes=1200,
+        bytes=b"clean-jpeg-page",
     )
     concurrent_result = SimpleNamespace(submission_id="staff-submission-1", already_existed=True)
 
@@ -374,6 +389,10 @@ async def test_student_copy_does_not_claim_a_canonical_submission_created_concur
         patch(
             "api.v1.evalpen_student_submission_async.secure_upload_many",
             new=AsyncMock(return_value=[clean_page]),
+        ),
+        patch(
+            "api.v1.evalpen_student_submission_async.upload_private_object",
+            new=AsyncMock(return_value="s3://stoody-test/private/exampen/student-answer-copies/page-1.jpg"),
         ),
         patch(
             "api.v1.evalpen_student_submission_async._canonical_ingest",

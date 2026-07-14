@@ -331,6 +331,25 @@ async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
     assert metadata["ocr_prompt_version"] == "exampen-qno-v2"
 
 
+@pytest.mark.asyncio
+async def test_camera_ocr_resolves_private_student_copy_from_s3(monkeypatch):
+    """PCR workers must read private S3 pages, not an API-worker disk path."""
+    import base64
+
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+    download = AsyncMock(return_value=b"private-png-bytes")
+    monkeypatch.setattr(ocr_service, "download_private_object", download)
+
+    result = await ocr_service._resolve_image_base64(
+        "s3://stoody-test/private/exampen/student-answer-copies/tenant/exam/attempt/page-1.png"
+    )
+
+    assert result == base64.b64encode(b"private-png-bytes").decode("ascii")
+    assert download.await_args.kwargs["allowed_key_prefix"] == "private/exampen/"
+
+
 def test_pen_stroke_renderer_crops_and_upscales_content():
     import base64
     import io

@@ -24,6 +24,7 @@ import asyncio
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 import mimetypes
+from urllib.parse import urlparse
 
 from config_async import settings
 
@@ -48,6 +49,15 @@ CLOUDFRONT_DOMAIN = os.getenv("CLOUDFRONT_DOMAIN", "")
 _s3_client = None
 
 
+class PrivateObjectStorageError(RuntimeError):
+    """Raised when a private S3 object cannot be safely stored or read.
+
+    Student answer copies are evidence for an exam result.  They must never
+    silently fall back to an EC2-local path or a public URL when object storage
+    is unavailable.
+    """
+
+
 def _get_s3_client():
     """Get or create S3 client (lazy initialization)"""
     global _s3_client
@@ -63,12 +73,15 @@ def _get_s3_client():
                 retries={'max_attempts': 3, 'mode': 'adaptive'}
             )
             
-            _s3_client = boto3.client(
-                's3',
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                config=config
-            )
+            client_kwargs = {"config": config}
+            # Leave credentials unset when they are not explicitly configured
+            # so boto3 can use the standard AWS credential chain (including an
+            # EC2 instance profile / IAM role in production).
+            if AWS_ACCESS_KEY_ID:
+                client_kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+            if AWS_SECRET_ACCESS_KEY:
+                client_kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+            _s3_client = boto3.client('s3', **client_kwargs)
             logger.info(f"✅ S3 client initialized for bucket: {S3_BUCKET_NAME}")
         except ImportError:
             logger.error("❌ boto3 not installed. Run: pip install boto3")
@@ -85,11 +98,204 @@ def is_s3_enabled() -> bool:
     if not USE_S3_STORAGE:
         return False
     
-    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
-        logger.warning("S3_STORAGE is enabled but credentials are missing")
+    if not S3_BUCKET_NAME:
+        logger.warning("S3_STORAGE is enabled but S3_BUCKET_NAME is missing")
         return False
     
     return _get_s3_client() is not None
+
+
+def _normalize_private_object_key(object_key: str) -> str:
+    """Validate an S3 object key used by a private evidence workflow."""
+    if not isinstance(object_key, str):
+        raise PrivateObjectStorageError("Private S3 object key is invalid")
+    key = object_key.strip().replace("\\", "/").lstrip("/")
+    if not key or key.startswith("s3://"):
+        raise PrivateObjectStorageError("Private S3 object key is invalid")
+    if any(part in {"", ".", ".."} for part in key.split("/")):
+        raise PrivateObjectStorageError("Private S3 object key is invalid")
+    return key
+
+
+def _parse_private_s3_path(
+    storage_path: str,
+    *,
+    allowed_key_prefix: str | None = None,
+) -> tuple[str, str]:
+    """Parse and constrain a private S3 URI to this application's bucket."""
+    parsed = urlparse(storage_path)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
+        raise PrivateObjectStorageError("Private object reference must be an s3:// URI")
+    if not S3_BUCKET_NAME or parsed.netloc != S3_BUCKET_NAME:
+        raise PrivateObjectStorageError("Private object reference is outside the configured bucket")
+
+    key = _normalize_private_object_key(parsed.path)
+    if allowed_key_prefix:
+        prefix_value = str(allowed_key_prefix).strip().rstrip("/")
+        prefix = _normalize_private_object_key(prefix_value) + "/"
+        if not key.startswith(prefix):
+            raise PrivateObjectStorageError("Private object reference is outside the allowed prefix")
+    return parsed.netloc, key
+
+
+def _private_s3_client_or_raise():
+    """Get S3 for evidence storage without allowing a local fallback."""
+    if not USE_S3_STORAGE:
+        raise PrivateObjectStorageError("Private S3 storage is disabled")
+    if not S3_BUCKET_NAME:
+        raise PrivateObjectStorageError("Private S3 bucket is not configured")
+    client = _get_s3_client()
+    if client is None:
+        raise PrivateObjectStorageError("Private S3 client is unavailable")
+    return client
+
+
+async def upload_private_object(
+    data: bytes,
+    *,
+    object_key: str,
+    content_type: str,
+    metadata: Optional[Dict[str, str]] = None,
+) -> str:
+    """Store evidence in private S3 only; never use a local fallback.
+
+    This is intentionally separate from :func:`upload_file`, which preserves
+    legacy development fallback behavior for public/content assets.  Answer
+    copies are private student data and must be durable across API and worker
+    processes, so a failed S3 write is a failed upload.
+    """
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise PrivateObjectStorageError("Private object payload is empty or invalid")
+
+    key = _normalize_private_object_key(object_key)
+    client = _private_s3_client_or_raise()
+    clean_metadata = {
+        str(meta_key): str(meta_value)
+        for meta_key, meta_value in (metadata or {}).items()
+        if meta_key and meta_value is not None
+    }
+    extra_args: Dict[str, Any] = {
+        "ContentType": content_type or "application/octet-stream",
+        # Do not make an object public.  Explicit SSE prevents an accidental
+        # bucket-default change from leaving student submissions unencrypted.
+        "ServerSideEncryption": "AES256",
+        "CacheControl": "private, no-store, max-age=0",
+    }
+    if clean_metadata:
+        extra_args["Metadata"] = clean_metadata
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: client.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=key,
+                Body=bytes(data),
+                **extra_args,
+            ),
+        )
+    except Exception as exc:
+        logger.error("Private S3 upload failed for key %s: %s", key, exc)
+        raise PrivateObjectStorageError("Private S3 upload failed") from exc
+
+    logger.info("Stored private S3 object: %s (%d bytes)", key, len(data))
+    return f"s3://{S3_BUCKET_NAME}/{key}"
+
+
+async def download_private_object(
+    storage_path: str,
+    *,
+    allowed_key_prefix: str | None = None,
+    max_bytes: int = 25 * 1024 * 1024,
+) -> bytes:
+    """Read a bounded private S3 object without URL or local-file fallbacks."""
+    if max_bytes <= 0:
+        raise PrivateObjectStorageError("Private object size limit is invalid")
+    bucket, key = _parse_private_s3_path(
+        storage_path,
+        allowed_key_prefix=allowed_key_prefix,
+    )
+    client = _private_s3_client_or_raise()
+
+    def _download() -> bytes:
+        response = client.get_object(Bucket=bucket, Key=key)
+        content_length = response.get("ContentLength")
+        if isinstance(content_length, int) and content_length > max_bytes:
+            raise PrivateObjectStorageError("Private object exceeds the allowed size")
+        body = response["Body"]
+        try:
+            data = body.read(max_bytes + 1)
+        finally:
+            close = getattr(body, "close", None)
+            if callable(close):
+                close()
+        if len(data) > max_bytes:
+            raise PrivateObjectStorageError("Private object exceeds the allowed size")
+        return data
+
+    try:
+        data = await asyncio.get_running_loop().run_in_executor(None, _download)
+    except PrivateObjectStorageError:
+        raise
+    except Exception as exc:
+        logger.error("Private S3 download failed for key %s: %s", key, exc)
+        raise PrivateObjectStorageError("Private S3 download failed") from exc
+
+    if not data:
+        raise PrivateObjectStorageError("Private S3 object is empty")
+    return data
+
+
+async def delete_private_object(
+    storage_path: str,
+    *,
+    allowed_key_prefix: str | None = None,
+) -> None:
+    """Best-effort caller-controlled deletion of a private S3 object."""
+    bucket, key = _parse_private_s3_path(
+        storage_path,
+        allowed_key_prefix=allowed_key_prefix,
+    )
+    client = _private_s3_client_or_raise()
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: client.delete_object(Bucket=bucket, Key=key),
+        )
+    except Exception as exc:
+        logger.error("Private S3 delete failed for key %s: %s", key, exc)
+        raise PrivateObjectStorageError("Private S3 delete failed") from exc
+
+
+def create_private_download_url(
+    storage_path: str,
+    *,
+    allowed_key_prefix: str | None = None,
+    expires_in: int = 300,
+) -> str:
+    """Create a short-lived S3 URL after the caller has authorized access.
+
+    This must be called only from a permission-checked backend route.  It does
+    not use CloudFront or the generic public URL helper, which would be wrong
+    for student answer copies.
+    """
+    if not isinstance(expires_in, int) or expires_in < 30 or expires_in > 900:
+        raise PrivateObjectStorageError("Private download expiry must be 30-900 seconds")
+    bucket, key = _parse_private_s3_path(
+        storage_path,
+        allowed_key_prefix=allowed_key_prefix,
+    )
+    client = _private_s3_client_or_raise()
+    try:
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_in,
+        )
+    except Exception as exc:
+        logger.error("Private S3 presign failed for key %s: %s", key, exc)
+        raise PrivateObjectStorageError("Private S3 download URL could not be created") from exc
 
 
 def _local_path_to_s3_key(local_path: str) -> str:
