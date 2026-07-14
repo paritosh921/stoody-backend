@@ -62,6 +62,25 @@ async def test_student_score_breakdown_keeps_unanswered_questions_in_total():
             "total_score": 4.0,
             "max_score": 4.0,
             "overall_feedback": "Correct.",
+            "reference_solution": "u_x = 16 m/s, u_y = 12 m/s.",
+            "teacher_feedback": "Keep showing your working clearly.",
+            "criterion_marks": [
+                {
+                    "criterion_id": "internal-only-id",
+                    "description": "Resolve the initial velocity into components",
+                    "marks_awarded": 1.0,
+                    "max_marks": 1.0,
+                    "rationale": "Both components are correct.",
+                    "evidence": "Internal OCR evidence must not be exposed.",
+                },
+                {
+                    "criterion_id": "internal-only-id-2",
+                    "description": "Calculate the time of flight",
+                    "marks_awarded": 3.0,
+                    "max_marks": 3.0,
+                    "rationale": "Correct formula and substitution.",
+                },
+            ],
         }
     )
 
@@ -93,4 +112,41 @@ async def test_student_score_breakdown_keeps_unanswered_questions_in_total():
         "detected",
         "not_attempted",
         "not_attempted",
+    ]
+    first_question = result.questions[0]
+    assert first_question.question_number == 1
+    assert first_question.reference_answer == "u_x = 16 m/s, u_y = 12 m/s."
+    assert first_question.teacher_feedback == "Keep showing your working clearly."
+    assert [row.description for row in first_question.mark_breakdown] == [
+        "Resolve the initial velocity into components",
+        "Calculate the time of flight",
+    ]
+    assert [row.marks_awarded for row in first_question.mark_breakdown] == [1.0, 3.0]
+    assert all("evidence" not in row.model_dump() for row in first_question.mark_breakdown)
+
+
+def test_student_mark_breakdown_supports_legacy_step_marks_without_leaking_evidence():
+    from api.v1.evalpen_student_bff_async import _student_mark_breakdown
+
+    breakdown = _student_mark_breakdown(
+        {
+            "step_marks": [
+                {
+                    "step": "State the relevant formula",
+                    "marks_awarded": 1.0,
+                    "marks_possible": 2.0,
+                    "justification": "The formula is correct but substitution is missing.",
+                    "evidence": "Internal OCR excerpt",
+                }
+            ]
+        }
+    )
+
+    assert breakdown == [
+        {
+            "description": "State the relevant formula",
+            "marks_awarded": 1.0,
+            "max_marks": 2.0,
+            "feedback": "The formula is correct but substitution is missing.",
+        }
     ]

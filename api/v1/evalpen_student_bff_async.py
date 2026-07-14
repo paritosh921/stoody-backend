@@ -29,7 +29,8 @@ Hard constraints:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+import math
+from typing import Any, Dict, List, Mapping, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -84,15 +85,28 @@ class StudentExamListResponse(BaseModel):
     items: List[StudentExamItem] = Field(default_factory=list)
 
 
+class StudentMarkBreakdownItem(BaseModel):
+    """A student-safe, mark-by-mark explanation for one evaluated response."""
+
+    description: str
+    marks_awarded: float = 0.0
+    max_marks: float = 0.0
+    feedback: Optional[str] = None
+
+
 class QuestionScoreItem(BaseModel):
     """Per-question score entry within an exam score breakdown."""
 
     question_id: str
+    question_number: Optional[int] = None
     score: float = 0.0
     max_score: float = 0.0
     feedback: Optional[str] = None
     eval_type: str = "pcr"  # "pcr" or "dcr"
     answer_state: Optional[str] = None
+    mark_breakdown: List[StudentMarkBreakdownItem] = Field(default_factory=list)
+    reference_answer: Optional[str] = None
+    teacher_feedback: Optional[str] = None
 
 
 class StudentExamScoresResponse(BaseModel):
@@ -215,9 +229,70 @@ def _dt_to_iso(val: Any) -> Optional[str]:
 def _safe_marks(value: Any) -> float:
     """Return a non-negative numeric mark without making score pages fragile."""
     try:
-        return max(0.0, float(value or 0.0))
+        numeric = float(value or 0.0)
+        return max(0.0, numeric) if math.isfinite(numeric) else 0.0
     except (TypeError, ValueError):
         return 0.0
+
+
+def _safe_question_number(value: Any) -> Optional[int]:
+    """Return a positive question number when legacy data provides one."""
+    try:
+        number = int(value)
+        return number if number > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _student_safe_text(value: Any, *, limit: int = 1600) -> Optional[str]:
+    """Return short presentation text without exposing internal evaluation data."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:limit] or None
+
+
+def _student_mark_breakdown(evaluation: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Project the rubric result into fields students are allowed to see.
+
+    PCR stores both structured criterion rows and a legacy step representation.
+    Prefer criteria because they directly reflect the teacher-approved marking
+    plan; fall back to steps for older evaluations.  Evidence, model metadata,
+    internal flags, and raw provider output must never leave the student BFF.
+    """
+    raw_rows = evaluation.get("criterion_marks") or evaluation.get("step_marks") or []
+    if not isinstance(raw_rows, list):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for index, raw_row in enumerate(raw_rows, start=1):
+        if not isinstance(raw_row, Mapping):
+            continue
+        description = _student_safe_text(
+            raw_row.get("description") or raw_row.get("step") or f"Mark {index}",
+            limit=500,
+        )
+        max_marks = _safe_marks(raw_row.get("max_marks", raw_row.get("marks_possible")))
+        marks_awarded = _safe_marks(
+            raw_row.get("marks_awarded", raw_row.get("score", raw_row.get("awarded")))
+        )
+        if max_marks > 0:
+            marks_awarded = min(marks_awarded, max_marks)
+        if not description:
+            continue
+        rows.append(
+            {
+                "description": description,
+                "marks_awarded": marks_awarded,
+                "max_marks": max_marks,
+                "feedback": _student_safe_text(
+                    raw_row.get("rationale")
+                    or raw_row.get("justification")
+                    or raw_row.get("feedback")
+                ),
+            }
+        )
+    return rows
 
 
 async def _get_pcr_question_catalog(
@@ -241,9 +316,7 @@ async def _get_pcr_question_catalog(
         catalog.append(
             {
                 "question_id": question_id,
-                "question_number": int(number)
-                if isinstance(number, (int, float))
-                else None,
+                "question_number": _safe_question_number(number),
                 "max_marks": _safe_marks(doc.get("max_marks")),
             }
         )
@@ -276,7 +349,7 @@ async def list_student_exams(
     DCR scores from ``exampen_dcr_results``.
 
     Exam title and type are resolved from ``evalpen_questions``
-    (first question's exam metadata) with a fallback to the raw exam_id.
+    (first question's exam metadata) with a human-readable fallback.
     """
     tenant_db = await _get_tenant_db(db, current_user)
     student_ids = await _get_student_identity_ids(tenant_db, current_user)
@@ -397,15 +470,17 @@ async def list_student_exams(
 
         # ----- Build response items -----
         items: List[StudentExamItem] = []
-        for eid in exam_ids:
+        for eid in dict.fromkeys(exam_ids):
             pcr = pcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
             dcr = dcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
             combined_total = pcr["total_score"] + dcr["total_score"]
             combined_max = pcr["max_score"] + dcr["max_score"]
 
             title_info = title_map.get(eid, {})
-            title = title_info.get("title") or eid
             exam_type = title_info.get("exam_type")
+            title = title_info.get("title") or (
+                f"{str(exam_type).upper()} Exam" if exam_type else "Exam Result"
+            )
 
             sub_info = exam_sub_map.get(eid, {})
             published_at = _dt_to_iso(sub_info.get("published_at"))
@@ -529,9 +604,17 @@ async def get_student_exam_scores(
                 entry = {
                     "score": _safe_marks(ev.get("total_score")),
                     "max_score": _safe_marks(ev.get("max_score")),
-                    "feedback": ev.get("overall_feedback"),
+                    "feedback": _student_safe_text(ev.get("overall_feedback")),
                     "answer_state": resp.get("answer_state")
                     or ("not_attempted" if resp.get("is_missing_response") else "detected"),
+                    "mark_breakdown": _student_mark_breakdown(ev),
+                    "reference_answer": _student_safe_text(
+                        ev.get("reference_solution"), limit=5000
+                    ),
+                    "teacher_feedback": _student_safe_text(
+                        ev.get("teacher_feedback") or ev.get("teacher_note")
+                    ),
+                    "question_number": _safe_question_number(resp.get("question_number")),
                 }
                 if question_id and question_id in catalog_question_ids:
                     # One score per paper question.  Duplicate OCR segments
@@ -550,6 +633,7 @@ async def get_student_exam_scores(
                         questions.append(
                             QuestionScoreItem(
                                 question_id=question_id,
+                                question_number=question["question_number"],
                                 score=0.0,
                                 max_score=question["max_marks"],
                                 feedback=(
@@ -570,11 +654,15 @@ async def get_student_exam_scores(
                     questions.append(
                         QuestionScoreItem(
                             question_id=question_id,
+                            question_number=question["question_number"],
                             score=result["score"],
                             max_score=question["max_marks"],
                             feedback=result["feedback"],
                             eval_type="pcr",
                             answer_state=result["answer_state"],
+                            mark_breakdown=result["mark_breakdown"],
+                            reference_answer=result["reference_answer"],
+                            teacher_feedback=result["teacher_feedback"],
                         )
                     )
             else:
@@ -586,11 +674,15 @@ async def get_student_exam_scores(
                     questions.append(
                         QuestionScoreItem(
                             question_id=result["question_id"],
+                            question_number=result.get("question_number"),
                             score=result["score"],
                             max_score=result["max_score"],
                             feedback=result["feedback"],
                             eval_type="pcr",
                             answer_state=result["answer_state"],
+                            mark_breakdown=result["mark_breakdown"],
+                            reference_answer=result["reference_answer"],
+                            teacher_feedback=result["teacher_feedback"],
                         )
                     )
         except ImportError:
@@ -607,6 +699,7 @@ async def get_student_exam_scores(
                 },
                 projection={
                     "question_id": 1,
+                    "question_number": 1,
                     "score": 1,
                     "max_score": 1,
                 },
@@ -620,6 +713,7 @@ async def get_student_exam_scores(
                 questions.append(
                     QuestionScoreItem(
                         question_id=doc.get("question_id", ""),
+                        question_number=_safe_question_number(doc.get("question_number")),
                         score=q_score,
                         max_score=q_max,
                         feedback=None,
