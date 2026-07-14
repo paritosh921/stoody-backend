@@ -181,9 +181,9 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
-    # ``available`` means OCR completed (a genuinely blank paper can score
-    # zero); ``processing`` and ``unavailable`` must never be rendered as a
-    # 0-mark attempt.
+    # ``available`` means OCR/mapping and every detected answer's evaluation
+    # completed (a genuinely blank paper can score zero); ``processing`` and
+    # ``unavailable`` must never be rendered as a 0-mark attempt.
     score_state: str = "processing"
     publication_status: Optional[str] = None
     responses: List[ResponseSummaryAPI] = Field(default_factory=list)
@@ -467,13 +467,6 @@ async def get_submission_summary(
             "retryable_error",
             "enqueue_failed",
         }
-        score_state = (
-            "available"
-            if segmentation_status == "complete"
-            else "unavailable"
-            if processing_failed
-            else "processing"
-        )
         question_catalog = await _get_pcr_question_catalog(
             tenant_db,
             str(sub_dict.get("exam_id") or ""),
@@ -498,11 +491,12 @@ async def get_submission_summary(
         blocked_count = 0
         pending_count = 0
         scored_question_ids: set[str] = set()
+        completed_question_keys: set[str] = set()
         observed_question_ids: set[str] = set()
 
         for resp_doc in response_docs:
             response_id = resp_doc.get("response_id", "")
-            eval_status = resp_doc.get("eval_status", "pending")
+            eval_status = str(resp_doc.get("eval_status") or "pending").lower()
             question_id = str(resp_doc.get("question_id") or "")
             catalog_question = catalog_by_id.get(question_id)
             if question_id:
@@ -530,6 +524,10 @@ async def get_submission_summary(
             marking_policy = None
             manual_review_required = False
 
+            # A completed evaluation document is the source of truth for a
+            # final award.  OCR/evaluation status updates happen in separate
+            # writes, so a response can legitimately still say ``ready`` or
+            # ``ready_with_warnings`` after its evaluation was saved.
             if evaluation:
                 resp_score = evaluation.get("total_score", 0.0)
                 resp_max = evaluation.get("max_score", 0.0)
@@ -556,21 +554,42 @@ async def get_submission_summary(
                     step_marks = [
                         mark for mark in raw_step_marks if isinstance(mark, dict)
                     ] or None
-                if manual_review_required or eval_status == "manual_review":
+                if has_blocking or eval_status == "blocked":
+                    # Never treat a score as publishable while a blocking
+                    # flag remains unresolved, even if an earlier evaluator
+                    # pass wrote a preliminary record.
+                    blocked_count += 1
+                elif manual_review_required or eval_status == "manual_review":
                     pending_count += 1
                 else:
                     # A malformed legacy submission can contain two OCR
                     # segments for the same question.  Count a question once;
                     # current submissions block this situation before eval.
+                    completion_key = question_id or response_id
                     if not question_id or question_id not in scored_question_ids:
                         total_score += _safe_marks(resp_score)
                         evaluated_max += _safe_marks(resp_max)
                         if question_id:
                             scored_question_ids.add(question_id)
-                    evaluated_count += 1
-            elif eval_status == "blocked":
+                    if completion_key not in completed_question_keys:
+                        completed_question_keys.add(completion_key)
+                        evaluated_count += 1
+            elif has_blocking or eval_status == "blocked":
                 blocked_count += 1
-            elif eval_status in {"pending", "manual_review"}:
+            elif eval_status == "not_attempted":
+                # Older completed submissions can contain an explicit blank
+                # answer slot without its zero-mark evaluation document.
+                # It is still a final, deliberately blank question.
+                resp_score = 0.0
+                completion_key = question_id or response_id
+                if completion_key not in completed_question_keys:
+                    completed_question_keys.add(completion_key)
+                    evaluated_count += 1
+            else:
+                # ``ready``, ``ready_with_warnings`` and a bare ``evaluated``
+                # response are not final by themselves.  Wait until the
+                # immutable evaluation record exists so the workspace cannot
+                # show a transient 0/40 while the Results view has the score.
                 pending_count += 1
 
             # A pending response still belongs to a fixed paper question.  It
@@ -625,15 +644,17 @@ async def get_submission_summary(
             )
 
         # Older submissions may have been processed before answer slots were
-        # introduced.  Backfill explicit blank rows only after OCR completed.
-        # A failed job used to look like ten deliberately blank answers and
-        # falsely award 0/40.  Keep a failed or running job visibly unresolved
-        # until it is reprocessed instead.
-        if score_state == "available":
+        # introduced.  Once segmentation has completed, every catalog question
+        # absent from the detected-response collection is genuinely blank.
+        # Add those final zero rows even when another response is still being
+        # evaluated; the submission as a whole remains ``processing`` below.
+        # A failed job must never be turned into a false 0-mark paper.
+        if segmentation_status == "complete" and not processing_failed:
             for question in question_catalog:
                 question_id = question["question_id"]
                 if question_id in observed_question_ids:
                     continue
+                completed_question_keys.add(question_id)
                 response_summaries.append(
                     ResponseSummaryAPI(
                         response_id=f"UNANSWERED-{submission_id}-{question_id}",
@@ -652,6 +673,17 @@ async def get_submission_summary(
                     )
                 )
                 evaluated_count += 1
+
+        # A score is only available when OCR/mapping has completed and every
+        # detected answer is terminally evaluated or explicitly blank.  This
+        # prevents the review workspace from publishing an OCR-era 0/40 that
+        # disagrees with the immutable evaluation records shown in Results.
+        if processing_failed:
+            score_state = "unavailable"
+        elif segmentation_status != "complete" or pending_count > 0 or blocked_count > 0:
+            score_state = "processing"
+        else:
+            score_state = "available"
 
         response_summaries.sort(
             key=lambda item: (

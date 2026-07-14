@@ -42,7 +42,10 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
             "question_number": 1,
             "content_type": "TEXT_ONLY",
             "detected_text": "T = 2u sin(theta) / g = 2.4 s",
-            "eval_status": "evaluated",
+            # Response status and evaluation persistence are deliberately
+            # separate writes.  A saved evaluation must win over this stale
+            # OCR-era status in the teacher workspace.
+            "eval_status": "ready_with_warnings",
             "flags": [],
         }
     )
@@ -82,6 +85,8 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
         )
 
     assert result.total_score == 4.0
+    assert result.score_state == "available"
+    assert result.evaluated_count == 1
     assert len(result.responses) == 1
     response = result.responses[0]
     assert response.question_number == 1
@@ -162,10 +167,68 @@ async def test_review_summary_keeps_full_paper_denominator_and_shows_blank_quest
 
     assert result.total_score == 4.0
     assert result.total_max_score == 12.0
+    assert result.score_state == "available"
+    assert result.evaluated_count == 3
     assert [response.question_number for response in result.responses] == [1, 2, 3]
     assert [response.is_missing_response for response in result.responses] == [False, True, True]
     assert [response.total_score for response in result.responses[1:]] == [0.0, 0.0]
     assert [response.max_score for response in result.responses[1:]] == [4.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_review_summary_stays_processing_until_each_detected_answer_has_evaluation():
+    """OCR completion alone must never expose a transient final zero score."""
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-WAIT-FOR-EVAL",
+            "exam_id": "EXAM-WAIT-FOR-EVAL",
+            "student_id": "STU-1",
+            "source": "web_upload",
+            "segmentation_status": "complete",
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-WAIT-FOR-EVAL::Q-1",
+            "exam_id": "EXAM-WAIT-FOR-EVAL",
+            "question_number": 1,
+            "max_marks": 4,
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-WAIT-FOR-EVAL-1",
+            "submission_id": "SUB-WAIT-FOR-EVAL",
+            "question_id": "EXAM-WAIT-FOR-EVAL::Q-1",
+            "question_number": 1,
+            "content_type": "TEXT_ONLY",
+            "detected_text": "Student answer awaiting AI marking",
+            "eval_status": "ready_with_warnings",
+            "flags": [],
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-WAIT-FOR-EVAL",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.score_state == "processing"
+    assert result.total_score == 0.0
+    assert result.evaluated_count == 0
+    assert result.pending_count == 1
+    assert result.responses[0].total_score is None
 
 
 @pytest.mark.asyncio
