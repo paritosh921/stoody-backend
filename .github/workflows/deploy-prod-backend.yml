@@ -177,31 +177,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # systemd can report a worker active before Celery has completed
-          # broker registration. Give remote control a bounded window instead
-          # of failing an otherwise healthy deployment during that handoff.
-          for attempt in $(seq 1 15); do
-            if ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
-              "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
-              "set -euo pipefail; \
-              systemctl is-enabled --quiet stoody-exampen-worker.service; \
-              systemctl is-active --quiet stoody-exampen-worker.service; \
-              systemctl is-enabled --quiet stoody-exampen-beat.service; \
-              systemctl is-active --quiet stoody-exampen-beat.service; \
-              cd '${PROD_MAIN_BACKEND_PATH}'; \
-              '${PROD_MAIN_BACKEND_VENV_PATH}/bin/celery' -A celery_app inspect ping --timeout 10 | grep -Eq 'pong|OK'"; then
-              echo "ExamPen PCR worker is ready."
-              exit 0
-            fi
-            echo "ExamPen PCR worker not ready yet (attempt ${attempt}/15); waiting 3 seconds..." >&2
-            sleep 3
-          done
-
+          # The deployment script starts the worker and proves its Celery
+          # broker connection before returning. Repeating a Celery pidbox
+          # broadcast here can wait for every timeout despite an active worker,
+          # adding minutes and falsely failing an otherwise healthy deploy.
           ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
             "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
-            "journalctl -u stoody-exampen-worker.service -u stoody-exampen-beat.service -n 120 --no-pager || true" >&2
-          echo "ExamPen PCR worker did not become ready after 45 seconds." >&2
-          exit 1
+            "set -euo pipefail; \
+            systemctl is-enabled --quiet stoody-exampen-worker.service; \
+            systemctl is-active --quiet stoody-exampen-worker.service; \
+            systemctl is-enabled --quiet stoody-exampen-beat.service; \
+            systemctl is-active --quiet stoody-exampen-beat.service"
 
       - name: Invalidate existing sessions after prod deploy
         shell: bash

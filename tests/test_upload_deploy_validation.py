@@ -331,8 +331,8 @@ def test_prod_workflow_enables_and_validates_exampen_processing_workers():
     assert "Validate ExamPen PCR worker runtime" in source
     assert "stoody-exampen-worker.service" in source
     assert "stoody-exampen-beat.service" in source
-    assert "celery' -A celery_app inspect ping" in source
-    assert "for attempt in $(seq 1 15)" in source
-    assert "waiting 3 seconds" in source
-    assert "did not become ready after 45 seconds" in source
+    assert "The deployment script starts the worker" in source
+    assert "Repeating a Celery pidbox" in source
+    assert "systemctl is-active --quiet stoody-exampen-worker.service" in source
+    assert "systemctl is-active --quiet stoody-exampen-beat.service" in source
     assert source.index("Deploy backend to prod") < source.index("Validate ExamPen PCR worker runtime")
