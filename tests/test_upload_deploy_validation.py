@@ -289,6 +289,25 @@ def test_remote_deploy_script_installs_upload_cleanup_timer():
     assert source.rindex("ensure_upload_cleanup_timer") < source.index('echo "Restarting service via $SERVICE_MANAGER"')
 
 
+def test_remote_deploy_script_installs_supervised_exampen_processing_workers():
+    source = Path("ops/remote_deploy_python_service.sh").read_text(encoding="utf-8")
+
+    assert "ensure_exampen_processing_workers" in source
+    assert "STOODY_EXAMPEN_WORKER_ENABLED" in source
+    assert "stoody-exampen-worker" in source
+    assert "stoody-exampen-beat" in source
+    assert "USE_S3_STORAGE" in source
+    assert "S3_BUCKET_NAME" in source
+    assert "EnvironmentFile=$APP_PATH/.env" in source
+    assert "-A celery_app worker" in source
+    assert "-A celery_app beat" in source
+    assert "reconcile" in source
+    assert "celery_app inspect ping" in source
+    assert source.rindex("ensure_exampen_processing_workers") > source.index(
+        'echo "Running backend health check: $HEALTHCHECK_URL"'
+    )
+
+
 def test_prod_workflow_runs_upload_security_deploy_validation_after_deploy():
     source = Path(".github/workflows/deploy-prod-backend.yml").read_text(encoding="utf-8")
 
@@ -303,3 +322,14 @@ def test_prod_workflow_runs_upload_security_deploy_validation_after_deploy():
     assert "--status-output" in source
     assert "upload_deploy_validation_status.json" in source
     assert source.index("Deploy backend to prod") < source.index("Validate upload security runtime controls")
+
+
+def test_prod_workflow_enables_and_validates_exampen_processing_workers():
+    source = Path(".github/workflows/deploy-prod-backend.yml").read_text(encoding="utf-8")
+
+    assert "STOODY_EXAMPEN_WORKER_ENABLED='true'" in source
+    assert "Validate ExamPen PCR worker runtime" in source
+    assert "stoody-exampen-worker.service" in source
+    assert "stoody-exampen-beat.service" in source
+    assert "celery' -A celery_app inspect ping" in source
+    assert source.index("Deploy backend to prod") < source.index("Validate ExamPen PCR worker runtime")

@@ -136,6 +136,7 @@ jobs:
             MENTOR_AI_PORT='${PROD_MENTOR_AI_PORT}' \
             MENTOR_AI_BASE_PATH='${PROD_MENTOR_AI_BASE_PATH}' \
             NGINX_SITE_PATH='${PROD_NGINX_SITE_PATH}' \
+            STOODY_EXAMPEN_WORKER_ENABLED='true' \
             bash /tmp/remote_deploy_python_service.sh \
             '${PROD_MAIN_BACKEND_PATH}' '${DEPLOY_BRANCH}' '${PROD_MAIN_BACKEND_VENV_PATH}' 'requirements.txt' '${PROD_MAIN_BACKEND_SERVICE_MANAGER}' '${PROD_MAIN_BACKEND_SERVICE_NAME}' '${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' '5'"
 
@@ -170,6 +171,21 @@ jobs:
             BACKEND_HEALTH_URL='${PROD_MAIN_BACKEND_HEALTHCHECK_URL}' \
             '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_upload_security_deploy.py \
             --status-output '${PROD_MAIN_BACKEND_PATH}/data/upload_deploy_validation_status.json'"
+
+      - name: Validate ExamPen PCR worker runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "set -euo pipefail; \
+            systemctl is-enabled --quiet stoody-exampen-worker.service; \
+            systemctl is-active --quiet stoody-exampen-worker.service; \
+            systemctl is-enabled --quiet stoody-exampen-beat.service; \
+            systemctl is-active --quiet stoody-exampen-beat.service; \
+            cd '${PROD_MAIN_BACKEND_PATH}'; \
+            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/celery' -A celery_app inspect ping --timeout 10 | grep -Eq 'pong|OK'"
 
       - name: Invalidate existing sessions after prod deploy
         shell: bash

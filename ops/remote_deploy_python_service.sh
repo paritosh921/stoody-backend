@@ -33,6 +33,12 @@ Optional environment variables:
   STOODY_UPLOAD_CLEANUP_UNIT=stoody-upload-cleanup
   STOODY_UPLOAD_CLEANUP_TIMER=*-*-* 03:20:00
   STOODY_UPLOAD_CLEANUP_RANDOMIZED_DELAY_SEC=15m
+  STOODY_EXAMPEN_WORKER_ENABLED=true|false (default: false)
+  STOODY_EXAMPEN_WORKER_UNIT=stoody-exampen-worker
+  STOODY_EXAMPEN_BEAT_UNIT=stoody-exampen-beat
+  STOODY_EXAMPEN_WORKER_CONCURRENCY=2
+  STOODY_EXAMPEN_CELERY_STATE_DIR=/var/lib/stoody/celery
+  STOODY_EXAMPEN_WORKER_STARTUP_TIMEOUT_SECONDS=30
 EOF
 }
 
@@ -496,6 +502,146 @@ TIMER
   systemctl is-active "${unit_base}.timer" >/dev/null
 }
 
+ensure_exampen_processing_workers() {
+  # The API only enqueues PCR jobs.  A supervised Celery worker is the
+  # production owner of OCR, segmentation, evaluation, and retry processing.
+  # Keep this opt-in so development deployments can continue using the inline
+  # processor, while the production workflow explicitly enables it.
+  local enabled="${STOODY_EXAMPEN_WORKER_ENABLED:-false}"
+  enabled="$(printf '%s' "$enabled" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$enabled" == "false" || "$enabled" == "0" || "$enabled" == "no" ]]; then
+    echo "ExamPen Celery workers are disabled"
+    return
+  fi
+  if [[ "$enabled" != "true" && "$enabled" != "1" && "$enabled" != "yes" ]]; then
+    echo "Invalid STOODY_EXAMPEN_WORKER_ENABLED value: $enabled" >&2
+    exit 1
+  fi
+
+  if [[ "$SERVICE_MANAGER" != "systemctl" ]]; then
+    echo "ExamPen Celery workers require systemctl service management" >&2
+    exit 1
+  fi
+
+  if [[ -z "$VENV_PATH" || ! -x "$VENV_PATH/bin/celery" ]]; then
+    echo "Celery executable not found at $VENV_PATH/bin/celery" >&2
+    exit 1
+  fi
+  if [[ ! -f "$APP_PATH/.env" ]]; then
+    echo "Production .env file is required for ExamPen workers: $APP_PATH/.env" >&2
+    exit 1
+  fi
+
+  # The worker reads answer copies directly from private S3.  Refuse to start
+  # it with the old local-storage configuration, which otherwise turns a
+  # recoverable storage misconfiguration into the misleading OCR-empty state.
+  if ! grep -Eiq '^[[:space:]]*USE_S3_STORAGE[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$APP_PATH/.env"; then
+    echo "ExamPen workers require USE_S3_STORAGE=true in $APP_PATH/.env" >&2
+    exit 1
+  fi
+  if ! grep -Eq '^[[:space:]]*S3_BUCKET_NAME[[:space:]]*=[[:space:]]*[^[:space:]#]+' "$APP_PATH/.env"; then
+    echo "ExamPen workers require S3_BUCKET_NAME in $APP_PATH/.env" >&2
+    exit 1
+  fi
+
+  local worker_unit="${STOODY_EXAMPEN_WORKER_UNIT:-stoody-exampen-worker}"
+  local beat_unit="${STOODY_EXAMPEN_BEAT_UNIT:-stoody-exampen-beat}"
+  local worker_concurrency="${STOODY_EXAMPEN_WORKER_CONCURRENCY:-2}"
+  local state_dir="${STOODY_EXAMPEN_CELERY_STATE_DIR:-/var/lib/stoody/celery}"
+  local startup_timeout="${STOODY_EXAMPEN_WORKER_STARTUP_TIMEOUT_SECONDS:-30}"
+  local celery_bin="$VENV_PATH/bin/celery"
+  local worker_owner worker_group
+  worker_owner="$(app_owner)"
+  worker_group="$(stat -c '%G' "$APP_PATH")"
+
+  if ! [[ "$worker_concurrency" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STOODY_EXAMPEN_WORKER_CONCURRENCY must be a positive integer" >&2
+    exit 1
+  fi
+  if ! [[ "$startup_timeout" =~ ^[1-9][0-9]*$ ]]; then
+    echo "STOODY_EXAMPEN_WORKER_STARTUP_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 1
+  fi
+
+  echo "Installing supervised ExamPen Celery worker services"
+  sudo install -d -o "$worker_owner" -g "$worker_group" -m 0750 "$state_dir"
+
+  sudo tee "/etc/systemd/system/${worker_unit}.service" >/dev/null <<SERVICE
+[Unit]
+Description=Stoody ExamPen PCR Celery worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$worker_owner
+Group=$worker_group
+WorkingDirectory=$APP_PATH
+EnvironmentFile=$APP_PATH/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=$APP_PATH:$APP_PATH/exam-conductor
+ExecStart=$celery_bin -A celery_app worker --loglevel=INFO --concurrency=$worker_concurrency --hostname=${worker_unit}@%H
+Restart=always
+RestartSec=5
+TimeoutStopSec=180
+KillSignal=TERM
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  # Beat runs the durable-job reconciler, so queue/broker interruptions cannot
+  # leave accepted student copies stranded indefinitely.
+  sudo tee "/etc/systemd/system/${beat_unit}.service" >/dev/null <<SERVICE
+[Unit]
+Description=Stoody ExamPen PCR Celery scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$worker_owner
+Group=$worker_group
+WorkingDirectory=$APP_PATH
+EnvironmentFile=$APP_PATH/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=$APP_PATH:$APP_PATH/exam-conductor
+ExecStart=$celery_bin -A celery_app beat --loglevel=INFO --schedule=$state_dir/beat-schedule
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+KillSignal=TERM
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  sudo systemctl daemon-reload
+  sudo systemctl reset-failed "${worker_unit}.service" "${beat_unit}.service" || true
+  sudo systemctl enable --now "${worker_unit}.service" "${beat_unit}.service"
+  sudo systemctl restart "${worker_unit}.service" "${beat_unit}.service"
+
+  local deadline=$((SECONDS + startup_timeout))
+  local ping_output=""
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    if ! systemctl is-active --quiet "${worker_unit}.service" || ! systemctl is-active --quiet "${beat_unit}.service"; then
+      sleep 1
+      continue
+    fi
+    ping_output="$($celery_bin -A celery_app inspect ping --timeout 3 2>&1 || true)"
+    if grep -Eq 'pong|OK' <<<"$ping_output"; then
+      echo "ExamPen Celery worker is ready"
+      return
+    fi
+    sleep 2
+  done
+
+  echo "ExamPen Celery worker did not become reachable within ${startup_timeout}s" >&2
+  printf '%s\n' "$ping_output" >&2
+  sudo journalctl -u "${worker_unit}.service" -u "${beat_unit}.service" -n 120 --no-pager >&2 || true
+  exit 1
+}
+
 acquire_deploy_lock
 sync_git_repo "$APP_PATH" "$BRANCH"
 
@@ -544,6 +690,8 @@ sleep "$POST_RESTART_DELAY"
 
 echo "Running backend health check: $HEALTHCHECK_URL"
 curl --fail --silent --show-error "$HEALTHCHECK_URL" >/dev/null
+
+ensure_exampen_processing_workers
 
 deploy_mentor_ai
 reload_nginx_if_config_provided
