@@ -26,17 +26,29 @@ from __future__ import annotations
 import logging
 import re
 import hashlib
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from ..domain.response_models import (
+    ContentType,
+    DetectedResponse,
+    Flag,
     FlagSeverity,
+    FlagType,
+    PageOCR,
     SegmentationResult,
+    SourcePageRef,
 )
 from ..domain.segmenter import segment_submission
 
 from .ocr_service import OCRAdapter, OCRResult, VisionGateProtocol, create_ocr_adapter
+from .response_mapping_service import (
+    DocumentAnswerMapper,
+    DocumentAnswerMapperProtocol,
+    needs_document_answer_mapping,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,12 +226,14 @@ class SubmissionService:
         question_repo: QuestionReader,
         gate: VisionGateProtocol,
         ocr_adapter: Optional[OCRAdapter] = None,
+        document_answer_mapper: Optional[DocumentAnswerMapperProtocol] = None,
     ) -> None:
         self._ingest = ingest
         self._response_repo = response_repo
         self._question_repo = question_repo
         self._gate = gate
         self._ocr_override = ocr_adapter
+        self._document_answer_mapper = document_answer_mapper
 
     # ------------------------------------------------------------------
     # Core processing
@@ -307,31 +321,58 @@ class SubmissionService:
                 error="OCR recognition failed",
             )
 
-        pages = ocr_result.pages
+        pages = list(ocr_result.pages)
         if not pages:
-            logger.warning(
-                "OCR produced no pages for submission %s", submission_id
-            )
-            await self._ingest.update_segmentation_status(
-                submission_id, "failed"
-            )
-            return SubmissionProcessingResult(
-                submission_id=submission_id,
-                page_count=len(answer_pages),
-                error="OCR produced no recognizable pages",
-            )
+            # A camera/PDF answer copy still has canonical private S3 image
+            # artefacts even when a first OCR pass yields no PageOCR records.
+            # Keep those images available to the document mapper; it can read
+            # handwriting visually and associate it to the paper without
+            # relying on text-block OCR.  Never turn such a copy into a false
+            # failed/not-attempted submission before that evidence-based pass.
+            if normalized_source == "camera":
+                pages = _camera_page_placeholders(answer_pages)
+                if pages:
+                    logger.warning(
+                        "OCR produced no PageOCR records for submission %s; "
+                        "continuing with private-image document mapping",
+                        submission_id,
+                    )
+            if not pages:
+                logger.warning(
+                    "OCR produced no pages for submission %s", submission_id
+                )
+                await self._ingest.update_segmentation_status(
+                    submission_id, "failed"
+                )
+                return SubmissionProcessingResult(
+                    submission_id=submission_id,
+                    page_count=len(answer_pages),
+                    error="OCR produced no recognizable pages",
+                )
         if all(not page.text_blocks for page in pages):
-            logger.warning(
-                "OCR produced no text blocks for submission %s", submission_id
-            )
-            await self._ingest.update_segmentation_status(
-                submission_id, "failed"
-            )
-            return SubmissionProcessingResult(
-                submission_id=submission_id,
-                page_count=len(pages),
-                error="OCR produced no text blocks",
-            )
+            if normalized_source == "camera":
+                logger.warning(
+                    "OCR produced no text blocks for submission %s; "
+                    "continuing with private-image document mapping",
+                    submission_id,
+                )
+            else:
+                # The pen path has stroke-native evidence, not the canonical
+                # private camera images consumed by DocumentAnswerMapper.  Do
+                # not silently broaden the camera/PDF fallback into that
+                # separate capture pipeline.
+                logger.warning(
+                    "OCR produced no text blocks for pen submission %s",
+                    submission_id,
+                )
+                await self._ingest.update_segmentation_status(
+                    submission_id, "failed"
+                )
+                return SubmissionProcessingResult(
+                    submission_id=submission_id,
+                    page_count=len(pages),
+                    error="OCR produced no text blocks",
+                )
 
         # Step 4: Fetch question metadata for manifest awareness.  A
         # conducted session uses immutable, canonical question IDs (for
@@ -370,15 +411,76 @@ class SubmissionService:
             ),
         )
 
-        # OCR markers are ideal, but handwritten copies often omit them.  When
-        # there is strong, unambiguous evidence in the response text, infer a
-        # question number from the immutable question paper.  Ambiguous copies
-        # deliberately remain unmapped and are routed to teacher review below;
-        # they must never be auto-scored against an invented question.
-        assignment_details_by_response = _assign_unmarked_responses(
-            seg_result.responses,
-            numbered_questions,
-        )
+        # OCR markers are ideal, but a real handwritten answer copy can contain
+        # several interleaved answers without labels or ruled separators.  In
+        # that case the page segmenter has only one ambiguous blob and must not
+        # assign it to Q1 then fabricate zero marks for Q2..Qn.  Resolve those
+        # copies at document level first, using every private page image and
+        # immutable question catalog.  If that association is uncertain, keep
+        # the evidence unassigned for teacher review and suppress synthetic
+        # blank-answer rows.
+        include_missing_slots = True
+        assignment_details_by_response: Dict[str, Dict[str, Any]]
+        if needs_document_answer_mapping(
+            pages=pages,
+            segmented_responses=seg_result.responses,
+            numbered_questions=numbered_questions,
+            source=normalized_source,
+        ):
+            mapper = self._document_answer_mapper or DocumentAnswerMapper(self._gate)
+            try:
+                mapping_result = await mapper.map_submission(
+                    pages=pages,
+                    answer_pages=answer_pages,
+                    numbered_questions=numbered_questions,
+                    source=normalized_source,
+                )
+            except Exception as exc:
+                # A mapper failure is a review state, never a reason to score
+                # the whole document as Q1 or to record false zero marks.
+                logger.exception(
+                    "Document answer mapping failed for submission %s",
+                    submission_id,
+                )
+                mapping_result = None
+                mapping_error = str(exc)[:500]
+            else:
+                mapping_error = None
+
+            if mapping_result and mapping_result.responses:
+                seg_result = seg_result.model_copy(
+                    update={"responses": mapping_result.responses}
+                )
+                assignment_details_by_response = (
+                    mapping_result.assignment_details_by_response
+                )
+                include_missing_slots = mapping_result.coverage_is_reliable
+                if mapping_result.manual_review_required:
+                    logger.warning(
+                        "Submission %s has unresolved document answer regions: %s",
+                        submission_id,
+                        mapping_result.reason or "unspecified mapping uncertainty",
+                    )
+            else:
+                reason = (
+                    (mapping_result.reason if mapping_result else None)
+                    or mapping_error
+                    or "Document-level answer mapping could not safely associate this copy"
+                )
+                seg_result, assignment_details_by_response = _route_collapsed_copy_to_review(
+                    seg_result,
+                    reason=reason,
+                    pages=pages,
+                )
+                include_missing_slots = False
+        else:
+            # For a normal, single response, retain the deterministic
+            # marker/content matcher.  It is cheaper and more reliable than a
+            # document vision pass when one answer is genuinely all that exists.
+            assignment_details_by_response = _assign_unmarked_responses(
+                seg_result.responses,
+                numbered_questions,
+            )
 
         # Step 6: Persist detected responses
         response_docs = _build_response_docs(
@@ -388,6 +490,7 @@ class SubmissionService:
             student_id,
             question_ids_by_number=question_ids_by_number,
             assignment_details_by_response=assignment_details_by_response,
+            include_missing_slots=include_missing_slots,
         )
 
         # A paper is a fixed set of questions, not a variable number of OCR
@@ -442,6 +545,7 @@ class SubmissionService:
 
                 if (
                     has_blocking
+                    or bool(doc.get("manual_review_required"))
                     or not doc.get("question_id")
                     or response_id in duplicate_response_ids
                 ):
@@ -545,6 +649,55 @@ def _normalize_source(source: str) -> str:
     if source in ("pen", "ble_pen"):
         return "pen"
     return "camera"
+
+
+def _camera_page_placeholders(
+    answer_pages: List[Dict[str, Any]],
+) -> List[PageOCR]:
+    """Return image-backed PageOCR placeholders when OCR returned no pages.
+
+    The source image itself remains the canonical evidence in private S3.  The
+    placeholder deliberately contains no invented text; it simply preserves
+    page identity and A4 page space so the document mapper can inspect the
+    private images and return its own bounded regions/transcription.
+    """
+    placeholders: List[PageOCR] = []
+    seen_page_numbers: set[int] = set()
+    for fallback_number, page in enumerate(answer_pages, start=1):
+        raw_image_ref = page.get("raw_image_ref")
+        if not isinstance(raw_image_ref, str) or not raw_image_ref.strip():
+            continue
+        page_number = _coerce_question_number(
+            page.get("page_number"), fallback_number
+        )
+        if page_number in seen_page_numbers:
+            continue
+        seen_page_numbers.add(page_number)
+        placeholders.append(
+            PageOCR(
+                page_number=page_number,
+                page_width_mm=210.0,
+                page_height_mm=297.0,
+                text_blocks=[],
+                image_width_px=_safe_optional_positive_int(
+                    page.get("image_width_px")
+                ),
+                image_height_px=_safe_optional_positive_int(
+                    page.get("image_height_px")
+                ),
+                source="camera",
+                mean_ocr_confidence=0.0,
+            )
+        )
+    return sorted(placeholders, key=lambda page: page.page_number)
+
+
+def _safe_optional_positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +894,113 @@ def _assign_unmarked_responses(
     return assignment_details
 
 
+def _route_collapsed_copy_to_review(
+    seg_result: SegmentationResult,
+    *,
+    reason: str,
+    pages: Optional[List[PageOCR]] = None,
+) -> tuple[SegmentationResult, Dict[str, Dict[str, Any]]]:
+    """Keep a collapsed answer copy visible without falsely scoring it as Q1.
+
+    This is the fail-safe path for a multi-answer document when the mapping
+    model is unavailable or cannot prove its associations.  The original OCR
+    evidence stays immutable and visible to the teacher, but its inherited
+    first-marker association is deliberately removed.  That prevents both a
+    wrong auto-score and synthetic zero records for the rest of the paper.
+    """
+    replacement: List[DetectedResponse] = []
+    assignment_details: Dict[str, Dict[str, Any]] = {}
+    for response in seg_result.responses:
+        flag_digest = hashlib.sha256(
+            f"{response.response_id}\x1f{reason}".encode("utf-8")
+        ).hexdigest()[:10]
+        blocking_flag = Flag(
+            flag_id=f"FLG-DOCMAP-{flag_digest}",
+            response_id=response.response_id,
+            source="document_answer_mapper",
+            flag_type=FlagType.LOW_SEGMENTATION_CONFIDENCE,
+            severity=FlagSeverity.BLOCKING,
+            reason=(
+                "The answer copy contains multiple possible answers but their "
+                f"question ownership could not be proven automatically: {reason}"
+            )[:1000],
+            suggested_action=(
+                "Review the submitted answer-copy regions and assign question "
+                "ownership before scoring."
+            ),
+            metadata={"document_mapping_failed": True},
+        )
+        replacement_response = response.model_copy(
+            update={
+                "question_number": None,
+                "sub_part": None,
+                "flags": [*response.flags, blocking_flag],
+            }
+        )
+        replacement.append(replacement_response)
+        assignment_details[str(replacement_response.response_id)] = {
+            "method": "document_mapping_unavailable",
+            "reason": reason,
+            "manual_review_required": True,
+        }
+
+    # If OCR produced no readable text at all, the normal segmenter has no
+    # response object to preserve.  Still create one *unassigned* evidence row
+    # so the teacher can see the private answer-copy pages and retry/review it.
+    # It intentionally has no question ID and therefore can never become a
+    # zero-mark answer or be sent to automatic grading.
+    if not replacement and pages:
+        response_id = f"RESP-DOCMAP-{uuid.uuid4().hex[:16]}"
+        source_pages = [
+            SourcePageRef(
+                page_number=page.page_number,
+                y_start=0.0,
+                y_end=page.page_height_mm,
+            )
+            for page in pages
+        ]
+        blocking_flag = Flag(
+            flag_id=f"FLG-DOCMAP-{hashlib.sha256(response_id.encode('utf-8')).hexdigest()[:10]}",
+            response_id=response_id,
+            source="document_answer_mapper",
+            flag_type=FlagType.LOW_SEGMENTATION_CONFIDENCE,
+            severity=FlagSeverity.BLOCKING,
+            reason=(
+                "The private answer-copy images could not be safely read or "
+                f"associated with paper questions: {reason}"
+            )[:1000],
+            suggested_action=(
+                "Review the submitted pages, retry document mapping, or ask "
+                "the student for clearer images before scoring."
+            ),
+            metadata={"document_mapping_failed": True, "ocr_text_unavailable": True},
+        )
+        review_response = DetectedResponse(
+            response_id=response_id,
+            question_number=None,
+            sub_part=None,
+            detected_text="",
+            source_pages=source_pages,
+            content_type=ContentType.TEXT_ONLY,
+            text_coverage_ratio=0.0,
+            segmentation_confidence=0.0,
+            ocr_confidence=0.0,
+            flags=[blocking_flag],
+            word_count=0,
+            is_continuation=len(source_pages) > 1,
+        )
+        replacement.append(review_response)
+        assignment_details[str(response_id)] = {
+            "method": "document_mapping_unavailable",
+            "reason": reason,
+            "manual_review_required": True,
+        }
+    return (
+        seg_result.model_copy(update={"responses": replacement}),
+        assignment_details,
+    )
+
+
 def _build_response_docs(
     seg_result: SegmentationResult,
     submission_id: str,
@@ -749,6 +1009,7 @@ def _build_response_docs(
     *,
     question_ids_by_number: Optional[Dict[int, str]] = None,
     assignment_details_by_response: Optional[Dict[str, Dict[str, Any]]] = None,
+    include_missing_slots: bool = True,
 ) -> List[Dict[str, Any]]:
     """Convert segmentation responses into MongoDB documents for
     persistence.
@@ -795,19 +1056,20 @@ def _build_response_docs(
             for sp in response.source_pages
         ]
 
+        assignment_detail = assignment_details_by_response.get(
+            str(response.response_id),
+            {
+                "method": "unmapped",
+                "reason": "No question association was recorded",
+            },
+        )
         doc: Dict[str, Any] = {
             "response_id": response.response_id,
             "submission_id": submission_id,
             "question_id": question_id,
             "question_number": response.question_number,
             "sub_part": response.sub_part,
-            "question_assignment": assignment_details_by_response.get(
-                str(response.response_id),
-                {
-                    "method": "unmapped",
-                    "reason": "No question association was recorded",
-                },
-            ),
+            "question_assignment": assignment_detail,
             "exam_id": exam_id,
             "student_id": student_id,
             "detected_text": response.detected_text,
@@ -820,6 +1082,16 @@ def _build_response_docs(
             "word_count": response.word_count,
             "is_continuation": response.is_continuation,
             "is_missing_response": False,
+            "manual_review_required": bool(
+                isinstance(assignment_detail, dict)
+                and assignment_detail.get("manual_review_required")
+            ),
+            "manual_review_reason": (
+                str(assignment_detail.get("reason") or "")
+                if isinstance(assignment_detail, dict)
+                and assignment_detail.get("manual_review_required")
+                else None
+            ),
             "answer_state": (
                 "detected" if question_id else "unmapped"
             ),
@@ -834,16 +1106,17 @@ def _build_response_docs(
     # These records intentionally contain no fabricated answer text or source
     # page.  They simply make the absence explicit, auditable, and scoreable
     # as zero by EvalCore.
-    assigned_question_ids = {
-        str(doc.get("question_id"))
-        for doc in docs
-        if doc.get("question_id")
-    }
-    for question_number, question_id in sorted(question_ids_by_number.items()):
-        if question_id in assigned_question_ids:
-            continue
-        docs.append(
-            {
+    if include_missing_slots:
+        assigned_question_ids = {
+            str(doc.get("question_id"))
+            for doc in docs
+            if doc.get("question_id")
+        }
+        for question_number, question_id in sorted(question_ids_by_number.items()):
+            if question_id in assigned_question_ids:
+                continue
+            docs.append(
+                {
                 "response_id": _missing_response_id(submission_id, question_id),
                 "submission_id": submission_id,
                 "question_id": question_id,
@@ -866,12 +1139,14 @@ def _build_response_docs(
                 "word_count": 0,
                 "is_continuation": False,
                 "is_missing_response": True,
+                "manual_review_required": False,
+                "manual_review_reason": None,
                 "answer_state": "not_attempted",
                 "eval_status": "pending",
                 "_immutable": True,
                 "created_at": datetime.now(timezone.utc),
-            }
-        )
+                }
+            )
 
     return docs
 

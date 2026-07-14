@@ -19,6 +19,15 @@ DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
 PROCESSING_LEASE_MINUTES = 30
 
 
+class ProcessingJobBusyError(RuntimeError):
+    """Raised when an operator tries to reprocess a copy already in flight.
+
+    A reprocess must never reset a job that a worker has already claimed.  That
+    would allow two workers to supersede each other's answer mapping and make
+    the teacher review screen depend on a timing race.
+    """
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -85,12 +94,20 @@ async def dispatch_processing_job(
     """Send a persisted job to Celery without losing it if Redis is down."""
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     status = str(job.get("status") or "queued")
-    if not force and status in TERMINAL_JOB_STATUSES | {"processing"}:
+    # Never move an actively claimed job back to queued, even when an operator
+    # explicitly requested a retry.  The conditional update below repeats the
+    # guard so it remains true if another worker claims it between this read
+    # and the write.
+    if status == "processing":
+        return job
+    if not force and status in TERMINAL_JOB_STATUSES:
+        return job
+    if not force and status not in DISPATCHABLE_JOB_STATUSES:
         return job
 
     now = _now()
-    await jobs.update_one(
-        {"job_id": job["job_id"]},
+    queued = await jobs.update_one(
+        {"job_id": job["job_id"], "status": {"$ne": "processing"}},
         {
             "$set": {
                 "status": "queued",
@@ -101,6 +118,10 @@ async def dispatch_processing_job(
             }
         },
     )
+    if not queued.matched_count:
+        current = await jobs.find_one({"job_id": job["job_id"]})
+        return current or job
+
     try:
         from celery_app import process_exampen_pcr_submission
 
@@ -108,7 +129,10 @@ async def dispatch_processing_job(
     except Exception as exc:
         logger.exception("Unable to enqueue PCR processing job %s", job["job_id"])
         await jobs.update_one(
-            {"job_id": job["job_id"]},
+            # If the worker claimed the job before the broker client raised,
+            # preserve the worker state rather than overwriting it with an
+            # enqueue error.
+            {"job_id": job["job_id"], "status": "queued"},
             {
                 "$set": {
                     "status": "enqueue_failed",
@@ -145,14 +169,76 @@ async def retry_processing_job(
     db_name: str,
     job_id: str,
 ) -> Dict[str, Any]:
-    """Reset a failed/pending job and send it to Celery again."""
+    """Backward-compatible alias for an audited operator reprocess."""
+    return await reprocess_processing_job(
+        tenant_db,
+        db_name=db_name,
+        job_id=job_id,
+        requested_by="system-retry",
+        reason="Operator requested a retry",
+    )
+
+
+async def reprocess_processing_job(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    job_id: str,
+    requested_by: str,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely rerun OCR, answer mapping, and marking for an existing copy.
+
+    The canonical uploaded pages remain unchanged.  ``SubmissionService``
+    supersedes previous detected-response rows before it writes the fresh
+    document mapping, so published audit evidence is preserved and a stale
+    score can never be mixed with newly mapped answers.
+    """
+    await ensure_indexes(tenant_db)
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     job = await jobs.find_one({"job_id": job_id})
     if job is None:
         raise ValueError(f"Processing job {job_id} not found")
-    if str(job.get("status")) == "processing":
-        return job
-    return await dispatch_processing_job(tenant_db, db_name=db_name, job=job, force=True)
+    if str(job.get("status") or "") == "processing":
+        raise ProcessingJobBusyError(f"Processing job {job_id} is already running")
+
+    now = _now()
+    history_entry = {
+        "requested_at": now,
+        "requested_by": requested_by or "unknown",
+        "reason": (reason or "Operator requested reprocessing").strip()[:500],
+        "previous_status": str(job.get("status") or "queued"),
+        "previous_attempts": int(job.get("attempts") or 0),
+        "previous_last_error": job.get("last_error"),
+        "previous_pipeline_version": job.get("pipeline_version"),
+    }
+    reset = await jobs.update_one(
+        {"job_id": job_id, "status": {"$ne": "processing"}},
+        {
+            "$set": {
+                "status": "queued",
+                "db_name": db_name,
+                "last_error": None,
+                "segmentation": {},
+                "evaluation": {},
+                "reprocess_requested_at": now,
+                "reprocess_requested_by": requested_by or "unknown",
+                "reprocess_reason": history_entry["reason"],
+                "mapping_pipeline_version": "document-answer-mapping-v1",
+                "updated_at": now,
+            },
+            "$unset": {"finished_at": ""},
+            "$inc": {"reprocess_count": 1},
+            "$push": {"reprocess_history": {"$each": [history_entry], "$slice": -20}},
+        },
+    )
+    if not reset.matched_count:
+        raise ProcessingJobBusyError(f"Processing job {job_id} is already running")
+
+    refreshed = await jobs.find_one({"job_id": job_id})
+    if refreshed is None:  # Defensive: the job was deleted after the reset.
+        raise ValueError(f"Processing job {job_id} not found")
+    return await dispatch_processing_job(tenant_db, db_name=db_name, job=refreshed, force=True)
 
 
 async def reconcile_processing_jobs(

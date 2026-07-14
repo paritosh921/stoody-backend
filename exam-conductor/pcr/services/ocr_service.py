@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
@@ -56,7 +57,11 @@ _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 _DEFAULT_OCR_VISION_MODEL = "gpt-4o"
 
 # LLM OCR extraction prompt
-_OCR_PROMPT_VERSION = "exampen-qno-v2"
+#
+# Location is a first-class part of the OCR contract.  PCR cannot safely map a
+# mixed handwritten answer copy if the model returns one paragraph for a whole
+# A4 page, so every line/paragraph block must carry a normalized page bbox.
+_OCR_PROMPT_VERSION = "exampen-layout-v3"
 _OCR_EXTRACTION_PROMPT = (
     "This image is one page of a student exam answer copy. It may be a camera "
     "photo, scanned PDF page, or a high-contrast rendering of digital pen strokes. "
@@ -64,12 +69,15 @@ _OCR_EXTRACTION_PROMPT = (
     "Pay special attention to question labels such as 'Q1', 'Q. 1', 'Question 1', "
     "'1)', or 'Q.No 1.Ans'; preserve them in the extracted text because they "
     "separate answers for marking. "
-    "Read line by line from top to bottom. For each detected text line or "
-    "region, return one JSON object with \"text\" (string: recognised text) "
-    "and \"confidence\" (float 0-1: recognition confidence). If text is faint "
-    "or partially clipped, return the best visible transcription with lower "
-    "confidence instead of dropping the line. If absolutely no text is "
-    "visible, return an empty array: []. Return ONLY the JSON array, no "
+    "Read top to bottom and preserve separate visual paragraphs/answer regions; "
+    "do not merge text from different vertical regions into one object. For each "
+    "detected text line or paragraph, return one JSON object with \"text\" "
+    "(string), \"confidence\" (float 0-1), and \"bbox\" with \"x_min\", "
+    "\"y_min\", \"x_max\", \"y_max\". Bbox coordinates MUST be normalized "
+    "integers from 0 to 1000 relative to this page (0,0 = top-left; 1000,1000 = "
+    "bottom-right). If text is faint or partially clipped, return the best visible "
+    "transcription with lower confidence instead of dropping the line. If absolutely "
+    "no text is visible, return an empty array: []. Return ONLY the JSON array, no "
     "markdown fences or extra text."
 )
 
@@ -185,10 +193,13 @@ def _parse_ocr_response_to_text_blocks(
 
     The expected format from the LLM is a JSON array of objects::
 
-        [{"text": "...", "confidence": 0.95}, ...]
+        [{"text": "...", "confidence": 0.95,
+          "bbox": {"x_min": 0, "y_min": 0, "x_max": 1000, "y_max": 80}}, ...]
 
-    If the response is not valid JSON, the entire response is treated as
-    a single text block spanning the full page.
+    Bbox coordinates in new output are normalized 0..1000 and are converted to
+    the page-space millimetres used by PCR.  Old mm-shaped output remains
+    accepted for backward compatibility.  If the response is not valid JSON,
+    its non-empty paragraphs are retained as conservative vertical blocks.
 
     Parameters
     ----------
@@ -225,29 +236,45 @@ def _parse_ocr_response_to_text_blocks(
     try:
         parsed = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
-        # Fallback: entire response as one text block
+        # Fallback: retain line/paragraph separation rather than converting an
+        # entire answer sheet into a single page-sized block.  This does not
+        # invent coordinates; it only preserves the best layout evidence left
+        # in a malformed provider response.
         logger.debug(
-            "LLM OCR response is not valid JSON — treating as single block"
+            "LLM OCR response is not valid JSON — retaining paragraph blocks"
         )
         if not cleaned:
             return []
+        paragraphs = [
+            item.strip()
+            for item in re.split(r"(?:\r?\n){1,}", cleaned)
+            if item.strip()
+        ]
+        if not paragraphs:
+            paragraphs = [cleaned]
+        count = len(paragraphs)
         return [
             TextBlock(
-                text=cleaned,
+                text=text,
                 bbox=BoundingBox(
                     x_min=0.0,
-                    y_min=0.0,
+                    y_min=(idx / count) * page_height_mm,
                     x_max=page_width_mm,
-                    y_max=page_height_mm,
+                    y_max=((idx + 1) / count) * page_height_mm,
                 ),
                 confidence=0.5,
                 source=source,
             )
+            for idx, text in enumerate(paragraphs)
         ]
 
     # Handle JSON response
     if isinstance(parsed, list):
         items = parsed
+    elif isinstance(parsed, dict) and isinstance(parsed.get("blocks"), list):
+        items = parsed["blocks"]
+    elif isinstance(parsed, dict) and isinstance(parsed.get("lines"), list):
+        items = parsed["lines"]
     elif isinstance(parsed, dict) and "text" in parsed:
         # Single block returned as an object instead of array
         items = [parsed]
@@ -281,15 +308,18 @@ def _parse_ocr_response_to_text_blocks(
         y_min = (idx / num_items) * page_height_mm
         y_max = ((idx + 1) / num_items) * page_height_mm
 
-        # If the LLM provided bbox coordinates, use them
+        # If the LLM provided bbox coordinates, normalize its coordinate space
+        # to page-space millimetres.  V3 uses 0..1000; legacy adapters sometimes
+        # return literal mm values, and a few providers use left/top/right/
+        # bottom or x/y/width/height aliases.
         bbox_data = item.get("bbox")
         if isinstance(bbox_data, dict):
             try:
-                bbox = BoundingBox(
-                    x_min=float(bbox_data.get("x_min", 0.0)),
-                    y_min=float(bbox_data.get("y_min", y_min)),
-                    x_max=float(bbox_data.get("x_max", page_width_mm)),
-                    y_max=float(bbox_data.get("y_max", y_max)),
+                bbox = _normalise_bbox_to_page_mm(
+                    bbox_data,
+                    page_width_mm=page_width_mm,
+                    page_height_mm=page_height_mm,
+                    fallback=(0.0, y_min, page_width_mm, y_max),
                 )
             except (TypeError, ValueError):
                 bbox = BoundingBox(
@@ -312,6 +342,68 @@ def _parse_ocr_response_to_text_blocks(
         )
 
     return text_blocks
+
+
+def _normalise_bbox_to_page_mm(
+    bbox_data: Dict[str, Any],
+    *,
+    page_width_mm: float,
+    page_height_mm: float,
+    fallback: tuple[float, float, float, float],
+) -> BoundingBox:
+    """Convert normalized or legacy bbox payloads into safe page mm bounds."""
+    x_min = bbox_data.get("x_min", bbox_data.get("left", bbox_data.get("x")))
+    y_min = bbox_data.get("y_min", bbox_data.get("top", bbox_data.get("y")))
+    x_max = bbox_data.get("x_max", bbox_data.get("right"))
+    y_max = bbox_data.get("y_max", bbox_data.get("bottom"))
+    if x_max is None and x_min is not None and bbox_data.get("width") is not None:
+        x_max = float(x_min) + float(bbox_data["width"])
+    if y_max is None and y_min is not None and bbox_data.get("height") is not None:
+        y_max = float(y_min) + float(bbox_data["height"])
+    values = [
+        float(x_min if x_min is not None else fallback[0]),
+        float(y_min if y_min is not None else fallback[1]),
+        float(x_max if x_max is not None else fallback[2]),
+        float(y_max if y_max is not None else fallback[3]),
+    ]
+
+    coordinate_space = str(
+        bbox_data.get("coordinate_space") or bbox_data.get("units") or ""
+    ).strip().lower()
+    max_coordinate = max(abs(value) for value in values)
+    if coordinate_space in {"normalized", "normalised", "0-1000", "1000"} or (
+        not coordinate_space and max_coordinate > max(page_width_mm, page_height_mm) + 20
+    ):
+        # V3's documented normalized 0..1000 coordinates.
+        x_min_mm = values[0] / 1000.0 * page_width_mm
+        y_min_mm = values[1] / 1000.0 * page_height_mm
+        x_max_mm = values[2] / 1000.0 * page_width_mm
+        y_max_mm = values[3] / 1000.0 * page_height_mm
+    elif coordinate_space in {"fraction", "relative", "0-1"} or (
+        not coordinate_space and max_coordinate <= 1.0
+    ):
+        x_min_mm = values[0] * page_width_mm
+        y_min_mm = values[1] * page_height_mm
+        x_max_mm = values[2] * page_width_mm
+        y_max_mm = values[3] * page_height_mm
+    else:
+        # Legacy current output already uses page-space millimetres.
+        x_min_mm, y_min_mm, x_max_mm, y_max_mm = values
+
+    x_min_mm = max(0.0, min(page_width_mm, x_min_mm))
+    x_max_mm = max(0.0, min(page_width_mm, x_max_mm))
+    y_min_mm = max(0.0, min(page_height_mm, y_min_mm))
+    y_max_mm = max(0.0, min(page_height_mm, y_max_mm))
+    if x_max_mm <= x_min_mm:
+        x_min_mm, x_max_mm = fallback[0], fallback[2]
+    if y_max_mm <= y_min_mm:
+        y_min_mm, y_max_mm = fallback[1], fallback[3]
+    return BoundingBox(
+        x_min=round(x_min_mm, 3),
+        y_min=round(y_min_mm, 3),
+        x_max=round(x_max_mm, 3),
+        y_max=round(y_max_mm, 3),
+    )
 
 
 # ---------------------------------------------------------------------------

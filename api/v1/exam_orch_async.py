@@ -260,6 +260,12 @@ class MarkAbsentRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500)
 
 
+class ProcessingJobReprocessRequest(BaseModel):
+    """Optional audit note recorded when staff rerun an answer-copy check."""
+
+    reason: Optional[str] = Field(None, max_length=500)
+
+
 class ProcessingJobResponse(BaseModel):
     job_id: str
     submission_id: str
@@ -270,6 +276,9 @@ class ProcessingJobResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     finished_at: Optional[str] = None
+    reprocess_count: int = 0
+    reprocess_requested_at: Optional[str] = None
+    reprocess_requested_by: Optional[str] = None
     segmentation: Dict[str, Any] = Field(default_factory=dict)
     evaluation: Dict[str, Any] = Field(default_factory=dict)
 
@@ -434,6 +443,9 @@ def _processing_job_to_response(doc: Dict[str, Any]) -> ProcessingJobResponse:
         created_at=_fmt(doc.get("created_at")),
         updated_at=_fmt(doc.get("updated_at")),
         finished_at=_fmt(doc.get("finished_at")),
+        reprocess_count=int(doc.get("reprocess_count") or 0),
+        reprocess_requested_at=_fmt(doc.get("reprocess_requested_at")),
+        reprocess_requested_by=_fmt(doc.get("reprocess_requested_by")),
         segmentation=dict(doc.get("segmentation") or {}),
         evaluation=dict(doc.get("evaluation") or {}),
     )
@@ -1795,11 +1807,12 @@ async def list_processing_jobs(
 @router.post(
     "/{exam_id}/processing/{job_id}/retry",
     response_model=ProcessingJobResponse,
-    summary="Retry a failed or pending PCR processing job",
+    summary="Reprocess a PCR answer copy from its canonical uploaded pages",
 )
 async def retry_exam_processing_job(
     exam_id: str,
     job_id: str,
+    body: Optional[ProcessingJobReprocessRequest] = None,
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ) -> ProcessingJobResponse:
@@ -1812,14 +1825,35 @@ async def retry_exam_processing_job(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Processing job {job_id} not found")
 
-    try:
-        from services.exampen_workflow import retry_processing_job
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": job.get("submission_id"), "exam_id": exam_id},
+        projection={"publication_status": 1},
+    )
+    if submission and submission.get("publication_status") == "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Published results cannot be reprocessed. Unpublish or create a recheck workflow first.",
+        )
 
-        retried = await retry_processing_job(
+    try:
+        from services.exampen_workflow import ProcessingJobBusyError, reprocess_processing_job
+
+        actor_id = str(
+            current_user.get("user_id")
+            or current_user.get("tutor_id")
+            or current_user.get("admin_id")
+            or current_user.get("username")
+            or "unknown"
+        )
+        retried = await reprocess_processing_job(
             tenant_db,
             db_name=str(current_user.get("db_name") or ""),
             job_id=job_id,
+            requested_by=actor_id,
+            reason=(body.reason if body else None),
         )
+    except ProcessingJobBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     return _processing_job_to_response(retried)

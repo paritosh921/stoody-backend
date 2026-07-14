@@ -328,7 +328,7 @@ async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
     metadata = gate.calls[0]["kwargs"]["metadata"]
     assert metadata["pcr_stage"] == "ocr_pen"
     assert metadata["stroke_count"] == 1
-    assert metadata["ocr_prompt_version"] == "exampen-qno-v2"
+    assert metadata["ocr_prompt_version"] == "exampen-layout-v3"
 
 
 @pytest.mark.asyncio
