@@ -311,6 +311,41 @@ DEFAULT_UPLOAD_POLICIES: dict[str, UploadPolicy] = {
         allowed_magic_types=_types(["jpeg", "png"]),
         max_image_pixels=25_000_000,
     ),
+    # Student answer copies use the same safe raster limits as the
+    # invigilator camera path, with a separate policy/audit identity.  The
+    # route-level policy provides an aggregate request limit; individual
+    # image/PDF fields are checked again with their stricter policies below.
+    "student_answer_copy_upload": BinaryUploadPolicy(
+        policy_id="student_answer_copy_upload",
+        max_size_bytes=80 * MB,
+        max_files=50,
+        max_total_size_bytes=100 * MB,
+        allowed_extensions=_types(["jpg", "jpeg", "png", "pdf"]),
+        allowed_mime_types=_types(["image/jpeg", "image/png", "application/pdf"]),
+        allowed_magic_types=_types(["jpeg", "png", "pdf"]),
+        allow_octet_stream=True,
+        max_pdf_pages=50,
+        max_image_pixels=25_000_000,
+    ),
+    "student_answer_copy_image": BinaryUploadPolicy(
+        policy_id="student_answer_copy_image",
+        max_size_bytes=12 * MB,
+        max_files=50,
+        max_total_size_bytes=100 * MB,
+        allowed_extensions=_types(["jpg", "jpeg", "png"]),
+        allowed_mime_types=_types(["image/jpeg", "image/png"]),
+        allowed_magic_types=_types(["jpeg", "png"]),
+        max_image_pixels=25_000_000,
+    ),
+    "student_answer_copy_pdf": BinaryUploadPolicy(
+        policy_id="student_answer_copy_pdf",
+        max_size_bytes=40 * MB,
+        allowed_extensions=_types(["pdf"]),
+        allowed_mime_types=_types(["application/pdf"]),
+        allowed_magic_types=_types(["pdf"]),
+        allow_octet_stream=True,
+        max_pdf_pages=50,
+    ),
     "hub_raw_data_batch": StructuredUploadPolicy(
         policy_id="hub_raw_data_batch",
         max_size_bytes=50 * MB,

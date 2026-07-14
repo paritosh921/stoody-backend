@@ -263,6 +263,8 @@ def adapt_question_to_pcr(
     max_marks_raw = (
         question_doc.get("max_marks")
         or question_doc.get("marks")
+        or question_doc.get("points")
+        or question_doc.get("total_points")
         or 0
     )
     try:
@@ -282,10 +284,38 @@ def adapt_question_to_pcr(
         question_type, has_diagram, explicit_diagram_weight
     )
 
-    # Build rubric from explanation if available
+    # Build rubric from explanation if available.
+    # ``question_text`` and ``reference_solution`` are deliberately carried
+    # into ExamPen metadata as well.  EvalCore uses them to build the marking
+    # prompt; dropping them here meant a real conducted PCR paper could be
+    # evaluated against a placeholder question and an LLM-generated key even
+    # when the teacher had already supplied the approved marking material.
     rubric = question_doc.get("rubric")
     if not rubric and question_doc.get("explanation"):
         rubric = question_doc["explanation"]
+
+    question_text = (
+        question_doc.get("question_text")
+        or question_doc.get("text")
+        or question_doc.get("question")
+        or ""
+    )
+    reference_solution = (
+        question_doc.get("reference_solution")
+        or question_doc.get("solution")
+        or question_doc.get("answer")
+        or question_doc.get("correct_answer")
+        or question_doc.get("correctAnswer")
+        or question_doc.get("final_answer_text")
+        or ""
+    )
+    if not reference_solution and isinstance(question_doc.get("metadata"), dict):
+        reference_solution = (
+            question_doc["metadata"].get("reference_solution")
+            or question_doc["metadata"].get("solution")
+            or question_doc["metadata"].get("answer")
+            or ""
+        )
 
     # Expected word range heuristic based on complexity
     expected_word_range: Optional[Dict[str, int]] = None
@@ -303,14 +333,32 @@ def adapt_question_to_pcr(
         or ""
     )
 
+    # Preserve the authoring order used by student answer labels (Q1, Q2,
+    # ...).  Session snapshots may override this with their immutable
+    # position, but carrying it through the generic adapter keeps direct PCR
+    # syncs and legacy papers addressable as well.
+    question_number: Optional[int] = None
+    for number_field in ("question_number", "extraction_order", "position"):
+        raw_number = question_doc.get(number_field)
+        try:
+            parsed_number = int(raw_number)
+        except (TypeError, ValueError):
+            continue
+        if parsed_number > 0:
+            question_number = parsed_number
+            break
+
     return {
         "question_id": question_id,
         "exam_id": resolved_exam_id,
+        "question_number": question_number,
         "subject": subject,
         "question_type": question_type,
         "complexity": complexity,
         "eval_template": eval_template,
         "max_marks": max_marks,
+        "question_text": question_text,
+        "reference_solution": reference_solution or None,
         "rubric": rubric,
         "expects_diagram": bool(has_diagram),
         "diagram_weight": diagram_weight,

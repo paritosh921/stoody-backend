@@ -27,6 +27,12 @@ class FakeCollection:
         self.rows.append(document)
         return {"inserted_id": document["upload_id"]}
 
+    def __call__(self, *args, **kwargs):
+        # A real AsyncIOMotorCollection is callable too, despite not being a
+        # DatabaseManager helper.  It raises when invoked; the persistence
+        # helper must recognize it as a collection before reaching this path.
+        raise TypeError("MotorCollection object is not callable")
+
 
 class FakeMotorDb:
     def __init__(self):
@@ -35,6 +41,13 @@ class FakeMotorDb:
     def __getitem__(self, name):
         assert name == "upload_security_verdicts"
         return self.collection
+
+    def __getattr__(self, name):
+        # Motor databases dynamically expose a collection for unknown
+        # attributes, including a name that looks like a manager helper.
+        if name == "mongo_insert_one":
+            return self.collection
+        raise AttributeError(name)
 
 
 def test_scan_result_factories():

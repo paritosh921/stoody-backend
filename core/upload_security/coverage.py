@@ -31,6 +31,7 @@ ROUTE_PREFIXES_BY_MODULE: dict[str, tuple[str, ...]] = {
     "desktop_diagnostics_async.py": ("/api/v1",),
     "desktop_bug_reports_async.py": ("/api/v1",),
     "camera_upload_async.py": ("/api/v1/ingest/camera",),
+    "evalpen_student_submission_async.py": ("/api/v1/student",),
     "student_bulk_upload.py": ("/api/v1/admin",),
     "tutor_bulk_upload.py": ("/api/v1/tutor",),
     "timetable_bulk_upload.py": ("/api/v1/admin",),

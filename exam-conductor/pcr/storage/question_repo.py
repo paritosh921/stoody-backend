@@ -175,12 +175,19 @@ class QuestionRepository:
     ) -> List[Dict[str, Any]]:
         """Fetch all questions for an exam.
 
-        Returns questions ordered by ``question_id`` for deterministic
-        presentation.
+        Returns questions in immutable paper order when ``question_number`` is
+        available.  Legacy sessions fall back to creation order, then ID, so
+        OCR's Q1/Q2 markers can still be mapped deterministically.
         """
         cursor = (
             self._questions.find({"exam_id": exam_id})
-            .sort("question_id", ASCENDING)
+            .sort(
+                [
+                    ("question_number", ASCENDING),
+                    ("created_at", ASCENDING),
+                    ("question_id", ASCENDING),
+                ]
+            )
         )
         return await cursor.to_list(length=500)
 

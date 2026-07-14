@@ -224,6 +224,22 @@ def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
     return (source_rank, review_rank, confidence_rank)
 
 
+async def _materialize_pcr_marking_plan(
+    tenant_db: Any,
+    *,
+    document_id: str,
+    questions: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Compatibility wrapper for the shared snapshot/finalization merger."""
+    from services.exampen_paper_service import materialize_pcr_marking_plan
+
+    return await materialize_pcr_marking_plan(
+        tenant_db,
+        document_id=document_id,
+        questions=questions,
+    )
+
+
 def _build_ai_gateway_context(
     *,
     current_user: Dict[str, Any],
@@ -3426,6 +3442,12 @@ def _document_file_exists(document: Dict[str, Any]) -> bool:
     return _resolve_document_file_path(document) is not None
 
 
+def _can_upload_answer_sheet(document_type: Any, exam_mode: Optional[str]) -> bool:
+    """Return whether a document type may carry a teacher-only worked answer PDF."""
+    normalized_exam_mode = str(exam_mode or "").strip().lower()
+    return document_type == "Test Series" and normalized_exam_mode in {"", "pcr"}
+
+
 @router.post("/upload")
 @limiter.limit("10/minute")
 async def upload_pdf(
@@ -3499,6 +3521,7 @@ async def upload_pdf(
                 detail=f"Invalid document type. Allowed: {', '.join(allowed_types)}"
             )
 
+        exam_mode = (exam_mode or "").strip().lower() or None
         question_type = (question_type or "").strip().lower() or None
         if question_type and question_type not in {"mcq", "subjective", "mixed"}:
             raise HTTPException(
@@ -3548,12 +3571,11 @@ async def upload_pdf(
                 detail="Answer template upload is only allowed for DCR exam documents",
             )
 
-        if answer_sheet is not None:
-            if document_type != "Test Series" or exam_mode:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Answer sheet upload is only allowed for online Test Series documents",
-                )
+        if answer_sheet is not None and not _can_upload_answer_sheet(document_type, exam_mode):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Answer sheet upload is only allowed for online or PCR Test Series documents",
+            )
 
         answer_solution_mode = (answer_solution_mode or ("upload" if answer_sheet is not None else "none")).strip().lower()
         if answer_solution_mode not in {"none", "upload", "auto"}:
@@ -3948,6 +3970,14 @@ async def finalize_exam(
                 ),
             )
 
+        # Use one tenant DB handle for both the legacy ExamPen sync and the
+        # immutable paper snapshot written below.  Finalization is the only
+        # point at which authoring content becomes conducted-exam metadata.
+        if is_b2c:
+            tenant_db = db.b2c_db
+        else:
+            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+
         # Validate and sync based on exam_mode
         sync_summary = {}
 
@@ -3984,11 +4014,6 @@ async def finalize_exam(
             # Sync to exampen_answer_keys
             from api.v1.tutor_async import sync_dcr_answer_keys
 
-            if is_b2c:
-                tenant_db = db.b2c_db
-            else:
-                tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-
             result = await sync_dcr_answer_keys(
                 tenant_db=tenant_db,
                 questions=questions,
@@ -3998,17 +4023,35 @@ async def finalize_exam(
             sync_summary = {"engine": "dcr", "answer_keys_upserted": (result or {}).get("upserted", 0)}
 
         elif exam_mode == "pcr":
+            # A subjective OCR result is not enough to mark a real paper.
+            # Require reviewed text, marks, and a teacher-approved solution or
+            # rubric before the document is frozen.  Approved answer-sheet
+            # mappings are merged into an in-memory marking plan here, so the
+            # normal Content Manager review flow can supply the authoritative
+            # solution without mutating the editable source question.
+            from services.exampen_paper_service import validate_pcr_questions
+
+            finalized_questions, marking_plan_summary = await _materialize_pcr_marking_plan(
+                tenant_db,
+                document_id=document_id,
+                questions=questions,
+            )
+            readiness_errors = validate_pcr_questions(finalized_questions)
+            if readiness_errors:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "message": "PCR finalization requires a complete marking plan",
+                        "errors": readiness_errors[:50],
+                    },
+                )
+
             # PCR: sync all questions to evalpen_questions
             from api.v1.tutor_async import sync_questions_to_exampen
 
-            if is_b2c:
-                tenant_db = db.b2c_db
-            else:
-                tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-
             result = await sync_questions_to_exampen(
                 tenant_db=tenant_db,
-                questions=questions,
+                questions=finalized_questions,
                 exam_id=document_id,
                 default_subject=doc.get("subject"),
             )
@@ -4016,7 +4059,26 @@ async def finalize_exam(
                 "engine": "pcr",
                 "questions_inserted": (result or {}).get("inserted", 0),
                 "questions_updated": (result or {}).get("updated", 0),
+                "marking_plan": marking_plan_summary,
             }
+
+            # The immutable snapshot below must use the same reviewed
+            # material that was validated and synced above.
+            questions = finalized_questions
+
+        # Persist an immutable version of the paper before setting the hard
+        # document lock.  Live sessions materialize their own metadata from
+        # this snapshot, so their question ids can never drift from the paper
+        # that was approved here.
+        from services.exampen_paper_service import create_paper_snapshot
+
+        paper_snapshot = await create_paper_snapshot(
+            tenant_db=tenant_db,
+            document=doc,
+            questions=questions,
+        )
+        sync_summary["paper_version_id"] = paper_snapshot["paper_version_id"]
+        sync_summary["paper_content_hash"] = paper_snapshot["content_hash"]
 
         # Mark document as finalized
         finalized_update = {
@@ -4024,6 +4086,13 @@ async def finalize_exam(
                 "exam_finalized": True,
                 "exam_finalized_at": datetime.utcnow(),
                 "exam_sync_summary": sync_summary,
+                "exam_paper_version_id": paper_snapshot["paper_version_id"],
+                "exam_content_hash": paper_snapshot["content_hash"],
+                "exam_readiness": {
+                    "status": "paper_ready",
+                    "question_count": paper_snapshot["question_count"],
+                    "checked_at": datetime.utcnow(),
+                },
             }
         }
 
@@ -4032,7 +4101,6 @@ async def finalize_exam(
                 {"document_id": document_id}, finalized_update
             )
         else:
-            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
             await tenant_db["documents"].update_one(
                 {"document_id": document_id}, finalized_update
             )
@@ -4044,6 +4112,7 @@ async def finalize_exam(
             "document_id": document_id,
             "exam_mode": exam_mode,
             "sync_summary": sync_summary,
+            "paper_version_id": paper_snapshot["paper_version_id"],
             "question_count": len(questions),
         }
 
@@ -6333,11 +6402,17 @@ async def update_document_metadata(
                 detail=f"Document {document_id} not found"
             )
 
-        # Block metadata edits if document is finalized for exam
-        if existing_doc.get("exam_finalized"):
+        # Finalization freezes the paper itself, not its operational
+        # availability.  Admins must still be able to activate/deactivate an
+        # approved paper for students without changing its immutable content.
+        finalized_metadata_fields = set(metadata) - {"is_active"}
+        if existing_doc.get("exam_finalized") and finalized_metadata_fields:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot modify metadata of a finalized exam document",
+                detail=(
+                    "Cannot modify metadata of a finalized exam document. "
+                    "Only its active status can be changed."
+                ),
             )
 
         # Update allowed fields
@@ -7085,6 +7160,8 @@ async def create_question(
     standard: str = Form(...),
     question_type: str = Form(default="mcq"),  # mcq or integer
     evaluation_mode: str = Form(default="auto"),
+    reference_solution: Optional[str] = Form(None),
+    rubric: Optional[str] = Form(None),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -7163,6 +7240,8 @@ async def create_question(
             "evaluation_mode": normalized_evaluation_mode,
             "options": [],  # Will be populated below (empty for integer type)
             "correct_answer": correct_answer,
+            "reference_solution": (reference_solution or "").strip() or None,
+            "rubric": (rubric or "").strip() or None,
             "subject": subject,
             "difficulty": difficulty,
             "document_type": document_type,
@@ -7329,6 +7408,12 @@ async def update_question(
             update_data["options"] = question_data["options"]
         if "correct_answer" in question_data:
             update_data["correct_answer"] = question_data["correct_answer"]
+        if "reference_solution" in question_data:
+            update_data["reference_solution"] = str(
+                question_data["reference_solution"] or ""
+            ).strip() or None
+        if "rubric" in question_data:
+            update_data["rubric"] = str(question_data["rubric"] or "").strip() or None
         if "subject" in question_data:
             update_data["subject"] = question_data["subject"]
         if "difficulty" in question_data:

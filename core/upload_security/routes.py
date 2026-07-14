@@ -93,6 +93,14 @@ UPLOAD_ROUTE_POLICY_MAP: tuple[UploadRoutePolicy, ...] = (
         "camera_answer_image",
         "Mobile camera answer image",
     ),
+    _route(
+        "POST",
+        "/api/v1/student/exams/{exam_id}/answer-copy",
+        "student_answer_copy_upload",
+        "Student-authenticated PCR answer-copy submission",
+        pages="student_answer_copy_image",
+        answer_pdf="student_answer_copy_pdf",
+    ),
     _route("POST", "/api/v1/debugger/upload", "debugger_document", "Authenticated debugger RAG document"),
     _route("POST", "/api/debugger/upload", "debugger_document", "Legacy authenticated debugger RAG document"),
     _route(

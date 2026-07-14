@@ -703,7 +703,15 @@ async def resolve_flag(
         # Check if all blocking flags are now resolved; if so, transition
         # eval_status from blocked -> ready
         updated_doc = await resp_repo.get_response(response_id)
-        if updated_doc and updated_doc.get("eval_status") == "blocked":
+        # An unmapped response is intentionally blocked even when its OCR
+        # flags are only warnings.  Resolving a layout/OCR flag must not make
+        # that response eligible for AI scoring until it has a real canonical
+        # session question association.
+        if (
+            updated_doc
+            and updated_doc.get("eval_status") == "blocked"
+            and updated_doc.get("question_id")
+        ):
             flags = updated_doc.get("flags", [])
             still_blocking = any(
                 f.get("severity") == "blocking"

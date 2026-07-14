@@ -9,14 +9,15 @@ Provides two endpoints:
 Architecture:
     Read-only aggregation over evalpen_submissions,
     evalpen_detected_responses, evalpen_evaluations,
-    evalpen_questions, and exampen_dcr_results.
+    evalpen_questions, exampen_dcr_results, and exampen_processing_jobs.
     No writes — this module is a pure reader.
 
 Ownership Declaration (per STATE_OWNERSHIP_MAP.md):
     - Writes:  NONE
     - Reads from: evalpen_submissions, evalpen_detected_responses,
                   evalpen_evaluations, evalpen_questions,
-                  exampen_dcr_results, documents (finalized offline exams)
+                  exampen_dcr_results, exampen_processing_jobs,
+                  documents (finalized offline exams)
     - Never writes to: any collection
 
 Hard constraints:
@@ -101,6 +102,11 @@ class QueueItem(BaseModel):
     response_count: int = 0
     status_summary: str = ""
     has_dcr_results: bool = False
+    # PCR copy-upload jobs are durable and may still be queued before OCR
+    # creates individual responses. Exposing that state prevents a teacher
+    # from seeing a misleading generic "Pending" message.
+    processing_status: Optional[str] = None
+    processing_error: Optional[str] = None
 
 
 class ExamQueueResponse(BaseModel):
@@ -754,7 +760,7 @@ async def get_exam_queue(
             return ExamQueueResponse()
 
         # ----- Fetch all responses for these submissions -----
-        sub_ids = [s.get("submission_id", "") for s in submissions]
+        sub_ids = [str(s.get("submission_id") or "") for s in submissions]
         resp_cursor = tenant_db["evalpen_detected_responses"].find(
             {
                 "submission_id": {"$in": sub_ids},
@@ -774,6 +780,26 @@ async def get_exam_queue(
         for resp in all_responses:
             sid = resp.get("submission_id", "")
             responses_by_sub.setdefault(sid, []).append(resp)
+
+        # ----- Surface durable PCR job state before OCR has created responses -----
+        # A student copy is canonically submitted before the worker performs OCR
+        # and evaluation.  Querying the job here lets the teacher distinguish
+        # "queued" / "checking" from a genuinely missing submission.
+        jobs_by_sub: Dict[str, Dict[str, Any]] = {}
+        if sub_ids:
+            jobs_cursor = tenant_db["exampen_processing_jobs"].find(
+                {"submission_id": {"$in": sub_ids}},
+                projection={
+                    "submission_id": 1,
+                    "status": 1,
+                    "last_error": 1,
+                    "updated_at": 1,
+                },
+            ).sort("updated_at", -1)
+            for job in await jobs_cursor.to_list(length=5000):
+                job_submission_id = str(job.get("submission_id") or "")
+                if job_submission_id and job_submission_id not in jobs_by_sub:
+                    jobs_by_sub[job_submission_id] = job
 
         # ----- Determine if this exam has DCR (metadata-driven) -----
         ak_count = await tenant_db["exampen_answer_keys"].count_documents(
@@ -797,11 +823,22 @@ async def get_exam_queue(
         ready_items: List[QueueItem] = []
 
         for sub in submissions:
-            sub_id = sub.get("submission_id", "")
-            student_id = sub.get("student_id", "")
+            sub_id = str(sub.get("submission_id") or "")
+            student_id = str(sub.get("student_id") or "")
             pub_status = sub.get("publication_status")
             sub_responses = responses_by_sub.get(sub_id, [])
             response_count = len(sub_responses)
+            processing_job = jobs_by_sub.get(sub_id)
+            processing_status = (
+                str(processing_job.get("status") or "")
+                if processing_job
+                else None
+            )
+            processing_error = (
+                str(processing_job.get("last_error") or "") or None
+                if processing_job
+                else None
+            )
 
             # DCR completeness for this student
             student_has_dcr = student_id in dcr_student_ids
@@ -835,17 +872,32 @@ async def get_exam_queue(
             # Fully evaluated = PCR done AND DCR done (if applicable)
             all_evaluated = pcr_all_evaluated and dcr_complete
 
+            job_needs_attention = processing_status in {
+                "failed",
+                "retryable_error",
+                "enqueue_failed",
+                "blocked_for_review",
+            }
+
             # Bucket logic
-            if has_unresolved_blocking:
+            if has_unresolved_blocking or job_needs_attention:
+                if has_unresolved_blocking:
+                    blocked_summary = f"{unresolved_count} unresolved blocking flag(s)"
+                elif processing_status == "blocked_for_review":
+                    blocked_summary = "AI checking needs teacher review"
+                elif processing_status == "failed":
+                    blocked_summary = "AI checking failed"
+                else:
+                    blocked_summary = "AI checking needs a retry"
                 blocked_items.append(
                     QueueItem(
                         submission_id=sub_id,
                         student_id=student_id,
                         response_count=response_count,
-                        status_summary=(
-                            f"{unresolved_count} unresolved blocking flag(s)"
-                        ),
+                        status_summary=blocked_summary,
                         has_dcr_results=student_has_dcr,
+                        processing_status=processing_status,
+                        processing_error=processing_error,
                     )
                 )
             elif not all_evaluated:
@@ -855,6 +907,13 @@ async def get_exam_queue(
                     parts.append(
                         f"{pending_responses}/{response_count} PCR pending"
                     )
+                if response_count == 0:
+                    if processing_status == "queued":
+                        parts.append("AI checking queued")
+                    elif processing_status == "processing":
+                        parts.append("AI checking in progress")
+                    elif processing_status == "completed":
+                        parts.append("AI completed without detected responses")
                 if exam_has_dcr and not student_has_dcr:
                     parts.append("DCR results missing")
                 status_msg = "; ".join(parts) if parts else "Pending"
@@ -866,6 +925,8 @@ async def get_exam_queue(
                         response_count=response_count,
                         status_summary=status_msg,
                         has_dcr_results=student_has_dcr,
+                        processing_status=processing_status,
+                        processing_error=processing_error,
                     )
                 )
             elif all_evaluated and pub_status != "published":
@@ -876,6 +937,8 @@ async def get_exam_queue(
                         response_count=response_count,
                         status_summary="Fully evaluated, ready to publish",
                         has_dcr_results=student_has_dcr,
+                        processing_status=processing_status,
+                        processing_error=processing_error,
                     )
                 )
             # else: already published — not in any queue bucket

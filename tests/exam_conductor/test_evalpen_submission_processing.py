@@ -130,6 +130,47 @@ class _FakeOCRAdapter:
         )
 
 
+class _UnmarkedProjectileOCRAdapter:
+    """OCR fixture for a handwritten answer that omitted a Q.No marker."""
+
+    async def recognize_pages(self, _pages_data, *, source: str = "camera"):
+        from api.v1._exampen_imports import load_exampen
+
+        models = load_exampen("pcr.domain.response_models")
+        ocr_service = load_exampen("pcr.services.ocr_service")
+
+        return ocr_service.OCRResult(
+            pages=[
+                models.PageOCR(
+                    page_number=1,
+                    page_width_mm=210.0,
+                    page_height_mm=297.0,
+                    text_blocks=[
+                        models.TextBlock(
+                            text=(
+                                "Initial speed u = 20 m/s at theta = 37 degrees. "
+                                "Time of flight, horizontal range, and maximum "
+                                "height are calculated using g = 10."
+                            ),
+                            bbox=models.BoundingBox(
+                                x_min=10.0,
+                                y_min=20.0,
+                                x_max=180.0,
+                                y_max=70.0,
+                            ),
+                            confidence=0.95,
+                            source="camera",
+                        ),
+                    ],
+                    source="camera",
+                    mean_ocr_confidence=0.95,
+                )
+            ],
+            source=source,
+            metadata={"adapter": "unmarked-projectile"},
+        )
+
+
 class _EmptyTextOCRAdapter:
     async def recognize_pages(self, _pages_data, *, source: str = "pen"):
         from api.v1._exampen_imports import load_exampen
@@ -701,6 +742,195 @@ async def test_process_submission_route_reads_ingested_artifact_and_writes_detec
     assert responses[0]["exam_id"] == "EXAM-1"
     assert responses[0]["student_id"] == "STU-1"
     assert "forty two" in responses[0]["detected_text"]
+
+
+@pytest.mark.asyncio
+async def test_process_submission_maps_marker_to_canonical_session_question_id():
+    """Q1 OCR markers must resolve to a session metadata ID, never exam_Q1."""
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import process_submission
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-CANONICAL::question-1",
+            "exam_id": "EXAM-CANONICAL",
+            "question_number": 1,
+            "question_text": "What is the answer?",
+            "question_type": "subjective",
+            "max_marks": 1,
+        }
+    )
+
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-CANONICAL",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="ble_pen",
+        pen_mac="AA:BB:CC:DD:EE:FF",
+        hub_id="HUB-1",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": [{"points": [{"x": 10, "y": 10, "t": 1}]}],
+            }
+        ],
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_FakeOCRAdapter(),
+        ),
+    ):
+        result = await process_submission(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+
+    assert result.blocked_count == 0
+    stored = await db["evalpen_detected_responses"].find_one(
+        {"submission_id": ingest_result.submission_id}
+    )
+    assert stored["question_id"] == "EXAM-CANONICAL::question-1"
+    assert stored["question_number"] == 1
+    assert stored["question_assignment"]["method"] == "marker"
+
+
+@pytest.mark.asyncio
+async def test_process_submission_content_matches_unmarked_handwritten_answer():
+    """A strong unmarked answer is associated before automatic PCR scoring."""
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import process_submission
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": "EXAM-AUTO-MAP::projectile",
+                "exam_id": "EXAM-AUTO-MAP",
+                "question_number": 1,
+                "question_text": (
+                    "A projectile is launched with speed 20 m/s at 37 degrees. "
+                    "Find time of flight, horizontal range, and maximum height."
+                ),
+                "question_type": "subjective",
+                "max_marks": 4,
+            },
+            {
+                "question_id": "EXAM-AUTO-MAP::wedge",
+                "exam_id": "EXAM-AUTO-MAP",
+                "question_number": 2,
+                "question_text": "A block moves on a smooth wedge. Find the normal reaction.",
+                "question_type": "subjective",
+                "max_marks": 4,
+            },
+        ]
+    )
+
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-AUTO-MAP",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="camera",
+        pages=[
+            {
+                "page_number": 1,
+                "image_url": "data:image/png;base64,ZmFrZQ==",
+            }
+        ],
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_UnmarkedProjectileOCRAdapter(),
+        ),
+    ):
+        result = await process_submission(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+
+    assert result.blocked_count == 0
+    stored = await db["evalpen_detected_responses"].find_one(
+        {"submission_id": ingest_result.submission_id}
+    )
+    assert stored["question_id"] == "EXAM-AUTO-MAP::projectile"
+    assert stored["question_number"] == 1
+    assert stored["question_assignment"]["method"] == "content_match"
+    assert stored["question_assignment"]["score"] >= 8
+
+
+@pytest.mark.asyncio
+async def test_process_submission_blocks_unmapped_response_for_teacher_review():
+    """Missing metadata must be reviewable, not auto-scored generically."""
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import process_submission
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-NO-METADATA",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="ble_pen",
+        pen_mac="AA:BB:CC:DD:EE:FF",
+        hub_id="HUB-1",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": [{"points": [{"x": 10, "y": 10, "t": 1}]}],
+            }
+        ],
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_FakeOCRAdapter(),
+        ),
+    ):
+        result = await process_submission(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+
+    assert result.blocked_count == 1
+    stored = await db["evalpen_detected_responses"].find_one(
+        {"submission_id": ingest_result.submission_id}
+    )
+    assert stored["question_id"] is None
+    assert stored["eval_status"] == "blocked"
 
 
 @pytest.mark.asyncio

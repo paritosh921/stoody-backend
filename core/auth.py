@@ -226,6 +226,7 @@ class AuthManager:
         token_data = {
             "sub": user_id,
             "user_type": user_type,
+            "student_id": user_data.get("student_id"),
             "email": user_data.get("email"),
             "username": user_data.get("username"),
             "admin_id": user_data.get("admin_id"),
@@ -251,6 +252,7 @@ class AuthManager:
         session_data = {
             "user_id": user_id,
             "user_type": user_type,
+            "student_id": user_data.get("student_id"),
             "email": user_data.get("email"),
             "username": user_data.get("username"),
             "full_name": user_data.get("full_name"),
@@ -335,6 +337,7 @@ class AuthManager:
             return {
                 "user_id": user_id,
                 "user_type": payload.get("user_type"),
+                "student_id": payload.get("student_id"),
                 "email": payload.get("email"),
                 "username": payload.get("username"),
                 "admin_id": payload.get("admin_id"),

@@ -124,6 +124,23 @@ DEFAULT_WARMUP_MODELS: Dict[str, str] = {
 DEFAULT_WARMUP_MODEL: str = "claude-sonnet-4-20250514"
 
 
+def _is_placeholder_solution(
+    solution: str,
+    question_metadata: Dict[str, Any],
+) -> bool:
+    """Identify option-letter placeholders on written/PCR questions.
+
+    A single ``A``/``B``/``C``/``D`` is a legitimate key for an objective
+    question, but it is not a usable reference solution for the subjective
+    PCR path.  Treating it as authoritative produces a confidently wrong
+    comparison, so fall back to generated marking material instead.
+    """
+    normalized = str(solution or "").strip().upper()
+    question_type = str(question_metadata.get("question_type") or "").strip().lower()
+    objective_types = {"mcq", "objective", "multiple_choice", "single_choice"}
+    return normalized in {"A", "B", "C", "D"} and question_type not in objective_types
+
+
 def _get_gate_provider_default_model() -> str:
     """Resolve the active gate provider's default model."""
     import_errors: list[str] = []
@@ -255,8 +272,78 @@ class SolutionCache:
             Contains the reference solution (cached or generated) and
             metadata about the cache operation.
         """
+        # A teacher-approved key is authoritative.  Persist it as a normal
+        # versioned solution so later evaluation/review stays auditable and so
+        # it supersedes any older LLM-generated cache entry for this question.
+        teacher_solution = str(
+            question_metadata.get("reference_solution")
+            or question_metadata.get("teacher_solution")
+            or ""
+        ).strip()
+        if teacher_solution and _is_placeholder_solution(
+            teacher_solution, question_metadata
+        ):
+            logger.warning(
+                "Question %s has an option-letter placeholder rather than a "
+                "written reference solution; generating a PCR key instead",
+                question_id,
+            )
+            teacher_solution = ""
+        # A reviewed rubric is itself teacher-authored marking material.  It
+        # must not be silently replaced by an LLM-generated answer key just
+        # because it is structured as criteria rather than prose solution.
+        teacher_material_type = "reference_solution"
+        if not teacher_solution:
+            teacher_solution = str(question_metadata.get("rubric") or "").strip()
+            if teacher_solution:
+                teacher_material_type = "rubric"
+        if teacher_solution:
+            existing = await self._store.get_latest_solution(question_id)
+            if not (
+                existing
+                and existing.get("reference_solution") == teacher_solution
+                and existing.get("solution_source") == "teacher"
+            ):
+                await self._store.upsert_solution(
+                    {
+                        "question_id": question_id,
+                        "reference_solution": teacher_solution,
+                        "solution_source": "teacher",
+                        "marking_material_type": teacher_material_type,
+                        "model_used": None,
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                )
+                existing = await self._store.get_latest_solution(question_id)
+
+            return CacheLookupResult(
+                hit=True,
+                reference_solution=teacher_solution,
+                version=(existing or {}).get("version", 1),
+                solution_source="teacher",
+                model_used=None,
+                was_generated=False,
+            )
+
         # -- Cache hit check --
         existing = await self._store.get_latest_solution(question_id)
+        if (
+            existing
+            and existing.get("solution_source") == "teacher"
+            and _is_placeholder_solution(
+                str(existing.get("reference_solution") or ""),
+                question_metadata,
+            )
+        ):
+            # Session materialisation may already have cached the placeholder
+            # before this lookup.  Ignore that version so _generate_and_store
+            # creates an auditable, newer LLM solution rather than comparing a
+            # handwritten answer to the letter "A".
+            logger.warning(
+                "Ignoring placeholder teacher solution cache for question %s",
+                question_id,
+            )
+            existing = None
 
         if existing is not None:
             logger.info(

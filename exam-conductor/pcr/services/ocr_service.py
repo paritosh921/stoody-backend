@@ -27,7 +27,10 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+from config_async import settings
 
 from ..domain.response_models import (
     BoundingBox,
@@ -671,8 +674,8 @@ def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
     Handles:
     - Already base64 data (starts with ``/9j/`` for JPEG, ``iVBOR`` for PNG,
       or is a data URI ``data:image/...;base64,...``)
-    - S3 keys (TODO: implement S3 fetch)
-    - Local file paths (TODO: implement local file read)
+    - released local upload paths (read only inside the private upload root)
+    - S3 keys (not configured in this adapter yet)
 
     Returns ``None`` if the reference cannot be resolved.
     """
@@ -702,9 +705,25 @@ def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
         except Exception:
             pass
 
-    # TODO: S3 key — fetch from S3 and return base64
-    # if ref.startswith("s3://") or "/" in ref:
-    #     return await _fetch_from_s3(ref)
+    # Released uploads use absolute local paths in the current deployment.
+    # Only resolve files inside the configured private upload root; a database
+    # reference must never become an arbitrary file-read primitive.
+    try:
+        root = Path(settings.UPLOAD_PRIVATE_LOCAL_DIR).resolve(strict=False)
+        candidate = Path(ref).resolve(strict=False)
+        if root == candidate or root in candidate.parents:
+            if candidate.is_file():
+                # Camera policy caps images well below this ceiling.  Keep a
+                # second bound here because OCR can also be invoked manually.
+                size = candidate.stat().st_size
+                if 0 < size <= 25 * 1024 * 1024:
+                    return base64.b64encode(candidate.read_bytes()).decode("ascii")
+                logger.warning("Refusing OCR image outside safe size limit: %s", candidate)
+    except OSError:
+        logger.warning("Could not read protected camera image reference: %s", ref[:120])
+
+    # S3-backed deployments should provide a storage resolver before camera
+    # OCR is enabled.  Do not attempt unauthenticated URL retrieval here.
 
     logger.debug(
         "raw_image_ref does not appear to be base64 or data URI: %s...",

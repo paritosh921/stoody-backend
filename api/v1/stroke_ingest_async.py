@@ -193,6 +193,8 @@ class FinalizeResponse(BaseModel):
     checksum_match: bool
     ingested: bool
     message: str
+    processing_job_id: Optional[str] = None
+    processing_status: Optional[str] = None
 
 
 class PenUploadStatus(BaseModel):
@@ -222,19 +224,21 @@ class DedupCheckResponse(BaseModel):
 # Index helpers
 # ---------------------------------------------------------------------------
 
-_indexes_ensured = False
+_indexed_collections: set[str] = set()
 
 
 async def _ensure_indexes(collection) -> None:
-    global _indexes_ensured
-    if _indexes_ensured:
+    # The API is tenant-scoped.  Do not let the first tenant processed by a
+    # worker suppress the uniqueness indexes needed by every later tenant.
+    collection_key = str(getattr(collection, "full_name", "")) or repr(collection)
+    if collection_key in _indexed_collections:
         return
     await collection.create_index(
         [("exam_id", 1), ("pen_mac", 1), ("chunk_index", 1)],
         unique=True,
     )
     await collection.create_index("dedup_hash")
-    _indexes_ensured = True
+    _indexed_collections.add(collection_key)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +360,13 @@ async def _resolve_exam_context_for_ingest(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {exam_id} not found",
+        )
+
+    configured_capture_mode = exam_doc.get("capture_mode")
+    if configured_capture_mode is not None and str(configured_capture_mode) not in {"pen", "hybrid"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pen capture was not enabled when this exam session was created",
         )
 
     user_type = (current_user.get("user_type") or "").lower()
@@ -684,6 +695,8 @@ async def finalize_pen_upload(
     # Bridge to canonical ingest — reconstruct pages from chunks if not provided
     submission_id = None
     ingested = False
+    processing_job_id = None
+    processing_status = None
 
     pages_for_ingest = body.pages
     if not pages_for_ingest:
@@ -725,6 +738,36 @@ async def finalize_pen_upload(
         submission_id = result.submission_id
         ingested = True
 
+        if canonical_exam_type == "pcr" and submission_id:
+            try:
+                from services.exampen_workflow import schedule_submission_processing
+
+                job = await schedule_submission_processing(
+                    tenant_db,
+                    db_name=str(current_user.get("db_name") or ""),
+                    exam_id=exam_id,
+                    submission_id=submission_id,
+                    student_id=body.student_id,
+                )
+                processing_job_id = job.get("job_id")
+                processing_status = job.get("status")
+            except Exception:
+                # Canonical ingest is already durable.  The job record can be
+                # reconciled later; never report a valid captured copy as an
+                # ingest failure merely because dispatch is unavailable.
+                logger.exception("PCR job scheduling failed for submission=%s", submission_id)
+
+        if submission_id:
+            try:
+                from services.exampen_workflow import _maybe_mark_exam_ready_for_review
+
+                await _maybe_mark_exam_ready_for_review(tenant_db, exam_id)
+            except Exception:
+                # Lifecycle coordination is retried at the upload transition
+                # and by later submissions; it must not invalidate a durable
+                # canonical copy.
+                logger.exception("Could not reconcile exam readiness for submission=%s", submission_id)
+
         logger.info(
             "Finalized and ingested: exam=%s pen=%s student=%s submission=%s",
             exam_id, pen_mac_upper, body.student_id, submission_id,
@@ -743,6 +786,8 @@ async def finalize_pen_upload(
         checksum_match=True,
         ingested=ingested,
         message="Upload finalized and ingested" if ingested else "Upload finalized, pending ingest",
+        processing_job_id=processing_job_id,
+        processing_status=processing_status,
     )
 
 

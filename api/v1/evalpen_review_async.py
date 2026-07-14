@@ -122,11 +122,19 @@ class ResponseSummaryAPI(BaseModel):
     response_id: str
     evaluation_id: Optional[str] = None
     question_id: Optional[str] = None
+    question_number: Optional[int] = None
     content_type: str = "TEXT_ONLY"
     eval_status: str = "pending"
+    # The answer text and AI-generated evaluation artefacts are deliberately
+    # returned only by this staff-only review endpoint.  They let the teacher
+    # audit what was read, the worked solution used for marking, and the
+    # per-step rationale before publishing a score.
+    detected_text: Optional[str] = None
     total_score: Optional[float] = None
     max_score: Optional[float] = None
     overall_feedback: Optional[str] = None
+    reference_solution: Optional[str] = None
+    step_marks: Optional[List[Dict[str, Any]]] = None
     flags: Optional[List[Dict[str, Any]]] = None
     has_blocking_flags: bool = False
 
@@ -375,11 +383,22 @@ async def get_submission_summary(
             resp_score = None
             resp_max = None
             feedback = None
+            reference_solution = None
+            step_marks = None
 
             if evaluation:
                 resp_score = evaluation.get("total_score", 0.0)
                 resp_max = evaluation.get("max_score", 0.0)
                 feedback = evaluation.get("overall_feedback")
+                reference_solution = evaluation.get("reference_solution")
+                raw_step_marks = evaluation.get("step_marks")
+                if isinstance(raw_step_marks, list):
+                    # Evaluation records are persisted as plain Mongo
+                    # documents, but keep the API robust if an older record
+                    # contains an unexpected value.
+                    step_marks = [
+                        mark for mark in raw_step_marks if isinstance(mark, dict)
+                    ] or None
                 total_score += resp_score or 0.0
                 total_max += resp_max or 0.0
                 evaluated_count += 1
@@ -409,11 +428,15 @@ async def get_submission_summary(
                     response_id=response_id,
                     evaluation_id=evaluation.get("evaluation_id") if evaluation else None,
                     question_id=resp_doc.get("question_id"),
+                    question_number=resp_doc.get("question_number"),
                     content_type=resp_doc.get("content_type", "TEXT_ONLY"),
                     eval_status=eval_status,
+                    detected_text=resp_doc.get("detected_text"),
                     total_score=resp_score,
                     max_score=resp_max,
                     overall_feedback=feedback,
+                    reference_solution=reference_solution,
+                    step_marks=step_marks,
                     flags=api_flags if api_flags else None,
                     has_blocking_flags=has_blocking,
                 )

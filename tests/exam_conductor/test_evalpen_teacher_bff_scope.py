@@ -139,3 +139,103 @@ async def test_teacher_bff_queue_rejects_exam_hidden_from_tutor():
 
     assert exc.value.status_code == 403
 
+
+@pytest.mark.asyncio
+async def test_teacher_bff_queue_exposes_queued_pcr_copy_before_responses_exist():
+    from api.v1.evalpen_teacher_bff_async import get_exam_queue
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-QUEUED",
+            "exam_type": "pcr",
+            "created_by_tutor_id": "TUT-1",
+            "teacher_ids": ["TUT-1"],
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-QUEUED",
+            "exam_id": "EXAM-QUEUED",
+            "student_id": "harsh21",
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-QUEUED",
+            "submission_id": "SUB-QUEUED",
+            "status": "queued",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "different-student-id"}],
+        ),
+    ):
+        result = await get_exam_queue(
+            exam_id="EXAM-QUEUED",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert len(result.pending) == 1
+    item = result.pending[0]
+    assert item.student_id == "harsh21"
+    assert item.response_count == 0
+    assert item.processing_status == "queued"
+    assert item.processing_error is None
+    assert item.status_summary == "AI checking queued"
+
+
+@pytest.mark.asyncio
+async def test_teacher_bff_queue_marks_failed_pcr_copy_for_staff_attention():
+    from api.v1.evalpen_teacher_bff_async import get_exam_queue
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-FAILED",
+            "exam_type": "pcr",
+            "created_by_tutor_id": "TUT-1",
+            "teacher_ids": ["TUT-1"],
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-FAILED",
+            "exam_id": "EXAM-FAILED",
+            "student_id": "harsh21",
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-FAILED",
+            "submission_id": "SUB-FAILED",
+            "status": "failed",
+            "last_error": "OCR provider did not respond",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "different-student-id"}],
+        ),
+    ):
+        result = await get_exam_queue(
+            exam_id="EXAM-FAILED",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert result.pending == []
+    assert len(result.blocked) == 1
+    item = result.blocked[0]
+    assert item.processing_status == "failed"
+    assert item.processing_error == "OCR provider did not respond"
+    assert item.status_summary == "AI checking failed"
+

@@ -781,6 +781,7 @@ async def student_login(
 
         student_data = {
             "user_id": str(student["_id"]),
+            "student_id": student.get("student_id"),
             "user_type": "student",
             "username": student.get("username"),
             "email": student.get("email"),

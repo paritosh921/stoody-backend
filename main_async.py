@@ -65,6 +65,9 @@ from config_async import (
     MAX_WORKERS,
     WORKER_CONNECTIONS,
     OCR_CONCURRENCY_LIMIT,
+    EXAMPEN_INLINE_PROCESSOR_ENABLED,
+    EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS,
+    EXAMPEN_INLINE_PROCESSOR_CONCURRENCY,
     ENABLE_METRICS,
     METRICS_ACCESS_TOKEN,
     UPLOAD_ENABLE_PUBLIC_STATIC_MOUNT,
@@ -383,6 +386,7 @@ try:
     from api.v1.evalpen_invigilator_async import router as evalpen_invigilator_router
     from api.v1.evalpen_teacher_bff_async import router as evalpen_teacher_bff_router
     from api.v1.evalpen_student_bff_async import router as evalpen_student_bff_router
+    from api.v1.evalpen_student_submission_async import router as evalpen_student_submission_router
     from api.v1.invig_console_async import router as invig_console_router
     from api.v1.hub_ops_async import router as hub_ops_router
     from api.v1.stroke_ingest_async import router as stroke_ingest_router
@@ -404,6 +408,7 @@ except Exception as e:
     evalpen_invigilator_router = None
     evalpen_teacher_bff_router = None
     evalpen_student_bff_router = None
+    evalpen_student_submission_router = None
     invig_console_router = None
     hub_ops_router = None
     stroke_ingest_router = None
@@ -580,6 +585,8 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting SkillBot Async Backend...")
     _refresh_upload_security_config_metrics()
 
+    inline_pcr_processor = None
+
     try:
         # Initialize database connections
         db_manager = DatabaseManager()
@@ -650,6 +657,28 @@ async def lifespan(app: FastAPI):
             except Exception as ep_err:
                 logger.warning(f"ExamPen index initialization skipped: {ep_err}")
 
+        # In local development, make the student-upload button behave like the
+        # deployed product even when a developer has not separately started a
+        # Celery worker.  Production keeps this disabled by default and uses
+        # its supervised worker service instead.
+        if _evalpen_available and EXAMPEN_INLINE_PROCESSOR_ENABLED:
+            try:
+                from services.exampen_inline_processor import InlinePCRProcessor
+
+                inline_pcr_processor = InlinePCRProcessor(
+                    db_manager,
+                    poll_seconds=EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS,
+                    concurrency=EXAMPEN_INLINE_PROCESSOR_CONCURRENCY,
+                )
+                await inline_pcr_processor.start()
+                app.state.exampen_inline_processor = inline_pcr_processor
+                logger.info("✅ ExamPen local automatic PCR processor started")
+            except Exception as inline_processor_error:
+                logger.warning(
+                    "⚠️ ExamPen local automatic PCR processor disabled: %s",
+                    inline_processor_error,
+                )
+
         logger.info("✅ All services initialized successfully")
 
         yield
@@ -677,6 +706,10 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
             logger.info("✅ Note classification worker stopped")
+
+        if inline_pcr_processor:
+            await inline_pcr_processor.stop()
+            logger.info("✅ ExamPen local automatic PCR processor stopped")
 
         if cache_manager:
             await cache_manager.close()
@@ -1526,6 +1559,11 @@ if _evalpen_available:
         evalpen_student_bff_router,
         prefix=f"{API_V1_PREFIX}/student",
         tags=["evalpen-student-bff"],
+    )
+    app.include_router(
+        evalpen_student_submission_router,
+        prefix=f"{API_V1_PREFIX}/student",
+        tags=["evalpen-student-copy-submission"],
     )
     app.include_router(
         invig_console_router,

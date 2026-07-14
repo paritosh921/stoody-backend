@@ -9,6 +9,7 @@ CENTRAL_UPLOAD_GATEWAY_CALLS = {
     "secure_upload_many",
     "upload_message_attachments",
     "_store_exam_template_file",
+    "_secure_student_copy_pages",
     "_validate_bulk_upload_file",
     "parse_upload_file",
     "_read_clean_timetable_upload",

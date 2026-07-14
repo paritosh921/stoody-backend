@@ -398,6 +398,21 @@ class AsyncSettings(BaseSettings):
     # Background task configuration
     CELERY_BROKER_URL: str = os.getenv("CELERY_BROKER_URL", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    # Local development must be able to process PCR copies without requiring a
+    # developer to manually open a separate Celery terminal.  Production keeps
+    # this disabled and relies on the separately supervised Celery worker.
+    EXAMPEN_INLINE_PROCESSOR_ENABLED: bool = _env_bool(
+        "EXAMPEN_INLINE_PROCESSOR_ENABLED",
+        _backend_debug_mode_from_env(),
+    )
+    EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS: float = max(
+        1.0,
+        float(os.getenv("EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS", "3")),
+    )
+    EXAMPEN_INLINE_PROCESSOR_CONCURRENCY: int = max(
+        1,
+        int(os.getenv("EXAMPEN_INLINE_PROCESSOR_CONCURRENCY", "1")),
+    )
 
     # Performance tuning
     DB_POOL_RECYCLE: int = int(os.getenv("DB_POOL_RECYCLE", 3600))
@@ -519,6 +534,9 @@ WORKER_CONNECTIONS = settings.WORKER_CONNECTIONS
 OPENAI_CONCURRENCY_LIMIT = settings.OPENAI_CONCURRENCY_LIMIT
 OCR_TIMEOUT_SECONDS = settings.OCR_TIMEOUT_SECONDS
 OCR_CONCURRENCY_LIMIT = settings.OCR_CONCURRENCY_LIMIT
+EXAMPEN_INLINE_PROCESSOR_ENABLED = settings.EXAMPEN_INLINE_PROCESSOR_ENABLED
+EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS = settings.EXAMPEN_INLINE_PROCESSOR_POLL_SECONDS
+EXAMPEN_INLINE_PROCESSOR_CONCURRENCY = settings.EXAMPEN_INLINE_PROCESSOR_CONCURRENCY
 LOG_LEVEL = settings.LOG_LEVEL
 ENABLE_METRICS = settings.ENABLE_METRICS
 METRICS_ACCESS_TOKEN = settings.METRICS_ACCESS_TOKEN

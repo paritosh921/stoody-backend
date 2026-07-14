@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -131,22 +132,70 @@ async def _get_tenant_db(
 # Helper: extract student_id from JWT claims
 # ---------------------------------------------------------------------------
 
-def _get_student_id(current_user: Dict[str, Any]) -> str:
-    """Return the authenticated user's user_id as the student_id.
+def _clean_identity(value: Any) -> str:
+    return str(value or "").strip()
 
-    The student_id in evalpen collections corresponds to ``user_id``
-    from the JWT claims (which is ``str(student["_id"])`` at login
-    time).  Any authenticated user is allowed to call these endpoints,
-    but the query is always scoped to their own user_id so they can
-    only see their own data.
+
+def _get_student_id(current_user: Dict[str, Any]) -> str:
+    """Return the Student DB identifier, falling back for legacy sessions.
+
+    Conducted-exam rosters are built from ``students.student_id``.  Login
+    sessions historically only carried the Mongo account ``user_id``, so the
+    fallback keeps older score records readable while new sessions use the
+    stable Student DB identifier.
     """
-    student_id = current_user.get("user_id")
+    student_id = _clean_identity(current_user.get("student_id")) or _clean_identity(
+        current_user.get("user_id")
+    )
     if not student_id:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User identity could not be determined from token",
         )
     return student_id
+
+
+async def _get_student_identity_ids(
+    tenant_db: Any,
+    current_user: Dict[str, Any],
+) -> List[str]:
+    """Return the canonical Student DB id followed by safe legacy aliases.
+
+    A currently logged-in student can hold a token issued before the
+    ``student_id`` claim existed.  Resolve that token back to its own student
+    profile so a roster selected in Student DB immediately works, without
+    requiring every student to log out first.  The account ``user_id`` stays
+    as a read-only alias so already-published legacy records remain visible.
+    """
+    account_id = _clean_identity(current_user.get("user_id"))
+    roster_student_id = _clean_identity(current_user.get("student_id"))
+
+    if not roster_student_id and tenant_db is not None:
+        clauses: List[Dict[str, Any]] = []
+        if ObjectId.is_valid(account_id):
+            clauses.append({"_id": ObjectId(account_id)})
+        if account_id:
+            clauses.append({"student_id": account_id})
+        username = _clean_identity(current_user.get("username"))
+        if username:
+            clauses.extend(({"username": username}, {"username_lower": username.lower()}))
+
+        if clauses:
+            profile_query: Dict[str, Any] = clauses[0] if len(clauses) == 1 else {"$or": clauses}
+            profile = await tenant_db["students"].find_one(
+                profile_query,
+                projection={"student_id": 1},
+            )
+            roster_student_id = _clean_identity((profile or {}).get("student_id"))
+
+    canonical_id = roster_student_id or account_id
+    if not canonical_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User identity could not be determined from token",
+        )
+
+    return list(dict.fromkeys(identity for identity in (canonical_id, account_id) if identity))
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +240,14 @@ async def list_student_exams(
     (first question's exam metadata) with a fallback to the raw exam_id.
     """
     tenant_db = await _get_tenant_db(db, current_user)
-    student_id = _get_student_id(current_user)
+    student_ids = await _get_student_identity_ids(tenant_db, current_user)
+    student_id = student_ids[0]
 
     try:
         # ----- Fetch published submissions for this student -----
         submissions_cursor = tenant_db["evalpen_submissions"].find(
             {
-                "student_id": student_id,
+                "student_id": {"$in": student_ids},
                 "publication_status": "published",
             },
             projection={
@@ -263,7 +313,7 @@ async def list_student_exams(
             dcr_cursor = tenant_db["exampen_dcr_results"].find(
                 {
                     "exam_id": {"$in": exam_ids},
-                    "student_id": student_id,
+                    "student_id": {"$in": student_ids},
                 },
                 projection={"exam_id": 1, "score": 1, "max_score": 1},
             )
@@ -370,14 +420,15 @@ async def get_student_exam_scores(
     Each question entry indicates its ``eval_type`` ("pcr" or "dcr").
     """
     tenant_db = await _get_tenant_db(db, current_user)
-    student_id = _get_student_id(current_user)
+    student_ids = await _get_student_identity_ids(tenant_db, current_user)
+    student_id = student_ids[0]
 
     try:
         # ----- Published-only guard -----
         submission = await tenant_db["evalpen_submissions"].find_one(
             {
                 "exam_id": exam_id,
-                "student_id": student_id,
+                "student_id": {"$in": student_ids},
                 "publication_status": "published",
             },
             projection={"submission_id": 1},
@@ -438,7 +489,7 @@ async def get_student_exam_scores(
             dcr_cursor = tenant_db["exampen_dcr_results"].find(
                 {
                     "exam_id": exam_id,
-                    "student_id": student_id,
+                    "student_id": {"$in": student_ids},
                 },
                 projection={
                     "question_id": 1,

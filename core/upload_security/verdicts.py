@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from inspect import iscoroutinefunction
 from typing import Any, Literal
 
 
@@ -59,8 +60,17 @@ def build_upload_verdict(
 
 
 async def persist_upload_verdict(db: Any, verdict: dict[str, Any]) -> None:
-    if hasattr(db, "mongo_insert_one"):
-        await db.mongo_insert_one("upload_security_verdicts", verdict)
+    # ``AsyncIOMotorDatabase`` dynamically returns a collection for arbitrary
+    # attributes.  ``hasattr(db, "mongo_insert_one")`` is therefore true for a
+    # Motor database even though it is not the DatabaseManager helper method.
+    # Motor collections are themselves callable (they raise a helpful error
+    # only when called), so ``callable(...)`` is not enough here.  The
+    # DatabaseManager adapter is an async method; only use it when the
+    # resolved attribute is actually an async function.  Otherwise persist
+    # through the tenant collection directly.
+    insert_with_manager = getattr(db, "mongo_insert_one", None)
+    if iscoroutinefunction(insert_with_manager):
+        await insert_with_manager("upload_security_verdicts", verdict)
         return
     await ensure_upload_verdict_indexes(db)
     collection = db["upload_security_verdicts"]

@@ -94,6 +94,17 @@ class CameraUploadAck(BaseModel):
     routed_engine: str
     deduplicated: bool
     accepted_at: str
+    completion_required: bool = True
+
+
+class CameraSubmissionAck(BaseModel):
+    exam_id: str
+    student_id: str
+    submission_id: str
+    page_count: int
+    processing_job_id: Optional[str] = None
+    processing_status: Optional[str] = None
+    accepted_at: str
 
 
 class CameraUploadStatus(BaseModel):
@@ -106,19 +117,21 @@ class CameraUploadStatus(BaseModel):
 # Index helpers
 # ---------------------------------------------------------------------------
 
-_indexes_ensured = False
+_indexed_collections: set[str] = set()
 
 
 async def _ensure_indexes(collection) -> None:
-    global _indexes_ensured
-    if _indexes_ensured:
+    # Indexes need to exist in each tenant database, not just the first one
+    # served by this application process.
+    collection_key = str(getattr(collection, "full_name", "")) or repr(collection)
+    if collection_key in _indexed_collections:
         return
     await collection.create_index(
         [("exam_id", 1), ("student_id", 1), ("page_number", 1)],
         unique=True,
     )
     await collection.create_index("content_hash")
-    _indexes_ensured = True
+    _indexed_collections.add(collection_key)
 
 
 def _fmt(v) -> Optional[str]:
@@ -129,9 +142,177 @@ def _fmt(v) -> Optional[str]:
     return None
 
 
+async def _require_camera_upload_context(
+    tenant_db: Any,
+    *,
+    exam_id: str,
+    student_id: str,
+    current_user: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate a camera copy against its conducted-session boundary."""
+    exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam_doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
+
+    from api.v1.exam_orch_async import _require_tutor_visibility
+
+    _require_tutor_visibility(exam_doc, current_user)
+    if exam_doc.get("exam_type") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Camera fallback is available for PCR exams only",
+        )
+    configured_capture_mode = exam_doc.get("capture_mode")
+    if configured_capture_mode is not None and str(configured_capture_mode) not in {"camera", "hybrid"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Camera capture was not enabled when this exam session was created",
+        )
+    lifecycle = exam_doc.get("lifecycle_state", "draft")
+    if lifecycle not in ("collection_closed", "uploading"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Exam {exam_id} is in state '{lifecycle}' — must be "
+                "'collection_closed' or 'uploading' for camera upload"
+            ),
+        )
+    roster = [str(item) for item in (exam_doc.get("roster") or [])]
+    if roster and student_id not in roster:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Student {student_id} not found in exam roster",
+        )
+    return exam_doc
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.post(
+    "/{exam_id}/{student_id}/complete",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CameraSubmissionAck,
+    summary="Finalize a student's uploaded camera copy and queue PCR processing",
+    responses={
+        400: {"description": "Camera fallback unavailable or exam not uploadable"},
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Exam, student, or uploaded pages not found"},
+        422: {"description": "Exam has no canonical owner"},
+    },
+)
+async def complete_camera_submission(
+    exam_id: str,
+    student_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> CameraSubmissionAck:
+    """Turn all uploaded pages for one student into one immutable submission.
+
+    Page uploads are deliberately not processed as they arrive: a multi-page
+    answer must be complete before OCR/segmentation runs, otherwise a fast
+    worker can mark only page one and never revisit later pages.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam_doc = await _require_camera_upload_context(
+        tenant_db,
+        exam_id=exam_id,
+        student_id=student_id,
+        current_user=current_user,
+    )
+    camera_col = tenant_db["exampen_camera_uploads"]
+    await _ensure_indexes(camera_col)
+    cursor = camera_col.find({"exam_id": exam_id, "student_id": student_id}).sort("page_number", 1)
+    pages = await cursor.to_list(length=500)
+    if not pages:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Upload at least one camera page before completing this copy",
+        )
+
+    canonical_admin_id = str(exam_doc.get("admin_id") or "").strip()
+    if not canonical_admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Exam is missing its canonical admin owner",
+        )
+
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        IngestService = load_exampen("ingest.service").IngestService
+        service = IngestService(tenant_db)
+        await service.initialize()
+        result = await service.ingest_submission(
+            exam_id=exam_id,
+            student_id=student_id,
+            admin_id=canonical_admin_id,
+            source="camera",
+            pen_mac=None,
+            pages=[
+                {
+                    "page_number": page["page_number"],
+                    "raw_strokes": None,
+                    # OCR receives the protected local/S3 reference, not a
+                    # public URL and not a mutable client payload.
+                    "raw_image_ref": page.get("storage_path") or page.get("artifact_id"),
+                }
+                for page in pages
+            ],
+        )
+    except ImportError as exc:
+        logger.error("Camera canonical ingest is unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Camera ingestion is not available in this deployment",
+        )
+    except Exception as exc:
+        logger.exception("Camera submission ingest failed: exam=%s student=%s", exam_id, student_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not finalize the uploaded camera copy",
+        ) from exc
+
+    await camera_col.update_many(
+        {"exam_id": exam_id, "student_id": student_id},
+        {
+            "$set": {
+                "submission_id": result.submission_id,
+                "submission_completed_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+    processing_job_id = None
+    processing_status = None
+    try:
+        from services.exampen_workflow import schedule_submission_processing
+
+        job = await schedule_submission_processing(
+            tenant_db,
+            db_name=str(current_user.get("db_name") or ""),
+            exam_id=exam_id,
+            submission_id=result.submission_id,
+            student_id=student_id,
+        )
+        processing_job_id = job.get("job_id")
+        processing_status = job.get("status")
+    except Exception:
+        # The canonical submission is durable and the reconciler can dispatch
+        # its persisted job later.  Surface the copy as accepted rather than
+        # inviting the invigilator to upload it again.
+        logger.exception("Unable to schedule camera PCR job for %s", result.submission_id)
+
+    return CameraSubmissionAck(
+        exam_id=exam_id,
+        student_id=student_id,
+        submission_id=result.submission_id,
+        page_count=len(pages),
+        processing_job_id=processing_job_id,
+        processing_status=processing_status,
+        accepted_at=datetime.now(timezone.utc).isoformat(),
+    )
 
 @router.post(
     "/{exam_id}/{student_id}/{page_num}",
@@ -162,36 +343,16 @@ async def upload_camera_page(
     """
     tenant_db = await _get_tenant_db(db, current_user)
 
-    # Validate exam
-    exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
-    if exam_doc is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Exam {exam_id} not found",
-        )
-
-    # DCR rejection guard
-    exam_type = exam_doc.get("exam_type", "")
-    if exam_type == "dcr":
+    await _require_camera_upload_context(
+        tenant_db,
+        exam_id=exam_id,
+        student_id=student_id,
+        current_user=current_user,
+    )
+    if source not in {"camera", "photographed_copy"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Camera fallback not allowed for DCR exams",
-        )
-
-    # Lifecycle validation
-    lifecycle = exam_doc.get("lifecycle_state", "draft")
-    if lifecycle not in ("collection_closed", "uploading"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Exam {exam_id} is in state '{lifecycle}' — must be 'collection_closed' or 'uploading' for camera upload",
-        )
-
-    # Roster validation
-    roster = exam_doc.get("roster", [])
-    if roster and student_id not in roster:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Student {student_id} not found in exam roster",
+            detail="Camera source must be 'camera' or 'photographed_copy'",
         )
 
     clean_upload = await secure_upload(
@@ -275,42 +436,6 @@ async def upload_camera_page(
             )
         raise
 
-    # Bridge to canonical ingest substrate
-    try:
-        from api.v1._exampen_imports import load_exampen
-        ingest_mod = load_exampen("ingest.service")
-        IngestService = ingest_mod.IngestService
-
-        service = IngestService(tenant_db)
-        await service.initialize()
-
-        await service.ingest_submission(
-            exam_id=exam_id,
-            student_id=student_id,
-            admin_id=current_user.get("user_id", "unknown"),
-            source="camera",
-            pen_mac=None,
-            pages=[{
-                "page_number": page_num,
-                "raw_strokes": None,
-                "raw_image_ref": artifact_id,
-            }],
-        )
-
-        logger.info(
-            "Camera page ingested: exam=%s student=%s page=%d",
-            exam_id, student_id, page_num,
-        )
-    except (ImportError, AttributeError):
-        logger.warning(
-            "IngestService not available — camera artifact saved but not canonically ingested"
-        )
-    except Exception:
-        logger.exception(
-            "Canonical ingest failed for camera upload: exam=%s student=%s page=%d",
-            exam_id, student_id, page_num,
-        )
-
     return CameraUploadAck(
         artifact_id=artifact_id,
         exam_id=exam_id,
@@ -320,6 +445,7 @@ async def upload_camera_page(
         routed_engine="pcr",
         deduplicated=False,
         accepted_at=now.isoformat(),
+        completion_required=True,
     )
 
 

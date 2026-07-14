@@ -123,6 +123,32 @@ def _concat_text(blocks: list[TextBlock]) -> str:
     return " ".join(b.text.strip() for b in sorted_blocks if b.text.strip())
 
 
+def _text_occupied_bbox(
+    text_blocks: list[TextBlock],
+    fallback: BoundingBox,
+) -> BoundingBox:
+    """Return the region actually represented by text-only OCR evidence.
+
+    Camera/PDF OCR commonly emits one compact text block for a handwritten
+    answer even though its segment is the whole A4 page.  Comparing that small
+    block to the full page incorrectly labels ordinary written answers as
+    ``DIAGRAM_HEAVY`` and blocks automatic checking.  The OCR payload has no
+    non-text visual evidence at this stage, so classify the occupied text
+    region instead.  A genuinely image-only page still has no text blocks and
+    continues down the diagram/manual-review path.
+    """
+    if not text_blocks:
+        return fallback
+
+    x_min = max(fallback.x_min, min(block.bbox.x_min for block in text_blocks))
+    y_min = max(fallback.y_min, min(block.bbox.y_min for block in text_blocks))
+    x_max = min(fallback.x_max, max(block.bbox.x_max for block in text_blocks))
+    y_max = min(fallback.y_max, max(block.bbox.y_max for block in text_blocks))
+    if x_max <= x_min or y_max <= y_min:
+        return fallback
+    return BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
+
+
 def _split_blocks_on_multiple_q_markers(pages: list[PageOCR]) -> list[PageOCR]:
     """Split OCR blocks that contain several Q markers into marker blocks.
 
@@ -495,10 +521,14 @@ def _segment_to_response(
             )
         )
 
-    # Content classification
+    # Content classification.  OCR currently carries text blocks but no
+    # reliable non-text/diagram geometry.  Use the text-occupied region so a
+    # normal compact answer on a large page is not falsely blocked as a
+    # diagram.  Empty OCR stays diagram-heavy and requires review.
+    classification_bbox = _text_occupied_bbox(seg.text_blocks, response_bbox)
     content_type, text_coverage, class_flags = classify_content(
         seg.text_blocks,
-        response_bbox,
+        classification_bbox,
         response_id,
     )
     flags.extend(class_flags)

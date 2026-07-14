@@ -775,6 +775,98 @@ class TestUEval01:
         assert gate.calls[0]["model_id"] == "gpt-5.1"
 
     @pytest.mark.asyncio
+    async def test_u_eval_01_teacher_rubric_is_used_without_generating_a_new_key(self):
+        """A finalized rubric is authoritative marking material for PCR."""
+        from pcr.services.solution_cache import SolutionCache
+
+        class Store:
+            def __init__(self):
+                self.docs = []
+
+            async def get_latest_solution(self, _question_id):
+                return None
+
+            async def upsert_solution(self, doc):
+                self.docs.append(doc)
+                return doc
+
+        class Gate:
+            async def call(self, **_kwargs):
+                raise AssertionError("A teacher rubric must not trigger solution generation")
+
+        store = Store()
+        result = await SolutionCache(store, Gate()).lookup(
+            "Q-rubric",
+            {
+                "subject": "English",
+                "question_type": "essay",
+                "max_marks": 5,
+                "question_text": "Discuss the theme.",
+                "rubric": "Award marks for theme, evidence, and clear expression.",
+            },
+        )
+
+        assert result.hit is True
+        assert result.reference_solution == "Award marks for theme, evidence, and clear expression."
+        assert store.docs[0]["solution_source"] == "teacher"
+        assert store.docs[0]["marking_material_type"] == "rubric"
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_subjective_option_letter_placeholder_generates_key(self):
+        """A subjectively marked PCR question cannot be evaluated against "A"."""
+        from pcr.services.solution_cache import SolutionCache
+
+        class Store:
+            def __init__(self):
+                self.docs = [
+                    {
+                        "question_id": "Q-placeholder",
+                        "version": 1,
+                        "reference_solution": "A",
+                        "solution_source": "teacher",
+                    }
+                ]
+
+            async def get_latest_solution(self, question_id):
+                matching = [doc for doc in self.docs if doc["question_id"] == question_id]
+                return matching[-1] if matching else None
+
+            async def upsert_solution(self, doc):
+                self.docs.append(dict(doc))
+                return doc
+
+        class Gate:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    content="Worked solution with calculation steps.",
+                    usage=SimpleNamespace(model="gpt-5.1", total_tokens=10),
+                )
+
+        store = Store()
+        gate = Gate()
+        result = await SolutionCache(store, gate).lookup(
+            "Q-placeholder",
+            {
+                "subject": "Physics",
+                "question_type": "subjective",
+                "max_marks": 4,
+                "question_text": "Find the time of flight.",
+                "reference_solution": "A",
+            },
+        )
+
+        assert result.was_generated is True
+        assert result.solution_source == "llm"
+        assert result.reference_solution == "Worked solution with calculation steps."
+        assert len(gate.calls) == 1
+        assert store.docs[-1]["version"] == 2
+        assert store.docs[-1]["solution_source"] == "llm"
+
+    @pytest.mark.asyncio
     async def test_u_eval_01_solution_warmup_defaults_to_openai_provider(
         self,
         monkeypatch,
