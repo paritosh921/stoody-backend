@@ -284,7 +284,7 @@ class DetectedResponseRepository:
         immutable detected content.  Valid transitions:
 
         - ``pending`` -> ``ready`` | ``ready_with_warnings`` | ``blocked``
-        - ``ready`` -> ``evaluated`` | ``manual_review``
+        - ``ready`` -> ``evaluated`` | ``not_attempted`` | ``manual_review``
         - ``ready_with_warnings`` -> ``evaluated`` | ``manual_review``
         - ``blocked`` -> ``manual_review``
 

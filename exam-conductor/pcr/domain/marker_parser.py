@@ -5,7 +5,8 @@ Spec authority: new-docs/architecture/PCR_EVAL_ENGINE_SPEC.md section 4.2
 Failure mode:   PCR-01 (boundary/marker detection failure -> flags + review queue)
 Test ID:        U-SEG-02
 
-Expected student notation: Q.No X.Ans
+Preferred student notation: Q.No X.Ans.  Common handwritten variants such as
+Q1, Q. 1, Question 1, and Question No. 1 are accepted as well.
 
 Regex from spec:
     /Q\\.?\\s*(?:No|no)\\.?\\s*(\\d{1,3})\\s*(?:[\\.\(\\s]*([a-z]|[ivx]+|[A-Z])[\\)\\.]?)?\\s*\\.?\\s*(?:Ans|ans|ANS)\\.?/i
@@ -27,16 +28,15 @@ from .response_models import PageOCR, QMarker, TextBlock
 # Regex — translated from the spec's JS-style pattern to Python
 # ---------------------------------------------------------------------------
 
-# Spec pattern (case-insensitive):
-# Q\.?\s*(?:No|no)\.?\s*(\d{1,3})\s*(?:[\.\(\s]*([a-z]|[ivx]+|[A-Z])[\)\.]?)?\s*\.?\s*(?:Ans|ans|ANS)\.?
-#
-# Python re.IGNORECASE makes the (?:No|no) and (?:Ans|ans|ANS) groups
-# redundant, but we keep the explicit alternations for fidelity to spec.
+# The original strict spec notation remains accepted, but student copies are
+# frequently labelled simply "Q1" or "Question 1".  Marker recognition must
+# be tolerant while still requiring an explicit Q/Question prefix so normal
+# numbered working is never mistaken for a new answer.
 
 Q_MARKER_PATTERN: re.Pattern[str] = re.compile(
-    r"Q\.?\s*(?:No|no)\.?\s*(\d{1,3})"           # Q.No <number>
-    r"\s*(?:[\.\(\s]*([a-z]|[ivx]+|[A-Z])[\)\.]?)?"  # optional sub-part
-    r"\s*\.?\s*(?:Ans|ans|ANS)\.?",               # .Ans
+    r"\bQ(?:uestion)?\.?\s*(?:No\.?\s*)?(\d{1,3})"  # Q1 / Q.No 1 / Question 1
+    r"\s*(?:\(\s*([a-z]|[ivx]+|[A-Z])\s*\)|\.\s*([a-z]|[ivx]+|[A-Z])(?=\s*\.?\s*(?:Ans(?:wer)?)\b|\s*$))?"  # optional (a) / .a, not .Ans
+    r"\s*\.?\s*(?:Ans(?:wer)?)?\.?",                    # optional .Ans / .Answer
     re.IGNORECASE,
 )
 
@@ -104,7 +104,9 @@ def _try_parse_marker(
         return None
 
     q_number_str = match.group(1)
-    sub_part_raw = match.group(2)
+    # Group 2 is the usual parenthesised sub-part, while group 3 supports
+    # compact labels such as ``Q1.a``.  Keep one normalized output field.
+    sub_part_raw = match.group(2) or match.group(3)
 
     try:
         question_number = int(q_number_str)

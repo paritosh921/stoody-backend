@@ -268,6 +268,21 @@ class TestUSeg02:
         assert match is not None
         assert match.group(1) == "3"
 
+    @pytest.mark.parametrize(
+        "label, expected_question",
+        [
+            ("Q1", "1"),
+            ("Q. 2", "2"),
+            ("Question 3", "3"),
+            ("Question No. 4", "4"),
+        ],
+    )
+    def test_u_seg_02_common_handwritten_question_labels(self, label, expected_question):
+        """Normal handwritten Q-number labels split an answer copy safely."""
+        match = Q_MARKER_PATTERN.search(label)
+        assert match is not None
+        assert match.group(1) == expected_question
+
     def test_u_seg_02_three_digit_question_number(self):
         """Up to 3-digit question numbers are supported."""
         match = Q_MARKER_PATTERN.search("Q.No 123.Ans")
@@ -1324,6 +1339,83 @@ class TestUEval01:
         assert evaluations.docs[0]["manual_review_required"] is True
         assert evaluations.docs[0]["criterion_marks"][0]["marks_awarded"] == 0.0
         assert responses.statuses == ["manual_review"]
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_not_attempted_question_is_zero_without_ai_call(self):
+        """A blank paper question is a deterministic zero, not an AI failure."""
+        from pcr.services.eval_core import EvalCore
+
+        class Responses:
+            def __init__(self):
+                self.statuses = []
+
+            async def get_response(self, response_id):
+                return {
+                    "response_id": response_id,
+                    "question_id": "EXAM-1::Q-4",
+                    "student_id": "STU-1",
+                    "detected_text": "",
+                    "content_type": "TEXT_ONLY",
+                    "is_missing_response": True,
+                    "answer_state": "not_attempted",
+                    "flags": [],
+                }
+
+            async def update_eval_status(self, _response_id, status):
+                self.statuses.append(status)
+
+        class Evaluations:
+            def __init__(self):
+                self.docs = []
+
+            async def insert_evaluation(self, doc):
+                self.docs.append(doc)
+                return doc, False
+
+        class Questions:
+            async def get_question(self, _question_id):
+                return {
+                    "subject": "Physics",
+                    "question_text": "Find the answer.",
+                    "reference_solution": "Teacher worked solution",
+                    "max_marks": 4,
+                    "marking_policy": {"mode": "criterion_rubric_v1"},
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "method",
+                            "description": "Uses the correct method",
+                            "max_marks": 1,
+                        },
+                        {
+                            "criterion_id": "answer",
+                            "description": "Obtains the correct answer",
+                            "max_marks": 3,
+                        },
+                    ],
+                }
+
+        class Cache:
+            async def lookup(self, *_args, **_kwargs):
+                raise AssertionError("A not-attempted answer must not warm or read the AI cache")
+
+        class Gate:
+            async def call(self, **_kwargs):
+                raise AssertionError("A not-attempted answer must not call AI")
+
+        responses = Responses()
+        evaluations = Evaluations()
+        result = await EvalCore(
+            responses, evaluations, Questions(), Cache(), Gate()
+        ).evaluate_response("RESP-MISSING-1")
+
+        assert result.eval_path == "not_attempted"
+        assert result.model_used == "none"
+        assert result.total_score == 0.0
+        assert result.max_score == 4.0
+        assert [mark.marks_awarded for mark in result.criterion_marks] == [0.0, 0.0]
+        assert responses.statuses == ["not_attempted"]
+        assert evaluations.docs[0]["overall_feedback"].startswith("No answer was detected")
+        assert evaluations.docs[0]["evaluation_id"].startswith("EVAL-MISSING-")
 
 
 # ===========================================================================

@@ -100,6 +100,75 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
 
 
 @pytest.mark.asyncio
+async def test_review_summary_keeps_full_paper_denominator_and_shows_blank_questions():
+    """Historical partial OCR records must never turn a 12-mark paper into 4/4."""
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-FULL-PAPER",
+            "exam_id": "EXAM-FULL-PAPER",
+            "student_id": "STU-1",
+            "source": "web_upload",
+            "segmentation_status": "complete",
+        }
+    )
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-FULL-PAPER::Q-{number}",
+                "exam_id": "EXAM-FULL-PAPER",
+                "question_number": number,
+                "max_marks": 4,
+            }
+            for number in (1, 2, 3)
+        ]
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-FULL-PAPER-1",
+            "submission_id": "SUB-FULL-PAPER",
+            "question_id": "EXAM-FULL-PAPER::Q-1",
+            "question_number": 1,
+            "content_type": "TEXT_ONLY",
+            "detected_text": "The only submitted answer",
+            "eval_status": "evaluated",
+            "flags": [],
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-FULL-PAPER-1",
+            "response_id": "RESP-FULL-PAPER-1",
+            "total_score": 4.0,
+            "max_score": 4.0,
+            "overall_feedback": "Correct.",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-FULL-PAPER",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.total_score == 4.0
+    assert result.total_max_score == 12.0
+    assert [response.question_number for response in result.responses] == [1, 2, 3]
+    assert [response.is_missing_response for response in result.responses] == [False, True, True]
+    assert [response.total_score for response in result.responses[1:]] == [0.0, 0.0]
+    assert [response.max_score for response in result.responses[1:]] == [4.0, 4.0]
+
+
+@pytest.mark.asyncio
 async def test_teacher_criterion_review_recomputes_total_and_keeps_audit_history():
     """Teachers can adjust only frozen criterion awards, never the rubric itself."""
     import os

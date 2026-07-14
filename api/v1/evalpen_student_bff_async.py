@@ -92,6 +92,7 @@ class QuestionScoreItem(BaseModel):
     max_score: float = 0.0
     feedback: Optional[str] = None
     eval_type: str = "pcr"  # "pcr" or "dcr"
+    answer_state: Optional[str] = None
 
 
 class StudentExamScoresResponse(BaseModel):
@@ -211,6 +212,44 @@ def _dt_to_iso(val: Any) -> Optional[str]:
     return str(val)
 
 
+def _safe_marks(value: Any) -> float:
+    """Return a non-negative numeric mark without making score pages fragile."""
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _get_pcr_question_catalog(
+    tenant_db: Any,
+    exam_id: str,
+) -> List[Dict[str, Any]]:
+    """Load the immutable paper question list used as the PCR denominator."""
+    if not exam_id:
+        return []
+    cursor = tenant_db["evalpen_questions"].find(
+        {"exam_id": exam_id},
+        projection={"question_id": 1, "question_number": 1, "max_marks": 1},
+    ).sort([("question_number", 1), ("question_id", 1)])
+    docs = await cursor.to_list(length=1000)
+    catalog: List[Dict[str, Any]] = []
+    for doc in docs:
+        question_id = str(doc.get("question_id") or "").strip()
+        if not question_id:
+            continue
+        number = doc.get("question_number")
+        catalog.append(
+            {
+                "question_id": question_id,
+                "question_number": int(number)
+                if isinstance(number, (int, float))
+                else None,
+                "max_marks": _safe_marks(doc.get("max_marks")),
+            }
+        )
+    return catalog
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -293,16 +332,31 @@ async def list_student_exams(
                 sid = sub_info["submission_id"]
                 responses = await resp_repo.get_responses_by_submission(sid)
                 pcr_total = 0.0
-                pcr_max = 0.0
+                evaluated_max = 0.0
+                question_catalog = await _get_pcr_question_catalog(tenant_db, eid)
+                paper_max = sum(question["max_marks"] for question in question_catalog)
+                catalog_question_ids = {
+                    question["question_id"] for question in question_catalog
+                }
+                scored_question_ids: set[str] = set()
                 for resp in responses:
                     response_id = resp.get("response_id", "")
                     ev = await eval_repo.get_evaluation_by_response(response_id)
                     if ev:
-                        pcr_total += ev.get("total_score", 0.0)
-                        pcr_max += ev.get("max_score", 0.0)
+                        question_id = str(resp.get("question_id") or "")
+                        if (
+                            question_id
+                            and question_id in catalog_question_ids
+                            and question_id in scored_question_ids
+                        ):
+                            continue
+                        pcr_total += _safe_marks(ev.get("total_score"))
+                        evaluated_max += _safe_marks(ev.get("max_score"))
+                        if question_id and question_id in catalog_question_ids:
+                            scored_question_ids.add(question_id)
                 pcr_scores[eid] = {
                     "total_score": pcr_total,
-                    "max_score": pcr_max,
+                    "max_score": paper_max or evaluated_max,
                 }
         except ImportError:
             logger.debug("PCR storage not available for student BFF aggregation")
@@ -459,24 +513,84 @@ async def get_student_exam_scores(
             responses = await resp_repo.get_responses_by_submission(
                 submission_id
             )
+            question_catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+            catalog_question_ids = {
+                question["question_id"] for question in question_catalog
+            }
+            evaluated_by_question: Dict[str, Dict[str, Any]] = {}
+            legacy_evaluations: List[Dict[str, Any]] = []
 
             for resp in responses:
                 response_id = resp.get("response_id", "")
-                question_id = resp.get("question_id", "")
+                question_id = str(resp.get("question_id") or "")
                 ev = await eval_repo.get_evaluation_by_response(response_id)
-                if ev:
-                    q_score = ev.get("total_score", 0.0)
-                    q_max = ev.get("max_score", 0.0)
-                    feedback = ev.get("overall_feedback")
-                    total_score += q_score
-                    total_max += q_max
+                if not ev:
+                    continue
+                entry = {
+                    "score": _safe_marks(ev.get("total_score")),
+                    "max_score": _safe_marks(ev.get("max_score")),
+                    "feedback": ev.get("overall_feedback"),
+                    "answer_state": resp.get("answer_state")
+                    or ("not_attempted" if resp.get("is_missing_response") else "detected"),
+                }
+                if question_id and question_id in catalog_question_ids:
+                    # One score per paper question.  Duplicate OCR segments
+                    # are reviewable evidence, never a second mark allocation.
+                    evaluated_by_question.setdefault(question_id, entry)
+                else:
+                    legacy_evaluations.append(
+                        {"question_id": question_id, **entry}
+                    )
+
+            if question_catalog:
+                for question in question_catalog:
+                    question_id = question["question_id"]
+                    result = evaluated_by_question.get(question_id)
+                    if result is None:
+                        questions.append(
+                            QuestionScoreItem(
+                                question_id=question_id,
+                                score=0.0,
+                                max_score=question["max_marks"],
+                                feedback=(
+                                    "No answer was detected for this question, so 0 marks were awarded."
+                                ),
+                                eval_type="pcr",
+                                answer_state="not_attempted",
+                            )
+                        )
+                        total_max += question["max_marks"]
+                        continue
+
+                    total_score += result["score"]
+                    # The immutable paper, not a response document, fixes the
+                    # question maximum.  This also repairs already-published
+                    # partial submissions created before answer slots existed.
+                    total_max += question["max_marks"]
                     questions.append(
                         QuestionScoreItem(
                             question_id=question_id,
-                            score=q_score,
-                            max_score=q_max,
-                            feedback=feedback,
+                            score=result["score"],
+                            max_score=question["max_marks"],
+                            feedback=result["feedback"],
                             eval_type="pcr",
+                            answer_state=result["answer_state"],
+                        )
+                    )
+            else:
+                # Fallback for historical records where immutable question
+                # metadata is unavailable.  Preserve their previous result.
+                for result in legacy_evaluations:
+                    total_score += result["score"]
+                    total_max += result["max_score"]
+                    questions.append(
+                        QuestionScoreItem(
+                            question_id=result["question_id"],
+                            score=result["score"],
+                            max_score=result["max_score"],
+                            feedback=result["feedback"],
+                            eval_type="pcr",
+                            answer_state=result["answer_state"],
                         )
                     )
         except ImportError:

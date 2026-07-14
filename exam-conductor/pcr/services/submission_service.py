@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
@@ -236,8 +237,9 @@ class SubmissionService:
         3. Run OCR/HWR on answer pages → PageOCR
         4. Fetch question metadata for the exam
         5. Run segmentation pipeline → detected responses + flags
-        6. Persist detected responses to ``evalpen_detected_responses``
-        7. Set ``eval_status`` on each response based on flag severity
+        6. Persist a complete answer-slot set to ``evalpen_detected_responses``
+           (detected answers plus explicit not-attempted slots)
+        7. Set ``eval_status`` on each answer slot based on flag severity
         8. Update submission ``segmentation_status``
 
         Parameters
@@ -388,6 +390,14 @@ class SubmissionService:
             assignment_details_by_response=assignment_details_by_response,
         )
 
+        # A paper is a fixed set of questions, not a variable number of OCR
+        # snippets.  If multiple snippets claim the same question, do not
+        # silently mark both and inflate the score.  Preserve the immutable
+        # evidence, but route those snippets to teacher review.
+        duplicate_response_ids = _mark_duplicate_question_assignments(
+            response_docs
+        )
+
         inserted_count = 0
         duplicate_count = 0
 
@@ -407,31 +417,43 @@ class SubmissionService:
         blocked_count = 0
         warning_count = 0
 
-        unmapped_response_ids = {
-            str(doc.get("response_id"))
-            for doc in response_docs
-            if not doc.get("question_id")
+        response_by_id = {
+            str(response.response_id): response
+            for response in seg_result.responses
         }
-        for response in seg_result.responses:
-            has_blocking = any(
-                f.severity == FlagSeverity.BLOCKING for f in response.flags
-            )
-            has_warning = any(
-                f.severity == FlagSeverity.WARNING for f in response.flags
-            )
+        for doc in response_docs:
+            response_id = str(doc.get("response_id") or "")
 
-            if has_blocking or response.response_id in unmapped_response_ids:
-                eval_status = "blocked"
-                blocked_count += 1
-            elif has_warning:
-                eval_status = "ready_with_warnings"
-                warning_count += 1
-            else:
+            # Synthetic slots are deliberate zero-mark records for a paper
+            # question where no answer was detected.  They are safe to send
+            # to EvalCore; it persists a zero result without invoking AI.
+            if doc.get("is_missing_response"):
                 eval_status = "ready"
+            else:
+                response = response_by_id.get(response_id)
+                has_blocking = bool(response) and any(
+                    f.severity == FlagSeverity.BLOCKING
+                    for f in response.flags
+                )
+                has_warning = bool(response) and any(
+                    f.severity == FlagSeverity.WARNING
+                    for f in response.flags
+                )
 
-            await self._response_repo.update_eval_status(
-                response.response_id, eval_status
-            )
+                if (
+                    has_blocking
+                    or not doc.get("question_id")
+                    or response_id in duplicate_response_ids
+                ):
+                    eval_status = "blocked"
+                    blocked_count += 1
+                elif has_warning:
+                    eval_status = "ready_with_warnings"
+                    warning_count += 1
+                else:
+                    eval_status = "ready"
+
+            await self._response_repo.update_eval_status(response_id, eval_status)
 
         if response_docs:
             await self._response_repo.supersede_responses_for_submission(
@@ -449,11 +471,12 @@ class SubmissionService:
         )
 
         logger.info(
-            "Submission %s processed: %d pages, %d responses "
+            "Submission %s processed: %d pages, %d detected answers / %d paper slots "
             "(%d blocked, %d warnings)",
             submission_id,
             len(pages),
             len(seg_result.responses),
+            len(response_docs),
             blocked_count,
             warning_count,
         )
@@ -461,7 +484,10 @@ class SubmissionService:
         return SubmissionProcessingResult(
             submission_id=submission_id,
             page_count=len(pages),
-            response_count=len(seg_result.responses),
+            # Report the full answer-slot count.  Downstream processing uses
+            # this to distinguish a completed paper with unanswered questions
+            # from an empty/failed OCR run.
+            response_count=len(response_docs),
             inserted_count=inserted_count,
             duplicate_count=duplicate_count,
             blocked_count=blocked_count,
@@ -793,10 +819,107 @@ def _build_response_docs(
             "flags": flags_serialized,
             "word_count": response.word_count,
             "is_continuation": response.is_continuation,
+            "is_missing_response": False,
+            "answer_state": (
+                "detected" if question_id else "unmapped"
+            ),
             "eval_status": "pending",
             "_immutable": True,
             "created_at": datetime.now(timezone.utc),
         }
         docs.append(doc)
 
+    # Complete the paper matrix.  A student's score must always be out of
+    # the marks printed on the paper, even when they leave a question blank.
+    # These records intentionally contain no fabricated answer text or source
+    # page.  They simply make the absence explicit, auditable, and scoreable
+    # as zero by EvalCore.
+    assigned_question_ids = {
+        str(doc.get("question_id"))
+        for doc in docs
+        if doc.get("question_id")
+    }
+    for question_number, question_id in sorted(question_ids_by_number.items()):
+        if question_id in assigned_question_ids:
+            continue
+        docs.append(
+            {
+                "response_id": _missing_response_id(submission_id, question_id),
+                "submission_id": submission_id,
+                "question_id": question_id,
+                "question_number": question_number,
+                "sub_part": None,
+                "question_assignment": {
+                    "method": "not_attempted",
+                    "confidence": 1.0,
+                    "reason": "No answer was detected for this paper question",
+                },
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "detected_text": "",
+                "source_pages": [],
+                "content_type": "TEXT_ONLY",
+                "text_coverage_ratio": 0.0,
+                "segmentation_confidence": 1.0,
+                "ocr_confidence": 1.0,
+                "flags": [],
+                "word_count": 0,
+                "is_continuation": False,
+                "is_missing_response": True,
+                "answer_state": "not_attempted",
+                "eval_status": "pending",
+                "_immutable": True,
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+
     return docs
+
+
+def _missing_response_id(submission_id: str, question_id: str) -> str:
+    """Return a deterministic response ID for one unanswered question.
+
+    Re-running OCR for the same submission must not produce a second zero row
+    for the same paper question.  The immutable response repository accepts a
+    duplicate with the same empty detected text, so this stays idempotent.
+    """
+    digest = hashlib.sha256(
+        f"{submission_id}\x1f{question_id}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"RESP-MISSING-{digest}"
+
+
+def _mark_duplicate_question_assignments(
+    docs: List[Dict[str, Any]],
+) -> set[str]:
+    """Mark multiple detected snippets for one question as teacher-review.
+
+    A missing slot is not a duplicate.  Multiple OCR snippets mapped to the
+    same question are ambiguous: automatic scoring of both would double count
+    the question, while choosing one would discard evidence.  Keep both rows
+    immutable and let the status flow route them to review.
+    """
+    by_question: Dict[str, List[Dict[str, Any]]] = {}
+    for doc in docs:
+        question_id = str(doc.get("question_id") or "")
+        if not question_id or doc.get("is_missing_response"):
+            continue
+        by_question.setdefault(question_id, []).append(doc)
+
+    duplicate_ids: set[str] = set()
+    for question_id, assigned_docs in by_question.items():
+        if len(assigned_docs) < 2:
+            continue
+        for doc in assigned_docs:
+            response_id = str(doc.get("response_id") or "")
+            if response_id:
+                duplicate_ids.add(response_id)
+            doc["manual_review_reason"] = (
+                "Multiple answer segments were associated with question "
+                f"{question_id}; teacher review is required before scoring"
+            )
+            assignment = doc.get("question_assignment")
+            if isinstance(assignment, dict):
+                assignment["duplicate_question_assignment"] = True
+
+    return duplicate_ids

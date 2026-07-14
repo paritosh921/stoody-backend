@@ -55,13 +55,14 @@ _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 _DEFAULT_OCR_VISION_MODEL = "gpt-4o"
 
 # LLM OCR extraction prompt
-_OCR_PROMPT_VERSION = "exampen-qno-v1"
+_OCR_PROMPT_VERSION = "exampen-qno-v2"
 _OCR_EXTRACTION_PROMPT = (
-    "This image is a high-contrast raster rendering of BLE digital pen strokes "
-    "from an ExamPen answer sheet. Extract the visible handwritten or "
-    "stroke-rendered text exactly as written. Pay special attention to exam "
-    "answer markers in the form 'Q.No X.Ans' or close variants; these markers "
-    "identify answer lines and must be preserved in the extracted text. "
+    "This image is one page of a student exam answer copy. It may be a camera "
+    "photo, scanned PDF page, or a high-contrast rendering of digital pen strokes. "
+    "Extract the visible handwritten or stroke-rendered text exactly as written. "
+    "Pay special attention to question labels such as 'Q1', 'Q. 1', 'Question 1', "
+    "'1)', or 'Q.No 1.Ans'; preserve them in the extracted text because they "
+    "separate answers for marking. "
     "Read line by line from top to bottom. For each detected text line or "
     "region, return one JSON object with \"text\" (string: recognised text) "
     "and \"confidence\" (float 0-1: recognition confidence). If text is faint "

@@ -162,6 +162,10 @@ class ResponseSummaryAPI(BaseModel):
     manual_review_required: bool = False
     flags: Optional[List[Dict[str, Any]]] = None
     has_blocking_flags: bool = False
+    # Every PCR paper is represented as a complete question matrix.  These
+    # fields distinguish a true blank answer from an OCR/AI failure.
+    is_missing_response: bool = False
+    answer_state: Optional[str] = None
 
 
 class SubmissionSummaryReviewAPI(BaseModel):
@@ -239,6 +243,51 @@ def _dt_to_iso(val: Any) -> Optional[str]:
     if hasattr(val, "isoformat"):
         return val.isoformat()
     return str(val)
+
+
+def _safe_marks(value: Any) -> float:
+    """Return a non-negative numeric mark without letting malformed data break totals."""
+    try:
+        return max(0.0, float(value or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _get_pcr_question_catalog(
+    tenant_db: Any,
+    exam_id: str,
+) -> List[Dict[str, Any]]:
+    """Return the immutable session questions in paper order.
+
+    The catalog is the denominator for every PCR score.  Evaluation rows are
+    evidence about an answer; they must never decide how many marks a paper is
+    out of.
+    """
+    if not exam_id:
+        return []
+    cursor = tenant_db["evalpen_questions"].find(
+        {"exam_id": exam_id},
+        projection={"question_id": 1, "question_number": 1, "max_marks": 1},
+    ).sort([("question_number", 1), ("question_id", 1)])
+    docs = await cursor.to_list(length=1000)
+    catalog: List[Dict[str, Any]] = []
+    for doc in docs:
+        question_id = str(doc.get("question_id") or "").strip()
+        if not question_id:
+            continue
+        question_number = doc.get("question_number")
+        catalog.append(
+            {
+                "question_id": question_id,
+                "question_number": (
+                    int(question_number)
+                    if isinstance(question_number, (int, float))
+                    else None
+                ),
+                "max_marks": _safe_marks(doc.get("max_marks")),
+            }
+        )
+    return catalog
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +421,15 @@ async def get_submission_summary(
             _sub_dict_for_scope.get("student_id", ""), scoped_ids
         )
 
+        sub_dict = _sub_dict_for_scope
+        question_catalog = await _get_pcr_question_catalog(
+            tenant_db,
+            str(sub_dict.get("exam_id") or ""),
+        )
+        catalog_by_id = {
+            item["question_id"]: item for item in question_catalog
+        }
+
         # Fetch all detected responses
         resp_repo = DetectedResponseRepository(tenant_db)
         response_docs = await resp_repo.get_responses_by_submission(
@@ -383,14 +441,20 @@ async def get_submission_summary(
 
         response_summaries: List[ResponseSummaryAPI] = []
         total_score = 0.0
-        total_max = 0.0
+        evaluated_max = 0.0
         evaluated_count = 0
         blocked_count = 0
         pending_count = 0
+        scored_question_ids: set[str] = set()
+        observed_question_ids: set[str] = set()
 
         for resp_doc in response_docs:
             response_id = resp_doc.get("response_id", "")
             eval_status = resp_doc.get("eval_status", "pending")
+            question_id = str(resp_doc.get("question_id") or "")
+            catalog_question = catalog_by_id.get(question_id)
+            if question_id:
+                observed_question_ids.add(question_id)
 
             # Check for blocking flags
             flags = resp_doc.get("flags", [])
@@ -443,13 +507,24 @@ async def get_submission_summary(
                 if manual_review_required or eval_status == "manual_review":
                     pending_count += 1
                 else:
-                    total_score += resp_score or 0.0
-                    total_max += resp_max or 0.0
+                    # A malformed legacy submission can contain two OCR
+                    # segments for the same question.  Count a question once;
+                    # current submissions block this situation before eval.
+                    if not question_id or question_id not in scored_question_ids:
+                        total_score += _safe_marks(resp_score)
+                        evaluated_max += _safe_marks(resp_max)
+                        if question_id:
+                            scored_question_ids.add(question_id)
                     evaluated_count += 1
             elif eval_status == "blocked":
                 blocked_count += 1
             elif eval_status in {"pending", "manual_review"}:
                 pending_count += 1
+
+            # A pending response still belongs to a fixed paper question.  It
+            # has no award yet, but the UI can show the question maximum.
+            if resp_max is None and catalog_question is not None:
+                resp_max = catalog_question["max_marks"]
 
             # Serialize flags for API response
             api_flags = [
@@ -471,8 +546,14 @@ async def get_submission_summary(
                 ResponseSummaryAPI(
                     response_id=response_id,
                     evaluation_id=evaluation.get("evaluation_id") if evaluation else None,
-                    question_id=resp_doc.get("question_id"),
-                    question_number=resp_doc.get("question_number"),
+                    question_id=question_id or None,
+                    question_number=(
+                        resp_doc.get("question_number")
+                        if resp_doc.get("question_number") is not None
+                        else catalog_question.get("question_number")
+                        if catalog_question is not None
+                        else None
+                    ),
                     content_type=resp_doc.get("content_type", "TEXT_ONLY"),
                     eval_status=eval_status,
                     detected_text=resp_doc.get("detected_text"),
@@ -486,16 +567,50 @@ async def get_submission_summary(
                     manual_review_required=manual_review_required,
                     flags=api_flags if api_flags else None,
                     has_blocking_flags=has_blocking,
+                    is_missing_response=bool(resp_doc.get("is_missing_response")),
+                    answer_state=resp_doc.get("answer_state"),
                 )
             )
 
-        # Get submission metadata
-        sub_dict = (
-            submission
-            if isinstance(submission, dict)
-            else submission.__dict__
-            if hasattr(submission, "__dict__")
-            else {}
+        # Older submissions may have been processed before answer slots were
+        # introduced.  Keep their review surface and total correct immediately
+        # instead of requiring a re-upload: add an explicit read-only blank
+        # row for every unseen immutable question.
+        for question in question_catalog:
+            question_id = question["question_id"]
+            if question_id in observed_question_ids:
+                continue
+            response_summaries.append(
+                ResponseSummaryAPI(
+                    response_id=f"UNANSWERED-{submission_id}-{question_id}",
+                    question_id=question_id,
+                    question_number=question["question_number"],
+                    content_type="TEXT_ONLY",
+                    eval_status="not_attempted",
+                    total_score=0.0,
+                    max_score=question["max_marks"],
+                    overall_feedback=(
+                        "No answer was detected for this question, so 0 marks were awarded."
+                    ),
+                    has_blocking_flags=False,
+                    is_missing_response=True,
+                    answer_state="not_attempted",
+                )
+            )
+            evaluated_count += 1
+
+        response_summaries.sort(
+            key=lambda item: (
+                item.question_number is None,
+                item.question_number if item.question_number is not None else 10**9,
+                item.is_missing_response,
+                item.response_id,
+            )
+        )
+        total_max = (
+            sum(question["max_marks"] for question in question_catalog)
+            if question_catalog
+            else evaluated_max
         )
 
         return SubmissionSummaryReviewAPI(
@@ -586,6 +701,13 @@ async def get_exam_results(
             sub_repo = SubmissionRepository(tenant_db)
             resp_repo = DetectedResponseRepository(tenant_db)
             eval_repo = EvaluationRepository(tenant_db)
+            question_catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+            paper_max_score = sum(
+                question["max_marks"] for question in question_catalog
+            )
+            catalog_question_ids = {
+                question["question_id"] for question in question_catalog
+            }
 
             # Find submissions for this exam (tutor-scoped)
             sub_query: Dict[str, Any] = {"exam_id": exam_id}
@@ -612,8 +734,9 @@ async def get_exam_results(
                 )
 
                 pcr_total = 0.0
-                pcr_max = 0.0
+                evaluated_max = 0.0
                 blocked_count = 0
+                scored_question_ids: set[str] = set()
 
                 for resp in responses:
                     response_id = resp.get("response_id", "")
@@ -627,8 +750,20 @@ async def get_exam_results(
                         response_id
                     )
                     if ev:
-                        pcr_total += ev.get("total_score", 0.0)
-                        pcr_max += ev.get("max_score", 0.0)
+                        question_id = str(resp.get("question_id") or "")
+                        # Never let duplicate OCR segments make one paper
+                        # question count twice.  New jobs block duplicates;
+                        # this also repairs historical result aggregation.
+                        if (
+                            question_id
+                            and question_id in catalog_question_ids
+                            and question_id in scored_question_ids
+                        ):
+                            continue
+                        pcr_total += _safe_marks(ev.get("total_score"))
+                        evaluated_max += _safe_marks(ev.get("max_score"))
+                        if question_id and question_id in catalog_question_ids:
+                            scored_question_ids.add(question_id)
 
                 entry = student_results.get(student_id)
                 if entry is None:
@@ -640,7 +775,7 @@ async def get_exam_results(
                     student_results[student_id] = entry
 
                 entry.pcr_total_score = pcr_total
-                entry.pcr_max_score = pcr_max
+                entry.pcr_max_score = paper_max_score or evaluated_max
                 entry.blocked_responses = blocked_count
 
         # DCR: aggregate results per student

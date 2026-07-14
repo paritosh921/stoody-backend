@@ -328,7 +328,7 @@ async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
     metadata = gate.calls[0]["kwargs"]["metadata"]
     assert metadata["pcr_stage"] == "ocr_pen"
     assert metadata["stroke_count"] == 1
-    assert metadata["ocr_prompt_version"] == "exampen-qno-v1"
+    assert metadata["ocr_prompt_version"] == "exampen-qno-v2"
 
 
 def test_pen_stroke_renderer_crops_and_upscales_content():
@@ -369,9 +369,9 @@ def test_vision_ocr_prompt_preserves_exampen_qno_markers():
     messages = ocr_service._build_vision_messages("aW1hZ2U=")
     prompt = messages[0]["content"][0]["text"]
 
-    assert "BLE digital pen strokes" in prompt
-    assert "Q.No X.Ans" in prompt
-    assert "must be preserved" in prompt
+    assert "camera photo, scanned PDF page" in prompt
+    assert "'Q1', 'Q. 1', 'Question 1'" in prompt
+    assert "preserve them" in prompt
 
 
 @pytest.mark.asyncio
@@ -805,6 +805,75 @@ async def test_process_submission_maps_marker_to_canonical_session_question_id()
     assert stored["question_id"] == "EXAM-CANONICAL::question-1"
     assert stored["question_number"] == 1
     assert stored["question_assignment"]["method"] == "marker"
+
+
+@pytest.mark.asyncio
+async def test_process_submission_creates_zero_answer_slots_for_unanswered_questions():
+    """One answered question on a 3-question paper must still be scored out of all 3."""
+    from api.v1._exampen_imports import load_exampen
+    from api.v1.evalpen_submissions_async import process_submission
+
+    db = _fresh_db()
+    ingest_mod = load_exampen("ingest.service")
+    submission_service_mod = load_exampen("pcr.services.submission_service")
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-SLOTS::question-{number}",
+                "exam_id": "EXAM-SLOTS",
+                "question_number": number,
+                "question_text": f"Question {number}",
+                "question_type": "subjective",
+                "max_marks": 4,
+            }
+            for number in (1, 2, 3)
+        ]
+    )
+    ingest = ingest_mod.IngestService(db)
+    await ingest.initialize()
+    ingest_result = await ingest.ingest_submission(
+        exam_id="EXAM-SLOTS",
+        student_id="STU-1",
+        admin_id="ADMIN-1",
+        source="ble_pen",
+        pen_mac="AA:BB:CC:DD:EE:FF",
+        hub_id="HUB-1",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": [{"points": [{"x": 10, "y": 10, "t": 1}]}],
+            }
+        ],
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_submissions_async._get_tenant_db_for_user",
+            new=AsyncMock(return_value=db),
+        ),
+        patch.object(
+            submission_service_mod,
+            "create_ocr_adapter",
+            return_value=_FakeOCRAdapter(),
+        ),
+    ):
+        result = await process_submission(
+            ingest_result.submission_id,
+            current_user=_admin_user(),
+            db=object(),
+        )
+
+    slots = await db["evalpen_detected_responses"].find(
+        {"submission_id": ingest_result.submission_id}
+    ).sort("question_number", 1).to_list(length=10)
+
+    assert result.response_count == 3
+    assert [slot["question_number"] for slot in slots] == [1, 2, 3]
+    assert slots[0]["is_missing_response"] is False
+    assert slots[0]["eval_status"] == "ready"
+    assert [slot["is_missing_response"] for slot in slots[1:]] == [True, True]
+    assert [slot["answer_state"] for slot in slots[1:]] == ["not_attempted", "not_attempted"]
+    assert [slot["eval_status"] for slot in slots[1:]] == ["ready", "ready"]
 
 
 @pytest.mark.asyncio

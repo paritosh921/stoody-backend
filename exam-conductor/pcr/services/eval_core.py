@@ -974,6 +974,157 @@ class EvalCore:
                     error=message,
                 )
 
+        # The submission processor creates an explicit answer slot for every
+        # paper question.  A slot with no detected answer is not an AI
+        # inference problem: it is a deterministic zero.  Persisting a real
+        # evaluation row keeps totals, teacher review, and student results all
+        # based on the full paper, while avoiding an unnecessary model call.
+        if response_doc.get("is_missing_response"):
+            no_answer_reason = (
+                "No answer was detected for this question, so 0 marks were awarded."
+            )
+            reference_solution = str(
+                question_doc.get("reference_solution")
+                or question_doc.get("rubric")
+                or ""
+            ).strip()
+            if uses_structured_rubric:
+                criterion_marks = [
+                    CriterionMark(
+                        criterion_id=str(criterion.get("criterion_id") or ""),
+                        description=str(criterion.get("description") or ""),
+                        marks_awarded=0.0,
+                        max_marks=float(criterion.get("max_marks") or 0.0),
+                        rationale=no_answer_reason,
+                        evidence="",
+                    )
+                    for criterion in marking_criteria
+                ]
+                step_marks = [
+                    StepMark(
+                        step=mark.description,
+                        marks_awarded=0.0,
+                        max_marks=mark.max_marks,
+                        rationale=no_answer_reason,
+                    )
+                    for mark in criterion_marks
+                ]
+            else:
+                criterion_marks = []
+                step_marks = [
+                    StepMark(
+                        step="No answer submitted",
+                        marks_awarded=0.0,
+                        max_marks=max_marks,
+                        rationale=no_answer_reason,
+                    )
+                ]
+
+            # A deterministic ID makes reprocessing idempotent: a later OCR
+            # run either replaces this response with detected evidence or
+            # returns the same immutable zero-evaluation record.
+            eval_id = "EVAL-MISSING-" + uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"pcr-not-attempted:{response_id}",
+            ).hex[:24]
+            no_answer_eval_doc: Dict[str, Any] = {
+                "evaluation_id": eval_id,
+                "response_id": response_id,
+                "question_id": question_id,
+                "student_id": resolved_student_id,
+                "eval_path": "not_attempted",
+                "model_used": "none",
+                "total_score": 0.0,
+                "max_score": max_marks,
+                "scoreable_max": max_marks,
+                "marking_policy": marking_policy,
+                "manual_review_required": False,
+                "step_marks": [
+                    {
+                        "step": mark.step,
+                        "marks_awarded": mark.marks_awarded,
+                        "max_marks": mark.max_marks,
+                        "rationale": mark.rationale,
+                    }
+                    for mark in step_marks
+                ],
+                "criterion_marks": [
+                    {
+                        "criterion_id": mark.criterion_id,
+                        "description": mark.description,
+                        "marks_awarded": mark.marks_awarded,
+                        "max_marks": mark.max_marks,
+                        "rationale": mark.rationale,
+                        "evidence": mark.evidence,
+                    }
+                    for mark in criterion_marks
+                ],
+                "overall_feedback": no_answer_reason,
+                "reference_solution": reference_solution,
+                "token_usage": {},
+                "raw_llm_response": "",
+                "eval_flags": [],
+                "audit_trail": [
+                    {
+                        "actor_id": "system",
+                        "timestamp": datetime.now(timezone.utc),
+                        "action": "not_attempted_recorded",
+                        "before": None,
+                        "after": {
+                            "total_score": 0.0,
+                            "max_score": max_marks,
+                            "answer_state": "not_attempted",
+                        },
+                        "reason": no_answer_reason,
+                    }
+                ],
+                "created_at": datetime.now(timezone.utc),
+            }
+            try:
+                await self._evals.insert_evaluation(no_answer_eval_doc)
+            except Exception:
+                logger.exception(
+                    "Failed to persist not-attempted evaluation %s for response %s",
+                    eval_id,
+                    response_id,
+                )
+                await self._responses.update_eval_status(response_id, "manual_review")
+                return EvalResult(
+                    evaluation_id=eval_id,
+                    response_id=response_id,
+                    question_id=question_id,
+                    student_id=resolved_student_id,
+                    eval_path="not_attempted",
+                    model_used="none",
+                    max_score=max_marks,
+                    scoreable_max=max_marks,
+                    step_marks=step_marks,
+                    criterion_marks=criterion_marks,
+                    overall_feedback=no_answer_reason,
+                    reference_solution=reference_solution or None,
+                    marking_policy=marking_policy,
+                    error="Not-attempted evaluation could not be persisted",
+                )
+
+            await self._responses.update_eval_status(response_id, "not_attempted")
+            return EvalResult(
+                evaluation_id=eval_id,
+                response_id=response_id,
+                question_id=question_id,
+                student_id=resolved_student_id,
+                eval_path="not_attempted",
+                model_used="none",
+                total_score=0.0,
+                max_score=max_marks,
+                scoreable_max=max_marks,
+                step_marks=step_marks,
+                criterion_marks=criterion_marks,
+                overall_feedback=no_answer_reason,
+                reference_solution=reference_solution or None,
+                marking_policy=marking_policy,
+            )
+
+        if uses_structured_rubric:
             # Criterion totals are already teacher-approved, so they remain
             # the scoreable maximum even if a legacy diagram-proration hint is
             # present. The teacher can explicitly include a diagram criterion.
