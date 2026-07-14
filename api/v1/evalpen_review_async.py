@@ -34,6 +34,7 @@ API authority:
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -96,6 +97,27 @@ class ScoreOverrideRequest(BaseModel):
         return v.strip()
 
 
+class CriterionMarkOverrideItem(BaseModel):
+    """One teacher-entered score for an already-locked rubric criterion."""
+
+    criterion_id: str = Field(..., min_length=1, max_length=64)
+    marks_awarded: float = Field(..., ge=0)
+
+
+class CriterionMarksOverrideRequest(BaseModel):
+    """Teacher correction of every criterion; total is recomputed server-side."""
+
+    criteria: List[CriterionMarkOverrideItem] = Field(..., min_length=1)
+    reason: str = Field(..., min_length=5)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_min_length(cls, v: str) -> str:
+        if len(v.strip()) < 5:
+            raise ValueError("Reason must be at least 5 characters")
+        return v.strip()
+
+
 class PublishRequest(BaseModel):
     """Request body for publishing submission results."""
 
@@ -135,6 +157,9 @@ class ResponseSummaryAPI(BaseModel):
     overall_feedback: Optional[str] = None
     reference_solution: Optional[str] = None
     step_marks: Optional[List[Dict[str, Any]]] = None
+    criterion_marks: Optional[List[Dict[str, Any]]] = None
+    marking_policy: Optional[Dict[str, Any]] = None
+    manual_review_required: bool = False
     flags: Optional[List[Dict[str, Any]]] = None
     has_blocking_flags: bool = False
 
@@ -385,12 +410,28 @@ async def get_submission_summary(
             feedback = None
             reference_solution = None
             step_marks = None
+            criterion_marks = None
+            marking_policy = None
+            manual_review_required = False
 
             if evaluation:
                 resp_score = evaluation.get("total_score", 0.0)
                 resp_max = evaluation.get("max_score", 0.0)
                 feedback = evaluation.get("overall_feedback")
                 reference_solution = evaluation.get("reference_solution")
+                raw_criterion_marks = evaluation.get("criterion_marks")
+                if isinstance(raw_criterion_marks, list):
+                    criterion_marks = [
+                        mark for mark in raw_criterion_marks if isinstance(mark, dict)
+                    ] or None
+                marking_policy = (
+                    evaluation.get("marking_policy")
+                    if isinstance(evaluation.get("marking_policy"), dict)
+                    else None
+                )
+                manual_review_required = bool(
+                    evaluation.get("manual_review_required")
+                )
                 raw_step_marks = evaluation.get("step_marks")
                 if isinstance(raw_step_marks, list):
                     # Evaluation records are persisted as plain Mongo
@@ -399,12 +440,15 @@ async def get_submission_summary(
                     step_marks = [
                         mark for mark in raw_step_marks if isinstance(mark, dict)
                     ] or None
-                total_score += resp_score or 0.0
-                total_max += resp_max or 0.0
-                evaluated_count += 1
+                if manual_review_required or eval_status == "manual_review":
+                    pending_count += 1
+                else:
+                    total_score += resp_score or 0.0
+                    total_max += resp_max or 0.0
+                    evaluated_count += 1
             elif eval_status == "blocked":
                 blocked_count += 1
-            elif eval_status == "pending":
+            elif eval_status in {"pending", "manual_review"}:
                 pending_count += 1
 
             # Serialize flags for API response
@@ -437,6 +481,9 @@ async def get_submission_summary(
                     overall_feedback=feedback,
                     reference_solution=reference_solution,
                     step_marks=step_marks,
+                    criterion_marks=criterion_marks,
+                    marking_policy=marking_policy,
+                    manual_review_required=manual_review_required,
                     flags=api_flags if api_flags else None,
                     has_blocking_flags=has_blocking,
                 )
@@ -721,6 +768,14 @@ async def override_evaluation_score(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Evaluation {evaluation_id} not found",
             )
+        if isinstance(existing.get("criterion_marks"), list) and existing.get("criterion_marks"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This evaluation uses a locked criterion rubric. "
+                    "Adjust its individual criterion marks instead of overriding the total."
+                ),
+            )
 
         # Tutor scoping: verify this evaluation's student is visible
         eval_student_id = existing.get("student_id")
@@ -814,6 +869,161 @@ async def override_evaluation_score(
 
 
 @router.post(
+    "/evaluations/{evaluation_id}/criterion-marks",
+    summary="Teacher-review locked PCR criterion marks with audit trail",
+    responses={
+        400: {"description": "Invalid criterion score or reason"},
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Evaluation not found"},
+        409: {"description": "Evaluation does not use a criterion rubric"},
+    },
+)
+async def override_criterion_marks(
+    evaluation_id: str,
+    body: CriterionMarksOverrideRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Record a teacher's criterion-level correction and recompute the total.
+
+    The API never accepts a browser-supplied aggregate score for structured
+    papers.  It validates the exact frozen criterion IDs/maxima and makes the
+    repository update plus audit append atomically.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        EvaluationRepository = load_exampen("pcr.storage").EvaluationRepository
+        eval_repo = EvaluationRepository(tenant_db)
+        existing = await eval_repo.get_evaluation(evaluation_id)
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Evaluation {evaluation_id} not found",
+            )
+
+        raw_criteria = existing.get("criterion_marks")
+        if not isinstance(raw_criteria, list) or not raw_criteria:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This evaluation does not use a locked criterion rubric",
+            )
+
+        eval_student_id = existing.get("student_id")
+        if not eval_student_id:
+            response_doc = await tenant_db["evalpen_detected_responses"].find_one(
+                {"response_id": existing.get("response_id", "")},
+                projection={"submission_id": 1, "student_id": 1},
+            )
+            eval_student_id = (response_doc or {}).get("student_id")
+            if not eval_student_id and response_doc:
+                submission_doc = await tenant_db["evalpen_submissions"].find_one(
+                    {"submission_id": response_doc.get("submission_id", "")},
+                    projection={"student_id": 1},
+                )
+                eval_student_id = (submission_doc or {}).get("student_id")
+        if eval_student_id:
+            _check_student_in_scope(str(eval_student_id), scoped_ids)
+
+        expected: Dict[str, float] = {}
+        for criterion in raw_criteria:
+            if not isinstance(criterion, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Stored criterion rubric is malformed; contact an administrator",
+                )
+            criterion_id = str(criterion.get("criterion_id") or "").strip()
+            if not criterion_id or criterion_id in expected:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Stored criterion rubric is malformed; contact an administrator",
+                )
+            expected[criterion_id] = float(criterion.get("max_marks") or 0.0)
+
+        submitted: Dict[str, float] = {}
+        for item in body.criteria:
+            criterion_id = item.criterion_id.strip()
+            if criterion_id in submitted:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Criterion {criterion_id} was submitted more than once",
+                )
+            submitted[criterion_id] = float(item.marks_awarded)
+        if set(submitted) != set(expected):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Submit one mark for every locked criterion",
+            )
+        for criterion_id, awarded in submitted.items():
+            if (
+                not math.isfinite(awarded)
+                or not math.isfinite(expected[criterion_id])
+                or awarded < 0
+                or awarded > expected[criterion_id]
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Criterion {criterion_id} must be between 0 and "
+                        f"{expected[criterion_id]:g}"
+                    ),
+                )
+
+        actor_id = current_user.get("user_id", "unknown")
+        updated = await eval_repo.override_criterion_marks(
+            evaluation_id,
+            marks_by_criterion=submitted,
+            actor_id=actor_id,
+            reason=body.reason,
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Criterion marks could not be updated; reload and try again",
+            )
+
+        await tenant_db["evalpen_detected_responses"].update_one(
+            {"response_id": existing.get("response_id", "")},
+            {
+                "$set": {
+                    "eval_status": "evaluated_teacher_reviewed",
+                    "teacher_reviewed_at": datetime.now(timezone.utc),
+                    "teacher_reviewed_by": actor_id,
+                }
+            },
+        )
+        return {
+            "evaluation_id": evaluation_id,
+            "total_score": updated["total_score"],
+            "max_score": updated.get("max_score"),
+            "criterion_marks": updated["criterion_marks"],
+            "actor_id": actor_id,
+        }
+    except HTTPException:
+        raise
+    except ImportError as exc:
+        logger.error("PCR storage module import failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="PCR engine is not available in this deployment",
+        ) from exc
+    except Exception as exc:
+        logger.error(
+            "Criterion mark override failed for %s: %s",
+            evaluation_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Criterion mark override encountered an internal error",
+        ) from exc
+
+
+@router.post(
     "/submissions/{submission_id}/publish",
     summary="Publish/finalize submission results",
     responses={
@@ -886,6 +1096,18 @@ async def publish_submission(
                     f"Cannot publish: {len(unresolved_blocking)} response(s) "
                     f"have unresolved blocking flags. Resolve all blocking "
                     f"flags before publishing."
+                ),
+            )
+
+        manual_review_count = await tenant_db["evalpen_detected_responses"].count_documents(
+            {"submission_id": submission_id, "eval_status": "manual_review"}
+        )
+        if manual_review_count:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot publish: {manual_review_count} response(s) still require "
+                    "teacher criterion review."
                 ),
             )
 

@@ -29,7 +29,10 @@ References
 from __future__ import annotations
 
 import logging
+import copy
 from typing import Any, Dict, List, Optional
+
+from .marking_policy import normalize_marking_criteria
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +271,7 @@ def adapt_question_to_pcr(
         or 0
     )
     try:
-        max_marks = int(max_marks_raw)
+        max_marks = float(max_marks_raw)
     except (TypeError, ValueError):
         max_marks = 0
 
@@ -317,6 +320,16 @@ def adapt_question_to_pcr(
             or ""
         )
 
+    raw_criteria = question_doc.get("marking_criteria")
+    if raw_criteria is None and isinstance(question_doc.get("metadata"), dict):
+        raw_criteria = question_doc["metadata"].get("marking_criteria")
+    try:
+        marking_criteria = normalize_marking_criteria(raw_criteria)
+    except ValueError:
+        # Draft/legacy content is validated at finalisation.  The adapter must
+        # remain tolerant for existing read-only records.
+        marking_criteria = []
+
     # Expected word range heuristic based on complexity
     expected_word_range: Optional[Dict[str, int]] = None
     if complexity == "L1":
@@ -360,6 +373,10 @@ def adapt_question_to_pcr(
         "question_text": question_text,
         "reference_solution": reference_solution or None,
         "rubric": rubric,
+        "marking_criteria": copy.deepcopy(marking_criteria),
+        "marking_policy": copy.deepcopy(question_doc.get("marking_policy"))
+        if isinstance(question_doc.get("marking_policy"), dict)
+        else None,
         "expects_diagram": bool(has_diagram),
         "diagram_weight": diagram_weight,
         "expected_word_range": expected_word_range,

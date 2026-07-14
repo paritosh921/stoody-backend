@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
 import logging
 from datetime import date, datetime, timezone
@@ -23,6 +24,12 @@ logger = logging.getLogger(__name__)
 
 PAPER_VERSIONS_COLLECTION = "exampen_paper_versions"
 PAPER_QUESTIONS_COLLECTION = "exampen_paper_questions"
+
+
+def _marking_policy_module() -> Any:
+    """Load PCR policy helpers without making the hyphenated package a normal import."""
+
+    return importlib.import_module("exam-conductor.pcr.marking_policy")
 
 
 def _as_text(value: Any) -> str:
@@ -84,17 +91,43 @@ def _question_reference_solution(question: Dict[str, Any]) -> str:
 
 def _question_rubric(question: Dict[str, Any]) -> str:
     for key in ("rubric", "marking_scheme", "marking_criteria", "explanation"):
-        value = _as_text(question.get(key))
+        raw_value = question.get(key)
+        # Structured criteria are a list of records, not a legacy free-text
+        # rubric.  Do not turn their Python representation into prompt text.
+        if isinstance(raw_value, (list, dict)):
+            continue
+        value = _as_text(raw_value)
         if value:
             return value
 
     metadata = question.get("metadata")
     if isinstance(metadata, dict):
         for key in ("rubric", "marking_scheme", "marking_criteria"):
-            value = _as_text(metadata.get(key))
+            raw_value = metadata.get(key)
+            if isinstance(raw_value, (list, dict)):
+                continue
+            value = _as_text(raw_value)
             if value:
                 return value
     return ""
+
+
+def _question_marking_criteria(question: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract structured criteria while preserving legacy free-text rubrics."""
+
+    raw_value = question.get("marking_criteria")
+    if raw_value is None and isinstance(question.get("metadata"), dict):
+        raw_value = question["metadata"].get("marking_criteria")
+    if raw_value is None:
+        return []
+    # Older content can use ``marking_criteria`` as a text alias for rubric.
+    # It becomes structured only once the value is an actual list/JSON list.
+    if isinstance(raw_value, str) and not raw_value.lstrip().startswith("["):
+        return []
+    try:
+        return _marking_policy_module().normalize_marking_criteria(raw_value)
+    except ValueError:
+        return []
 
 
 def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
@@ -218,6 +251,7 @@ def _content_hash(document: Dict[str, Any], questions: Iterable[Dict[str, Any]])
                 "marks": _question_marks(question),
                 "rubric": _question_rubric(question),
                 "reference_solution": _question_reference_solution(question),
+                "marking_criteria": _question_marking_criteria(question),
                 "expects_diagram": bool(question.get("has_diagram") or question.get("expects_diagram")),
             }
         )
@@ -226,19 +260,27 @@ def _content_hash(document: Dict[str, Any], questions: Iterable[Dict[str, Any]])
         "exam_mode": _as_text(document.get("exam_mode")),
         "title": _as_text(document.get("title")),
         "subject": _as_text(document.get("subject")),
+        "pcr_marking_policy": document.get("pcr_marking_policy"),
         "questions": normalized_questions,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def validate_pcr_questions(questions: Iterable[Dict[str, Any]]) -> List[str]:
+def validate_pcr_questions(
+    questions: Iterable[Dict[str, Any]],
+    *,
+    marking_policy: Optional[Dict[str, Any]] = None,
+) -> List[str]:
     """Return human-readable readiness errors for a PCR marking paper.
 
     OCR extraction is not a marking plan.  Each question must be identifiable,
     have text and marks, and contain either an approved reference solution or
     an explicit rubric before the paper becomes immutable.
     """
+    policy_module = _marking_policy_module()
+    policy = policy_module.normalize_marking_policy(marking_policy)
+    uses_structured_criteria = policy_module.is_structured_rubric_policy(policy)
     errors: List[str] = []
     for position, question in enumerate(questions, start=1):
         label = _source_question_id(question) or str(position)
@@ -248,10 +290,25 @@ def validate_pcr_questions(questions: Iterable[Dict[str, Any]]) -> List[str]:
             errors.append(f"Q {label}: missing question text")
         if _question_marks(question) is None:
             errors.append(f"Q {label}: assign marks greater than zero")
-        if not _question_reference_solution(question) and not _question_rubric(question):
+        # A legacy paper still needs free-text marking material. A structured
+        # PCR paper instead has a complete teacher-authored criterion plan,
+        # so its optional worked solution/notes are helpful context rather
+        # than a second mandatory source of marks.
+        if (
+            not uses_structured_criteria
+            and not _question_reference_solution(question)
+            and not _question_rubric(question)
+        ):
             errors.append(
                 f"Q {label}: add an approved reference solution or marking rubric"
             )
+        if uses_structured_criteria:
+            criteria = _question_marking_criteria(question)
+            criterion_errors = policy_module.validate_marking_criteria(
+                criteria,
+                _question_marks(question),
+            )
+            errors.extend(f"Q {label}: {error}" for error in criterion_errors)
     return errors
 
 
@@ -289,7 +346,13 @@ async def create_paper_snapshot(
             detail="Cannot snapshot a paper without document_id",
         )
 
-    content_hash = _content_hash(document, questions)
+    policy_module = _marking_policy_module()
+    marking_policy = policy_module.normalize_marking_policy(
+        document.get("pcr_marking_policy")
+    )
+    content_hash = _content_hash(
+        {**document, "pcr_marking_policy": marking_policy}, questions
+    )
     paper_version_id = f"paper-{document_id}-{content_hash[:16]}"
     versions = tenant_db[PAPER_VERSIONS_COLLECTION]
     paper_questions = tenant_db[PAPER_QUESTIONS_COLLECTION]
@@ -311,6 +374,12 @@ async def create_paper_snapshot(
         # anonymous question after _id is removed.
         if source_question_id and not clean_question.get("id") and not clean_question.get("question_id"):
             clean_question["id"] = source_question_id
+        if policy_module.is_structured_rubric_policy(marking_policy):
+            # Snapshot exactly the validated criterion rows.  This prevents a
+            # later authoring edit from changing a conducted sitting.
+            clean_question["marking_criteria"] = policy_module.snapshot_criteria(
+                _question_marking_criteria(clean_question)
+            )
         question_docs.append(
             {
                 "paper_version_id": paper_version_id,
@@ -338,6 +407,7 @@ async def create_paper_snapshot(
             "teacher_ids": [str(item) for item in (document.get("teacher_ids") or [])],
             "content_hash": content_hash,
             "question_count": len(question_docs),
+            "pcr_marking_policy": copy.deepcopy(marking_policy),
             "created_at": now,
             "source_document_finalized_at": document.get("exam_finalized_at"),
         }
@@ -380,7 +450,10 @@ async def load_or_create_paper_snapshot(
                 document_id=document_id,
                 questions=source_questions,
             )
-            errors = validate_pcr_questions(snapshot_source_questions)
+            errors = validate_pcr_questions(
+                snapshot_source_questions,
+                marking_policy=document.get("pcr_marking_policy"),
+            )
             if errors:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -443,6 +516,10 @@ async def snapshot_paper_to_session(
         await repo.ensure_indexes()
         await solutions.ensure_indexes()
 
+        policy_module = _marking_policy_module()
+        marking_policy = policy_module.normalize_marking_policy(
+            paper_version.get("pcr_marking_policy")
+        )
         docs: List[Dict[str, Any]] = []
         for snapshot_question, raw_question in zip(snapshot_questions, raw_questions):
             source_id = _as_text(snapshot_question.get("source_question_id"))
@@ -461,6 +538,10 @@ async def snapshot_paper_to_session(
             pcr_doc["question_number"] = int(snapshot_question.get("position") or 0) or None
             pcr_doc["paper_version_id"] = paper_version["paper_version_id"]
             pcr_doc["immutable"] = True
+            pcr_doc["marking_policy"] = copy.deepcopy(marking_policy)
+            pcr_doc["marking_criteria"] = _question_marking_criteria(raw_question)
+            if policy_module.is_structured_rubric_policy(marking_policy):
+                pcr_doc["evaluation_mode"] = policy_module.STRUCTURED_RUBRIC_MODE
             pcr_doc["question_text"] = _question_text(raw_question)
             pcr_doc["reference_solution"] = _question_reference_solution(raw_question) or None
             pcr_doc["rubric"] = _question_rubric(raw_question) or pcr_doc.get("rubric")

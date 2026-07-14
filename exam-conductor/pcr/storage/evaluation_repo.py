@@ -35,6 +35,7 @@ References
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -394,3 +395,122 @@ class EvaluationRepository:
             return True
 
         return False
+
+    async def override_criterion_marks(
+        self,
+        evaluation_id: str,
+        *,
+        marks_by_criterion: Dict[str, float],
+        actor_id: str,
+        reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply a teacher's criterion-level correction with an audit trail.
+
+        The stored criterion descriptions and maxima remain immutable.  A
+        teacher may change only the award for each already-locked criterion;
+        the total is always recomputed on the server instead of accepted from
+        the browser.
+        """
+
+        existing = await self._evaluations.find_one(
+            {"evaluation_id": evaluation_id},
+            projection={
+                "criterion_marks": 1,
+                "step_marks": 1,
+                "total_score": 1,
+                "max_score": 1,
+            },
+        )
+        if existing is None:
+            return None
+        raw_criteria = existing.get("criterion_marks")
+        if not isinstance(raw_criteria, list) or not raw_criteria:
+            return None
+
+        expected_ids = set()
+        for mark in raw_criteria:
+            if not isinstance(mark, dict):
+                return None
+            criterion_id = str(mark.get("criterion_id") or "")
+            if not criterion_id or criterion_id in expected_ids:
+                return None
+            expected_ids.add(criterion_id)
+        if not expected_ids or set(marks_by_criterion) != expected_ids:
+            return None
+
+        next_criteria: List[Dict[str, Any]] = []
+        for existing_mark in raw_criteria:
+            if not isinstance(existing_mark, dict):
+                return None
+            criterion_id = str(existing_mark.get("criterion_id") or "")
+            try:
+                maximum = float(existing_mark.get("max_marks") or 0.0)
+                awarded = float(marks_by_criterion[criterion_id])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                not math.isfinite(maximum)
+                or not math.isfinite(awarded)
+                or maximum < 0
+                or awarded < 0
+                or awarded > maximum
+            ):
+                return None
+            next_mark = dict(existing_mark)
+            next_mark["marks_awarded"] = round(awarded, 2)
+            next_mark["teacher_adjusted"] = True
+            next_criteria.append(next_mark)
+
+        new_total = round(
+            sum(float(mark.get("marks_awarded") or 0.0) for mark in next_criteria),
+            2,
+        )
+        next_step_marks = [
+            {
+                "criterion_id": mark.get("criterion_id"),
+                "step": mark.get("description") or mark.get("criterion_id"),
+                "marks_awarded": mark.get("marks_awarded"),
+                "max_marks": mark.get("max_marks"),
+                "rationale": mark.get("rationale") or "Teacher-reviewed criterion mark",
+                "evidence": mark.get("evidence") or "",
+            }
+            for mark in next_criteria
+        ]
+        now = datetime.now(timezone.utc)
+        audit_entry = {
+            "actor_id": actor_id,
+            "timestamp": now,
+            "action": "criterion_marks_override",
+            "before": {
+                "total_score": existing.get("total_score"),
+                "criterion_marks": raw_criteria,
+            },
+            "after": {
+                "total_score": new_total,
+                "criterion_marks": next_criteria,
+            },
+            "reason": reason,
+        }
+        result = await self._evaluations.update_one(
+            {"evaluation_id": evaluation_id},
+            {
+                "$set": {
+                    "criterion_marks": next_criteria,
+                    "step_marks": next_step_marks,
+                    "total_score": new_total,
+                    "manual_review_required": False,
+                    "teacher_reviewed": True,
+                    "teacher_reviewed_at": now,
+                    "teacher_reviewed_by": actor_id,
+                    "updated_at": now,
+                },
+                "$push": {"audit_trail": audit_entry},
+            },
+        )
+        if result.modified_count == 0:
+            return None
+        return {
+            "total_score": new_total,
+            "criterion_marks": next_criteria,
+            "max_score": existing.get("max_score"),
+        }

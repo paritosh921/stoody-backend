@@ -120,6 +120,17 @@ class StepMarkAPI(BaseModel):
     justification: Optional[str] = None
 
 
+class CriterionMarkAPI(BaseModel):
+    """A score against one immutable, teacher-authored PCR criterion."""
+
+    criterion_id: str
+    description: Optional[str] = None
+    marks_awarded: Optional[float] = None
+    max_marks: Optional[float] = None
+    rationale: Optional[str] = None
+    evidence: Optional[str] = None
+
+
 class ReferenceSolutionAPI(BaseModel):
     """Reference solution summary."""
 
@@ -153,6 +164,9 @@ class EvaluationDetailAPI(BaseModel):
     max_score: float
     scoreable_max: Optional[float] = None
     step_marks: Optional[List[StepMarkAPI]] = None
+    criterion_marks: Optional[List[CriterionMarkAPI]] = None
+    marking_policy: Optional[Dict[str, Any]] = None
+    manual_review_required: bool = False
     overall_feedback: Optional[str] = None
     reference_solution: Optional[ReferenceSolutionAPI] = None
     token_usage: Optional[TokenUsageAPI] = None
@@ -245,6 +259,20 @@ def _eval_result_to_api(result: Any) -> Dict[str, Any]:
             for sm in result.step_marks
         ]
 
+    criterion_marks = None
+    if result.criterion_marks:
+        criterion_marks = [
+            {
+                "criterion_id": mark.criterion_id,
+                "description": mark.description,
+                "marks_awarded": mark.marks_awarded,
+                "max_marks": mark.max_marks,
+                "rationale": mark.rationale,
+                "evidence": mark.evidence,
+            }
+            for mark in result.criterion_marks
+        ]
+
     reference_solution = None
     if result.reference_solution:
         reference_solution = {
@@ -272,6 +300,9 @@ def _eval_result_to_api(result: Any) -> Dict[str, Any]:
         "max_score": result.max_score,
         "scoreable_max": result.scoreable_max,
         "step_marks": step_marks,
+        "criterion_marks": criterion_marks,
+        "marking_policy": result.marking_policy or None,
+        "manual_review_required": bool(result.manual_review_required),
         "overall_feedback": result.overall_feedback or None,
         "reference_solution": reference_solution,
         "token_usage": token_usage,
@@ -292,6 +323,22 @@ def _doc_to_evaluation_detail(doc: Dict[str, Any]) -> Dict[str, Any]:
             }
             for sm in step_marks_raw
         ]
+
+    criterion_marks = None
+    raw_criterion_marks = doc.get("criterion_marks")
+    if isinstance(raw_criterion_marks, list):
+        criterion_marks = [
+            {
+                "criterion_id": str(mark.get("criterion_id") or ""),
+                "description": mark.get("description"),
+                "marks_awarded": mark.get("marks_awarded"),
+                "max_marks": mark.get("max_marks"),
+                "rationale": mark.get("rationale"),
+                "evidence": mark.get("evidence"),
+            }
+            for mark in raw_criterion_marks
+            if isinstance(mark, dict) and str(mark.get("criterion_id") or "").strip()
+        ] or None
 
     reference_solution = None
     ref_sol = doc.get("reference_solution")
@@ -325,6 +372,9 @@ def _doc_to_evaluation_detail(doc: Dict[str, Any]) -> Dict[str, Any]:
         "max_score": doc.get("max_score", 0.0),
         "scoreable_max": doc.get("scoreable_max"),
         "step_marks": step_marks,
+        "criterion_marks": criterion_marks,
+        "marking_policy": doc.get("marking_policy") if isinstance(doc.get("marking_policy"), dict) else None,
+        "manual_review_required": bool(doc.get("manual_review_required")),
         "overall_feedback": doc.get("overall_feedback"),
         "reference_solution": reference_solution,
         "token_usage": token_usage,

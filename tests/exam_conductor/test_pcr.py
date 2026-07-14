@@ -1003,6 +1003,307 @@ class TestUEval01:
         assert parsed["parse_error"] is True
         assert parsed["total_score"] == 0.0
 
+    def test_u_eval_01_locked_criteria_require_exact_question_total(self):
+        """A new PCR paper cannot freeze a rubric that invents or loses marks."""
+        from pcr.marking_policy import validate_marking_criteria
+
+        errors = validate_marking_criteria(
+            [
+                {
+                    "criterion_id": "method",
+                    "description": "Correct method",
+                    "max_marks": 1,
+                },
+                {
+                    "criterion_id": "result",
+                    "description": "Correct result",
+                    "max_marks": 2,
+                },
+            ],
+            question_max_marks=4,
+        )
+
+        assert errors == ["criterion marks total 3, but this question is worth 4"]
+
+    def test_u_eval_01_complete_criteria_are_a_valid_marking_plan_without_notes(self):
+        """A teacher may use the structured rubric itself as the marking authority."""
+        from services.exampen_paper_service import validate_pcr_questions
+
+        errors = validate_pcr_questions(
+            [
+                {
+                    "id": "Q-1",
+                    "question_text": "State Newton's second law.",
+                    "points": 2,
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "statement",
+                            "description": "States force equals rate of change of momentum",
+                            "max_marks": 2,
+                        }
+                    ],
+                }
+            ],
+            marking_policy={"mode": "criterion_rubric_v1"},
+        )
+
+        assert errors == []
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_structured_rubric_scores_only_locked_criteria(self):
+        """PCR recomputes a criterion-rubric total and honours its low temperature."""
+        from pcr.services.eval_core import EvalCore
+
+        class Responses:
+            def __init__(self):
+                self.statuses = []
+
+            async def get_response(self, response_id):
+                assert response_id == "RESP-criterion"
+                return {
+                    "response_id": response_id,
+                    "question_id": "EXAM-1::Q-1",
+                    "student_id": "STU-1",
+                    "detected_text": "Uses v = u + at and obtains the correct final value.",
+                    "content_type": "TEXT_ONLY",
+                    "flags": [],
+                }
+
+            async def update_eval_status(self, _response_id, status):
+                self.statuses.append(status)
+
+        class Evaluations:
+            def __init__(self):
+                self.docs = []
+
+            async def insert_evaluation(self, doc):
+                self.docs.append(doc)
+                return doc, False
+
+        class Questions:
+            async def get_question(self, question_id):
+                assert question_id == "EXAM-1::Q-1"
+                return {
+                    "question_id": question_id,
+                    "subject": "Physics",
+                    "complexity": "L2",
+                    "eval_template": "stepwise_numerical",
+                    "question_text": "Find the final velocity.",
+                    "reference_solution": "Apply v = u + at before calculating the final value.",
+                    "max_marks": 4,
+                    "marking_policy": {
+                        "mode": "criterion_rubric_v1",
+                        "strictness": "strict",
+                        "temperature": 0.05,
+                    },
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "method",
+                            "description": "Uses the correct kinematic equation",
+                            "max_marks": 1,
+                            "acceptable_evidence": "v = u + at",
+                        },
+                        {
+                            "criterion_id": "answer",
+                            "description": "Calculates the final value correctly",
+                            "max_marks": 3,
+                            "acceptable_evidence": "correct numerical result",
+                        },
+                    ],
+                }
+
+        class Cache:
+            async def lookup(self, *_args, **_kwargs):
+                raise AssertionError("Structured criterion marking must not generate a replacement answer key")
+
+        class Gate:
+            def __init__(self):
+                self.calls = []
+
+            async def call(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    content=(
+                        '{"criterion_marks": ['
+                        '{"criterion_id": "method", "marks_awarded": 1, "rationale": "Equation present", "evidence": "v = u + at"}, '
+                        '{"criterion_id": "answer", "marks_awarded": 2, "rationale": "Minor arithmetic slip", "evidence": "final value differs"}'
+                        '], "total_score": 999, "needs_review": false, "overall_feedback": "Check the arithmetic."}'
+                    ),
+                    usage=SimpleNamespace(
+                        model="test-model",
+                        caller="pcr_eval_core",
+                        input_tokens=10,
+                        output_tokens=12,
+                        total_tokens=22,
+                        estimated_cost_usd=0.0,
+                    ),
+                )
+
+        responses = Responses()
+        evaluations = Evaluations()
+        gate = Gate()
+        core = EvalCore(responses, evaluations, Questions(), Cache(), gate)
+
+        result = await core.evaluate_response("RESP-criterion")
+
+        assert result.eval_path == "criterion_rubric"
+        assert result.total_score == 3.0  # Server ignores the model's 999 total.
+        assert result.manual_review_required is False
+        assert [mark.criterion_id for mark in result.criterion_marks] == ["method", "answer"]
+        assert gate.calls[0]["temperature"] == 0.05
+        assert responses.statuses == ["evaluated"]
+        assert evaluations.docs[0]["total_score"] == 3.0
+        assert evaluations.docs[0]["criterion_marks"][1]["max_marks"] == 3.0
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_invalid_criterion_output_requires_teacher_review(self):
+        """Malformed AI criterion rows cannot silently create a score."""
+        from pcr.services.eval_core import EvalCore
+
+        class Responses:
+            def __init__(self):
+                self.statuses = []
+
+            async def get_response(self, response_id):
+                return {
+                    "response_id": response_id,
+                    "question_id": "EXAM-1::Q-2",
+                    "student_id": "STU-1",
+                    "detected_text": "Some work",
+                    "content_type": "TEXT_ONLY",
+                    "flags": [],
+                }
+
+            async def update_eval_status(self, _response_id, status):
+                self.statuses.append(status)
+
+        class Evaluations:
+            def __init__(self):
+                self.docs = []
+
+            async def insert_evaluation(self, doc):
+                self.docs.append(doc)
+                return doc, False
+
+        class Questions:
+            async def get_question(self, _question_id):
+                return {
+                    "subject": "Physics",
+                    "complexity": "L2",
+                    "question_text": "Question",
+                    "reference_solution": "Teacher solution",
+                    "max_marks": 2,
+                    "marking_policy": {"mode": "criterion_rubric_v1"},
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "working",
+                            "description": "Shows the correct working",
+                            "max_marks": 2,
+                        }
+                    ],
+                }
+
+        class Cache:
+            async def lookup(self, *_args, **_kwargs):
+                raise AssertionError("Structured criterion marking must bypass cache lookup")
+
+        class Gate:
+            async def call(self, **_kwargs):
+                return SimpleNamespace(
+                    content=(
+                        '{"criterion_marks": [{"criterion_id": "invented", "marks_awarded": 2}], '
+                        '"needs_review": false, "overall_feedback": "Looks good"}'
+                    ),
+                    usage=SimpleNamespace(
+                        model="test-model",
+                        caller="pcr_eval_core",
+                        input_tokens=1,
+                        output_tokens=1,
+                        total_tokens=2,
+                        estimated_cost_usd=0.0,
+                    ),
+                )
+
+        responses = Responses()
+        evaluations = Evaluations()
+        core = EvalCore(responses, evaluations, Questions(), Cache(), Gate())
+
+        result = await core.evaluate_response("RESP-invalid")
+
+        assert result.total_score == 0.0
+        assert result.manual_review_required is True
+        assert responses.statuses == ["manual_review"]
+        assert evaluations.docs[0]["criterion_marks"][0]["criterion_id"] == "working"
+        assert evaluations.docs[0]["criterion_marks"][0]["marks_awarded"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_gate_failure_keeps_structured_rubric_reviewable(self):
+        """A temporary AI outage still leaves teacher-editable criterion rows."""
+        from pcr.services.eval_core import EvalCore
+
+        class Responses:
+            def __init__(self):
+                self.statuses = []
+
+            async def get_response(self, response_id):
+                return {
+                    "response_id": response_id,
+                    "question_id": "EXAM-1::Q-3",
+                    "student_id": "STU-1",
+                    "detected_text": "Answer",
+                    "content_type": "TEXT_ONLY",
+                    "flags": [],
+                }
+
+            async def update_eval_status(self, _response_id, status):
+                self.statuses.append(status)
+
+        class Evaluations:
+            def __init__(self):
+                self.docs = []
+
+            async def insert_evaluation(self, doc):
+                self.docs.append(doc)
+                return doc, False
+
+        class Questions:
+            async def get_question(self, _question_id):
+                return {
+                    "subject": "Chemistry",
+                    "complexity": "L2",
+                    "question_text": "Question",
+                    "reference_solution": "Teacher solution",
+                    "max_marks": 2,
+                    "marking_policy": {"mode": "criterion_rubric_v1"},
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "explain",
+                            "description": "Explains the principle",
+                            "max_marks": 2,
+                        }
+                    ],
+                }
+
+        class Cache:
+            async def lookup(self, *_args, **_kwargs):
+                raise AssertionError("Structured criterion marking must bypass the cache")
+
+        class Gate:
+            async def call(self, **_kwargs):
+                raise RuntimeError("gate temporarily unavailable")
+
+        responses = Responses()
+        evaluations = Evaluations()
+        core = EvalCore(responses, evaluations, Questions(), Cache(), Gate())
+
+        result = await core.evaluate_response("RESP-gate-failure")
+
+        assert result.manual_review_required is True
+        assert result.criterion_marks[0].criterion_id == "explain"
+        assert evaluations.docs[0]["manual_review_required"] is True
+        assert evaluations.docs[0]["criterion_marks"][0]["marks_awarded"] == 0.0
+        assert responses.statuses == ["manual_review"]
+
 
 # ===========================================================================
 # Flag registry completeness

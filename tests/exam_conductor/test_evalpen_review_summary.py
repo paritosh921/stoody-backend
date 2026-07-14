@@ -97,3 +97,59 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
             "rationale": "Correct substitution.",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_teacher_criterion_review_recomputes_total_and_keeps_audit_history():
+    """Teachers can adjust only frozen criterion awards, never the rubric itself."""
+    import os
+    import sys
+
+    ec_dir = os.path.join(os.path.dirname(__file__), "..", "..", "exam-conductor")
+    if ec_dir not in sys.path:
+        sys.path.insert(0, ec_dir)
+    from pcr.storage.evaluation_repo import EvaluationRepository
+
+    db = _fresh_db()
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-rubric",
+            "response_id": "RESP-rubric",
+            "student_id": "STU-1",
+            "total_score": 1.0,
+            "max_score": 4.0,
+            "manual_review_required": True,
+            "criterion_marks": [
+                {
+                    "criterion_id": "method",
+                    "description": "Uses the correct equation",
+                    "marks_awarded": 1.0,
+                    "max_marks": 1.0,
+                    "rationale": "Equation present",
+                },
+                {
+                    "criterion_id": "result",
+                    "description": "Obtains the correct result",
+                    "marks_awarded": 0.0,
+                    "max_marks": 3.0,
+                    "rationale": "AI could not read final line",
+                },
+            ],
+            "audit_trail": [],
+        }
+    )
+
+    updated = await EvaluationRepository(db).override_criterion_marks(
+        "EVAL-rubric",
+        marks_by_criterion={"method": 1.0, "result": 2.5},
+        actor_id="teacher-1",
+        reason="Final calculation is legible in the uploaded copy",
+    )
+
+    assert updated is not None
+    assert updated["total_score"] == 3.5
+    stored = await db["evalpen_evaluations"].find_one({"evaluation_id": "EVAL-rubric"})
+    assert stored["criterion_marks"][0]["description"] == "Uses the correct equation"
+    assert stored["criterion_marks"][1]["marks_awarded"] == 2.5
+    assert stored["manual_review_required"] is False
+    assert stored["audit_trail"][-1]["action"] == "criterion_marks_override"

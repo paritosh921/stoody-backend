@@ -2996,6 +2996,7 @@ async def sync_questions_to_exampen(
     questions: List[Dict[str, Any]],
     exam_id: str,
     default_subject: Optional[str] = None,
+    marking_policy: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, int]]:
     """Sync question metadata to ExamPen ``evalpen_questions`` via PCR adapter.
 
@@ -3009,6 +3010,9 @@ async def sync_questions_to_exampen(
         Exam/paper identifier to tag questions with.
     default_subject
         Fallback subject when individual questions lack one.
+    marking_policy
+        Immutable PCR policy being frozen for this paper.  Existing callers
+        may omit it; those records retain legacy compatibility behaviour.
 
     Returns
     -------
@@ -3040,6 +3044,8 @@ async def sync_questions_to_exampen(
                 exam_id=exam_id,
                 default_subject=default_subject,
             )
+            if marking_policy is not None:
+                pcr_doc["marking_policy"] = marking_policy
             if pcr_doc.get("question_id"):
                 pcr_docs.append(pcr_doc)
 

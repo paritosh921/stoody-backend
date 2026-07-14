@@ -125,6 +125,14 @@ class PDFProcessingResult(BaseModel):
 class AnswerSheetOCRRequest(BaseModel):
     documentAnchorText: Optional[str] = None
 
+
+class PCRMarkingPolicyRequest(BaseModel):
+    """The teacher-controlled policy frozen into a PCR paper on finalisation."""
+
+    mode: str = Field(default="criterion_rubric_v1")
+    strictness: str = Field(default="balanced")
+    temperature: float = Field(default=0.10, ge=0.0, le=0.20)
+
 class QuestionImage(BaseModel):
     id: str
     filename: str
@@ -238,6 +246,14 @@ async def _materialize_pcr_marking_plan(
         document_id=document_id,
         questions=questions,
     )
+
+
+def _pcr_marking_policy_module() -> Any:
+    """Load ExamPen's policy helpers through the hyphenated package bridge."""
+
+    from api.v1._exampen_imports import load_exampen
+
+    return load_exampen("pcr.marking_policy")
 
 
 def _build_ai_gateway_context(
@@ -3335,6 +3351,8 @@ class DocumentMetadata(BaseModel):
     exam_finalized: Optional[bool] = None
     exam_finalized_at: Optional[datetime] = None
     exam_sync_summary: Optional[Dict[str, Any]] = None
+    pcr_marking_policy: Optional[Dict[str, Any]] = None
+    pcr_marking_policy_locked_at: Optional[datetime] = None
     orientation_applied: Optional[int] = None  # Rotation degrees baked into the uploaded PDF at upload time (0/90/180/270). Audit-only — file is already pre-rotated.
     exam_template_orientation_applied: Optional[int] = None  # Same as above for the DCR answer template.
     tally_num_questions: Optional[int] = None
@@ -3770,6 +3788,12 @@ async def upload_pdf(
             except Exception as pdf_err:
                 logger.warning(f"Failed to count answer sheet pages for {document_id}: {pdf_err}")
 
+        pcr_marking_policy = (
+            _pcr_marking_policy_module().default_structured_marking_policy()
+            if exam_mode == "pcr"
+            else None
+        )
+
         document_metadata = {
             "document_id": document_id,
             "title": title,
@@ -3803,6 +3827,10 @@ async def upload_pdf(
             "is_active": False,  # Default to inactive until admin enables
             "is_s3": str(relative_path).startswith("s3://"),  # Track storage location
             "exam_mode": exam_mode if exam_mode in ("dcr", "pcr") else None,
+            "pcr_marking_policy": pcr_marking_policy,
+            "pcr_marking_policy_updated_at": datetime.utcnow() if pcr_marking_policy else None,
+            "pcr_marking_policy_updated_by": current_user.get("user_id") if pcr_marking_policy else None,
+            "pcr_marking_policy_locked_at": None,
             "exam_template_path": exam_template_path,
             "answer_sheet_path": answer_sheet_path,
             "answer_sheet_filename": answer_sheet_filename,
@@ -3903,6 +3931,78 @@ async def upload_pdf(
             detail=f"Failed to upload document: {str(e)}"
         )
 
+@router.put("/documents/{document_id}/pcr-marking-policy")
+@limiter.limit("20/minute")
+async def update_pcr_marking_policy(
+    request: Request,
+    document_id: str,
+    body: PCRMarkingPolicyRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Save the draft criterion-marking policy for an unfinalized PCR paper.
+
+    The endpoint is deliberately unavailable after finalisation.  The policy
+    is then copied into the immutable paper version and each session snapshot,
+    so an administrator cannot make an already submitted copy stricter or
+    more lenient after the fact.
+    """
+
+    is_b2c = is_b2c_admin(current_user)
+    document = (
+        await db.b2c_find_one("documents", {"document_id": document_id})
+        if is_b2c
+        else await db.mongo_find_one("documents", {"document_id": document_id})
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    if document.get("exam_mode") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="PCR marking policy is available only for PCR exam documents",
+        )
+    if document.get("exam_finalized"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="PCR marking policy is locked because this paper is finalized",
+        )
+
+    try:
+        policy_module = _pcr_marking_policy_module()
+        policy = policy_module.normalize_marking_policy(
+            body.model_dump(),
+            default_structured=True,
+        )
+        if policy.get("mode") != policy_module.STRUCTURED_RUBRIC_MODE:
+            raise ValueError(
+                "New PCR papers must use the locked criterion-rubric marking mode"
+            )
+    except (ImportError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    update = {
+        "$set": {
+            "pcr_marking_policy": policy,
+            "pcr_marking_policy_updated_at": datetime.utcnow(),
+            "pcr_marking_policy_updated_by": current_user.get("user_id"),
+        }
+    }
+    if is_b2c:
+        await db.b2c_db["documents"].update_one({"document_id": document_id}, update)
+    else:
+        tenant_db = await db.get_tenant_db(current_user.get("db_name"))
+        await tenant_db["documents"].update_one({"document_id": document_id}, update)
+
+    return {
+        "document_id": document_id,
+        "pcr_marking_policy": policy,
+        "message": "PCR marking policy saved. It will be locked when the paper is finalized.",
+    }
+
+
 @router.post("/documents/{document_id}/finalize-exam")
 @limiter.limit("5/minute")
 async def finalize_exam(
@@ -3980,6 +4080,20 @@ async def finalize_exam(
 
         # Validate and sync based on exam_mode
         sync_summary = {}
+        pcr_marking_policy: Optional[Dict[str, Any]] = None
+        if exam_mode == "pcr":
+            try:
+                # Documents created before structured rubrics did not store a
+                # policy.  They remain legacy-compatible; newly uploaded PCR
+                # documents are explicitly saved as criterion_rubric_v1.
+                pcr_marking_policy = _pcr_marking_policy_module().normalize_marking_policy(
+                    doc.get("pcr_marking_policy")
+                )
+            except (ImportError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid PCR marking policy: {exc}",
+                ) from exc
 
         if exam_mode == "dcr":
             # DCR: require answer template
@@ -4036,7 +4150,10 @@ async def finalize_exam(
                 document_id=document_id,
                 questions=questions,
             )
-            readiness_errors = validate_pcr_questions(finalized_questions)
+            readiness_errors = validate_pcr_questions(
+                finalized_questions,
+                marking_policy=pcr_marking_policy,
+            )
             if readiness_errors:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -4054,12 +4171,14 @@ async def finalize_exam(
                 questions=finalized_questions,
                 exam_id=document_id,
                 default_subject=doc.get("subject"),
+                marking_policy=pcr_marking_policy,
             )
             sync_summary = {
                 "engine": "pcr",
                 "questions_inserted": (result or {}).get("inserted", 0),
                 "questions_updated": (result or {}).get("updated", 0),
                 "marking_plan": marking_plan_summary,
+                "marking_policy": pcr_marking_policy,
             }
 
             # The immutable snapshot below must use the same reviewed
@@ -4072,9 +4191,13 @@ async def finalize_exam(
         # that was approved here.
         from services.exampen_paper_service import create_paper_snapshot
 
+        snapshot_document = dict(doc)
+        if pcr_marking_policy is not None:
+            snapshot_document["pcr_marking_policy"] = pcr_marking_policy
+
         paper_snapshot = await create_paper_snapshot(
             tenant_db=tenant_db,
-            document=doc,
+            document=snapshot_document,
             questions=questions,
         )
         sync_summary["paper_version_id"] = paper_snapshot["paper_version_id"]
@@ -4088,6 +4211,10 @@ async def finalize_exam(
                 "exam_sync_summary": sync_summary,
                 "exam_paper_version_id": paper_snapshot["paper_version_id"],
                 "exam_content_hash": paper_snapshot["content_hash"],
+                "pcr_marking_policy": pcr_marking_policy,
+                "pcr_marking_policy_locked_at": datetime.utcnow()
+                if pcr_marking_policy is not None
+                else None,
                 "exam_readiness": {
                     "status": "paper_ready",
                     "question_count": paper_snapshot["question_count"],
@@ -5396,6 +5523,8 @@ async def get_documents(
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
                 exam_sync_summary=doc.get("exam_sync_summary"),
+                pcr_marking_policy=doc.get("pcr_marking_policy"),
+                pcr_marking_policy_locked_at=doc.get("pcr_marking_policy_locked_at"),
                 orientation_applied=doc.get("orientation_applied"),
                 exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
                 tally_num_questions=doc.get("tally_num_questions"),
@@ -6048,6 +6177,8 @@ async def get_student_available_options(
                 exam_finalized=doc.get("exam_finalized"),
                 exam_finalized_at=doc.get("exam_finalized_at"),
                 exam_sync_summary=doc.get("exam_sync_summary"),
+                pcr_marking_policy=doc.get("pcr_marking_policy"),
+                pcr_marking_policy_locked_at=doc.get("pcr_marking_policy_locked_at"),
                 orientation_applied=doc.get("orientation_applied"),
                 exam_template_orientation_applied=doc.get("exam_template_orientation_applied"),
                 tally_num_questions=doc.get("tally_num_questions"),
@@ -7162,6 +7293,7 @@ async def create_question(
     evaluation_mode: str = Form(default="auto"),
     reference_solution: Optional[str] = Form(None),
     rubric: Optional[str] = Form(None),
+    marking_criteria: Optional[str] = Form(None),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -7200,6 +7332,15 @@ async def create_question(
         normalized_evaluation_mode = str(evaluation_mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
         if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
             normalized_evaluation_mode = "auto"
+        try:
+            normalized_marking_criteria = _pcr_marking_policy_module().normalize_marking_criteria(
+                marking_criteria
+            )
+        except (ImportError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
 
         manual_image_entries = []
         if question_image and question_image.filename:
@@ -7242,6 +7383,7 @@ async def create_question(
             "correct_answer": correct_answer,
             "reference_solution": (reference_solution or "").strip() or None,
             "rubric": (rubric or "").strip() or None,
+            "marking_criteria": normalized_marking_criteria,
             "subject": subject,
             "difficulty": difficulty,
             "document_type": document_type,
@@ -7414,6 +7556,16 @@ async def update_question(
             ).strip() or None
         if "rubric" in question_data:
             update_data["rubric"] = str(question_data["rubric"] or "").strip() or None
+        if "marking_criteria" in question_data:
+            try:
+                update_data["marking_criteria"] = _pcr_marking_policy_module().normalize_marking_criteria(
+                    question_data["marking_criteria"]
+                )
+            except (ImportError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
         if "subject" in question_data:
             update_data["subject"] = question_data["subject"]
         if "difficulty" in question_data:
