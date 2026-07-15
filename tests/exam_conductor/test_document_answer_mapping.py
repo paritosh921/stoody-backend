@@ -289,6 +289,63 @@ def test_multi_page_camera_copy_always_uses_document_mapping():
     ) is False
 
 
+def test_numbered_answer_book_skips_document_remap_when_coverage_is_reliable():
+    """Content-style 1)/2)/3) splits must not be destroyed by vision remapping."""
+    mapping = _mapping_service()
+    pages = [
+        _page(
+            1,
+            [
+                ("Prayaan Answer Book Date Page", 2.0, 15.0),
+                ("1) 50,067", 40.0, 55.0),
+                ("2) 3630", 70.0, 90.0),
+                ("3) small diagram", 110.0, 140.0),
+            ],
+        )
+    ]
+    segmented = [
+        _response("RESP-1", 1, "1) 50,067", 1, 40.0, 55.0),
+        _response("RESP-2", 2, "2) 3630", 1, 70.0, 90.0),
+        _response("RESP-3", 3, "3) small diagram", 1, 110.0, 140.0),
+    ]
+    questions = [(number, {"question_text": f"Question {number}"}) for number in range(1, 4)]
+
+    assert mapping.has_reliable_marker_coverage(segmented, questions) is True
+    assert mapping.needs_document_answer_mapping(
+        pages=pages,
+        segmented_responses=segmented,
+        numbered_questions=questions,
+        source="camera",
+    ) is False
+
+
+def test_deterministic_numbered_mapping_ignores_form_header():
+    """Header chrome must never become Q1 when 1)/2) labels exist."""
+    mapping = _mapping_service()
+    pages = [
+        _page(
+            1,
+            [
+                ("Prayaan Answer Book Date Page", 2.0, 12.0),
+                ("1) 50,067", 40.0, 55.0),
+                ("2) 3630", 70.0, 90.0),
+                ("3) E coli 5.0 x 10^12", 110.0, 140.0),
+            ],
+        )
+    ]
+    questions = [(number, {"question_text": f"Question {number}"}) for number in range(1, 4)]
+    result = mapping._deterministic_numbered_mapping(
+        pages=pages,
+        numbered_questions=questions,
+    )
+    assert result is not None
+    by_q = {r.question_number: r.detected_text for r in result.responses}
+    assert 1 in by_q and "50,067" in by_q[1]
+    assert 2 in by_q and "3630" in by_q[2]
+    assert "Prayaan" not in (by_q.get(1) or "")
+    assert "Answer Book" not in (by_q.get(1) or "")
+
+
 @pytest.mark.asyncio
 async def test_document_mapper_maps_interleaved_regions_across_all_pages(monkeypatch):
     """A mixed copy is associated to Q1/Q3/Q5 before any marking occurs."""

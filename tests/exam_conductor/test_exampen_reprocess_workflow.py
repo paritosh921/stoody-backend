@@ -52,6 +52,10 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
         "celery_app",
         SimpleNamespace(process_exampen_pcr_submission=task),
     )
+    monkeypatch.setattr(
+        "services.exampen_workflow._celery_broker_available",
+        lambda: True,
+    )
 
     result = await reprocess_processing_job(
         db,
@@ -143,3 +147,51 @@ async def test_force_dispatch_keeps_a_worker_claimed_job_untouched():
     assert result["status"] == "processing"
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-3"})
     assert stored["status"] == "processing"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_without_redis_does_not_hang_and_schedules_inline(monkeypatch):
+    """Reprocess must not sit on Celery Redis retries when Redis is down."""
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        dispatch_processing_job,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    job = {
+        "job_id": "pcr-job-SUB-4",
+        "submission_id": "SUB-4",
+        "status": "queued",
+    }
+    await jobs.insert_one(job)
+
+    monkeypatch.setattr(
+        "services.exampen_workflow._celery_broker_available",
+        lambda: False,
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        "services.exampen_workflow._schedule_inline_processing",
+        lambda tenant_db, job_id: scheduled.append(job_id),
+    )
+    # Ensure delay is never called (would hang in real Redis-down environments).
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("Celery delay must not be called when broker is down")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=SimpleNamespace(delay=_boom)),
+    )
+
+    result = await dispatch_processing_job(
+        db,
+        db_name="skb_test",
+        job=job,
+        force=True,
+    )
+
+    assert result["status"] == "queued"
+    assert "broker unavailable" in str(result.get("last_error") or "").lower()
+    assert scheduled == ["pcr-job-SUB-4"]

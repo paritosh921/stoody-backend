@@ -808,6 +808,268 @@ async def get_submission_pages(
     )
 
 
+class CollectionRosterItemAPI(BaseModel):
+    """One expected student row for the collection / workspace roster."""
+
+    student_id: str
+    student_name: Optional[str] = None
+    submission_id: Optional[str] = None
+    status: str = "expected"
+    source: Optional[str] = None
+    last_activity: Optional[str] = None
+
+
+class ExamRosterAPI(BaseModel):
+    """Roster + collection progress for a conducted exam sitting."""
+
+    exam_id: str
+    expected_students: List[CollectionRosterItemAPI]
+    total_expected: int = 0
+    total_submitted: int = 0
+    total_blocked: int = 0
+    total_ready: int = 0
+    total_published: int = 0
+
+
+@router.get(
+    "/exams/{exam_id}/roster",
+    response_model=ExamRosterAPI,
+    summary="Get expected-student roster and collection status for an exam",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Exam not found"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def get_exam_roster(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> ExamRosterAPI:
+    """Return the planned roster with live submission/processing status.
+
+    Used by the ExamPen workspace collection monitor and student explorer.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Exam {exam_id} not found",
+        )
+
+    roster_ids = [
+        str(student_id).strip()
+        for student_id in (exam.get("roster") or [])
+        if str(student_id).strip()
+    ]
+    if scoped_ids is not None:
+        allowed = {str(item) for item in scoped_ids}
+        roster_ids = [student_id for student_id in roster_ids if student_id in allowed]
+
+    # Student display names (best-effort).
+    name_by_id: Dict[str, str] = {}
+    if roster_ids:
+        try:
+            cursor = tenant_db["students"].find(
+                {"student_id": {"$in": roster_ids}},
+                {"student_id": 1, "name": 1, "full_name": 1, "display_name": 1},
+            )
+            for doc in await cursor.to_list(length=max(len(roster_ids), 1)):
+                sid = str(doc.get("student_id") or "").strip()
+                if not sid:
+                    continue
+                name = (
+                    doc.get("display_name")
+                    or doc.get("full_name")
+                    or doc.get("name")
+                    or ""
+                )
+                if name:
+                    name_by_id[sid] = str(name)
+        except Exception:
+            logger.debug("Student name lookup failed for exam %s roster", exam_id)
+
+    submissions = await tenant_db["evalpen_submissions"].find(
+        {"exam_id": exam_id},
+        projection={
+            "submission_id": 1,
+            "student_id": 1,
+            "source": 1,
+            "publication_status": 1,
+            "segmentation_status": 1,
+            "updated_at": 1,
+            "created_at": 1,
+        },
+    ).to_list(length=5000)
+    if scoped_ids is not None:
+        allowed = {str(item) for item in scoped_ids}
+        submissions = [
+            doc
+            for doc in submissions
+            if str(doc.get("student_id") or "") in allowed
+        ]
+
+    jobs = await tenant_db["exampen_processing_jobs"].find(
+        {"exam_id": exam_id},
+        projection={
+            "submission_id": 1,
+            "student_id": 1,
+            "status": 1,
+            "updated_at": 1,
+        },
+    ).to_list(length=5000)
+    job_by_submission = {
+        str(job.get("submission_id") or ""): job
+        for job in jobs
+        if job.get("submission_id")
+    }
+
+    # Prefer the latest submission per student.
+    sub_by_student: Dict[str, Dict[str, Any]] = {}
+    for doc in submissions:
+        student_id = str(doc.get("student_id") or "").strip()
+        if not student_id:
+            continue
+        existing = sub_by_student.get(student_id)
+        if existing is None:
+            sub_by_student[student_id] = doc
+            continue
+        existing_ts = existing.get("updated_at") or existing.get("created_at")
+        new_ts = doc.get("updated_at") or doc.get("created_at")
+        if new_ts and (not existing_ts or new_ts > existing_ts):
+            sub_by_student[student_id] = doc
+
+    # Include unexpected submitters who are not on the formal roster.
+    all_student_ids = list(dict.fromkeys([*roster_ids, *sub_by_student.keys()]))
+
+    # Response/eval status for submitted copies.
+    submission_ids = [
+        str(doc.get("submission_id"))
+        for doc in sub_by_student.values()
+        if doc.get("submission_id")
+    ]
+    blocked_submissions: set[str] = set()
+    ready_submissions: set[str] = set()
+    if submission_ids:
+        try:
+            cursor = tenant_db["evalpen_detected_responses"].aggregate(
+                [
+                    {
+                        "$match": {
+                            "submission_id": {"$in": submission_ids},
+                            "superseded_at": {"$exists": False},
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": "$submission_id",
+                            "statuses": {"$addToSet": "$eval_status"},
+                        }
+                    },
+                ]
+            )
+            for row in await cursor.to_list(length=max(len(submission_ids), 1)):
+                sid = str(row.get("_id") or "")
+                statuses = {str(s or "").lower() for s in (row.get("statuses") or [])}
+                if "blocked" in statuses:
+                    blocked_submissions.add(sid)
+                elif statuses and statuses.issubset(
+                    {
+                        "evaluated",
+                        "evaluated_with_warnings",
+                        "not_attempted",
+                        "manual_review",
+                    }
+                ):
+                    ready_submissions.add(sid)
+                elif any(s.startswith("evaluated") for s in statuses):
+                    ready_submissions.add(sid)
+        except Exception:
+            logger.debug("Roster response status aggregation failed for exam %s", exam_id)
+
+    items: List[CollectionRosterItemAPI] = []
+    total_submitted = 0
+    total_blocked = 0
+    total_ready = 0
+    total_published = 0
+
+    for student_id in all_student_ids:
+        submission = sub_by_student.get(student_id)
+        submission_id = (
+            str(submission.get("submission_id")) if submission and submission.get("submission_id") else None
+        )
+        job = job_by_submission.get(submission_id or "")
+        publication = str((submission or {}).get("publication_status") or "").lower()
+        job_status = str((job or {}).get("status") or "").lower()
+        source = str((submission or {}).get("source") or "").lower() or None
+        if source and source not in {"pen", "camera", "mixed"}:
+            source = "camera" if source in {"upload", "pdf", "image"} else source
+
+        if not submission_id:
+            status_value = "expected"
+        elif publication == "published":
+            status_value = "published"
+            total_published += 1
+            total_submitted += 1
+            total_ready += 1
+        elif submission_id in blocked_submissions or job_status == "blocked_for_review":
+            status_value = "blocked"
+            total_blocked += 1
+            total_submitted += 1
+        elif (
+            submission_id in ready_submissions
+            or job_status == "completed"
+            or publication in {"ready", "unpublished"}
+        ):
+            status_value = "ready"
+            total_ready += 1
+            total_submitted += 1
+        elif job_status in {
+            "queued",
+            "processing",
+            "retryable_error",
+            "enqueue_failed",
+            "not_enqueued",
+        } or str((submission or {}).get("segmentation_status") or "") in {
+            "pending",
+            "processing",
+        }:
+            status_value = "evaluating"
+            total_submitted += 1
+        else:
+            status_value = "submitted"
+            total_submitted += 1
+
+        last_activity = _dt_to_iso(
+            (job or {}).get("updated_at")
+            or (submission or {}).get("updated_at")
+            or (submission or {}).get("created_at")
+        )
+        items.append(
+            CollectionRosterItemAPI(
+                student_id=student_id,
+                student_name=name_by_id.get(student_id),
+                submission_id=submission_id,
+                status=status_value,
+                source=source if source in {"pen", "camera", "mixed"} else None,
+                last_activity=last_activity,
+            )
+        )
+
+    return ExamRosterAPI(
+        exam_id=exam_id,
+        expected_students=items,
+        total_expected=len(items),
+        total_submitted=total_submitted,
+        total_blocked=total_blocked,
+        total_ready=total_ready,
+        total_published=total_published,
+    )
+
+
 @router.get(
     "/exams/{exam_id}/results",
     response_model=ExamResultsAPI,

@@ -7,6 +7,7 @@ for the web UI and lifecycle coordinator to explain what is still pending.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,60 @@ PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
 PROCESSING_LEASE_MINUTES = 30
+
+
+def _celery_broker_available() -> bool:
+    """Return True only when Redis/Celery broker answers a fast PING.
+
+    Local development often runs the API without Redis.  Calling
+    ``task.delay()`` in that state can hang for tens of seconds while Celery
+    retries the broker.  A one-second ping keeps reprocess responsive and lets
+    the inline processor own the job instead.
+    """
+    try:
+        import redis
+        from config_async import settings
+
+        broker_url = (
+            getattr(settings, "CELERY_BROKER_URL", None)
+            or getattr(settings, "REDIS_URL", None)
+            or "redis://localhost:6379/0"
+        )
+        client = redis.from_url(
+            str(broker_url),
+            socket_connect_timeout=1,
+            socket_timeout=1,
+            retry_on_timeout=False,
+        )
+        try:
+            return bool(client.ping())
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.info("Celery broker unavailable for PCR dispatch: %s", exc)
+        return False
+
+
+def _schedule_inline_processing(tenant_db: Any, job_id: str) -> None:
+    """Kick local in-process PCR work without waiting for a Celery worker."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _run() -> None:
+        try:
+            await process_pcr_processing_job(tenant_db, job_id)
+        except Exception:
+            logger.exception(
+                "Inline PCR processing failed for job %s after broker-less dispatch",
+                job_id,
+            )
+
+    loop.create_task(_run(), name=f"exampen-inline-dispatch-{job_id}")
 
 
 class ProcessingJobBusyError(RuntimeError):
@@ -122,17 +177,47 @@ async def dispatch_processing_job(
         current = await jobs.find_one({"job_id": job["job_id"]})
         return current or job
 
+    job_id = str(job["job_id"])
+    if not _celery_broker_available():
+        # Keep the job durable and dispatchable.  Prefer inline processing in
+        # local/debug mode so Reprocess does not hang on Redis retries.
+        await jobs.update_one(
+            {"job_id": job_id, "status": "queued"},
+            {
+                "$set": {
+                    "last_error": (
+                        "Celery/Redis broker unavailable; job kept queued for "
+                        "inline processor"
+                    ),
+                    "updated_at": _now(),
+                }
+            },
+        )
+        try:
+            from config_async import settings as _settings
+
+            inline_enabled = bool(
+                getattr(_settings, "EXAMPEN_INLINE_PROCESSOR_ENABLED", False)
+            )
+        except Exception:
+            inline_enabled = False
+        if inline_enabled or force:
+            # Operator reprocess (force=True) must not wait for a 3s poll loop
+            # when Redis is down — start work immediately in-process.
+            _schedule_inline_processing(tenant_db, job_id)
+        return await jobs.find_one({"job_id": job_id})
+
     try:
         from celery_app import process_exampen_pcr_submission
 
-        process_exampen_pcr_submission.delay(db_name, job["job_id"])
+        process_exampen_pcr_submission.delay(db_name, job_id)
     except Exception as exc:
-        logger.exception("Unable to enqueue PCR processing job %s", job["job_id"])
+        logger.exception("Unable to enqueue PCR processing job %s", job_id)
         await jobs.update_one(
             # If the worker claimed the job before the broker client raised,
             # preserve the worker state rather than overwriting it with an
             # enqueue error.
-            {"job_id": job["job_id"], "status": "queued"},
+            {"job_id": job_id, "status": "queued"},
             {
                 "$set": {
                     "status": "enqueue_failed",
@@ -141,7 +226,15 @@ async def dispatch_processing_job(
                 }
             },
         )
-    return await jobs.find_one({"job_id": job["job_id"]})
+        # Still try local inline processing so teacher reprocess works offline.
+        try:
+            from config_async import settings as _settings
+
+            if bool(getattr(_settings, "EXAMPEN_INLINE_PROCESSOR_ENABLED", False)) or force:
+                _schedule_inline_processing(tenant_db, job_id)
+        except Exception:
+            pass
+    return await jobs.find_one({"job_id": job_id})
 
 
 async def schedule_submission_processing(

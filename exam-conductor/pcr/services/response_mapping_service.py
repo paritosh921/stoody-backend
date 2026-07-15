@@ -96,6 +96,69 @@ class DocumentAnswerMapperProtocol(Protocol):
         ...  # pragma: no cover
 
 
+def has_reliable_marker_coverage(
+    segmented_responses: Iterable[DetectedResponse],
+    numbered_questions: List[tuple[int, Dict[str, Any]]],
+) -> bool:
+    """Return True when marker-based segments already own distinct paper Qs.
+
+    Content-section mapping trusts numbered answer labels when they line up
+    with the paper.  PCR must do the same: once the segmenter has split a copy
+    into unique, non-empty answers with question numbers, full-document vision
+    remapping must not replace those associations (that was overwriting correct
+    ``1)``/``2)`` splits with header chrome or wrong Q ownership).
+    """
+    responses = list(segmented_responses)
+    if len(responses) < 2 or len(numbered_questions) < 2:
+        return False
+
+    valid_numbers = {int(number) for number, _question in numbered_questions}
+    marked: List[DetectedResponse] = []
+    for response in responses:
+        number = getattr(response, "question_number", None)
+        text = str(getattr(response, "detected_text", "") or "").strip()
+        if number is None or int(number) not in valid_numbers:
+            continue
+        if not text:
+            continue
+        # Reject pure form-header detections so "Answer Book Date Page" never
+        # counts as a reliable Q1 mapping.
+        from ..domain.marker_parser import is_form_header_text, strip_form_header_noise
+
+        cleaned = strip_form_header_noise(text)
+        if not cleaned or is_form_header_text(cleaned):
+            continue
+        marked.append(response)
+
+    if len(marked) < 2:
+        return False
+
+    numbers = [int(response.question_number) for response in marked]  # type: ignore[arg-type]
+    if len(numbers) != len(set(numbers)):
+        return False
+
+    # Leftover unmarked handwriting still needs document association.
+    from ..domain.marker_parser import strip_form_header_noise as _strip_headers
+
+    unmarked_body = [
+        response
+        for response in responses
+        if response.question_number is None
+        and _strip_headers(str(response.detected_text or ""))
+    ]
+    if unmarked_body:
+        return False
+
+    paper_size = len(valid_numbers)
+    # Full paper coverage, or a clear majority of unique numbered answers with
+    # no leftover blobs — safe to skip a destructive vision remap.
+    if len(numbers) >= paper_size:
+        return True
+    if len(numbers) >= max(2, (paper_size + 1) // 2):
+        return True
+    return False
+
+
 def needs_document_answer_mapping(
     *,
     pages: List[PageOCR],
@@ -110,7 +173,8 @@ def needs_document_answer_mapping(
     boundary hints, but it cannot prove that every handwritten region has been
     assigned exactly once.  Therefore every multi-page camera copy for a
     meaningful paper takes the document-association path before any missing
-    answer slots or marks are created.
+    answer slots or marks are created — **unless** marker coverage is already
+    reliable (content-section style numbered answers).
 
     Pen submissions are deliberately left on their existing stroke-aware path
     until they expose the same canonical page-image evidence.  A normal short,
@@ -119,6 +183,12 @@ def needs_document_answer_mapping(
     """
     responses = list(segmented_responses)
     if len(numbered_questions) < 2 or not pages:
+        return False
+
+    # Strong numbered / Q-marker splits already mirror the content-section
+    # answer mapper.  Do not throw them away for a second vision pass that has
+    # been observed to reattach the form header to Q1.
+    if has_reliable_marker_coverage(responses, numbered_questions):
         return False
 
     # Student-uploaded PDF/image copies have canonical private image pages, so
@@ -179,12 +249,32 @@ class DocumentAnswerMapper:
         if not numbered_questions:
             return _unsafe_result("No immutable paper questions were available")
 
+        # Prefer content-section style deterministic numbered-block mapping
+        # before paying for a multi-page vision remap.  Student answer books
+        # almost always use ``1)`` / ``2.`` labels.
+        deterministic = _deterministic_numbered_mapping(
+            pages=pages,
+            numbered_questions=numbered_questions,
+        )
+        if deterministic is not None and deterministic.responses:
+            logger.info(
+                "Document answer mapping used deterministic numbered anchors: "
+                "%d response(s), reliable=%s",
+                len(deterministic.responses),
+                deterministic.coverage_is_reliable,
+            )
+            # When deterministic coverage is reliable, skip vision entirely.
+            if deterministic.coverage_is_reliable:
+                return deterministic
+
         messages, unresolved_page_numbers = await _build_document_messages(
             pages=pages,
             answer_pages=answer_pages,
             numbered_questions=numbered_questions,
         )
         if not messages:
+            if deterministic is not None and deterministic.responses:
+                return deterministic
             return _unsafe_result(
                 "The answer copy could not be loaded for document-level mapping",
                 metadata={"unreadable_pages": unresolved_page_numbers},
@@ -208,6 +298,8 @@ class DocumentAnswerMapper:
             )
         except Exception as exc:
             logger.exception("Document answer mapping vision request failed")
+            if deterministic is not None and deterministic.responses:
+                return deterministic
             return _unsafe_result(
                 "Document-level answer mapping was unavailable; teacher review is required",
                 metadata={"error": str(exc)[:500]},
@@ -215,6 +307,8 @@ class DocumentAnswerMapper:
 
         payload = _parse_mapping_payload(getattr(gate_response, "content", ""))
         if payload is None:
+            if deterministic is not None and deterministic.responses:
+                return deterministic
             return _unsafe_result(
                 "The document mapper returned an invalid response; teacher review is required"
             )
@@ -225,6 +319,9 @@ class DocumentAnswerMapper:
             numbered_questions=numbered_questions,
             unreadable_pages=unresolved_page_numbers,
         )
+        # Prefer the mapping that owns more real student text without header junk.
+        if deterministic is not None and deterministic.responses:
+            result = _prefer_better_mapping(deterministic, result)
         logger.info(
             "Document answer mapping completed: %d mapped response(s), reliable=%s, review=%s",
             len(result.responses),
@@ -316,12 +413,18 @@ def _build_mapping_prompt(
         "student evidence. Answers may be intermixed, continue across pages, omit "
         "Q labels, or appear in a different order. Use visible handwriting, layout, "
         "equations, and semantic content together.\n\n"
+        "CRITICAL: Ignore printed answer-book form chrome such as Name, Date, Page, "
+        "Class, Roll No, Answer Book, school logos, and the student name header. "
+        "Never map a form-header band to any question. Prefer handwritten body text "
+        "and numbered labels like '1)', '2.', 'Q1', 'Ans 3)'.\n\n"
         "First make a private ledger of every distinct worked solution visible on "
         "the answer pages. Match each ledger item against the catalog using its "
         "given values, method, equations, requested result, teacher reference "
         "solution/rubric, and visible label when there is one. The teacher reference "
         "material is an identity anchor only: it never proves that the student wrote "
-        "an answer and it must not be used to award marks. A projectile-motion solution, a smooth-wedge solution, and "
+        "an answer and it must not be used to award marks. Never copy the teacher "
+        "reference / answer key text into transcribed_text. A projectile-motion "
+        "solution, a smooth-wedge solution, and "
         "a work-energy solution are distinct answers even if the student wrote them "
         "without Q numbers. Never attach a whole mixed page to the first question "
         "just because that question appears first in the catalog.\n\n"
@@ -674,19 +777,28 @@ def _response_from_answer(
     regions: List[SourcePageRef],
     pages_by_number: Dict[int, PageOCR],
 ) -> DetectedResponse:
+    from ..domain.marker_parser import is_form_header_text, strip_form_header_noise
+
     selected_block_pairs = _blocks_for_regions(regions, pages_by_number)
-    selected_blocks = [block for _page_number, block in selected_block_pairs]
+    selected_blocks = [
+        block
+        for _page_number, block in selected_block_pairs
+        if not is_form_header_text(block.text)
+    ]
     text = " ".join(block.text.strip() for block in selected_blocks if block.text.strip())
+    text = strip_form_header_noise(text)
     used_vision_transcription = False
-    fallback_text = str(answer.get("transcribed_text") or "").strip()
-    if not text or _contains_only_full_page_blocks(
+    fallback_text = strip_form_header_noise(str(answer.get("transcribed_text") or "").strip())
+    if (not text or _contains_only_full_page_blocks(
         selected_block_pairs,
         pages_by_number,
-    ):
-        if fallback_text:
-            text = fallback_text
-            used_vision_transcription = True
+    )) and fallback_text and not is_form_header_text(fallback_text):
+        text = fallback_text
+        used_vision_transcription = True
     text = text.strip()
+    # Never persist pure form chrome as a scoreable answer.
+    if is_form_header_text(text):
+        text = ""
     response_id = f"RESP-MAP-{uuid.uuid4().hex[:12]}"
     flags: List[Flag] = []
     mapping_basis = str(answer.get("mapping_basis") or "layout_and_semantics")
@@ -1189,6 +1301,178 @@ def _unsafe_result(reason: str, *, metadata: Optional[Dict[str, Any]] = None) ->
         manual_review_required=True,
         reason=reason,
         metadata=metadata or {},
+    )
+
+
+def _prefer_better_mapping(
+    primary: DocumentAnswerMappingResult,
+    secondary: DocumentAnswerMappingResult,
+) -> DocumentAnswerMappingResult:
+    """Choose the mapping with more usable, non-header student text."""
+    from ..domain.marker_parser import is_form_header_text, strip_form_header_noise
+
+    def _score(result: DocumentAnswerMappingResult) -> tuple[int, int, int]:
+        usable = 0
+        chars = 0
+        for response in result.responses:
+            text = strip_form_header_noise(str(response.detected_text or ""))
+            if not text or is_form_header_text(text):
+                continue
+            if response.question_number is None:
+                continue
+            usable += 1
+            chars += len(text)
+        return (
+            usable,
+            1 if result.coverage_is_reliable else 0,
+            chars,
+        )
+
+    return primary if _score(primary) >= _score(secondary) else secondary
+
+
+def _deterministic_numbered_mapping(
+    *,
+    pages: List[PageOCR],
+    numbered_questions: List[tuple[int, Dict[str, Any]]],
+) -> Optional[DocumentAnswerMappingResult]:
+    """Map answers using content-section style numbered labels from OCR.
+
+    Mirrors ``AnswerSheetBlockNormalizer`` / ``AnswerQuestionMappingService``:
+    collect blocks that start with ``1)``, ``2.``, ``Ans 3)``, or Q markers,
+    then bind each unique number to the matching paper question.
+    """
+    from ..domain.marker_parser import (
+        is_form_header_text,
+        parse_markers,
+        strip_form_header_noise,
+    )
+
+    if not pages or not numbered_questions:
+        return None
+
+    valid_numbers = {int(number) for number, _question in numbered_questions}
+    pages_by_number = {page.page_number: page for page in pages}
+    markers = parse_markers(pages)
+    if len(markers) < 2:
+        return None
+
+    # Keep first (top-most) occurrence of each number across the document.
+    first_by_number: Dict[int, Any] = {}
+    for marker in markers:
+        number = int(marker.question_number)
+        if number not in valid_numbers:
+            continue
+        if number not in first_by_number:
+            first_by_number[number] = marker
+
+    if len(first_by_number) < 2:
+        return None
+
+    ordered = sorted(
+        first_by_number.values(),
+        key=lambda marker: (marker.page_number, marker.y_position),
+    )
+    responses: List[DetectedResponse] = []
+    assignment_details: Dict[str, Dict[str, Any]] = {}
+
+    for index, marker in enumerate(ordered):
+        number = int(marker.question_number)
+        page = pages_by_number.get(marker.page_number)
+        if page is None:
+            continue
+
+        # Region ends at the next marker on the same page, else page bottom.
+        # Markers on later pages own their own regions.
+        y_start = max(0.0, float(marker.y_position) - 3.0)
+        if float(marker.y_position) > 35.0:
+            y_start = max(35.0, y_start)
+
+        y_end = page.page_height_mm
+        next_same_page = None
+        for later in ordered[index + 1 :]:
+            if later.page_number == marker.page_number:
+                next_same_page = later
+                break
+            if later.page_number > marker.page_number:
+                break
+        if next_same_page is not None:
+            y_end = float(next_same_page.y_position)
+
+        # Continuation: if the next marker is on a later page, still only take
+        # this page's span for the current answer (continuation is rare for
+        # numbered short answers).  Body text on intermediate pages without a
+        # marker remains unassigned for vision / teacher review.
+        region = SourcePageRef(
+            page_number=marker.page_number,
+            y_start=y_start,
+            y_end=max(y_end, y_start + 1.0),
+        )
+        selected_blocks = [
+            block
+            for _page_number, block in _blocks_for_regions([region], pages_by_number)
+            if not is_form_header_text(block.text)
+        ]
+        text = strip_form_header_noise(
+            " ".join(block.text.strip() for block in selected_blocks if block.text.strip())
+        )
+        if not text:
+            continue
+
+        response_id = f"RESP-NUM-{uuid.uuid4().hex[:12]}"
+        mean_ocr = (
+            sum(block.confidence for block in selected_blocks) / len(selected_blocks)
+            if selected_blocks
+            else 0.85
+        )
+        response = DetectedResponse(
+            response_id=response_id,
+            question_number=number,
+            sub_part=None,
+            detected_text=text,
+            source_pages=[region],
+            content_type=ContentType.TEXT_ONLY,
+            text_coverage_ratio=1.0,
+            segmentation_confidence=0.92,
+            ocr_confidence=round(max(0.0, min(1.0, mean_ocr)), 4),
+            flags=[],
+            word_count=len(text.split()),
+            is_continuation=False,
+        )
+        responses.append(response)
+        assignment_details[response_id] = {
+            "method": "deterministic_answer_number",
+            "question_number": number,
+            "confidence": 0.92,
+            "mapping_basis": "explicit_label",
+            "prompt_version": "content-section-numbered-v1",
+            "manual_review_required": False,
+        }
+
+    if len(responses) < 2:
+        return None
+
+    mapped_numbers = {
+        int(response.question_number)
+        for response in responses
+        if response.question_number is not None
+    }
+    paper_size = len(valid_numbers)
+    coverage_is_reliable = (
+        len(mapped_numbers) >= min(paper_size, max(2, paper_size - 1))
+        and len(mapped_numbers) == len(responses)
+    )
+    return DocumentAnswerMappingResult(
+        responses=responses,
+        assignment_details_by_response=assignment_details,
+        coverage_is_reliable=coverage_is_reliable,
+        manual_review_required=not coverage_is_reliable,
+        reason=None if coverage_is_reliable else "Some paper questions lack numbered answer labels",
+        metadata={
+            "mapping_strategy": "deterministic_answer_number",
+            "mapped_question_numbers": sorted(mapped_numbers),
+            "paper_question_count": paper_size,
+        },
     )
 
 

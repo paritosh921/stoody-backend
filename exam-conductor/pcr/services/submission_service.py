@@ -47,6 +47,7 @@ from .ocr_service import OCRAdapter, OCRResult, VisionGateProtocol, create_ocr_a
 from .response_mapping_service import (
     DocumentAnswerMapper,
     DocumentAnswerMapperProtocol,
+    has_reliable_marker_coverage,
     needs_document_answer_mapping,
 )
 
@@ -421,7 +422,34 @@ class SubmissionService:
         # blank-answer rows.
         include_missing_slots = True
         assignment_details_by_response: Dict[str, Dict[str, Any]]
-        if needs_document_answer_mapping(
+        # Content-section style numbered labels (1), 2., Q1) already give
+        # reliable ownership.  Keep those segments; do not let vision remapping
+        # reattach the form header to Q1.
+        if has_reliable_marker_coverage(seg_result.responses, numbered_questions):
+            assignment_details_by_response = _assign_unmarked_responses(
+                seg_result.responses,
+                numbered_questions,
+            )
+            # Ensure marked rows keep explicit assignment audit metadata.
+            for response in seg_result.responses:
+                response_id = str(response.response_id)
+                if (
+                    response.question_number is not None
+                    and response_id not in assignment_details_by_response
+                ):
+                    assignment_details_by_response[response_id] = {
+                        "method": "marker",
+                        "question_number": int(response.question_number),
+                        "confidence": 0.95,
+                    }
+            include_missing_slots = True
+            logger.info(
+                "Submission %s using reliable marker/number coverage "
+                "(%d response(s)); skipped document vision remap",
+                submission_id,
+                len(seg_result.responses),
+            )
+        elif needs_document_answer_mapping(
             pages=pages,
             segmented_responses=seg_result.responses,
             numbered_questions=numbered_questions,
@@ -448,19 +476,56 @@ class SubmissionService:
                 mapping_error = None
 
             if mapping_result and mapping_result.responses:
-                seg_result = seg_result.model_copy(
-                    update={"responses": mapping_result.responses}
-                )
-                assignment_details_by_response = (
-                    mapping_result.assignment_details_by_response
-                )
-                include_missing_slots = mapping_result.coverage_is_reliable
-                if mapping_result.manual_review_required:
-                    logger.warning(
-                        "Submission %s has unresolved document answer regions: %s",
-                        submission_id,
-                        mapping_result.reason or "unspecified mapping uncertainty",
+                # Never replace real student text with pure form-header junk.
+                cleaned_responses = []
+                for response in mapping_result.responses:
+                    try:
+                        from ..domain.marker_parser import (
+                            is_form_header_text,
+                            strip_form_header_noise,
+                        )
+
+                        cleaned = strip_form_header_noise(response.detected_text or "")
+                        if is_form_header_text(cleaned) or not cleaned:
+                            # Drop unusable form-header-only rows rather than
+                            # grading them as a real answer.
+                            continue
+                        if cleaned != response.detected_text:
+                            response = response.model_copy(
+                                update={
+                                    "detected_text": cleaned,
+                                    "word_count": len(cleaned.split()),
+                                }
+                            )
+                    except Exception:
+                        pass
+                    cleaned_responses.append(response)
+
+                if cleaned_responses:
+                    seg_result = seg_result.model_copy(
+                        update={"responses": cleaned_responses}
                     )
+                    assignment_details_by_response = (
+                        mapping_result.assignment_details_by_response
+                    )
+                    include_missing_slots = mapping_result.coverage_is_reliable
+                    if mapping_result.manual_review_required:
+                        logger.warning(
+                            "Submission %s has unresolved document answer regions: %s",
+                            submission_id,
+                            mapping_result.reason or "unspecified mapping uncertainty",
+                        )
+                else:
+                    reason = (
+                        mapping_result.reason
+                        or "Document mapping returned only form-header chrome"
+                    )
+                    seg_result, assignment_details_by_response = _route_collapsed_copy_to_review(
+                        seg_result,
+                        reason=reason,
+                        pages=pages,
+                    )
+                    include_missing_slots = False
             else:
                 reason = (
                     (mapping_result.reason if mapping_result else None)

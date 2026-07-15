@@ -61,24 +61,28 @@ _DEFAULT_OCR_VISION_MODEL = "gpt-4o"
 # Location is a first-class part of the OCR contract.  PCR cannot safely map a
 # mixed handwritten answer copy if the model returns one paragraph for a whole
 # A4 page, so every line/paragraph block must carry a normalized page bbox.
-_OCR_PROMPT_VERSION = "exampen-layout-v3"
+_OCR_PROMPT_VERSION = "exampen-layout-v4"
 _OCR_EXTRACTION_PROMPT = (
     "This image is one page of a student exam answer copy. It may be a camera "
     "photo, scanned PDF page, or a high-contrast rendering of digital pen strokes. "
-    "Extract the visible handwritten or stroke-rendered text exactly as written. "
+    "Extract the visible HANDWRITTEN or stroke-rendered student working exactly as "
+    "written. Prioritise body answers over printed form fields. "
+    "IGNORE printed answer-book chrome such as Name, Date, Page, Class, Roll No, "
+    "Answer Book titles, school logos, and empty form lines — do not return those "
+    "labels as the only content of a page. "
     "Pay special attention to question labels such as 'Q1', 'Q. 1', 'Question 1', "
-    "'1)', or 'Q.No 1.Ans'; preserve them in the extracted text because they "
-    "separate answers for marking. "
+    "'1)', '2.', 'Ans 3)', or 'Q.No 1.Ans'; preserve them in the extracted text "
+    "because they separate answers for marking. "
     "Read top to bottom and preserve separate visual paragraphs/answer regions; "
     "do not merge text from different vertical regions into one object. For each "
     "detected text line or paragraph, return one JSON object with \"text\" "
     "(string), \"confidence\" (float 0-1), and \"bbox\" with \"x_min\", "
     "\"y_min\", \"x_max\", \"y_max\". Bbox coordinates MUST be normalized "
     "integers from 0 to 1000 relative to this page (0,0 = top-left; 1000,1000 = "
-    "bottom-right). If text is faint or partially clipped, return the best visible "
+    "bottom-right). If handwriting is faint, return the best visible "
     "transcription with lower confidence instead of dropping the line. If absolutely "
-    "no text is visible, return an empty array: []. Return ONLY the JSON array, no "
-    "markdown fences or extra text."
+    "no student answer text is visible, return an empty array: []. Return ONLY the "
+    "JSON array, no markdown fences or extra text."
 )
 
 # Gate caller identity (already registered in ALLOWED_CALLER_IDS)

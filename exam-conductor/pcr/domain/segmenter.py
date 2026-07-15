@@ -33,7 +33,13 @@ from .clubbed_detector import (
 )
 from .content_classifier import classify_content
 from .flag_registry import FLAG_REGISTRY
-from .marker_parser import Q_MARKER_PATTERN, QMarker, parse_markers
+from .marker_parser import (
+    QMarker,
+    find_answer_marker_spans,
+    is_form_header_text,
+    parse_markers,
+    strip_form_header_noise,
+)
 from .response_models import (
     BoundingBox,
     ContentType,
@@ -46,7 +52,6 @@ from .response_models import (
     SourcePageRef,
     TextBlock,
 )
-
 
 # ---------------------------------------------------------------------------
 # Confidence thresholds
@@ -118,9 +123,18 @@ def _word_count(text: str) -> int:
 
 
 def _concat_text(blocks: list[TextBlock]) -> str:
-    """Concatenate text from blocks sorted by vertical then horizontal position."""
+    """Concatenate text from blocks sorted by vertical then horizontal position.
+
+    Form-header chrome (Name/Date/Page/Answer Book titles) is stripped so it
+    cannot become the graded ``detected_text`` for Q1.
+    """
     sorted_blocks = sorted(blocks, key=lambda b: (b.bbox.y_min, b.bbox.x_min))
-    return " ".join(b.text.strip() for b in sorted_blocks if b.text.strip())
+    parts: list[str] = []
+    for block in sorted_blocks:
+        text = strip_form_header_noise(block.text.strip())
+        if text:
+            parts.append(text)
+    return " ".join(parts)
 
 
 def _text_occupied_bbox(
@@ -150,12 +164,15 @@ def _text_occupied_bbox(
 
 
 def _split_blocks_on_multiple_q_markers(pages: list[PageOCR]) -> list[PageOCR]:
-    """Split OCR blocks that contain several Q markers into marker blocks.
+    """Split OCR blocks that contain several answer markers into marker blocks.
 
     Vision OCR can legitimately return one text block for a whole rendered pen
     page.  The text is still canonical OCR output, but segmentation needs one
     block per marker-delimited response so the PCR path can evaluate each
     answer independently instead of treating the page as a clubbed answer.
+
+    Supports both explicit Q labels and content-section style ``1)`` / ``2.``
+    numbered answer labels.
     """
     normalized_pages: list[PageOCR] = []
 
@@ -164,7 +181,13 @@ def _split_blocks_on_multiple_q_markers(pages: list[PageOCR]) -> list[PageOCR]:
         changed = False
 
         for block in page.text_blocks:
-            matches = list(Q_MARKER_PATTERN.finditer(block.text))
+            if is_form_header_text(block.text):
+                # Keep the block out of marker splitting; form chrome is
+                # filtered later when building detected_text.
+                normalized_blocks.append(block)
+                continue
+
+            matches = find_answer_marker_spans(block.text)
             if len(matches) <= 1:
                 normalized_blocks.append(block)
                 continue
@@ -181,7 +204,7 @@ def _split_blocks_on_multiple_q_markers(pages: list[PageOCR]) -> list[PageOCR]:
                     else len(block.text)
                 )
                 text = block.text[match.start():next_start].strip()
-                if not text:
+                if not text or is_form_header_text(text):
                     continue
 
                 y_min = block.bbox.y_min + idx * slice_height
@@ -228,6 +251,27 @@ def _markers_in_range(
     ]
 
 
+def _segment_y_start_for_marker(
+    marker: QMarker,
+    *,
+    previous_marker_y: float | None,
+    page_height_mm: float,
+) -> float:
+    """Choose the top of an answer region.
+
+    The first marker still starts at the page top so rough notes above the
+    label remain with Q1 (existing behaviour).  Printed form chrome inside that
+    band is filtered out of ``detected_text`` via ``is_form_header_text`` —
+    that is what prevented "Answer Book Date Page" from becoming Q1, without
+    dropping legitimate pre-label working.
+    """
+    del page_height_mm  # reserved for future page-relative clamps
+    del marker
+    if previous_marker_y is None:
+        return 0.0
+    return max(0.0, previous_marker_y)
+
+
 def _build_marker_delimited_segments_for_page(
     page: PageOCR,
     page_markers: list[QMarker],
@@ -237,7 +281,12 @@ def _build_marker_delimited_segments_for_page(
     sorted_markers = sorted(page_markers, key=lambda m: m.y_position)
 
     for idx, marker in enumerate(sorted_markers):
-        y_start = 0.0 if idx == 0 else marker.y_position
+        previous_y = sorted_markers[idx - 1].y_position if idx > 0 else None
+        y_start = _segment_y_start_for_marker(
+            marker,
+            previous_marker_y=previous_y,
+            page_height_mm=page.page_height_mm,
+        )
         y_end = (
             sorted_markers[idx + 1].y_position
             if idx + 1 < len(sorted_markers)
@@ -252,9 +301,13 @@ def _build_marker_delimited_segments_for_page(
             y_end,
             page.page_height_mm,
         )
-        seg.text_blocks.extend(
-            _blocks_in_range(page.text_blocks, y_start, y_end)
-        )
+        # Exclude pure form-header blocks even if they fall near the boundary.
+        body_blocks = [
+            block
+            for block in _blocks_in_range(page.text_blocks, y_start, y_end)
+            if not is_form_header_text(block.text)
+        ]
+        seg.text_blocks.extend(body_blocks)
         seg.markers.append(marker)
         seg.closed = True
         segments.append(seg)
@@ -657,6 +710,10 @@ def segment_submission(
         if not seg.text_blocks:
             continue
         response, resp_flags = _segment_to_response(seg, page_widths)
+        # Form-header-only segments produce empty cleaned text — do not create
+        # a scoreable Q1 from "Answer Book Date Page".
+        if not (response.detected_text or "").strip():
+            continue
         responses.append(response)
         all_response_flags.extend(resp_flags)
         markers_by_response[response.response_id] = seg.markers

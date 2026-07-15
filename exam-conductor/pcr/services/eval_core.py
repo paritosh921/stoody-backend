@@ -892,9 +892,31 @@ class EvalCore:
             )
 
         question_id = stored_question_id
-        detected_text = response_doc.get("detected_text", "")
+        detected_text = str(response_doc.get("detected_text", "") or "")
         content_type = response_doc.get("content_type", "TEXT_ONLY")
         flags = response_doc.get("flags", [])
+
+        # Strip printed answer-book chrome so form headers are never graded as
+        # the student response (production: "Prayaan Answer Book Date Page").
+        try:
+            from ..domain.marker_parser import is_form_header_text, strip_form_header_noise
+
+            cleaned_detected = strip_form_header_noise(detected_text)
+            if cleaned_detected and not is_form_header_text(cleaned_detected):
+                detected_text = cleaned_detected
+            elif is_form_header_text(detected_text) or not cleaned_detected:
+                # Treat pure form chrome as a missing answer so marks are not
+                # invented from labels, and teachers see an honest zero/review.
+                if not response_doc.get("is_missing_response"):
+                    response_doc = {
+                        **response_doc,
+                        "is_missing_response": True,
+                        "detected_text": "",
+                        "answer_state": "not_attempted",
+                    }
+                    detected_text = ""
+        except Exception:
+            logger.debug("Form-header cleanup unavailable for response %s", response_id)
 
         # Step 2: Check blocking flags (I-PCR-02, PCR_EVAL_ENGINE_SPEC §6.3)
         has_blocking = any(

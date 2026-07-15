@@ -307,6 +307,33 @@ class TestUSeg02:
         match = Q_MARKER_PATTERN.search("The answer is 42")
         assert match is None
 
+    def test_u_seg_02_plain_numbered_answer_labels(self):
+        """Content-section style 1)/2. labels map to question numbers."""
+        from pcr.domain.marker_parser import (
+            ANSWER_NUMBER_MARKER_PATTERN,
+            is_form_header_text,
+            parse_markers,
+            strip_form_header_noise,
+        )
+
+        assert ANSWER_NUMBER_MARKER_PATTERN.search("1) 3630") is not None
+        assert ANSWER_NUMBER_MARKER_PATTERN.search("2. 64") is not None
+        assert ANSWER_NUMBER_MARKER_PATTERN.search("Ans 3) small diagram") is not None
+        assert ANSWER_NUMBER_MARKER_PATTERN.search("The answer is 42") is None
+
+        page = _make_page_ocr(
+            1,
+            [
+                _make_text_block("Prayaan Answer Book Date Page", y_min=2.0, y_max=12.0),
+                _make_text_block("1) 50,067", y_min=40.0, y_max=55.0),
+                _make_text_block("2) 3630", y_min=70.0, y_max=85.0),
+            ],
+        )
+        markers = parse_markers([page])
+        assert [m.question_number for m in markers] == [1, 2]
+        assert is_form_header_text("Prayaan Answer Book Date Page")
+        assert strip_form_header_noise("Prayaan Answer Book Date Page") == ""
+
     def test_u_seg_02_ocr_fix_l_to_1(self):
         """OCR fix: l -> 1 helps recognize 'Q.No l.Ans' as Q.No 1."""
         fixed = _apply_ocr_fixes("Q.No l.Ans")
