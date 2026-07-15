@@ -442,6 +442,8 @@ class SubmissionService:
                         "question_number": int(response.question_number),
                         "confidence": 0.95,
                     }
+            # Always complete the paper matrix for unanswered questions once we
+            # have a clear numbered subset (student wrote 1–5 of 9 → zeros for 6–9).
             include_missing_slots = True
             logger.info(
                 "Submission %s using reliable marker/number coverage "

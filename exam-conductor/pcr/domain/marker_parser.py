@@ -277,6 +277,18 @@ def parse_markers(pages: list[PageOCR]) -> list[QMarker]:
     return all_markers
 
 
+# Mid-paragraph numbered labels (OCR often returns one long line:
+# "4) partition ... 5) Rohit goes ...").  Require a short number + )/. and
+# surrounding whitespace so decimals like 5609.32 are not treated as markers.
+_INLINE_ANSWER_NUMBER_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:(?<=\s)|^)"
+    r"(?:(?:ans(?:wer)?|sol(?:ution)?)\s*[:.\-]?\s*)?"
+    r"(\d{1,3})\s*[\.\)]\s+"
+    r"(?=[A-Za-z(\[]|\d{1,3}\s*[\.\)]|\d{4,}|\S)",
+    re.IGNORECASE,
+)
+
+
 def find_answer_marker_spans(text: str) -> list[re.Match[str]]:
     """Return non-overlapping marker matches suitable for splitting a blob."""
     if not text:
@@ -288,4 +300,11 @@ def find_answer_marker_spans(text: str) -> list[re.Match[str]]:
         return q_matches
     if len(q_matches) == 1:
         return q_matches
-    return list(ANSWER_NUMBER_MARKER_PATTERN.finditer(text))
+    line_matches = list(ANSWER_NUMBER_MARKER_PATTERN.finditer(text))
+    if len(line_matches) > 1:
+        return line_matches
+    # Single-line multi-answer OCR blob: "4) ... 5) ..."
+    inline_matches = list(_INLINE_ANSWER_NUMBER_PATTERN.finditer(text))
+    if len(inline_matches) > 1:
+        return inline_matches
+    return line_matches or inline_matches

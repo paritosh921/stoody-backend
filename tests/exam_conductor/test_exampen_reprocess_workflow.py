@@ -105,6 +105,8 @@ async def test_reprocess_refuses_to_reset_a_copy_already_claimed_by_a_worker():
             "submission_id": "SUB-2",
             "status": "processing",
             "attempts": 1,
+            # Fresh lease — must not be reclaimed mid-run.
+            "updated_at": datetime.now(timezone.utc),
         }
     )
 
@@ -119,6 +121,48 @@ async def test_reprocess_refuses_to_reset_a_copy_already_claimed_by_a_worker():
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-2"})
     assert stored["status"] == "processing"
     assert "reprocess_count" not in stored
+
+
+@pytest.mark.asyncio
+async def test_reprocess_reclaims_stale_processing_job(monkeypatch):
+    from datetime import timedelta
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        reprocess_processing_job,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    stale = datetime.now(timezone.utc) - timedelta(minutes=10)
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-SUB-STALE",
+            "submission_id": "SUB-STALE",
+            "status": "processing",
+            "attempts": 1,
+            "updated_at": stale,
+        }
+    )
+    monkeypatch.setattr(
+        "services.exampen_workflow._celery_broker_available",
+        lambda: True,
+    )
+    task = _RecordedTask()
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=task),
+    )
+
+    result = await reprocess_processing_job(
+        db,
+        db_name="skb_test",
+        job_id="pcr-job-SUB-STALE",
+        requested_by="TUT-1",
+        reason="Recover half-marked paper",
+    )
+    assert result["status"] == "queued"
+    assert task.calls == [("skb_test", "pcr-job-SUB-STALE")]
 
 
 @pytest.mark.asyncio

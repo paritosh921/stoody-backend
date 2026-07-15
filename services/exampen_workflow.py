@@ -292,21 +292,52 @@ async def reprocess_processing_job(
     job = await jobs.find_one({"job_id": job_id})
     if job is None:
         raise ValueError(f"Processing job {job_id} not found")
-    if str(job.get("status") or "") == "processing":
-        raise ProcessingJobBusyError(f"Processing job {job_id} is already running")
+
+    current_status = str(job.get("status") or "queued")
+    if current_status == "processing":
+        # Allow reclaim when a worker crashed / Redis died mid-run and left the
+        # lease stuck.  Without this the UI never shows Reprocess again.
+        updated_at = job.get("updated_at")
+        stale = True
+        if isinstance(updated_at, datetime):
+            age = _now() - (
+                updated_at
+                if updated_at.tzinfo
+                else updated_at.replace(tzinfo=timezone.utc)
+            )
+            stale = age > timedelta(minutes=2)
+        if not stale:
+            raise ProcessingJobBusyError(
+                f"Processing job {job_id} is already running"
+            )
+        logger.warning(
+            "Reclaiming stale processing job %s for reprocess (lease older than 2m)",
+            job_id,
+        )
 
     now = _now()
     history_entry = {
         "requested_at": now,
         "requested_by": requested_by or "unknown",
         "reason": (reason or "Operator requested reprocessing").strip()[:500],
-        "previous_status": str(job.get("status") or "queued"),
+        "previous_status": current_status,
         "previous_attempts": int(job.get("attempts") or 0),
         "previous_last_error": job.get("last_error"),
         "previous_pipeline_version": job.get("pipeline_version"),
     }
     reset = await jobs.update_one(
-        {"job_id": job_id, "status": {"$ne": "processing"}},
+        {
+            "job_id": job_id,
+            "$or": [
+                {"status": {"$ne": "processing"}},
+                {
+                    "status": "processing",
+                    "updated_at": {
+                        "$lt": now - timedelta(minutes=2),
+                    },
+                },
+            ],
+        },
         {
             "$set": {
                 "status": "queued",
@@ -540,9 +571,18 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
 
     evaluation_errors: List[str] = []
     evaluated_count = 0
-    if responses:
-        eval_core = await _build_eval_core(tenant_db)
-        for response in responses:
+    eval_core = await _build_eval_core(tenant_db)
+
+    async def _evaluate_ready_batch() -> None:
+        nonlocal evaluated_count, blocked_count
+        batch = await tenant_db["evalpen_detected_responses"].find(
+            {
+                "submission_id": submission_id,
+                "superseded_at": {"$exists": False},
+                "eval_status": {"$in": ["ready", "ready_with_warnings"]},
+            }
+        ).to_list(length=2000)
+        for response in batch:
             response_id = str(response.get("response_id") or "")
             question_id = response.get("question_id")
             if not response_id or not question_id:
@@ -562,7 +602,30 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                 )
                 blocked_count += 1
                 continue
-            result = await eval_core.evaluate_response(response_id, question_id=str(question_id))
+            try:
+                result = await eval_core.evaluate_response(
+                    response_id, question_id=str(question_id)
+                )
+            except Exception as exc:
+                # One bad question must never strand Q5..Qn as permanent "ready"
+                # without a score (production: 4/9 evaluated, rest stuck).
+                logger.exception(
+                    "Evaluation crashed for response %s question %s",
+                    response_id,
+                    question_id,
+                )
+                evaluation_errors.append(f"{response_id}: {exc}")
+                await tenant_db["evalpen_detected_responses"].update_one(
+                    {"response_id": response_id},
+                    {
+                        "$set": {
+                            "eval_status": "ready",
+                            "manual_review_reason": f"Evaluation failed: {_short_error(exc)}",
+                            "updated_at": _now(),
+                        }
+                    },
+                )
+                continue
             if result.error:
                 evaluation_errors.append(f"{response_id}: {result.error}")
             elif result.skipped:
@@ -570,10 +633,39 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
             else:
                 evaluated_count += 1
 
+    # First pass: responses returned by the OCR/mapping stage.
+    # Second pass: any leftover ready rows (including not_attempted slots that
+    # were written after the first fetch, or retries after a partial crash).
+    await _evaluate_ready_batch()
+    await _evaluate_ready_batch()
+
     if processing_result.response_count == 0:
         evaluation_errors.append("No student responses were detected")
 
-    final_status = "failed" if evaluation_errors else ("blocked_for_review" if blocked_count else "completed")
+    remaining_ready = await tenant_db["evalpen_detected_responses"].count_documents(
+        {
+            "submission_id": submission_id,
+            "superseded_at": {"$exists": False},
+            "eval_status": {"$in": ["ready", "ready_with_warnings"]},
+        }
+    )
+    # Partial success is still a terminal job so the teacher can reprocess.
+    # Only mark hard-failed when nothing was scored and errors exist.
+    if remaining_ready > 0 and evaluation_errors:
+        final_status = "failed"
+    elif evaluation_errors and evaluated_count == 0:
+        final_status = "failed"
+    elif blocked_count and evaluated_count == 0 and remaining_ready == 0:
+        final_status = "blocked_for_review"
+    elif remaining_ready > 0:
+        final_status = "failed"
+        evaluation_errors.append(
+            f"{remaining_ready} answer(s) still waiting for evaluation"
+        )
+    elif blocked_count:
+        final_status = "blocked_for_review"
+    else:
+        final_status = "completed"
     now = _now()
     await jobs.update_one(
         {"job_id": job_id},
@@ -590,6 +682,7 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                     "evaluated_count": evaluated_count,
                     "blocked_count": blocked_count,
                     "error_count": len(evaluation_errors),
+                    "remaining_ready": remaining_ready,
                 },
                 "last_error": "; ".join(evaluation_errors[:10]) or None,
                 "finished_at": now,
