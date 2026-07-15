@@ -44,6 +44,7 @@ from ..domain.response_models import (
 from ..domain.segmenter import segment_submission
 
 from .ocr_service import OCRAdapter, OCRResult, VisionGateProtocol, create_ocr_adapter
+from .answer_book_extractor import try_extract_answer_book_responses
 from .response_mapping_service import (
     DocumentAnswerMapper,
     DocumentAnswerMapperProtocol,
@@ -422,10 +423,29 @@ class SubmissionService:
         # blank-answer rows.
         include_missing_slots = True
         assignment_details_by_response: Dict[str, Dict[str, Any]]
-        # Content-section style numbered labels (1), 2., Q1) already give
-        # reliable ownership.  Keep those segments; do not let vision remapping
-        # reattach the form header to Q1.
-        if has_reliable_marker_coverage(seg_result.responses, numbered_questions):
+
+        # ── PRIMARY PATH (content-section style) ─────────────────────────
+        # Student answer books almost always use plain "1) 2) 3)" labels.
+        # Extract them directly from OCR before any vision remap can destroy
+        # the association or invent header-only Q1 rows.
+        book_extract = try_extract_answer_book_responses(
+            pages, numbered_questions
+        )
+        if book_extract is not None:
+            book_responses, book_assignment = book_extract
+            seg_result = seg_result.model_copy(
+                update={"responses": book_responses}
+            )
+            assignment_details_by_response = book_assignment
+            include_missing_slots = True
+            logger.info(
+                "Submission %s: answer-book numbered extract mapped %d "
+                "answer(s) from OCR (skipped fragile vision remap)",
+                submission_id,
+                len(book_responses),
+            )
+        # Content-section style numbered labels from the page segmenter.
+        elif has_reliable_marker_coverage(seg_result.responses, numbered_questions):
             assignment_details_by_response = _assign_unmarked_responses(
                 seg_result.responses,
                 numbered_questions,

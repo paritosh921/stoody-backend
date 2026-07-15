@@ -129,6 +129,7 @@ class MockGate:
         prompt: str,
         caller_id: str,
         *,
+        messages: Optional[Any] = None,
         max_output_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -137,6 +138,7 @@ class MockGate:
             "model_id": model_id,
             "prompt": prompt,
             "caller_id": caller_id,
+            "messages": messages,
             "metadata": metadata,
         })
 

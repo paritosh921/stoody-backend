@@ -249,6 +249,41 @@ class DocumentAnswerMapper:
         if not numbered_questions:
             return _unsafe_result("No immutable paper questions were available")
 
+        # Prefer content-section style numbered extraction before vision.
+        try:
+            from .answer_book_extractor import try_extract_answer_book_responses
+
+            book = try_extract_answer_book_responses(pages, numbered_questions)
+        except Exception:
+            book = None
+            logger.exception("Answer-book numbered extract failed during document mapping")
+        if book is not None:
+            book_responses, book_assignment = book
+            paper_size = len(numbered_questions)
+            mapped = {
+                int(r.question_number)
+                for r in book_responses
+                if r.question_number is not None
+            }
+            coverage_is_reliable = len(mapped) >= max(1, min(paper_size, max(2, paper_size - 1)))
+            result = DocumentAnswerMappingResult(
+                responses=book_responses,
+                assignment_details_by_response=book_assignment,
+                coverage_is_reliable=True,  # always fill unanswered zeros after extract
+                manual_review_required=not coverage_is_reliable,
+                reason=None,
+                metadata={
+                    "mapping_strategy": "answer_book_numbered_extract",
+                    "mapped_question_numbers": sorted(mapped),
+                },
+            )
+            logger.info(
+                "Document answer mapping used answer-book numbered extract: "
+                "%d response(s)",
+                len(book_responses),
+            )
+            return result
+
         # Prefer content-section style deterministic numbered-block mapping
         # before paying for a multi-page vision remap.  Student answer books
         # almost always use ``1)`` / ``2.`` labels.

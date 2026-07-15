@@ -238,6 +238,7 @@ async def _build_eval_core(tenant_db: Any) -> Any:
         question_repo=question_repo,
         solution_cache=solution_cache,
         gate=gate,
+        tenant_db=tenant_db,
     )
 
 

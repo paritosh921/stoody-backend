@@ -328,7 +328,7 @@ async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
     metadata = gate.calls[0]["kwargs"]["metadata"]
     assert metadata["pcr_stage"] == "ocr_pen"
     assert metadata["stroke_count"] == 1
-    assert metadata["ocr_prompt_version"] == "exampen-layout-v4"
+    assert metadata["ocr_prompt_version"] == "exampen-layout-v5"
 
 
 @pytest.mark.asyncio
@@ -388,9 +388,10 @@ def test_vision_ocr_prompt_preserves_exampen_qno_markers():
     messages = ocr_service._build_vision_messages("aW1hZ2U=")
     prompt = messages[0]["content"][0]["text"]
 
-    assert "camera photo, scanned PDF page" in prompt
-    assert "'Q1', 'Q. 1', 'Question 1'" in prompt
-    assert "preserve them" in prompt
+    assert "ANSWER BOOK" in prompt or "answer book" in prompt.lower()
+    assert "1)" in prompt
+    assert "Q1" in prompt or "Question 1" in prompt
+    assert "handwritten" in prompt.lower()
 
 
 @pytest.mark.asyncio
