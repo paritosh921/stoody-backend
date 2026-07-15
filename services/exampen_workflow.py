@@ -294,25 +294,15 @@ async def reprocess_processing_job(
         raise ValueError(f"Processing job {job_id} not found")
 
     current_status = str(job.get("status") or "queued")
+    # Teacher/operator reprocess is an explicit force.  A stuck ``processing``
+    # lease (Redis crash, killed worker, partial OCR) must never return HTTP 409
+    # forever — that was stranding half-marked papers in production.
     if current_status == "processing":
-        # Allow reclaim when a worker crashed / Redis died mid-run and left the
-        # lease stuck.  Without this the UI never shows Reprocess again.
-        updated_at = job.get("updated_at")
-        stale = True
-        if isinstance(updated_at, datetime):
-            age = _now() - (
-                updated_at
-                if updated_at.tzinfo
-                else updated_at.replace(tzinfo=timezone.utc)
-            )
-            stale = age > timedelta(minutes=2)
-        if not stale:
-            raise ProcessingJobBusyError(
-                f"Processing job {job_id} is already running"
-            )
         logger.warning(
-            "Reclaiming stale processing job %s for reprocess (lease older than 2m)",
+            "Teacher reprocess reclaiming job %s from status=processing "
+            "(requested_by=%s)",
             job_id,
+            requested_by,
         )
 
     now = _now()
@@ -324,20 +314,11 @@ async def reprocess_processing_job(
         "previous_attempts": int(job.get("attempts") or 0),
         "previous_last_error": job.get("last_error"),
         "previous_pipeline_version": job.get("pipeline_version"),
+        "force_reclaim": current_status == "processing",
     }
+    # Always match by job_id only — teacher reprocess supersedes any lease.
     reset = await jobs.update_one(
-        {
-            "job_id": job_id,
-            "$or": [
-                {"status": {"$ne": "processing"}},
-                {
-                    "status": "processing",
-                    "updated_at": {
-                        "$lt": now - timedelta(minutes=2),
-                    },
-                },
-            ],
-        },
+        {"job_id": job_id},
         {
             "$set": {
                 "status": "queued",
@@ -351,13 +332,13 @@ async def reprocess_processing_job(
                 "mapping_pipeline_version": "document-answer-mapping-v1",
                 "updated_at": now,
             },
-            "$unset": {"finished_at": ""},
+            "$unset": {"finished_at": "", "started_at": ""},
             "$inc": {"reprocess_count": 1},
             "$push": {"reprocess_history": {"$each": [history_entry], "$slice": -20}},
         },
     )
     if not reset.matched_count:
-        raise ProcessingJobBusyError(f"Processing job {job_id} is already running")
+        raise ValueError(f"Processing job {job_id} not found")
 
     refreshed = await jobs.find_one({"job_id": job_id})
     if refreshed is None:  # Defensive: the job was deleted after the reset.
@@ -554,61 +535,80 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
         )
         return {"job_id": job_id, "status": "failed", "error": processing_result.error}
 
-    responses = await tenant_db["evalpen_detected_responses"].find(
-        {
-            "submission_id": submission_id,
-            "superseded_at": {"$exists": False},
-            "eval_status": {"$in": ["ready", "ready_with_warnings"]},
-        }
-    ).to_list(length=2000)
-    blocked_count = await tenant_db["evalpen_detected_responses"].count_documents(
-        {
-            "submission_id": submission_id,
-            "superseded_at": {"$exists": False},
-            "eval_status": "blocked",
-        }
-    )
+    # Soft-unblock false "diagram heavy" / geometry blocks when the response
+    # already has a question id and student text.  Those rows must be scored;
+    # teachers can still see the warning flags on the review card.
+    await _soften_false_blocking_flags(tenant_db, submission_id)
 
     evaluation_errors: List[str] = []
     evaluated_count = 0
+    blocked_count = 0
     eval_core = await _build_eval_core(tenant_db)
 
-    async def _evaluate_ready_batch() -> None:
+    async def _evaluate_scoreable_batch() -> None:
         nonlocal evaluated_count, blocked_count
         batch = await tenant_db["evalpen_detected_responses"].find(
             {
                 "submission_id": submission_id,
                 "superseded_at": {"$exists": False},
-                "eval_status": {"$in": ["ready", "ready_with_warnings"]},
+                "eval_status": {
+                    "$in": ["ready", "ready_with_warnings", "blocked"]
+                },
             }
         ).to_list(length=2000)
         for response in batch:
             response_id = str(response.get("response_id") or "")
             question_id = response.get("question_id")
-            if not response_id or not question_id:
-                # A copy without reliable question association must not make
-                # the whole PCR job look like an infrastructure failure.  It
-                # is a normal teacher-review outcome: retain the OCR text,
-                # mark the response blocked, and let the staff UI explain why.
+            eval_status = str(response.get("eval_status") or "")
+            detected_text = str(response.get("detected_text") or "").strip()
+            is_missing = bool(response.get("is_missing_response"))
+
+            if not response_id:
+                continue
+
+            # Unmapped text stays blocked for teacher ownership — never invent
+            # a question id.  Missing-answer slots always have a question id.
+            if not question_id:
+                if eval_status != "blocked":
+                    await tenant_db["evalpen_detected_responses"].update_one(
+                        {"response_id": response_id},
+                        {
+                            "$set": {
+                                "eval_status": "blocked",
+                                "manual_review_reason": (
+                                    "Question could not be safely associated "
+                                    "from the submitted copy"
+                                ),
+                                "updated_at": _now(),
+                            }
+                        },
+                    )
+                blocked_count += 1
+                continue
+
+            # Still-blocked rows without missing-slot intent and without text
+            # stay blocked (true diagram blanks / unreadable).
+            if eval_status == "blocked" and not is_missing and not detected_text:
+                blocked_count += 1
+                continue
+
+            # Promote blocked-but-scoreable rows so EvalCore does not skip them.
+            if eval_status == "blocked":
                 await tenant_db["evalpen_detected_responses"].update_one(
                     {"response_id": response_id},
                     {
                         "$set": {
-                            "eval_status": "blocked",
-                            "manual_review_reason": "Question could not be safely associated from the submitted copy",
+                            "eval_status": "ready_with_warnings",
                             "updated_at": _now(),
                         }
                     },
                 )
-                blocked_count += 1
-                continue
+
             try:
                 result = await eval_core.evaluate_response(
                     response_id, question_id=str(question_id)
                 )
             except Exception as exc:
-                # One bad question must never strand Q5..Qn as permanent "ready"
-                # without a score (production: 4/9 evaluated, rest stuck).
                 logger.exception(
                     "Evaluation crashed for response %s question %s",
                     response_id,
@@ -620,7 +620,9 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                     {
                         "$set": {
                             "eval_status": "ready",
-                            "manual_review_reason": f"Evaluation failed: {_short_error(exc)}",
+                            "manual_review_reason": (
+                                f"Evaluation failed: {_short_error(exc)}"
+                            ),
                             "updated_at": _now(),
                         }
                     },
@@ -633,13 +635,22 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
             else:
                 evaluated_count += 1
 
-    # First pass: responses returned by the OCR/mapping stage.
-    # Second pass: any leftover ready rows (including not_attempted slots that
-    # were written after the first fetch, or retries after a partial crash).
-    await _evaluate_ready_batch()
-    await _evaluate_ready_batch()
+    # Pass 1+2: score every scoreable row (including not-attempted zeros).
+    await _evaluate_scoreable_batch()
+    await _evaluate_scoreable_batch()
 
-    if processing_result.response_count == 0:
+    # Pass 3: guarantee every paper question has a terminal mark row.
+    paper_coverage = await _ensure_full_paper_evaluations(
+        tenant_db,
+        eval_core=eval_core,
+        submission_id=submission_id,
+        exam_id=str(submission.get("exam_id") or ""),
+        student_id=str(submission.get("student_id") or ""),
+    )
+    evaluated_count += int(paper_coverage.get("created_zeros") or 0)
+    evaluation_errors.extend(paper_coverage.get("errors") or [])
+
+    if processing_result.response_count == 0 and evaluated_count == 0:
         evaluation_errors.append("No student responses were detected")
 
     remaining_ready = await tenant_db["evalpen_detected_responses"].count_documents(
@@ -649,20 +660,47 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
             "eval_status": {"$in": ["ready", "ready_with_warnings"]},
         }
     )
-    # Partial success is still a terminal job so the teacher can reprocess.
-    # Only mark hard-failed when nothing was scored and errors exist.
-    if remaining_ready > 0 and evaluation_errors:
+    blocked_count = await tenant_db["evalpen_detected_responses"].count_documents(
+        {
+            "submission_id": submission_id,
+            "superseded_at": {"$exists": False},
+            "eval_status": "blocked",
+        }
+    )
+
+    # Terminal statuses teachers can reprocess from.  Prefer completed when
+    # every paper question has a score, even if some unmapped text remains blocked.
+    scored_questions = await tenant_db["evalpen_evaluations"].count_documents(
+        {
+            "response_id": {
+                "$in": [
+                    doc["response_id"]
+                    for doc in await tenant_db["evalpen_detected_responses"]
+                    .find(
+                        {
+                            "submission_id": submission_id,
+                            "superseded_at": {"$exists": False},
+                            "question_id": {"$exists": True, "$nin": [None, ""]},
+                        },
+                        {"response_id": 1},
+                    )
+                    .to_list(length=2000)
+                ]
+            }
+        }
+    )
+    if remaining_ready > 0:
         final_status = "failed"
-    elif evaluation_errors and evaluated_count == 0:
+        if not any("waiting for evaluation" in e for e in evaluation_errors):
+            evaluation_errors.append(
+                f"{remaining_ready} answer(s) still waiting for evaluation"
+            )
+    elif evaluated_count == 0 and evaluation_errors:
         final_status = "failed"
-    elif blocked_count and evaluated_count == 0 and remaining_ready == 0:
+    elif blocked_count and scored_questions == 0:
         final_status = "blocked_for_review"
-    elif remaining_ready > 0:
-        final_status = "failed"
-        evaluation_errors.append(
-            f"{remaining_ready} answer(s) still waiting for evaluation"
-        )
     elif blocked_count:
+        # Some unmapped evidence remains, but the paper has marks — reviewable.
         final_status = "blocked_for_review"
     else:
         final_status = "completed"
@@ -683,6 +721,7 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                     "blocked_count": blocked_count,
                     "error_count": len(evaluation_errors),
                     "remaining_ready": remaining_ready,
+                    "scored_questions": scored_questions,
                 },
                 "last_error": "; ".join(evaluation_errors[:10]) or None,
                 "finished_at": now,
@@ -699,6 +738,193 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
         "blocked_count": blocked_count,
         "errors": evaluation_errors,
     }
+
+
+_SOFT_BLOCK_FLAG_TYPES = {
+    "DIAGRAM_HEAVY_CONTENT",
+    "diagram_heavy_content",
+    "LOW_SEGMENTATION_CONFIDENCE",
+    "low_segmentation_confidence",
+}
+
+
+async def _soften_false_blocking_flags(tenant_db: Any, submission_id: str) -> int:
+    """Re-open blocked responses that already have Q ownership + OCR text.
+
+    Production failure: reprocess classified sparse handwriting as diagram-heavy
+    (blocking), set eval_status=blocked, and left the paper at 0/9 evaluated.
+    """
+    cursor = tenant_db["evalpen_detected_responses"].find(
+        {
+            "submission_id": submission_id,
+            "superseded_at": {"$exists": False},
+            "eval_status": "blocked",
+            "question_id": {"$exists": True, "$nin": [None, ""]},
+        }
+    )
+    docs = await cursor.to_list(length=2000)
+    softened = 0
+    for doc in docs:
+        text = str(doc.get("detected_text") or "").strip()
+        if not text and not doc.get("is_missing_response"):
+            continue
+        flags = doc.get("flags") or []
+        hard_blocks = []
+        for flag in flags:
+            if not isinstance(flag, dict):
+                continue
+            if str(flag.get("severity") or "").lower() != "blocking":
+                continue
+            flag_type = str(flag.get("flag_type") or "")
+            if flag_type not in _SOFT_BLOCK_FLAG_TYPES:
+                hard_blocks.append(flag_type)
+        if hard_blocks:
+            continue
+        # Demote soft blocking flags to warning so EvalCore will score them.
+        new_flags = []
+        for flag in flags:
+            if not isinstance(flag, dict):
+                continue
+            updated = dict(flag)
+            if (
+                str(updated.get("severity") or "").lower() == "blocking"
+                and str(updated.get("flag_type") or "") in _SOFT_BLOCK_FLAG_TYPES
+            ):
+                updated["severity"] = "warning"
+                updated["suggested_action"] = (
+                    updated.get("suggested_action")
+                    or "Auto-scored with caution; review if needed"
+                )
+            new_flags.append(updated)
+        await tenant_db["evalpen_detected_responses"].update_one(
+            {"response_id": doc.get("response_id")},
+            {
+                "$set": {
+                    "eval_status": "ready_with_warnings",
+                    "flags": new_flags,
+                    "manual_review_reason": None,
+                    "updated_at": _now(),
+                }
+            },
+        )
+        softened += 1
+    if softened:
+        logger.info(
+            "Softened %d false blocking flag(s) for submission %s before scoring",
+            softened,
+            submission_id,
+        )
+    return softened
+
+
+async def _ensure_full_paper_evaluations(
+    tenant_db: Any,
+    *,
+    eval_core: Any,
+    submission_id: str,
+    exam_id: str,
+    student_id: str,
+) -> Dict[str, Any]:
+    """Create terminal zero rows for any paper question still without a score.
+
+    A conducted paper is always out of the full printed marks.  Partial OCR
+    must not leave Q5–Q9 as blank navigator dashes forever.
+    """
+    created_zeros = 0
+    errors: List[str] = []
+    if not exam_id:
+        return {"created_zeros": 0, "errors": errors}
+
+    questions = await tenant_db["evalpen_questions"].find(
+        {"exam_id": exam_id},
+        {"question_id": 1, "question_number": 1, "max_marks": 1},
+    ).sort([("question_number", 1)]).to_list(length=500)
+
+    responses = await tenant_db["evalpen_detected_responses"].find(
+        {
+            "submission_id": submission_id,
+            "superseded_at": {"$exists": False},
+        }
+    ).to_list(length=2000)
+    response_by_question = {
+        str(doc.get("question_id")): doc
+        for doc in responses
+        if doc.get("question_id")
+    }
+
+    for question in questions:
+        question_id = str(question.get("question_id") or "").strip()
+        if not question_id:
+            continue
+        response = response_by_question.get(question_id)
+        if response is None:
+            # Create a synthetic missing slot then score it as zero.
+            response_id = f"RESP-FILL-{submission_id}-{question_id}"[:64]
+            max_marks = float(question.get("max_marks") or 0)
+            try:
+                await tenant_db["evalpen_detected_responses"].update_one(
+                    {"response_id": response_id},
+                    {
+                        "$setOnInsert": {
+                            "response_id": response_id,
+                            "submission_id": submission_id,
+                            "question_id": question_id,
+                            "question_number": question.get("question_number"),
+                            "exam_id": exam_id,
+                            "student_id": student_id,
+                            "detected_text": "",
+                            "content_type": "TEXT_ONLY",
+                            "is_missing_response": True,
+                            "answer_state": "not_attempted",
+                            "eval_status": "ready",
+                            "flags": [],
+                            "source_pages": [],
+                            "word_count": 0,
+                            "created_at": _now(),
+                            "_immutable": True,
+                        }
+                    },
+                    upsert=True,
+                )
+                result = await eval_core.evaluate_response(
+                    response_id, question_id=question_id
+                )
+                if result.error:
+                    errors.append(f"{response_id}: {result.error}")
+                else:
+                    created_zeros += 1
+            except Exception as exc:
+                errors.append(f"{question_id}: {_short_error(exc)}")
+            continue
+
+        response_id = str(response.get("response_id") or "")
+        existing_eval = await tenant_db["evalpen_evaluations"].find_one(
+            {"response_id": response_id}
+        )
+        if existing_eval:
+            continue
+        # Response exists but was never scored — force a mark pass.
+        if str(response.get("eval_status")) == "blocked" and not str(
+            response.get("detected_text") or ""
+        ).strip():
+            continue
+        try:
+            if str(response.get("eval_status")) == "blocked":
+                await tenant_db["evalpen_detected_responses"].update_one(
+                    {"response_id": response_id},
+                    {"$set": {"eval_status": "ready_with_warnings", "updated_at": _now()}},
+                )
+            result = await eval_core.evaluate_response(
+                response_id, question_id=question_id
+            )
+            if result.error:
+                errors.append(f"{response_id}: {result.error}")
+            elif not result.skipped:
+                created_zeros += 1
+        except Exception as exc:
+            errors.append(f"{response_id}: {_short_error(exc)}")
+
+    return {"created_zeros": created_zeros, "errors": errors}
 
 
 async def mark_processing_job_retryable_error(tenant_db: Any, job_id: str, error: Exception | str) -> None:

@@ -508,8 +508,13 @@ class TestUCcls01:
         flag_types = [f.flag_type for f in flags]
         assert FlagType.DIAGRAM_PRESENT in flag_types
 
-    def test_u_ccls_01_diagram_heavy_classification(self):
-        """Text coverage < 40% -> DIAGRAM_HEAVY with blocking flag."""
+    def test_u_ccls_01_sparse_text_still_scoreable(self):
+        """Sparse handwriting in a large region must remain auto-scoreable.
+
+        Camera OCR often yields small text bboxes inside a full-page segment.
+        That must not raise a blocking DIAGRAM_HEAVY flag (production left
+        papers at 0/N evaluated after reprocess).
+        """
         blocks = [
             _make_text_block(
                 "Tiny text",
@@ -519,22 +524,26 @@ class TestUCcls01:
         bbox = BoundingBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
 
         content_type, coverage, flags = classify_content(blocks, bbox)
-        assert content_type == ContentType.DIAGRAM_HEAVY
         assert coverage < MIXED_LOWER_THRESHOLD
+        assert content_type in {ContentType.TEXT_ONLY, ContentType.MIXED}
         flag_types = [f.flag_type for f in flags]
-        assert FlagType.DIAGRAM_HEAVY_CONTENT in flag_types
-        # DIAGRAM_HEAVY_CONTENT is blocking per spec
+        assert FlagType.DIAGRAM_HEAVY_CONTENT not in flag_types
         blocking_flags = [
             f for f in flags if f.severity == FlagSeverity.BLOCKING
         ]
-        assert len(blocking_flags) >= 1
+        assert blocking_flags == []
 
     def test_u_ccls_01_no_text_blocks(self):
-        """No text blocks -> DIAGRAM_HEAVY."""
+        """No text blocks -> DIAGRAM_HEAVY (true blank geometry)."""
         bbox = BoundingBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
         content_type, coverage, flags = classify_content([], bbox)
         assert content_type == ContentType.DIAGRAM_HEAVY
         assert coverage == 0.0
+        assert any(
+            f.flag_type == FlagType.DIAGRAM_HEAVY_CONTENT
+            and f.severity == FlagSeverity.BLOCKING
+            for f in flags
+        )
 
     def test_u_ccls_01_expected_diagram_missing(self):
         """TEXT_ONLY + expects_diagram=True -> EXPECTED_DIAGRAM_MISSING flag."""

@@ -85,15 +85,16 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
             "previous_attempts": 2,
             "previous_last_error": "OCR produced a collapsed full-page response",
             "previous_pipeline_version": 1,
+            "force_reclaim": False,
         }
     ]
 
 
 @pytest.mark.asyncio
-async def test_reprocess_refuses_to_reset_a_copy_already_claimed_by_a_worker():
+async def test_teacher_reprocess_always_reclaims_processing_job(monkeypatch):
+    """Teacher Reprocess must never 409 on a stuck processing lease."""
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,
-        ProcessingJobBusyError,
         reprocess_processing_job,
     )
 
@@ -105,42 +106,7 @@ async def test_reprocess_refuses_to_reset_a_copy_already_claimed_by_a_worker():
             "submission_id": "SUB-2",
             "status": "processing",
             "attempts": 1,
-            # Fresh lease — must not be reclaimed mid-run.
             "updated_at": datetime.now(timezone.utc),
-        }
-    )
-
-    with pytest.raises(ProcessingJobBusyError):
-        await reprocess_processing_job(
-            db,
-            db_name="skb_test",
-            job_id="pcr-job-SUB-2",
-            requested_by="TUT-1",
-        )
-
-    stored = await jobs.find_one({"job_id": "pcr-job-SUB-2"})
-    assert stored["status"] == "processing"
-    assert "reprocess_count" not in stored
-
-
-@pytest.mark.asyncio
-async def test_reprocess_reclaims_stale_processing_job(monkeypatch):
-    from datetime import timedelta
-    from services.exampen_workflow import (
-        PROCESSING_JOBS_COLLECTION,
-        reprocess_processing_job,
-    )
-
-    db = _fresh_db()
-    jobs = db[PROCESSING_JOBS_COLLECTION]
-    stale = datetime.now(timezone.utc) - timedelta(minutes=10)
-    await jobs.insert_one(
-        {
-            "job_id": "pcr-job-SUB-STALE",
-            "submission_id": "SUB-STALE",
-            "status": "processing",
-            "attempts": 1,
-            "updated_at": stale,
         }
     )
     monkeypatch.setattr(
@@ -157,12 +123,15 @@ async def test_reprocess_reclaims_stale_processing_job(monkeypatch):
     result = await reprocess_processing_job(
         db,
         db_name="skb_test",
-        job_id="pcr-job-SUB-STALE",
+        job_id="pcr-job-SUB-2",
         requested_by="TUT-1",
-        reason="Recover half-marked paper",
+        reason="Teacher reprocess after stuck job",
     )
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-STALE")]
+    assert task.calls == [("skb_test", "pcr-job-SUB-2")]
+    stored = await jobs.find_one({"job_id": "pcr-job-SUB-2"})
+    assert stored["reprocess_count"] == 1
+    assert stored["reprocess_history"][0]["force_reclaim"] is True
 
 
 @pytest.mark.asyncio

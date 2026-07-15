@@ -183,6 +183,9 @@ def classify_content(
         return ContentType.TABLE_PRESENT, text_coverage, flags
 
     # Area-based classification
+    word_count = sum(len((block.text or "").split()) for block in text_blocks)
+    has_scoreable_text = word_count >= 1
+
     if text_coverage > TEXT_ONLY_THRESHOLD:
         content_type = ContentType.TEXT_ONLY
     elif text_coverage >= MIXED_LOWER_THRESHOLD:
@@ -195,14 +198,35 @@ def classify_content(
             )
         )
     else:
-        content_type = ContentType.DIAGRAM_HEAVY
-        flags.append(
-            _make_flag(
-                FlagType.DIAGRAM_HEAVY_CONTENT,
-                response_id,
-                {"text_coverage": round(text_coverage, 4)},
+        # Camera / PDF OCR often has no real diagram geometry — only sparse
+        # text bboxes inside a large segment.  A blocking DIAGRAM_HEAVY flag
+        # on real handwriting leaves Q1–Qn unscored (0/9 evaluated).  When
+        # OCR extracted any student text, treat it as scoreable text/mixed
+        # and keep auto-evaluation open; pure blank geometry stays blocking.
+        if has_scoreable_text:
+            content_type = (
+                ContentType.MIXED if text_coverage > 0.05 else ContentType.TEXT_ONLY
             )
-        )
+            flags.append(
+                _make_flag(
+                    FlagType.DIAGRAM_PRESENT,
+                    response_id,
+                    {
+                        "text_coverage": round(text_coverage, 4),
+                        "softened_from": "DIAGRAM_HEAVY",
+                        "word_count": word_count,
+                    },
+                )
+            )
+        else:
+            content_type = ContentType.DIAGRAM_HEAVY
+            flags.append(
+                _make_flag(
+                    FlagType.DIAGRAM_HEAVY_CONTENT,
+                    response_id,
+                    {"text_coverage": round(text_coverage, 4)},
+                )
+            )
 
     # Check for expected diagram that is missing
     if expects_diagram and content_type == ContentType.TEXT_ONLY:

@@ -610,15 +610,17 @@ class SubmissionService:
                     for f in response.flags
                 )
 
-                if (
-                    has_blocking
-                    or bool(doc.get("manual_review_required"))
-                    or not doc.get("question_id")
-                    or response_id in duplicate_response_ids
-                ):
+                # Scoreable when we own a question and have text (or explicit
+                # missing slot).  Soft review flags must not freeze the paper
+                # at 0/N evaluated — that was the production reprocess failure.
+                has_text = bool(str(doc.get("detected_text") or "").strip())
+                if not doc.get("question_id") or response_id in duplicate_response_ids:
                     eval_status = "blocked"
                     blocked_count += 1
-                elif has_warning:
+                elif has_blocking and not has_text and not doc.get("is_missing_response"):
+                    eval_status = "blocked"
+                    blocked_count += 1
+                elif has_blocking or has_warning or bool(doc.get("manual_review_required")):
                     eval_status = "ready_with_warnings"
                     warning_count += 1
                 else:
