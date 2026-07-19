@@ -187,6 +187,36 @@ class TestUIng02:
         h = compute_page_hash(page_number=1, raw_image_ref="s3://bucket/img1.jpg")
         assert len(h) == 64
 
+    def test_u_ing_02_camera_hash_commits_to_image_bytes_not_storage_path(self):
+        """Relocating an immutable object does not change its byte commitment."""
+        digest = "ab" * 32
+        first = compute_page_hash(
+            page_number=1,
+            raw_image_ref="s3://bucket/original/page.png",
+            asset_sha256=digest,
+        )
+        relocated = compute_page_hash(
+            page_number=1,
+            raw_image_ref="s3://bucket/archive/page.png",
+            asset_sha256=digest,
+        )
+        changed_bytes = compute_page_hash(
+            page_number=1,
+            raw_image_ref="s3://bucket/original/page.png",
+            asset_sha256="cd" * 32,
+        )
+
+        assert first == relocated
+        assert first != changed_bytes
+
+    def test_u_ing_02_rejects_invalid_camera_byte_digest(self):
+        with pytest.raises(ValueError, match="asset_sha256"):
+            compute_page_hash(
+                page_number=1,
+                raw_image_ref="s3://bucket/page.png",
+                asset_sha256="not-a-sha256",
+            )
+
     def test_u_ing_02_content_hash_deterministic(self):
         """compute_content_hash returns consistent SHA-256 for same input."""
         page_hashes = ["aaa", "bbb"]
@@ -255,7 +285,9 @@ class TestIIng01:
             service._repo = repo
 
             # Simulate successful first insert
-            repo.insert_answer_pages_bulk = AsyncMock(return_value=(2, 0))
+            repo.insert_answer_pages_bulk = AsyncMock(
+                return_value=(2, 0, ["page-1", "page-2"])
+            )
             repo.insert_submission = AsyncMock(
                 side_effect=lambda doc: (doc, False)
             )
@@ -321,7 +353,7 @@ class TestIIng02:
                 "page_count": 1,
                 "segmentation_status": "pending",
             }
-            repo.insert_answer_pages_bulk = AsyncMock(return_value=(0, 1))
+            repo.insert_answer_pages_bulk = AsyncMock(return_value=(0, 1, []))
             repo.insert_submission = AsyncMock(
                 return_value=(existing_doc, True)
             )
@@ -364,3 +396,42 @@ class TestIIng02:
         assert result.page_count == 3
         assert result.segmentation_status == SubmissionStatus.PENDING
         assert result.already_existed is False
+
+    def test_submission_failure_rolls_back_only_pages_inserted_by_this_attempt(self):
+        """A duplicate immutable page must survive compensating cleanup."""
+
+        async def _run():
+            db = MagicMock()
+            service = IngestService(db)
+            repo = AsyncMock()
+            service._repo = repo
+            repo.insert_answer_pages_bulk = AsyncMock(
+                return_value=(1, 1, ["new-page-id"])
+            )
+            repo.insert_submission = AsyncMock(side_effect=RuntimeError("write failed"))
+
+            with pytest.raises(RuntimeError, match="write failed"):
+                await service.ingest_submission(
+                    exam_id="exam-001",
+                    student_id="stu-001",
+                    admin_id="admin-001",
+                    source="camera",
+                    pages=[
+                        {
+                            "page_number": 1,
+                            "raw_image_ref": "s3://copy/existing.png",
+                            "content_hash": "11" * 32,
+                        },
+                        {
+                            "page_number": 2,
+                            "raw_image_ref": "s3://copy/new.png",
+                            "content_hash": "22" * 32,
+                        },
+                    ],
+                )
+
+            repo.delete_answer_pages_by_ids.assert_awaited_once_with(
+                ["new-page-id"]
+            )
+
+        asyncio.run(_run())

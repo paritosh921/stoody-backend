@@ -21,6 +21,8 @@ Failure modes:  PCR-01 (detection failure -> flags + review)
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import importlib
 import io
 import json
@@ -41,6 +43,11 @@ from ..domain.response_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AssetIntegrityError(RuntimeError):
+    """Raised when stored answer-copy bytes do not match their ingest digest."""
+
 
 # ---------------------------------------------------------------------------
 # A4 defaults (mm)
@@ -518,7 +525,15 @@ class LLMVisionCameraAdapter:
             image_height_px = page_data.get("image_height_px")
 
             # Get image as base64
-            image_b64 = await _resolve_image_base64(raw_image_ref)
+            expected_sha256 = page_data.get("asset_sha256")
+            image_b64 = (
+                await _resolve_image_base64(
+                    raw_image_ref,
+                    expected_sha256=expected_sha256,
+                )
+                if expected_sha256
+                else await _resolve_image_base64(raw_image_ref)
+            )
             if image_b64 is None:
                 logger.warning(
                     "Page %d: could not resolve image from %s — skipping",
@@ -767,7 +782,11 @@ def create_ocr_adapter(source: str, gate: VisionGateProtocol) -> OCRAdapter:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
+async def _resolve_image_base64(
+    raw_image_ref: str,
+    *,
+    expected_sha256: Optional[str] = None,
+) -> Optional[str]:
     """Resolve a raw_image_ref to a base64-encoded string.
 
     Handles:
@@ -776,31 +795,50 @@ async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
     - private ``s3://`` answer-copy artefacts (the production source of truth)
     - released local upload paths only for legacy artefacts during migration
 
-    Returns ``None`` if the reference cannot be resolved.
+    When ``expected_sha256`` is present, the resolved bytes must match the
+    immutable checksum recorded at ingest.  A mismatch raises
+    :class:`AssetIntegrityError`; callers must never continue to OCR or mark
+    different bytes.  Returns ``None`` only when the reference cannot be
+    resolved or decoded.
     """
     if not raw_image_ref or not isinstance(raw_image_ref, str):
         return None
 
     ref = raw_image_ref.strip()
+    expected = _normalize_expected_sha256(expected_sha256)
 
     # Data URI — extract the base64 payload
     if ref.startswith("data:"):
         parts = ref.split(",", 1)
         if len(parts) == 2:
-            return parts[1]
+            return _verify_base64_payload(
+                parts[1],
+                expected_sha256=expected,
+                reference=ref[:80],
+            )
         return None
 
     # Heuristic: if it looks like raw base64 (starts with known image
     # magic bytes in base64), use it directly
     if ref.startswith(("/9j/", "iVBOR")):
-        return ref
+        return _verify_base64_payload(
+            ref,
+            expected_sha256=expected,
+            reference="inline-image",
+        )
 
     # Attempt to detect if the entire string is valid base64
     # (conservative: at least 100 chars, no slashes that look like paths)
     if len(ref) > 100 and "/" not in ref[:20]:
         try:
             base64.b64decode(ref[:64], validate=True)
-            return ref
+            return _verify_base64_payload(
+                ref,
+                expected_sha256=expected,
+                reference="inline-image",
+            )
+        except AssetIntegrityError:
+            raise
         except Exception:
             pass
 
@@ -820,6 +858,11 @@ async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
                 exc,
             )
             return None
+        _verify_image_bytes(
+            image_bytes,
+            expected_sha256=expected,
+            reference=ref,
+        )
         return base64.b64encode(image_bytes).decode("ascii")
 
     # Released uploads use absolute local paths in the current deployment.
@@ -834,7 +877,13 @@ async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
                 # second bound here because OCR can also be invoked manually.
                 size = candidate.stat().st_size
                 if 0 < size <= 25 * 1024 * 1024:
-                    return base64.b64encode(candidate.read_bytes()).decode("ascii")
+                    image_bytes = candidate.read_bytes()
+                    _verify_image_bytes(
+                        image_bytes,
+                        expected_sha256=expected,
+                        reference=str(candidate),
+                    )
+                    return base64.b64encode(image_bytes).decode("ascii")
                 logger.warning("Refusing OCR image outside safe size limit: %s", candidate)
     except OSError:
         logger.warning("Could not read protected camera image reference: %s", ref[:120])
@@ -844,6 +893,67 @@ async def _resolve_image_base64(raw_image_ref: str) -> Optional[str]:
         ref[:60],
     )
     return None
+
+
+def _normalize_expected_sha256(expected_sha256: Optional[str]) -> Optional[str]:
+    if expected_sha256 is None:
+        return None
+    normalized = str(expected_sha256).strip().lower()
+    if not normalized:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise AssetIntegrityError(
+            "Answer-copy asset has an invalid stored SHA-256 checksum"
+        )
+    return normalized
+
+
+def _verify_base64_payload(
+    payload: str,
+    *,
+    expected_sha256: Optional[str],
+    reference: str,
+) -> Optional[str]:
+    if expected_sha256 is None:
+        return payload
+    try:
+        image_bytes = base64.b64decode(payload, validate=True)
+    except Exception:
+        logger.error(
+            "Could not decode checksummed answer-copy image: %s",
+            reference[:120],
+        )
+        raise AssetIntegrityError(
+            "Answer-copy asset could not be decoded for integrity verification"
+        )
+    _verify_image_bytes(
+        image_bytes,
+        expected_sha256=expected_sha256,
+        reference=reference,
+    )
+    return payload
+
+
+def _verify_image_bytes(
+    image_bytes: bytes,
+    *,
+    expected_sha256: Optional[str],
+    reference: str,
+) -> None:
+    if expected_sha256 is None:
+        return
+    actual_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    if hmac.compare_digest(actual_sha256, expected_sha256):
+        return
+    logger.error(
+        "Answer-copy integrity mismatch for %s: expected=%s actual=%s",
+        reference[:120],
+        expected_sha256,
+        actual_sha256,
+    )
+    raise AssetIntegrityError(
+        "Answer-copy asset integrity verification failed; re-upload is required"
+    )
 
 
 def _detect_media_type(raw_image_ref: str) -> str:

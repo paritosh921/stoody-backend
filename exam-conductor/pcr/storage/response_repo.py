@@ -224,6 +224,7 @@ class DetectedResponseRepository:
         query: Dict[str, Any] = {"submission_id": submission_id}
         if not include_superseded:
             query["eval_status"] = {"$ne": "superseded"}
+            query["superseded_at"] = {"$exists": False}
 
         cursor = self._responses.find(query).sort("question_id", ASCENDING)
         return await cursor.to_list(length=500)

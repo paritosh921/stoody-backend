@@ -189,11 +189,13 @@ class IngestService:
             page_number = page_data["page_number"]
             raw_strokes = page_data.get("raw_strokes")
             raw_image_ref = page_data.get("raw_image_ref")
+            asset_sha256 = page_data.get("asset_sha256") or page_data.get("content_hash")
 
             page_hash = compute_page_hash(
                 page_number=page_number,
                 raw_strokes=raw_strokes,
                 raw_image_ref=raw_image_ref,
+                asset_sha256=asset_sha256,
             )
             page_hashes.append(page_hash)
 
@@ -208,6 +210,13 @@ class IngestService:
                 pen_mac=pen_mac,
                 raw_strokes=raw_strokes,
                 raw_image_ref=raw_image_ref,
+                asset_sha256=(str(asset_sha256).strip().lower() if asset_sha256 else None),
+                image_width_px=page_data.get("image_width_px"),
+                image_height_px=page_data.get("image_height_px"),
+                original_filename=page_data.get("original_filename"),
+                upload_id=page_data.get("upload_id"),
+                content_type=page_data.get("content_type"),
+                file_size_bytes=page_data.get("file_size_bytes"),
                 content_hash=page_hash,
                 created_at=now,
             )
@@ -222,9 +231,11 @@ class IngestService:
             for pr in page_refs:
                 page_num = pr.get("page_num", pr.get("page_number", 0))
                 asset_ref = pr.get("raw_asset_ref")
+                asset_sha256 = pr.get("asset_sha256") or pr.get("content_hash")
                 page_hash = compute_page_hash(
                     page_number=page_num,
                     raw_image_ref=asset_ref,
+                    asset_sha256=asset_sha256,
                 )
                 page_hashes.append(page_hash)
                 page_ref_models.append(
@@ -266,13 +277,9 @@ class IngestService:
         inserted_page_ids: List[str] = []
 
         if pages_to_insert:
-            inserted, duplicates = await self._repo.insert_answer_pages_bulk(
+            inserted, duplicates, inserted_page_ids = await self._repo.insert_answer_pages_bulk(
                 pages_to_insert
             )
-            # Track page_ids for potential rollback
-            inserted_page_ids = [
-                p["page_id"] for p in pages_to_insert
-            ]
             logger.info(
                 "Answer pages for submission %s: %d inserted, %d duplicates",
                 submission_id,

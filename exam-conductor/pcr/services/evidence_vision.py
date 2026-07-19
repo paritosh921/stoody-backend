@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import io
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -24,16 +25,84 @@ _DIAGRAM_HINT_RE = re.compile(
 )
 
 
+def _ocr_verification_threshold() -> float:
+    """Minimum OCR confidence before text-only marking is considered safe."""
+
+    raw = os.getenv("PCR_OCR_VISION_VERIFY_THRESHOLD", "0.93")
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.93
+
+
+def _optional_confidence(value: Any) -> Optional[float]:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if confidence < 0.0 or confidence > 1.0:
+        return None
+    return confidence
+
+
+def _assignment_method(question_assignment: Any) -> str:
+    if not isinstance(question_assignment, dict):
+        return ""
+    return str(question_assignment.get("method") or "").strip().lower()
+
+
+def requires_transcription_verification(
+    *,
+    ocr_confidence: Any = None,
+    segmentation_confidence: Any = None,
+    question_assignment: Any = None,
+) -> bool:
+    """Return whether original pixels must verify a scoreable transcription.
+
+    A vision-generated transcription is still only a lossy intermediate.  Low
+    confidence text must never be the sole evidence used to deny marks.
+    """
+
+    threshold = _ocr_verification_threshold()
+    ocr_value = _optional_confidence(ocr_confidence)
+    segmentation_value = _optional_confidence(segmentation_confidence)
+    method = _assignment_method(question_assignment)
+    vision_transcribed = method in {
+        "verified_paper_page_order",
+        "document_vision_mapping",
+        "verified_paper_layout_unresolved",
+    }
+    if ocr_value is not None and ocr_value < threshold:
+        return True
+    if segmentation_value is not None and segmentation_value < threshold:
+        return True
+    # When no independent OCR confidence exists, a model-generated transcript
+    # must be checked against the source image before it can affect a score.
+    if vision_transcribed and ocr_value is None:
+        return True
+    return False
+
+
 def needs_vision_evaluation(
     *,
     content_type: str,
     detected_text: str,
     question_text: str = "",
     has_page_images: bool = True,
+    ocr_confidence: Any = None,
+    segmentation_confidence: Any = None,
+    question_assignment: Any = None,
 ) -> bool:
     """Decide whether marking must look at the answer image, not only OCR text."""
     if not has_page_images:
         return False
+
+    if requires_transcription_verification(
+        ocr_confidence=ocr_confidence,
+        segmentation_confidence=segmentation_confidence,
+        question_assignment=question_assignment,
+    ):
+        return True
 
     ctype = (content_type or "").upper()
     if ctype in {"MIXED", "DIAGRAM_HEAVY", "TABLE_PRESENT"}:
@@ -105,6 +174,23 @@ async def build_vision_eval_messages(
     if not target_pages:
         return None
 
+    verify_transcription = requires_transcription_verification(
+        ocr_confidence=response_doc.get("ocr_confidence"),
+        segmentation_confidence=response_doc.get("segmentation_confidence"),
+        question_assignment=response_doc.get("question_assignment"),
+    )
+    question_number = response_doc.get("question_number")
+    verification_instruction = ""
+    if verify_transcription:
+        verification_instruction = (
+            " The OCR transcription is untrusted because its evidence confidence "
+            "is below the automatic-marking threshold. Locate the exact printed "
+            f"question {question_number or ''} using the supplied question text, "
+            "read the handwriting from the original full page, and grade the image "
+            "when it conflicts with OCR. Never borrow work from a neighbouring "
+            "question. If the handwriting cannot be read reliably, set needs_review=true."
+        )
+
     content: List[Dict[str, Any]] = [
         {
             "type": "text",
@@ -116,6 +202,7 @@ async def build_vision_eval_messages(
                 "text may be incomplete — diagrams, Venn diagrams, circled "
                 "options, tables, and constructions are valid answers even when "
                 "OCR missed them. Award marks for what is visibly drawn or written."
+                + verification_instruction
             ),
         }
     ]
@@ -128,7 +215,15 @@ async def build_vision_eval_messages(
         raw_ref = page.get("raw_image_ref")
         if not isinstance(raw_ref, str) or not raw_ref.strip():
             continue
-        image_b64 = await _resolve_image_base64(raw_ref)
+        expected_sha256 = page.get("asset_sha256")
+        image_b64 = (
+            await _resolve_image_base64(
+                raw_ref,
+                expected_sha256=expected_sha256,
+            )
+            if expected_sha256
+            else await _resolve_image_base64(raw_ref)
+        )
         if not image_b64:
             continue
 
@@ -147,23 +242,67 @@ async def build_vision_eval_messages(
             page_doc=page,
             region=region if isinstance(region, dict) else None,
         )
-        payload = cropped or image_b64
         media = _detect_media_type(raw_ref)
-        content.append(
-            {
-                "type": "text",
-                "text": f"Student answer evidence — page {page_number}:",
-            }
-        )
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{media};base64,{payload}",
-                    "detail": "high",
-                },
-            }
-        )
+        if verify_transcription:
+            # The mapped band is itself model-produced and can be displaced.
+            # Attach the canonical full page first so the evaluator can locate
+            # the printed question independently, then add the crop as a zoom.
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Canonical full student page {page_number}; locate "
+                        f"question {question_number or 'from the prompt'}:"
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media};base64,{image_b64}",
+                        "detail": "high",
+                    },
+                }
+            )
+            if cropped:
+                content.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            "Supplementary mapped-band crop; use only after "
+                            "confirming it belongs to the same printed question:"
+                        ),
+                    }
+                )
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            # _maybe_crop_page_image_b64 always emits JPEG.
+                            "url": f"data:image/jpeg;base64,{cropped}",
+                            "detail": "high",
+                        },
+                    }
+                )
+        else:
+            payload = cropped or image_b64
+            payload_media = "image/jpeg" if cropped else media
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"Student answer evidence - page {page_number}:",
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{payload_media};base64,{payload}",
+                        "detail": "high",
+                    },
+                }
+            )
         attached += 1
 
     if attached == 0:

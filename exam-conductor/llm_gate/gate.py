@@ -120,6 +120,10 @@ class LLMGate:
         caller_id: str,
         *,
         messages: Optional[List[Dict[str, Any]]] = None,
+        responses_input: Optional[List[Dict[str, Any]]] = None,
+        json_schema: Optional[Dict[str, Any]] = None,
+        prompt_cache_key: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         max_output_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -142,6 +146,16 @@ class LLMGate:
             *prompt* is used only for logging context (not sent to the LLM).
             Token estimation accounts for text parts plus a conservative
             per-image heuristic.
+        responses_input : list of dict, optional
+            Native OpenAI Responses input for PDF/image document calls. This
+            is mutually exclusive with ``messages`` and remains subject to
+            the same caller, budget, and usage-log controls.
+        json_schema : dict, optional
+            Strict structured-output schema for a Responses API call.
+        prompt_cache_key : str, optional
+            Stable non-PII routing key for repeated static prompt prefixes.
+        reasoning_effort : str, optional
+            Provider reasoning effort for supported Responses models.
         max_output_tokens : int, optional
             Override for the max output token count.
         temperature : float, optional
@@ -175,7 +189,13 @@ class LLMGate:
         # ── Step 2: Estimate prompt size ────────────────────────────────
         # For multimodal calls, estimate text tokens + conservative per-image
         # heuristic.  For text-only calls, use the simple heuristic.
-        estimated_input = estimate_tokens_for_messages(prompt, messages)
+        if messages is not None and responses_input is not None:
+            raise ValueError("messages and responses_input are mutually exclusive")
+        estimated_input = estimate_tokens_for_messages(
+            prompt,
+            messages,
+            responses_input,
+        )
 
         # ── Load config once ────────────────────────────────────────────
         config = await self._repo.get_config()
@@ -198,6 +218,10 @@ class LLMGate:
             model_id,
             prompt,
             messages=messages,
+            responses_input=responses_input,
+            json_schema=json_schema,
+            prompt_cache_key=prompt_cache_key,
+            reasoning_effort=reasoning_effort,
             max_output_tokens=effective_max_output,
             temperature=temperature,
         )

@@ -35,11 +35,13 @@ from __future__ import annotations
 
 import logging
 import math
+import hashlib
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
@@ -128,6 +130,46 @@ class PublishRequest(BaseModel):
     )
 
 
+class ResponseRegionCorrection(BaseModel):
+    page_number: int = Field(..., ge=1)
+    y_start: float = Field(..., ge=0)
+    y_end: float = Field(..., gt=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "ResponseRegionCorrection":
+        if self.y_end <= self.y_start:
+            raise ValueError("y_end must be greater than y_start")
+        return self
+
+
+class ResponseSplitPart(BaseModel):
+    question_id: str = Field(..., min_length=1)
+    detected_text: str = ""
+    source_pages: List[ResponseRegionCorrection] = Field(default_factory=list)
+
+
+class ResponseAssignmentCorrectionRequest(BaseModel):
+    """Teacher correction for response ownership or proven absence."""
+
+    action: str = Field(
+        ...,
+        pattern="^(assign|split|merge|confirm_not_attempted|discard_non_answer)$",
+    )
+    reason: str = Field(..., min_length=5, max_length=1000)
+    response_id: Optional[str] = None
+    response_ids: List[str] = Field(default_factory=list)
+    question_id: Optional[str] = None
+    parts: List[ResponseSplitPart] = Field(default_factory=list)
+
+    @field_validator("reason")
+    @classmethod
+    def correction_reason(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 5:
+            raise ValueError("Reason must be at least 5 characters")
+        return value
+
+
 class AuditEntryAPI(BaseModel):
     """Audit trail entry in API responses."""
 
@@ -167,6 +209,22 @@ class ResponseSummaryAPI(BaseModel):
     # fields distinguish a true blank answer from an OCR/AI failure.
     is_missing_response: bool = False
     answer_state: Optional[str] = None
+    source_pages: List[Dict[str, Any]] = Field(default_factory=list)
+    question_assignment: Optional[Dict[str, Any]] = None
+    manual_review_reason: Optional[str] = None
+
+
+class QuestionCatalogItemAPI(BaseModel):
+    """One immutable paper question, independent of OCR response cardinality."""
+
+    question_id: str
+    question_number: Optional[int] = None
+    question_text: str = ""
+    max_marks: float = 0.0
+    reference_solution: Optional[str] = None
+    source_page_number: Optional[int] = None
+    source_region_id: Optional[str] = None
+    source_bbox_percent: Optional[Dict[str, Any]] = None
 
 
 class SubmissionSummaryReviewAPI(BaseModel):
@@ -186,7 +244,10 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # ``unavailable`` must never be rendered as a 0-mark attempt.
     score_state: str = "processing"
     publication_status: Optional[str] = None
+    question_catalog: List[QuestionCatalogItemAPI] = Field(default_factory=list)
     responses: List[ResponseSummaryAPI] = Field(default_factory=list)
+    unassigned_responses: List[ResponseSummaryAPI] = Field(default_factory=list)
+    page_count: int = 0
     total_score: float = 0.0
     total_max_score: float = 0.0
     evaluated_count: int = 0
@@ -293,7 +354,16 @@ async def _get_pcr_question_catalog(
         return []
     cursor = tenant_db["evalpen_questions"].find(
         {"exam_id": exam_id},
-        projection={"question_id": 1, "question_number": 1, "max_marks": 1},
+        projection={
+            "question_id": 1,
+            "question_number": 1,
+            "question_text": 1,
+            "max_marks": 1,
+            "reference_solution": 1,
+            "source_page_number": 1,
+            "source_region_id": 1,
+            "source_bbox_percent": 1,
+        },
     ).sort([("question_number", 1), ("question_id", 1)])
     docs = await cursor.to_list(length=1000)
     catalog: List[Dict[str, Any]] = []
@@ -311,6 +381,13 @@ async def _get_pcr_question_catalog(
                     else None
                 ),
                 "max_marks": _safe_marks(doc.get("max_marks")),
+                "question_text": str(doc.get("question_text") or "").strip(),
+                "reference_solution": (
+                    str(doc.get("reference_solution") or "").strip() or None
+                ),
+                "source_page_number": doc.get("source_page_number"),
+                "source_region_id": doc.get("source_region_id"),
+                "source_bbox_percent": doc.get("source_bbox_percent"),
             }
         )
     return catalog
@@ -481,10 +558,26 @@ async def get_submission_summary(
             submission_id
         )
 
-        # Fetch evaluations for each response
-        eval_repo = EvaluationRepository(tenant_db)
+        # Fetch all evaluations in one query. The previous per-response lookup
+        # made a 100-question review perform 100 sequential database calls.
+        response_ids = [
+            str(item.get("response_id") or "")
+            for item in response_docs
+            if str(item.get("response_id") or "")
+        ]
+        evaluation_docs = (
+            await tenant_db["evalpen_evaluations"]
+            .find({"response_id": {"$in": response_ids}})
+            .to_list(length=5000)
+            if response_ids
+            else []
+        )
+        evaluations_by_response = {
+            str(item.get("response_id") or ""): item for item in evaluation_docs
+        }
 
         response_summaries: List[ResponseSummaryAPI] = []
+        unassigned_summaries: List[ResponseSummaryAPI] = []
         total_score = 0.0
         evaluated_max = 0.0
         evaluated_count = 0
@@ -499,7 +592,8 @@ async def get_submission_summary(
             eval_status = str(resp_doc.get("eval_status") or "pending").lower()
             question_id = str(resp_doc.get("question_id") or "")
             catalog_question = catalog_by_id.get(question_id)
-            if question_id:
+            is_unassigned = bool(question_catalog) and catalog_question is None
+            if question_id and not is_unassigned:
                 observed_question_ids.add(question_id)
 
             # Check for blocking flags
@@ -510,10 +604,7 @@ async def get_submission_summary(
                 for f in flags
             )
 
-            # Try to get evaluation for this response
-            evaluation = await eval_repo.get_evaluation_by_response(
-                response_id
-            )
+            evaluation = evaluations_by_response.get(response_id)
 
             resp_score = None
             resp_max = None
@@ -554,7 +645,9 @@ async def get_submission_summary(
                     step_marks = [
                         mark for mark in raw_step_marks if isinstance(mark, dict)
                     ] or None
-                if has_blocking or eval_status == "blocked":
+                if is_unassigned:
+                    blocked_count += 1
+                elif has_blocking or eval_status == "blocked":
                     # Never treat a score as publishable while a blocking
                     # flag remains unresolved, even if an earlier evaluator
                     # pass wrote a preliminary record.
@@ -574,6 +667,8 @@ async def get_submission_summary(
                     if completion_key not in completed_question_keys:
                         completed_question_keys.add(completion_key)
                         evaluated_count += 1
+            elif is_unassigned:
+                blocked_count += 1
             elif has_blocking or eval_status == "blocked":
                 blocked_count += 1
             elif eval_status == "not_attempted":
@@ -613,8 +708,7 @@ async def get_submission_summary(
                 for f in flags
             ]
 
-            response_summaries.append(
-                ResponseSummaryAPI(
+            response_summary = ResponseSummaryAPI(
                     response_id=response_id,
                     evaluation_id=evaluation.get("evaluation_id") if evaluation else None,
                     question_id=question_id or None,
@@ -640,39 +734,49 @@ async def get_submission_summary(
                     has_blocking_flags=has_blocking,
                     is_missing_response=bool(resp_doc.get("is_missing_response")),
                     answer_state=resp_doc.get("answer_state"),
+                    source_pages=[
+                        item
+                        for item in (resp_doc.get("source_pages") or [])
+                        if isinstance(item, dict)
+                    ],
+                    question_assignment=(
+                        resp_doc.get("question_assignment")
+                        if isinstance(resp_doc.get("question_assignment"), dict)
+                        else None
+                    ),
+                    manual_review_reason=resp_doc.get("manual_review_reason"),
                 )
-            )
+            if is_unassigned:
+                unassigned_summaries.append(response_summary)
+            else:
+                response_summaries.append(response_summary)
 
-        # Older submissions may have been processed before answer slots were
-        # introduced.  Once segmentation has completed, every catalog question
-        # absent from the detected-response collection is genuinely blank.
-        # Add those final zero rows even when another response is still being
-        # evaluated; the submission as a whole remains ``processing`` below.
-        # A failed job must never be turned into a false 0-mark paper.
-        if segmentation_status == "complete" and not processing_failed:
+        # A missing response row is not proof that the student skipped the
+        # question.  Keep the missing state explicit and blocking until the
+        # document mapper or a teacher records evidence-backed absence.
+        if question_catalog and not processing_failed:
             for question in question_catalog:
                 question_id = question["question_id"]
                 if question_id in observed_question_ids:
                     continue
-                completed_question_keys.add(question_id)
                 response_summaries.append(
                     ResponseSummaryAPI(
-                        response_id=f"UNANSWERED-{submission_id}-{question_id}",
+                        response_id=f"UNRESOLVED-{submission_id}-{question_id}",
                         question_id=question_id,
                         question_number=question["question_number"],
                         content_type="TEXT_ONLY",
-                        eval_status="not_attempted",
-                        total_score=0.0,
+                        eval_status="unresolved",
+                        total_score=None,
                         max_score=question["max_marks"],
                         overall_feedback=(
-                            "No answer was detected for this question, so 0 marks were awarded."
+                            "No verified answer state exists for this question. Review the copy before publishing."
                         ),
-                        has_blocking_flags=False,
-                        is_missing_response=True,
-                        answer_state="not_attempted",
+                        has_blocking_flags=True,
+                        is_missing_response=False,
+                        answer_state="unresolved",
                     )
                 )
-                evaluated_count += 1
+                blocked_count += 1
 
         # A score is only available when OCR/mapping has completed and every
         # detected answer is terminally evaluated or explicitly blank.  This
@@ -693,10 +797,14 @@ async def get_submission_summary(
                 item.response_id,
             )
         )
+        unassigned_summaries.sort(key=lambda item: item.response_id)
         total_max = (
             sum(question["max_marks"] for question in question_catalog)
             if question_catalog
             else evaluated_max
+        )
+        page_count = await tenant_db["evalpen_answer_pages"].count_documents(
+            {"submission_id": submission_id}
         )
 
         return SubmissionSummaryReviewAPI(
@@ -709,7 +817,10 @@ async def get_submission_summary(
             processing_error=processing_error,
             score_state=score_state,
             publication_status=sub_dict.get("publication_status"),
+            question_catalog=question_catalog,
             responses=response_summaries,
+            unassigned_responses=unassigned_summaries,
+            page_count=page_count,
             total_score=total_score,
             total_max_score=total_max,
             evaluated_count=evaluated_count,
@@ -774,6 +885,38 @@ async def get_submission_pages(
     page_docs = await tenant_db["evalpen_answer_pages"].find(
         {"submission_id": submission_id}
     ).sort("page_number", 1).to_list(length=100)
+    active_responses = await tenant_db["evalpen_detected_responses"].find(
+        {
+            "submission_id": submission_id,
+            "superseded_at": {"$exists": False},
+            "eval_status": {"$ne": "superseded"},
+        },
+        {
+            "response_id": 1,
+            "question_id": 1,
+            "question_number": 1,
+            "source_pages": 1,
+            "answer_state": 1,
+        },
+    ).to_list(length=5000)
+    regions_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    for response in active_responses:
+        for source_region in response.get("source_pages") or []:
+            if not isinstance(source_region, dict):
+                continue
+            try:
+                source_page_number = int(source_region.get("page_number"))
+            except (TypeError, ValueError):
+                continue
+            regions_by_page.setdefault(source_page_number, []).append(
+                {
+                    **source_region,
+                    "response_id": str(response.get("response_id") or ""),
+                    "question_id": response.get("question_id"),
+                    "question_number": response.get("question_number"),
+                    "answer_state": response.get("answer_state"),
+                }
+            )
     pages: List[SubmissionPageThumbnailAPI] = []
     for index, page_doc in enumerate(page_docs):
         raw_image_ref = str(page_doc.get("raw_image_ref") or "")
@@ -799,6 +942,9 @@ async def get_submission_pages(
                 image_url=image_url,
                 width=int(page_doc.get("image_width_px") or 0),
                 height=int(page_doc.get("image_height_px") or 0),
+                regions=regions_by_page.get(
+                    int(page_doc.get("page_number") or index + 1), []
+                ),
             )
         )
     return SubmissionPagesAPI(
@@ -1098,17 +1244,14 @@ async def get_exam_results(
         # --- PCR data ---
         pcr_available = True
         try:
-            _pcr_storage = load_exampen("pcr.storage")
-            SubmissionRepository = _pcr_storage.SubmissionRepository
-            EvaluationRepository = _pcr_storage.EvaluationRepository
-            DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
+            load_exampen("pcr.storage")
         except ImportError:
             pcr_available = False
 
         # --- DCR data ---
         dcr_available = True
         try:
-            DCRRepository = load_exampen("dcr.repository").DCRRepository
+            load_exampen("dcr.repository")
         except ImportError:
             dcr_available = False
 
@@ -1117,9 +1260,6 @@ async def get_exam_results(
 
         # PCR: find submissions for this exam, then aggregate evaluations
         if pcr_available:
-            sub_repo = SubmissionRepository(tenant_db)
-            resp_repo = DetectedResponseRepository(tenant_db)
-            eval_repo = EvaluationRepository(tenant_db)
             question_catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
             paper_max_score = sum(
                 question["max_marks"] for question in question_catalog
@@ -1141,15 +1281,72 @@ async def get_exam_results(
                     "publication_status": 1,
                 },
             )
-            submissions = await submissions_cursor.to_list(length=1000)
+            submissions = await submissions_cursor.to_list(length=5000)
+
+            # Read responses/evaluations in two bounded batch queries. The
+            # former nested repository loop performed one response query per
+            # student and then one evaluation query per question, which made
+            # Results latency grow as students x questions.
+            submission_ids = [
+                str(item.get("submission_id") or "")
+                for item in submissions
+                if str(item.get("submission_id") or "")
+            ]
+            responses = (
+                await tenant_db["evalpen_detected_responses"]
+                .find(
+                    {
+                        "submission_id": {"$in": submission_ids},
+                        "eval_status": {"$ne": "superseded"},
+                        "superseded_at": {"$exists": False},
+                    },
+                    {
+                        "response_id": 1,
+                        "submission_id": 1,
+                        "question_id": 1,
+                        "eval_status": 1,
+                    },
+                )
+                .to_list(length=max(len(submission_ids) * 1000, 5000))
+                if submission_ids
+                else []
+            )
+            responses_by_submission: Dict[str, List[Dict[str, Any]]] = {}
+            response_ids: List[str] = []
+            for response in responses:
+                owner_submission_id = str(response.get("submission_id") or "")
+                response_id = str(response.get("response_id") or "")
+                responses_by_submission.setdefault(owner_submission_id, []).append(
+                    response
+                )
+                if response_id:
+                    response_ids.append(response_id)
+
+            evaluation_docs = (
+                await tenant_db["evalpen_evaluations"]
+                .find(
+                    {"response_id": {"$in": response_ids}},
+                    {
+                        "response_id": 1,
+                        "total_score": 1,
+                        "max_score": 1,
+                    },
+                )
+                .to_list(length=max(len(response_ids) * 2, 5000))
+                if response_ids
+                else []
+            )
+            evaluations_by_response = {
+                str(item.get("response_id") or ""): item
+                for item in evaluation_docs
+                if str(item.get("response_id") or "")
+            }
 
             for sub in submissions:
                 student_id = sub.get("student_id", "")
                 submission_id = sub.get("submission_id", "")
-
-                # Get responses for this submission
-                responses = await resp_repo.get_responses_by_submission(
-                    submission_id
+                submission_responses = responses_by_submission.get(
+                    str(submission_id), []
                 )
 
                 pcr_total = 0.0
@@ -1157,19 +1354,25 @@ async def get_exam_results(
                 blocked_count = 0
                 scored_question_ids: set[str] = set()
 
-                for resp in responses:
+                for resp in submission_responses:
                     response_id = resp.get("response_id", "")
 
                     # Count blocked
                     if resp.get("eval_status") == "blocked":
                         blocked_count += 1
 
-                    # Get evaluation
-                    ev = await eval_repo.get_evaluation_by_response(
-                        response_id
-                    )
+                    ev = evaluations_by_response.get(str(response_id))
                     if ev:
                         question_id = str(resp.get("question_id") or "")
+                        if (
+                            catalog_question_ids
+                            and question_id not in catalog_question_ids
+                        ):
+                            # Stray/unassigned OCR evidence is review work,
+                            # never an extra marks-bearing paper question.
+                            if resp.get("eval_status") != "blocked":
+                                blocked_count += 1
+                            continue
                         # Never let duplicate OCR segments make one paper
                         # question count twice.  New jobs block duplicates;
                         # this also repairs historical result aggregation.
@@ -1199,8 +1402,6 @@ async def get_exam_results(
 
         # DCR: aggregate results per student
         if dcr_available:
-            dcr_repo = DCRRepository(tenant_db)
-
             # Find distinct students with DCR results for this exam (tutor-scoped)
             dcr_query: Dict[str, Any] = {"exam_id": exam_id}
             if scoped_ids is not None:
@@ -1331,28 +1532,26 @@ async def override_evaluation_score(
                 ),
             )
 
-        # Tutor scoping: verify this evaluation's student is visible
+        # Tutor scoping and publication freeze are resolved through the
+        # response's canonical submission, even when the evaluation already
+        # carries a student_id.
         eval_student_id = existing.get("student_id")
-        if not eval_student_id:
-            # Fallback: look up student_id via response -> submission
-            _resp_id = existing.get("response_id", "")
-            if _resp_id:
-                _resp_doc = await tenant_db[
-                    "evalpen_detected_responses"
-                ].find_one(
-                    {"response_id": _resp_id},
-                    projection={"submission_id": 1},
-                )
-                if _resp_doc:
-                    _sub_doc = await tenant_db[
-                        "evalpen_submissions"
-                    ].find_one(
-                        {"submission_id": _resp_doc.get("submission_id", "")},
-                        projection={"student_id": 1},
-                    )
-                    eval_student_id = (
-                        _sub_doc.get("student_id") if _sub_doc else None
-                    )
+        _resp_doc = await tenant_db["evalpen_detected_responses"].find_one(
+            {"response_id": existing.get("response_id", "")},
+            projection={"submission_id": 1, "student_id": 1},
+        )
+        _sub_doc = None
+        if _resp_doc:
+            _sub_doc = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": _resp_doc.get("submission_id", "")},
+                projection={"student_id": 1, "publication_status": 1},
+            )
+            eval_student_id = eval_student_id or (_sub_doc or {}).get("student_id")
+        if (_sub_doc or {}).get("publication_status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Published results are immutable; create a formal result revision instead",
+            )
         if eval_student_id:
             _check_student_in_scope(eval_student_id, scoped_ids)
 
@@ -1467,18 +1666,23 @@ async def override_criterion_marks(
             )
 
         eval_student_id = existing.get("student_id")
-        if not eval_student_id:
-            response_doc = await tenant_db["evalpen_detected_responses"].find_one(
-                {"response_id": existing.get("response_id", "")},
-                projection={"submission_id": 1, "student_id": 1},
+        response_doc = await tenant_db["evalpen_detected_responses"].find_one(
+            {"response_id": existing.get("response_id", "")},
+            projection={"submission_id": 1, "student_id": 1},
+        )
+        eval_student_id = eval_student_id or (response_doc or {}).get("student_id")
+        submission_doc = None
+        if response_doc:
+            submission_doc = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": response_doc.get("submission_id", "")},
+                projection={"student_id": 1, "publication_status": 1},
             )
-            eval_student_id = (response_doc or {}).get("student_id")
-            if not eval_student_id and response_doc:
-                submission_doc = await tenant_db["evalpen_submissions"].find_one(
-                    {"submission_id": response_doc.get("submission_id", "")},
-                    projection={"student_id": 1},
-                )
-                eval_student_id = (submission_doc or {}).get("student_id")
+            eval_student_id = eval_student_id or (submission_doc or {}).get("student_id")
+        if (submission_doc or {}).get("publication_status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Published results are immutable; create a formal result revision instead",
+            )
         if eval_student_id:
             _check_student_in_scope(str(eval_student_id), scoped_ids)
 
@@ -1577,21 +1781,635 @@ async def override_criterion_marks(
         ) from exc
 
 
+async def _correct_response_assignment_impl(
+    submission_id: str,
+    body: ResponseAssignmentCorrectionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id}
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    _check_student_in_scope(str(submission.get("student_id") or ""), scoped_ids)
+    if submission.get("publication_status") == "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Published results are immutable; create a formal result revision instead",
+        )
+    active_processing_job = await tenant_db["exampen_processing_jobs"].find_one(
+        {
+            "submission_id": submission_id,
+            "status": {"$in": ["queued", "processing"]},
+        },
+        {"status": 1},
+    )
+    if active_processing_job is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Wait for answer-copy processing to finish before correcting response ownership"
+            ),
+        )
+
+    exam_id = str(submission.get("exam_id") or "")
+    student_id = str(submission.get("student_id") or "")
+    actor_id = str(current_user.get("user_id") or "unknown")
+    now = datetime.now(timezone.utc)
+    questions = await tenant_db["evalpen_questions"].find(
+        {"exam_id": exam_id}
+    ).to_list(length=1000)
+    catalog = {
+        str(question.get("question_id") or ""): question
+        for question in questions
+        if str(question.get("question_id") or "")
+    }
+
+    requested_question_ids = {
+        value
+        for value in [body.question_id, *(part.question_id for part in body.parts)]
+        if value
+    }
+    unknown = sorted(requested_question_ids - set(catalog))
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown immutable question id(s): {', '.join(unknown)}",
+        )
+
+    async def _active_response(response_id: str) -> Dict[str, Any]:
+        response = await tenant_db["evalpen_detected_responses"].find_one(
+            {
+                "submission_id": submission_id,
+                "response_id": response_id,
+                "superseded_at": {"$exists": False},
+            }
+        )
+        if response is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Active response {response_id} was not found",
+            )
+        return response
+
+    async def _clear_target_slot(
+        question_id: str,
+        *,
+        replacing_response_ids: Optional[set[str]] = None,
+    ) -> None:
+        owners = await tenant_db["evalpen_detected_responses"].find(
+            {
+                "submission_id": submission_id,
+                "question_id": question_id,
+                "superseded_at": {"$exists": False},
+            }
+        ).to_list(length=20)
+        replacing_response_ids = replacing_response_ids or set()
+        real_owners = [
+            item
+            for item in owners
+            if not item.get("is_missing_response")
+            and str(item.get("response_id") or "") not in replacing_response_ids
+        ]
+        if real_owners:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The target question already has answer evidence. Split or merge "
+                    "the responses instead of overwriting it."
+                ),
+            )
+        for owner in owners:
+            if str(owner.get("response_id") or "") in replacing_response_ids:
+                continue
+            await tenant_db["evalpen_detected_responses"].update_one(
+                {"_id": owner["_id"]},
+                {
+                    "$set": {
+                        "eval_status": "superseded",
+                        "superseded_at": now,
+                        "superseded_by": actor_id,
+                        "superseded_reason": "Teacher replaced not-attempted state with answer evidence",
+                    }
+                },
+            )
+
+    async def _assert_target_slot_available(
+        question_id: str,
+        *,
+        replacing_response_ids: Optional[set[str]] = None,
+    ) -> None:
+        owners = await tenant_db["evalpen_detected_responses"].find(
+            {
+                "submission_id": submission_id,
+                "question_id": question_id,
+                "superseded_at": {"$exists": False},
+            },
+            {"response_id": 1, "is_missing_response": 1},
+        ).to_list(length=20)
+        replacing_response_ids = replacing_response_ids or set()
+        if any(
+            not owner.get("is_missing_response")
+            and str(owner.get("response_id") or "") not in replacing_response_ids
+            for owner in owners
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The target question already has answer evidence. Split or merge "
+                    "the responses instead of overwriting it."
+                ),
+            )
+
+    def _resolved_flags(flags: Any) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for raw in flags or []:
+            if not isinstance(raw, dict):
+                continue
+            flag = dict(raw)
+            if flag.get("severity") == "blocking":
+                flag["resolution"] = {
+                    "resolved": True,
+                    "resolution": "response_ownership_corrected_by_teacher",
+                    "note": body.reason,
+                    "resolved_by": actor_id,
+                    "resolved_at": now,
+                }
+            result.append(flag)
+        return result
+
+    def _region_evidence_atoms(regions: List[Dict[str, Any]]) -> List[str]:
+        atoms: List[str] = []
+        for region in regions:
+            payload = (
+                f"teacher-region-v1|{submission_id}|{int(region['page_number'])}|"
+                f"{float(region['y_start']):.4f}|{float(region['y_end']):.4f}"
+            )
+            atoms.append(
+                "teacher-region:"
+                + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+            )
+        return sorted(set(atoms))
+
+    async def _create_assigned_response(
+        source: Dict[str, Any],
+        *,
+        question_id: str,
+        detected_text: Optional[str] = None,
+        source_pages: Optional[List[Dict[str, Any]]] = None,
+        operation: str,
+        replacing_response_ids: Optional[set[str]] = None,
+        evidence_atom_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        await _clear_target_slot(
+            question_id,
+            replacing_response_ids=replacing_response_ids,
+        )
+        question = catalog[question_id]
+        response_id = f"RESP-TEACH-{uuid.uuid4().hex[:16]}"
+        response = {
+            key: value
+            for key, value in source.items()
+            if key not in {
+                "_id",
+                "response_id",
+                "question_id",
+                "question_number",
+                "created_at",
+                "evidence_atom_ids",
+                "evidence_version",
+                "evidence_source",
+            }
+        }
+        text_source = source.get("detected_text") if detected_text is None else detected_text
+        text = str(text_source or "").strip()
+        pages = source.get("source_pages") if source_pages is None else source_pages
+        resolved_atoms = (
+            list(evidence_atom_ids)
+            if evidence_atom_ids is not None
+            else _region_evidence_atoms(list(pages or []))
+            if source_pages is not None
+            else [str(item) for item in (source.get("evidence_atom_ids") or []) if str(item)]
+        )
+        response.update(
+            {
+                "response_id": response_id,
+                "submission_id": submission_id,
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "question_id": question_id,
+                "question_number": question.get("question_number"),
+                "detected_text": text,
+                "source_pages": pages or [],
+                "evidence_version": 1,
+                "evidence_atom_ids": sorted(set(resolved_atoms)),
+                "evidence_source": f"teacher_{operation}",
+                "flags": _resolved_flags(source.get("flags")),
+                "question_assignment": {
+                    "method": f"teacher_{operation}",
+                    "confidence": 1.0,
+                    "manual_review_required": False,
+                    "reason": body.reason,
+                    "assigned_by": actor_id,
+                    "assigned_at": now,
+                    "source_response_id": str(source.get("response_id") or ""),
+                },
+                "manual_review_required": False,
+                "manual_review_reason": None,
+                "is_missing_response": False,
+                "absence_proven": False,
+                "answer_state": "detected",
+                "eval_status": "ready",
+                "word_count": len(text.split()),
+                "created_at": now,
+                "updated_at": now,
+                "_immutable": True,
+            }
+        )
+        await tenant_db["evalpen_detected_responses"].insert_one(response)
+        return response
+
+    async def _supersede(source: Dict[str, Any], operation: str) -> None:
+        await tenant_db["evalpen_detected_responses"].update_one(
+            {"_id": source["_id"], "superseded_at": {"$exists": False}},
+            {
+                "$set": {
+                    "eval_status": "superseded",
+                    "superseded_at": now,
+                    "superseded_by": actor_id,
+                    "superseded_reason": body.reason,
+                    "superseded_operation": operation,
+                }
+            },
+        )
+
+    created: List[Dict[str, Any]] = []
+    source_ids: List[str] = []
+
+    if body.action == "assign":
+        if not body.response_id or not body.question_id:
+            raise HTTPException(status_code=400, detail="assign requires response_id and question_id")
+        source = await _active_response(body.response_id)
+        await _assert_target_slot_available(
+            body.question_id,
+            replacing_response_ids={body.response_id},
+        )
+        created.append(
+            await _create_assigned_response(
+                source,
+                question_id=body.question_id,
+                operation="assignment",
+                replacing_response_ids={body.response_id},
+            )
+        )
+        await _supersede(source, "assign")
+        source_ids.append(body.response_id)
+
+    elif body.action == "split":
+        if not body.response_id or len(body.parts) < 2:
+            raise HTTPException(status_code=400, detail="split requires response_id and at least two parts")
+        if len({part.question_id for part in body.parts}) != len(body.parts):
+            raise HTTPException(status_code=400, detail="Each split part must target a different question")
+        source = await _active_response(body.response_id)
+        original_regions = [
+            region
+            for region in (source.get("source_pages") or [])
+            if isinstance(region, dict)
+            and region.get("page_number") is not None
+            and region.get("y_start") is not None
+            and region.get("y_end") is not None
+        ]
+        if not original_regions:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This response has no page region and cannot be split safely",
+            )
+
+        split_regions: List[Dict[str, Any]] = []
+        for part in body.parts:
+            pages = [region.model_dump() for region in part.source_pages]
+            if not part.detected_text.strip() or not pages:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Each split part requires corrected text and a source-page region",
+                )
+            for region in pages:
+                contained = any(
+                    int(original.get("page_number")) == int(region["page_number"])
+                    and float(region["y_start"]) >= float(original["y_start"]) - 0.01
+                    and float(region["y_end"]) <= float(original["y_end"]) + 0.01
+                    for original in original_regions
+                )
+                if not contained:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Every split region must stay inside the original response evidence",
+                    )
+                split_regions.append(region)
+
+        for original in original_regions:
+            page_number = int(original["page_number"])
+            start = float(original["y_start"])
+            end = float(original["y_end"])
+            ranges = sorted(
+                (
+                    max(start, float(region["y_start"])),
+                    min(end, float(region["y_end"])),
+                )
+                for region in split_regions
+                if int(region["page_number"]) == page_number
+                and float(region["y_end"]) > start
+                and float(region["y_start"]) < end
+            )
+            cursor = start
+            for range_start, range_end in ranges:
+                if range_start > cursor + 0.5:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Split regions must cover the complete original response without gaps",
+                    )
+                if range_start < cursor - 0.01:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Split regions must not overlap",
+                    )
+                cursor = max(cursor, range_end)
+            if cursor < end - 0.5:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Split regions must cover the complete original response without gaps",
+                )
+
+        for part in body.parts:
+            await _assert_target_slot_available(
+                part.question_id,
+                replacing_response_ids={body.response_id},
+            )
+        for part in body.parts:
+            pages = [region.model_dump() for region in part.source_pages]
+            created.append(
+                await _create_assigned_response(
+                    source,
+                    question_id=part.question_id,
+                    detected_text=part.detected_text,
+                    source_pages=pages,
+                    operation="split",
+                    replacing_response_ids={body.response_id},
+                )
+            )
+        await _supersede(source, "split")
+        source_ids.append(body.response_id)
+
+    elif body.action == "merge":
+        merge_ids = list(dict.fromkeys(body.response_ids))
+        if len(merge_ids) < 2 or not body.question_id:
+            raise HTTPException(status_code=400, detail="merge requires at least two response_ids and question_id")
+        sources = [await _active_response(response_id) for response_id in merge_ids]
+        await _assert_target_slot_available(
+            body.question_id,
+            replacing_response_ids=set(merge_ids),
+        )
+        merged_text = "\n\n".join(
+            str(source.get("detected_text") or "").strip()
+            for source in sources
+            if str(source.get("detected_text") or "").strip()
+        )
+        merged_pages: List[Dict[str, Any]] = []
+        seen_regions = set()
+        for source in sources:
+            for region in source.get("source_pages") or []:
+                if not isinstance(region, dict):
+                    continue
+                key = (region.get("page_number"), region.get("y_start"), region.get("y_end"))
+                if key not in seen_regions:
+                    seen_regions.add(key)
+                    merged_pages.append(region)
+        created.append(
+            await _create_assigned_response(
+                sources[0],
+                question_id=body.question_id,
+                detected_text=merged_text,
+                source_pages=merged_pages,
+                operation="merge",
+                replacing_response_ids=set(merge_ids),
+                evidence_atom_ids=sorted(
+                    {
+                        str(atom_id)
+                        for source in sources
+                        for atom_id in (source.get("evidence_atom_ids") or [])
+                        if str(atom_id)
+                    }
+                ),
+            )
+        )
+        for source in sources:
+            await _supersede(source, "merge")
+        source_ids.extend(merge_ids)
+
+    elif body.action == "confirm_not_attempted":
+        if not body.question_id:
+            raise HTTPException(status_code=400, detail="confirm_not_attempted requires question_id")
+        await _clear_target_slot(body.question_id)
+        question = catalog[body.question_id]
+        response_id = f"RESP-TEACH-BLANK-{uuid.uuid4().hex[:12]}"
+        blank = {
+            "response_id": response_id,
+            "submission_id": submission_id,
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "question_id": body.question_id,
+            "question_number": question.get("question_number"),
+            "detected_text": "",
+            "source_pages": [],
+            "content_type": "TEXT_ONLY",
+            "text_coverage_ratio": 0.0,
+            "segmentation_confidence": 1.0,
+            "ocr_confidence": 1.0,
+            "flags": [],
+            "word_count": 0,
+            "is_continuation": False,
+            "is_missing_response": True,
+            "absence_proven": True,
+            "answer_state": "not_attempted",
+            "question_assignment": {
+                "method": "not_attempted",
+                "confidence": 1.0,
+                "reason": body.reason,
+                "absence_proof": {
+                    "verified": True,
+                    "method": "teacher_visual_confirmation",
+                    "verified_by": actor_id,
+                    "verified_at": now,
+                    "reason": body.reason,
+                },
+            },
+            "manual_review_required": False,
+            "eval_status": "ready",
+            "created_at": now,
+            "updated_at": now,
+            "_immutable": True,
+        }
+        await tenant_db["evalpen_detected_responses"].insert_one(blank)
+        created.append(blank)
+
+    elif body.action == "discard_non_answer":
+        if not body.response_id:
+            raise HTTPException(status_code=400, detail="discard_non_answer requires response_id")
+        source = await _active_response(body.response_id)
+        await _supersede(source, "discard_non_answer")
+        source_ids.append(body.response_id)
+
+    await tenant_db["evalpen_response_assignment_audit"].insert_one(
+        {
+            "audit_id": f"RAUD-{uuid.uuid4().hex[:16]}",
+            "submission_id": submission_id,
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "action": body.action,
+            "source_response_ids": source_ids,
+            "created_response_ids": [str(item.get("response_id") or "") for item in created],
+            "question_ids": sorted(requested_question_ids),
+            "reason": body.reason,
+            "actor_id": actor_id,
+            "created_at": now,
+        }
+    )
+
+    evaluation_errors: List[str] = []
+    if created:
+        from api.v1.evalpen_evaluate_async import _build_eval_core
+
+        eval_core = await _build_eval_core(tenant_db)
+        for response in created:
+            try:
+                result = await eval_core.evaluate_response(
+                    str(response["response_id"]),
+                    question_id=str(response["question_id"]),
+                )
+                if result.error:
+                    evaluation_errors.append(str(result.error))
+            except Exception as exc:
+                logger.exception(
+                    "Teacher-corrected response %s could not be reevaluated",
+                    response.get("response_id"),
+                )
+                evaluation_errors.append(str(exc)[:500])
+
+    from services.exampen_submission_readiness import (
+        assess_submission_readiness,
+        readiness_message,
+    )
+
+    # The processing job's previous ``blocked_for_review`` state described the
+    # condition this teacher action is resolving.  Re-open the readiness check
+    # from a completed processing baseline, then restore blocked state if any
+    # independent invariant still fails.
+    await tenant_db["exampen_processing_jobs"].update_one(
+        {"submission_id": submission_id},
+        {
+            "$set": {
+                "status": "completed",
+                "last_error": None,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$setOnInsert": {
+                "job_id": f"pcr-job-{submission_id}",
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    readiness = await assess_submission_readiness(tenant_db, submission_id)
+    next_job_status = "completed" if readiness.get("ready") else "blocked_for_review"
+    await tenant_db["exampen_processing_jobs"].update_one(
+        {"submission_id": submission_id},
+        {
+            "$set": {
+                "status": next_job_status,
+                "last_error": None if readiness.get("ready") else readiness_message(readiness),
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return {
+        "submission_id": submission_id,
+        "action": body.action,
+        "created_response_ids": [str(item.get("response_id") or "") for item in created],
+        "evaluation_errors": evaluation_errors,
+        "readiness": readiness,
+    }
+
+
 @router.post(
-    "/submissions/{submission_id}/publish",
-    summary="Publish/finalize submission results",
-    responses={
-        403: {"description": "Insufficient permissions"},
-        404: {"description": "Submission not found"},
-        409: {"description": "Submission has unresolved blocking flags"},
-        503: {"description": "Tenant database or exam-conductor unavailable"},
-    },
+    "/submissions/{submission_id}/response-assignment",
+    summary="Correct PCR response ownership with audit and reevaluation",
 )
-async def publish_submission(
+async def correct_response_assignment(
+    submission_id: str,
+    body: ResponseAssignmentCorrectionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Serialize evidence corrections for one answer copy.
+
+    A correction can supersede several immutable response rows and create
+    several replacements.  Mongo deployments used by some institutions do
+    not provide cross-document transactions, so a short, fenced lease keeps
+    two teachers (or two browser retries) from racing those writes.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    from services.exampen_review_lease import (
+        SubmissionReviewBusyError,
+        acquire_submission_review_lease,
+        release_submission_review_lease,
+    )
+
+    try:
+        lease_token = await acquire_submission_review_lease(
+            tenant_db,
+            submission_id,
+            actor_id=str(current_user.get("user_id") or "unknown"),
+            operation="response_assignment",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Submission not found",
+        ) from exc
+    except SubmissionReviewBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        return await _correct_response_assignment_impl(
+            submission_id,
+            body,
+            current_user=current_user,
+            db=db,
+        )
+    finally:
+        await release_submission_review_lease(
+            tenant_db,
+            submission_id,
+            lease_token,
+        )
+
+
+async def _publish_submission_impl(
     submission_id: str,
     body: PublishRequest,
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
+    *,
+    review_lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Mark submission results as published/finalized.
 
@@ -1619,11 +2437,32 @@ async def publish_submission(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Submission {submission_id} not found",
             )
+        if submission.get("publication_status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This result has already been published and is immutable",
+            )
 
         # Tutor scoping: verify this submission's student is visible
         _check_student_in_scope(
             submission.get("student_id", ""), scoped_ids
         )
+
+        from services.exampen_submission_readiness import (
+            assess_submission_readiness,
+            build_publication_snapshot,
+            readiness_message,
+        )
+
+        readiness = await assess_submission_readiness(tenant_db, submission_id)
+        if not readiness.get("ready"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": f"Cannot publish: {readiness_message(readiness)}",
+                    "readiness": readiness,
+                },
+            )
 
         # Check for unresolved blocking flags
         resp_repo = DetectedResponseRepository(tenant_db)
@@ -1666,20 +2505,50 @@ async def publish_submission(
             )
 
         actor_id = current_user.get("user_id", "unknown")
-        now = datetime.now(timezone.utc)
+        publication_snapshot = await build_publication_snapshot(
+            tenant_db,
+            submission_id,
+            actor_id=actor_id,
+        )
+        now = publication_snapshot.pop("published_at_dt")
 
         # Update publication status (non-immutable metadata field)
-        await submissions_col.update_one(
-            {"submission_id": submission_id},
+        publish_filter: Dict[str, Any] = {
+            "submission_id": submission_id,
+            "publication_status": {"$ne": "published"},
+        }
+        if review_lease_token:
+            publish_filter["review_mutation_lease_token"] = review_lease_token
+        published = await submissions_col.update_one(
+            publish_filter,
             {
                 "$set": {
                     "publication_status": "published",
                     "published_at": now,
                     "published_by": actor_id,
                     "publication_note": body.note,
+                    "publication_snapshot": publication_snapshot,
+                    "publication_snapshot_hash": publication_snapshot["snapshot_hash"],
+                },
+                "$push": {
+                    "publication_history": {
+                        "action": "published",
+                        "published_at": now,
+                        "published_by": actor_id,
+                        "publication_note": body.note,
+                        "snapshot_hash": publication_snapshot["snapshot_hash"],
+                    }
                 },
             },
         )
+        if published.matched_count != 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Publication ownership changed while the result snapshot was "
+                    "being created. Refresh before trying again."
+                ),
+            )
 
         logger.info(
             "Submission %s published by %s at %s",
@@ -1713,4 +2582,63 @@ async def publish_submission(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Publication encountered an internal error",
+        )
+
+
+@router.post(
+    "/submissions/{submission_id}/publish",
+    summary="Publish/finalize submission results",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Submission not found"},
+        409: {"description": "Submission has unresolved blocking flags"},
+        503: {"description": "Tenant database or exam-conductor unavailable"},
+    },
+)
+async def publish_submission(
+    submission_id: str,
+    body: PublishRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Publish under the same fence used by correction and reprocessing."""
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    from services.exampen_review_lease import (
+        SubmissionReviewBusyError,
+        acquire_submission_review_lease,
+        release_submission_review_lease,
+    )
+
+    try:
+        lease_token = await acquire_submission_review_lease(
+            tenant_db,
+            submission_id,
+            actor_id=str(current_user.get("user_id") or "unknown"),
+            operation="publish",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Submission not found",
+        ) from exc
+    except SubmissionReviewBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        return await _publish_submission_impl(
+            submission_id,
+            body,
+            current_user=current_user,
+            db=db,
+            review_lease_token=lease_token,
+        )
+    finally:
+        await release_submission_review_lease(
+            tenant_db,
+            submission_id,
+            lease_token,
         )

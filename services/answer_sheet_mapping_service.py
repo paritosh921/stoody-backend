@@ -377,6 +377,9 @@ class AnswerSheetMappingService:
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
             }
+            if candidate.get("requires_option_label") is not None:
+                mapping["requires_option_label"] = bool(candidate.get("requires_option_label"))
+                mapping["question_type"] = str(candidate.get("question_type") or "subjective")
             by_question[question_id] = mapping
 
         merged_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -636,12 +639,17 @@ class AnswerSheetMappingService:
         correct_confidence = self._float(candidate.get("correct_answer_confidence"), 0.0)
         answer_text = str(candidate.get("answer_text") or "").strip()
         correct_answer = self._normalise_correct_answer(candidate.get("correct_answer"))
-        return (
-            bool(answer_text)
-            and bool(correct_answer)
-            and confidence >= self.VISION_ACCEPT_THRESHOLD
-            and correct_confidence >= self.VISION_ACCEPT_THRESHOLD
-        )
+        requires_option_label = candidate.get("requires_option_label")
+        if requires_option_label is None:
+            # Compatibility for older/fake mapper payloads that predate the
+            # explicit objective-vs-subjective answer contract.
+            requires_option_label = bool(correct_answer or correct_confidence > 0)
+
+        if not answer_text or confidence < self.VISION_ACCEPT_THRESHOLD:
+            return False
+        if not requires_option_label:
+            return True
+        return bool(correct_answer) and correct_confidence >= self.VISION_ACCEPT_THRESHOLD
 
     def _float(self, value: Any, default: float) -> float:
         try:

@@ -39,24 +39,70 @@ async def _seed_visible_exam_with_hub_submission(db) -> None:
             "exam_id": "EXAM-1",
             "student_id": "lavyansh",
             "source": "ble_pen",
+            # Deliberately stale metadata: the queue must prefer the canonical
+            # page collection rather than showing the response count as pages.
+            "page_count": 1,
             "segmentation_status": "complete",
         }
+    )
+    await db["evalpen_answer_pages"].insert_many(
+        [
+            {
+                "page_id": f"PAGE-{number}",
+                "submission_id": "SUB-1",
+                "page_number": number,
+            }
+            for number in range(1, 5)
+        ]
     )
     await db["evalpen_detected_responses"].insert_many(
         [
             {
                 "response_id": "RESP-1",
                 "submission_id": "SUB-1",
+                "question_id": "EXAM-1::Q-1",
                 "eval_status": "evaluated",
                 "flags": [],
             },
             {
                 "response_id": "RESP-2",
                 "submission_id": "SUB-1",
+                "question_id": "EXAM-1::Q-2",
                 "eval_status": "evaluated",
                 "flags": [],
             },
         ]
+    )
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-1::Q-{number}",
+                "exam_id": "EXAM-1",
+                "question_number": number,
+                "max_marks": 4,
+            }
+            for number in (1, 2)
+        ]
+    )
+    await db["evalpen_evaluations"].insert_many(
+        [
+            {
+                "evaluation_id": f"EVAL-{number}",
+                "response_id": f"RESP-{number}",
+                "question_id": f"EXAM-1::Q-{number}",
+                "total_score": 3,
+                "max_score": 4,
+                "manual_review_required": False,
+            }
+            for number in (1, 2)
+        ]
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-1",
+            "submission_id": "SUB-1",
+            "status": "completed",
+        }
     )
 
 
@@ -108,6 +154,8 @@ async def test_teacher_bff_queue_uses_visible_exam_for_hub_submission():
     assert result.ready_to_publish[0].submission_id == "SUB-1"
     assert result.ready_to_publish[0].student_id == "lavyansh"
     assert result.ready_to_publish[0].response_count == 2
+    assert result.ready_to_publish[0].page_count == 4
+    assert result.ready_to_publish[0].source == "ble_pen"
 
 
 @pytest.mark.asyncio

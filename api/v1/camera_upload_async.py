@@ -257,6 +257,12 @@ async def complete_camera_submission(
                     # OCR receives the protected local/S3 reference, not a
                     # public URL and not a mutable client payload.
                     "raw_image_ref": page.get("storage_path") or page.get("artifact_id"),
+                    "asset_sha256": page.get("content_hash"),
+                    "content_hash": page.get("content_hash"),
+                    "content_type": page.get("content_type"),
+                    "file_size_bytes": page.get("file_size_bytes"),
+                    "original_filename": page.get("original_filename"),
+                    "upload_id": page.get("upload_id"),
                 }
                 for page in pages
             ],
@@ -384,7 +390,15 @@ async def upload_camera_page(
     })
 
     if existing:
-        # Same page already uploaded — return dedup ack
+        if str(existing.get("content_hash") or "") != content_hash:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This page number already contains different image bytes. "
+                    "Remove or explicitly replace the existing draft page before completing the copy."
+                ),
+            )
+        # Same bytes for the same page — return an idempotent acknowledgement.
         return CameraUploadAck(
             artifact_id=existing.get("artifact_id", str(existing["_id"])),
             exam_id=exam_id,

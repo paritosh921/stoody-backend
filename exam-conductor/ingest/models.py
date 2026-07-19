@@ -204,6 +204,17 @@ class AnswerPage(BaseModel):
         default=None,
         description="Reference to raw camera/scan image asset",
     )
+    asset_sha256: Optional[str] = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 digest of the immutable image bytes",
+    )
+    image_width_px: Optional[int] = Field(default=None, ge=1)
+    image_height_px: Optional[int] = Field(default=None, ge=1)
+    original_filename: Optional[str] = None
+    upload_id: Optional[str] = None
+    content_type: Optional[str] = None
+    file_size_bytes: Optional[int] = Field(default=None, ge=0)
 
     # --- integrity ---
     content_hash: str = Field(

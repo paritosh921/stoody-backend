@@ -14,8 +14,10 @@ must not manufacture ``not attempted`` zero rows for the rest of the paper.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -42,8 +44,10 @@ logger = logging.getLogger(__name__)
 
 _CALLER_ID = "pcr_eval_core"
 _PROMPT_VERSION = "exampen-document-answer-map-v1"
+_LAYOUT_PROMPT_VERSION = "exampen-same-paper-page-order-v2"
 _ACCEPT_CONFIDENCE = 0.82
 _WARN_CONFIDENCE = 0.90
+_BLANK_ACCEPT_CONFIDENCE = 0.90
 _MAX_QUESTION_TEXT_CHARS = 650
 _MAX_REFERENCE_TEXT_CHARS = 450
 _MAX_RUBRIC_TEXT_CHARS = 450
@@ -79,6 +83,29 @@ class _AnswerCandidate:
     confidence: float
     regions: List[SourcePageRef]
     answer: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _QuestionLayoutAnchor:
+    """One immutable question region from the finalized paper snapshot."""
+
+    question_number: int
+    page_number: int
+    x_percent: float
+    y_percent: float
+    width_percent: float
+    height_percent: float
+    question: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _SamePaperLayoutMatch:
+    """Deterministic proof that an upload preserves the finalized paper layout."""
+
+    anchors: tuple[_QuestionLayoutAnchor, ...]
+    confidence: float
+    matched_question_numbers: tuple[int, ...]
+    matched_page_numbers: tuple[int, ...]
 
 
 @runtime_checkable
@@ -150,12 +177,33 @@ def has_reliable_marker_coverage(
         return False
 
     paper_size = len(valid_numbers)
-    # Full paper coverage, or a clear majority of unique numbered answers with
-    # no leftover blobs — safe to skip a destructive vision remap.
-    if len(numbers) >= paper_size:
-        return True
-    if len(numbers) >= max(2, (paper_size + 1) // 2):
-        return True
+    # Only a complete set of explicit labels proves coverage.  A partial set
+    # cannot prove that later, unlabelled handwriting was not appended to the
+    # final labelled response by OCR.  Full-document mapping must account for
+    # the remaining page evidence before absent questions can become zeros.
+    return len(numbers) == paper_size and not _responses_reuse_evidence(marked)
+
+
+def _responses_reuse_evidence(responses: Iterable[DetectedResponse]) -> bool:
+    """Detect duplicate text/region ownership across proposed answers."""
+
+    seen_text: set[str] = set()
+    accepted_regions: Dict[int, List[tuple[float, float, int]]] = {}
+    for index, response in enumerate(responses):
+        text_key = _normalized_evidence_text(response.detected_text)
+        if len(text_key) >= 24:
+            if text_key in seen_text:
+                return True
+            seen_text.add(text_key)
+        if _materially_overlaps_other_assignment(
+            list(response.source_pages), accepted_regions
+        ):
+            return True
+        question_number = int(response.question_number or index + 1)
+        for region in response.source_pages:
+            accepted_regions.setdefault(region.page_number, []).append(
+                (region.y_start, region.y_end, question_number)
+            )
     return False
 
 
@@ -201,8 +249,7 @@ def needs_document_answer_mapping(
         # that the page is blank.  Route a multi-page copy, or a copy for which
         # the page segmenter produced no response at all, through full-document
         # association before declaring it unreadable/not attempted.
-        if len(pages) > 1 or not responses:
-            return True
+        return True
 
     # A single huge response on a multi-question paper is also suspicious,
     # especially when the segmenter has already reported clubbing/low
@@ -249,6 +296,33 @@ class DocumentAnswerMapper:
         if not numbered_questions:
             return _unsafe_result("No immutable paper questions were available")
 
+        # A student may write directly on the same printed question paper that
+        # was finalized for the exam.  In that format, the immutable source
+        # page order is stronger ownership evidence than guessed document-wide
+        # OCR/vision boundaries. Activate this path only after answer evidence
+        # is found on the expected pages in monotonic question order. A separate
+        # or jumbled answer book therefore continues through the flexible
+        # document mapper below.
+        layout_match = _detect_same_paper_layout(
+            pages=pages,
+            numbered_questions=numbered_questions,
+        )
+        if layout_match is not None:
+            logger.info(
+                "Answer copy matches finalized paper layout: %d/%d ownership anchors "
+                "across %d page(s), confidence=%.3f",
+                len(layout_match.matched_question_numbers),
+                len(numbered_questions),
+                len(layout_match.matched_page_numbers),
+                layout_match.confidence,
+            )
+            return await self._map_same_paper_layout(
+                pages=pages,
+                answer_pages=answer_pages,
+                layout_match=layout_match,
+                source=source,
+            )
+
         # Prefer content-section style numbered extraction before vision.
         try:
             from .answer_book_extractor import try_extract_answer_book_responses
@@ -259,30 +333,34 @@ class DocumentAnswerMapper:
             logger.exception("Answer-book numbered extract failed during document mapping")
         if book is not None:
             book_responses, book_assignment = book
-            paper_size = len(numbered_questions)
-            mapped = {
-                int(r.question_number)
-                for r in book_responses
-                if r.question_number is not None
-            }
-            coverage_is_reliable = len(mapped) >= max(1, min(paper_size, max(2, paper_size - 1)))
-            result = DocumentAnswerMappingResult(
-                responses=book_responses,
-                assignment_details_by_response=book_assignment,
-                coverage_is_reliable=True,  # always fill unanswered zeros after extract
-                manual_review_required=not coverage_is_reliable,
-                reason=None,
-                metadata={
-                    "mapping_strategy": "answer_book_numbered_extract",
-                    "mapped_question_numbers": sorted(mapped),
-                },
-            )
+            if has_reliable_marker_coverage(book_responses, numbered_questions):
+                mapped = {
+                    int(r.question_number)
+                    for r in book_responses
+                    if r.question_number is not None
+                }
+                result = DocumentAnswerMappingResult(
+                    responses=book_responses,
+                    assignment_details_by_response=book_assignment,
+                    coverage_is_reliable=True,
+                    manual_review_required=False,
+                    reason=None,
+                    metadata={
+                        "mapping_strategy": "answer_book_numbered_extract",
+                        "mapped_question_numbers": sorted(mapped),
+                        "coverage_proof": "all_paper_question_labels_detected",
+                    },
+                )
+                logger.info(
+                    "Document answer mapping used complete answer-book numbered extract: "
+                    "%d response(s)",
+                    len(book_responses),
+                )
+                return result
             logger.info(
-                "Document answer mapping used answer-book numbered extract: "
-                "%d response(s)",
-                len(book_responses),
+                "Answer-book numbered extract was partial; requiring full-document "
+                "coverage before creating absent-answer rows"
             )
-            return result
 
         # Prefer content-section style deterministic numbered-block mapping
         # before paying for a multi-page vision remap.  Student answer books
@@ -365,6 +443,733 @@ class DocumentAnswerMapper:
         )
         return result
 
+    async def _map_same_paper_layout(
+        self,
+        *,
+        pages: List[PageOCR],
+        answer_pages: List[Dict[str, Any]],
+        layout_match: _SamePaperLayoutMatch,
+        source: str,
+    ) -> DocumentAnswerMappingResult:
+        """Transcribe one proven paper page at a time in immutable Q order."""
+
+        page_requests, unreadable_page_numbers = await _build_layout_page_requests(
+            pages=pages,
+            answer_pages=answer_pages,
+            anchors=list(layout_match.anchors),
+        )
+        if unreadable_page_numbers or not page_requests:
+            return _layout_mapping_failure(
+                anchors=list(layout_match.anchors),
+                pages=pages,
+                reason=(
+                    "One or more verified paper pages could not be loaded "
+                    "from the submitted answer copy"
+                ),
+                unreadable_page_numbers=unreadable_page_numbers,
+                layout_match_confidence=layout_match.confidence,
+            )
+
+        records: List[Dict[str, Any]] = []
+        coverage_confidences: List[float] = []
+        coverage_complete = True
+        for request_index, request in enumerate(page_requests, start=1):
+            messages = _build_layout_page_messages(request)
+            try:
+                gate_response = await self._gate.call(
+                    model_id=_get_ocr_vision_model(),
+                    prompt="",
+                    caller_id=_CALLER_ID,
+                    messages=messages,
+                    max_output_tokens=min(
+                        8000,
+                        1400 + 900 * len(request[1]),
+                    ),
+                    temperature=0.0,
+                    metadata={
+                        "pcr_stage": "same_paper_layout_transcription",
+                        "layout_prompt_version": _LAYOUT_PROMPT_VERSION,
+                        "page_number": request[0].page_number,
+                        "page_index": request_index,
+                        "page_count": len(page_requests),
+                        "question_count": len(request[1]),
+                        "source": source,
+                    },
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Verified paper-page transcription failed for page %d",
+                    request[0].page_number,
+                )
+                return _layout_mapping_failure(
+                    anchors=list(layout_match.anchors),
+                    pages=pages,
+                    reason=(
+                        "Verified paper pages could not be transcribed; "
+                        "teacher review is required"
+                    ),
+                    layout_match_confidence=layout_match.confidence,
+                    metadata={"error": str(exc)[:500]},
+                )
+
+            payload = _parse_mapping_payload(getattr(gate_response, "content", ""))
+            if payload is None:
+                return _layout_mapping_failure(
+                    anchors=list(layout_match.anchors),
+                    pages=pages,
+                    reason=(
+                        "Verified paper-page transcription returned an invalid "
+                        "response; teacher review is required"
+                    ),
+                    layout_match_confidence=layout_match.confidence,
+                )
+            raw_records = payload.get("questions")
+            if not isinstance(raw_records, list):
+                raw_records = []
+            records.extend(item for item in raw_records if isinstance(item, dict))
+            coverage = payload.get("page_coverage")
+            if not isinstance(coverage, dict):
+                coverage_complete = False
+                coverage_confidences.append(0.0)
+            else:
+                coverage_complete = coverage_complete and bool(coverage.get("complete"))
+                coverage_confidences.append(_confidence(coverage.get("confidence")))
+
+        return _build_layout_page_mapping_result(
+            records=records,
+            anchors=list(layout_match.anchors),
+            pages=pages,
+            coverage_complete=coverage_complete,
+            coverage_confidence=(
+                min(coverage_confidences) if coverage_confidences else 0.0
+            ),
+            layout_match_confidence=layout_match.confidence,
+        )
+
+
+_LAYOUT_PROMPT_STOP_WORDS = {
+    "and",
+    "answer",
+    "calculate",
+    "find",
+    "for",
+    "from",
+    "given",
+    "into",
+    "question",
+    "show",
+    "that",
+    "the",
+    "then",
+    "this",
+    "use",
+    "using",
+    "what",
+    "with",
+    "work",
+    "working",
+}
+
+
+def _detect_same_paper_layout(
+    *,
+    pages: List[PageOCR],
+    numbered_questions: List[tuple[int, Dict[str, Any]]],
+) -> Optional[_SamePaperLayoutMatch]:
+    """Return verified layout evidence only when printed prompts align.
+
+    Question count or page count alone is never enough.  A free-form answer
+    book can have both.  We require several immutable question prompts (or
+    their explicit number plus distinctive content) to be present in granular
+    OCR blocks on the exact finalized page and inside the finalized region.
+    """
+
+    anchors = _validated_layout_anchors(pages, numbered_questions)
+    if not anchors:
+        return None
+
+    pages_by_number = {page.page_number: page for page in pages}
+    matched_questions: List[int] = []
+    matched_positions_by_page: Dict[int, List[tuple[int, float]]] = {}
+    for anchor in anchors:
+        page = pages_by_number[anchor.page_number]
+        matching_blocks = sorted(
+            (
+                block
+                for block in page.text_blocks
+                if _block_matches_layout_prompt(block, page, anchor)
+            ),
+            key=lambda block: (
+                -_layout_block_match_score(block, anchor),
+                block.bbox.y_min,
+                block.bbox.x_min,
+            ),
+        )
+        if matching_blocks:
+            block = matching_blocks[0]
+            matched_questions.append(anchor.question_number)
+            matched_positions_by_page.setdefault(anchor.page_number, []).append(
+                (
+                    anchor.question_number,
+                    (block.bbox.y_min + block.bbox.y_max) / 2.0,
+                )
+            )
+
+    # The expected questions must occur top-to-bottom on their finalized page.
+    # This rejects a jumbled answer book that happens to reuse the same page
+    # count and values while still accepting normal handwriting-only OCR.
+    matched_pages: set[int] = set()
+    for page_number, positions in matched_positions_by_page.items():
+        ordered = sorted(positions, key=lambda item: item[0])
+        if all(
+            right[1] + pages_by_number[page_number].page_height_mm * 0.02 >= left[1]
+            for left, right in zip(ordered, ordered[1:])
+        ):
+            matched_pages.add(page_number)
+
+    layout_pages = {anchor.page_number for anchor in anchors}
+    required_questions = max(2, math.ceil(len(anchors) * 0.45))
+    required_pages = max(1, math.ceil(len(layout_pages) * 0.75))
+    if (
+        len(matched_questions) < required_questions
+        or len(matched_pages) < required_pages
+    ):
+        return None
+
+    question_ratio = len(matched_questions) / len(anchors)
+    page_ratio = len(matched_pages) / len(layout_pages)
+    confidence = round(min(0.99, 0.78 + 0.14 * question_ratio + 0.07 * page_ratio), 4)
+    return _SamePaperLayoutMatch(
+        anchors=tuple(anchors),
+        confidence=confidence,
+        matched_question_numbers=tuple(sorted(matched_questions)),
+        matched_page_numbers=tuple(sorted(matched_pages)),
+    )
+
+
+def _validated_layout_anchors(
+    pages: List[PageOCR],
+    numbered_questions: List[tuple[int, Dict[str, Any]]],
+) -> List[_QuestionLayoutAnchor]:
+    pages_by_number = {page.page_number: page for page in pages}
+    anchors: List[_QuestionLayoutAnchor] = []
+    for question_number, question in numbered_questions:
+        layout = question.get("question_layout")
+        if not isinstance(layout, dict):
+            layout = {}
+        bbox = question.get("source_bbox_percent") or layout.get("bbox_percent")
+        if not isinstance(bbox, dict):
+            return []
+        try:
+            page_number = int(
+                question.get("source_page_number") or layout.get("page_number")
+            )
+            x = float(bbox.get("x"))
+            y = float(bbox.get("y"))
+            width = float(bbox.get("width"))
+            height = float(bbox.get("height"))
+        except (TypeError, ValueError):
+            return []
+        if page_number not in pages_by_number:
+            return []
+        if (
+            x < 0
+            or y < 0
+            or width <= 0
+            or height <= 0
+            or x + width > 100.001
+            or y + height > 100.001
+        ):
+            return []
+        anchors.append(
+            _QuestionLayoutAnchor(
+                question_number=int(question_number),
+                page_number=page_number,
+                x_percent=x,
+                y_percent=y,
+                width_percent=width,
+                height_percent=height,
+                question=question,
+            )
+        )
+
+    if len(anchors) != len(numbered_questions) or not anchors:
+        return []
+    expected_pages = set(range(1, max(anchor.page_number for anchor in anchors) + 1))
+    if set(pages_by_number) != expected_pages:
+        return []
+
+    # Finalization normally enforces this already.  Revalidate at consumption
+    # so a malformed legacy record can never give two questions the same ink.
+    for index, left in enumerate(anchors):
+        for right in anchors[index + 1 :]:
+            if left.page_number != right.page_number:
+                continue
+            overlap_width = max(
+                0.0,
+                min(left.x_percent + left.width_percent, right.x_percent + right.width_percent)
+                - max(left.x_percent, right.x_percent),
+            )
+            overlap_height = max(
+                0.0,
+                min(left.y_percent + left.height_percent, right.y_percent + right.height_percent)
+                - max(left.y_percent, right.y_percent),
+            )
+            smaller_area = min(
+                left.width_percent * left.height_percent,
+                right.width_percent * right.height_percent,
+            )
+            if smaller_area > 0 and overlap_width * overlap_height / smaller_area > 0.02:
+                return []
+    return sorted(anchors, key=lambda anchor: anchor.question_number)
+
+
+def _layout_prompt_tokens(value: Any) -> tuple[set[str], set[str], set[tuple[str, str]]]:
+    normalized = str(value or "").casefold()
+    normalized = re.sub(r"\blcm\b", "lowest common multiple", normalized)
+    normalized = re.sub(r"\bhcf\b", "highest common factor", normalized)
+    raw = re.findall(r"[a-zA-Z]{3,}|-?\d+(?:\.\d+)?", normalized)
+    words = [
+        token
+        for token in raw
+        if token[0].isalpha() and token not in _LAYOUT_PROMPT_STOP_WORDS
+    ]
+    numbers = {token.lstrip("-") for token in raw if not token[0].isalpha()}
+    return set(words), numbers, set(zip(words, words[1:]))
+
+
+def _block_matches_layout_prompt(
+    block: TextBlock,
+    page: PageOCR,
+    anchor: _QuestionLayoutAnchor,
+) -> bool:
+    text = str(block.text or "").strip()
+    if not text or block.bbox.height >= page.page_height_mm * 0.72:
+        return False
+
+    return _layout_block_match_score(block, anchor) > 0
+
+
+def _layout_block_match_score(
+    block: TextBlock,
+    anchor: _QuestionLayoutAnchor,
+) -> float:
+    text = str(block.text or "").strip()
+    if not text:
+        return 0.0
+
+    question_words, question_numbers, question_bigrams = _layout_prompt_tokens(
+        " ".join(
+            (
+                _question_text(anchor.question),
+                _question_reference_solution(anchor.question),
+                _question_rubric(anchor.question),
+            )
+        )
+    )
+    block_words, block_numbers, block_bigrams = _layout_prompt_tokens(text)
+    shared_words = question_words & block_words
+    shared_numbers = question_numbers & block_numbers
+    shared_bigrams = question_bigrams & block_bigrams
+    word_coverage = len(shared_words) / max(1, len(question_words))
+    lexical_match = (
+        len(shared_words) >= 3
+        or (
+            len(shared_words) >= 2
+            and (word_coverage >= 0.25 or bool(shared_bigrams))
+        )
+        or (
+            len(shared_words) >= 1
+            and len(shared_numbers) >= 1
+        )
+        or len(shared_numbers) >= 2
+    )
+    marker_match = bool(
+        re.match(
+            rf"^\s*(?:q(?:uestion)?\s*\.?\s*)?{anchor.question_number}\s*(?:[\)\]:]|\.(?=\s))",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    if not lexical_match and not marker_match:
+        return 0.0
+    return (
+        (100.0 if marker_match else 0.0)
+        + 6.0 * len(shared_words)
+        + 4.0 * len(shared_numbers)
+        + 10.0 * len(shared_bigrams)
+        + 5.0 * word_coverage
+    )
+
+
+async def _build_layout_page_requests(
+    *,
+    pages: List[PageOCR],
+    answer_pages: List[Dict[str, Any]],
+    anchors: List[_QuestionLayoutAnchor],
+) -> tuple[
+    List[tuple[PageOCR, List[_QuestionLayoutAnchor], str, str]],
+    List[int],
+]:
+    artefacts = {
+        int(page.get("page_number") or 0): page
+        for page in answer_pages
+        if int(page.get("page_number") or 0) > 0
+    }
+    anchors_by_page: Dict[int, List[_QuestionLayoutAnchor]] = {}
+    for anchor in anchors:
+        anchors_by_page.setdefault(anchor.page_number, []).append(anchor)
+
+    requests: List[tuple[PageOCR, List[_QuestionLayoutAnchor], str, str]] = []
+    unreadable: List[int] = []
+    for page in sorted(pages, key=lambda item: item.page_number):
+        page_anchors = sorted(
+            anchors_by_page.get(page.page_number, []),
+            key=lambda anchor: anchor.question_number,
+        )
+        if not page_anchors:
+            continue
+        artefact = artefacts.get(page.page_number, {})
+        raw_image_ref = artefact.get("raw_image_ref")
+        if not isinstance(raw_image_ref, str) or not raw_image_ref.strip():
+            unreadable.append(page.page_number)
+            continue
+        expected_sha256 = artefact.get("asset_sha256")
+        image_b64 = (
+            await _resolve_image_base64(raw_image_ref, expected_sha256=expected_sha256)
+            if expected_sha256
+            else await _resolve_image_base64(raw_image_ref)
+        )
+        if not image_b64:
+            unreadable.append(page.page_number)
+            continue
+        requests.append(
+            (
+                page,
+                page_anchors,
+                image_b64,
+                _detect_media_type(raw_image_ref),
+            )
+        )
+    return requests, sorted(set(unreadable))
+
+
+def _build_layout_page_messages(
+    request: tuple[PageOCR, List[_QuestionLayoutAnchor], str, str],
+) -> List[Dict[str, Any]]:
+    page, anchors, image_b64, media_type = request
+    catalog = [
+        {
+            "question_number": anchor.question_number,
+            "question": _question_text(anchor.question)[:_MAX_QUESTION_TEXT_CHARS],
+        }
+        for anchor in anchors
+    ]
+    prompt = (
+        "This is one page from a student's submission whose page grouping and "
+        "top-to-bottom question order have already been verified against the "
+        "finalized printed paper. Segment and transcribe ONLY the student's marks "
+        "for the listed questions on this page. Never grade and never move work to "
+        "a different question or page.\n\n"
+        "The catalog order is authoritative. Answers must occur top-to-bottom in "
+        "that same order, but their physical bands are not pre-assumed because a "
+        "scan may be shifted or stretched. Extract handwriting, filled blanks, "
+        "calculations, diagrams, ticks, and corrections. Ignore printed question "
+        "wording, printed diagrams, page furniture, and empty lines. Printed content "
+        "alone means attempted=false. Preserve mathematical signs. Describe student "
+        "additions to a diagram/table in transcribed_text.\n\n"
+        "Return one item for EVERY catalog question. Regions are normalized page-Y "
+        "coordinates 0..1000 and must contain only that student's work. Regions for "
+        "different questions must not overlap and must follow catalog order. A blank "
+        "question has attempted=false, transcribed_text='', and regions=[]. If work "
+        "visibly carries a conflicting question label, set ownership_conflict=true.\n\n"
+        "Return ONLY JSON in this exact shape:\n"
+        "{\n"
+        '  "page_coverage": {"complete": true, "confidence": 0.0},\n'
+        '  "questions": [{"question_number": 1, "attempted": true, '
+        '"confidence": 0.0, "regions": [{"page_number": 1, "y_start": 0, '
+        '"y_end": 1000}], "transcribed_text": "student work only", '
+        '"ownership_conflict": false, "reason": ""}]\n'
+        "}\n\n"
+        f"Page number: {page.page_number}\n"
+        f"Ordered catalog: {json.dumps(catalog, ensure_ascii=False)}\n"
+        f"OCR handwriting layout hints: {_page_layout_evidence(page)}"
+    )
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{image_b64}",
+                        "detail": "high",
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def _build_layout_page_mapping_result(
+    *,
+    records: List[Dict[str, Any]],
+    anchors: List[_QuestionLayoutAnchor],
+    pages: List[PageOCR],
+    coverage_complete: bool,
+    coverage_confidence: float,
+    layout_match_confidence: float,
+) -> DocumentAnswerMappingResult:
+    pages_by_number = {page.page_number: page for page in pages}
+    records_by_number: Dict[int, List[Dict[str, Any]]] = {}
+    invalid_record_count = 0
+    for record in records:
+        number = _as_int(record.get("question_number"))
+        if number is None:
+            invalid_record_count += 1
+            continue
+        records_by_number.setdefault(number, []).append(record)
+
+    responses: List[DetectedResponse] = []
+    assignment_details: Dict[str, Dict[str, Any]] = {}
+    unresolved: List[Dict[str, Any]] = []
+    processed_numbers: set[int] = set()
+    verified_blank_numbers: set[int] = set()
+    anchor_numbers = {anchor.question_number for anchor in anchors}
+    accepted_regions_by_page: Dict[int, List[tuple[float, float, int]]] = {}
+    last_region_start_by_page: Dict[int, float] = {}
+
+    for anchor in anchors:
+        number = anchor.question_number
+        candidates = records_by_number.get(number, [])
+        if len(candidates) != 1:
+            unresolved.append(
+                {
+                    "reason": (
+                        f"Q{number} page returned no transcription record"
+                        if not candidates
+                        else f"Q{number} page returned duplicate transcription records"
+                    ),
+                    "page_numbers": [anchor.page_number],
+                }
+            )
+            continue
+
+        record = candidates[0]
+        attempted = record.get("attempted")
+        confidence = _confidence(record.get("confidence"))
+        text = str(record.get("transcribed_text") or "").strip()
+        ownership_conflict = record.get("ownership_conflict") is True
+        regions = _normalise_regions(record.get("regions"), pages_by_number)
+        if any(region.page_number != anchor.page_number for region in regions):
+            ownership_conflict = True
+            record = {
+                **record,
+                "reason": f"Q{number} returned a region on the wrong source page",
+            }
+        if not isinstance(attempted, bool):
+            unresolved.append(
+                {
+                    "reason": f"Q{number} did not return a valid attempted state",
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+        if ownership_conflict:
+            unresolved.append(
+                {
+                    "reason": (
+                        str(record.get("reason") or "").strip()
+                        or f"Q{number} contains work whose ownership is ambiguous"
+                    ),
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+        threshold = _ACCEPT_CONFIDENCE if attempted else _BLANK_ACCEPT_CONFIDENCE
+        if confidence < threshold:
+            unresolved.append(
+                {
+                    "reason": (
+                        f"Q{number} confidence {confidence:.2f} is below the "
+                        f"required {threshold:.2f}"
+                    ),
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+        if not attempted:
+            if _normalized_evidence_text(text) or regions:
+                unresolved.append(
+                    {
+                        "reason": f"Q{number} was labelled blank but also returned student evidence",
+                        "regions": record.get("regions") or [],
+                        "transcribed_text": text,
+                    }
+                )
+                continue
+            processed_numbers.add(number)
+            verified_blank_numbers.add(number)
+            continue
+        if not regions or not _normalized_evidence_text(text):
+            unresolved.append(
+                {
+                    "reason": f"Q{number} was labelled attempted but lacks a usable region or transcription",
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+        if _materially_overlaps_other_assignment(regions, accepted_regions_by_page):
+            unresolved.append(
+                {
+                    "reason": f"Q{number} materially overlaps another question on the same page",
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+        region_start = min(region.y_start for region in regions)
+        previous_start = last_region_start_by_page.get(anchor.page_number)
+        if previous_start is not None and region_start + 3.0 < previous_start:
+            unresolved.append(
+                {
+                    "reason": f"Q{number} appears above an earlier question, violating verified page order",
+                    "regions": record.get("regions") or [],
+                    "transcribed_text": text,
+                }
+            )
+            continue
+
+        processed_numbers.add(number)
+        last_region_start_by_page[anchor.page_number] = region_start
+        for region in regions:
+            accepted_regions_by_page.setdefault(region.page_number, []).append(
+                (region.y_start, region.y_end, number)
+            )
+        answer = {
+            "question_number": number,
+            "confidence": confidence,
+            "mapping_basis": "same_paper_layout",
+            "transcribed_text": text,
+        }
+        response = _response_from_answer(
+            answer,
+            number,
+            confidence,
+            regions,
+            pages_by_number,
+            prefer_vision_transcription=True,
+        )
+        responses.append(response)
+        assignment_details[str(response.response_id)] = {
+            "method": "verified_paper_page_order",
+            "question_number": number,
+            "confidence": confidence,
+            "mapping_basis": "same_paper_layout",
+            "prompt_version": _LAYOUT_PROMPT_VERSION,
+            "manual_review_required": False,
+            "evidence_version": 1,
+            "evidence_atom_ids": sorted(_region_atom_ids(regions)),
+            "evidence_source": "verified_page_order_regions",
+            "layout_match_confidence": layout_match_confidence,
+        }
+
+    unexpected_numbers = sorted(set(records_by_number) - anchor_numbers)
+    if invalid_record_count or unexpected_numbers:
+        unresolved.append(
+            {"reason": "Paper-page transcription returned invalid or out-of-catalog records"}
+        )
+
+    coverage_is_reliable = (
+        coverage_complete
+        and coverage_confidence >= _ACCEPT_CONFIDENCE
+        and len(processed_numbers) == len(anchors)
+        and not unresolved
+    )
+    if unresolved:
+        unresolved_response = _unresolved_response(unresolved, pages_by_number)
+        responses.append(unresolved_response)
+        assignment_details[str(unresolved_response.response_id)] = {
+            "method": "verified_paper_layout_unresolved",
+            "confidence": min(coverage_confidence, layout_match_confidence),
+            "reason": _compact_unresolved_reason(unresolved),
+            "prompt_version": _LAYOUT_PROMPT_VERSION,
+            "manual_review_required": True,
+        }
+
+    return DocumentAnswerMappingResult(
+        responses=responses,
+        assignment_details_by_response=assignment_details,
+        coverage_is_reliable=coverage_is_reliable,
+        manual_review_required=not coverage_is_reliable,
+        reason=None if coverage_is_reliable else _compact_unresolved_reason(unresolved),
+        metadata={
+            "mapping_strategy": "verified_same_paper_page_order",
+            "layout_prompt_version": _LAYOUT_PROMPT_VERSION,
+            "layout_match_confidence": layout_match_confidence,
+            "page_coverage_confidence": coverage_confidence,
+            "mapped_question_numbers": sorted(
+                response.question_number
+                for response in responses
+                if response.question_number is not None
+            ),
+            "verified_blank_question_numbers": sorted(verified_blank_numbers),
+            "unresolved_region_count": len(unresolved),
+        },
+    )
+
+
+def _layout_mapping_failure(
+    *,
+    anchors: List[_QuestionLayoutAnchor],
+    pages: List[PageOCR],
+    reason: str,
+    layout_match_confidence: float,
+    unreadable_page_numbers: Optional[List[int]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> DocumentAnswerMappingResult:
+    pages_by_number = {page.page_number: page for page in pages}
+    target_pages = sorted(
+        set(unreadable_page_numbers or [anchor.page_number for anchor in anchors])
+    )
+    unresolved = [
+        {
+            "reason": reason,
+            "regions": [
+                {"page_number": page_number, "y_start": 0, "y_end": 1000}
+            ],
+        }
+        for page_number in target_pages
+        if page_number in pages_by_number
+    ] or [{"reason": reason}]
+    response = _unresolved_response(unresolved, pages_by_number)
+    detail = {
+        "method": "verified_paper_layout_unresolved",
+        "confidence": layout_match_confidence,
+        "reason": reason,
+        "prompt_version": _LAYOUT_PROMPT_VERSION,
+        "manual_review_required": True,
+    }
+    result_metadata = {
+        "mapping_strategy": "verified_same_paper_page_order",
+        "layout_match_confidence": layout_match_confidence,
+        "unreadable_page_numbers": target_pages,
+    }
+    result_metadata.update(metadata or {})
+    return DocumentAnswerMappingResult(
+        responses=[response],
+        assignment_details_by_response={str(response.response_id): detail},
+        coverage_is_reliable=False,
+        manual_review_required=True,
+        reason=reason,
+        metadata=result_metadata,
+    )
+
 
 async def _build_document_messages(
     *,
@@ -392,7 +1197,15 @@ async def _build_document_messages(
         if not isinstance(raw_image_ref, str) or not raw_image_ref.strip():
             unreadable.append(page.page_number)
             continue
-        image_b64 = await _resolve_image_base64(raw_image_ref)
+        expected_sha256 = artefact.get("asset_sha256")
+        image_b64 = (
+            await _resolve_image_base64(
+                raw_image_ref,
+                expected_sha256=expected_sha256,
+            )
+            if expected_sha256
+            else await _resolve_image_base64(raw_image_ref)
+        )
         if not image_b64:
             unreadable.append(page.page_number)
             continue
@@ -673,6 +1486,8 @@ def _build_mapping_result(
     pages_by_number = {page.page_number: page for page in pages}
     used_numbers: set[int] = set()
     accepted_regions_by_page: Dict[int, List[tuple[float, float, int]]] = {}
+    accepted_block_owners: Dict[str, int] = {}
+    accepted_text_owners: Dict[str, int] = {}
     responses: List[DetectedResponse] = []
     assignment_details: Dict[str, Dict[str, Any]] = {}
     unresolved: List[Dict[str, Any]] = []
@@ -711,6 +1526,25 @@ def _build_mapping_result(
                 }
             )
             continue
+        block_atom_ids = _block_atom_ids_for_regions(regions, pages_by_number)
+        reused_atoms = sorted(
+            atom_id for atom_id in block_atom_ids if atom_id in accepted_block_owners
+        )
+        if reused_atoms:
+            unresolved.append(
+                {
+                    "reason": (
+                        f"The proposed answer for Q{number} reuses OCR evidence "
+                        "already owned by another question"
+                    ),
+                    "answer": answer,
+                    "conflicting_question_numbers": sorted(
+                        {accepted_block_owners[atom_id] for atom_id in reused_atoms}
+                    ),
+                    "evidence_atom_ids": reused_atoms,
+                }
+            )
+            continue
         response = _response_from_answer(answer, number, confidence, regions, pages_by_number)
         if not response.detected_text.strip():
             unresolved.append(
@@ -723,12 +1557,32 @@ def _build_mapping_result(
                 }
             )
             continue
+        normalized_text = _normalized_evidence_text(response.detected_text)
+        if len(normalized_text) >= 24 and normalized_text in accepted_text_owners:
+            unresolved.append(
+                {
+                    "reason": (
+                        f"The proposed answer for Q{number} duplicates answer text "
+                        "already assigned to another question"
+                    ),
+                    "answer": answer,
+                    "conflicting_question_numbers": [
+                        accepted_text_owners[normalized_text]
+                    ],
+                }
+            )
+            continue
         used_numbers.add(number)
         for region in regions:
             accepted_regions_by_page.setdefault(region.page_number, []).append(
                 (region.y_start, region.y_end, number)
             )
         responses.append(response)
+        evidence_atom_ids = block_atom_ids or _region_atom_ids(regions)
+        for atom_id in block_atom_ids:
+            accepted_block_owners[atom_id] = number
+        if len(normalized_text) >= 24:
+            accepted_text_owners[normalized_text] = number
         assignment_details[str(response.response_id)] = {
             "method": "document_vision_mapping",
             "question_number": number,
@@ -739,6 +1593,9 @@ def _build_mapping_result(
             ),
             "prompt_version": _PROMPT_VERSION,
             "manual_review_required": False,
+            "evidence_version": 1,
+            "evidence_atom_ids": sorted(evidence_atom_ids),
+            "evidence_source": "ocr_blocks" if block_atom_ids else "vision_regions",
         }
 
     # The model's coverage assertion is useful but not sufficient on its own.
@@ -811,6 +1668,8 @@ def _response_from_answer(
     confidence: float,
     regions: List[SourcePageRef],
     pages_by_number: Dict[int, PageOCR],
+    *,
+    prefer_vision_transcription: bool = False,
 ) -> DetectedResponse:
     from ..domain.marker_parser import is_form_header_text, strip_form_header_noise
 
@@ -824,10 +1683,18 @@ def _response_from_answer(
     text = strip_form_header_noise(text)
     used_vision_transcription = False
     fallback_text = strip_form_header_noise(str(answer.get("transcribed_text") or "").strip())
-    if (not text or _contains_only_full_page_blocks(
-        selected_block_pairs,
-        pages_by_number,
-    )) and fallback_text and not is_form_header_text(fallback_text):
+    if (
+        prefer_vision_transcription
+        and fallback_text
+        and not is_form_header_text(fallback_text)
+    ) or (
+        (not text or _contains_only_full_page_blocks(
+            selected_block_pairs,
+            pages_by_number,
+        ))
+        and fallback_text
+        and not is_form_header_text(fallback_text)
+    ):
         text = fallback_text
         used_vision_transcription = True
     text = text.strip()
@@ -837,7 +1704,7 @@ def _response_from_answer(
     response_id = f"RESP-MAP-{uuid.uuid4().hex[:12]}"
     flags: List[Flag] = []
     mapping_basis = str(answer.get("mapping_basis") or "layout_and_semantics")
-    if mapping_basis != "explicit_label":
+    if mapping_basis not in {"explicit_label", "same_paper_layout"}:
         flags.append(
             _make_flag(
                 response_id,
@@ -848,7 +1715,9 @@ def _response_from_answer(
                 {"mapping_basis": mapping_basis, "confidence": confidence},
             )
         )
-    if confidence < _WARN_CONFIDENCE or used_vision_transcription:
+    if confidence < _WARN_CONFIDENCE or (
+        used_vision_transcription and mapping_basis != "same_paper_layout"
+    ):
         flags.append(
             _make_flag(
                 response_id,
@@ -1261,6 +2130,48 @@ def _blocks_for_regions(
     )
 
 
+def _normalized_evidence_text(value: Any) -> str:
+    """Normalize meaningful text for conservative duplicate detection."""
+
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _block_atom_id(page_number: int, block: TextBlock) -> str:
+    payload = "\x1f".join(
+        (
+            str(page_number),
+            f"{block.bbox.x_min:.3f}",
+            f"{block.bbox.y_min:.3f}",
+            f"{block.bbox.x_max:.3f}",
+            f"{block.bbox.y_max:.3f}",
+            _normalized_evidence_text(block.text),
+        )
+    )
+    return f"ocr-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _block_atom_ids_for_regions(
+    regions: List[SourcePageRef],
+    pages_by_number: Dict[int, PageOCR],
+) -> set[str]:
+    return {
+        _block_atom_id(page_number, block)
+        for page_number, block in _blocks_for_regions(regions, pages_by_number)
+    }
+
+
+def _region_atom_ids(regions: List[SourcePageRef]) -> set[str]:
+    atom_ids: set[str] = set()
+    for region in regions:
+        payload = (
+            f"{region.page_number}\x1f{region.y_start:.3f}\x1f{region.y_end:.3f}"
+        )
+        atom_ids.add(
+            f"region-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+        )
+    return atom_ids
+
+
 def _contains_only_full_page_blocks(
     blocks: List[tuple[int, TextBlock]],
     pages_by_number: Dict[int, PageOCR],
@@ -1363,6 +2274,21 @@ def _prefer_better_mapping(
             chars,
         )
 
+    if primary.coverage_is_reliable != secondary.coverage_is_reliable:
+        return primary if primary.coverage_is_reliable else secondary
+
+    def _has_unassigned_evidence(result: DocumentAnswerMappingResult) -> bool:
+        return any(response.question_number is None for response in result.responses)
+
+    # When neither candidate proves coverage, preserve the result that keeps
+    # unowned handwriting explicit and blocking.  Never trade that evidence
+    # away merely because another candidate assigned more snippets.
+    if not primary.coverage_is_reliable:
+        primary_unassigned = _has_unassigned_evidence(primary)
+        secondary_unassigned = _has_unassigned_evidence(secondary)
+        if primary_unassigned != secondary_unassigned:
+            return primary if primary_unassigned else secondary
+
     return primary if _score(primary) >= _score(secondary) else secondary
 
 
@@ -1410,6 +2336,7 @@ def _deterministic_numbered_mapping(
     )
     responses: List[DetectedResponse] = []
     assignment_details: Dict[str, Dict[str, Any]] = {}
+    owned_block_atoms: set[str] = set()
 
     for index, marker in enumerate(ordered):
         number = int(marker.question_number)
@@ -1443,9 +2370,19 @@ def _deterministic_numbered_mapping(
             y_start=y_start,
             y_end=max(y_end, y_start + 1.0),
         )
+        selected_block_pairs = _blocks_for_regions([region], pages_by_number)
+        block_atom_ids = {
+            _block_atom_id(page_number, block)
+            for page_number, block in selected_block_pairs
+        }
+        if block_atom_ids & owned_block_atoms:
+            # A coarse OCR block spanning several labelled regions cannot be
+            # treated as distinct evidence for each label. Vision/teacher
+            # review must split the physical handwriting first.
+            continue
         selected_blocks = [
             block
-            for _page_number, block in _blocks_for_regions([region], pages_by_number)
+            for _page_number, block in selected_block_pairs
             if not is_form_header_text(block.text)
         ]
         text = strip_form_header_noise(
@@ -1475,6 +2412,7 @@ def _deterministic_numbered_mapping(
             is_continuation=False,
         )
         responses.append(response)
+        owned_block_atoms.update(block_atom_ids)
         assignment_details[response_id] = {
             "method": "deterministic_answer_number",
             "question_number": number,
@@ -1482,6 +2420,9 @@ def _deterministic_numbered_mapping(
             "mapping_basis": "explicit_label",
             "prompt_version": "content-section-numbered-v1",
             "manual_review_required": False,
+            "evidence_version": 1,
+            "evidence_atom_ids": sorted(block_atom_ids or _region_atom_ids([region])),
+            "evidence_source": "ocr_blocks" if block_atom_ids else "numbered_region",
         }
 
     if len(responses) < 2:
@@ -1494,9 +2435,15 @@ def _deterministic_numbered_mapping(
     }
     paper_size = len(valid_numbers)
     coverage_is_reliable = (
-        len(mapped_numbers) >= min(paper_size, max(2, paper_size - 1))
+        len(mapped_numbers) == paper_size
         and len(mapped_numbers) == len(responses)
     )
+    if not coverage_is_reliable:
+        for detail in assignment_details.values():
+            detail["manual_review_required"] = True
+            detail["reason"] = (
+                "Explicit labels were found, but full answer-copy coverage was not proven"
+            )
     return DocumentAnswerMappingResult(
         responses=responses,
         assignment_details_by_response=assignment_details,

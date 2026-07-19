@@ -1829,22 +1829,62 @@ async def retry_exam_processing_job(
         {"submission_id": job.get("submission_id"), "exam_id": exam_id},
         projection={"publication_status": 1},
     )
-    if submission and submission.get("publication_status") == "published":
+    if submission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Canonical answer-copy submission not found",
+        )
+    if submission.get("publication_status") == "published":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Published results cannot be reprocessed. Unpublish or create a recheck workflow first.",
         )
 
+    from services.exampen_review_lease import (
+        SubmissionReviewBusyError,
+        acquire_submission_review_lease,
+        release_submission_review_lease,
+    )
+
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or current_user.get("username")
+        or "unknown"
+    )
+    try:
+        review_lease_token = await acquire_submission_review_lease(
+            tenant_db,
+            str(job.get("submission_id") or ""),
+            actor_id=actor_id,
+            operation="reprocess",
+        )
+    except SubmissionReviewBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
     try:
         from services.exampen_workflow import ProcessingJobBusyError, reprocess_processing_job
 
-        actor_id = str(
-            current_user.get("user_id")
-            or current_user.get("tutor_id")
-            or current_user.get("admin_id")
-            or current_user.get("username")
-            or "unknown"
+        # Recheck after acquiring the shared review fence. Publication may
+        # have committed between the first read and the lease acquisition.
+        current_submission = await tenant_db["evalpen_submissions"].find_one(
+            {"submission_id": job.get("submission_id")},
+            {"publication_status": 1},
         )
+        if (current_submission or {}).get("publication_status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Published results cannot be reprocessed. Create a recheck workflow first.",
+            )
         retried = await reprocess_processing_job(
             tenant_db,
             db_name=str(current_user.get("db_name") or ""),
@@ -1856,4 +1896,10 @@ async def retry_exam_processing_job(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    finally:
+        await release_submission_review_lease(
+            tenant_db,
+            str(job.get("submission_id") or ""),
+            review_lease_token,
+        )
     return _processing_job_to_response(retried)

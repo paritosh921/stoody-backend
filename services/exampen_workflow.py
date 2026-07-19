@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,7 @@ PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
 PROCESSING_LEASE_MINUTES = 30
+PROCESSING_HEARTBEAT_SECONDS = 60
 
 
 def _celery_broker_available() -> bool:
@@ -96,6 +99,96 @@ def _short_error(error: Exception | str) -> str:
     return message[:800] or type(error).__name__
 
 
+def _as_utc(value: Any) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _lease_expiry(job: Dict[str, Any]) -> Optional[datetime]:
+    """Return the explicit expiry, or the legacy updated-at lease boundary."""
+    explicit = _as_utc(job.get("lease_expires_at"))
+    if explicit is not None:
+        return explicit
+    updated_at = _as_utc(job.get("updated_at"))
+    if updated_at is None:
+        return None
+    return updated_at + timedelta(minutes=PROCESSING_LEASE_MINUTES)
+
+
+def _lease_is_active(job: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    if str(job.get("status") or "") != "processing":
+        return False
+    expiry = _lease_expiry(job)
+    return expiry is not None and expiry > (now or _now())
+
+
+def _owned_lease_filter(job: Dict[str, Any]) -> Dict[str, Any]:
+    token = str(job.get("lease_token") or "")
+    if not token:
+        raise ProcessingJobBusyError("Processing job has no worker lease token")
+    return {
+        "job_id": str(job.get("job_id") or ""),
+        "status": "processing",
+        "lease_token": token,
+    }
+
+
+async def _heartbeat_processing_job(tenant_db: Any, job: Dict[str, Any]) -> None:
+    """Renew a worker lease, failing closed if another worker fenced it out."""
+    now = _now()
+    expires_at = now + timedelta(minutes=PROCESSING_LEASE_MINUTES)
+    result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+        _owned_lease_filter(job),
+        {"$set": {"lease_expires_at": expires_at, "updated_at": now}},
+    )
+    if result.matched_count != 1:
+        raise ProcessingJobBusyError(
+            f"Processing lease for job {job.get('job_id')} is no longer owned by this worker"
+        )
+    job["lease_expires_at"] = expires_at
+    job["updated_at"] = now
+
+
+async def _run_with_lease_heartbeat(
+    tenant_db: Any,
+    job: Dict[str, Any],
+    operation: Awaitable[Any],
+) -> Any:
+    """Keep the ownership fence live while OCR/mapping performs a long call."""
+
+    async def _pulse() -> None:
+        while True:
+            await asyncio.sleep(PROCESSING_HEARTBEAT_SECONDS)
+            await _heartbeat_processing_job(tenant_db, job)
+
+    operation_task = asyncio.create_task(operation)
+    heartbeat_task = asyncio.create_task(_pulse())
+    try:
+        done, _ = await asyncio.wait(
+            {operation_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            error = heartbeat_task.exception()
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+            if error is not None:
+                raise error
+            raise ProcessingJobBusyError("Processing worker heartbeat stopped unexpectedly")
+
+        result = await operation_task
+        await _heartbeat_processing_job(tenant_db, job)
+        return result
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
 async def ensure_indexes(tenant_db: Any) -> None:
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     await jobs.create_index("job_id", unique=True, name="uniq_processing_job")
@@ -128,6 +221,7 @@ async def ensure_processing_job(
                 "pipeline_version": 1,
                 "status": "queued",
                 "attempts": 0,
+                "lease_generation": 0,
                 "created_at": now,
                 "updated_at": now,
                 "last_error": None,
@@ -280,12 +374,13 @@ async def reprocess_processing_job(
     requested_by: str,
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Safely rerun OCR, answer mapping, and marking for an existing copy.
+    """Safely rerun full-document visual marking for an existing copy.
 
-    The canonical uploaded pages remain unchanged.  ``SubmissionService``
-    supersedes previous detected-response rows before it writes the fresh
-    document mapping, so published audit evidence is preserved and a stale
-    score can never be mixed with newly mapped answers.
+    The canonical uploaded pages remain unchanged. The primary path inspects
+    the immutable paper, teacher solution, and full answer copy together; the
+    OCR/segmentation service is retained only for legacy sessions without the
+    required canonical files. Fresh response rows supersede old mappings, so
+    stale marks cannot be mixed with the new evidence ledger.
     """
     await ensure_indexes(tenant_db)
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
@@ -293,19 +388,33 @@ async def reprocess_processing_job(
     if job is None:
         raise ValueError(f"Processing job {job_id} not found")
 
+    now = _now()
     current_status = str(job.get("status") or "queued")
-    # Teacher/operator reprocess is an explicit force.  A stuck ``processing``
-    # lease (Redis crash, killed worker, partial OCR) must never return HTTP 409
-    # forever — that was stranding half-marked papers in production.
+    if _lease_is_active(job, now=now):
+        expiry = _lease_expiry(job)
+        raise ProcessingJobBusyError(
+            "This answer copy is still being processed by an active worker"
+            + (f" until {expiry.isoformat()}" if expiry else "")
+            + ". Wait for it to finish before reprocessing."
+        )
+
+    # Reclaiming is allowed only after the observed lease expires.  Include the
+    # exact observed fence fields in the reset so a concurrent heartbeat wins
+    # safely instead of allowing two mapping runs to overlap.
+    reset_filter: Dict[str, Any] = {"job_id": job_id, "status": current_status}
     if current_status == "processing":
+        if job.get("lease_token"):
+            reset_filter["lease_token"] = job["lease_token"]
+        if job.get("lease_expires_at") is not None:
+            reset_filter["lease_expires_at"] = job["lease_expires_at"]
+        elif job.get("updated_at") is not None:
+            reset_filter["updated_at"] = job["updated_at"]
         logger.warning(
-            "Teacher reprocess reclaiming job %s from status=processing "
-            "(requested_by=%s)",
+            "Reclaiming expired processing lease for job %s (requested_by=%s)",
             job_id,
             requested_by,
         )
 
-    now = _now()
     history_entry = {
         "requested_at": now,
         "requested_by": requested_by or "unknown",
@@ -316,9 +425,8 @@ async def reprocess_processing_job(
         "previous_pipeline_version": job.get("pipeline_version"),
         "force_reclaim": current_status == "processing",
     }
-    # Always match by job_id only — teacher reprocess supersedes any lease.
     reset = await jobs.update_one(
-        {"job_id": job_id},
+        reset_filter,
         {
             "$set": {
                 "status": "queued",
@@ -329,16 +437,28 @@ async def reprocess_processing_job(
                 "reprocess_requested_at": now,
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": "document-answer-mapping-v1",
+                "mapping_pipeline_version": "full-document-visual-v1",
                 "updated_at": now,
             },
-            "$unset": {"finished_at": "", "started_at": ""},
+            "$unset": {
+                "finished_at": "",
+                "started_at": "",
+                "lease_token": "",
+                "lease_expires_at": "",
+            },
             "$inc": {"reprocess_count": 1},
             "$push": {"reprocess_history": {"$each": [history_entry], "$slice": -20}},
         },
     )
     if not reset.matched_count:
-        raise ValueError(f"Processing job {job_id} not found")
+        latest = await jobs.find_one({"job_id": job_id})
+        if latest is not None and _lease_is_active(latest):
+            raise ProcessingJobBusyError(
+                "This answer copy was claimed by a worker while reprocessing was requested"
+            )
+        raise ProcessingJobBusyError(
+            "The processing job changed while reprocessing was requested; refresh and try again"
+        )
 
     refreshed = await jobs.find_one({"job_id": job_id})
     if refreshed is None:  # Defensive: the job was deleted after the reset.
@@ -367,14 +487,21 @@ async def reconcile_processing_jobs(
     stale_result = await jobs.update_many(
         {
             "status": "processing",
-            "updated_at": {"$lt": stale_before},
+            "$or": [
+                {"lease_expires_at": {"$lte": now}},
+                {
+                    "lease_expires_at": {"$exists": False},
+                    "updated_at": {"$lt": stale_before},
+                },
+            ],
         },
         {
             "$set": {
                 "status": "retryable_error",
                 "last_error": "Processing worker lease expired; queued for recovery",
                 "updated_at": now,
-            }
+            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
     )
 
@@ -406,9 +533,15 @@ async def reconcile_processing_jobs(
     }
 
 
-async def _claim_job(tenant_db: Any, job_id: str) -> Optional[Dict[str, Any]]:
+async def _claim_job(
+    tenant_db: Any,
+    job_id: str,
+    *,
+    execution_token: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     now = _now()
+    lease_token = str(execution_token or uuid.uuid4().hex)
     result = await jobs.update_one(
         {"job_id": job_id, "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)}},
         {
@@ -416,14 +549,16 @@ async def _claim_job(tenant_db: Any, job_id: str) -> Optional[Dict[str, Any]]:
                 "status": "processing",
                 "started_at": now,
                 "updated_at": now,
+                "lease_token": lease_token,
+                "lease_expires_at": now + timedelta(minutes=PROCESSING_LEASE_MINUTES),
                 "last_error": None,
             },
-            "$inc": {"attempts": 1},
+            "$inc": {"attempts": 1, "lease_generation": 1},
         },
     )
     if result.matched_count != 1:
         return None
-    return await jobs.find_one({"job_id": job_id})
+    return await jobs.find_one({"job_id": job_id, "lease_token": lease_token})
 
 
 async def _maybe_mark_exam_ready_for_review(tenant_db: Any, exam_id: str) -> None:
@@ -478,14 +613,23 @@ async def _maybe_mark_exam_ready_for_review(tenant_db: Any, exam_id: str) -> Non
         logger.info("Exam %s automatically moved to ready_for_eval", exam_id)
 
 
-async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, Any]:
+async def process_pcr_processing_job(
+    tenant_db: Any,
+    job_id: str,
+    *,
+    execution_token: Optional[str] = None,
+) -> Dict[str, Any]:
     """Run OCR/segmentation/evaluation for one persisted PCR job.
 
     Exceptions from transient infrastructure are allowed to reach Celery so it
     can retry.  Expected content-quality failures are persisted as a terminal
     ``failed`` job for teacher/admin action rather than retried indefinitely.
     """
-    job = await _claim_job(tenant_db, job_id)
+    job = await _claim_job(
+        tenant_db,
+        job_id,
+        execution_token=execution_token,
+    )
     if job is None:
         existing = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one({"job_id": job_id})
         return {
@@ -495,31 +639,161 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
         }
 
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
+    lease_filter = _owned_lease_filter(job)
     submission_id = str(job["submission_id"])
     submission = await tenant_db["evalpen_submissions"].find_one({"submission_id": submission_id})
     if submission is None:
-        await jobs.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "failed", "last_error": "Canonical submission not found", "updated_at": _now()}},
+        failed = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": "failed",
+                    "last_error": "Canonical submission not found",
+                    "updated_at": _now(),
+                },
+                "$unset": {"lease_token": "", "lease_expires_at": ""},
+            },
         )
+        if failed.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
         return {"job_id": job_id, "status": "failed", "error": "Canonical submission not found"}
+    if submission.get("publication_status") == "published":
+        stopped = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": "failed",
+                    "last_error": (
+                        "Published answer copies are immutable and cannot be reprocessed"
+                    ),
+                    "finished_at": _now(),
+                    "updated_at": _now(),
+                },
+                "$unset": {"lease_token": "", "lease_expires_at": ""},
+            },
+        )
+        if stopped.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error": "Published answer copies are immutable",
+        }
 
     exam = await tenant_db["exampen_exams"].find_one({"exam_id": submission.get("exam_id")})
     if exam is None or exam.get("exam_type") != "pcr":
-        await jobs.update_one(
-            {"job_id": job_id},
-            {"$set": {"status": "failed", "last_error": "Submission is not attached to a PCR session", "updated_at": _now()}},
+        failed = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": "failed",
+                    "last_error": "Submission is not attached to a PCR session",
+                    "updated_at": _now(),
+                },
+                "$unset": {"lease_token": "", "lease_expires_at": ""},
+            },
         )
+        if failed.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
         return {"job_id": job_id, "status": "failed", "error": "Not a PCR session"}
 
+    from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_evaluate_async import _build_eval_core
     from api.v1.evalpen_submissions_async import _build_submission_service
 
+    # Primary PCR camera/PDF path: the model sees the immutable question
+    # paper, teacher solution, and complete student copy in one visual request.
+    # OCR/segmentation remains a legacy fallback only when a session predates
+    # the canonical paper assets or the feature is explicitly disabled.
+    pcr_services = load_exampen("pcr.services")
+    LLMGate = load_exampen("llm_gate").LLMGate
+    full_document_gate = LLMGate(tenant_db)
+    if hasattr(full_document_gate, "initialize"):
+        await full_document_gate.initialize()
+    full_document_grader = pcr_services.FullDocumentGradingService(
+        tenant_db,
+        full_document_gate,
+    )
+    try:
+        document_result = await _run_with_lease_heartbeat(
+            tenant_db,
+            job,
+            full_document_grader.grade_submission(submission_id),
+        )
+    except ProcessingJobBusyError:
+        logger.warning(
+            "PCR worker lost its lease for job %s during full-document grading",
+            job_id,
+        )
+        return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+
+    if document_result.handled:
+        now = _now()
+        final_status = str(document_result.status or "blocked_for_review")
+        finished = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": final_status,
+                    "processing_path": "full_document_visual",
+                    "document_grading_run_id": document_result.run_id,
+                    "segmentation": {
+                        "path": "full_document_visual",
+                        "page_count": document_result.page_count,
+                        "response_count": document_result.response_count,
+                        "blocked_count": document_result.blocked_count,
+                        "warning_count": document_result.warning_count,
+                    },
+                    "evaluation": {
+                        "path": "full_document_visual",
+                        "evaluated_count": document_result.evaluated_count,
+                        "blocked_count": document_result.blocked_count,
+                        "error_count": len(document_result.errors),
+                        "remaining_ready": 0,
+                        "scored_questions": document_result.evaluated_count,
+                        "missing_question_count": document_result.blocked_count,
+                    },
+                    "last_error": "; ".join(document_result.errors[:10]) or None,
+                    "finished_at": now,
+                    "updated_at": now,
+                },
+                "$unset": {"lease_token": "", "lease_expires_at": ""},
+            },
+        )
+        if finished.matched_count != 1:
+            logger.warning(
+                "PCR worker lost its lease for job %s before document-grade commit",
+                job_id,
+            )
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+        await _maybe_mark_exam_ready_for_review(
+            tenant_db,
+            str(submission.get("exam_id")),
+        )
+        return {
+            "job_id": job_id,
+            "status": final_status,
+            "submission_id": submission_id,
+            "processing_path": "full_document_visual",
+            "document_grading_run_id": document_result.run_id,
+            "evaluated_count": document_result.evaluated_count,
+            "blocked_count": document_result.blocked_count,
+            "errors": document_result.errors,
+        }
+
     processor = await _build_submission_service(tenant_db)
-    processing_result = await processor.process_submission(submission_id)
+    try:
+        processing_result = await _run_with_lease_heartbeat(
+            tenant_db,
+            job,
+            processor.process_submission(submission_id),
+        )
+    except ProcessingJobBusyError:
+        logger.warning("PCR worker lost its lease for job %s during answer mapping", job_id)
+        return {"job_id": job_id, "status": "lease_lost", "claimed": False}
     if processing_result.error:
-        await jobs.update_one(
-            {"job_id": job_id},
+        failed = await jobs.update_one(
+            lease_filter,
             {
                 "$set": {
                     "status": "failed",
@@ -530,9 +804,12 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                     },
                     "finished_at": _now(),
                     "updated_at": _now(),
-                }
+                },
+                "$unset": {"lease_token": "", "lease_expires_at": ""},
             },
         )
+        if failed.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
         return {"job_id": job_id, "status": "failed", "error": processing_result.error}
 
     # Soft-unblock false "diagram heavy" / geometry blocks when the response
@@ -556,7 +833,10 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                 },
             }
         ).to_list(length=2000)
-        for response in batch:
+        await _heartbeat_processing_job(tenant_db, job)
+        for response_index, response in enumerate(batch):
+            if response_index and response_index % 10 == 0:
+                await _heartbeat_processing_job(tenant_db, job)
             response_id = str(response.get("response_id") or "")
             question_id = response.get("question_id")
             eval_status = str(response.get("eval_status") or "")
@@ -636,19 +916,35 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                 evaluated_count += 1
 
     # Pass 1+2: score every scoreable row (including not-attempted zeros).
-    await _evaluate_scoreable_batch()
-    await _evaluate_scoreable_batch()
+    try:
+        await _evaluate_scoreable_batch()
+        await _evaluate_scoreable_batch()
+    except ProcessingJobBusyError:
+        logger.warning("PCR worker lost its lease for job %s during evaluation", job_id)
+        return {"job_id": job_id, "status": "lease_lost", "claimed": False}
 
-    # Pass 3: guarantee every paper question has a terminal mark row.
-    paper_coverage = await _ensure_full_paper_evaluations(
-        tenant_db,
-        eval_core=eval_core,
-        submission_id=submission_id,
-        exam_id=str(submission.get("exam_id") or ""),
-        student_id=str(submission.get("student_id") or ""),
-    )
-    evaluated_count += int(paper_coverage.get("created_zeros") or 0)
+    # Pass 3: evaluate any existing paper rows and report questions whose
+    # answer state is unresolved.  Missing database rows are never proof that
+    # the student left a question blank.
+    try:
+        paper_coverage = await _ensure_full_paper_evaluations(
+            tenant_db,
+            eval_core=eval_core,
+            submission_id=submission_id,
+            exam_id=str(submission.get("exam_id") or ""),
+            student_id=str(submission.get("student_id") or ""),
+            lease_heartbeat=lambda: _heartbeat_processing_job(tenant_db, job),
+        )
+    except ProcessingJobBusyError:
+        logger.warning("PCR worker lost its lease for job %s during paper coverage", job_id)
+        return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+    evaluated_count += int(paper_coverage.get("evaluated_existing") or 0)
     evaluation_errors.extend(paper_coverage.get("errors") or [])
+    missing_question_count = int(paper_coverage.get("missing_question_count") or 0)
+    if missing_question_count:
+        evaluation_errors.append(
+            f"{missing_question_count} paper question(s) have no verified answer state"
+        )
 
     if processing_result.response_count == 0 and evaluated_count == 0:
         evaluation_errors.append("No student responses were detected")
@@ -695,6 +991,8 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
             evaluation_errors.append(
                 f"{remaining_ready} answer(s) still waiting for evaluation"
             )
+    elif missing_question_count:
+        final_status = "blocked_for_review"
     elif evaluated_count == 0 and evaluation_errors:
         final_status = "failed"
     elif blocked_count and scored_questions == 0:
@@ -705,8 +1003,8 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
     else:
         final_status = "completed"
     now = _now()
-    await jobs.update_one(
-        {"job_id": job_id},
+    finished = await jobs.update_one(
+        lease_filter,
         {
             "$set": {
                 "status": final_status,
@@ -722,13 +1020,18 @@ async def process_pcr_processing_job(tenant_db: Any, job_id: str) -> Dict[str, A
                     "error_count": len(evaluation_errors),
                     "remaining_ready": remaining_ready,
                     "scored_questions": scored_questions,
+                    "missing_question_count": missing_question_count,
                 },
                 "last_error": "; ".join(evaluation_errors[:10]) or None,
                 "finished_at": now,
                 "updated_at": now,
-            }
+            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
     )
+    if finished.matched_count != 1:
+        logger.warning("PCR worker lost its lease for job %s before final commit", job_id)
+        return {"job_id": job_id, "status": "lease_lost", "claimed": False}
     await _maybe_mark_exam_ready_for_review(tenant_db, str(submission.get("exam_id")))
     return {
         "job_id": job_id,
@@ -824,16 +1127,23 @@ async def _ensure_full_paper_evaluations(
     submission_id: str,
     exam_id: str,
     student_id: str,
+    lease_heartbeat: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> Dict[str, Any]:
-    """Create terminal zero rows for any paper question still without a score.
+    """Evaluate existing rows and report unresolved paper coverage.
 
-    A conducted paper is always out of the full printed marks.  Partial OCR
-    must not leave Q5–Q9 as blank navigator dashes forever.
+    Absence of a response document is not evidence that the student skipped a
+    question.  Only ingestion may create a ``not_attempted`` row, and only
+    after document coverage has been independently verified.
     """
-    created_zeros = 0
+    evaluated_existing = 0
     errors: List[str] = []
     if not exam_id:
-        return {"created_zeros": 0, "errors": errors}
+        return {
+            "evaluated_existing": 0,
+            "missing_question_count": 0,
+            "missing_question_ids": [],
+            "errors": errors,
+        }
 
     questions = await tenant_db["evalpen_questions"].find(
         {"exam_id": exam_id},
@@ -852,49 +1162,16 @@ async def _ensure_full_paper_evaluations(
         if doc.get("question_id")
     }
 
-    for question in questions:
+    missing_question_ids: List[str] = []
+    for question_index, question in enumerate(questions):
+        if lease_heartbeat is not None and question_index % 10 == 0:
+            await lease_heartbeat()
         question_id = str(question.get("question_id") or "").strip()
         if not question_id:
             continue
         response = response_by_question.get(question_id)
         if response is None:
-            # Create a synthetic missing slot then score it as zero.
-            response_id = f"RESP-FILL-{submission_id}-{question_id}"[:64]
-            max_marks = float(question.get("max_marks") or 0)
-            try:
-                await tenant_db["evalpen_detected_responses"].update_one(
-                    {"response_id": response_id},
-                    {
-                        "$setOnInsert": {
-                            "response_id": response_id,
-                            "submission_id": submission_id,
-                            "question_id": question_id,
-                            "question_number": question.get("question_number"),
-                            "exam_id": exam_id,
-                            "student_id": student_id,
-                            "detected_text": "",
-                            "content_type": "TEXT_ONLY",
-                            "is_missing_response": True,
-                            "answer_state": "not_attempted",
-                            "eval_status": "ready",
-                            "flags": [],
-                            "source_pages": [],
-                            "word_count": 0,
-                            "created_at": _now(),
-                            "_immutable": True,
-                        }
-                    },
-                    upsert=True,
-                )
-                result = await eval_core.evaluate_response(
-                    response_id, question_id=question_id
-                )
-                if result.error:
-                    errors.append(f"{response_id}: {result.error}")
-                else:
-                    created_zeros += 1
-            except Exception as exc:
-                errors.append(f"{question_id}: {_short_error(exc)}")
+            missing_question_ids.append(question_id)
             continue
 
         response_id = str(response.get("response_id") or "")
@@ -920,37 +1197,82 @@ async def _ensure_full_paper_evaluations(
             if result.error:
                 errors.append(f"{response_id}: {result.error}")
             elif not result.skipped:
-                created_zeros += 1
+                evaluated_existing += 1
         except Exception as exc:
             errors.append(f"{response_id}: {_short_error(exc)}")
 
-    return {"created_zeros": created_zeros, "errors": errors}
+    return {
+        "evaluated_existing": evaluated_existing,
+        "missing_question_count": len(missing_question_ids),
+        "missing_question_ids": missing_question_ids,
+        "errors": errors,
+    }
 
 
-async def mark_processing_job_retryable_error(tenant_db: Any, job_id: str, error: Exception | str) -> None:
-    """Persist a retryable worker failure before Celery schedules its retry."""
-    await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-        {"job_id": job_id},
+async def mark_processing_job_retryable_error(
+    tenant_db: Any,
+    job_id: str,
+    error: Exception | str,
+    *,
+    expected_lease_token: Optional[str] = None,
+) -> bool:
+    """Persist a retryable failure only for the worker that owned the lease."""
+
+    query: Dict[str, Any] = {"job_id": job_id}
+    if expected_lease_token:
+        query.update(
+            {
+                "status": "processing",
+                "lease_token": str(expected_lease_token),
+            }
+        )
+    else:
+        # Legacy callers have no ownership proof. They may update an idle job,
+        # but must never fence out an active worker.
+        query["status"] = {"$ne": "processing"}
+    result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+        query,
         {
             "$set": {
                 "status": "retryable_error",
                 "last_error": _short_error(error),
                 "updated_at": _now(),
-            }
+            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
     )
+    return result.matched_count == 1
 
 
-async def mark_processing_job_failed(tenant_db: Any, job_id: str, error: Exception | str) -> None:
-    """Persist a terminal worker failure after retry exhaustion."""
-    await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-        {"job_id": job_id},
+async def mark_processing_job_failed(
+    tenant_db: Any,
+    job_id: str,
+    error: Exception | str,
+    *,
+    expected_lease_token: Optional[str] = None,
+) -> bool:
+    """Persist terminal failure only for the worker that owned the lease."""
+
+    query: Dict[str, Any] = {"job_id": job_id}
+    if expected_lease_token:
+        query.update(
+            {
+                "status": "processing",
+                "lease_token": str(expected_lease_token),
+            }
+        )
+    else:
+        query["status"] = {"$ne": "processing"}
+    result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+        query,
         {
             "$set": {
                 "status": "failed",
                 "last_error": _short_error(error),
                 "finished_at": _now(),
                 "updated_at": _now(),
-            }
+            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
     )
+    return result.matched_count == 1

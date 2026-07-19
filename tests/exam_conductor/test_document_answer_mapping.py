@@ -95,6 +95,33 @@ def _response(
     )
 
 
+def _layout_question(
+    number: int,
+    text: str,
+    *,
+    page_number: int = 1,
+    y: float,
+    height: float,
+):
+    bbox = {"x": 0.0, "y": y, "width": 100.0, "height": height}
+    return (
+        number,
+        {
+            "question_id": f"EXAM-LAYOUT::Q{number}",
+            "question_number": number,
+            "question_text": text,
+            "immutable": True,
+            "source_page_number": page_number,
+            "source_bbox_percent": bbox,
+            "question_layout": {
+                "page_number": page_number,
+                "bbox_percent": bbox,
+                "layout_source": "reviewed_ocr_anchor",
+            },
+        },
+    )
+
+
 class _StaticVisionGate:
     def __init__(self, payload: Dict[str, Any]) -> None:
         self.payload = payload
@@ -289,6 +316,254 @@ def test_multi_page_camera_copy_always_uses_document_mapping():
     ) is False
 
 
+@pytest.mark.asyncio
+async def test_same_printed_paper_uses_verified_question_crops(monkeypatch):
+    """Frozen paper regions own ink when printed prompts prove the same form."""
+    mapping = _mapping_service()
+    questions = [
+        _layout_question(
+            1,
+            "The sum of two integers is -9 and their product is -36.",
+            y=0.0,
+            height=50.0,
+        ),
+        _layout_question(
+            2,
+            "Estimate the division result to the nearest whole number.",
+            y=50.0,
+            height=50.0,
+        ),
+    ]
+    pages = [
+        _page(
+            1,
+            [
+                (
+                    "1) The sum of two integers is -9 and their product is -36.",
+                    25.0,
+                    115.0,
+                ),
+                (
+                    "2) Estimate the division result to the nearest whole number.",
+                    165.0,
+                    260.0,
+                ),
+            ],
+        )
+    ]
+    gate = _StaticVisionGate(
+        {
+            "page_coverage": {"complete": True, "confidence": 0.99},
+            "questions": [
+                {
+                    "question_number": 1,
+                    "attempted": True,
+                    "confidence": 0.99,
+                    "regions": [{"page_number": 1, "y_start": 100, "y_end": 400}],
+                    "transcribed_text": "-12 + 3 = -9; -12 x 3 = -36",
+                    "ownership_conflict": False,
+                    "reason": "",
+                },
+                {
+                    "question_number": 2,
+                    "attempted": True,
+                    "confidence": 0.98,
+                    "regions": [{"page_number": 1, "y_start": 550, "y_end": 900}],
+                    "transcribed_text": "-105 / -15 = 7",
+                    "ownership_conflict": False,
+                    "reason": "",
+                },
+            ],
+        }
+    )
+
+    async def _image_loader(_reference: str):
+        return "cGFnZS1pbWFnZQ=="
+
+    monkeypatch.setattr(mapping, "_resolve_image_base64", _image_loader)
+    monkeypatch.setattr(mapping, "_get_ocr_vision_model", lambda: "test-vision")
+
+    result = await mapping.DocumentAnswerMapper(gate).map_submission(
+        pages=pages,
+        answer_pages=[
+            {"page_number": 1, "raw_image_ref": "s3://private/same-paper/page-1.png"}
+        ],
+        numbered_questions=questions,
+        source="camera",
+    )
+
+    assert result.coverage_is_reliable is True
+    assert result.manual_review_required is False
+    assert [response.detected_text for response in result.responses] == [
+        "-12 + 3 = -9; -12 x 3 = -36",
+        "-105 / -15 = 7",
+    ]
+    assert result.responses[0].source_pages[0].y_end == pytest.approx(118.8)
+    assert result.responses[1].source_pages[0].y_start == pytest.approx(163.35)
+    assert result.metadata["mapping_strategy"] == "verified_same_paper_page_order"
+    assert gate.calls[0]["kwargs"]["metadata"]["pcr_stage"] == "same_paper_layout_transcription"
+    content = gate.calls[0]["kwargs"]["messages"][0]["content"]
+    assert sum(part["type"] == "image_url" for part in content) == 1
+    image_part = next(part for part in content if part["type"] == "image_url")
+    assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_frozen_layout_is_not_used_for_a_free_form_answer_book(monkeypatch):
+    """Page count plus finalized boxes cannot activate layout ownership alone."""
+    mapping = _mapping_service()
+    questions = [
+        _layout_question(
+            1,
+            "The sum of two integers is -9 and their product is -36.",
+            y=0.0,
+            height=50.0,
+        ),
+        _layout_question(
+            2,
+            "Estimate the division result to the nearest whole number.",
+            y=50.0,
+            height=50.0,
+        ),
+    ]
+    pages = [_page(1, [("-12 and 3", 25.0, 90.0), ("The result is 7", 180.0, 245.0)])]
+    gate = _StaticVisionGate(
+        {
+            "document_coverage": {"complete": True, "confidence": 0.99},
+            "answers": [
+                {
+                    "question_number": 1,
+                    "confidence": 0.98,
+                    "mapping_basis": "layout_and_semantics",
+                    "regions": [{"page_number": 1, "y_start": 0, "y_end": 450}],
+                    "transcribed_text": "-12 and 3",
+                },
+                {
+                    "question_number": 2,
+                    "confidence": 0.98,
+                    "mapping_basis": "layout_and_semantics",
+                    "regions": [{"page_number": 1, "y_start": 550, "y_end": 1000}],
+                    "transcribed_text": "The result is 7",
+                },
+            ],
+            "unresolved_regions": [],
+        }
+    )
+
+    async def _image_loader(_reference: str):
+        return "cGFnZS1pbWFnZQ=="
+
+    monkeypatch.setattr(mapping, "_resolve_image_base64", _image_loader)
+    monkeypatch.setattr(mapping, "_get_ocr_vision_model", lambda: "test-vision")
+
+    result = await mapping.DocumentAnswerMapper(gate).map_submission(
+        pages=pages,
+        answer_pages=[
+            {"page_number": 1, "raw_image_ref": "s3://private/answer-book/page-1.png"}
+        ],
+        numbered_questions=questions,
+        source="camera",
+    )
+
+    assert result.metadata.get("mapping_strategy") != "verified_same_paper_page_order"
+    assert gate.calls[0]["kwargs"]["metadata"]["pcr_stage"] == "document_answer_mapping"
+
+
+@pytest.mark.asyncio
+async def test_same_paper_page_coverage_fails_closed_when_a_question_is_missing(monkeypatch):
+    mapping = _mapping_service()
+    questions = [
+        _layout_question(1, "Calculate the integer product and sum.", y=0.0, height=50.0),
+        _layout_question(2, "Estimate the division to nearest whole number.", y=50.0, height=50.0),
+    ]
+    pages = [
+        _page(
+            1,
+            [
+                ("1) Calculate the integer product and sum.", 20.0, 110.0),
+                ("2) Estimate the division to nearest whole number.", 170.0, 260.0),
+            ],
+        )
+    ]
+    gate = _StaticVisionGate(
+        {
+            "page_coverage": {"complete": True, "confidence": 0.99},
+            "questions": [
+                {
+                    "question_number": 1,
+                    "attempted": True,
+                    "confidence": 0.99,
+                    "regions": [{"page_number": 1, "y_start": 100, "y_end": 400}],
+                    "transcribed_text": "-12 and 3",
+                    "ownership_conflict": False,
+                }
+            ],
+        }
+    )
+
+    async def _image_loader(_reference: str):
+        return "cGFnZS1pbWFnZQ=="
+
+    monkeypatch.setattr(mapping, "_resolve_image_base64", _image_loader)
+    monkeypatch.setattr(mapping, "_get_ocr_vision_model", lambda: "test-vision")
+
+    result = await mapping.DocumentAnswerMapper(gate).map_submission(
+        pages=pages,
+        answer_pages=[
+            {"page_number": 1, "raw_image_ref": "s3://private/same-paper/page-1.png"}
+        ],
+        numbered_questions=questions,
+        source="camera",
+    )
+
+    assert result.coverage_is_reliable is False
+    assert result.manual_review_required is True
+    assert [response.question_number for response in result.responses] == [1, None]
+    assert "Q2 page returned no transcription record" in (result.reason or "")
+    assert len(gate.calls) == 1
+
+
+def test_same_paper_page_result_can_prove_an_all_blank_copy():
+    mapping = _mapping_service()
+    pages = [_page(1, [])]
+    anchors = mapping._validated_layout_anchors(
+        pages,
+        [
+            _layout_question(1, "First printed question", y=0.0, height=50.0),
+            _layout_question(2, "Second printed question", y=50.0, height=50.0),
+        ],
+    )
+    result = mapping._build_layout_page_mapping_result(
+        records=[
+            {
+                "question_number": 1,
+                "attempted": False,
+                "confidence": 0.99,
+                "regions": [],
+                "transcribed_text": "",
+                "ownership_conflict": False,
+            },
+            {
+                "question_number": 2,
+                "attempted": False,
+                "confidence": 0.99,
+                "regions": [],
+                "transcribed_text": "",
+                "ownership_conflict": False,
+            },
+        ],
+        anchors=anchors,
+        pages=pages,
+        coverage_complete=True,
+        coverage_confidence=0.99,
+        layout_match_confidence=0.98,
+    )
+
+    assert result.coverage_is_reliable is True
+    assert result.responses == []
+    assert result.metadata["verified_blank_question_numbers"] == [1, 2]
+
+
 def test_numbered_answer_book_skips_document_remap_when_coverage_is_reliable():
     """Content-style 1)/2)/3) splits must not be destroyed by vision remapping."""
     mapping = _mapping_service()
@@ -317,6 +592,64 @@ def test_numbered_answer_book_skips_document_remap_when_coverage_is_reliable():
         numbered_questions=questions,
         source="camera",
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_single_numbered_label_does_not_swallow_later_unlabelled_answer(monkeypatch):
+    """One Q1 label is not whole-document coverage proof for a five-question paper."""
+    mapping = _mapping_service()
+    pages = [
+        _page(1, [("1) First answer work", 30.0, 90.0)]),
+        _page(2, [("Unnumbered answer to question 3", 25.0, 120.0)]),
+    ]
+    questions = [
+        (number, {"question_text": f"Question {number}"})
+        for number in range(1, 6)
+    ]
+    gate = _StaticVisionGate(
+        {
+            "document_coverage": {"complete": True, "confidence": 0.98},
+            "answers": [
+                {
+                    "question_number": 1,
+                    "confidence": 0.98,
+                    "mapping_basis": "explicit_label",
+                    "regions": [{"page_number": 1, "y_start": 50, "y_end": 350}],
+                    "transcribed_text": "First answer work",
+                },
+                {
+                    "question_number": 3,
+                    "confidence": 0.96,
+                    "mapping_basis": "layout_and_semantics",
+                    "regions": [{"page_number": 2, "y_start": 40, "y_end": 450}],
+                    "transcribed_text": "Unnumbered answer to question 3",
+                },
+            ],
+            "unresolved_regions": [],
+        }
+    )
+
+    async def _image_loader(_reference: str):
+        return "ZmFrZS1pbWFnZQ=="
+
+    monkeypatch.setattr(mapping, "_resolve_image_base64", _image_loader)
+    monkeypatch.setattr(mapping, "_get_ocr_vision_model", lambda: "test-vision")
+
+    result = await mapping.DocumentAnswerMapper(gate).map_submission(
+        pages=pages,
+        answer_pages=[
+            {"page_number": 1, "raw_image_ref": "s3://private/page-1.png"},
+            {"page_number": 2, "raw_image_ref": "s3://private/page-2.png"},
+        ],
+        numbered_questions=questions,
+        source="camera",
+    )
+
+    assert len(gate.calls) == 1
+    assert result.coverage_is_reliable is True
+    assert [response.question_number for response in result.responses] == [1, 3]
+    assert result.responses[0].source_pages[0].page_number == 1
+    assert result.responses[1].source_pages[0].page_number == 2
 
 
 def test_deterministic_numbered_mapping_ignores_form_header():
@@ -575,6 +908,65 @@ async def test_document_mapper_routes_overlapping_regions_to_teacher_review(monk
     assert result.manual_review_required is True
     assert [response.question_number for response in result.responses] == [1, None]
     assert result.assignment_details_by_response[str(result.responses[-1].response_id)]["manual_review_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_document_mapper_rejects_same_coarse_ocr_block_for_two_questions(monkeypatch):
+    """Disjoint model regions may not reuse one page-sized OCR transcription."""
+    mapping = _mapping_service()
+    pages = [
+        _page(
+            1,
+            [
+                (
+                    "A single coarse OCR block containing several handwritten answers",
+                    5.0,
+                    292.0,
+                )
+            ],
+        )
+    ]
+    gate = _StaticVisionGate(
+        {
+            "document_coverage": {"complete": True, "confidence": 0.99},
+            "answers": [
+                {
+                    "question_number": 1,
+                    "confidence": 0.98,
+                    "mapping_basis": "layout_and_semantics",
+                    "regions": [{"page_number": 1, "y_start": 0, "y_end": 400}],
+                    "transcribed_text": "First answer",
+                },
+                {
+                    "question_number": 2,
+                    "confidence": 0.98,
+                    "mapping_basis": "layout_and_semantics",
+                    "regions": [{"page_number": 1, "y_start": 600, "y_end": 1000}],
+                    "transcribed_text": "Second answer",
+                },
+            ],
+            "unresolved_regions": [],
+        }
+    )
+
+    async def _image_loader(_reference: str):
+        return "ZmFrZS1pbWFnZQ=="
+
+    monkeypatch.setattr(mapping, "_resolve_image_base64", _image_loader)
+    monkeypatch.setattr(mapping, "_get_ocr_vision_model", lambda: "test-vision")
+
+    result = await mapping.DocumentAnswerMapper(gate).map_submission(
+        pages=pages,
+        answer_pages=[{"page_number": 1, "raw_image_ref": "s3://private/exampen/page-1.png"}],
+        numbered_questions=[(1, {"question_text": "Question 1"}), (2, {"question_text": "Question 2"})],
+        source="camera",
+    )
+
+    mapped = [response for response in result.responses if response.question_number is not None]
+    assert len(mapped) == 1
+    assert result.coverage_is_reliable is False
+    assert result.manual_review_required is True
+    assert any(response.question_number is None for response in result.responses)
 
 
 @pytest.mark.asyncio

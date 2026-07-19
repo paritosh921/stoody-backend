@@ -113,11 +113,13 @@ def estimate_tokens(text: str) -> int:
 # Vision models typically use 765-1105 tokens per image depending on detail;
 # 1000 is a safe middle-ground heuristic.
 _TOKENS_PER_IMAGE = 1000
+_TOKENS_PER_FILE = 10_000
 
 
 def estimate_tokens_for_messages(
     prompt: str,
     messages: Optional[List[Dict[str, Any]]] = None,
+    responses_input: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """
     Estimate input tokens for a gate call.
@@ -129,24 +131,32 @@ def estimate_tokens_for_messages(
     - text tokens (from all ``text`` content parts across all messages)
     - a conservative fixed count per image (``_TOKENS_PER_IMAGE``)
     """
-    if messages is None:
+    if messages is None and responses_input is None:
         return estimate_tokens(prompt)
 
     text_chars = 0
     image_count = 0
-    for msg in messages:
+    file_count = 0
+    input_items = responses_input if responses_input is not None else messages or []
+    for msg in input_items:
         content = msg.get("content")
         if isinstance(content, str):
             text_chars += len(content)
         elif isinstance(content, list):
             for part in content:
                 ptype = part.get("type", "")
-                if ptype == "text":
+                if ptype in ("text", "input_text"):
                     text_chars += len(part.get("text", ""))
-                elif ptype in ("image_url", "image"):
+                elif ptype in ("image_url", "image", "input_image"):
                     image_count += 1
+                elif ptype == "input_file":
+                    file_count += 1
     text_tokens = max(1, int(text_chars / 3.5)) if text_chars else 0
-    return text_tokens + image_count * _TOKENS_PER_IMAGE
+    return (
+        text_tokens
+        + image_count * _TOKENS_PER_IMAGE
+        + file_count * _TOKENS_PER_FILE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +251,92 @@ async def _call_openai(
         cache_read_tokens=usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
         cache_creation_tokens=0,
         model=data.get("model", model_id),
+        raw=data,
+    )
+
+
+async def _call_openai_responses(
+    model_id: str,
+    *,
+    responses_input: List[Dict[str, Any]],
+    json_schema: Optional[Dict[str, Any]] = None,
+    prompt_cache_key: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    api_key: Optional[str] = None,
+) -> ProviderResponse:
+    """Call the OpenAI Responses API for native PDF/image inputs.
+
+    The payload stays behind the shared LLM gate so budgets and append-only
+    usage logs remain authoritative. ``store=false`` is mandatory because the
+    inputs can contain student work and identifying school information.
+    """
+    key = api_key or os.getenv("OPENAI_API_KEY", "")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    if not responses_input:
+        raise ValueError("responses_input must contain at least one item")
+
+    payload: Dict[str, Any] = {
+        "model": model_id,
+        "input": responses_input,
+        "store": False,
+    }
+    if max_output_tokens is not None:
+        payload["max_output_tokens"] = max_output_tokens
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if prompt_cache_key:
+        payload["prompt_cache_key"] = prompt_cache_key
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
+    if json_schema:
+        payload["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": "exam_document_evidence_ledger",
+                "strict": True,
+                "schema": json_schema,
+            }
+        }
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        resp = await client.post(
+            f"{base_url}/responses",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            logger.error(
+                "OpenAI Responses API error %s for model=%s: %s",
+                resp.status_code,
+                model_id,
+                resp.text[:500],
+            )
+        resp.raise_for_status()
+        data = resp.json()
+
+    output_text_parts: List[str] = []
+    for output_item in data.get("output") or []:
+        if not isinstance(output_item, dict) or output_item.get("type") != "message":
+            continue
+        for part in output_item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                output_text_parts.append(str(part.get("text") or ""))
+    usage = data.get("usage") or {}
+    input_details = usage.get("input_tokens_details") or {}
+    return ProviderResponse(
+        content="".join(output_text_parts),
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+        cache_read_tokens=int(input_details.get("cached_tokens") or 0),
+        cache_creation_tokens=0,
+        model=str(data.get("model") or model_id),
         raw=data,
     )
 
@@ -543,6 +639,10 @@ async def call_provider(
     prompt: str,
     *,
     messages: Optional[List[Dict[str, Any]]] = None,
+    responses_input: Optional[List[Dict[str, Any]]] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    prompt_cache_key: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     max_output_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
 ) -> ProviderResponse:
@@ -565,10 +665,29 @@ async def call_provider(
     exclusively by ``gate.py`` — no other module may import or call
     the internal ``_call_*`` functions.
     """
+    if messages is not None and responses_input is not None:
+        raise ValueError("messages and responses_input are mutually exclusive")
+
     provider = _detect_provider(model_id)
-    logger.debug("LLM gate dispatching to %s for model %s (multimodal=%s)", provider, model_id, messages is not None)
+    logger.debug(
+        "LLM gate dispatching to %s for model %s (multimodal=%s, responses=%s)",
+        provider,
+        model_id,
+        messages is not None,
+        responses_input is not None,
+    )
 
     if provider == "openai":
+        if responses_input is not None:
+            return await _call_openai_responses(
+                model_id,
+                responses_input=responses_input,
+                json_schema=json_schema,
+                prompt_cache_key=prompt_cache_key,
+                reasoning_effort=reasoning_effort,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+            )
         return await _call_openai(
             model_id, prompt,
             messages=messages,
@@ -576,6 +695,8 @@ async def call_provider(
             temperature=temperature,
         )
     elif provider == "mistral":
+        if responses_input is not None:
+            raise ValueError("Native file inputs currently require an OpenAI model")
         return await _call_mistral(
             model_id, prompt,
             messages=messages,
@@ -583,6 +704,8 @@ async def call_provider(
             temperature=temperature,
         )
     elif provider == "anthropic":
+        if responses_input is not None:
+            raise ValueError("Native file inputs currently require an OpenAI model")
         return await _call_anthropic(
             model_id, prompt,
             messages=messages,
@@ -590,6 +713,8 @@ async def call_provider(
             temperature=temperature,
         )
     elif provider == "gemini":
+        if responses_input is not None:
+            raise ValueError("Native file inputs currently require an OpenAI model")
         return await _call_gemini(
             model_id, prompt,
             messages=messages,

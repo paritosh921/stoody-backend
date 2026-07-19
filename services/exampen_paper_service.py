@@ -15,15 +15,19 @@ import hashlib
 import importlib
 import json
 import logging
+import uuid
 from datetime import date, datetime, timezone
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException, status
+from pymongo.errors import DuplicateKeyError
 
 logger = logging.getLogger(__name__)
 
 PAPER_VERSIONS_COLLECTION = "exampen_paper_versions"
 PAPER_QUESTIONS_COLLECTION = "exampen_paper_questions"
+PAPER_LAYOUT_SCHEMA_VERSION = 1
 
 
 def _marking_policy_module() -> Any:
@@ -237,7 +241,11 @@ def _json_default(value: Any) -> str:
     return str(value)
 
 
-def _content_hash(document: Dict[str, Any], questions: Iterable[Dict[str, Any]]) -> str:
+def _content_hash(
+    document: Dict[str, Any],
+    questions: Iterable[Dict[str, Any]],
+    question_layout: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Hash only fields that determine the exam paper and marking outcome."""
     normalized_questions: List[Dict[str, Any]] = []
     for position, question in enumerate(questions, start=1):
@@ -262,9 +270,311 @@ def _content_hash(document: Dict[str, Any], questions: Iterable[Dict[str, Any]])
         "subject": _as_text(document.get("subject")),
         "pcr_marking_policy": document.get("pcr_marking_policy"),
         "questions": normalized_questions,
+        "question_layout": question_layout or [],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _question_print_order(question: Dict[str, Any], fallback: int) -> int:
+    for key in ("question_number", "extraction_order"):
+        raw_value = question.get(key)
+        if raw_value in (None, "") or isinstance(raw_value, bool):
+            continue
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return fallback
+
+
+def _regions_from_reviewed_ocr_anchors(
+    document: Dict[str, Any],
+    questions: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build non-overlapping page bands from trusted OCR question anchors.
+
+    Manual boxes are authoritative when present.  For papers whose OCR quality
+    gate explicitly says manual segmentation is unnecessary, the persisted
+    question anchors are the reviewed layout evidence and must remain usable at
+    finalization.  The fallback is deliberately fail-closed: every immutable
+    question must have exactly one numbered anchor on the same source page.
+    """
+    if document.get("ocr_manual_segmentation_recommended") is not False:
+        return [], [
+            "No reviewed question regions are saved. Segment every printed question before finalizing."
+        ]
+
+    layout_summary = document.get("ocr_layout_summary")
+    raw_pages = layout_summary.get("pages") if isinstance(layout_summary, dict) else None
+    if not isinstance(raw_pages, list) or not raw_pages:
+        return [], [
+            "Question OCR has no reviewed page anchors. Reprocess OCR or segment the paper manually."
+        ]
+
+    anchors_by_number: Dict[int, Dict[str, Any]] = {}
+    errors: List[str] = []
+    for page_index, page in enumerate(raw_pages, start=1):
+        if not isinstance(page, dict):
+            errors.append(f"OCR layout page {page_index}: invalid page metadata")
+            continue
+        try:
+            page_number = int(page.get("page") or page_index)
+        except (TypeError, ValueError):
+            errors.append(f"OCR layout page {page_index}: invalid page number")
+            continue
+        raw_anchors = page.get("question_anchors") or []
+        if not isinstance(raw_anchors, list):
+            errors.append(f"OCR layout page {page_number}: invalid question anchors")
+            continue
+        for anchor_index, anchor in enumerate(raw_anchors, start=1):
+            if not isinstance(anchor, dict):
+                errors.append(f"OCR layout page {page_number}, anchor {anchor_index}: invalid anchor")
+                continue
+            try:
+                number = int(str(anchor.get("number") or "").strip())
+                y = float(anchor.get("y"))
+            except (TypeError, ValueError):
+                errors.append(f"OCR layout page {page_number}, anchor {anchor_index}: invalid number or position")
+                continue
+            if number < 1 or y < 0:
+                errors.append(f"OCR layout page {page_number}, anchor {anchor_index}: invalid number or position")
+                continue
+            if number in anchors_by_number:
+                errors.append(f"OCR layout: duplicate question anchor {number}")
+                continue
+            anchors_by_number[number] = {
+                "number": number,
+                "page_number": page_number,
+                "y": y,
+                "page_height": page.get("page_height") or page.get("height") or page.get("height_points"),
+            }
+
+    question_by_number: Dict[int, Dict[str, Any]] = {}
+    for position, question in enumerate(questions, start=1):
+        number = _question_print_order(question, position)
+        if number in question_by_number:
+            errors.append(f"Question {number}: duplicate printed order")
+            continue
+        question_by_number[number] = question
+
+    expected_numbers = set(question_by_number)
+    anchor_numbers = set(anchors_by_number)
+    for number in sorted(expected_numbers - anchor_numbers):
+        errors.append(f"Question {number}: no reviewed OCR page anchor")
+    for number in sorted(anchor_numbers - expected_numbers):
+        errors.append(f"OCR anchor {number}: has no reviewed question record")
+    if errors:
+        return [], errors
+
+    anchors_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    for number in sorted(expected_numbers):
+        question = question_by_number[number]
+        anchor = anchors_by_number[number]
+        try:
+            question_page = int(question.get("page_number") or 0)
+        except (TypeError, ValueError):
+            question_page = 0
+        if question_page > 0 and question_page != anchor["page_number"]:
+            errors.append(
+                f"Question {number}: OCR question page {question_page} conflicts with anchor page {anchor['page_number']}"
+            )
+        anchors_by_page.setdefault(anchor["page_number"], []).append(anchor)
+    if errors:
+        return [], errors
+
+    regions: List[Dict[str, Any]] = []
+    for page_number, page_anchors in sorted(anchors_by_page.items()):
+        page_anchors.sort(key=lambda item: (item["y"], item["number"]))
+        raw_height = next((item.get("page_height") for item in page_anchors if item.get("page_height")), None)
+        try:
+            page_height = float(raw_height) if raw_height is not None else 0.0
+        except (TypeError, ValueError):
+            page_height = 0.0
+        last_y = page_anchors[-1]["y"]
+        if page_height <= last_y:
+            gaps = [
+                right["y"] - left["y"]
+                for left, right in zip(page_anchors, page_anchors[1:])
+                if right["y"] > left["y"]
+            ]
+            trailing_span = sorted(gaps)[len(gaps) // 2] if gaps else max(last_y, 1.0)
+            page_height = max(last_y + trailing_span, last_y * 1.05, 1.0)
+
+        anchor_percent = [min(100.0, max(0.0, item["y"] / page_height * 100.0)) for item in page_anchors]
+        boundaries = [0.0]
+        boundaries.extend(
+            (left + right) / 2.0
+            for left, right in zip(anchor_percent, anchor_percent[1:])
+        )
+        boundaries.append(100.0)
+
+        for index, anchor in enumerate(page_anchors):
+            number = anchor["number"]
+            question_id = _source_question_id(question_by_number[number])
+            top = boundaries[index]
+            bottom = boundaries[index + 1]
+            regions.append(
+                {
+                    "id": question_id,
+                    "pageNumber": page_number,
+                    "x": 0.0,
+                    "y": round(top, 6),
+                    "width": 100.0,
+                    "height": round(bottom - top, 6),
+                    "order": number,
+                    "label": f"Q{number}",
+                    "ocrStatus": "completed",
+                    "manualReviewRequired": False,
+                    "layoutSource": "reviewed_ocr_anchor",
+                }
+            )
+    return regions, []
+
+
+def build_question_layout(
+    document: Dict[str, Any],
+    questions: Iterable[Dict[str, Any]],
+    regions_document: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Validate and normalize the reviewed question-to-page layout.
+
+    A question list alone cannot tell the answer mapper where a printed
+    question belongs.  New PCR papers therefore freeze one non-overlapping,
+    page-scoped source region for every immutable question.
+    """
+    question_list = list(questions)
+    errors: List[str] = []
+    question_ids: List[str] = []
+    seen_question_ids: set[str] = set()
+    for position, question in enumerate(question_list, start=1):
+        question_id = _source_question_id(question)
+        if not question_id:
+            continue
+        if question_id in seen_question_ids:
+            errors.append(f"Q {position}: duplicate stable question id {question_id}")
+        seen_question_ids.add(question_id)
+        question_ids.append(question_id)
+
+    raw_regions = list((regions_document or {}).get("regions") or [])
+    if not raw_regions:
+        raw_regions, anchor_errors = _regions_from_reviewed_ocr_anchors(document, question_list)
+        if anchor_errors:
+            return [], anchor_errors
+
+    excluded_pages = {
+        int(page)
+        for page in ((regions_document or {}).get("excluded_pages") or [])
+        if isinstance(page, int) and page > 0
+    }
+    try:
+        page_count = int(document.get("pages_count") or 0)
+    except (TypeError, ValueError):
+        page_count = 0
+
+    normalized_by_id: Dict[str, Dict[str, Any]] = {}
+    seen_orders: set[int] = set()
+    for index, region in enumerate(raw_regions, start=1):
+        region_id = _as_text(region.get("id"))
+        if not region_id:
+            errors.append(f"Region {index}: missing stable region id")
+            continue
+        if region_id in normalized_by_id:
+            errors.append(f"Region {region_id}: duplicate region id")
+            continue
+        try:
+            page_number = int(region.get("pageNumber"))
+            order = int(region.get("order"))
+            x = float(region.get("x"))
+            y = float(region.get("y"))
+            width = float(region.get("width"))
+            height = float(region.get("height"))
+        except (TypeError, ValueError):
+            errors.append(f"Region {region_id}: invalid page, order, or bounding box")
+            continue
+
+        if page_number < 1 or (page_count and page_number > page_count):
+            errors.append(f"Region {region_id}: page {page_number} is outside the source PDF")
+        if page_number in excluded_pages:
+            errors.append(f"Region {region_id}: points to excluded page {page_number}")
+        if order < 1:
+            errors.append(f"Region {region_id}: order must be greater than zero")
+        elif order in seen_orders:
+            errors.append(f"Region {region_id}: duplicate question order {order}")
+        seen_orders.add(order)
+        if x < 0 or y < 0 or width <= 0 or height <= 0:
+            errors.append(f"Region {region_id}: bounding box must have positive in-page dimensions")
+        if x + width > 100.0001 or y + height > 100.0001:
+            errors.append(f"Region {region_id}: bounding box extends beyond the page")
+        if _as_text(region.get("ocrStatus")).lower() != "completed":
+            errors.append(f"Region {region_id}: OCR/review is not complete")
+        if bool(region.get("manualReviewRequired")):
+            errors.append(f"Region {region_id}: resolve its extraction review warning")
+
+        normalized_by_id[region_id] = {
+            "schema_version": PAPER_LAYOUT_SCHEMA_VERSION,
+            "source_question_id": region_id,
+            "source_region_id": region_id,
+            "question_number": order,
+            "page_number": page_number,
+            "bbox_percent": {
+                "x": round(x, 6),
+                "y": round(y, 6),
+                "width": round(width, 6),
+                "height": round(height, 6),
+            },
+            "label": _as_text(region.get("label")) or f"Q{order}",
+            "has_sub_questions": bool(region.get("hasSubQuestions")),
+            "layout_source": _as_text(region.get("layoutSource")) or "manual_region",
+        }
+
+    question_id_set = set(question_ids)
+    region_id_set = set(normalized_by_id)
+    for question_id in sorted(question_id_set - region_id_set):
+        errors.append(f"Question {question_id}: no saved source-page region")
+    for region_id in sorted(region_id_set - question_id_set):
+        errors.append(f"Region {region_id}: has no reviewed question record")
+
+    expected_orders = list(range(1, len(question_list) + 1))
+    actual_orders = sorted(
+        item["question_number"]
+        for region_id, item in normalized_by_id.items()
+        if region_id in question_id_set
+    )
+    if actual_orders != expected_orders:
+        errors.append(
+            "Question region order must be unique and contiguous from 1 to "
+            f"{len(question_list)}"
+        )
+
+    # Any material overlap makes page evidence ownership ambiguous.  Tiny
+    # edge overlaps from drag rounding are tolerated (2% of the smaller box).
+    comparable = [
+        item for key, item in normalized_by_id.items() if key in question_id_set
+    ]
+    for left_index, left in enumerate(comparable):
+        for right in comparable[left_index + 1 :]:
+            if left["page_number"] != right["page_number"]:
+                continue
+            a = left["bbox_percent"]
+            b = right["bbox_percent"]
+            overlap_width = max(0.0, min(a["x"] + a["width"], b["x"] + b["width"]) - max(a["x"], b["x"]))
+            overlap_height = max(0.0, min(a["y"] + a["height"], b["y"] + b["height"]) - max(a["y"], b["y"]))
+            overlap_area = overlap_width * overlap_height
+            smaller_area = min(a["width"] * a["height"], b["width"] * b["height"])
+            if smaller_area > 0 and overlap_area / smaller_area > 0.02:
+                errors.append(
+                    f"Question regions {left['source_region_id']} and "
+                    f"{right['source_region_id']} overlap on page {left['page_number']}"
+                )
+
+    layout = sorted(
+        comparable,
+        key=lambda item: (item["question_number"], item["page_number"]),
+    )
+    return layout, errors
 
 
 def validate_pcr_questions(
@@ -290,6 +600,11 @@ def validate_pcr_questions(
             errors.append(f"Q {label}: missing question text")
         if _question_marks(question) is None:
             errors.append(f"Q {label}: assign marks greater than zero")
+        extraction_metadata = question.get("extraction_metadata")
+        if isinstance(extraction_metadata, dict) and extraction_metadata.get(
+            "manual_review_required"
+        ):
+            errors.append(f"Q {label}: resolve the OCR/layout review warning")
         # A legacy paper still needs free-text marking material. A structured
         # PCR paper instead has a complete teacher-authored criterion plan,
         # so its optional worked solution/notes are helpful context rather
@@ -331,6 +646,8 @@ async def create_paper_snapshot(
     tenant_db: Any,
     document: Dict[str, Any],
     questions: List[Dict[str, Any]],
+    *,
+    question_layout: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Persist one immutable version of a reviewed document.
 
@@ -351,18 +668,22 @@ async def create_paper_snapshot(
         document.get("pcr_marking_policy")
     )
     content_hash = _content_hash(
-        {**document, "pcr_marking_policy": marking_policy}, questions
+        {**document, "pcr_marking_policy": marking_policy},
+        questions,
+        question_layout,
     )
     paper_version_id = f"paper-{document_id}-{content_hash[:16]}"
     versions = tenant_db[PAPER_VERSIONS_COLLECTION]
     paper_questions = tenant_db[PAPER_QUESTIONS_COLLECTION]
     await ensure_indexes(tenant_db)
 
-    existing = await versions.find_one({"paper_version_id": paper_version_id})
-    if existing is not None:
-        return existing
-
     now = datetime.now(timezone.utc)
+    reservation_token = uuid.uuid4().hex
+    layout_by_question = {
+        _as_text(item.get("source_question_id")): copy.deepcopy(item)
+        for item in (question_layout or [])
+        if _as_text(item.get("source_question_id"))
+    }
     question_docs: List[Dict[str, Any]] = []
     for position, question in enumerate(questions, start=1):
         source_question_id = _source_question_id(question)
@@ -387,35 +708,110 @@ async def create_paper_snapshot(
                 "source_question_id": source_question_id,
                 "position": position,
                 "question": clean_question,
+                "layout": layout_by_question.get(source_question_id),
                 "created_at": now,
             }
         )
 
-    inserted_question_ids: List[Any] = []
+    version_doc = {
+        "paper_version_id": paper_version_id,
+        "document_id": document_id,
+        "exam_mode": _as_text(document.get("exam_mode")),
+        "title": _as_text(document.get("title")),
+        "subject": _as_text(document.get("subject")),
+        "admin_id": _as_text(document.get("admin_id")) or None,
+        "teacher_ids": [str(item) for item in (document.get("teacher_ids") or [])],
+        "content_hash": content_hash,
+        "question_count": len(question_docs),
+        "layout_schema_version": PAPER_LAYOUT_SCHEMA_VERSION if question_layout else None,
+        "question_layout": copy.deepcopy(question_layout or []),
+        "layout_status": "verified" if question_layout else "legacy_unverified",
+        "pcr_marking_policy": copy.deepcopy(marking_policy),
+        "created_at": now,
+        "source_document_finalized_at": document.get("exam_finalized_at"),
+        "snapshot_status": "building",
+        "snapshot_reservation_token": reservation_token,
+        "snapshot_reservation_expires_at": now + timedelta(minutes=10),
+    }
+
+    existing = await versions.find_one({"paper_version_id": paper_version_id})
+    if existing is not None and existing.get("snapshot_status") != "building":
+        return existing
+    if existing is not None:
+        expires_at = existing.get("snapshot_reservation_expires_at")
+        if isinstance(expires_at, datetime):
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at > now:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The immutable paper snapshot is already being created",
+                )
+        reclaimed = await versions.update_one(
+            {
+                "paper_version_id": paper_version_id,
+                "snapshot_status": "building",
+                "snapshot_reservation_token": existing.get("snapshot_reservation_token"),
+            },
+            {
+                "$set": {
+                    "snapshot_reservation_token": reservation_token,
+                    "snapshot_reservation_expires_at": now + timedelta(minutes=10),
+                }
+            },
+        )
+        if reclaimed.matched_count != 1:
+            current = await versions.find_one({"paper_version_id": paper_version_id})
+            if current is not None and current.get("snapshot_status") != "building":
+                return current
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The immutable paper snapshot changed while it was being reclaimed",
+            )
+        await paper_questions.delete_many({"paper_version_id": paper_version_id})
+    else:
+        try:
+            await versions.insert_one(version_doc)
+        except DuplicateKeyError:
+            current = await versions.find_one({"paper_version_id": paper_version_id})
+            if current is not None and current.get("snapshot_status") != "building":
+                return current
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The immutable paper snapshot is already being created",
+            )
+
     try:
         if question_docs:
-            result = await paper_questions.insert_many(question_docs, ordered=True)
-            inserted_question_ids = list(result.inserted_ids)
-
-        version_doc = {
-            "paper_version_id": paper_version_id,
-            "document_id": document_id,
-            "exam_mode": _as_text(document.get("exam_mode")),
-            "title": _as_text(document.get("title")),
-            "subject": _as_text(document.get("subject")),
-            "admin_id": _as_text(document.get("admin_id")) or None,
-            "teacher_ids": [str(item) for item in (document.get("teacher_ids") or [])],
-            "content_hash": content_hash,
-            "question_count": len(question_docs),
-            "pcr_marking_policy": copy.deepcopy(marking_policy),
-            "created_at": now,
-            "source_document_finalized_at": document.get("exam_finalized_at"),
-        }
-        await versions.insert_one(version_doc)
-        return version_doc
+            await paper_questions.insert_many(question_docs, ordered=True)
+        ready_at = datetime.now(timezone.utc)
+        committed = await versions.update_one(
+            {
+                "paper_version_id": paper_version_id,
+                "snapshot_status": "building",
+                "snapshot_reservation_token": reservation_token,
+            },
+            {
+                "$set": {"snapshot_status": "ready", "snapshot_ready_at": ready_at},
+                "$unset": {
+                    "snapshot_reservation_token": "",
+                    "snapshot_reservation_expires_at": "",
+                },
+            },
+        )
+        if committed.matched_count != 1:
+            raise RuntimeError("Lost immutable paper snapshot ownership before commit")
+        stored = await versions.find_one({"paper_version_id": paper_version_id})
+        return stored or {**version_doc, "snapshot_status": "ready", "snapshot_ready_at": ready_at}
     except Exception:
-        if inserted_question_ids:
-            await paper_questions.delete_many({"_id": {"$in": inserted_question_ids}})
+        await paper_questions.delete_many({"paper_version_id": paper_version_id})
+        await versions.delete_one(
+            {
+                "paper_version_id": paper_version_id,
+                "snapshot_status": "building",
+                "snapshot_reservation_token": reservation_token,
+            }
+        )
         raise
 
 
@@ -523,6 +919,7 @@ async def snapshot_paper_to_session(
         docs: List[Dict[str, Any]] = []
         for snapshot_question, raw_question in zip(snapshot_questions, raw_questions):
             source_id = _as_text(snapshot_question.get("source_question_id"))
+            question_layout = copy.deepcopy(snapshot_question.get("layout") or {})
             pcr_doc = adapter.adapt_question_to_pcr(
                 raw_question,
                 exam_id=exam_id,
@@ -538,6 +935,10 @@ async def snapshot_paper_to_session(
             pcr_doc["question_number"] = int(snapshot_question.get("position") or 0) or None
             pcr_doc["paper_version_id"] = paper_version["paper_version_id"]
             pcr_doc["immutable"] = True
+            pcr_doc["question_layout"] = question_layout or None
+            pcr_doc["source_page_number"] = question_layout.get("page_number")
+            pcr_doc["source_region_id"] = question_layout.get("source_region_id")
+            pcr_doc["source_bbox_percent"] = question_layout.get("bbox_percent")
             pcr_doc["marking_policy"] = copy.deepcopy(marking_policy)
             pcr_doc["marking_criteria"] = _question_marking_criteria(raw_question)
             if policy_module.is_structured_rubric_policy(marking_policy):

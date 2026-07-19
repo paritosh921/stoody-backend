@@ -37,8 +37,9 @@ async def test_inline_processor_picks_up_durable_queued_job_from_active_tenant()
 
     called: list[str] = []
 
-    async def fake_process(db, job_id: str):
+    async def fake_process(db, job_id: str, *, execution_token: str):
         assert db is tenant_db
+        assert execution_token.startswith("inline:")
         called.append(job_id)
         return {"job_id": job_id, "status": "completed"}
 
@@ -73,7 +74,8 @@ async def test_inline_processor_does_not_schedule_same_job_twice_while_active():
     release = asyncio.Event()
     calls: list[str] = []
 
-    async def slow_process(_db, job_id: str):
+    async def slow_process(_db, job_id: str, *, execution_token: str):
+        assert execution_token.startswith("inline:")
         calls.append(job_id)
         started.set()
         await release.wait()
@@ -96,4 +98,3 @@ async def test_inline_processor_does_not_schedule_same_job_twice_while_active():
         await asyncio.sleep(0)
 
     assert calls == ["JOB-1"]
-

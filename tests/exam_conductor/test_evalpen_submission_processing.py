@@ -350,6 +350,31 @@ async def test_camera_ocr_resolves_private_student_copy_from_s3(monkeypatch):
     assert download.await_args.kwargs["allowed_key_prefix"] == "private/exampen/"
 
 
+@pytest.mark.asyncio
+async def test_camera_ocr_rejects_private_object_with_wrong_ingest_digest(monkeypatch):
+    """A replaced or corrupted storage object must never reach OCR or marking."""
+    import hashlib
+
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+    original_bytes = b"original-answer-copy"
+    monkeypatch.setattr(
+        ocr_service,
+        "download_private_object",
+        AsyncMock(return_value=b"different-answer-copy"),
+    )
+
+    with pytest.raises(
+        ocr_service.AssetIntegrityError,
+        match="integrity verification failed",
+    ):
+        await ocr_service._resolve_image_base64(
+            "s3://stoody-test/private/exampen/student-answer-copies/page-1.png",
+            expected_sha256=hashlib.sha256(original_bytes).hexdigest(),
+        )
+
+
 def test_pen_stroke_renderer_crops_and_upscales_content():
     import base64
     import io
@@ -828,8 +853,8 @@ async def test_process_submission_maps_marker_to_canonical_session_question_id()
 
 
 @pytest.mark.asyncio
-async def test_process_submission_creates_zero_answer_slots_for_unanswered_questions():
-    """One answered question on a 3-question paper must still be scored out of all 3."""
+async def test_process_submission_does_not_invent_unanswered_slots_without_coverage_proof():
+    """Partial pen OCR is unresolved evidence, not proof that Q2/Q3 were blank."""
     from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_submissions_async import process_submission
 
@@ -887,18 +912,15 @@ async def test_process_submission_creates_zero_answer_slots_for_unanswered_quest
         {"submission_id": ingest_result.submission_id}
     ).sort("question_number", 1).to_list(length=10)
 
-    assert result.response_count == 3
-    assert [slot["question_number"] for slot in slots] == [1, 2, 3]
+    assert result.response_count == 1
+    assert [slot["question_number"] for slot in slots] == [1]
     assert slots[0]["is_missing_response"] is False
     assert slots[0]["eval_status"] == "ready"
-    assert [slot["is_missing_response"] for slot in slots[1:]] == [True, True]
-    assert [slot["answer_state"] for slot in slots[1:]] == ["not_attempted", "not_attempted"]
-    assert [slot["eval_status"] for slot in slots[1:]] == ["ready", "ready"]
 
 
 @pytest.mark.asyncio
-async def test_process_submission_content_matches_unmarked_handwritten_answer():
-    """A strong unmarked answer is associated before automatic PCR scoring."""
+async def test_process_submission_routes_unverified_unmarked_copy_to_review():
+    """Lexical similarity alone cannot prove whole-copy question ownership."""
     from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_submissions_async import process_submission
 
@@ -961,14 +983,14 @@ async def test_process_submission_content_matches_unmarked_handwritten_answer():
             db=object(),
         )
 
-    assert result.blocked_count == 0
+    assert result.blocked_count == 1
     stored = await db["evalpen_detected_responses"].find_one(
         {"submission_id": ingest_result.submission_id}
     )
-    assert stored["question_id"] == "EXAM-AUTO-MAP::projectile"
-    assert stored["question_number"] == 1
-    assert stored["question_assignment"]["method"] == "content_match"
-    assert stored["question_assignment"]["score"] >= 8
+    assert stored["question_id"] is None
+    assert stored["question_number"] is None
+    assert stored["question_assignment"]["manual_review_required"] is True
+    assert stored["eval_status"] == "blocked"
 
 
 @pytest.mark.asyncio

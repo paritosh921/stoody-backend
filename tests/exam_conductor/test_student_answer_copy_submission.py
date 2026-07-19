@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import AsyncMock, patch
@@ -365,6 +366,52 @@ async def test_single_final_copy_reservation_blocks_parallel_browser_tabs_but_al
     reservation = await collection.find_one({"attempt_id": "attempt-first"})
     assert reservation["status"] == "receiving"
     assert reservation["upload_attempt_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_crashed_receiving_reservation_expires_and_reuses_the_same_attempt():
+    from api.v1.evalpen_student_submission_async import (
+        _ensure_student_copy_indexes,
+        _reserve_student_copy_attempt,
+        list_answer_copy_options,
+    )
+
+    db = _fresh_db()
+    await _seed_self_submission_exam(db)
+    collection = db["exampen_student_copy_uploads"]
+    await _ensure_student_copy_indexes(collection)
+    await _reserve_student_copy_attempt(
+        collection,
+        attempt_id="attempt-crashed",
+        exam_id="PCR-SELF-1",
+        student_id="student-1",
+        admin_id="admin-1",
+    )
+    expired_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await collection.update_one(
+        {"attempt_id": "attempt-crashed"},
+        {"$set": {"lease_expires_at": expired_at}},
+    )
+
+    with patch(
+        "api.v1.evalpen_student_submission_async._get_tenant_db",
+        return_value=db,
+    ):
+        options = await list_answer_copy_options(current_user=_student_user(), db=None)
+    assert options.items[0].can_submit is True
+
+    retry_attempt = await _reserve_student_copy_attempt(
+        collection,
+        attempt_id="attempt-new-client-request",
+        exam_id="PCR-SELF-1",
+        student_id="student-1",
+        admin_id="admin-1",
+    )
+    assert retry_attempt == "attempt-crashed"
+    reservation = await collection.find_one({"attempt_id": "attempt-crashed"})
+    assert reservation["status"] == "receiving"
+    assert reservation["upload_attempt_count"] == 2
+    assert reservation["lease_expires_at"] > datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

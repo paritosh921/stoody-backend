@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -42,6 +42,7 @@ STUDENT_COPY_UPLOADS_COLLECTION = "exampen_student_copy_uploads"
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 ALLOWED_UPLOAD_LIFECYCLE_STATES = {"in_progress", "collection_closed", "uploading"}
 PRIVATE_STUDENT_COPY_S3_PREFIX = "private/exampen/student-answer-copies"
+STUDENT_COPY_RECEIVING_LEASE = timedelta(minutes=15)
 
 
 class StudentCopyStatus(BaseModel):
@@ -273,6 +274,7 @@ async def _reserve_student_copy_attempt(
     can safely retry because no canonical evidence was written.
     """
     now = datetime.now(timezone.utc)
+    lease_expires_at = now + STUDENT_COPY_RECEIVING_LEASE
     try:
         await collection.insert_one(
             {
@@ -283,6 +285,7 @@ async def _reserve_student_copy_attempt(
                 "submitted_by": student_id,
                 "submission_channel": "student_web",
                 "status": "receiving",
+                "lease_expires_at": lease_expires_at,
                 "upload_attempt_count": 1,
                 "created_at": now,
                 "updated_at": now,
@@ -295,25 +298,41 @@ async def _reserve_student_copy_attempt(
 
     existing = await collection.find_one(
         {"exam_id": exam_id, "student_id": student_id},
-        projection={"attempt_id": 1, "status": 1, "submission_id": 1},
+        projection={
+            "attempt_id": 1,
+            "status": 1,
+            "submission_id": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "lease_expires_at": 1,
+        },
+    )
+    existing_status = str((existing or {}).get("status") or "")
+    stale_receiving = existing_status == "receiving" and _receiving_attempt_is_stale(
+        existing,
+        now=now,
     )
     if (
         existing
-        and str(existing.get("status") or "") == "upload_failed"
+        and (existing_status == "upload_failed" or stale_receiving)
         and not existing.get("submission_id")
         and existing.get("attempt_id")
     ):
         existing_attempt_id = str(existing["attempt_id"])
+        retry_filter: Dict[str, Any] = {
+            "attempt_id": existing_attempt_id,
+            "status": existing_status,
+            "submission_id": {"$exists": False},
+        }
+        if stale_receiving:
+            retry_filter["updated_at"] = existing.get("updated_at")
         retry = await collection.update_one(
-            {
-                "attempt_id": existing_attempt_id,
-                "status": "upload_failed",
-                "submission_id": {"$exists": False},
-            },
+            retry_filter,
             {
                 "$set": {
                     "status": "receiving",
                     "updated_at": now,
+                    "lease_expires_at": lease_expires_at,
                     "last_error": None,
                 },
                 "$inc": {"upload_attempt_count": 1},
@@ -329,6 +348,30 @@ async def _reserve_student_copy_attempt(
     else:
         detail = "An answer-copy submission is already in progress. Please wait before trying again"
     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _receiving_attempt_is_stale(
+    attempt: Optional[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Return whether a crashed pre-ingest upload reservation may be retried."""
+    if not attempt or str(attempt.get("status") or "") != "receiving":
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    lease_expires_at = attempt.get("lease_expires_at")
+    if isinstance(lease_expires_at, datetime):
+        if lease_expires_at.tzinfo is None:
+            lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+        return lease_expires_at <= current
+    updated_at = attempt.get("updated_at") or attempt.get("created_at")
+    if not isinstance(updated_at, datetime):
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return updated_at <= current - STUDENT_COPY_RECEIVING_LEASE
 
 
 async def _mark_attempt_upload_failed(
@@ -382,6 +425,33 @@ def _student_upload_availability(exam: Dict[str, Any], student_id: str) -> tuple
     return True, None
 
 
+def _student_copy_status_from_records(
+    submission: Optional[Dict[str, Any]],
+    job: Optional[Dict[str, Any]] = None,
+) -> StudentCopyStatus:
+    """Build the student-safe status from records already fetched by a caller."""
+    if submission is None:
+        return StudentCopyStatus()
+
+    submission_id = str(submission.get("submission_id") or "")
+    processing_status = str((job or {}).get("status") or "") or None
+    publication_status = str(submission.get("publication_status") or "") or None
+    if publication_status == "published":
+        overall_status = "published"
+    elif processing_status:
+        overall_status = processing_status
+    else:
+        overall_status = str(submission.get("segmentation_status") or "submitted")
+    return StudentCopyStatus(
+        submission_id=submission_id or None,
+        status=overall_status,
+        page_count=int(submission.get("page_count") or 0),
+        submitted_at=_fmt(submission.get("submitted_at")),
+        processing_status=processing_status,
+        publication_status=publication_status,
+    )
+
+
 async def _get_submission_status(
     tenant_db: Any,
     *,
@@ -406,22 +476,7 @@ async def _get_submission_status(
         {"submission_id": submission_id},
         projection={"status": 1},
     )
-    processing_status = str((job or {}).get("status") or "") or None
-    publication_status = str(submission.get("publication_status") or "") or None
-    if publication_status == "published":
-        overall_status = "published"
-    elif processing_status:
-        overall_status = processing_status
-    else:
-        overall_status = str(submission.get("segmentation_status") or "submitted")
-    return StudentCopyStatus(
-        submission_id=submission_id or None,
-        status=overall_status,
-        page_count=int(submission.get("page_count") or 0),
-        submitted_at=_fmt(submission.get("submitted_at")),
-        processing_status=processing_status,
-        publication_status=publication_status,
-    )
+    return _student_copy_status_from_records(submission, job)
 
 
 async def _get_copy_attempt_state(
@@ -433,7 +488,13 @@ async def _get_copy_attempt_state(
     """Read the non-canonical reservation only when no submission exists."""
     return await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION].find_one(
         {"exam_id": exam_id, "student_id": student_id},
-        projection={"status": 1, "created_at": 1, "updated_at": 1, "page_count": 1},
+        projection={
+            "status": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "lease_expires_at": 1,
+            "page_count": 1,
+        },
     )
 
 
@@ -578,34 +639,59 @@ async def _prepare_pdf_pages(
         clean_pdf.bytes,
         max_pages=max_pages,
     )
+    # S3 writes are network-bound. Serial page uploads made a four-page copy
+    # take more than a minute before the browser received its acknowledgement.
+    # A small bound keeps memory/network pressure predictable for large papers.
+    upload_slots = asyncio.Semaphore(4)
+
+    async def _store_page(
+        page_number: int,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+    ) -> Dict[str, Any]:
+        async with upload_slots:
+            storage_path = await _store_student_copy_object(
+                data=image_bytes,
+                db_name=db_name,
+                exam_id=exam_id,
+                attempt_id=attempt_id,
+                filename=f"page-{page_number}.png",
+                content_type="image/png",
+                artifact_kind="rendered_page",
+                page_number=page_number,
+            )
+        return {
+            "page_number": page_number,
+            "raw_image_ref": storage_path,
+            "image_width_px": width,
+            "image_height_px": height,
+            "original_filename": clean_pdf.original_filename,
+            "upload_id": clean_pdf.upload_id,
+            "content_hash": hashlib.sha256(image_bytes).hexdigest(),
+            "storage_path": storage_path,
+            "content_type": "image/png",
+            "file_size_bytes": len(image_bytes),
+        }
+
+    results = await asyncio.gather(
+        *(
+            _store_page(page_number, image_bytes, width, height)
+            for page_number, (image_bytes, width, height) in enumerate(rendered, start=1)
+        ),
+        return_exceptions=True,
+    )
     pages: List[Dict[str, Any]] = []
-    for page_number, (image_bytes, width, height) in enumerate(rendered, start=1):
-        storage_path = await _store_student_copy_object(
-            data=image_bytes,
-            db_name=db_name,
-            exam_id=exam_id,
-            attempt_id=attempt_id,
-            filename=f"page-{page_number}.png",
-            content_type="image/png",
-            artifact_kind="rendered_page",
-            page_number=page_number,
-        )
-        uploaded_storage_paths.append(storage_path)
-        pages.append(
-            {
-                "page_number": page_number,
-                "raw_image_ref": storage_path,
-                "image_width_px": width,
-                "image_height_px": height,
-                "original_filename": clean_pdf.original_filename,
-                "upload_id": clean_pdf.upload_id,
-                "content_hash": hashlib.sha256(image_bytes).hexdigest(),
-                "storage_path": storage_path,
-                "content_type": "image/png",
-                "file_size_bytes": len(image_bytes),
-            }
-        )
-    return pages
+    first_error: Optional[BaseException] = None
+    for result in results:
+        if isinstance(result, BaseException):
+            first_error = first_error or result
+            continue
+        uploaded_storage_paths.append(str(result["storage_path"]))
+        pages.append(result)
+    if first_error is not None:
+        raise first_error
+    return sorted(pages, key=lambda page: int(page["page_number"]))
 
 
 async def _secure_student_copy_pages(
@@ -821,25 +907,96 @@ async def list_answer_copy_options(
     ).sort("created_at", -1)
     exams = await cursor.to_list(length=100)
 
+    # Fetch status data in fixed-size batches. The previous implementation ran
+    # two extra Mongo queries for every exam, so the 5-second student poll could
+    # exceed its client timeout as the exam history grew.
+    exam_ids = [str(exam.get("exam_id") or "") for exam in exams if exam.get("exam_id")]
+    submissions = (
+        await tenant_db["evalpen_submissions"]
+        .find(
+            {"exam_id": {"$in": exam_ids}, "student_id": student_id},
+            projection={
+                "exam_id": 1,
+                "submission_id": 1,
+                "page_count": 1,
+                "submitted_at": 1,
+                "segmentation_status": 1,
+                "publication_status": 1,
+            },
+        )
+        .to_list(length=max(1, len(exam_ids)))
+        if exam_ids
+        else []
+    )
+    submission_by_exam = {
+        str(item.get("exam_id") or ""): item
+        for item in submissions
+        if item.get("exam_id")
+    }
+    submission_ids = [
+        str(item.get("submission_id") or "")
+        for item in submissions
+        if item.get("submission_id")
+    ]
+    jobs = (
+        await tenant_db[PROCESSING_JOBS_COLLECTION]
+        .find(
+            {"submission_id": {"$in": submission_ids}},
+            projection={"submission_id": 1, "status": 1, "updated_at": 1, "created_at": 1},
+        )
+        .sort("updated_at", -1)
+        .to_list(length=max(1, len(submission_ids) * 5))
+        if submission_ids
+        else []
+    )
+    job_by_submission: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        submission_id = str(job.get("submission_id") or "")
+        if submission_id and submission_id not in job_by_submission:
+            job_by_submission[submission_id] = job
+    attempts = (
+        await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION]
+        .find(
+            {"exam_id": {"$in": exam_ids}, "student_id": student_id},
+            projection={
+                "exam_id": 1,
+                "status": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "lease_expires_at": 1,
+                "page_count": 1,
+            },
+        )
+        .to_list(length=max(1, len(exam_ids)))
+        if exam_ids
+        else []
+    )
+    attempt_by_exam = {
+        str(item.get("exam_id") or ""): item
+        for item in attempts
+        if item.get("exam_id")
+    }
+
     items: List[StudentCopyExamOption] = []
     for exam in exams:
+        exam_id = str(exam.get("exam_id") or "")
         can_submit, unavailable_reason = _student_upload_availability(exam, student_id)
-        submission = await _get_submission_status(
-            tenant_db,
-            exam_id=str(exam.get("exam_id") or ""),
-            student_id=student_id,
+        submission_record = submission_by_exam.get(exam_id)
+        submission_id = str((submission_record or {}).get("submission_id") or "")
+        submission = _student_copy_status_from_records(
+            submission_record,
+            job_by_submission.get(submission_id),
         )
         if submission.submission_id:
             can_submit = False
             unavailable_reason = "Your final answer copy has already been submitted"
         else:
-            attempt = await _get_copy_attempt_state(
-                tenant_db,
-                exam_id=str(exam.get("exam_id") or ""),
-                student_id=student_id,
-            )
+            attempt = attempt_by_exam.get(exam_id)
             attempt_status = str((attempt or {}).get("status") or "")
-            if attempt_status in {"receiving", "received"}:
+            if attempt_status == "receiving" and _receiving_attempt_is_stale(attempt):
+                can_submit = True
+                unavailable_reason = None
+            elif attempt_status in {"receiving", "received"}:
                 can_submit = False
                 unavailable_reason = "Your answer copy is still being prepared. Please wait before trying again"
             elif attempt_status == "ingest_failed":
@@ -847,7 +1004,7 @@ async def list_answer_copy_options(
                 unavailable_reason = "Your copy needs teacher support before another final copy can be submitted"
         items.append(
             StudentCopyExamOption(
-                exam_id=str(exam.get("exam_id") or ""),
+                exam_id=exam_id,
                 title=str(exam.get("title") or "PCR exam"),
                 lifecycle_state=str(exam.get("lifecycle_state") or "draft"),
                 max_pages=int(exam.get("student_submission_max_pages") or 20),

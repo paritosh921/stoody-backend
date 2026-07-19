@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _canonicalize(obj: Any) -> str:
@@ -35,12 +39,14 @@ def compute_page_hash(
     page_number: int,
     raw_strokes: Optional[List[Dict[str, Any]]] = None,
     raw_image_ref: Optional[str] = None,
+    asset_sha256: Optional[str] = None,
 ) -> str:
     """Compute SHA-256 hex digest for a single answer page.
 
     For pen-originated pages the hash covers the canonical stroke vectors.
-    For camera-originated pages the hash covers the image asset reference
-    (the actual image bytes are integrity-checked at the storage layer).
+    For camera-originated pages the preferred input is the SHA-256 digest of
+    the actual image bytes.  ``raw_image_ref`` remains a legacy fallback for
+    older capture clients that cannot yet provide a byte commitment.
 
     Parameters
     ----------
@@ -50,6 +56,8 @@ def compute_page_hash(
         Canonical stroke vector list (pen path).
     raw_image_ref:
         Opaque reference to a camera/scan image asset.
+    asset_sha256:
+        Lowercase SHA-256 digest of the actual immutable image bytes.
 
     Returns
     -------
@@ -63,7 +71,15 @@ def compute_page_hash(
         h.update(b"strokes:")
         h.update(_canonicalize(raw_strokes).encode("utf-8"))
 
-    if raw_image_ref is not None:
+    normalized_asset_hash = str(asset_sha256 or "").strip().lower()
+    if normalized_asset_hash:
+        if not _SHA256_RE.fullmatch(normalized_asset_hash):
+            raise ValueError("asset_sha256 must be a 64-character hexadecimal SHA-256 digest")
+        h.update(b"image_sha256:")
+        h.update(normalized_asset_hash.encode("ascii"))
+    elif raw_image_ref is not None:
+        # Backward compatibility only. New camera/PDF paths must pass the
+        # scanner/object checksum so a mutable path cannot stand in for bytes.
         h.update(b"image_ref:")
         h.update(raw_image_ref.encode("utf-8"))
 

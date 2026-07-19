@@ -563,13 +563,17 @@ async def review_flagged_response(
         # Tutor scoping: verify this response's student is visible.
         # Try student_id on the response first, fall back to submission lookup.
         _resp_student_id = response_doc.get("student_id")
-        if not _resp_student_id:
-            _sub_lookup = await tenant_db["evalpen_submissions"].find_one(
-                {"submission_id": response_doc.get("submission_id", "")},
-                projection={"student_id": 1},
-            )
-            _resp_student_id = (
-                _sub_lookup.get("student_id") if _sub_lookup else None
+        _sub_lookup = await tenant_db["evalpen_submissions"].find_one(
+            {"submission_id": response_doc.get("submission_id", "")},
+            projection={"student_id": 1, "publication_status": 1},
+        )
+        _resp_student_id = _resp_student_id or (
+            _sub_lookup.get("student_id") if _sub_lookup else None
+        )
+        if (_sub_lookup or {}).get("publication_status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Published results are immutable; create a formal result revision instead",
             )
         if _resp_student_id:
             _check_student_in_scope(_resp_student_id, scoped_ids)
@@ -597,6 +601,13 @@ async def review_flagged_response(
         old_eval_status = response_doc.get("eval_status", "blocked")
 
         if body.action == "accept":
+            if not str(response_doc.get("question_id") or ""):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Assign this evidence to an immutable question before accepting it"
+                    ),
+                )
             # Resolve all unresolved blocking flags
             for flag in unresolved_blocking:
                 flag_id = flag.get("flag_id", "")
@@ -684,6 +695,12 @@ async def review_flagged_response(
             }
 
         elif body.action == "manual_score":
+            question_id = str(response_doc.get("question_id") or "")
+            if not question_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Assign this evidence to a question before entering a manual score",
+                )
             # Validate required fields for manual scoring
             if body.manual_score is None:
                 raise HTTPException(
@@ -695,7 +712,30 @@ async def review_flagged_response(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="manual_max_score is required when action=manual_score",
                 )
-            if body.manual_score > body.manual_max_score:
+            question = await tenant_db["evalpen_questions"].find_one(
+                {"question_id": question_id},
+                {"max_marks": 1},
+            )
+            if question is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The response question is not part of the immutable paper",
+                )
+            immutable_max = float(question.get("max_marks") or 0.0)
+            if immutable_max <= 0:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The immutable question maximum is invalid",
+                )
+            if abs(float(body.manual_max_score) - immutable_max) > 0.01:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"manual_max_score must match the immutable question maximum "
+                        f"({immutable_max:g})"
+                    ),
+                )
+            if body.manual_score > immutable_max:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
@@ -739,8 +779,22 @@ async def review_flagged_response(
                     reason=f"Manual score from flagged review: {body.reason}",
                 )
 
+                await tenant_db["evalpen_evaluations"].update_one(
+                    {"evaluation_id": evaluation_id},
+                    {
+                        "$set": {
+                            "max_score": immutable_max,
+                            "scoreable_max": immutable_max,
+                            "manual_review_required": False,
+                            "teacher_reviewed": True,
+                            "teacher_reviewed_at": now,
+                            "teacher_reviewed_by": actor_id,
+                        }
+                    },
+                )
+
                 await resp_repo.update_eval_status(
-                    response_id, "manual_review"
+                    response_id, "evaluated_teacher_reviewed"
                 )
 
                 return {
@@ -749,9 +803,9 @@ async def review_flagged_response(
                     "evaluation_id": evaluation_id,
                     "previous_score": old_score,
                     "new_score": body.manual_score,
-                    "max_score": body.manual_max_score,
+                    "max_score": immutable_max,
                     "previous_eval_status": old_eval_status,
-                    "new_eval_status": "manual_review",
+                    "new_eval_status": "evaluated_teacher_reviewed",
                     "reviewed_by": actor_id,
                     "reviewed_at": now.isoformat(),
                 }
@@ -763,18 +817,22 @@ async def review_flagged_response(
                 eval_doc = {
                     "evaluation_id": evaluation_id,
                     "response_id": response_id,
-                    "question_id": response_doc.get("question_id", ""),
+                    "question_id": question_id,
                     "student_id": response_doc.get("student_id", ""),
                     "eval_path": "manual_teacher_review",
                     "model_used": None,
                     "total_score": body.manual_score,
-                    "max_score": body.manual_max_score,
-                    "scoreable_max": body.manual_max_score,
+                    "max_score": immutable_max,
+                    "scoreable_max": immutable_max,
                     "step_marks": [],
                     "overall_feedback": f"Manually scored by teacher: {body.reason}",
                     "reference_solution": None,
                     "token_usage": None,
                     "raw_llm_response": None,
+                    "manual_review_required": False,
+                    "teacher_reviewed": True,
+                    "teacher_reviewed_at": now,
+                    "teacher_reviewed_by": actor_id,
                     "audit_trail": [
                         {
                             "actor_id": actor_id,
@@ -783,7 +841,7 @@ async def review_flagged_response(
                             "before": None,
                             "after": {
                                 "total_score": body.manual_score,
-                                "max_score": body.manual_max_score,
+                                "max_score": immutable_max,
                             },
                             "reason": body.reason,
                         }
@@ -793,7 +851,7 @@ async def review_flagged_response(
 
                 await eval_repo.insert_evaluation(eval_doc)
                 await resp_repo.update_eval_status(
-                    response_id, "manual_review"
+                    response_id, "evaluated_teacher_reviewed"
                 )
 
                 logger.info(
@@ -803,7 +861,7 @@ async def review_flagged_response(
                     response_id,
                     actor_id,
                     body.manual_score,
-                    body.manual_max_score,
+                    immutable_max,
                 )
 
                 return {
@@ -812,9 +870,9 @@ async def review_flagged_response(
                     "evaluation_id": evaluation_id,
                     "previous_score": None,
                     "new_score": body.manual_score,
-                    "max_score": body.manual_max_score,
+                    "max_score": immutable_max,
                     "previous_eval_status": old_eval_status,
-                    "new_eval_status": "manual_review",
+                    "new_eval_status": "evaluated_teacher_reviewed",
                     "reviewed_by": actor_id,
                     "reviewed_at": now.isoformat(),
                 }

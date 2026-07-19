@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from time import monotonic
 from typing import Any
 
@@ -160,14 +161,24 @@ class InlinePCRProcessor:
 
     async def _process_job(self, key: str, tenant_db: Any, job_id: str) -> None:
         async with self._semaphore:
+            execution_token = f"inline:{uuid.uuid4().hex}"
             try:
-                await process_pcr_processing_job(tenant_db, job_id)
+                await process_pcr_processing_job(
+                    tenant_db,
+                    job_id,
+                    execution_token=execution_token,
+                )
                 self._retry_not_before.pop(key, None)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Inline PCR processing failed for job %s", job_id)
                 try:
-                    await mark_processing_job_retryable_error(tenant_db, job_id, exc)
+                    await mark_processing_job_retryable_error(
+                        tenant_db,
+                        job_id,
+                        exc,
+                        expected_lease_token=execution_token,
+                    )
                 finally:
                     self._retry_not_before[key] = monotonic() + self._retry_delay_seconds

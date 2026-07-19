@@ -47,6 +47,22 @@ class GateRequest(BaseModel):
     prompt: str = Field(..., description="The prompt text (system+user combined or user-only).  May be empty for pure vision calls when messages is provided.")
     caller_id: str = Field(..., description="Registered caller identity")
     messages: Optional[List[Dict[str, Any]]] = Field(None, description="Pre-built messages array for multimodal/vision calls.  When provided, prompt is ignored for the LLM call.")
+    responses_input: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "OpenAI Responses API input. Supports native input_file and "
+            "input_image parts. Mutually exclusive with messages."
+        ),
+    )
+    json_schema: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Strict structured-output JSON schema for Responses API calls.",
+    )
+    prompt_cache_key: Optional[str] = Field(
+        None,
+        description="Stable non-PII cache-routing key for repeated prompt prefixes.",
+    )
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high"]] = None
     max_output_tokens: Optional[int] = Field(None, ge=1, description="Override for max output tokens")
     temperature: Optional[float] = Field(None, ge=0.0, le=2.0, description="Temperature override (where allowed)")
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Opaque metadata forwarded to logs")

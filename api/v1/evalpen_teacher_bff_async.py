@@ -42,6 +42,10 @@ from api.v1.exam_orch_async import (
     _is_tutor_admin_role,
 )
 from utils.tutor_scoping import get_tutor_scoped_students
+from services.exampen_submission_readiness import (
+    assess_submissions_readiness,
+    readiness_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,8 @@ class QueueItem(BaseModel):
     submission_id: str
     student_id: str
     response_count: int = 0
+    page_count: int = 0
+    source: Optional[str] = None
     status_summary: str = ""
     has_dcr_results: bool = False
     # PCR copy-upload jobs are durable and may still be queued before OCR
@@ -462,6 +468,8 @@ async def list_exams(
                 "exam_id": 1,
                 "student_id": 1,
                 "publication_status": 1,
+                "page_count": 1,
+                "source": 1,
             },
         )
         submissions = await submissions_cursor.to_list(length=5000)
@@ -501,6 +509,7 @@ async def list_exams(
             {
                 "submission_id": {"$in": all_sub_ids},
                 "eval_status": {"$ne": "superseded"},
+                "superseded_at": {"$exists": False},
             },
             projection={
                 "response_id": 1,
@@ -752,6 +761,8 @@ async def get_exam_queue(
                 "submission_id": 1,
                 "student_id": 1,
                 "publication_status": 1,
+                "page_count": 1,
+                "source": 1,
             },
         )
         submissions = await submissions_cursor.to_list(length=5000)
@@ -761,10 +772,24 @@ async def get_exam_queue(
 
         # ----- Fetch all responses for these submissions -----
         sub_ids = [str(s.get("submission_id") or "") for s in submissions]
+        page_counts_by_submission: Dict[str, int] = {}
+        page_count_cursor = tenant_db["evalpen_answer_pages"].aggregate(
+            [
+                {"$match": {"submission_id": {"$in": sub_ids}}},
+                {"$group": {"_id": "$submission_id", "count": {"$sum": 1}}},
+            ]
+        )
+        for row in await page_count_cursor.to_list(length=max(len(sub_ids), 1)):
+            row_submission_id = str(row.get("_id") or "")
+            if row_submission_id:
+                page_counts_by_submission[row_submission_id] = max(
+                    0, int(row.get("count") or 0)
+                )
         resp_cursor = tenant_db["evalpen_detected_responses"].find(
             {
                 "submission_id": {"$in": sub_ids},
                 "eval_status": {"$ne": "superseded"},
+                "superseded_at": {"$exists": False},
             },
             projection={
                 "response_id": 1,
@@ -817,6 +842,15 @@ async def get_exam_queue(
             dcr_student_docs = await dcr_cursor.to_list(length=5000)
             dcr_student_ids = {d["_id"] for d in dcr_student_docs}
 
+        pcr_question_count = await tenant_db["evalpen_questions"].count_documents(
+            {"exam_id": exam_id}, limit=1
+        )
+        readiness_by_submission = (
+            await assess_submissions_readiness(tenant_db, sub_ids)
+            if pcr_question_count > 0
+            else {}
+        )
+
         # ----- Bucket each submission -----
         pending_items: List[QueueItem] = []
         blocked_items: List[QueueItem] = []
@@ -828,6 +862,11 @@ async def get_exam_queue(
             pub_status = sub.get("publication_status")
             sub_responses = responses_by_sub.get(sub_id, [])
             response_count = len(sub_responses)
+            page_count = max(
+                max(0, int(sub.get("page_count") or 0)),
+                page_counts_by_submission.get(sub_id, 0),
+            )
+            submission_source = str(sub.get("source") or "") or None
             processing_job = jobs_by_sub.get(sub_id)
             processing_status = (
                 str(processing_job.get("status") or "")
@@ -843,6 +882,33 @@ async def get_exam_queue(
             # DCR completeness for this student
             student_has_dcr = student_id in dcr_student_ids
             dcr_complete = not exam_has_dcr or student_has_dcr
+
+            if pcr_question_count > 0:
+                readiness = readiness_by_submission.get(
+                    sub_id,
+                    {
+                        "ready": False,
+                        "blockers": [
+                            {
+                                "code": "readiness_missing",
+                                "message": "Submission readiness could not be determined",
+                            }
+                        ],
+                    },
+                )
+            elif exam_has_dcr:
+                readiness = {"ready": True, "blockers": []}
+            else:
+                readiness = {
+                    "ready": False,
+                    "blockers": [
+                        {
+                            "code": "paper_catalog_missing",
+                            "message": "PCR paper questions are not available yet",
+                        }
+                    ],
+                }
+            pcr_ready = bool(readiness.get("ready"))
 
             # Determine blocking status
             has_unresolved_blocking = False
@@ -865,9 +931,7 @@ async def get_exam_queue(
                 for r in sub_responses
                 if r.get("eval_status", "pending") == "pending"
             )
-            pcr_all_evaluated = (
-                response_count > 0 and pending_responses == 0
-            )
+            pcr_all_evaluated = pcr_ready
 
             # Fully evaluated = PCR done AND DCR done (if applicable)
             all_evaluated = pcr_all_evaluated and dcr_complete
@@ -880,13 +944,18 @@ async def get_exam_queue(
             }
 
             # Bucket logic
-            if has_unresolved_blocking or job_needs_attention:
+            if has_unresolved_blocking or job_needs_attention or (
+                not pcr_ready
+                and processing_status not in {"queued", "processing", None}
+            ):
                 if has_unresolved_blocking:
                     blocked_summary = f"{unresolved_count} unresolved blocking flag(s)"
                 elif processing_status == "blocked_for_review":
                     blocked_summary = "AI checking needs teacher review"
                 elif processing_status == "failed":
                     blocked_summary = "AI checking failed"
+                elif not pcr_ready:
+                    blocked_summary = readiness_message(readiness)
                 else:
                     blocked_summary = "AI checking needs a retry"
                 blocked_items.append(
@@ -894,6 +963,8 @@ async def get_exam_queue(
                         submission_id=sub_id,
                         student_id=student_id,
                         response_count=response_count,
+                        page_count=page_count,
+                        source=submission_source,
                         status_summary=blocked_summary,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
@@ -923,6 +994,8 @@ async def get_exam_queue(
                         submission_id=sub_id,
                         student_id=student_id,
                         response_count=response_count,
+                        page_count=page_count,
+                        source=submission_source,
                         status_summary=status_msg,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
@@ -935,6 +1008,8 @@ async def get_exam_queue(
                         submission_id=sub_id,
                         student_id=student_id,
                         response_count=response_count,
+                        page_count=page_count,
+                        source=submission_source,
                         status_summary="Fully evaluated, ready to publish",
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,

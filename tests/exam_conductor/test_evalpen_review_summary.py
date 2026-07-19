@@ -105,8 +105,8 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
 
 
 @pytest.mark.asyncio
-async def test_review_summary_keeps_full_paper_denominator_and_shows_blank_questions():
-    """Historical partial OCR records must never turn a 12-mark paper into 4/4."""
+async def test_review_summary_keeps_full_denominator_but_blocks_unproven_blanks():
+    """Historical missing rows remain unresolved instead of becoming false zeros."""
     from api.v1.evalpen_review_async import get_submission_summary
 
     db = _fresh_db()
@@ -167,11 +167,12 @@ async def test_review_summary_keeps_full_paper_denominator_and_shows_blank_quest
 
     assert result.total_score == 4.0
     assert result.total_max_score == 12.0
-    assert result.score_state == "available"
-    assert result.evaluated_count == 3
+    assert result.score_state == "processing"
+    assert result.evaluated_count == 1
+    assert result.blocked_count == 2
     assert [response.question_number for response in result.responses] == [1, 2, 3]
-    assert [response.is_missing_response for response in result.responses] == [False, True, True]
-    assert [response.total_score for response in result.responses[1:]] == [0.0, 0.0]
+    assert [response.answer_state for response in result.responses] == [None, "unresolved", "unresolved"]
+    assert [response.total_score for response in result.responses[1:]] == [None, None]
     assert [response.max_score for response in result.responses[1:]] == [4.0, 4.0]
 
 
@@ -287,6 +288,177 @@ async def test_failed_ocr_does_not_look_like_a_zero_mark_blank_paper():
 
 
 @pytest.mark.asyncio
+async def test_review_summary_keeps_unassigned_evidence_out_of_question_navigator():
+    """An extra OCR segment must not become a fake twelfth paper question."""
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-ELEVEN",
+            "exam_id": "EXAM-ELEVEN",
+            "student_id": "STU-1",
+            "segmentation_status": "complete",
+        }
+    )
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-ELEVEN::Q-{number}",
+                "exam_id": "EXAM-ELEVEN",
+                "question_number": number,
+                "question_text": f"Question {number}",
+                "max_marks": 1,
+            }
+            for number in range(1, 12)
+        ]
+    )
+    await db["evalpen_detected_responses"].insert_many(
+        [
+            {
+                "response_id": "RESP-Q1",
+                "submission_id": "SUB-ELEVEN",
+                "question_id": "EXAM-ELEVEN::Q-1",
+                "question_number": 1,
+                "detected_text": "Answer one",
+                "eval_status": "evaluated",
+                "flags": [],
+            },
+            {
+                "response_id": "RESP-EXTRA",
+                "submission_id": "SUB-ELEVEN",
+                "question_id": "EXAM-ELEVEN::Q-12",
+                "question_number": 12,
+                "detected_text": "Unmapped working from the margin",
+                "source_pages": [
+                    {"page_number": 4, "y_start": 120, "y_end": 260}
+                ],
+                "eval_status": "blocked",
+                "flags": [],
+            },
+        ]
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-Q1",
+            "response_id": "RESP-Q1",
+            "question_id": "EXAM-ELEVEN::Q-1",
+            "total_score": 1,
+            "max_score": 1,
+        }
+    )
+    await db["evalpen_answer_pages"].insert_many(
+        [
+            {
+                "page_id": f"PAGE-{number}",
+                "submission_id": "SUB-ELEVEN",
+                "page_number": number,
+            }
+            for number in range(1, 5)
+        ]
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-ELEVEN",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert len(result.question_catalog) == 11
+    assert len(result.responses) == 11
+    assert {item.question_number for item in result.responses} == set(range(1, 12))
+    assert len(result.unassigned_responses) == 1
+    assert result.unassigned_responses[0].response_id == "RESP-EXTRA"
+    assert result.unassigned_responses[0].question_number == 12
+    assert result.total_max_score == 11
+    assert result.page_count == 4
+    assert result.score_state == "processing"
+
+
+@pytest.mark.asyncio
+async def test_exam_results_exclude_fake_questions_and_use_the_paper_denominator():
+    from api.v1.evalpen_review_async import get_exam_results
+
+    db = _fresh_db()
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-RESULTS::Q-{number}",
+                "exam_id": "EXAM-RESULTS",
+                "question_number": number,
+                "max_marks": 2,
+            }
+            for number in (1, 2)
+        ]
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-RESULTS",
+            "exam_id": "EXAM-RESULTS",
+            "student_id": "STU-1",
+        }
+    )
+    await db["evalpen_detected_responses"].insert_many(
+        [
+            {
+                "response_id": "RESP-RESULTS-Q1",
+                "submission_id": "SUB-RESULTS",
+                "question_id": "EXAM-RESULTS::Q-1",
+                "eval_status": "evaluated",
+            },
+            {
+                "response_id": "RESP-RESULTS-FAKE-Q3",
+                "submission_id": "SUB-RESULTS",
+                "question_id": "EXAM-RESULTS::Q-3",
+                "eval_status": "evaluated",
+            },
+        ]
+    )
+    await db["evalpen_evaluations"].insert_many(
+        [
+            {
+                "evaluation_id": "EVAL-RESULTS-Q1",
+                "response_id": "RESP-RESULTS-Q1",
+                "total_score": 1.5,
+                "max_score": 2,
+            },
+            {
+                "evaluation_id": "EVAL-RESULTS-FAKE-Q3",
+                "response_id": "RESP-RESULTS-FAKE-Q3",
+                "total_score": 9,
+                "max_score": 9,
+            },
+        ]
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_exam_results(
+            exam_id="EXAM-RESULTS",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.total_students == 1
+    student = result.students[0]
+    assert student.pcr_total_score == 1.5
+    assert student.pcr_max_score == 4
+    assert student.blocked_responses == 1
+
+
+@pytest.mark.asyncio
 async def test_staff_page_preview_uses_short_lived_private_s3_url():
     from api.v1.evalpen_review_async import get_submission_pages
 
@@ -310,6 +482,18 @@ async def test_staff_page_preview_uses_short_lived_private_s3_url():
             "image_height_px": 1600,
         }
     )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-PREVIEW",
+            "submission_id": "SUB-PREVIEW",
+            "question_id": "EXAM-PREVIEW::Q-3",
+            "question_number": 3,
+            "source_pages": [
+                {"page_number": 1, "y_start": 240, "y_end": 620}
+            ],
+            "eval_status": "evaluated",
+        }
+    )
 
     with (
         patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
@@ -331,6 +515,17 @@ async def test_staff_page_preview_uses_short_lived_private_s3_url():
     assert result.total_pages == 1
     assert result.pages[0].image_url == "https://private.test/signed-preview"
     assert result.pages[0].width == 1200
+    assert result.pages[0].regions == [
+        {
+            "page_number": 1,
+            "y_start": 240,
+            "y_end": 620,
+            "response_id": "RESP-PREVIEW",
+            "question_id": "EXAM-PREVIEW::Q-3",
+            "question_number": 3,
+            "answer_state": None,
+        }
+    ]
     assert presign.call_count == 1
     assert presign.call_args.kwargs["allowed_key_prefix"] == "private/exampen/"
 

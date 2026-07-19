@@ -47,7 +47,11 @@ from llm_gate.models import (
 )
 from llm_gate.budget import BudgetChecker
 from llm_gate.gate import LLMGate
-from llm_gate.provider import ProviderResponse
+from llm_gate.provider import (
+    ProviderResponse,
+    _call_openai_responses,
+    estimate_tokens_for_messages,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +479,110 @@ class TestIGate02:
 
             assert response.usage.caller == "pcr_practice"
         asyncio.run(_run())
+
+
+class TestOpenAIResponsesDocumentInput:
+    """Native file inputs remain inside the shared, usage-metered gate."""
+
+    def test_document_input_estimator_counts_files_and_images_without_base64_text(self):
+        estimated = estimate_tokens_for_messages(
+            "",
+            responses_input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "grade this paper"},
+                        {
+                            "type": "input_file",
+                            "filename": "paper.pdf",
+                            "file_data": "data:application/pdf;base64," + "A" * 100_000,
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64," + "B" * 100_000,
+                        },
+                    ],
+                }
+            ],
+        )
+        assert 11_000 <= estimated < 12_000
+
+    def test_openai_responses_payload_uses_private_structured_file_call(self):
+        class _HTTPResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "model": "gpt-5.1-2025-11-13",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": '{"questions":[]}'},
+                            ],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 2000,
+                        "output_tokens": 50,
+                        "input_tokens_details": {"cached_tokens": 1500},
+                    },
+                }
+
+        class _HTTPClient:
+            def __init__(self):
+                self.payload = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                assert headers["Authorization"] == "Bearer secret"
+                self.payload = json
+                return _HTTPResponse()
+
+        async def _run():
+            client = _HTTPClient()
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=client):
+                result = await _call_openai_responses(
+                    "gpt-5.1-2025-11-13",
+                    responses_input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_file",
+                                    "filename": "paper.pdf",
+                                    "file_data": "data:application/pdf;base64,AAAA",
+                                }
+                            ],
+                        }
+                    ],
+                    json_schema={"type": "object", "properties": {}},
+                    prompt_cache_key="pcr-paper-static",
+                    reasoning_effort="medium",
+                    max_output_tokens=8000,
+                    api_key="secret",
+                )
+            assert client.payload["store"] is False
+            assert client.payload["prompt_cache_key"] == "pcr-paper-static"
+            assert client.payload["text"]["format"]["strict"] is True
+            assert client.payload["input"][0]["content"][0]["type"] == "input_file"
+            assert result.content == '{"questions":[]}'
+            assert result.cache_read_tokens == 1500
+
+        asyncio.run(_run())
+
+
+class TestIGate02UsageLogging:
+    """I-GATE-02: successful PCR calls append one usage record."""
 
     def test_i_gate_02_log_appended_on_success(self):
         """Gate appends a token log entry after a successful call."""

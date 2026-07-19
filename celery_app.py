@@ -161,6 +161,8 @@ def process_exampen_pcr_submission(self, db_name: str, job_id: str) -> dict:
     """Run the durable OCR/segmentation/evaluation workflow for one PCR copy."""
     from core.database import DatabaseManager
 
+    execution_token = f"celery:{self.request.id}"
+
     async def _run() -> dict:
         db_mgr = DatabaseManager()
         await db_mgr.initialize()
@@ -170,7 +172,11 @@ def process_exampen_pcr_submission(self, db_name: str, job_id: str) -> dict:
 
         from services.exampen_workflow import process_pcr_processing_job
 
-        return await process_pcr_processing_job(tenant_db, job_id)
+        return await process_pcr_processing_job(
+            tenant_db,
+            job_id,
+            execution_token=execution_token,
+        )
 
     async def _record_error(exc: Exception, terminal: bool) -> None:
         try:
@@ -184,9 +190,19 @@ def process_exampen_pcr_submission(self, db_name: str, job_id: str) -> dict:
                 mark_processing_job_retryable_error,
             )
             if terminal:
-                await mark_processing_job_failed(tenant_db, job_id, exc)
+                await mark_processing_job_failed(
+                    tenant_db,
+                    job_id,
+                    exc,
+                    expected_lease_token=execution_token,
+                )
             else:
-                await mark_processing_job_retryable_error(tenant_db, job_id, exc)
+                await mark_processing_job_retryable_error(
+                    tenant_db,
+                    job_id,
+                    exc,
+                    expected_lease_token=execution_token,
+                )
         except Exception:
             logger.exception("Unable to record PCR processing failure for job %s", job_id)
 

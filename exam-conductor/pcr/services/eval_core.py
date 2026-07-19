@@ -36,6 +36,7 @@ Hard constraints: C1 (MongoDB only), C3 (practice untouched),
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import importlib
@@ -464,6 +465,66 @@ class EvalResult:
     error: Optional[str] = None
 
 
+def _deterministic_evaluation_id(response_doc: Dict[str, Any]) -> str:
+    """Return the stable identity for one immutable evaluation input."""
+
+    payload = "\x1f".join(
+        (
+            "eval-input-v1",
+            str(response_doc.get("response_id") or ""),
+            str(response_doc.get("question_id") or ""),
+            str(response_doc.get("mapping_version_id") or "legacy"),
+        )
+    )
+    return f"EVAL-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _result_from_evaluation_doc(doc: Dict[str, Any]) -> EvalResult:
+    """Hydrate an already-persisted result without making another AI call."""
+
+    step_marks = [
+        StepMark(
+            step=str(item.get("step") or ""),
+            marks_awarded=float(item.get("marks_awarded") or 0.0),
+            max_marks=float(item.get("max_marks") or 0.0),
+            rationale=str(item.get("rationale") or ""),
+        )
+        for item in (doc.get("step_marks") or [])
+        if isinstance(item, dict)
+    ]
+    criterion_marks = [
+        CriterionMark(
+            criterion_id=str(item.get("criterion_id") or ""),
+            description=str(item.get("description") or ""),
+            marks_awarded=float(item.get("marks_awarded") or 0.0),
+            max_marks=float(item.get("max_marks") or 0.0),
+            rationale=str(item.get("rationale") or ""),
+            evidence=str(item.get("evidence") or ""),
+        )
+        for item in (doc.get("criterion_marks") or [])
+        if isinstance(item, dict)
+    ]
+    return EvalResult(
+        evaluation_id=str(doc.get("evaluation_id") or ""),
+        response_id=str(doc.get("response_id") or ""),
+        question_id=str(doc.get("question_id") or "") or None,
+        student_id=str(doc.get("student_id") or ""),
+        eval_path=str(doc.get("eval_path") or ""),
+        model_used=str(doc.get("model_used") or ""),
+        total_score=float(doc.get("total_score") or 0.0),
+        max_score=float(doc.get("max_score") or 0.0),
+        scoreable_max=float(doc.get("scoreable_max") or doc.get("max_score") or 0.0),
+        step_marks=step_marks,
+        criterion_marks=criterion_marks,
+        overall_feedback=str(doc.get("overall_feedback") or ""),
+        reference_solution=doc.get("reference_solution"),
+        token_usage=dict(doc.get("token_usage") or {}),
+        raw_llm_response=str(doc.get("raw_llm_response") or ""),
+        marking_policy=dict(doc.get("marking_policy") or {}),
+        manual_review_required=bool(doc.get("manual_review_required")),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Batch result envelope
 # ---------------------------------------------------------------------------
@@ -534,6 +595,8 @@ def _parse_eval_response(raw: str, max_score: float) -> Dict[str, Any]:
                     "max_score": max_score,
                     "overall_feedback": "Evaluation response could not be parsed",
                     "parse_error": True,
+                    "manual_review_required": True,
+                    "validation_errors": ["invalid JSON response"],
                 }
         else:
             logger.warning("No JSON found in LLM eval response")
@@ -543,30 +606,87 @@ def _parse_eval_response(raw: str, max_score: float) -> Dict[str, Any]:
                 "max_score": max_score,
                 "overall_feedback": "Evaluation response could not be parsed",
                 "parse_error": True,
+                "manual_review_required": True,
+                "validation_errors": ["no JSON object in response"],
             }
 
-    # Validate and clamp total_score
-    total_score = float(parsed.get("total_score", 0.0))
-    total_score = max(0.0, min(total_score, max_score))
+    validation_errors: List[str] = []
+    try:
+        raw_total_score = float(parsed.get("total_score", 0.0))
+    except (TypeError, ValueError):
+        raw_total_score = 0.0
+        validation_errors.append("total_score is not numeric")
+    if not math.isfinite(raw_total_score):
+        raw_total_score = 0.0
+        validation_errors.append("total_score is not finite")
+    if raw_total_score < 0.0 or raw_total_score > max_score:
+        validation_errors.append(
+            f"total_score is outside the immutable 0-{max_score:g} range"
+        )
+    total_score = max(0.0, min(raw_total_score, max_score))
+
+    try:
+        reported_max = float(parsed.get("max_score", max_score))
+    except (TypeError, ValueError):
+        reported_max = max_score
+        validation_errors.append("max_score is not numeric")
+    if not math.isfinite(reported_max) or abs(reported_max - max_score) > 0.01:
+        validation_errors.append(
+            "model-reported max_score does not match the immutable question maximum"
+        )
 
     # Parse step marks
     step_marks_raw = parsed.get("step_marks", [])
-    step_marks = []
+    if not isinstance(step_marks_raw, list):
+        step_marks_raw = []
+        validation_errors.append("step_marks must be a list")
+    step_marks: List[Dict[str, Any]] = []
     for sm in step_marks_raw:
-        if isinstance(sm, dict):
-            step_marks.append({
-                "step": sm.get("step", ""),
-                "marks_awarded": float(sm.get("marks_awarded", 0.0)),
-                "max_marks": float(sm.get("max_marks", 0.0)),
-                "rationale": sm.get("rationale", ""),
-            })
+        if not isinstance(sm, dict):
+            validation_errors.append("step mark row is not an object")
+            continue
+        try:
+            awarded = float(sm.get("marks_awarded", 0.0))
+            step_max = float(sm.get("max_marks", 0.0))
+        except (TypeError, ValueError):
+            validation_errors.append("step mark contains a non-numeric mark")
+            continue
+        if (
+            not math.isfinite(awarded)
+            or not math.isfinite(step_max)
+            or step_max < 0
+            or awarded < 0
+            or awarded > step_max + 0.001
+        ):
+            validation_errors.append("step mark is outside its declared bounds")
+            continue
+        rationale = str(sm.get("rationale") or "").strip()
+        if not rationale:
+            validation_errors.append("step mark is missing a rationale")
+        step_marks.append(
+            {
+                "step": str(sm.get("step") or "").strip(),
+                "marks_awarded": round(awarded, 2),
+                "max_marks": round(step_max, 2),
+                "rationale": rationale,
+            }
+        )
+
+    if step_marks:
+        step_total = sum(item["marks_awarded"] for item in step_marks)
+        if abs(step_total - total_score) > 0.01:
+            validation_errors.append(
+                "step mark awards do not add up to total_score"
+            )
 
     return {
         "step_marks": step_marks,
         "total_score": total_score,
-        "max_score": float(parsed.get("max_score", max_score)),
+        "max_score": max_score,
         "overall_feedback": parsed.get("overall_feedback", ""),
-        "parse_error": False,
+        "parse_error": bool(validation_errors),
+        "manual_review_required": bool(validation_errors),
+        "validation_errors": validation_errors,
     }
 
 
@@ -665,13 +785,21 @@ def _parse_criterion_eval_response(
         if not math.isfinite(awarded) or awarded < -0.001 or awarded > maximum + 0.001:
             errors.append(f"criterion {criterion_id} score is outside 0-{maximum:g}")
             continue
+        rationale = str(item.get("rationale") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+        if not rationale:
+            errors.append(f"criterion {criterion_id} is missing a rationale")
+        if awarded > 0.001 and not evidence:
+            errors.append(
+                f"criterion {criterion_id} awards marks without answer evidence"
+            )
         returned[criterion_id] = {
             "criterion_id": criterion_id,
             "description": str(expected[criterion_id].get("description") or ""),
             "marks_awarded": round(max(0.0, min(awarded, maximum)), 2),
             "max_marks": maximum,
-            "rationale": str(item.get("rationale") or "").strip(),
-            "evidence": str(item.get("evidence") or "").strip(),
+            "rationale": rationale,
+            "evidence": evidence,
         }
 
     missing = [criterion_id for criterion_id in expected if criterion_id not in returned]
@@ -718,7 +846,10 @@ def _build_criterion_rubric_prompt(
         vision_block = (
             "\nYou will also receive image(s) of the student's handwritten page. "
             "Images are PRIMARY evidence. Diagrams, Venn diagrams, tables, circled "
-            "answers, constructions, and labelled figures count even if OCR missed them.\n"
+            "answers, constructions, and labelled figures count even if OCR missed them. "
+            "OCR may also contain wrong digits, decimal points, exponents, or minus signs. "
+            "When the image clearly conflicts with OCR, grade the visible image. Set "
+            "needs_review=true instead of guessing when the relevant handwriting is unreadable.\n"
         )
     return f"""You are evaluating one handwritten exam response for {subject}.
 
@@ -876,7 +1007,7 @@ class EvalCore:
         EvalResult
             Complete evaluation result.
         """
-        eval_id = f"EVAL-{uuid.uuid4().hex[:12]}"
+        eval_id = _deterministic_evaluation_id({"response_id": response_id})
 
         # Step 1: Server-side fetch (TAMPER_PROOF_SPEC Layer 2)
         response_doc = await self._responses.get_response(response_id)
@@ -894,6 +1025,8 @@ class EvalCore:
                 response_id=response_id,
                 error=f"Response {response_id} has been superseded",
             )
+
+        eval_id = _deterministic_evaluation_id(response_doc)
 
         resolved_student_id = student_id or response_doc.get("student_id", "")
         stored_question_id = response_doc.get("question_id")
@@ -915,9 +1048,27 @@ class EvalCore:
             )
 
         question_id = stored_question_id
+        get_existing = getattr(self._evals, "get_evaluation_by_response", None)
+        if callable(get_existing):
+            existing_evaluation = await get_existing(response_id)
+            if existing_evaluation is not None:
+                logger.info(
+                    "Evaluation already exists for immutable response %s; returning %s",
+                    response_id,
+                    existing_evaluation.get("evaluation_id"),
+                )
+                return _result_from_evaluation_doc(existing_evaluation)
         detected_text = str(response_doc.get("detected_text", "") or "")
         content_type = response_doc.get("content_type", "TEXT_ONLY")
         flags = response_doc.get("flags", [])
+        assignment = response_doc.get("question_assignment")
+        assignment_review_required = bool(
+            response_doc.get("manual_review_required")
+            or (
+                isinstance(assignment, dict)
+                and assignment.get("manual_review_required")
+            )
+        )
 
         # Strip printed answer-book chrome so form headers are never graded as
         # the student response (production: "Prayaan Answer Book Date Page").
@@ -1074,6 +1225,8 @@ class EvalCore:
             ).hex[:24]
             no_answer_eval_doc: Dict[str, Any] = {
                 "evaluation_id": eval_id,
+                "evaluation_input_version": 1,
+                "mapping_version_id": response_doc.get("mapping_version_id"),
                 "response_id": response_id,
                 "question_id": question_id,
                 "student_id": resolved_student_id,
@@ -1174,6 +1327,7 @@ class EvalCore:
             build_vision_eval_messages,
             load_answer_page_docs,
             needs_vision_evaluation,
+            requires_transcription_verification,
         )
 
         answer_pages: List[Dict[str, Any]] = []
@@ -1182,11 +1336,19 @@ class EvalCore:
                 self._tenant_db,
                 str(response_doc.get("submission_id") or ""),
             )
+        verify_transcription_with_vision = requires_transcription_verification(
+            ocr_confidence=response_doc.get("ocr_confidence"),
+            segmentation_confidence=response_doc.get("segmentation_confidence"),
+            question_assignment=response_doc.get("question_assignment"),
+        )
         use_vision = needs_vision_evaluation(
             content_type=str(content_type or ""),
             detected_text=detected_text,
             question_text=question_text,
             has_page_images=bool(answer_pages),
+            ocr_confidence=response_doc.get("ocr_confidence"),
+            segmentation_confidence=response_doc.get("segmentation_confidence"),
+            question_assignment=response_doc.get("question_assignment"),
         )
 
         if uses_structured_rubric:
@@ -1275,12 +1437,20 @@ class EvalCore:
                     answer_pages=answer_pages,
                     question_text=question_text,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Failed to attach vision evidence for response %s",
                     response_id,
                 )
-                vision_messages = None
+                raise RuntimeError(
+                    "Required answer-image evidence could not be verified; "
+                    "teacher review or re-upload is required"
+                ) from exc
+            if not vision_messages:
+                raise RuntimeError(
+                    "Required answer-image evidence was unavailable; "
+                    "teacher review or re-upload is required"
+                )
 
         try:
             gate_response = await self._gate.call(
@@ -1298,6 +1468,9 @@ class EvalCore:
                     "marking_mode": marking_policy.get("mode"),
                     "strictness": marking_policy.get("strictness"),
                     "vision_eval": bool(vision_messages),
+                    "vision_transcription_verification": bool(
+                        verify_transcription_with_vision
+                    ),
                 },
             )
         except Exception as exc:
@@ -1335,6 +1508,8 @@ class EvalCore:
                 ]
                 manual_eval_doc: Dict[str, Any] = {
                     "evaluation_id": eval_id,
+                    "evaluation_input_version": 1,
+                    "mapping_version_id": response_doc.get("mapping_version_id"),
                     "response_id": response_id,
                     "question_id": question_id,
                     "student_id": resolved_student_id,
@@ -1471,7 +1646,9 @@ class EvalCore:
 
         total_score = parsed.get("total_score", 0.0)
         overall_feedback = parsed.get("overall_feedback", "")
-        manual_review_required = bool(parsed.get("manual_review_required"))
+        manual_review_required = bool(
+            parsed.get("manual_review_required") or assignment_review_required
+        )
 
         # Check for score divergence (flag if significantly off)
         eval_flags: List[Dict[str, Any]] = []
@@ -1484,10 +1661,15 @@ class EvalCore:
             })
 
         if manual_review_required:
+            review_reason = (
+                "Question ownership or answer evidence requires teacher confirmation"
+                if assignment_review_required
+                else "AI requested teacher review before this criterion rubric can be published"
+            )
             eval_flags.append({
                 "flag_type": FlagType.LLM_SCORE_DIVERGENCE.value,
                 "severity": FlagSeverity.WARNING.value,
-                "reason": "AI requested teacher review before this criterion rubric can be published",
+                "reason": review_reason,
             })
 
         # Partial eval diagram exclusion flag
@@ -1508,6 +1690,8 @@ class EvalCore:
         # Step 9: Store evaluation result
         eval_doc: Dict[str, Any] = {
             "evaluation_id": eval_id,
+            "evaluation_input_version": 1,
+            "mapping_version_id": response_doc.get("mapping_version_id"),
             "response_id": response_id,
             "question_id": question_id,
             "student_id": resolved_student_id,

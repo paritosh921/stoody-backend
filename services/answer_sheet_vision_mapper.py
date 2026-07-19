@@ -418,6 +418,7 @@ class AnswerSheetVisionMapper:
         questions_payload = []
         for index, question in enumerate(question_docs or [], start=1):
             options = question.get("enhanced_options") or question.get("options") or []
+            requires_option_label = self._question_requires_option_label(question)
             option_payload = []
             if options and isinstance(options[0], dict):
                 for opt in options:
@@ -440,6 +441,8 @@ class AnswerSheetVisionMapper:
                     "question_index": index,
                     "question_id": str(question.get("id") or question.get("question_id") or ""),
                     "text": str(question.get("text") or question.get("question_text") or "")[:1000],
+                    "question_type": str(question.get("question_type") or "subjective"),
+                    "answer_format": "option_label" if requires_option_label else "worked_solution",
                     "options": option_payload,
                 }
             )
@@ -456,7 +459,7 @@ class AnswerSheetVisionMapper:
                     "question_index": 1,
                     "question_id": "copy from input",
                     "visible_answer_number": "visible answer number on sheet, e.g. 1",
-                    "correct_answer": "A/B/C/D/E/F",
+                    "correct_answer": "A/B/C/D/E/F for objective questions; empty for subjective questions",
                     "correct_answer_confidence": 0.0,
                     "answer_text": "teacher's worked solution/explanation for this question",
                     "final_answer_text": "visible final answer text if present",
@@ -491,8 +494,9 @@ class AnswerSheetVisionMapper:
             "Rules:\n"
             "- For every question_index, find the matching answer/solution in the answer-sheet images.\n"
             "- Use question_index as the primary identifier. Do not reorder questions.\n"
-            "- If the answer sheet writes Ans 1/2/3/4/5/6, convert it to A/B/C/D/E/F.\n"
-            "- correct_answer must be the option label, not the option text.\n"
+            "- For answer_format=option_label, if the answer sheet writes Ans 1/2/3/4/5/6, convert it to A/B/C/D/E/F.\n"
+            "- For answer_format=option_label, correct_answer must be the option label, not the option text.\n"
+            "- For answer_format=worked_solution, leave correct_answer empty. A missing A-F label is expected and must not by itself require review.\n"
             "- answer_text must be the teacher/admin uploaded worked solution, not a new generated solution.\n"
             "- Preserve equations and final values in answer_text.\n"
             "- If the solution contains a diagram/image/formula that cannot be fully represented as text, describe it in solution_image_notes and mention the page.\n"
@@ -558,13 +562,19 @@ class AnswerSheetVisionMapper:
         correct_answer_confidence = self._confidence(mapping.get("correct_answer_confidence"))
         correct_answer = self._normalise_answer_label(mapping.get("correct_answer"))
         answer_text = str(mapping.get("answer_text") or "").strip()
+        requires_option_label = self._question_requires_option_label(question)
         image_notes = str(mapping.get("solution_image_notes") or "").strip()
         if image_notes and image_notes not in answer_text:
             answer_text = f"{answer_text}\n\nSolution visual notes: {image_notes}".strip()
         manual_review = bool(mapping.get("manual_review_required")) and (
-            confidence < 0.9 or correct_answer_confidence < 0.9
+            confidence < 0.9
+            or (requires_option_label and correct_answer_confidence < 0.9)
         )
-        if not answer_text or not correct_answer or confidence < 0.75 or correct_answer_confidence < 0.75:
+        if not answer_text or confidence < 0.75:
+            manual_review = True
+        if requires_option_label and (
+            not correct_answer or correct_answer_confidence < 0.75
+        ):
             manual_review = True
         return {
             "question_index": question_index,
@@ -574,6 +584,8 @@ class AnswerSheetVisionMapper:
             "answer_number": mapping.get("visible_answer_number") or mapping.get("answer_number") or question_index,
             "correct_answer": correct_answer,
             "correct_answer_confidence": correct_answer_confidence,
+            "question_type": str(question.get("question_type") or "subjective"),
+            "requires_option_label": requires_option_label,
             "final_answer_text": str(mapping.get("final_answer_text") or "").strip(),
             "answer_text": answer_text,
             "mapping_strategy": "gpt_question_anchored",
@@ -584,6 +596,20 @@ class AnswerSheetVisionMapper:
             "page_numbers": mapping.get("page_numbers") if isinstance(mapping.get("page_numbers"), list) else [],
             "solution_image_notes": image_notes,
             "solution_bbox": self._normalise_bbox(mapping.get("solution_bbox") or mapping.get("solution_image_bbox")),
+        }
+
+    def _question_requires_option_label(self, question: Dict[str, Any]) -> bool:
+        options = question.get("enhanced_options") or question.get("options") or []
+        if isinstance(options, list) and len(options) > 0:
+            return True
+        question_type = str(question.get("question_type") or "").strip().lower()
+        return question_type in {
+            "mcq",
+            "multiple_choice",
+            "multiple-choice",
+            "objective",
+            "single_choice",
+            "single-choice",
         }
 
     def _confidence(self, value: Any) -> float:

@@ -11,7 +11,7 @@ import os
 import json
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Suppress verbose aiohttp logging
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
@@ -22,7 +22,7 @@ logging.getLogger("aiohttp.server").setLevel(logging.WARNING)
 from fastapi import APIRouter, Request, HTTPException, Depends, status, UploadFile, File, Form, Query, Body
 from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 import aiofiles
@@ -241,6 +241,23 @@ def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
     except (TypeError, ValueError):
         confidence_rank = 0.0
     return (source_rank, review_rank, confidence_rank)
+
+
+def _is_reviewed_pcr_answer_mapping(mapping: Dict[str, Any]) -> bool:
+    """Only explicit teacher-approved mappings may seed a marking plan."""
+
+    return (
+        str(mapping.get("review_status") or "").strip().lower()
+        in {"accepted", "trusted"}
+        and not bool(mapping.get("manual_review_required"))
+        and bool(
+            str(
+                mapping.get("final_answer_text")
+                or mapping.get("answer_text")
+                or ""
+            ).strip()
+        )
+    )
 
 
 async def _materialize_pcr_marking_plan(
@@ -2695,10 +2712,12 @@ async def generate_pcr_marking_plan_draft(
         "You are assisting a teacher to author a subjective-exam marking plan.\n"
         "This is a DRAFT only. Do not award a student score.\n\n"
         "Use only the supplied question and teacher-uploaded worked solution.\n"
-        "Create clear, independently assessable criterion rows for the required method, intermediate work, "
-        "and final answer. Do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
+        "Create clear, independently assessable criterion rows using only requirements actually supported by the uploaded solution. "
+        "Do not automatically require method, intermediate work, and a final answer when the source or mark value does not require all three. "
+        "Never make a criterion stricter than the teacher solution, and do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
         f"The question is worth exactly {question_marks:g} marks. The sum of all criterion max_marks MUST be exactly {question_marks:g}.\n"
-        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence may contain valid alternatives.\n"
+        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the uploaded solution's own method and conclusion plus clearly equivalent valid alternatives. "
+        "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
         "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
         '{"reference_solution":"teacher-ready cleaned solution", "marking_criteria":['
@@ -4134,11 +4153,7 @@ async def update_pcr_marking_policy(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="PCR marking policy is available only for PCR exam documents",
         )
-    if document.get("exam_finalized"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="PCR marking policy is locked because this paper is finalized",
-        )
+    _require_document_authoring_unlocked(document)
 
     try:
         policy_module = _pcr_marking_policy_module()
@@ -4238,11 +4253,7 @@ async def draft_pcr_marking_plan(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Marking-plan drafts are available only for PCR papers",
         )
-    if document.get("exam_finalized"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="This PCR paper is finalized and its marking plan is locked",
-        )
+    _require_document_authoring_unlocked(document)
 
     tenant_db = db.b2c_db if is_b2c else await db.get_tenant_db(current_user.get("db_name"))
     question = await tenant_db["questions"].find_one(
@@ -4268,10 +4279,13 @@ async def draft_pcr_marking_plan(
             detail="No mapped answer-sheet solution is available for this question",
         )
     mapping = max(mappings, key=_answer_mapping_rank)
-    if str(mapping.get("review_status") or "").strip().lower() == "rejected":
+    if not _is_reviewed_pcr_answer_mapping(mapping):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The selected mapped answer was rejected and cannot be used as a draft source",
+            detail=(
+                "Review and accept the selected answer mapping before using it "
+                "as a PCR marking-plan source"
+            ),
         )
     mapped_solution = str(
         mapping.get("final_answer_text") or mapping.get("answer_text") or ""
@@ -4337,6 +4351,8 @@ async def finalize_exam(
     After finalization, the document and its questions become read-only
     for exam integrity.
     """
+    tenant_db = None
+    finalization_token: Optional[str] = None
     try:
         is_b2c = is_b2c_admin(current_user)
 
@@ -4368,13 +4384,46 @@ async def finalize_exam(
                 detail="OCR must be completed before finalizing.",
             )
 
-        # Load questions for this document
-        if is_b2c:
-            questions_cursor = db.b2c_db["questions"].find({"document_id": document_id})
-        else:
-            questions_cursor = (await db.get_tenant_db(current_user.get("db_name")))["questions"].find(
-                {"document_id": document_id}
+        tenant_db = db.b2c_db if is_b2c else await db.get_tenant_db(
+            current_user.get("db_name")
+        )
+        finalization_token = uuid.uuid4().hex
+        finalization_now = datetime.utcnow()
+        lock_result = await tenant_db["documents"].update_one(
+            {
+                "document_id": document_id,
+                "exam_finalized": {"$ne": True},
+                "$or": [
+                    {"exam_finalization_status": {"$ne": "processing"}},
+                    {"exam_finalization_lease_expires_at": {"$lte": finalization_now}},
+                    {"exam_finalization_lease_expires_at": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "exam_finalization_status": "processing",
+                    "exam_finalization_token": finalization_token,
+                    "exam_finalization_started_at": finalization_now,
+                    "exam_finalization_lease_expires_at": finalization_now
+                    + timedelta(minutes=10),
+                    "exam_finalization_requested_by": current_user.get("user_id"),
+                }
+            },
+        )
+        if lock_result.matched_count != 1:
+            current_document = await tenant_db["documents"].find_one(
+                {"document_id": document_id},
+                {"exam_finalized": 1, "exam_finalization_status": 1},
             )
+            if current_document and current_document.get("exam_finalized"):
+                detail = "Document is already finalized. Cannot re-finalize."
+            else:
+                detail = "This paper is already being finalized by another request."
+            finalization_token = None
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+        # Load questions for this document
+        questions_cursor = tenant_db["questions"].find({"document_id": document_id})
         questions = await questions_cursor.to_list(length=10000)
 
         if not questions:
@@ -4387,17 +4436,10 @@ async def finalize_exam(
                 ),
             )
 
-        # Use one tenant DB handle for both the legacy ExamPen sync and the
-        # immutable paper snapshot written below.  Finalization is the only
-        # point at which authoring content becomes conducted-exam metadata.
-        if is_b2c:
-            tenant_db = db.b2c_db
-        else:
-            tenant_db = await db.get_tenant_db(current_user.get("db_name"))
-
         # Validate and sync based on exam_mode
         sync_summary = {}
         pcr_marking_policy: Optional[Dict[str, Any]] = None
+        question_layout: List[Dict[str, Any]] = []
         if exam_mode == "pcr":
             try:
                 # Documents created before structured rubrics did not store a
@@ -4460,7 +4502,10 @@ async def finalize_exam(
             # mappings are merged into an in-memory marking plan here, so the
             # normal Content Manager review flow can supply the authoritative
             # solution without mutating the editable source question.
-            from services.exampen_paper_service import validate_pcr_questions
+            from services.exampen_paper_service import (
+                build_question_layout,
+                validate_pcr_questions,
+            )
 
             finalized_questions, marking_plan_summary = await _materialize_pcr_marking_plan(
                 tenant_db,
@@ -4471,6 +4516,15 @@ async def finalize_exam(
                 finalized_questions,
                 marking_policy=pcr_marking_policy,
             )
+            regions_document = await tenant_db["document_regions"].find_one(
+                _document_regions_filter(document_id, "question")
+            )
+            question_layout, layout_errors = build_question_layout(
+                doc,
+                finalized_questions,
+                regions_document,
+            )
+            readiness_errors.extend(layout_errors)
             if readiness_errors:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -4479,6 +4533,20 @@ async def finalize_exam(
                         "errors": readiness_errors[:50],
                     },
                 )
+
+            # Printed page order is authoritative. Mongo insertion order is
+            # not a paper contract and previously produced Q2/Q3 shifts after
+            # partial OCR reruns.
+            layout_order = {
+                str(item["source_question_id"]): int(item["question_number"])
+                for item in question_layout
+            }
+            finalized_questions.sort(
+                key=lambda item: layout_order.get(
+                    str(item.get("question_id") or item.get("id") or item.get("_id") or ""),
+                    10**9,
+                )
+            )
 
             # PCR: sync all questions to evalpen_questions
             from api.v1.tutor_async import sync_questions_to_exampen
@@ -4496,6 +4564,8 @@ async def finalize_exam(
                 "questions_updated": (result or {}).get("updated", 0),
                 "marking_plan": marking_plan_summary,
                 "marking_policy": pcr_marking_policy,
+                "layout_schema_version": 1,
+                "layout_question_count": len(question_layout),
             }
 
             # The immutable snapshot below must use the same reviewed
@@ -4516,6 +4586,7 @@ async def finalize_exam(
             tenant_db=tenant_db,
             document=snapshot_document,
             questions=questions,
+            question_layout=question_layout or None,
         )
         sync_summary["paper_version_id"] = paper_snapshot["paper_version_id"]
         sync_summary["paper_content_hash"] = paper_snapshot["content_hash"]
@@ -4537,17 +4608,29 @@ async def finalize_exam(
                     "question_count": paper_snapshot["question_count"],
                     "checked_at": datetime.utcnow(),
                 },
-            }
+                "exam_finalization_status": "completed",
+                "exam_finalization_completed_at": datetime.utcnow(),
+            },
+            "$unset": {
+                "exam_finalization_token": "",
+                "exam_finalization_lease_expires_at": "",
+            },
         }
 
-        if is_b2c:
-            await db.b2c_db["documents"].update_one(
-                {"document_id": document_id}, finalized_update
+        finalized_result = await tenant_db["documents"].update_one(
+            {
+                "document_id": document_id,
+                "exam_finalization_token": finalization_token,
+                "exam_finalized": {"$ne": True},
+            },
+            finalized_update,
+        )
+        if finalized_result.matched_count != 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Paper finalization ownership changed before the immutable commit.",
             )
-        else:
-            await tenant_db["documents"].update_one(
-                {"document_id": document_id}, finalized_update
-            )
+        finalization_token = None
 
         logger.info(f"Document {document_id} finalized as {exam_mode}: {sync_summary}")
 
@@ -4560,9 +4643,45 @@ async def finalize_exam(
             "question_count": len(questions),
         }
 
-    except HTTPException:
+    except HTTPException as exc:
+        if tenant_db is not None and finalization_token:
+            await tenant_db["documents"].update_one(
+                {
+                    "document_id": document_id,
+                    "exam_finalization_token": finalization_token,
+                },
+                {
+                    "$set": {
+                        "exam_finalization_status": "failed",
+                        "exam_finalization_error": str(exc.detail)[:800],
+                        "exam_finalization_failed_at": datetime.utcnow(),
+                    },
+                    "$unset": {
+                        "exam_finalization_token": "",
+                        "exam_finalization_lease_expires_at": "",
+                    },
+                },
+            )
         raise
     except Exception as e:
+        if tenant_db is not None and finalization_token:
+            await tenant_db["documents"].update_one(
+                {
+                    "document_id": document_id,
+                    "exam_finalization_token": finalization_token,
+                },
+                {
+                    "$set": {
+                        "exam_finalization_status": "failed",
+                        "exam_finalization_error": str(e)[:800],
+                        "exam_finalization_failed_at": datetime.utcnow(),
+                    },
+                    "$unset": {
+                        "exam_finalization_token": "",
+                        "exam_finalization_lease_expires_at": "",
+                    },
+                },
+            )
         logger.error(f"Finalize exam error for {document_id}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -7628,11 +7747,8 @@ async def create_question(
             is_b2c = is_b2c_admin(current_user)
             _doc = await (db.b2c_find_one("documents", {"document_id": document_id}) if is_b2c
                           else db.mongo_find_one("documents", {"document_id": document_id}))
-            if _doc and _doc.get("exam_finalized"):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cannot add questions to a finalized exam document",
-                )
+            if _doc:
+                _require_document_authoring_unlocked(_doc)
 
         # DCR documents are objective-only.
         if document_id and _doc and _doc.get("exam_mode") == "dcr" and question_type == "subjective":
@@ -7811,6 +7927,8 @@ async def create_question(
             "question_id": full_question_id
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Create question error: {str(e)}")
         raise HTTPException(
@@ -7853,11 +7971,8 @@ async def update_question(
         if _q_doc_id:
             _parent_doc = await (db.b2c_find_one("documents", {"document_id": _q_doc_id}) if is_b2c
                                  else db.mongo_find_one("documents", {"document_id": _q_doc_id}))
-            if _parent_doc and _parent_doc.get("exam_finalized"):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cannot edit questions in a finalized exam document",
-                )
+            if _parent_doc:
+                _require_document_authoring_unlocked(_parent_doc)
 
         # Update fields
         update_data = {}
@@ -8087,11 +8202,8 @@ async def bulk_update_questions(
         # Block bulk updates if document is finalized for exam
         _parent_doc = await (db.b2c_find_one("documents", {"document_id": document_id}) if is_b2c
                              else db.mongo_find_one("documents", {"document_id": document_id}))
-        if _parent_doc and _parent_doc.get("exam_finalized"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot modify questions in a finalized exam document",
-            )
+        if _parent_doc:
+            _require_document_authoring_unlocked(_parent_doc)
 
         # Build the $set update
         set_fields = {}
@@ -8177,11 +8289,8 @@ async def delete_question(
         if _q_doc_id:
             _parent_doc = await (db.b2c_find_one("documents", {"document_id": _q_doc_id}) if is_b2c
                                  else db.mongo_find_one("documents", {"document_id": _q_doc_id}))
-            if _parent_doc and _parent_doc.get("exam_finalized"):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Cannot delete questions from a finalized exam document",
-                )
+            if _parent_doc:
+                _require_document_authoring_unlocked(_parent_doc)
 
         # Delete associated images
         deleted_images_count = 0
@@ -8677,16 +8786,38 @@ def _document_regions_filter(document_id: str, region_scope: str) -> Dict[str, A
     return {"document_id": document_id, "region_scope": region_scope}
 
 
+def _require_document_authoring_unlocked(document: Dict[str, Any]) -> None:
+    if document.get("exam_finalized"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This paper is finalized. Its question and solution regions are immutable.",
+        )
+    finalization_expiry = document.get("exam_finalization_lease_expires_at")
+    active_finalization = document.get("exam_finalization_status") == "processing"
+    if active_finalization and isinstance(finalization_expiry, datetime):
+        comparison_now = (
+            datetime.now(finalization_expiry.tzinfo)
+            if finalization_expiry.tzinfo is not None
+            else datetime.utcnow()
+        )
+        active_finalization = finalization_expiry > comparison_now
+    if active_finalization:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This paper is currently being finalized. Wait for finalization to finish.",
+        )
+
+
 class QuestionRegion(BaseModel):
     """Represents a bounding box for a question region on a PDF page"""
-    id: str
-    pageNumber: int
-    x: float  # Percentage (0-100)
-    y: float  # Percentage (0-100)
-    width: float  # Percentage (0-100)
-    height: float  # Percentage (0-100)
-    order: int
-    label: str
+    id: str = Field(..., min_length=1, max_length=200)
+    pageNumber: int = Field(..., ge=1)
+    x: float = Field(..., ge=0, le=100)  # Percentage (0-100)
+    y: float = Field(..., ge=0, le=100)  # Percentage (0-100)
+    width: float = Field(..., gt=0, le=100)  # Percentage (0-100)
+    height: float = Field(..., gt=0, le=100)  # Percentage (0-100)
+    order: int = Field(..., ge=1)
+    label: str = Field(..., min_length=1, max_length=100)
     hasSubQuestions: bool = False
     notes: Optional[str] = None
     ocrStatus: Optional[str] = None  # pending, processing, completed, error
@@ -8694,10 +8825,26 @@ class QuestionRegion(BaseModel):
     createdAt: str
     updatedAt: str
 
+    @model_validator(mode="after")
+    def validate_page_bounds(self) -> "QuestionRegion":
+        if self.x + self.width > 100.0001 or self.y + self.height > 100.0001:
+            raise ValueError("question region must stay within the PDF page")
+        return self
+
 class DocumentRegionsRequest(BaseModel):
     """Request body for saving document regions"""
     regions: List[QuestionRegion]
     excludedPages: List[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_unique_regions(self) -> "DocumentRegionsRequest":
+        ids = [region.id for region in self.regions]
+        orders = [region.order for region in self.regions]
+        if len(ids) != len(set(ids)):
+            raise ValueError("question region ids must be unique")
+        if len(orders) != len(set(orders)):
+            raise ValueError("question region orders must be unique")
+        return self
 
 class DocumentRegionsResponse(BaseModel):
     """Response for document regions"""
@@ -8730,6 +8877,13 @@ class AnswerMappingReviewRequest(BaseModel):
     questionId: Optional[str] = None
     answerText: Optional[str] = None
     correctAnswer: Optional[str] = None
+
+
+class BulkAnswerMappingReviewRequest(BaseModel):
+    """Explicit teacher approval for several PCR worked-solution mappings."""
+    mappingIds: List[str] = Field(..., min_length=1, max_length=200)
+    reviewStatus: str = Field(default="accepted", pattern="^accepted$")
+    confirmReviewed: bool = False
 
 
 class RegionOCRResult(BaseModel):
@@ -8922,7 +9076,8 @@ async def get_document_answer_mappings(
             ]
         )
         full_answer_count = int(document.get("answer_sheet_extracted_answers_count") or 0)
-        answer_count = max(extracted_answer_count, full_answer_count, generated_solution_count)
+        raw_answer_block_count = max(extracted_answer_count, full_answer_count)
+        answer_count = max(raw_answer_block_count, generated_solution_count)
         answer_key_candidates_by_question_id = {
             str(candidate.get("question_id") or ""): candidate
             for candidate in (document.get("answer_key_candidates") or [])
@@ -8951,6 +9106,13 @@ async def get_document_answer_mappings(
                 and str(mapping.get("review_status") or "accepted").lower() in {"accepted", "trusted"}
             ]
         )
+        solution_count = len(
+            [
+                mapping
+                for mapping in mappings_by_question_id.values()
+                if str(mapping.get("answer_text") or "").strip()
+            ]
+        )
         coverage = await refresh_answer_solution_coverage(
             db=db,
             is_b2c=is_b2c,
@@ -8971,6 +9133,8 @@ async def get_document_answer_mappings(
             "generatedSolutionCount": generated_solution_count,
             "questionCount": len(questions),
             "answerCount": answer_count,
+            "rawAnswerBlockCount": raw_answer_block_count,
+            "solutionCount": solution_count,
             "mappedCount": mapped_count,
             "answerSheetMappingSummary": document.get("answer_sheet_mapping_summary") or {},
             "answerKeyExtractionSummary": document.get("answer_key_extraction_summary") or {},
@@ -8993,6 +9157,123 @@ async def get_document_answer_mappings(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get answer mappings: {str(e)}"
         )
+
+
+@router.patch("/documents/{document_id}/answer-mappings/bulk-review")
+@limiter.limit("20/minute")
+async def bulk_update_document_answer_mapping_review(
+    request: Request,
+    document_id: str,
+    review_request: BulkAnswerMappingReviewRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Accept a teacher-confirmed batch of complete PCR solution mappings."""
+    is_b2c = is_b2c_admin(current_user)
+    document = (
+        await db.b2c_find_one("documents", {"document_id": document_id})
+        if is_b2c
+        else await db.mongo_find_one("documents", {"document_id": document_id})
+    )
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if not is_b2c:
+        from config_async import DEBUG_MODE as _DEBUG_MODE
+
+        document_admin_id = str(document.get("admin_id")) if document.get("admin_id") is not None else None
+        actor_admin_id = (
+            str(current_user.get("user_id"))
+            if current_user.get("user_type") == "admin" and current_user.get("user_id") is not None
+            else str(current_user.get("admin_id"))
+            if current_user.get("admin_id") is not None
+            else None
+        )
+        if actor_admin_id != document_admin_id and not _DEBUG_MODE:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+
+    if document.get("exam_mode") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bulk solution approval is available only for PCR papers",
+        )
+    _require_document_authoring_unlocked(document)
+    if not review_request.confirmReviewed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Confirm that the worked solutions were reviewed before bulk approval",
+        )
+
+    requested_ids = list(dict.fromkeys(
+        str(mapping_id or "").strip()
+        for mapping_id in review_request.mappingIds
+        if str(mapping_id or "").strip()
+    ))
+    if not requested_ids:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No mapping IDs supplied")
+
+    mapping_query = {"document_id": document_id, "mapping_id": {"$in": requested_ids}}
+    mappings = (
+        await db.b2c_find("answer_question_mappings", mapping_query)
+        if is_b2c
+        else await db.mongo_find("answer_question_mappings", mapping_query)
+    )
+    eligible_ids = [
+        str(mapping.get("mapping_id"))
+        for mapping in mappings
+        if str(mapping.get("mapping_id") or "").strip()
+        and str(mapping.get("answer_text") or "").strip()
+        and str(mapping.get("question_id") or mapping.get("question_region_id") or "").strip()
+        and str(mapping.get("review_status") or "").lower() != "rejected"
+    ]
+    if not eligible_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="None of the selected mappings has a complete question and worked solution",
+        )
+
+    now = datetime.utcnow()
+    batch_id = uuid.uuid4().hex
+    update = {
+        "$set": {
+            "review_status": "accepted",
+            "manual_review_required": False,
+            "reviewed_by": current_user.get("user_id") or current_user.get("_id"),
+            "reviewed_at": now,
+            "updated_at": now,
+            "bulk_review_id": batch_id,
+        }
+    }
+    eligible_query = {"document_id": document_id, "mapping_id": {"$in": eligible_ids}}
+    if is_b2c:
+        b2c_database = await db.get_b2c_db()
+        if b2c_database is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="B2C database is not available",
+            )
+        result = await b2c_database["answer_question_mappings"].update_many(eligible_query, update)
+        updated_count = int(result.modified_count)
+    else:
+        updated_count = await db.mongo_update_many("answer_question_mappings", eligible_query, update)
+
+    coverage = await refresh_answer_solution_coverage(
+        db=db,
+        is_b2c=is_b2c,
+        document_id=document_id,
+        document=document,
+    )
+    return {
+        "success": True,
+        "documentId": document_id,
+        "batchId": batch_id,
+        "requestedCount": len(requested_ids),
+        "eligibleCount": len(eligible_ids),
+        "updatedCount": updated_count,
+        "skippedCount": len(requested_ids) - len(eligible_ids),
+        "answerSolutionCoverageStatus": coverage.get("answer_solution_coverage_status"),
+        "answerSolutionCoverageSummary": coverage.get("answer_solution_coverage_summary"),
+    }
 
 
 @router.patch("/documents/{document_id}/answer-mappings/{mapping_id}")
@@ -9023,6 +9304,7 @@ async def update_document_answer_mapping_review(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
         if not mapping:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer mapping not found")
+        _require_document_authoring_unlocked(document)
 
         if not is_b2c:
             from config_async import DEBUG_MODE as _DEBUG_MODE
@@ -9044,6 +9326,17 @@ async def update_document_answer_mapping_review(
         else:
             manual_review_required = review_status != "accepted"
 
+        effective_answer_text = (
+            review_request.answerText
+            if review_request.answerText is not None
+            else mapping.get("answer_text") or mapping.get("final_answer_text") or ""
+        )
+        if review_status == "accepted" and not str(effective_answer_text).strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="An accepted mapping must include a worked solution",
+            )
+
         update_fields: Dict[str, Any] = {
             "review_status": review_status,
             "manual_review_required": manual_review_required,
@@ -9055,7 +9348,14 @@ async def update_document_answer_mapping_review(
             update_fields["question_id"] = review_request.questionId.strip()
             update_fields["question_region_id"] = review_request.questionId.strip()
         if review_request.answerText is not None:
-            update_fields["answer_text"] = review_request.answerText.strip()
+            edited_answer_text = review_request.answerText.strip()
+            update_fields["answer_text"] = edited_answer_text
+            update_fields["final_answer_text"] = edited_answer_text
+            update_fields["answer_text_edited_by"] = current_user.get("user_id") or current_user.get("_id")
+            update_fields["answer_text_edited_at"] = datetime.utcnow()
+            if mapping.get("original_answer_text") is None:
+                update_fields["original_answer_text"] = mapping.get("answer_text") or ""
+                update_fields["original_final_answer_text"] = mapping.get("final_answer_text") or ""
         if review_request.correctAnswer is not None:
             update_fields["correct_answer_candidate"] = _normalise_correct_answer_label(review_request.correctAnswer)
 
@@ -9404,6 +9704,8 @@ async def save_document_regions(
                 detail=f"Document {document_id} not found"
             )
 
+        _require_document_authoring_unlocked(document)
+
         if region_scope == "answer" and not document.get("answer_sheet_path"):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -9495,6 +9797,17 @@ async def delete_document_regions(
     try:
         region_scope = _normalise_region_scope(region_scope)
         is_b2c = is_b2c_admin(current_user)
+        document = (
+            await db.b2c_find_one("documents", {"document_id": document_id})
+            if is_b2c
+            else await db.mongo_find_one("documents", {"document_id": document_id})
+        )
+        if not document:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document {document_id} not found",
+            )
+        _require_document_authoring_unlocked(document)
         regions_filter = _document_regions_filter(document_id, region_scope)
         
         if is_b2c:
@@ -9507,6 +9820,8 @@ async def delete_document_regions(
             "message": f"Deleted {region_scope} regions for document {document_id}"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error deleting document regions: {str(e)}")
         raise HTTPException(
@@ -9696,6 +10011,8 @@ async def process_regions_ocr(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
             )
+
+        _require_document_authoring_unlocked(document)
 
         status_field = "answer_sheet_ocr_status" if is_answer_scope else "ocr_status"
         if document.get(status_field) == "processing":

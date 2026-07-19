@@ -1052,7 +1052,24 @@ class TestUEval01:
 
         parsed = _parse_eval_response("not json at all", max_score=10.0)
         assert parsed["parse_error"] is True
+        assert parsed["manual_review_required"] is True
         assert parsed["total_score"] == 0.0
+
+    def test_u_eval_01_legacy_step_total_mismatch_requires_teacher_review(self):
+        """Legacy AI totals are provisional unless their step awards reconcile."""
+        from pcr.services.eval_core import _parse_eval_response
+
+        parsed = _parse_eval_response(
+            '{"step_marks":[{"step":"method","marks_awarded":2,'
+            '"max_marks":2,"rationale":"Correct method"}],'
+            '"total_score":3,"max_score":4,"overall_feedback":"Good"}',
+            max_score=4,
+        )
+
+        assert parsed["total_score"] == 3
+        assert parsed["parse_error"] is True
+        assert parsed["manual_review_required"] is True
+        assert "do not add up" in parsed["validation_errors"][0]
 
     def test_u_eval_01_locked_criteria_require_exact_question_total(self):
         """A new PCR paper cannot freeze a rubric that invents or loses marks."""
@@ -1075,6 +1092,28 @@ class TestUEval01:
         )
 
         assert errors == ["criterion marks total 3, but this question is worth 4"]
+
+    def test_u_eval_01_criterion_award_without_evidence_requires_review(self):
+        from pcr.services.eval_core import _parse_criterion_eval_response
+
+        parsed = _parse_criterion_eval_response(
+            (
+                '{"criterion_marks":[{"criterion_id":"method",'
+                '"marks_awarded":1,"rationale":"Method is correct",'
+                '"evidence":""}],"needs_review":false}'
+            ),
+            [
+                {
+                    "criterion_id": "method",
+                    "description": "Uses the correct method",
+                    "max_marks": 1,
+                }
+            ],
+        )
+
+        assert parsed["total_score"] == 0
+        assert parsed["manual_review_required"] is True
+        assert "without answer evidence" in parsed["validation_errors"][0]
 
     def test_u_eval_01_complete_criteria_are_a_valid_marking_plan_without_notes(self):
         """A teacher may use the structured rubric itself as the marking authority."""
@@ -1228,6 +1267,71 @@ class TestUEval01:
         assert evaluations.docs[0]["criterion_marks"][1]["max_marks"] == 3.0
 
     @pytest.mark.asyncio
+    async def test_evaluation_retry_returns_persisted_result_without_second_ai_call(self):
+        """A worker retry is idempotent once the immutable evaluation exists."""
+        from pcr.services.eval_core import EvalCore, _deterministic_evaluation_id
+
+        response_doc = {
+            "response_id": "RESP-idempotent",
+            "question_id": "EXAM-1::Q-1",
+            "student_id": "STU-1",
+            "mapping_version_id": "MAP-v1",
+            "detected_text": "Student working",
+            "content_type": "TEXT_ONLY",
+            "flags": [],
+        }
+        evaluation_id = _deterministic_evaluation_id(response_doc)
+
+        class Responses:
+            async def get_response(self, response_id):
+                assert response_id == response_doc["response_id"]
+                return response_doc
+
+            async def update_eval_status(self, *_args):
+                raise AssertionError("Existing evaluation must not update processing state")
+
+        class Evaluations:
+            async def get_evaluation_by_response(self, response_id):
+                assert response_id == response_doc["response_id"]
+                return {
+                    "evaluation_id": evaluation_id,
+                    "response_id": response_id,
+                    "question_id": response_doc["question_id"],
+                    "student_id": "STU-1",
+                    "eval_path": "criterion_rubric",
+                    "model_used": "test-model",
+                    "total_score": 2.0,
+                    "max_score": 4.0,
+                    "scoreable_max": 4.0,
+                    "step_marks": [],
+                    "criterion_marks": [],
+                    "overall_feedback": "Persisted feedback",
+                    "token_usage": {},
+                }
+
+            async def insert_evaluation(self, _doc):
+                raise AssertionError("Retry must not insert a second evaluation")
+
+        class MustNotRead:
+            def __getattr__(self, _name):
+                raise AssertionError("Retry must not read marking inputs or call AI")
+
+        core = EvalCore(
+            Responses(),
+            Evaluations(),
+            MustNotRead(),
+            MustNotRead(),
+            MustNotRead(),
+        )
+
+        first = await core.evaluate_response("RESP-idempotent")
+        second = await core.evaluate_response("RESP-idempotent")
+
+        assert first.evaluation_id == second.evaluation_id == evaluation_id
+        assert first.total_score == second.total_score == 2.0
+        assert first.overall_feedback == "Persisted feedback"
+
+    @pytest.mark.asyncio
     async def test_u_eval_01_invalid_criterion_output_requires_teacher_review(self):
         """Malformed AI criterion rows cannot silently create a score."""
         from pcr.services.eval_core import EvalCore
@@ -1375,6 +1479,92 @@ class TestUEval01:
         assert evaluations.docs[0]["manual_review_required"] is True
         assert evaluations.docs[0]["criterion_marks"][0]["marks_awarded"] == 0.0
         assert responses.statuses == ["manual_review"]
+
+    @pytest.mark.asyncio
+    async def test_u_eval_01_required_vision_failure_never_falls_back_to_text(
+        self,
+        monkeypatch,
+    ):
+        """A diagram answer cannot be scored from OCR after image verification fails."""
+        from pcr.services import evidence_vision
+        from pcr.services.eval_core import EvalCore
+        from pcr.services.ocr_service import AssetIntegrityError
+
+        class Responses:
+            async def get_response(self, response_id):
+                return {
+                    "response_id": response_id,
+                    "submission_id": "SUB-vision",
+                    "question_id": "EXAM-1::Q-diagram",
+                    "student_id": "STU-1",
+                    "detected_text": "rough OCR",
+                    "content_type": "DIAGRAM_HEAVY",
+                    "source_pages": [{"page_number": 1, "y_start": 10, "y_end": 80}],
+                    "flags": [],
+                }
+
+            async def update_eval_status(self, *_args):
+                raise AssertionError("An unverified image must not produce an evaluation state")
+
+        class Evaluations:
+            async def insert_evaluation(self, _doc):
+                raise AssertionError("An unverified image must not be scored")
+
+        class Questions:
+            async def get_question(self, _question_id):
+                return {
+                    "subject": "Mathematics",
+                    "question_text": "Draw and label the diagram.",
+                    "reference_solution": "Teacher diagram",
+                    "max_marks": 2,
+                    "marking_policy": {"mode": "criterion_rubric_v1"},
+                    "marking_criteria": [
+                        {
+                            "criterion_id": "diagram",
+                            "description": "Draws and labels the diagram",
+                            "max_marks": 2,
+                        }
+                    ],
+                }
+
+        class Cache:
+            async def lookup(self, *_args, **_kwargs):
+                raise AssertionError("Structured rubric marking bypasses the cache")
+
+        class Gate:
+            async def call(self, **_kwargs):
+                raise AssertionError("AI must not receive unverified answer evidence")
+
+        async def _answer_pages(_tenant_db, _submission_id):
+            return [
+                {
+                    "page_number": 1,
+                    "raw_image_ref": "s3://private/exampen/page-1.png",
+                    "asset_sha256": "ab" * 32,
+                }
+            ]
+
+        async def _integrity_failure(**_kwargs):
+            raise AssetIntegrityError("integrity verification failed")
+
+        monkeypatch.setattr(evidence_vision, "load_answer_page_docs", _answer_pages)
+        monkeypatch.setattr(
+            evidence_vision,
+            "build_vision_eval_messages",
+            _integrity_failure,
+        )
+
+        core = EvalCore(
+            Responses(),
+            Evaluations(),
+            Questions(),
+            Cache(),
+            Gate(),
+            tenant_db=object(),
+        )
+
+        with pytest.raises(RuntimeError, match="could not be verified"):
+            await core.evaluate_response("RESP-vision")
 
     @pytest.mark.asyncio
     async def test_u_eval_01_not_attempted_question_is_zero_without_ai_call(self):

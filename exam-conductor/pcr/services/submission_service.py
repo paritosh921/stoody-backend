@@ -43,7 +43,13 @@ from ..domain.response_models import (
 )
 from ..domain.segmenter import segment_submission
 
-from .ocr_service import OCRAdapter, OCRResult, VisionGateProtocol, create_ocr_adapter
+from .ocr_service import (
+    AssetIntegrityError,
+    OCRAdapter,
+    OCRResult,
+    VisionGateProtocol,
+    create_ocr_adapter,
+)
 from .answer_book_extractor import try_extract_answer_book_responses
 from .response_mapping_service import (
     DocumentAnswerMapper,
@@ -310,6 +316,22 @@ class SubmissionService:
                 answer_pages,
                 source=normalized_source,
             )
+        except AssetIntegrityError:
+            logger.exception(
+                "Answer-copy integrity verification failed for submission %s",
+                submission_id,
+            )
+            await self._ingest.update_segmentation_status(
+                submission_id, "failed"
+            )
+            return SubmissionProcessingResult(
+                submission_id=submission_id,
+                page_count=len(answer_pages),
+                error=(
+                    "Answer-copy asset integrity verification failed; "
+                    "re-upload is required"
+                ),
+            )
         except Exception:
             logger.exception(
                 "OCR failed for submission %s", submission_id
@@ -421,7 +443,15 @@ class SubmissionService:
         # immutable question catalog.  If that association is uncertain, keep
         # the evidence unassigned for teacher review and suppress synthetic
         # blank-answer rows.
-        include_missing_slots = True
+        include_missing_slots = len(numbered_questions) <= 1
+        coverage_proof: Optional[Dict[str, Any]] = (
+            {
+                "verified": True,
+                "method": "single_question_paper",
+            }
+            if len(numbered_questions) <= 1
+            else None
+        )
         assignment_details_by_response: Dict[str, Dict[str, Any]]
 
         # ── PRIMARY PATH (content-section style) ─────────────────────────
@@ -431,13 +461,20 @@ class SubmissionService:
         book_extract = try_extract_answer_book_responses(
             pages, numbered_questions
         )
-        if book_extract is not None:
+        if book_extract is not None and has_reliable_marker_coverage(
+            book_extract[0], numbered_questions
+        ):
             book_responses, book_assignment = book_extract
             seg_result = seg_result.model_copy(
                 update={"responses": book_responses}
             )
             assignment_details_by_response = book_assignment
             include_missing_slots = True
+            coverage_proof = {
+                "verified": True,
+                "method": "all_paper_question_labels_detected",
+                "mapped_question_count": len(book_responses),
+            }
             logger.info(
                 "Submission %s: answer-book numbered extract mapped %d "
                 "answer(s) from OCR (skipped fragile vision remap)",
@@ -465,6 +502,11 @@ class SubmissionService:
             # Always complete the paper matrix for unanswered questions once we
             # have a clear numbered subset (student wrote 1–5 of 9 → zeros for 6–9).
             include_missing_slots = True
+            coverage_proof = {
+                "verified": True,
+                "method": "all_paper_question_markers_detected",
+                "mapped_question_count": len(seg_result.responses),
+            }
             logger.info(
                 "Submission %s using reliable marker/number coverage "
                 "(%d response(s)); skipped document vision remap",
@@ -485,6 +527,22 @@ class SubmissionService:
                     numbered_questions=numbered_questions,
                     source=normalized_source,
                 )
+            except AssetIntegrityError:
+                logger.exception(
+                    "Answer-copy integrity changed during mapping for submission %s",
+                    submission_id,
+                )
+                await self._ingest.update_segmentation_status(
+                    submission_id, "failed"
+                )
+                return SubmissionProcessingResult(
+                    submission_id=submission_id,
+                    page_count=len(answer_pages),
+                    error=(
+                        "Answer-copy asset integrity verification failed; "
+                        "re-upload is required"
+                    ),
+                )
             except Exception as exc:
                 # A mapper failure is a review state, never a reason to score
                 # the whole document as Q1 or to record false zero marks.
@@ -497,7 +555,9 @@ class SubmissionService:
             else:
                 mapping_error = None
 
-            if mapping_result and mapping_result.responses:
+            if mapping_result and (
+                mapping_result.responses or mapping_result.coverage_is_reliable
+            ):
                 # Never replace real student text with pure form-header junk.
                 cleaned_responses = []
                 for response in mapping_result.responses:
@@ -523,7 +583,7 @@ class SubmissionService:
                         pass
                     cleaned_responses.append(response)
 
-                if cleaned_responses:
+                if cleaned_responses or mapping_result.coverage_is_reliable:
                     seg_result = seg_result.model_copy(
                         update={"responses": cleaned_responses}
                     )
@@ -531,6 +591,15 @@ class SubmissionService:
                         mapping_result.assignment_details_by_response
                     )
                     include_missing_slots = mapping_result.coverage_is_reliable
+                    coverage_proof = (
+                        {
+                            "verified": True,
+                            "method": "document_answer_mapping",
+                            "metadata": mapping_result.metadata,
+                        }
+                        if mapping_result.coverage_is_reliable
+                        else None
+                    )
                     if mapping_result.manual_review_required:
                         logger.warning(
                             "Submission %s has unresolved document answer regions: %s",
@@ -578,6 +647,7 @@ class SubmissionService:
             question_ids_by_number=question_ids_by_number,
             assignment_details_by_response=assignment_details_by_response,
             include_missing_slots=include_missing_slots,
+            coverage_proof=coverage_proof,
         )
 
         # A paper is a fixed set of questions, not a variable number of OCR
@@ -1099,6 +1169,7 @@ def _build_response_docs(
     question_ids_by_number: Optional[Dict[int, str]] = None,
     assignment_details_by_response: Optional[Dict[str, Dict[str, Any]]] = None,
     include_missing_slots: bool = True,
+    coverage_proof: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Convert segmentation responses into MongoDB documents for
     persistence.
@@ -1152,6 +1223,27 @@ def _build_response_docs(
                 "reason": "No question association was recorded",
             },
         )
+        evidence_atom_ids = list(
+            dict.fromkeys(
+                str(value)
+                for value in (
+                    assignment_detail.get("evidence_atom_ids", [])
+                    if isinstance(assignment_detail, dict)
+                    else []
+                )
+                if str(value)
+            )
+        )
+        if not evidence_atom_ids:
+            for source_page in source_pages_serialized:
+                atom_payload = (
+                    f"{submission_id}\x1f{source_page['page_number']}\x1f"
+                    f"{source_page['y_start']:.3f}\x1f{source_page['y_end']:.3f}"
+                )
+                evidence_atom_ids.append(
+                    "region-"
+                    + hashlib.sha256(atom_payload.encode("utf-8")).hexdigest()[:24]
+                )
         doc: Dict[str, Any] = {
             "response_id": response.response_id,
             "submission_id": submission_id,
@@ -1163,6 +1255,8 @@ def _build_response_docs(
             "student_id": student_id,
             "detected_text": response.detected_text,
             "source_pages": source_pages_serialized,
+            "evidence_version": 1,
+            "evidence_atom_ids": evidence_atom_ids,
             "content_type": response.content_type.value,
             "text_coverage_ratio": response.text_coverage_ratio,
             "segmentation_confidence": response.segmentation_confidence,
@@ -1215,6 +1309,7 @@ def _build_response_docs(
                     "method": "not_attempted",
                     "confidence": 1.0,
                     "reason": "No answer was detected for this paper question",
+                    "absence_proof": coverage_proof,
                 },
                 "exam_id": exam_id,
                 "student_id": student_id,
@@ -1231,6 +1326,10 @@ def _build_response_docs(
                 "manual_review_required": False,
                 "manual_review_reason": None,
                 "answer_state": "not_attempted",
+                "absence_proven": bool(
+                    isinstance(coverage_proof, dict)
+                    and coverage_proof.get("verified") is True
+                ),
                 "eval_status": "pending",
                 "_immutable": True,
                 "created_at": datetime.now(timezone.utc),

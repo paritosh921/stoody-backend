@@ -366,6 +366,7 @@ async def list_student_exams(
                 "submission_id": 1,
                 "exam_id": 1,
                 "published_at": 1,
+                "publication_snapshot": 1,
             },
         )
         submissions = await submissions_cursor.to_list(length=1000)
@@ -387,6 +388,7 @@ async def list_student_exams(
                 exam_sub_map[eid] = {
                     "submission_id": sid,
                     "published_at": sub.get("published_at"),
+                    "publication_snapshot": sub.get("publication_snapshot"),
                 }
 
         # ----- PCR: aggregate evaluations per exam -----
@@ -403,34 +405,28 @@ async def list_student_exams(
 
             for eid, sub_info in exam_sub_map.items():
                 sid = sub_info["submission_id"]
-                responses = await resp_repo.get_responses_by_submission(sid)
-                pcr_total = 0.0
-                evaluated_max = 0.0
                 question_catalog = await _get_pcr_question_catalog(tenant_db, eid)
-                paper_max = sum(question["max_marks"] for question in question_catalog)
-                catalog_question_ids = {
-                    question["question_id"] for question in question_catalog
-                }
-                scored_question_ids: set[str] = set()
-                for resp in responses:
-                    response_id = resp.get("response_id", "")
-                    ev = await eval_repo.get_evaluation_by_response(response_id)
-                    if ev:
-                        question_id = str(resp.get("question_id") or "")
-                        if (
-                            question_id
-                            and question_id in catalog_question_ids
-                            and question_id in scored_question_ids
-                        ):
-                            continue
-                        pcr_total += _safe_marks(ev.get("total_score"))
-                        evaluated_max += _safe_marks(ev.get("max_score"))
-                        if question_id and question_id in catalog_question_ids:
-                            scored_question_ids.add(question_id)
-                pcr_scores[eid] = {
-                    "total_score": pcr_total,
-                    "max_score": paper_max or evaluated_max,
-                }
+                if question_catalog:
+                    from services.exampen_submission_readiness import (
+                        validate_publication_snapshot,
+                    )
+
+                    snapshot = sub_info.get("publication_snapshot")
+                    if not validate_publication_snapshot(
+                        snapshot,
+                        submission_id=sid,
+                        exam_id=eid,
+                    ):
+                        logger.error(
+                            "Withholding published PCR result with invalid snapshot: %s",
+                            sid,
+                        )
+                        pcr_scores[eid] = {"invalid": 1.0}
+                        continue
+                    pcr_scores[eid] = {
+                        "total_score": _safe_marks(snapshot.get("total_score")),
+                        "max_score": _safe_marks(snapshot.get("total_max_score")),
+                    }
         except ImportError:
             logger.debug("PCR storage not available for student BFF aggregation")
 
@@ -472,6 +468,8 @@ async def list_student_exams(
         items: List[StudentExamItem] = []
         for eid in dict.fromkeys(exam_ids):
             pcr = pcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
+            if pcr.get("invalid"):
+                continue
             dcr = dcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
             combined_total = pcr["total_score"] + dcr["total_score"]
             combined_max = pcr["max_score"] + dcr["max_score"]
@@ -560,7 +558,7 @@ async def get_student_exam_scores(
                 "student_id": {"$in": student_ids},
                 "publication_status": "published",
             },
-            projection={"submission_id": 1},
+            projection={"submission_id": 1, "publication_snapshot": 1},
         )
         if submission is None:
             raise HTTPException(
@@ -569,6 +567,28 @@ async def get_student_exam_scores(
             )
 
         submission_id = submission.get("submission_id", "")
+
+        question_catalog_for_integrity = await _get_pcr_question_catalog(
+            tenant_db, exam_id
+        )
+        publication_snapshot = submission.get("publication_snapshot")
+        if question_catalog_for_integrity:
+            from services.exampen_submission_readiness import (
+                validate_publication_snapshot,
+            )
+
+            if not validate_publication_snapshot(
+                publication_snapshot,
+                submission_id=submission_id,
+                exam_id=exam_id,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Published PCR results failed the integrity check and require "
+                        "teacher review before they can be shown"
+                    ),
+                )
 
         questions: List[QuestionScoreItem] = []
         total_score = 0.0
@@ -626,24 +646,36 @@ async def get_student_exam_scores(
                     )
 
             if question_catalog:
+                # Published PCR scores are read from the immutable release
+                # snapshot.  Mutable evaluation documents remain useful for
+                # staff audit, but cannot silently change a student's result
+                # after publication.
+                evaluated_by_question = {
+                    str(row.get("question_id") or ""): {
+                        "score": _safe_marks(row.get("score")),
+                        "max_score": _safe_marks(row.get("max_score")),
+                        "feedback": _student_safe_text(row.get("overall_feedback")),
+                        "answer_state": row.get("answer_state") or "detected",
+                        "mark_breakdown": _student_mark_breakdown(row),
+                        "reference_answer": _student_safe_text(
+                            row.get("reference_solution"), limit=5000
+                        ),
+                        "teacher_feedback": _student_safe_text(
+                            row.get("teacher_feedback")
+                        ),
+                        "question_number": _safe_question_number(
+                            row.get("question_number")
+                        ),
+                    }
+                    for row in publication_snapshot.get("score_rows", [])
+                    if isinstance(row, dict) and row.get("question_id")
+                }
+                missing_question_ids: List[str] = []
                 for question in question_catalog:
                     question_id = question["question_id"]
                     result = evaluated_by_question.get(question_id)
                     if result is None:
-                        questions.append(
-                            QuestionScoreItem(
-                                question_id=question_id,
-                                question_number=question["question_number"],
-                                score=0.0,
-                                max_score=question["max_marks"],
-                                feedback=(
-                                    "No answer was detected for this question, so 0 marks were awarded."
-                                ),
-                                eval_type="pcr",
-                                answer_state="not_attempted",
-                            )
-                        )
-                        total_max += question["max_marks"]
+                        missing_question_ids.append(question_id)
                         continue
 
                     total_score += result["score"]
@@ -664,6 +696,13 @@ async def get_student_exam_scores(
                             reference_answer=result["reference_answer"],
                             teacher_feedback=result["teacher_feedback"],
                         )
+                    )
+                if missing_question_ids:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            "Published PCR results are incomplete and require teacher review"
+                        ),
                     )
             else:
                 # Fallback for historical records where immutable question

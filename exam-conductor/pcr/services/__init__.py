@@ -33,6 +33,11 @@ from .ocr_service import OCRAdapter, OCRResult, LLMVisionCameraAdapter, LLMVisio
 from .solution_cache import SolutionCache
 from .submission_service import SubmissionService
 from .eval_core import EvalCore
+from .full_document_grading import (
+    FullDocumentGradingError,
+    FullDocumentGradingResult,
+    FullDocumentGradingService,
+)
 
 __all__ = [
     # OCR
@@ -48,4 +53,8 @@ __all__ = [
     "SubmissionService",
     # Evaluation core
     "EvalCore",
+    # Submission-level visual grading
+    "FullDocumentGradingError",
+    "FullDocumentGradingResult",
+    "FullDocumentGradingService",
 ]

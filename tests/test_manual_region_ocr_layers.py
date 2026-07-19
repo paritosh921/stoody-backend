@@ -1285,6 +1285,141 @@ def test_full_answer_sheet_mapping_uses_vision_for_weak_cases():
     assert result["summary"]["vision_used"] is True
 
 
+def test_question_anchored_subjective_solution_does_not_require_an_option_label():
+    from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
+
+    result = AnswerSheetVisionMapper()._normalise_question_anchored_mapping(
+        {
+            "question_index": 1,
+            "question_id": "q1",
+            "answer_text": "The two integers are -12 and 3 because their sum is -9.",
+            "final_answer_text": "-12 and 3",
+            "correct_answer": "",
+            "correct_answer_confidence": 0.0,
+            "confidence": 0.98,
+            "manual_review_required": False,
+        },
+        {
+            1: {
+                "id": "q1",
+                "question_type": "subjective",
+                "options": [],
+            }
+        },
+    )
+
+    assert result["requires_option_label"] is False
+    assert result["correct_answer"] == ""
+    assert result["manual_review_required"] is False
+
+
+def test_question_anchored_objective_solution_without_option_label_requires_review():
+    from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
+
+    result = AnswerSheetVisionMapper()._normalise_question_anchored_mapping(
+        {
+            "question_index": 1,
+            "question_id": "q1",
+            "answer_text": "The visible working does not state the selected option.",
+            "correct_answer": "",
+            "correct_answer_confidence": 0.0,
+            "confidence": 0.98,
+            "manual_review_required": False,
+        },
+        {
+            1: {
+                "id": "q1",
+                "question_type": "mcq",
+                "options": ["First", "Second", "Third", "Fourth"],
+            }
+        },
+    )
+
+    assert result["requires_option_label"] is True
+    assert result["manual_review_required"] is True
+
+
+def test_full_answer_sheet_question_anchored_subjective_solutions_can_auto_accept():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        async def extract_by_question(self, **kwargs):
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mode": "question_anchored",
+                "mappings": [
+                    {
+                        "question_id": "q1",
+                        "question_type": "subjective",
+                        "requires_option_label": False,
+                        "answer_block_id": "question_anchored_q_1",
+                        "answer_item_id": "question_anchored_q_1",
+                        "answer_number": "1",
+                        "correct_answer": "",
+                        "correct_answer_confidence": 0.0,
+                        "answer_text": "The two integers are -12 and 3.",
+                        "final_answer_text": "-12 and 3",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 0.98,
+                        "manual_review_required": True,
+                    },
+                    {
+                        "question_id": "q2",
+                        "question_type": "subjective",
+                        "requires_option_label": False,
+                        "answer_block_id": "question_anchored_q_2",
+                        "answer_item_id": "question_anchored_q_2",
+                        "answer_number": "2",
+                        "correct_answer": "",
+                        "correct_answer_confidence": 0.0,
+                        "answer_text": "Cube root 125 minus cube root 27 equals 5 minus 3.",
+                        "final_answer_text": "2",
+                        "mapping_strategy": "gpt_question_anchored",
+                        "confidence": 0.96,
+                        "manual_review_required": True,
+                    },
+                ],
+            }
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    db = FakeDb()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=FakeVisionMapper()).map_full_document_blocks(
+            db=db,
+            is_b2c=False,
+            document_id="doc-subjective",
+            question_docs=[
+                {"id": "q1", "text": "1. Find the integers", "question_type": "subjective", "extraction_order": 1},
+                {"id": "q2", "text": "2. Work out the expression", "question_type": "subjective", "extraction_order": 2},
+            ],
+            answer_blocks=[{"text": "OCR grouped the sheet badly.", "confidence": 0.2}],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert result["mapped_count"] == 2
+    assert result["manual_review_count"] == 0
+    assert result["summary"]["auto_acceptance_blocked"] is False
+    assert all(mapping["review_status"] == "accepted" for mapping in result["mappings"])
+    assert all(mapping["correct_answer_candidate"] == "" for mapping in result["mappings"])
+    assert all(mapping["requires_option_label"] is False for mapping in result["mappings"])
+
+
 def test_full_answer_sheet_question_anchored_vision_can_auto_accept_complete_result():
     from services.answer_sheet_mapping_service import AnswerSheetMappingService
 

@@ -45,15 +45,33 @@ async def test_student_score_breakdown_keeps_unanswered_questions_in_total():
             for number in (1, 2, 3)
         ]
     )
-    await db["evalpen_detected_responses"].insert_one(
-        {
+    await db["evalpen_detected_responses"].insert_many(
+        [{
             "response_id": "RESP-STUDENT-FULL-1",
             "submission_id": "SUB-STUDENT-FULL",
             "question_id": "EXAM-STUDENT-FULL::Q-1",
             "question_number": 1,
             "eval_status": "evaluated",
             "answer_state": "detected",
-        }
+        }] + [
+            {
+                "response_id": f"RESP-STUDENT-FULL-{number}",
+                "submission_id": "SUB-STUDENT-FULL",
+                "question_id": f"EXAM-STUDENT-FULL::Q-{number}",
+                "question_number": number,
+                "eval_status": "not_attempted",
+                "answer_state": "not_attempted",
+                "is_missing_response": True,
+                "absence_proven": True,
+                "detected_text": "",
+                "source_pages": [],
+                "question_assignment": {
+                    "method": "not_attempted",
+                    "absence_proof": {"verified": True, "method": "document_answer_mapping"},
+                },
+            }
+            for number in (2, 3)
+        ]
     )
     await db["evalpen_evaluations"].insert_one(
         {
@@ -82,6 +100,30 @@ async def test_student_score_breakdown_keeps_unanswered_questions_in_total():
                 },
             ],
         }
+    )
+    await db["evalpen_evaluations"].insert_many(
+        [
+            {
+                "evaluation_id": f"EVAL-STUDENT-FULL-{number}",
+                "response_id": f"RESP-STUDENT-FULL-{number}",
+                "question_id": f"EXAM-STUDENT-FULL::Q-{number}",
+                "total_score": 0.0,
+                "max_score": 4.0,
+                "overall_feedback": "Not attempted.",
+                "manual_review_required": False,
+            }
+            for number in (2, 3)
+        ]
+    )
+    from services.exampen_submission_readiness import build_publication_snapshot
+
+    snapshot = await build_publication_snapshot(
+        db, "SUB-STUDENT-FULL", actor_id="TEACHER-1"
+    )
+    snapshot.pop("published_at_dt")
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-STUDENT-FULL"},
+        {"$set": {"publication_snapshot": snapshot}},
     )
 
     with (

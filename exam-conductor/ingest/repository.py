@@ -293,18 +293,23 @@ class IngestRepository:
 
     async def insert_answer_pages_bulk(
         self, docs: List[Dict[str, Any]]
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, List[str]]:
         """Bulk-insert answer pages.  Skips duplicates (ING-03).
 
         Returns
         -------
-        (inserted_count, duplicate_count)
+        (inserted_count, duplicate_count, inserted_page_ids)
+
+        Returning the exact inserted IDs is required for safe compensating
+        cleanup.  Treating every attempted ID as newly inserted can delete an
+        older immutable page when a later submission write fails.
         """
         if not docs:
-            return 0, 0
+            return 0, 0, []
 
         inserted = 0
         duplicates = 0
+        inserted_page_ids: List[str] = []
 
         for doc in docs:
             _, already_existed = await self.insert_answer_page(doc)
@@ -312,8 +317,9 @@ class IngestRepository:
                 duplicates += 1
             else:
                 inserted += 1
+                inserted_page_ids.append(str(doc["page_id"]))
 
-        return inserted, duplicates
+        return inserted, duplicates, inserted_page_ids
 
     async def get_answer_pages(
         self, submission_id: str
