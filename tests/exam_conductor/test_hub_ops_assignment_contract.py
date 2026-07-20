@@ -418,6 +418,42 @@ async def test_link_local_hub_preserves_selected_tutors_on_relink():
 
 
 @pytest.mark.asyncio
+async def test_link_local_hub_rejects_same_id_from_different_hardware():
+    db = _fresh_db()
+    master_db = _fresh_db()
+    await db["exampen_hubs"].insert_one(
+        {"hub_id": "PI-SCH01-0001", "hardware_fingerprint": "hardware-a"}
+    )
+    await master_db["exampen_hubs"].insert_one(
+        {
+            "hub_id": "PI-SCH01-0001",
+            "db_name": "skb_test",
+            "institution_id": "INST-1",
+            "hardware_fingerprint": "hardware-a",
+        }
+    )
+
+    from api.v1.hub_ops_async import LinkLocalHubRequest, link_local_hub
+
+    with (
+        patch("api.v1.hub_ops_async._get_tenant_db", return_value=db),
+        patch("api.v1.hub_ops_async._get_master_db", return_value=master_db),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await link_local_hub(
+                body=LinkLocalHubRequest(
+                    hub_id="PI-SCH01-0001",
+                    hardware_fingerprint="hardware-b",
+                ),
+                current_user=_admin_user(),
+                db=None,  # type: ignore[arg-type]
+            )
+
+    assert exc_info.value.status_code == 409
+    assert "different hardware" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_hub_session_events_move_exam_lifecycle():
     db = _fresh_db()
     await _seed_hub(db)

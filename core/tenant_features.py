@@ -338,7 +338,6 @@ FEATURE_PATH_PREFIXES: Dict[str, Tuple[str, ...]] = {
         "/api/v1/video",
     ),
     "tutor_online_class": (
-        "/api/v1/classroom",
         "/api/v1/meeting",
         "/api/v1/online-class",
         "/api/v1/sessions",

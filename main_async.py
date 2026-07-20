@@ -205,15 +205,6 @@ except Exception as e:
     _online_class_available = False
     logging.warning(f"Online class routes disabled: {str(e)}")
 
-# Classroom Management routes (Online Class with Meet links)
-try:
-    from api.v1.classroom_async import router as classroom_router
-    _classroom_available = True
-except Exception as e:
-    classroom_router = None
-    _classroom_available = False
-    logging.warning(f"Classroom routes disabled: {str(e)}")
-
 # Meeting Management routes (online class video integration)
 try:
     from api.v1.meeting_async import router as meeting_router
@@ -1306,17 +1297,6 @@ app.include_router(
     tags=["Two-Factor Authentication (Legacy)"]
 )
 logger.info("✅ TOTP 2FA authentication routes enabled")
-
-# Classroom Management routes (Online Class with Meet links)
-if _classroom_available and classroom_router:
-    app.include_router(
-        classroom_router,
-        prefix=f"{API_V1_PREFIX}/classroom",
-        tags=["Classroom"]
-    )
-    logger.info("✅ Classroom routes enabled")
-else:
-    logger.warning("⚠️ Classroom routes disabled")
 
 # Meeting Management routes (online class video integration)
 if _meeting_available and meeting_router:

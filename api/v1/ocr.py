@@ -123,6 +123,6 @@ async def ocr_status():
     """Check OCR service availability."""
     ocr_service = get_ocr_service()
     return {
-        "mistral_available": ocr_service.mistral_available,
-        "openai_available": ocr_service.openai_available,
+        "provider": "llm_gate",
+        "gate_available": ocr_service.gate_available,
     }

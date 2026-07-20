@@ -231,6 +231,8 @@ class CreateMeetingRequest(BaseModel):
     course_type: Optional[str] = Field(None, description="Plan type (e.g., 'foundation', 'advanced')")
     scheduled_at: datetime = Field(..., description="Scheduled start time")
     duration_minutes: int = Field(60, ge=15, le=480, description="Duration in minutes")
+    calendar_period_id: Optional[str] = Field(None, description="Source timetable period for calendar-created meetings")
+    timetable_id: Optional[str] = Field(None, description="Source timetable for calendar-created meetings")
 
 
 class UpdateMeetingRequest(BaseModel):
@@ -241,6 +243,8 @@ class UpdateMeetingRequest(BaseModel):
     course_type: Optional[str] = Field(None, description="Plan type (e.g., 'foundation', 'advanced')")
     scheduled_at: Optional[datetime] = Field(None, description="Scheduled start time")
     duration_minutes: Optional[int] = Field(None, ge=15, le=480, description="Duration in minutes")
+    calendar_period_id: Optional[str] = Field(None, description="Source timetable period for calendar-created meetings")
+    timetable_id: Optional[str] = Field(None, description="Source timetable for calendar-created meetings")
 
 
 class ExtendMeetingRequest(BaseModel):
@@ -278,6 +282,8 @@ class MeetingResponse(BaseModel):
     ended_at: Optional[datetime] = None
     provider_details: Optional[ProviderDetails] = None
     is_archived: bool = False
+    calendar_period_id: Optional[str] = None
+    timetable_id: Optional[str] = None
 
 
 class StudentMeetingResponse(BaseModel):
@@ -296,6 +302,8 @@ class StudentMeetingResponse(BaseModel):
     can_join: bool = False
     started_at: Optional[datetime] = None
     provider_details: Optional[ProviderDetails] = None
+    calendar_period_id: Optional[str] = None
+    timetable_id: Optional[str] = None
 
 
 async def get_database(request: Request) -> DatabaseManager:
@@ -427,6 +435,8 @@ def _meeting_response_from_doc(
         ended_at=meeting.get("ended_at"),
         provider_details=provider,
         is_archived=bool(meeting.get("is_archived")),
+        calendar_period_id=meeting.get("calendar_period_id"),
+        timetable_id=meeting.get("timetable_id"),
     )
 
 
@@ -477,6 +487,8 @@ async def create_meeting(
         "course_type": meeting_data.course_type,
         "scheduled_at": meeting_data.scheduled_at,
         "duration_minutes": meeting_data.duration_minutes,
+        "calendar_period_id": meeting_data.calendar_period_id,
+        "timetable_id": meeting_data.timetable_id,
         "meet_link": meet_link,
         "meet_code": meet_code,
         "provider": "jitsi",
@@ -769,11 +781,16 @@ async def get_student_meetings(
     now = datetime.now(timezone.utc)
     for m in meetings:
         can_join = _is_student_joinable(m, now=now)
-        meet_link, meet_code = (
-            _public_video_fields(m.get("meeting_id"))
+        provider = (
+            _provider_or_none(
+                m.get("meeting_id"),
+                current_user=current_user,
+                moderator=False,
+            )
             if can_join
-            else (None, None)
+            else None
         )
+        meet_link, meet_code = _provider_video_fields(provider)
         responses.append(
             StudentMeetingResponse(
                 meeting_id=m.get("meeting_id"),
@@ -789,7 +806,9 @@ async def get_student_meetings(
                 status=_student_visible_status(m, now=now),
                 can_join=can_join,
                 started_at=m.get("started_at"),
-                provider_details=None,
+                provider_details=provider,
+                calendar_period_id=m.get("calendar_period_id"),
+                timetable_id=m.get("timetable_id"),
             )
         )
     return responses

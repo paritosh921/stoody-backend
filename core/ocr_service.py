@@ -7,18 +7,15 @@ question images. Uses OpenAI GPT vision as the provider.
 SWM-011: All LLM calls — text and vision — are routed through the shared
 gate (caller_id ``dcr_ai``) per C4 policy.  Vision calls use
 ``gate.call(messages=...)`` which forwards the multimodal messages array
-to the provider.  If the gate module is not deployed, the direct OpenAI
-provider is used as a fallback with a CRITICAL log so the C4 violation
-is visible in monitoring.
+to the provider. If the gate module is not deployed, inference fails closed
+so no provider call bypasses shared accounting and budget enforcement.
 """
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 from typing import Any, Dict, List, Optional
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,12 +25,7 @@ logger = logging.getLogger(__name__)
 # API Configuration
 
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-
-# Provider selection
-DEFAULT_PROVIDER = os.getenv("OCR_PROVIDER", "openai")  # prioritize openai due to stability
 
 
 # ---------------------------------------------------------------------------
@@ -43,19 +35,16 @@ DEFAULT_PROVIDER = os.getenv("OCR_PROVIDER", "openai")  # prioritize openai due 
 # with caller_id ``dcr_ai``.  Vision calls use ``gate.call(messages=...)``
 # which forwards the multimodal messages array to the provider.
 #
-# If the gate module is not deployed, the direct OpenAI provider is used
-# as a fallback with a CRITICAL log so the C4 violation is visible in
-# monitoring.
+# If the gate module is not deployed, inference fails closed.
 # ---------------------------------------------------------------------------
 
 _gate_module = None
 _gate_import_attempted = False  # True once we have tried (success or failure)
-_gate_unavailable = False       # True when import was attempted and failed
 
 
 def _try_load_gate_module():
     """Attempt to import the LLM gate module once.  Returns the module or None."""
-    global _gate_module, _gate_import_attempted, _gate_unavailable
+    global _gate_module, _gate_import_attempted
     if _gate_module is not None:
         return _gate_module
     if _gate_import_attempted:
@@ -67,13 +56,9 @@ def _try_load_gate_module():
         logger.info("LLM gate module loaded for OCR bridge (SWM-011)")
         return _gate_module
     except ImportError:
-        _gate_unavailable = True
-        # CRITICAL: C4 requires all LLM calls through the gate.  If the gate
-        # is not importable the deployment is non-compliant.
         logger.critical(
-            "SWM-011 C4 VIOLATION: exam-conductor.llm_gate not importable — "
-            "OCR LLM calls (text + vision) will bypass the gate.  "
-            "Deploy exam-conductor to restore compliance."
+            "SWM-011 C4: exam-conductor.llm_gate not importable; "
+            "OCR inference is unavailable until exam-conductor is deployed."
         )
         return None
 
@@ -291,13 +276,12 @@ class OCRService:
     """
 
     def __init__(self):
-        self.openai_available = bool(OPENAI_API_KEY)
-        self.http_client = httpx.AsyncClient(timeout=60.0)
+        logger.info("OCRService initialized with shared LLM gate routing")
 
-        if self.openai_available:
-            logger.info("OCRService initialized with OpenAI")
-        else:
-            logger.warning("OCRService: No OpenAI API key configured, OCR will be unavailable")
+    @property
+    def gate_available(self) -> bool:
+        """Return whether the required exam-conductor LLM gate is loadable."""
+        return _try_load_gate_module() is not None
 
     async def analyze_image(
         self,
@@ -369,62 +353,6 @@ Return ONLY the extracted text, nothing else. No explanations, no comments, no f
             temperature=temperature,
         )
         return {"success": True, "text": gate_content, "provider": "gate:dcr_ai"}
-
-
-
-
-    async def _analyze_with_openai(self, image_b64: str, prompt: str) -> dict:
-        """Analyze image using OpenAI GPT vision API."""
-        url = f"{OPENAI_BASE_URL}/chat/completions"
-
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        img_raw, mime = await _normalize_image_b64(image_b64)
-
-        payload = {
-            "model": OPENAI_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{img_raw}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                }
-            ],
-        }
-
-        # Use max_completion_tokens for newer models, max_tokens for older ones
-        # GPT-5.x, GPT-4o, GPT-4-turbo, o1-preview, o1-mini use the new parameter
-        model_lower = OPENAI_MODEL.lower()
-        if any(m in model_lower for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
-            payload['max_completion_tokens'] = 1024
-        else:
-            payload['max_tokens'] = 1024
-
-        response = await self.http_client.post(url, json=payload, headers=headers)
-
-        if response.status_code != 200:
-            error_text = response.text
-            logger.error(f"OpenAI vision error: {response.status_code} - {error_text}")
-            return {"success": False, "text": "", "error": error_text}
-
-        data = response.json()
-        text = data["choices"][0]["message"]["content"]
-
-        return {"success": True, "text": text, "provider": "openai"}
 
     async def evaluate_answer(
         self,
@@ -515,88 +443,91 @@ Only respond with the JSON, nothing else."""
                 "provider": "gate:dcr_ai",
             }
 
-    async def _evaluate_with_openai(self, image_b64: str, prompt: str) -> dict:
-        """Evaluate using OpenAI."""
+    async def evaluate_answers(
+        self,
+        question_text: str,
+        answer_images: List[Dict[str, str]],
+        *,
+        tenant_db: Any = None,
+        correct_answer: Optional[str] = None,
+    ) -> Dict[str, dict]:
+        """Evaluate multiple labeled student images in one gate call."""
         import json as json_module
 
-        url = f"{OPENAI_BASE_URL}/chat/completions"
+        if not answer_images:
+            return {}
 
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
+        labels = [str(image.get("label") or "") for image in answer_images]
+        if any(not label for label in labels) or len(set(labels)) != len(labels):
+            raise ValueError("Grouped evaluation requires unique non-empty labels")
 
-        img_raw, mime = await _normalize_image_b64(image_b64)
+        prompt = f"""You are a teacher evaluating multiple handwritten responses to one question.
 
-        payload = {
-            "model": OPENAI_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{mime};base64,{img_raw}",
-                                "detail": "high",
-                            },
-                        },
-                    ],
-                }
-            ],
-        }
+QUESTION: {question_text}
+"""
+        if correct_answer:
+            prompt += f"\nCORRECT ANSWER: {correct_answer}\n"
+        prompt += f"""
+Each following image is labeled with its pen ID. Evaluate every image independently.
+Return one result for each of these labels: {json_module.dumps(labels)}.
 
-        # Use max_completion_tokens for newer models
-        model_lower = OPENAI_MODEL.lower()
-        if any(m in model_lower for m in ['gpt-4o', 'gpt-4-turbo', 'gpt-5', 'o1-preview', 'o1-mini']):
-            payload['max_completion_tokens'] = 512
-        else:
-            payload['max_tokens'] = 512
+Respond with JSON only in this exact shape:
+{{
+  "results": [
+    {{
+      "pen_id": "the exact image label",
+      "score": "correct or incorrect or partial or inconclusive",
+      "extracted_answer": "what was read",
+      "correct_answer": "the correct answer if known",
+      "feedback": "brief feedback"
+    }}
+  ]
+}}
+"""
 
-        response = await self.http_client.post(url, json=payload, headers=headers)
-
-        if response.status_code != 200:
-            return {"success": False, "error": response.text}
-
-        data = response.json()
-        response_text = data["choices"][0]["message"]["content"]
-
-        # Parse the JSON response
-        try:
-            # Clean up response - sometimes models add markdown code blocks
-            clean_text = response_text.strip()
-            if clean_text.startswith("```"):
-                clean_text = clean_text.split("```")[1]
-                if clean_text.startswith("json"):
-                    clean_text = clean_text[4:]
+        gate_content = await _gate_vision_images_call(
+            tenant_db,
+            answer_images,
+            prompt,
+            max_tokens=min(4096, max(768, len(answer_images) * 512)),
+            temperature=0.2,
+        )
+        clean_text = (gate_content or "").strip()
+        if clean_text.startswith("```"):
+            clean_text = clean_text.split("```", 2)[1]
+            if clean_text.startswith("json"):
+                clean_text = clean_text[4:]
             clean_text = clean_text.strip()
 
-            result = json_module.loads(clean_text)
-            return {
-                "success": True,
-                "score": result.get("score", "partial"),
-                "extracted_answer": result.get("extracted_answer", ""),
-                "feedback": result.get("feedback", ""),
-                "provider": "openai",
-            }
-        except json_module.JSONDecodeError:
-            # Fallback: try to extract score from text
-            lower_text = response_text.lower()
-            if "correct" in lower_text and "incorrect" not in lower_text:
-                score = "correct"
-            elif "incorrect" in lower_text:
-                score = "incorrect"
-            else:
-                score = "partial"
+        try:
+            decoded = json_module.loads(clean_text)
+        except json_module.JSONDecodeError as exc:
+            raise ValueError("Grouped evaluation returned invalid JSON") from exc
 
-            return {
+        rows = decoded.get("results") if isinstance(decoded, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("Grouped evaluation response has no results list")
+
+        expected = set(labels)
+        results: Dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            pen_id = str(row.get("pen_id") or "")
+            if pen_id not in expected or pen_id in results:
+                continue
+            score = str(row.get("score") or "inconclusive").lower()
+            if score not in ("correct", "incorrect", "partial", "inconclusive"):
+                score = "inconclusive"
+            results[pen_id] = {
                 "success": True,
                 "score": score,
-                "extracted_answer": "",
-                "feedback": response_text[:200],
-                "provider": "openai",
+                "extracted_answer": row.get("extracted_answer", ""),
+                "correct_answer": row.get("correct_answer", correct_answer or ""),
+                "feedback": row.get("feedback", ""),
+                "provider": "gate:dcr_ai",
             }
+        return results
 
     async def generate_solution(
         self,
@@ -654,8 +585,8 @@ Only respond with the JSON, nothing else."""
             }
 
     async def close(self):
-        """Close HTTP client."""
-        await self.http_client.aclose()
+        """Keep the service lifecycle API; the shared gate owns its clients."""
+        return None
 
 
 # Singleton instance

@@ -33,6 +33,8 @@ router = APIRouter(prefix="/api/v1/question-attempts", tags=["question-attempts"
 ATTEMPTS_DIR = Path(__file__).resolve().parents[2] / "data" / "question_attempts"
 
 EVAL_CONCURRENCY = 4
+EVAL_GROUP_SIZE = 6
+EVAL_GROUP_CONCURRENCY = 2
 
 
 def _verify_tenant(attempt: QuestionAttempt, user: dict):
@@ -598,10 +600,26 @@ async def evaluate_all_responses(request: Request, attempt_id: str, payload: Eva
     ocr_service = get_ocr_service()
     tenant_db = await _resolve_tenant_db(user)
 
-    sem = asyncio.Semaphore(EVAL_CONCURRENCY)
+    fallback_sem = asyncio.Semaphore(EVAL_CONCURRENCY)
+    group_sem = asyncio.Semaphore(EVAL_GROUP_CONCURRENCY)
+
+    def project_result(pen_id: str, result: dict) -> EvaluationResult:
+        score = result.get("score", "inconclusive")
+        if score not in ("correct", "incorrect", "partial", "inconclusive"):
+            score = "inconclusive"
+        return EvaluationResult(
+            success=result.get("success", False),
+            pen_id=pen_id,
+            score=score,
+            extracted_answer=result.get("extracted_answer"),
+            correct_answer=correct_answer or result.get("correct_answer"),
+            feedback=result.get("feedback"),
+            ai_solution=attempt.ai_solution if score != "correct" else None,
+            error=result.get("error"),
+        )
 
     async def evaluate_single(pen_id: str, image_b64: str) -> tuple:
-        async with sem:
+        async with fallback_sem:
             try:
                 result = await ocr_service.evaluate_answer(
                     question_text=question_text,
@@ -609,20 +627,7 @@ async def evaluate_all_responses(request: Request, attempt_id: str, payload: Eva
                     tenant_db=tenant_db,
                     correct_answer=correct_answer,
                 )
-                score = result.get("score", "inconclusive")
-                if score not in ("correct", "incorrect", "partial", "inconclusive"):
-                    score = "inconclusive"
-
-                return (pen_id, EvaluationResult(
-                    success=result.get("success", False),
-                    pen_id=pen_id,
-                    score=score,
-                    extracted_answer=result.get("extracted_answer"),
-                    correct_answer=correct_answer or result.get("correct_answer"),
-                    feedback=result.get("feedback"),
-                    ai_solution=attempt.ai_solution if score != "correct" else None,
-                    error=result.get("error"),
-                ))
+                return pen_id, project_result(pen_id, result)
             except Exception as e:
                 logger.error(f"[QLock] Evaluation failed for pen {pen_id}: {e}")
                 return (pen_id, EvaluationResult(
@@ -632,12 +637,48 @@ async def evaluate_all_responses(request: Request, attempt_id: str, payload: Eva
                     error=str(e),
                 ))
 
-    tasks = [
-        evaluate_single(pen_id, image_b64)
-        for pen_id, image_b64 in payload.pen_images.items()
-    ]
+    async def evaluate_group(group: List[tuple[str, str]]) -> List[tuple[str, EvaluationResult]]:
+        grouped_results: Dict[str, dict] = {}
+        try:
+            async with group_sem:
+                grouped_results = await ocr_service.evaluate_answers(
+                    question_text=question_text,
+                    answer_images=[
+                        {"label": pen_id, "image_b64": image_b64}
+                        for pen_id, image_b64 in group
+                    ],
+                    tenant_db=tenant_db,
+                    correct_answer=correct_answer,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[QLock] Grouped evaluation failed for %d pen(s); falling back individually: %s",
+                len(group),
+                exc,
+            )
 
-    results_list = await asyncio.gather(*tasks)
+        completed = [
+            (pen_id, project_result(pen_id, grouped_results[pen_id]))
+            for pen_id, _image_b64 in group
+            if pen_id in grouped_results
+        ]
+        completed_ids = {pen_id for pen_id, _result in completed}
+        missing = [
+            evaluate_single(pen_id, image_b64)
+            for pen_id, image_b64 in group
+            if pen_id not in completed_ids
+        ]
+        if missing:
+            completed.extend(await asyncio.gather(*missing))
+        return completed
+
+    items = list(payload.pen_images.items())
+    groups = [
+        items[index:index + EVAL_GROUP_SIZE]
+        for index in range(0, len(items), EVAL_GROUP_SIZE)
+    ]
+    grouped_lists = await asyncio.gather(*(evaluate_group(group) for group in groups))
+    results_list = [result for group_results in grouped_lists for result in group_results]
     results = {pen_id: result for pen_id, result in results_list}
 
     errors = [
@@ -646,7 +687,12 @@ async def evaluate_all_responses(request: Request, attempt_id: str, payload: Eva
         if not r.success and r.error
     ]
 
-    logger.info(f"[QLock] Evaluated {len(results)} responses for attempt {attempt_id}")
+    logger.info(
+        "[QLock] Evaluated %d responses for attempt %s in %d grouped request(s)",
+        len(results),
+        attempt_id,
+        len(groups),
+    )
 
     return EvaluateAllResponse(
         success=len(errors) == 0,

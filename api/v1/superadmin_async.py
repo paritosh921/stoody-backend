@@ -16,7 +16,7 @@ import jwt
 import pyotp
 from bson import ObjectId
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from passlib.context import CryptContext
@@ -55,6 +55,7 @@ TOTP_ISSUER = "Stoody Super Admin"
 TOTP_ENC_KEY = os.getenv("TOTP_ENC_KEY", "")
 AUTHORIZATION_CODE_PATTERN = re.compile(r"^[A-Z0-9]{6}$")
 INSTITUTION_ID_PATTERN = re.compile(r"^[A-Z]{4}-[0-9]{4}$")
+PEN_MAC_PATTERN = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
 
 
 # ============ PYDANTIC MODELS ============
@@ -578,6 +579,72 @@ def ensure_tenant_owned_by_admin(tenant: Dict[str, Any], admin_id: str) -> None:
         )
     if str(assigned) != admin_id:
         raise HTTPException(status_code=403, detail="Access denied for this tenant")
+
+
+def build_pen_lookup_query(raw_query: str) -> tuple[str, str, Dict[str, Any]]:
+    """Build an exact pen lookup filter for MAC and generated pen IDs."""
+    query = (raw_query or "").strip()
+    if len(query) < 3:
+        raise HTTPException(status_code=400, detail="Enter at least 3 characters for a pen MAC or pen ID")
+    if len(query) > 96:
+        raise HTTPException(status_code=400, detail="Pen lookup query is too long")
+
+    normalized = query.upper() if PEN_MAC_PATTERN.match(query.upper()) else query
+    clauses: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for field, value in (
+        ("pen_mac", query.upper()),
+        ("pen_id", query),
+        ("pen_id", query.lower()),
+        ("pen_id", query.upper()),
+    ):
+        if field == "pen_mac" and not PEN_MAC_PATTERN.match(value):
+            continue
+        key = (field, value)
+        if value and key not in seen:
+            clauses.append({field: value})
+            seen.add(key)
+
+    if not clauses:
+        clauses.append({"pen_id": query})
+
+    return query, normalized, {"$or": clauses}
+
+
+async def attach_global_pen_student_metadata(
+    tenant_db,
+    pen_docs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    usernames = sorted({p.get("user_id") for p in pen_docs if p.get("user_id")})
+    student_lookup: Dict[str, Dict[str, Any]] = {}
+    if usernames:
+        cursor = tenant_db["students"].find(
+            {"username": {"$in": usernames}},
+            {"username": 1, "student_id": 1, "name": 1, "full_name": 1},
+        )
+        async for doc in cursor:
+            student_lookup[doc["username"]] = doc
+
+    rows: List[Dict[str, Any]] = []
+    for pen in pen_docs:
+        username = pen.get("user_id")
+        student_doc = student_lookup.get(username) if username else None
+        rows.append(
+            {
+                "pen_id": pen.get("pen_id"),
+                "pen_mac": pen.get("pen_mac"),
+                "pen_name": pen.get("pen_name"),
+                "status": pen.get("status", "unknown"),
+                "user_id": username,
+                "student_id": (student_doc or {}).get("student_id"),
+                "student_name": (student_doc or {}).get("full_name") or (student_doc or {}).get("name"),
+                "last_registered_at": pen.get("last_registered_at"),
+                "created_at": pen.get("created_at"),
+                "deregistered_at": pen.get("deregistered_at"),
+            }
+        )
+    return rows
 
 
 async def get_tenant_for_admin_or_error(master_db, tenant_id: str, admin_id: str) -> Dict[str, Any]:
@@ -1321,6 +1388,85 @@ async def update_tenant_features_v2(
         "tenant_id": tenant_id,
         "features_v2": after_v2,
         "changed_features": changed_features,
+    }
+
+
+@router.get("/tenants/{tenant_id}/pen-lookup")
+async def lookup_pen_globally_for_tenant(
+    tenant_id: str,
+    pen_id: str = Query(..., min_length=3, max_length=96),
+    include_deregistered: bool = Query(True),
+    db: DatabaseManager = Depends(get_database),
+    admin: Dict = Depends(verify_superadmin_token),
+):
+    """Look up a pen binding across all tenant DBs visible to this Super Admin."""
+    master_db = await get_master_db_or_503(db)
+    selected_tenant = await get_tenant_for_admin_or_error(master_db, tenant_id, admin["admin_id"])
+    raw_query, normalized_query, pen_filter = build_pen_lookup_query(pen_id)
+
+    assigned_tenants = await master_db["tenants"].find(
+        {"assigned_superadmin_id": ObjectId(admin["admin_id"])},
+        {
+            "_id": 1,
+            "institution_id": 1,
+            "tenant_id": 1,
+            "institution_name": 1,
+            "organization": 1,
+            "db_name": 1,
+            "status": 1,
+        },
+    ).to_list(length=1000)
+
+    results: List[Dict[str, Any]] = []
+    skipped_tenants = 0
+    find_filter: Dict[str, Any] = dict(pen_filter)
+    if not include_deregistered:
+        find_filter["status"] = "active"
+
+    for tenant in assigned_tenants:
+        db_name = tenant.get("db_name")
+        if not db_name:
+            skipped_tenants += 1
+            continue
+        try:
+            tenant_db = await db.get_tenant_db(db_name)
+            if tenant_db is None:
+                skipped_tenants += 1
+                continue
+            pen_docs = await tenant_db["pens"].find(find_filter).sort("last_registered_at", -1).to_list(length=100)
+            annotated = await attach_global_pen_student_metadata(tenant_db, pen_docs)
+        except Exception as exc:
+            skipped_tenants += 1
+            logger.warning("Superadmin pen lookup skipped tenant db %s: %s", db_name, exc)
+            continue
+
+        for row in annotated:
+            results.append(
+                {
+                    **row,
+                    "tenant_id": str(tenant["_id"]),
+                    "institution_id": tenant.get("institution_id") or tenant.get("tenant_id"),
+                    "institution_name": tenant.get("institution_name") or tenant.get("organization") or "Unknown institution",
+                    "db_name": db_name,
+                    "is_selected_tenant": str(tenant["_id"]) == str(selected_tenant["_id"]),
+                }
+            )
+
+    def _sort_key(row: Dict[str, Any]) -> tuple[int, int, float]:
+        status_rank = 0 if row.get("status") == "active" else 1
+        last_registered = row.get("last_registered_at")
+        last_registered_ts = last_registered.timestamp() if isinstance(last_registered, datetime) else 0.0
+        return (0 if row.get("is_selected_tenant") else 1, status_rank, -last_registered_ts)
+
+    results.sort(key=_sort_key)
+    return {
+        "query": raw_query,
+        "normalized_query": normalized_query,
+        "selected_tenant_id": str(selected_tenant["_id"]),
+        "total_matches": len(results),
+        "scanned_tenants": len(assigned_tenants) - skipped_tenants,
+        "skipped_tenants": skipped_tenants,
+        "results": results,
     }
 
 

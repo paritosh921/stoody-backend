@@ -301,6 +301,7 @@ class LinkLocalHubRequest(BaseModel):
     hub_name: Optional[str] = Field(None, max_length=120)
     hostname: Optional[str] = Field(None, max_length=120)
     mac_address: Optional[str] = Field(None, max_length=64)
+    hardware_fingerprint: Optional[str] = Field(None, max_length=128)
     ip_address: Optional[str] = Field(None, max_length=64)
     firmware_version: Optional[str] = Field(None, max_length=64)
     capabilities: List[str] = Field(default_factory=list)
@@ -1210,6 +1211,21 @@ async def link_local_hub(
                 detail="Hub is already linked to another tenant",
             )
 
+    incoming_fingerprint = str(body.hardware_fingerprint or "").strip().lower()
+    existing_fingerprint = str(
+        (existing_hub or {}).get("hardware_fingerprint")
+        or (existing_master or {}).get("hardware_fingerprint")
+        or ""
+    ).strip().lower()
+    if incoming_fingerprint and existing_fingerprint and incoming_fingerprint != existing_fingerprint:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Hub ID {hub_id} is already assigned to different hardware. "
+                "Assign this Raspberry Pi a unique hub ID before linking."
+            ),
+        )
+
     device_credential = _new_hub_device_credential()
     credential_version = 1
     set_doc = {
@@ -1220,6 +1236,7 @@ async def link_local_hub(
         "db_name": db_name,
         "hostname": body.hostname,
         "mac_address": body.mac_address,
+        "hardware_fingerprint": incoming_fingerprint or existing_fingerprint or None,
         "ip_address": body.ip_address,
         "firmware_version": body.firmware_version,
         "capabilities": capabilities,
@@ -1272,6 +1289,7 @@ async def link_local_hub(
                 "hub_name": body.hub_name,
                 "institution_id": institution_id,
                 "db_name": db_name,
+                "hardware_fingerprint": incoming_fingerprint or existing_fingerprint or None,
                 "status": "linked",
                 "link_method": "admin_login",
                 "last_seen_at": now,
