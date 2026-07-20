@@ -7,7 +7,7 @@ from io import BytesIO
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.ai_gateway_service import AIGatewayService, estimate_ocr_tokens, estimate_text_tokens
 from utils.s3_storage import get_public_url, upload_file
@@ -19,12 +19,24 @@ class AnswerSheetVisionMapper:
     def __init__(self, model: Optional[str] = None, max_pages: Optional[int] = None):
         self.model = model or os.getenv("ANSWER_MAPPING_VISION_MODEL", "gpt-5.4-mini")
         self.max_pages = max(1, int(max_pages or os.getenv("ANSWER_MAPPING_VISION_MAX_PAGES", "12")))
+        self.auto_orientation_enabled = str(
+            os.getenv("ANSWER_MAPPING_AUTO_ORIENTATION_ENABLED", "true")
+        ).lower() not in {"0", "false", "no"}
+        self.orientation_line_ratio = max(
+            1.15,
+            float(os.getenv("ANSWER_MAPPING_SIDEWAYS_LINE_RATIO", "1.45")),
+        )
+        self.orientation_recovery_max_pages = max(
+            1,
+            int(os.getenv("ANSWER_MAPPING_ORIENTATION_RECOVERY_MAX_PAGES", "6")),
+        )
 
     async def extract_by_question(
         self,
         *,
         pdf_bytes: bytes,
         question_docs: List[Dict[str, Any]],
+        answer_blocks: Optional[List[Dict[str, Any]]] = None,
         page_summaries: Optional[List[Dict[str, Any]]] = None,
         layout_report: Optional[Dict[str, Any]] = None,
         gateway_context: Optional[Dict[str, Any]] = None,
@@ -41,7 +53,11 @@ class AnswerSheetVisionMapper:
                 "mappings": [],
             }
 
-        page_renders = self._render_relevant_pages(pdf_bytes, [])
+        page_renders = self._render_relevant_pages(
+            pdf_bytes,
+            [],
+            recover_unknown_orientation=not bool(answer_blocks),
+        )
         if not page_renders:
             return {
                 "used": False,
@@ -60,6 +76,7 @@ class AnswerSheetVisionMapper:
             question_docs=question_docs,
             page_summaries=page_summaries or [],
             layout_report=layout_report,
+            render_manifest=self._render_manifest(page_renders),
         )
 
         async def _raw_call():
@@ -68,6 +85,7 @@ class AnswerSheetVisionMapper:
             client = AsyncOpenAI(api_key=openai_key)
             content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
             for render in page_renders:
+                content.append({"type": "text", "text": self._render_label(render)})
                 content.append(
                     {
                         "type": "image_url",
@@ -148,7 +166,11 @@ class AnswerSheetVisionMapper:
             "mode": "question_anchored",
             "mappings": mappings,
             "notes": parsed.get("notes", []) if isinstance(parsed, dict) else [],
-            "rendered_pages": [render["page_index"] for render in page_renders],
+            "rendered_pages": self._rendered_page_indexes(page_renders),
+            "render_orientations": self._render_manifest(page_renders),
+            "orientation_recovery_used": any(
+                int(render.get("rotation_degrees") or 0) != 0 for render in page_renders
+            ),
         }
 
     async def map(
@@ -196,6 +218,7 @@ class AnswerSheetVisionMapper:
             client = AsyncOpenAI(api_key=openai_key)
             content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
             for render in page_renders:
+                content.append({"type": "text", "text": self._render_label(render)})
                 content.append(
                     {
                         "type": "image_url",
@@ -262,10 +285,19 @@ class AnswerSheetVisionMapper:
             "model": self.model,
             "mappings": [self._normalise_mapping(mapping) for mapping in mappings if isinstance(mapping, dict)],
             "notes": parsed.get("notes", []) if isinstance(parsed, dict) else [],
-            "rendered_pages": [render["page_index"] for render in page_renders],
+            "rendered_pages": self._rendered_page_indexes(page_renders),
+            "render_orientations": self._render_manifest(page_renders),
+            "orientation_recovery_used": any(
+                int(render.get("rotation_degrees") or 0) != 0 for render in page_renders
+            ),
         }
 
-    def _render_relevant_pages(self, pdf_bytes: bytes, answer_blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _render_relevant_pages(
+        self,
+        pdf_bytes: bytes,
+        answer_blocks: List[Dict[str, Any]],
+        recover_unknown_orientation: bool = False,
+    ) -> List[Dict[str, Any]]:
         try:
             import fitz
         except Exception:
@@ -278,25 +310,205 @@ class AnswerSheetVisionMapper:
 
         try:
             page_indexes = self._page_indexes(answer_blocks, len(doc))
+            bounded_unknown_recovery = bool(
+                recover_unknown_orientation
+                and len(page_indexes) <= self.orientation_recovery_max_pages
+            )
             renders: List[Dict[str, Any]] = []
             for page_index in page_indexes[: self.max_pages]:
                 page = doc[page_index]
                 mat = fitz.Matrix(180 / 72, 180 / 72)
                 pix = page.get_pixmap(matrix=mat)
                 image_bytes = pix.tobytes("png")
-                renders.append(
-                    {
-                        "page_index": page_index,
-                        "b64": base64.b64encode(image_bytes).decode("utf-8"),
-                        "image_bytes": image_bytes,
-                        "bytes": len(image_bytes),
-                        "width": pix.width,
-                        "height": pix.height,
-                    }
+                renders.extend(
+                    self._orientation_aware_renders(
+                        page_index=page_index,
+                        image_bytes=image_bytes,
+                        width=pix.width,
+                        height=pix.height,
+                        recover_unknown_orientation=bounded_unknown_recovery,
+                    )
                 )
             return renders
         finally:
             doc.close()
+
+    def _orientation_aware_renders(
+        self,
+        *,
+        page_index: int,
+        image_bytes: bytes,
+        width: int,
+        height: int,
+        recover_unknown_orientation: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return one normal render or two bounded sideways recovery candidates.
+
+        Ruled notebook pages provide a strong local signal: in an upright page the
+        long rules are horizontal, while a sideways camera/PDF upload turns them
+        vertical. Direction cannot be established safely without reading the page,
+        so suspicious pages are represented by clockwise 90 and 270 degree
+        candidates in the *same* model request. This avoids another paid API call
+        and lets the vision model choose the readable candidate.
+        """
+        sideways, evidence = self._detect_sideways_page(image_bytes)
+        rotations = (
+            [90, 270]
+            if sideways
+            else ([0, 90, 270] if recover_unknown_orientation else [0])
+        )
+        renders: List[Dict[str, Any]] = []
+        for rotation in rotations:
+            rotated_bytes, rotated_width, rotated_height = self._rotate_png(
+                image_bytes=image_bytes,
+                rotation_degrees=rotation,
+                fallback_width=width,
+                fallback_height=height,
+            )
+            renders.append(
+                {
+                    "page_index": page_index,
+                    "rotation_degrees": rotation,
+                    "orientation_recovery_candidate": sideways or recover_unknown_orientation,
+                    "orientation_detection_uncertain": bool(
+                        recover_unknown_orientation and not sideways
+                    ),
+                    "orientation_evidence": evidence,
+                    "b64": base64.b64encode(rotated_bytes).decode("utf-8"),
+                    "image_bytes": rotated_bytes,
+                    "bytes": len(rotated_bytes),
+                    "width": rotated_width,
+                    "height": rotated_height,
+                }
+            )
+        return renders
+
+    def _detect_sideways_page(self, image_bytes: bytes) -> Tuple[bool, Dict[str, Any]]:
+        if not self.auto_orientation_enabled:
+            return False, {"method": "disabled"}
+        try:
+            import cv2
+            import numpy as np
+
+            encoded = np.frombuffer(image_bytes, dtype=np.uint8)
+            image = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
+            if image is None or image.size == 0:
+                return False, {"method": "line_projection", "reason": "decode_failed"}
+
+            height, width = image.shape[:2]
+            largest = max(height, width)
+            if largest > 1400:
+                scale = 1400.0 / largest
+                image = cv2.resize(
+                    image,
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                height, width = image.shape[:2]
+
+            edges = cv2.Canny(image, 50, 150, apertureSize=3)
+            longest = max(height, width)
+            lines = cv2.HoughLinesP(
+                edges,
+                1,
+                np.pi / 180,
+                threshold=max(30, int(min(height, width) * 0.06)),
+                minLineLength=max(60, int(longest * 0.22)),
+                maxLineGap=max(12, int(longest * 0.025)),
+            )
+            horizontal_support = 0.0
+            vertical_support = 0.0
+            horizontal_count = 0
+            vertical_count = 0
+            if lines is not None:
+                # OpenCV returns either N x 1 x 4 or N x 4 depending on build.
+                for raw_line in lines.reshape(-1, 4):
+                    x1, y1, x2, y2 = (int(value) for value in raw_line)
+                    dx, dy = x2 - x1, y2 - y1
+                    length = float((dx * dx + dy * dy) ** 0.5)
+                    if length <= 0:
+                        continue
+                    angle = abs(float(np.degrees(np.arctan2(dy, dx)))) % 180.0
+                    folded = min(angle, 180.0 - angle)
+                    if folded <= 12.0:
+                        horizontal_support += length
+                        horizontal_count += 1
+                    elif folded >= 78.0:
+                        vertical_support += length
+                        vertical_count += 1
+
+            enough_signal = (
+                vertical_count >= 2
+                and vertical_support >= longest
+                and (vertical_support + horizontal_support) >= longest * 1.5
+            )
+            sideways = bool(
+                enough_signal
+                and vertical_support > horizontal_support * self.orientation_line_ratio
+            )
+            return sideways, {
+                "method": "line_projection",
+                "horizontal_support": round(horizontal_support, 1),
+                "vertical_support": round(vertical_support, 1),
+                "horizontal_lines": horizontal_count,
+                "vertical_lines": vertical_count,
+                "sideways": sideways,
+            }
+        except Exception as exc:
+            return False, {
+                "method": "line_projection",
+                "reason": "detector_unavailable",
+                "error_type": type(exc).__name__,
+            }
+
+    def _rotate_png(
+        self,
+        *,
+        image_bytes: bytes,
+        rotation_degrees: int,
+        fallback_width: int,
+        fallback_height: int,
+    ) -> Tuple[bytes, int, int]:
+        rotation = self._normalise_rotation(rotation_degrees)
+        if rotation == 0:
+            return image_bytes, fallback_width, fallback_height
+        try:
+            from PIL import Image
+
+            image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            # PIL positive angles are counter-clockwise; the public contract is clockwise.
+            rotated = image.rotate(-rotation, expand=True, fillcolor="white")
+            output = BytesIO()
+            rotated.save(output, format="PNG", optimize=True)
+            return output.getvalue(), rotated.width, rotated.height
+        except Exception:
+            return image_bytes, fallback_width, fallback_height
+
+    def _render_manifest(self, page_renders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "physical_page": int(render.get("page_index") or 0) + 1,
+                "rotation_degrees_clockwise": int(render.get("rotation_degrees") or 0),
+                "orientation_recovery_candidate": bool(
+                    render.get("orientation_recovery_candidate")
+                ),
+            }
+            for render in page_renders
+        ]
+
+    def _render_label(self, render: Dict[str, Any]) -> str:
+        page_number = int(render.get("page_index") or 0) + 1
+        rotation = int(render.get("rotation_degrees") or 0)
+        if render.get("orientation_recovery_candidate"):
+            return (
+                f"Physical answer-sheet page {page_number}; orientation candidate "
+                f"rotated {rotation} degrees clockwise. Another image may be the same "
+                "physical page in the opposite orientation. Use only the readable candidate."
+            )
+        return f"Physical answer-sheet page {page_number}; rotation 0 degrees."
+
+    def _rendered_page_indexes(self, page_renders: List[Dict[str, Any]]) -> List[int]:
+        return sorted({int(render.get("page_index") or 0) for render in page_renders})
 
     def _page_indexes(self, answer_blocks: List[Dict[str, Any]], total_pages: int) -> List[int]:
         seen: set[int] = set()
@@ -379,6 +591,7 @@ class AnswerSheetVisionMapper:
                     "correct_answer_confidence": 0.0,
                     "final_answer_text": "visible final answer text if present",
                     "answer_text": "worked solution text only",
+                    "source_rotation_degrees": "0, 90, or 270 from the readable orientation candidate",
                     "mapping_strategy": "gpt_vision_mapper",
                     "confidence": 0.0,
                     "manual_review_required": True,
@@ -398,6 +611,7 @@ class AnswerSheetVisionMapper:
             "- Leave correct_answer empty when the option label is inferred but not visible.\n"
             "- If one broad OCR block contains multiple worked solutions, return one mapping per question and give each one a distinct answer_item_id.\n"
             "- answer_item_id must be unique within this response. Use values like page_2_q_7 or answer_block_3_q_9.\n"
+            "- When a physical page has orientation candidates, inspect both but use it only once; set source_rotation_degrees to the readable candidate.\n"
             "- If a mapping is uncertain, set manual_review_required=true and confidence below 0.75.\n"
             "- Do not invent missing answer numbers or missing solution text.\n\n"
             f"Reasons this vision check is needed:\n{json.dumps(reasons, ensure_ascii=False)}\n\n"
@@ -414,6 +628,7 @@ class AnswerSheetVisionMapper:
         question_docs: List[Dict[str, Any]],
         page_summaries: List[Dict[str, Any]],
         layout_report: Optional[Dict[str, Any]],
+        render_manifest: List[Dict[str, Any]],
     ) -> str:
         questions_payload = []
         for index, question in enumerate(question_docs or [], start=1):
@@ -464,6 +679,7 @@ class AnswerSheetVisionMapper:
                     "answer_text": "teacher's worked solution/explanation for this question",
                     "final_answer_text": "visible final answer text if present",
                     "solution_image_notes": "describe any diagram/image/formula evidence in the solution",
+                    "source_rotation_degrees": "0, 90, or 270 from the readable orientation candidate",
                     "solution_bbox": {
                         "page": 1,
                         "x": 0.0,
@@ -494,6 +710,7 @@ class AnswerSheetVisionMapper:
             "Rules:\n"
             "- For every question_index, find the matching answer/solution in the answer-sheet images.\n"
             "- Use question_index as the primary identifier. Do not reorder questions.\n"
+            "- Images labelled as orientation candidates are alternate views of the same physical page, not additional pages. Read both candidates, use the upright one, and set source_rotation_degrees accordingly.\n"
             "- For answer_format=option_label, if the answer sheet writes Ans 1/2/3/4/5/6, convert it to A/B/C/D/E/F.\n"
             "- For answer_format=option_label, correct_answer must be the option label, not the option text.\n"
             "- For answer_format=worked_solution, leave correct_answer empty. A missing A-F label is expected and must not by itself require review.\n"
@@ -508,6 +725,7 @@ class AnswerSheetVisionMapper:
             f"Questions:\n{json.dumps(questions_payload, ensure_ascii=False)}\n\n"
             f"OCR text from answer sheet for cross-checking:\n{json.dumps(ocr_payload, ensure_ascii=False)}\n\n"
             f"Layout summary:\n{json.dumps(layout_payload, ensure_ascii=False)}\n\n"
+            f"Image orientation manifest:\n{json.dumps(render_manifest, ensure_ascii=False)}\n\n"
             f"Return JSON exactly in this shape:\n{json.dumps(schema_hint, ensure_ascii=False)}"
         )
 
@@ -540,6 +758,9 @@ class AnswerSheetVisionMapper:
             "correct_answer_confidence": self._confidence(mapping.get("correct_answer_confidence")),
             "final_answer_text": str(mapping.get("final_answer_text") or "").strip(),
             "answer_text": str(mapping.get("answer_text") or "").strip(),
+            "source_rotation_degrees": self._normalise_rotation(
+                mapping.get("source_rotation_degrees")
+            ),
             "mapping_strategy": "gpt_vision_mapper",
             "confidence": max(0.0, min(1.0, confidence)),
             "manual_review_required": bool(mapping.get("manual_review_required")),
@@ -595,6 +816,9 @@ class AnswerSheetVisionMapper:
             "notes": str(mapping.get("notes") or "").strip(),
             "page_numbers": mapping.get("page_numbers") if isinstance(mapping.get("page_numbers"), list) else [],
             "solution_image_notes": image_notes,
+            "source_rotation_degrees": self._normalise_rotation(
+                mapping.get("source_rotation_degrees")
+            ),
             "solution_bbox": self._normalise_bbox(mapping.get("solution_bbox") or mapping.get("solution_image_bbox")),
         }
 
@@ -631,6 +855,13 @@ class AnswerSheetVisionMapper:
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    def _normalise_rotation(self, value: Any) -> int:
+        try:
+            rotation = int(value or 0) % 360
+        except (TypeError, ValueError):
+            return 0
+        return rotation if rotation in {0, 90, 180, 270} else 0
 
     def _normalise_bbox(self, value: Any) -> Optional[Dict[str, float]]:
         if not value:
@@ -673,7 +904,10 @@ class AnswerSheetVisionMapper:
     ) -> List[Dict[str, Any]]:
         if not mappings or not page_renders:
             return mappings
-        render_by_page = {int(render.get("page_index") or 0) + 1: render for render in page_renders}
+        renders_by_page: Dict[int, List[Dict[str, Any]]] = {}
+        for render in page_renders:
+            page_number = int(render.get("page_index") or 0) + 1
+            renders_by_page.setdefault(page_number, []).append(render)
         updated: List[Dict[str, Any]] = []
         for mapping in mappings:
             bbox = mapping.get("solution_bbox")
@@ -684,7 +918,19 @@ class AnswerSheetVisionMapper:
             if page_number <= 0:
                 page_numbers = mapping.get("page_numbers") if isinstance(mapping.get("page_numbers"), list) else []
                 page_number = self._int(page_numbers[0], 0) if page_numbers else 0
-            render = render_by_page.get(page_number)
+            page_candidates = renders_by_page.get(page_number, [])
+            requested_rotation = self._normalise_rotation(
+                mapping.get("source_rotation_degrees")
+            )
+            render = next(
+                (
+                    candidate
+                    for candidate in page_candidates
+                    if self._normalise_rotation(candidate.get("rotation_degrees"))
+                    == requested_rotation
+                ),
+                page_candidates[0] if page_candidates else None,
+            )
             if not render:
                 updated.append(mapping)
                 continue
@@ -721,6 +967,9 @@ class AnswerSheetVisionMapper:
                 "content_type": "image/png",
                 "page_number": page_number,
                 "bbox": crop["bbox"],
+                "orientation_applied": self._normalise_rotation(
+                    render.get("rotation_degrees")
+                ),
                 "source": "answer_sheet_solution_crop",
             }
             updated.append(

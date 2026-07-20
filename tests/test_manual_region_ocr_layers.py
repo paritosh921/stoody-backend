@@ -1313,6 +1313,122 @@ def test_question_anchored_subjective_solution_does_not_require_an_option_label(
     assert result["manual_review_required"] is False
 
 
+def test_answer_sheet_sideways_ruled_page_builds_bounded_orientation_candidates():
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
+
+    image = Image.new("RGB", (700, 1000), "white")
+    draw = ImageDraw.Draw(image)
+    for x in range(70, 650, 55):
+        draw.line((x, 40, x, 960), fill="black", width=3)
+    output = BytesIO()
+    image.save(output, format="PNG")
+
+    mapper = AnswerSheetVisionMapper()
+    renders = mapper._orientation_aware_renders(
+        page_index=0,
+        image_bytes=output.getvalue(),
+        width=image.width,
+        height=image.height,
+    )
+
+    assert {render["rotation_degrees"] for render in renders} == {90, 270}
+    assert all(render["orientation_recovery_candidate"] is True for render in renders)
+    assert all(render["width"] == image.height for render in renders)
+    assert all(render["height"] == image.width for render in renders)
+
+
+def test_answer_sheet_upright_ruled_page_does_not_duplicate_vision_images():
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
+
+    image = Image.new("RGB", (700, 1000), "white")
+    draw = ImageDraw.Draw(image)
+    for y in range(80, 940, 55):
+        draw.line((40, y, 660, y), fill="black", width=3)
+    output = BytesIO()
+    image.save(output, format="PNG")
+
+    mapper = AnswerSheetVisionMapper()
+    renders = mapper._orientation_aware_renders(
+        page_index=0,
+        image_bytes=output.getvalue(),
+        width=image.width,
+        height=image.height,
+    )
+
+    assert len(renders) == 1
+    assert renders[0]["rotation_degrees"] == 0
+    assert renders[0]["orientation_recovery_candidate"] is False
+
+
+def test_successful_empty_question_anchored_result_does_not_make_duplicate_paid_call():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeVisionMapper:
+        def __init__(self):
+            self.extract_calls = 0
+            self.map_calls = 0
+
+        async def extract_by_question(self, **kwargs):
+            self.extract_calls += 1
+            return {
+                "used": True,
+                "provider": "openai",
+                "model": "gpt-5.4-mini",
+                "mode": "question_anchored",
+                "mappings": [],
+                "orientation_recovery_used": True,
+                "render_orientations": [
+                    {
+                        "physical_page": 1,
+                        "rotation_degrees_clockwise": 90,
+                        "orientation_recovery_candidate": True,
+                    }
+                ],
+            }
+
+        async def map(self, **kwargs):
+            self.map_calls += 1
+            raise AssertionError("legacy mapper must not repeat a successful full-page call")
+
+    class FakeDb:
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            return True
+
+    vision = FakeVisionMapper()
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=vision).map_full_document_blocks(
+            db=FakeDb(),
+            is_b2c=False,
+            document_id="doc-rotated",
+            question_docs=[
+                {"id": "q1", "text": "1. First question"},
+                {"id": "q2", "text": "2. Second question"},
+            ],
+            answer_blocks=[{"text": "one weak OCR block", "confidence": 0.2}],
+            pdf_bytes=b"%PDF-test",
+        )
+    )
+
+    assert vision.extract_calls == 1
+    assert vision.map_calls == 0
+    assert result["summary"]["vision_orientation_recovery_used"] is True
+    assert result["summary"]["vision_render_orientations"][0]["rotation_degrees_clockwise"] == 90
+
+
 def test_question_anchored_objective_solution_without_option_label_requires_review():
     from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
 

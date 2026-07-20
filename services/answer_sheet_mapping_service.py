@@ -69,6 +69,7 @@ class AnswerSheetMappingService:
                 vision_result = await self.vision_mapper.extract_by_question(
                     pdf_bytes=pdf_bytes,
                     question_docs=questions,
+                    answer_blocks=blocks,
                     page_summaries=page_summaries or [],
                     layout_report=layout_report,
                     gateway_context=gateway_context,
@@ -96,7 +97,12 @@ class AnswerSheetMappingService:
             self.vision_enabled
             and pdf_bytes
             and vision_reasons
-            and not (vision_result.get("used") and vision_result.get("mappings"))
+            # The question-anchored call already receives the complete page images,
+            # question list, OCR text and layout context. An empty but successful
+            # response is a safe "could not locate" result, not a reason to pay for
+            # a second near-identical full-document call. Only use the legacy block
+            # mapper when the primary extractor could not run at all.
+            and not vision_result.get("used")
         ):
             try:
                 vision_result = await self.vision_mapper.map(
@@ -196,6 +202,10 @@ class AnswerSheetMappingService:
             "vision_mode": vision_result.get("mode"),
             "vision_reasons": vision_reasons,
             "vision_error": vision_result.get("error"),
+            "vision_orientation_recovery_used": bool(
+                vision_result.get("orientation_recovery_used")
+            ),
+            "vision_render_orientations": vision_result.get("render_orientations") or [],
             "auto_acceptance_blocked": acceptance_policy.get("auto_acceptance_blocked"),
             "auto_acceptance_blockers": acceptance_policy.get("auto_acceptance_blockers"),
             "manual_segmentation_recommended": bool(
@@ -371,6 +381,9 @@ class AnswerSheetMappingService:
                 "solution_image_notes": str(candidate.get("solution_image_notes") or "").strip(),
                 "solution_images": candidate.get("solution_images") if isinstance(candidate.get("solution_images"), list) else [],
                 "answer_page_numbers": candidate.get("page_numbers") if isinstance(candidate.get("page_numbers"), list) else [],
+                "source_rotation_degrees": self._normalise_rotation(
+                    candidate.get("source_rotation_degrees")
+                ),
                 "source": self.SOURCE,
                 "mapper_provider": vision_result.get("provider"),
                 "mapper_model": vision_result.get("model"),
@@ -663,3 +676,10 @@ class AnswerSheetMappingService:
         except (TypeError, ValueError):
             return None
         return parsed if parsed > 0 else None
+
+    def _normalise_rotation(self, value: Any) -> int:
+        try:
+            rotation = int(value or 0) % 360
+        except (TypeError, ValueError):
+            return 0
+        return rotation if rotation in {0, 90, 180, 270} else 0
