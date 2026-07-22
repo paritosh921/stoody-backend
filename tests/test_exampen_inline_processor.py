@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -98,3 +99,52 @@ async def test_inline_processor_does_not_schedule_same_job_twice_while_active():
         await asyncio.sleep(0)
 
     assert calls == ["JOB-1"]
+
+
+@pytest.mark.asyncio
+async def test_inline_processor_recovers_stalled_processing_job_and_retries_it():
+    from services.exampen_inline_processor import InlinePCRProcessor
+    from services.exampen_workflow import PROCESSING_HEARTBEAT_STALE_SECONDS
+
+    master_db = _database("skb_master")
+    tenant_db = _database("skb_test")
+    await master_db["tenants"].insert_one({"status": "active", "db_name": "skb_test"})
+    now = datetime.now(timezone.utc)
+    await tenant_db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-stalled",
+            "submission_id": "SUB-stalled",
+            "status": "processing",
+            "lease_token": "dead-worker",
+            "lease_expires_at": now + timedelta(minutes=20),
+            "updated_at": now
+            - timedelta(seconds=PROCESSING_HEARTBEAT_STALE_SECONDS + 1),
+        }
+    )
+
+    called: list[str] = []
+
+    async def fake_process(_db, job_id: str, *, execution_token: str):
+        assert execution_token.startswith("inline:")
+        called.append(job_id)
+        return {"job_id": job_id, "status": "completed"}
+
+    processor = InlinePCRProcessor(
+        _DbManager(master_db, {"skb_test": tenant_db}),
+        poll_seconds=1,
+        concurrency=1,
+    )
+
+    with patch(
+        "services.exampen_inline_processor.process_pcr_processing_job",
+        new=fake_process,
+    ):
+        assert await processor.run_once() == 1
+        await asyncio.sleep(0)
+
+    assert called == ["JOB-stalled"]
+    recovered = await tenant_db["exampen_processing_jobs"].find_one(
+        {"job_id": "JOB-stalled"}
+    )
+    assert recovered["status"] == "retryable_error"
+    assert "lease_token" not in recovered

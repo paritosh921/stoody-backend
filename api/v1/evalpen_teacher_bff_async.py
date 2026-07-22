@@ -120,6 +120,7 @@ class ExamQueueResponse(BaseModel):
 
     pending: List[QueueItem] = Field(default_factory=list)
     blocked: List[QueueItem] = Field(default_factory=list)
+    needs_review: List[QueueItem] = Field(default_factory=list)
     ready_to_publish: List[QueueItem] = Field(default_factory=list)
 
 
@@ -729,10 +730,11 @@ async def get_exam_queue(
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ) -> ExamQueueResponse:
-    """Get the submission queue for a specific exam, split into three buckets:
+    """Get the submission queue for a specific exam, split by workflow state:
 
     - ``pending``: submissions where responses exist but not all evaluated
     - ``blocked``: submissions with any unresolved blocking flags
+    - ``needs_review``: technically complete submissions awaiting a teacher check
     - ``ready_to_publish``: submissions fully evaluated, no blocking flags,
       not yet published
 
@@ -854,6 +856,7 @@ async def get_exam_queue(
         # ----- Bucket each submission -----
         pending_items: List[QueueItem] = []
         blocked_items: List[QueueItem] = []
+        review_items: List[QueueItem] = []
         ready_items: List[QueueItem] = []
 
         for sub in submissions:
@@ -909,6 +912,19 @@ async def get_exam_queue(
                     ],
                 }
             pcr_ready = bool(readiness.get("ready"))
+            blocker_codes = {
+                str(item.get("code") or "")
+                for item in (readiness.get("blockers") or [])
+                if str(item.get("code") or "")
+            }
+            reviewable_codes = {
+                "document_coverage_requires_review",
+                "response_assignment_requires_review",
+                "evaluation_requires_review",
+            }
+            needs_teacher_review = bool(blocker_codes) and blocker_codes.issubset(
+                reviewable_codes
+            )
 
             # Determine blocking status
             has_unresolved_blocking = False
@@ -940,11 +956,29 @@ async def get_exam_queue(
                 "failed",
                 "retryable_error",
                 "enqueue_failed",
-                "blocked_for_review",
             }
 
             # Bucket logic
-            if has_unresolved_blocking or job_needs_attention or (
+            if (
+                needs_teacher_review
+                and not has_unresolved_blocking
+                and not job_needs_attention
+                and pub_status != "published"
+            ):
+                review_items.append(
+                    QueueItem(
+                        submission_id=sub_id,
+                        student_id=student_id,
+                        response_count=response_count,
+                        page_count=page_count,
+                        source=submission_source,
+                        status_summary=readiness_message(readiness),
+                        has_dcr_results=student_has_dcr,
+                        processing_status=processing_status,
+                        processing_error=processing_error,
+                    )
+                )
+            elif has_unresolved_blocking or job_needs_attention or (
                 not pcr_ready
                 and processing_status not in {"queued", "processing", None}
             ):
@@ -1021,6 +1055,7 @@ async def get_exam_queue(
         return ExamQueueResponse(
             pending=pending_items,
             blocked=blocked_items,
+            needs_review=review_items,
             ready_to_publish=ready_items,
         )
 

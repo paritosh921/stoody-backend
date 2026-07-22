@@ -21,6 +21,7 @@ from services.exampen_workflow import (
     PROCESSING_JOBS_COLLECTION,
     mark_processing_job_retryable_error,
     process_pcr_processing_job,
+    recover_stale_processing_jobs,
 )
 
 
@@ -120,6 +121,14 @@ class InlinePCRProcessor:
                 continue
             if tenant_db is None:
                 continue
+
+            recovered = await recover_stale_processing_jobs(tenant_db)
+            if recovered:
+                logger.warning(
+                    "Inline PCR processor recovered %s stalled job(s) for tenant %s",
+                    recovered,
+                    db_name,
+                )
 
             cursor = tenant_db[PROCESSING_JOBS_COLLECTION].find(
                 {"status": {"$in": list(DISPATCHABLE_JOB_STATUSES)}},

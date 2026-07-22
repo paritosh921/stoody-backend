@@ -285,7 +285,14 @@ async def _call_openai_responses(
     }
     if max_output_tokens is not None:
         payload["max_output_tokens"] = max_output_tokens
-    if temperature is not None:
+    # GPT-5 reasoning requests reject sampling controls unless the selected
+    # model/effort combination explicitly supports them.  Keep this guard at
+    # the provider boundary so a caller cannot strand a durable job with a
+    # deterministic HTTP 400 by forwarding a marking-policy temperature.
+    if temperature is not None and _responses_supports_temperature(
+        model_id,
+        reasoning_effort=reasoning_effort,
+    ):
         payload["temperature"] = temperature
     if prompt_cache_key:
         payload["prompt_cache_key"] = prompt_cache_key
@@ -339,6 +346,28 @@ async def _call_openai_responses(
         model=str(data.get("model") or model_id),
         raw=data,
     )
+
+
+def _responses_supports_temperature(
+    model_id: str,
+    *,
+    reasoning_effort: Optional[str],
+) -> bool:
+    """Return whether a Responses request may include ``temperature``.
+
+    GPT-5 family models only expose sampling controls for their non-reasoning
+    mode.  When effort is absent the provider chooses its reasoning default,
+    so omission is the safe request contract.  Classic GPT-4-class models
+    continue to receive the caller's explicit temperature.
+    """
+
+    normalized_model = str(model_id or "").strip().lower()
+    normalized_effort = str(reasoning_effort or "").strip().lower()
+    if normalized_model.startswith("gpt-5"):
+        return normalized_effort == "none"
+    if normalized_model.startswith(("o1", "o3", "o4")):
+        return False
+    return True
 
 
 async def _call_mistral(

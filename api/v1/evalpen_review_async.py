@@ -130,6 +130,21 @@ class PublishRequest(BaseModel):
     )
 
 
+class DocumentCoverageReviewRequest(BaseModel):
+    """Teacher confirmation that every submitted page was visually reviewed."""
+
+    grading_run_id: str = Field(..., min_length=1, max_length=128)
+    note: str = Field(..., min_length=5, max_length=1000)
+
+    @field_validator("grading_run_id", "note")
+    @classmethod
+    def strip_document_review_fields(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Value must not be blank")
+        return value
+
+
 class ResponseRegionCorrection(BaseModel):
     page_number: int = Field(..., ge=1)
     y_start: float = Field(..., ge=0)
@@ -202,6 +217,9 @@ class ResponseSummaryAPI(BaseModel):
     step_marks: Optional[List[Dict[str, Any]]] = None
     criterion_marks: Optional[List[Dict[str, Any]]] = None
     marking_policy: Optional[Dict[str, Any]] = None
+    method_policy: Optional[Dict[str, Any]] = None
+    method_analysis: Optional[Dict[str, Any]] = None
+    eval_path: Optional[str] = None
     manual_review_required: bool = False
     flags: Optional[List[Dict[str, Any]]] = None
     has_blocking_flags: bool = False
@@ -239,9 +257,9 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
-    # ``available`` means OCR/mapping and every detected answer's evaluation
-    # completed (a genuinely blank paper can score zero); ``processing`` and
-    # ``unavailable`` must never be rendered as a 0-mark attempt.
+    # ``available`` means all materialized evaluations can be displayed. A
+    # separate review_state/readiness gate still prevents unsafe publication;
+    # ``processing`` and ``unavailable`` must never render as a final zero.
     score_state: str = "processing"
     publication_status: Optional[str] = None
     question_catalog: List[QuestionCatalogItemAPI] = Field(default_factory=list)
@@ -253,6 +271,9 @@ class SubmissionSummaryReviewAPI(BaseModel):
     evaluated_count: int = 0
     blocked_count: int = 0
     pending_count: int = 0
+    review_count: int = 0
+    review_state: str = "processing"
+    document_review: Optional[Dict[str, Any]] = None
 
 
 class SubmissionPageThumbnailAPI(BaseModel):
@@ -583,6 +604,7 @@ async def get_submission_summary(
         evaluated_count = 0
         blocked_count = 0
         pending_count = 0
+        review_count = 0
         scored_question_ids: set[str] = set()
         completed_question_keys: set[str] = set()
         observed_question_ids: set[str] = set()
@@ -613,7 +635,16 @@ async def get_submission_summary(
             step_marks = None
             criterion_marks = None
             marking_policy = None
-            manual_review_required = False
+            method_policy = None
+            method_analysis = None
+            assignment = resp_doc.get("question_assignment")
+            manual_review_required = bool(
+                resp_doc.get("manual_review_required")
+                or (
+                    isinstance(assignment, dict)
+                    and assignment.get("manual_review_required")
+                )
+            )
 
             # A completed evaluation document is the source of truth for a
             # final award.  OCR/evaluation status updates happen in separate
@@ -634,8 +665,19 @@ async def get_submission_summary(
                     if isinstance(evaluation.get("marking_policy"), dict)
                     else None
                 )
+                method_policy = (
+                    evaluation.get("method_policy")
+                    if isinstance(evaluation.get("method_policy"), dict)
+                    else None
+                )
+                method_analysis = (
+                    evaluation.get("method_analysis")
+                    if isinstance(evaluation.get("method_analysis"), dict)
+                    else None
+                )
                 manual_review_required = bool(
                     evaluation.get("manual_review_required")
+                    or manual_review_required
                 )
                 raw_step_marks = evaluation.get("step_marks")
                 if isinstance(raw_step_marks, list):
@@ -652,9 +694,9 @@ async def get_submission_summary(
                     # flag remains unresolved, even if an earlier evaluator
                     # pass wrote a preliminary record.
                     blocked_count += 1
-                elif manual_review_required or eval_status == "manual_review":
-                    pending_count += 1
                 else:
+                    if manual_review_required or eval_status == "manual_review":
+                        review_count += 1
                     # A malformed legacy submission can contain two OCR
                     # segments for the same question.  Count a question once;
                     # current submissions block this situation before eval.
@@ -686,6 +728,13 @@ async def get_submission_summary(
                 # immutable evaluation record exists so the workspace cannot
                 # show a transient 0/40 while the Results view has the score.
                 pending_count += 1
+
+            if method_analysis is None and isinstance(assignment, dict):
+                method_analysis = (
+                    assignment.get("method_analysis")
+                    if isinstance(assignment.get("method_analysis"), dict)
+                    else None
+                )
 
             # A pending response still belongs to a fixed paper question.  It
             # has no award yet, but the UI can show the question maximum.
@@ -729,6 +778,9 @@ async def get_submission_summary(
                     step_marks=step_marks,
                     criterion_marks=criterion_marks,
                     marking_policy=marking_policy,
+                    method_policy=method_policy,
+                    method_analysis=method_analysis,
+                    eval_path=(evaluation.get("eval_path") if evaluation else None),
                     manual_review_required=manual_review_required,
                     flags=api_flags if api_flags else None,
                     has_blocking_flags=has_blocking,
@@ -778,16 +830,33 @@ async def get_submission_summary(
                 )
                 blocked_count += 1
 
-        # A score is only available when OCR/mapping has completed and every
-        # detected answer is terminally evaluated or explicitly blank.  This
-        # prevents the review workspace from publishing an OCR-era 0/40 that
-        # disagrees with the immutable evaluation records shown in Results.
+        # Display every persisted award once evaluation has settled. Review
+        # and blocking states are reported separately and still prevent
+        # publication; they must not hide already-materialized marks.
         if processing_failed:
             score_state = "unavailable"
-        elif segmentation_status != "complete" or pending_count > 0 or blocked_count > 0:
+        elif segmentation_status != "complete" or pending_count > 0:
             score_state = "processing"
         else:
             score_state = "available"
+
+        document_review = (
+            sub_dict.get("document_review")
+            if isinstance(sub_dict.get("document_review"), dict)
+            else None
+        )
+        # Derive the displayed state from canonical rows on every read. The
+        # stored field is an index hint and can briefly lag behind a review or
+        # reprocess write; it must never hide a current blocker.
+        review_state = (
+            "blocked"
+            if processing_failed or blocked_count
+            else "processing"
+            if score_state == "processing"
+            else "needs_review"
+            if review_count or (document_review and document_review.get("required"))
+            else "ready"
+        )
 
         response_summaries.sort(
             key=lambda item: (
@@ -826,6 +895,9 @@ async def get_submission_summary(
             evaluated_count=evaluated_count,
             blocked_count=blocked_count,
             pending_count=pending_count,
+            review_count=review_count,
+            review_state=review_state,
+            document_review=document_review,
         )
 
     except HTTPException:
@@ -847,6 +919,126 @@ async def get_submission_summary(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve submission summary",
         )
+
+
+@router.post(
+    "/submissions/{submission_id}/document-review",
+    summary="Confirm full answer-copy coverage review",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Submission not found"},
+        409: {"description": "Review is stale or the result is already published"},
+    },
+)
+async def confirm_document_coverage_review(
+    submission_id: str,
+    body: DocumentCoverageReviewRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Clear one submission-level coverage gate without changing marks.
+
+    The run id fences this acknowledgement against a simultaneous reprocess:
+    a teacher can only confirm the exact visual ledger currently on screen.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id}
+    )
+    if submission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Submission {submission_id} not found",
+        )
+    _check_student_in_scope(str(submission.get("student_id") or ""), scoped_ids)
+    if str(submission.get("publication_status") or "").lower() == "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Published results are immutable",
+        )
+
+    current_review = submission.get("document_review")
+    if not isinstance(current_review, dict):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This submission has no document-coverage review to confirm",
+        )
+    if str(current_review.get("grading_run_id") or "") != body.grading_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The answer copy was reprocessed. Refresh before confirming it.",
+        )
+
+    now = datetime.now(timezone.utc)
+    actor_id = str(current_user.get("user_id") or "unknown")
+    accepted_review = {
+        **current_review,
+        "status": "accepted",
+        "required": False,
+        "accepted_at": now,
+        "accepted_by": actor_id,
+        "acceptance_note": body.note,
+        "updated_at": now,
+    }
+    updated = await tenant_db["evalpen_submissions"].update_one(
+        {
+            "submission_id": submission_id,
+            "publication_status": {"$ne": "published"},
+            "document_review.grading_run_id": body.grading_run_id,
+        },
+        {
+            "$set": {
+                "document_review": accepted_review,
+                "updated_at": now,
+            },
+            "$push": {
+                "document_review_history": {
+                    "action": "coverage_confirmed",
+                    "grading_run_id": body.grading_run_id,
+                    "actor_id": actor_id,
+                    "note": body.note,
+                    "timestamp": now,
+                    "before": current_review,
+                    "after": accepted_review,
+                }
+            },
+        },
+    )
+    if updated.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The review changed while it was being confirmed. Refresh and retry.",
+        )
+
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    readiness = await assess_submission_readiness(tenant_db, submission_id)
+    blocker_codes = {
+        str(item.get("code") or "") for item in (readiness.get("blockers") or [])
+    }
+    reviewable_codes = {
+        "response_assignment_requires_review",
+        "evaluation_requires_review",
+    }
+    review_state = (
+        "ready"
+        if readiness.get("ready")
+        else "needs_review"
+        if blocker_codes and blocker_codes.issubset(reviewable_codes)
+        else "blocked"
+    )
+    await tenant_db["evalpen_submissions"].update_one(
+        {"submission_id": submission_id},
+        {"$set": {"review_state": review_state, "updated_at": now}},
+    )
+    return {
+        "submission_id": submission_id,
+        "review_state": review_state,
+        "document_review": accepted_review,
+        "readiness": readiness,
+    }
 
 
 @router.get(
@@ -973,6 +1165,7 @@ class ExamRosterAPI(BaseModel):
     total_expected: int = 0
     total_submitted: int = 0
     total_blocked: int = 0
+    total_needs_review: int = 0
     total_ready: int = 0
     total_published: int = 0
 
@@ -1046,6 +1239,7 @@ async def get_exam_roster(
             "source": 1,
             "publication_status": 1,
             "segmentation_status": 1,
+            "review_state": 1,
             "updated_at": 1,
             "created_at": 1,
         },
@@ -1098,6 +1292,7 @@ async def get_exam_roster(
         if doc.get("submission_id")
     ]
     blocked_submissions: set[str] = set()
+    review_submissions: set[str] = set()
     ready_submissions: set[str] = set()
     if submission_ids:
         try:
@@ -1122,12 +1317,13 @@ async def get_exam_roster(
                 statuses = {str(s or "").lower() for s in (row.get("statuses") or [])}
                 if "blocked" in statuses:
                     blocked_submissions.add(sid)
+                elif "manual_review" in statuses:
+                    review_submissions.add(sid)
                 elif statuses and statuses.issubset(
                     {
                         "evaluated",
                         "evaluated_with_warnings",
                         "not_attempted",
-                        "manual_review",
                     }
                 ):
                     ready_submissions.add(sid)
@@ -1139,6 +1335,7 @@ async def get_exam_roster(
     items: List[CollectionRosterItemAPI] = []
     total_submitted = 0
     total_blocked = 0
+    total_needs_review = 0
     total_ready = 0
     total_published = 0
 
@@ -1150,6 +1347,7 @@ async def get_exam_roster(
         job = job_by_submission.get(submission_id or "")
         publication = str((submission or {}).get("publication_status") or "").lower()
         job_status = str((job or {}).get("status") or "").lower()
+        review_state = str((submission or {}).get("review_state") or "").lower()
         source = str((submission or {}).get("source") or "").lower() or None
         if source and source not in {"pen", "camera", "mixed"}:
             source = "camera" if source in {"upload", "pdf", "image"} else source
@@ -1161,9 +1359,20 @@ async def get_exam_roster(
             total_published += 1
             total_submitted += 1
             total_ready += 1
-        elif submission_id in blocked_submissions or job_status == "blocked_for_review":
+        elif submission_id in blocked_submissions or review_state == "blocked" or job_status in {
+            "failed",
+            "retryable_error",
+            "enqueue_failed",
+        }:
             status_value = "blocked"
             total_blocked += 1
+            total_submitted += 1
+        elif review_state == "needs_review" or submission_id in review_submissions or (
+            job_status == "blocked_for_review"
+            and submission_id not in blocked_submissions
+        ):
+            status_value = "review"
+            total_needs_review += 1
             total_submitted += 1
         elif (
             submission_id in ready_submissions
@@ -1211,6 +1420,7 @@ async def get_exam_roster(
         total_expected=len(items),
         total_submitted=total_submitted,
         total_blocked=total_blocked,
+        total_needs_review=total_needs_review,
         total_ready=total_ready,
         total_published=total_published,
     )
@@ -2300,13 +2510,10 @@ async def _correct_response_assignment_impl(
 
     from services.exampen_submission_readiness import (
         assess_submission_readiness,
-        readiness_message,
     )
 
-    # The processing job's previous ``blocked_for_review`` state described the
-    # condition this teacher action is resolving.  Re-open the readiness check
-    # from a completed processing baseline, then restore blocked state if any
-    # independent invariant still fails.
+    # A teacher correction changes review/publication eligibility, never the
+    # fact that the durable processing job finished.
     await tenant_db["exampen_processing_jobs"].update_one(
         {"submission_id": submission_id},
         {
@@ -2325,22 +2532,31 @@ async def _correct_response_assignment_impl(
         upsert=True,
     )
     readiness = await assess_submission_readiness(tenant_db, submission_id)
-    next_job_status = "completed" if readiness.get("ready") else "blocked_for_review"
-    await tenant_db["exampen_processing_jobs"].update_one(
+    blocker_codes = {
+        str(item.get("code") or "") for item in (readiness.get("blockers") or [])
+    }
+    reviewable_codes = {
+        "document_coverage_requires_review",
+        "response_assignment_requires_review",
+        "evaluation_requires_review",
+    }
+    review_state = (
+        "ready"
+        if readiness.get("ready")
+        else "needs_review"
+        if blocker_codes and blocker_codes.issubset(reviewable_codes)
+        else "blocked"
+    )
+    await tenant_db["evalpen_submissions"].update_one(
         {"submission_id": submission_id},
-        {
-            "$set": {
-                "status": next_job_status,
-                "last_error": None if readiness.get("ready") else readiness_message(readiness),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        },
+        {"$set": {"review_state": review_state, "updated_at": now}},
     )
     return {
         "submission_id": submission_id,
         "action": body.action,
         "created_response_ids": [str(item.get("response_id") or "") for item in created],
         "evaluation_errors": evaluation_errors,
+        "review_state": review_state,
         "readiness": readiness,
     }
 

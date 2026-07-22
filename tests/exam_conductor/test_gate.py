@@ -568,6 +568,7 @@ class TestOpenAIResponsesDocumentInput:
                     json_schema={"type": "object", "properties": {}},
                     prompt_cache_key="pcr-paper-static",
                     reasoning_effort="medium",
+                    temperature=0.10,
                     max_output_tokens=8000,
                     api_key="secret",
                 )
@@ -575,8 +576,51 @@ class TestOpenAIResponsesDocumentInput:
             assert client.payload["prompt_cache_key"] == "pcr-paper-static"
             assert client.payload["text"]["format"]["strict"] is True
             assert client.payload["input"][0]["content"][0]["type"] == "input_file"
+            assert "temperature" not in client.payload
             assert result.content == '{"questions":[]}'
             assert result.cache_read_tokens == 1500
+
+        asyncio.run(_run())
+
+    def test_openai_responses_retains_temperature_for_supported_model(self):
+        class _HTTPResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "model": "gpt-4.1",
+                    "output": [],
+                    "usage": {},
+                }
+
+        class _HTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                assert json["temperature"] == 0.10
+                return _HTTPResponse()
+
+        async def _run():
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=_HTTPClient()):
+                await _call_openai_responses(
+                    "gpt-4.1",
+                    responses_input=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "grade"}],
+                        }
+                    ],
+                    temperature=0.10,
+                    api_key="secret",
+                )
 
         asyncio.run(_run())
 

@@ -134,6 +134,15 @@ def _question_marking_criteria(question: Dict[str, Any]) -> List[Dict[str, Any]]
         return []
 
 
+def _question_method_policy(question: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the explicit method contract, defaulting to any valid method."""
+
+    raw_value = question.get("method_policy")
+    if raw_value is None and isinstance(question.get("metadata"), dict):
+        raw_value = question["metadata"].get("method_policy")
+    return _marking_policy_module().normalize_method_policy(raw_value)
+
+
 def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
     """Choose the strongest reviewed worked-answer mapping deterministically."""
     source = _as_text(mapping.get("source")).lower()
@@ -618,6 +627,10 @@ def validate_pcr_questions(
                 f"Q {label}: add an approved reference solution or marking rubric"
             )
         if uses_structured_criteria:
+            try:
+                _question_method_policy(question)
+            except ValueError as exc:
+                errors.append(f"Q {label}: {exc}")
             criteria = _question_marking_criteria(question)
             criterion_errors = policy_module.validate_marking_criteria(
                 criteria,
@@ -700,6 +713,9 @@ async def create_paper_snapshot(
             # later authoring edit from changing a conducted sitting.
             clean_question["marking_criteria"] = policy_module.snapshot_criteria(
                 _question_marking_criteria(clean_question)
+            )
+            clean_question["method_policy"] = policy_module.snapshot_method_policy(
+                _question_method_policy(clean_question)
             )
         question_docs.append(
             {
@@ -941,6 +957,7 @@ async def snapshot_paper_to_session(
             pcr_doc["source_bbox_percent"] = question_layout.get("bbox_percent")
             pcr_doc["marking_policy"] = copy.deepcopy(marking_policy)
             pcr_doc["marking_criteria"] = _question_marking_criteria(raw_question)
+            pcr_doc["method_policy"] = _question_method_policy(raw_question)
             if policy_module.is_structured_rubric_policy(marking_policy):
                 pcr_doc["evaluation_mode"] = policy_module.STRUCTURED_RUBRIC_MODE
             pcr_doc["question_text"] = _question_text(raw_question)

@@ -237,6 +237,66 @@ async def test_readiness_blocks_a_scored_response_with_uncertain_question_owners
 
 
 @pytest.mark.asyncio
+async def test_document_coverage_review_is_one_gate_and_teacher_can_confirm_it():
+    from api.v1.evalpen_review_async import (
+        DocumentCoverageReviewRequest,
+        confirm_document_coverage_review,
+    )
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "review_state": "needs_review",
+                "document_review": {
+                    "status": "pending_review",
+                    "required": True,
+                    "all_student_work_accounted": True,
+                    "confidence": 0.78,
+                    "warnings": ["Confirm that the faint bottom edge has no work."],
+                    "grading_run_id": "DOCGR-run-1",
+                },
+            }
+        },
+    )
+
+    before = await assess_submission_readiness(db, "SUB-READY")
+    assert before["ready"] is False
+    assert [item["code"] for item in before["blockers"]] == [
+        "document_coverage_requires_review"
+    ]
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await confirm_document_coverage_review(
+            "SUB-READY",
+            DocumentCoverageReviewRequest(
+                grading_run_id="DOCGR-run-1",
+                note="Checked every uploaded page against the original copy",
+            ),
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result["readiness"]["ready"] is True
+    assert result["review_state"] == "ready"
+    stored = await db["evalpen_submissions"].find_one(
+        {"submission_id": "SUB-READY"}
+    )
+    assert stored["document_review"]["status"] == "accepted"
+    assert stored["document_review"]["required"] is False
+    assert stored["document_review_history"][-1]["actor_id"] == "TEACHER-1"
+
+
+@pytest.mark.asyncio
 async def test_publication_builds_valid_hashed_snapshot():
     from api.v1.evalpen_review_async import PublishRequest, publish_submission
     from services.exampen_submission_readiness import validate_publication_snapshot

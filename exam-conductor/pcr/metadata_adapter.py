@@ -32,7 +32,7 @@ import logging
 import copy
 from typing import Any, Dict, List, Optional
 
-from .marking_policy import normalize_marking_criteria
+from .marking_policy import normalize_marking_criteria, normalize_method_policy
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,14 @@ def adapt_question_to_pcr(
         # remain tolerant for existing read-only records.
         marking_criteria = []
 
+    raw_method_policy = question_doc.get("method_policy")
+    if raw_method_policy is None and isinstance(question_doc.get("metadata"), dict):
+        raw_method_policy = question_doc["metadata"].get("method_policy")
+    try:
+        method_policy = normalize_method_policy(raw_method_policy)
+    except ValueError:
+        method_policy = normalize_method_policy(None)
+
     # Expected word range heuristic based on complexity
     expected_word_range: Optional[Dict[str, int]] = None
     if complexity == "L1":
@@ -374,6 +382,7 @@ def adapt_question_to_pcr(
         "reference_solution": reference_solution or None,
         "rubric": rubric,
         "marking_criteria": copy.deepcopy(marking_criteria),
+        "method_policy": copy.deepcopy(method_policy),
         "marking_policy": copy.deepcopy(question_doc.get("marking_policy"))
         if isinstance(question_doc.get("marking_policy"), dict)
         else None,

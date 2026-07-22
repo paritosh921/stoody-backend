@@ -105,6 +105,74 @@ async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
 
 
 @pytest.mark.asyncio
+async def test_manual_review_score_remains_visible_and_counted_as_evaluated():
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-REVIEW-SCORE",
+            "exam_id": "EXAM-REVIEW-SCORE",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "complete",
+            "review_state": "needs_review",
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-REVIEW-SCORE::Q-1",
+            "exam_id": "EXAM-REVIEW-SCORE",
+            "question_number": 1,
+            "max_marks": 4,
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-REVIEW-SCORE",
+            "submission_id": "SUB-REVIEW-SCORE",
+            "question_id": "EXAM-REVIEW-SCORE::Q-1",
+            "question_number": 1,
+            "detected_text": "A visually scored answer",
+            "eval_status": "manual_review",
+            "manual_review_required": True,
+            "flags": [],
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-REVIEW-SCORE",
+            "response_id": "RESP-REVIEW-SCORE",
+            "question_id": "EXAM-REVIEW-SCORE::Q-1",
+            "eval_path": "full_document_visual",
+            "total_score": 3.0,
+            "max_score": 4.0,
+            "manual_review_required": True,
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-REVIEW-SCORE",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.total_score == 3.0
+    assert result.evaluated_count == 1
+    assert result.pending_count == 0
+    assert result.review_count == 1
+    assert result.score_state == "available"
+    assert result.responses[0].eval_path == "full_document_visual"
+
+
+@pytest.mark.asyncio
 async def test_review_summary_keeps_full_denominator_but_blocks_unproven_blanks():
     """Historical missing rows remain unresolved instead of becoming false zeros."""
     from api.v1.evalpen_review_async import get_submission_summary
@@ -167,7 +235,7 @@ async def test_review_summary_keeps_full_denominator_but_blocks_unproven_blanks(
 
     assert result.total_score == 4.0
     assert result.total_max_score == 12.0
-    assert result.score_state == "processing"
+    assert result.score_state == "available"
     assert result.evaluated_count == 1
     assert result.blocked_count == 2
     assert [response.question_number for response in result.responses] == [1, 2, 3]
@@ -379,7 +447,7 @@ async def test_review_summary_keeps_unassigned_evidence_out_of_question_navigato
     assert result.unassigned_responses[0].question_number == 12
     assert result.total_max_score == 11
     assert result.page_count == 4
-    assert result.score_state == "processing"
+    assert result.score_state == "available"
 
 
 @pytest.mark.asyncio

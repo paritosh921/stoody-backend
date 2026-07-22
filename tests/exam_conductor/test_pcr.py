@@ -44,6 +44,26 @@ from pcr.domain.response_models import (
     SourcePageRef,
     TextBlock,
 )
+
+
+def test_method_policy_defaults_to_alternative_methods_and_follow_through():
+    from pcr.marking_policy import normalize_method_policy
+
+    policy = normalize_method_policy(None)
+
+    assert policy == {
+        "version": "method-policy-v1",
+        "mode": "any_valid_method",
+        "required_method": None,
+        "allow_error_carried_forward": True,
+    }
+
+
+def test_named_method_policy_requires_an_explicit_method_name():
+    from pcr.marking_policy import normalize_method_policy
+
+    with pytest.raises(ValueError, match="Name the method"):
+        normalize_method_policy({"mode": "specified_method_required"})
 from pcr.domain.segmenter import segment_submission
 from pcr.domain.content_classifier import (
     TEXT_ONLY_THRESHOLD,

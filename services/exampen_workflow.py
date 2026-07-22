@@ -21,6 +21,12 @@ TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
+# A live worker renews ``updated_at`` every heartbeat. Waiting for the full
+# 30-minute ownership lease after a process crash leaves the UI stuck on
+# "Checking" even though no worker exists. Three missed heartbeats provide a
+# conservative crash detector while the lease token still fences late writes
+# from the old owner.
+PROCESSING_HEARTBEAT_STALE_SECONDS = PROCESSING_HEARTBEAT_SECONDS * 3
 
 
 def _celery_broker_available() -> bool:
@@ -56,25 +62,6 @@ def _celery_broker_available() -> bool:
     except Exception as exc:
         logger.info("Celery broker unavailable for PCR dispatch: %s", exc)
         return False
-
-
-def _schedule_inline_processing(tenant_db: Any, job_id: str) -> None:
-    """Kick local in-process PCR work without waiting for a Celery worker."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-
-    async def _run() -> None:
-        try:
-            await process_pcr_processing_job(tenant_db, job_id)
-        except Exception:
-            logger.exception(
-                "Inline PCR processing failed for job %s after broker-less dispatch",
-                job_id,
-            )
-
-    loop.create_task(_run(), name=f"exampen-inline-dispatch-{job_id}")
 
 
 class ProcessingJobBusyError(RuntimeError):
@@ -273,8 +260,11 @@ async def dispatch_processing_job(
 
     job_id = str(job["job_id"])
     if not _celery_broker_available():
-        # Keep the job durable and dispatchable.  Prefer inline processing in
-        # local/debug mode so Reprocess does not hang on Redis retries.
+        # Keep the job durable and dispatchable. The supervised local inline
+        # processor will claim it within its next bounded polling pass. Do not
+        # create an untracked API-process task here: those tasks bypass the
+        # configured concurrency limit and strand a ``processing`` lease when
+        # the API reloads or exits.
         await jobs.update_one(
             {"job_id": job_id, "status": "queued"},
             {
@@ -287,18 +277,6 @@ async def dispatch_processing_job(
                 }
             },
         )
-        try:
-            from config_async import settings as _settings
-
-            inline_enabled = bool(
-                getattr(_settings, "EXAMPEN_INLINE_PROCESSOR_ENABLED", False)
-            )
-        except Exception:
-            inline_enabled = False
-        if inline_enabled or force:
-            # Operator reprocess (force=True) must not wait for a 3s poll loop
-            # when Redis is down — start work immediately in-process.
-            _schedule_inline_processing(tenant_db, job_id)
         return await jobs.find_one({"job_id": job_id})
 
     try:
@@ -320,14 +298,6 @@ async def dispatch_processing_job(
                 }
             },
         )
-        # Still try local inline processing so teacher reprocess works offline.
-        try:
-            from config_async import settings as _settings
-
-            if bool(getattr(_settings, "EXAMPEN_INLINE_PROCESSOR_ENABLED", False)) or force:
-                _schedule_inline_processing(tenant_db, job_id)
-        except Exception:
-            pass
     return await jobs.find_one({"job_id": job_id})
 
 
@@ -437,7 +407,7 @@ async def reprocess_processing_job(
                 "reprocess_requested_at": now,
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": "full-document-visual-v1",
+                "mapping_pipeline_version": "full-document-visual-v2",
                 "updated_at": now,
             },
             "$unset": {
@@ -466,6 +436,49 @@ async def reprocess_processing_job(
     return await dispatch_processing_job(tenant_db, db_name=db_name, job=refreshed, force=True)
 
 
+async def recover_stale_processing_jobs(
+    tenant_db: Any,
+    *,
+    now: Optional[datetime] = None,
+) -> int:
+    """Atomically return dead worker leases to the durable retry queue.
+
+    Lease expiry remains the hard ownership boundary, but a worker that misses
+    three consecutive heartbeats is also considered dead. The update predicate
+    is evaluated atomically, so a concurrent heartbeat wins and prevents a live
+    worker from being reclaimed. Late writes from a reclaimed worker remain
+    fenced by the removed lease token.
+    """
+
+    jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
+    recovered_at = now or _now()
+    heartbeat_stale_before = recovered_at - timedelta(
+        seconds=PROCESSING_HEARTBEAT_STALE_SECONDS
+    )
+    stale_result = await jobs.update_many(
+        {
+            "status": "processing",
+            "$or": [
+                {"lease_expires_at": {"$lte": recovered_at}},
+                {"updated_at": {"$lt": heartbeat_stale_before}},
+                {"updated_at": {"$exists": False}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "retryable_error",
+                "last_error": (
+                    "Processing worker heartbeat stopped; queued for automatic recovery"
+                ),
+                "stale_worker_recovered_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
+        },
+    )
+    return int(stale_result.modified_count)
+
+
 async def reconcile_processing_jobs(
     tenant_db: Any,
     *,
@@ -481,30 +494,13 @@ async def reconcile_processing_jobs(
     strand an entire conducted session forever.
     """
     await ensure_indexes(tenant_db)
-    jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     now = _now()
-    stale_before = now - timedelta(minutes=PROCESSING_LEASE_MINUTES)
-    stale_result = await jobs.update_many(
-        {
-            "status": "processing",
-            "$or": [
-                {"lease_expires_at": {"$lte": now}},
-                {
-                    "lease_expires_at": {"$exists": False},
-                    "updated_at": {"$lt": stale_before},
-                },
-            ],
-        },
-        {
-            "$set": {
-                "status": "retryable_error",
-                "last_error": "Processing worker lease expired; queued for recovery",
-                "updated_at": now,
-            },
-            "$unset": {"lease_token": "", "lease_expires_at": ""},
-        },
+    stale_recovered = await recover_stale_processing_jobs(
+        tenant_db,
+        now=now,
     )
 
+    jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     retry_after = now - timedelta(seconds=60)
     cursor = jobs.find(
         {
@@ -527,7 +523,7 @@ async def reconcile_processing_jobs(
             dispatched += 1
 
     return {
-        "stale_recovered": int(stale_result.modified_count),
+        "stale_recovered": stale_recovered,
         "dispatched": dispatched,
         "pending": len(pending),
     }
@@ -752,6 +748,13 @@ async def process_pcr_processing_job(
                         "remaining_ready": 0,
                         "scored_questions": document_result.evaluated_count,
                         "missing_question_count": document_result.blocked_count,
+                    },
+                    "review": {
+                        "state": document_result.review_state,
+                        "document_review_required": (
+                            document_result.document_review_required
+                        ),
+                        "reasons": document_result.review_reasons[:20],
                     },
                     "last_error": "; ".join(document_result.errors[:10]) or None,
                     "finished_at": now,

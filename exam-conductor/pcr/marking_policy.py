@@ -17,9 +17,19 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
 POLICY_VERSION = "criterion-rubric-v1"
+METHOD_POLICY_VERSION = "method-policy-v1"
 STRUCTURED_RUBRIC_MODE = "criterion_rubric_v1"
 LEGACY_AI_MODE = "legacy_ai_v1"
 MAX_AI_TEMPERATURE = 0.20
+
+ANY_VALID_METHOD = "any_valid_method"
+SPECIFIED_METHOD_REQUIRED = "specified_method_required"
+NO_METHOD_REQUIRED = "no_method_required"
+METHOD_POLICY_MODES = {
+    ANY_VALID_METHOD,
+    SPECIFIED_METHOD_REQUIRED,
+    NO_METHOD_REQUIRED,
+}
 
 
 # These are marking standards, not model-temperature aliases.  Temperature is
@@ -66,6 +76,110 @@ def legacy_marking_policy() -> Dict[str, Any]:
         "strictness": "balanced",
         "temperature": 0.10,
     }
+
+
+def default_method_policy() -> Dict[str, Any]:
+    """Return the method contract for a normal subjective question.
+
+    The teacher solution is an example of a valid route, not the only route.
+    A stricter method requirement must be explicitly authored and frozen with
+    the paper; the grader must never infer it merely from the worked solution.
+    """
+
+    return {
+        "version": METHOD_POLICY_VERSION,
+        "mode": ANY_VALID_METHOD,
+        "required_method": None,
+        "allow_error_carried_forward": True,
+    }
+
+
+def normalize_method_policy(value: Any) -> Dict[str, Any]:
+    """Canonicalise one question's method and follow-through contract."""
+
+    if value is None or value == "":
+        return default_method_policy()
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("PCR method policy must be valid JSON") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("PCR method policy must be an object")
+
+    raw_mode = str(value.get("mode") or ANY_VALID_METHOD).strip().lower()
+    aliases = {
+        "any": ANY_VALID_METHOD,
+        "alternative_methods": ANY_VALID_METHOD,
+        "any-equivalent-method": ANY_VALID_METHOD,
+        "specified": SPECIFIED_METHOD_REQUIRED,
+        "required": SPECIFIED_METHOD_REQUIRED,
+        "required_method": SPECIFIED_METHOD_REQUIRED,
+        "answer_only": NO_METHOD_REQUIRED,
+        "result_only": NO_METHOD_REQUIRED,
+        "no_working_required": NO_METHOD_REQUIRED,
+    }
+    mode = aliases.get(raw_mode, raw_mode)
+    if mode not in METHOD_POLICY_MODES:
+        raise ValueError(
+            "Method policy mode must be any_valid_method, "
+            "specified_method_required, or no_method_required"
+        )
+
+    required_method = str(value.get("required_method") or "").strip()
+    if mode == SPECIFIED_METHOD_REQUIRED and not required_method:
+        raise ValueError("Name the method that the question explicitly requires")
+    if mode != SPECIFIED_METHOD_REQUIRED:
+        required_method = ""
+    if len(required_method) > 800:
+        raise ValueError("Required method description is too long")
+
+    raw_follow_through = value.get("allow_error_carried_forward", True)
+    if not isinstance(raw_follow_through, bool):
+        raise ValueError("allow_error_carried_forward must be true or false")
+
+    return {
+        "version": METHOD_POLICY_VERSION,
+        "mode": mode,
+        "required_method": required_method or None,
+        "allow_error_carried_forward": raw_follow_through,
+    }
+
+
+def method_policy_instruction(policy: Any) -> str:
+    """Return a server-owned examiner instruction for one frozen question."""
+
+    normalized = normalize_method_policy(policy)
+    mode = normalized["mode"]
+    if mode == SPECIFIED_METHOD_REQUIRED:
+        method = normalized["required_method"]
+        instruction = (
+            f"The question explicitly requires this method: {method}. "
+            "Award method-dependent criteria only when that method is visibly used, "
+            "while still awarding independent accuracy or conclusion criteria when met."
+        )
+    elif mode == NO_METHOD_REQUIRED:
+        instruction = (
+            "No working method is required. Judge the visible result and any other "
+            "locked criteria; do not withhold marks merely because working is absent."
+        )
+    else:
+        instruction = (
+            "Accept any mathematically, scientifically, or academically valid method. "
+            "The teacher solution is one example only; method difference is never a "
+            "reason to deduct marks when the locked criterion is satisfied."
+        )
+
+    if normalized["allow_error_carried_forward"]:
+        instruction += (
+            " Apply error-carried-forward marking: after a clearly identified earlier "
+            "error, award later method or reasoning criteria when the subsequent work is "
+            "internally correct for the student's own value, unless a criterion explicitly "
+            "requires the correct earlier value."
+        )
+    else:
+        instruction += " Do not apply error-carried-forward credit for this question."
+    return instruction
 
 
 def normalize_marking_policy(
@@ -259,3 +373,8 @@ def snapshot_criteria(value: Any) -> List[Dict[str, Any]]:
 
     return deepcopy(normalize_marking_criteria(value, assign_missing_ids=False))
 
+
+def snapshot_method_policy(value: Any) -> Dict[str, Any]:
+    """Make an immutable copy of a validated question method policy."""
+
+    return deepcopy(normalize_method_policy(value))

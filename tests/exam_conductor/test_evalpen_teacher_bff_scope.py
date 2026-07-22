@@ -159,6 +159,89 @@ async def test_teacher_bff_queue_uses_visible_exam_for_hub_submission():
 
 
 @pytest.mark.asyncio
+async def test_teacher_bff_queue_separates_review_from_technical_failure():
+    from api.v1.evalpen_teacher_bff_async import get_exam_queue
+
+    db = _fresh_db()
+    await _seed_visible_exam_with_hub_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-1"},
+        {
+            "$set": {
+                "review_state": "needs_review",
+                "document_review": {
+                    "status": "pending_review",
+                    "required": True,
+                    "confidence": 0.76,
+                    "warnings": ["Confirm the faint page edge."],
+                    "grading_run_id": "DOCGR-review",
+                },
+            }
+        },
+    )
+
+    with (
+        patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "different-student-id"}],
+        ),
+    ):
+        result = await get_exam_queue(
+            exam_id="EXAM-1",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert result.blocked == []
+    assert result.ready_to_publish == []
+    assert len(result.needs_review) == 1
+    assert result.needs_review[0].submission_id == "SUB-1"
+    assert result.needs_review[0].processing_status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_teacher_bff_queue_treats_scored_manual_review_as_review_not_blocked():
+    from api.v1.evalpen_teacher_bff_async import get_exam_queue
+
+    db = _fresh_db()
+    await _seed_visible_exam_with_hub_submission(db)
+    await db["evalpen_detected_responses"].update_one(
+        {"response_id": "RESP-1"},
+        {
+            "$set": {
+                "eval_status": "manual_review",
+                "manual_review_required": True,
+                "manual_review_reason": "Confirm ownership of this visual evidence.",
+                "question_assignment.manual_review_required": True,
+            }
+        },
+    )
+    await db["evalpen_evaluations"].update_one(
+        {"response_id": "RESP-1"},
+        {"$set": {"manual_review_required": True}},
+    )
+
+    with (
+        patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "different-student-id"}],
+        ),
+    ):
+        result = await get_exam_queue(
+            exam_id="EXAM-1",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert result.blocked == []
+    assert result.ready_to_publish == []
+    assert len(result.needs_review) == 1
+    assert result.needs_review[0].submission_id == "SUB-1"
+
+
+@pytest.mark.asyncio
 async def test_teacher_bff_queue_rejects_exam_hidden_from_tutor():
     from api.v1.evalpen_teacher_bff_async import get_exam_queue
 

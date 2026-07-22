@@ -75,6 +75,9 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
                 warning_count=0,
                 run_id="DOCGR-1",
                 errors=[],
+                review_state="ready",
+                document_review_required=False,
+                review_reasons=[],
             )
 
     def _load(name: str):
@@ -100,6 +103,7 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
     )
     assert stored["processing_path"] == "full_document_visual"
     assert stored["evaluation"]["evaluated_count"] == 11
+    assert stored["review"]["state"] == "ready"
     assert "lease_token" not in stored
 
 
@@ -155,7 +159,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     assert stored["segmentation"] == {}
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
-    assert stored["mapping_pipeline_version"] == "full-document-visual-v1"
+    assert stored["mapping_pipeline_version"] == "full-document-visual-v2"
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
     assert stored["reprocess_history"] == [
@@ -268,6 +272,59 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
 
 
 @pytest.mark.asyncio
+async def test_automatic_recovery_uses_missing_heartbeats_without_reclaiming_live_worker():
+    from services.exampen_workflow import (
+        PROCESSING_HEARTBEAT_STALE_SECONDS,
+        PROCESSING_JOBS_COLLECTION,
+        recover_stale_processing_jobs,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    now = datetime.now(timezone.utc)
+    await jobs.insert_many(
+        [
+            {
+                "job_id": "pcr-job-stalled",
+                "submission_id": "SUB-stalled",
+                "status": "processing",
+                "lease_token": "dead-worker",
+                # The long ownership lease has not expired, but its heartbeat
+                # stopped. This is the production failure that left Checking
+                # visible indefinitely.
+                "lease_expires_at": now + timedelta(minutes=20),
+                "updated_at": now
+                - timedelta(seconds=PROCESSING_HEARTBEAT_STALE_SECONDS + 1),
+            },
+            {
+                "job_id": "pcr-job-live",
+                "submission_id": "SUB-live",
+                "status": "processing",
+                "lease_token": "live-worker",
+                "lease_expires_at": now + timedelta(minutes=20),
+                "updated_at": now - timedelta(seconds=10),
+            },
+        ]
+    )
+
+    recovered = await recover_stale_processing_jobs(db, now=now)
+
+    assert recovered == 1
+    stalled = await jobs.find_one({"job_id": "pcr-job-stalled"})
+    assert stalled["status"] == "retryable_error"
+    assert "heartbeat stopped" in stalled["last_error"].lower()
+    recovered_at = stalled["stale_worker_recovered_at"]
+    if recovered_at.tzinfo is None:
+        recovered_at = recovered_at.replace(tzinfo=timezone.utc)
+    assert abs((recovered_at - now).total_seconds()) < 0.01
+    assert "lease_token" not in stalled
+    assert "lease_expires_at" not in stalled
+    live = await jobs.find_one({"job_id": "pcr-job-live"})
+    assert live["status"] == "processing"
+    assert live["lease_token"] == "live-worker"
+
+
+@pytest.mark.asyncio
 async def test_force_dispatch_keeps_a_worker_claimed_job_untouched():
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,
@@ -296,8 +353,8 @@ async def test_force_dispatch_keeps_a_worker_claimed_job_untouched():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_without_redis_does_not_hang_and_schedules_inline(monkeypatch):
-    """Reprocess must not sit on Celery Redis retries when Redis is down."""
+async def test_dispatch_without_redis_leaves_job_for_bounded_inline_processor(monkeypatch):
+    """Broker failure must not launch an untracked API-process task."""
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,
         dispatch_processing_job,
@@ -315,11 +372,6 @@ async def test_dispatch_without_redis_does_not_hang_and_schedules_inline(monkeyp
     monkeypatch.setattr(
         "services.exampen_workflow._celery_broker_available",
         lambda: False,
-    )
-    scheduled: list[str] = []
-    monkeypatch.setattr(
-        "services.exampen_workflow._schedule_inline_processing",
-        lambda tenant_db, job_id: scheduled.append(job_id),
     )
     # Ensure delay is never called (would hang in real Redis-down environments).
     def _boom(*_args, **_kwargs):
@@ -340,7 +392,6 @@ async def test_dispatch_without_redis_does_not_hang_and_schedules_inline(monkeyp
 
     assert result["status"] == "queued"
     assert "broker unavailable" in str(result.get("last_error") or "").lower()
-    assert scheduled == ["pcr-job-SUB-4"]
 
 
 @pytest.mark.asyncio

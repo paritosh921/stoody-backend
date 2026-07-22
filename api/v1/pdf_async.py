@@ -2649,9 +2649,16 @@ def _parse_pcr_marking_plan_draft(
     reference_solution = str(
         payload.get("reference_solution") or payload.get("teacher_reference_solution") or ""
     ).strip()
+    try:
+        method_policy = policy_module.normalize_method_policy(
+            payload.get("method_policy")
+        )
+    except ValueError as exc:
+        raise ValueError(f"The AI returned an invalid method policy: {exc}") from exc
     return {
         "reference_solution": reference_solution,
         "marking_criteria": criteria,
+        "method_policy": method_policy,
     }
 
 
@@ -2715,12 +2722,16 @@ async def generate_pcr_marking_plan_draft(
         "Create clear, independently assessable criterion rows using only requirements actually supported by the uploaded solution. "
         "Do not automatically require method, intermediate work, and a final answer when the source or mark value does not require all three. "
         "Never make a criterion stricter than the teacher solution, and do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
+        "Infer the method policy from the QUESTION wording, not from the teacher's chosen worked route. Use any_valid_method by default. "
+        "Use specified_method_required only when the question explicitly names a compulsory method, and copy that requirement into required_method. "
+        "Use no_method_required when a result alone earns the available marks. Enable error-carried-forward unless the question or scheme clearly forbids it.\n"
         f"The question is worth exactly {question_marks:g} marks. The sum of all criterion max_marks MUST be exactly {question_marks:g}.\n"
         "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the uploaded solution's own method and conclusion plus clearly equivalent valid alternatives. "
         "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
         "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
-        '{"reference_solution":"teacher-ready cleaned solution", "marking_criteria":['
+        '{"reference_solution":"teacher-ready cleaned solution", "method_policy":'
+        '{"mode":"any_valid_method","required_method":null,"allow_error_carried_forward":true}, "marking_criteria":['
         '{"criterion_id":"criterion_1","description":"...","max_marks":1,"acceptable_evidence":"..."}'
         "]}\n\n"
         f"Document: {document.get('title') or document.get('document_id') or ''}\n"
@@ -7730,6 +7741,7 @@ async def create_question(
     reference_solution: Optional[str] = Form(None),
     rubric: Optional[str] = Form(None),
     marking_criteria: Optional[str] = Form(None),
+    method_policy: Optional[str] = Form(None),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -7766,9 +7778,9 @@ async def create_question(
         if normalized_evaluation_mode not in {"auto", "standard", "stem", "objective_stem", "case_study", "business_case", "mba_case"}:
             normalized_evaluation_mode = "auto"
         try:
-            normalized_marking_criteria = _pcr_marking_policy_module().normalize_marking_criteria(
-                marking_criteria
-            )
+            policy_module = _pcr_marking_policy_module()
+            normalized_marking_criteria = policy_module.normalize_marking_criteria(marking_criteria)
+            normalized_method_policy = policy_module.normalize_method_policy(method_policy)
         except (ImportError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -7817,6 +7829,7 @@ async def create_question(
             "reference_solution": (reference_solution or "").strip() or None,
             "rubric": (rubric or "").strip() or None,
             "marking_criteria": normalized_marking_criteria,
+            "method_policy": normalized_method_policy,
             "subject": subject,
             "difficulty": difficulty,
             "document_type": document_type,
@@ -7992,6 +8005,16 @@ async def update_question(
             try:
                 update_data["marking_criteria"] = _pcr_marking_policy_module().normalize_marking_criteria(
                     question_data["marking_criteria"]
+                )
+            except (ImportError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+        if "method_policy" in question_data:
+            try:
+                update_data["method_policy"] = _pcr_marking_policy_module().normalize_method_policy(
+                    question_data["method_policy"]
                 )
             except (ImportError, ValueError) as exc:
                 raise HTTPException(
