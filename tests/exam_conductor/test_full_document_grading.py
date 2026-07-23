@@ -383,6 +383,44 @@ async def test_not_attempted_zero_requires_explicit_high_confidence_full_copy_pr
 
 
 @pytest.mark.asyncio
+async def test_canonical_visual_exam_never_silently_falls_back_when_asset_is_missing(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v1",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                }
+            }
+        },
+    )
+    await db["documents"].delete_many({"document_id": "paper-1"})
+    monkeypatch.setenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "true")
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    module = _module()
+    service = module.FullDocumentGradingService(
+        db,
+        _FakeGate({}),
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    with pytest.raises(
+        module.FullDocumentGradingError,
+        match="immutable question-paper record is unavailable",
+    ):
+        await service.grade_submission("SUB-DOC-1")
+
+    assert await db["evalpen_document_grading_runs"].count_documents({}) == 0
+    assert await db["evalpen_detected_responses"].count_documents({}) == 0
+
+
+@pytest.mark.asyncio
 async def test_invalid_criterion_award_is_blocked_instead_of_clamped_or_scored(
     monkeypatch,
 ):
@@ -481,13 +519,49 @@ async def test_low_confidence_criterion_is_review_gated(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_document_warning_is_one_submission_gate_not_every_question(
+async def test_document_note_does_not_override_typed_complete_coverage(
     monkeypatch,
 ):
     db = _fresh_db()
     await _seed(db)
     review = _document_review()
-    review["warnings"] = ["A page edge is faint; confirm that no work is cropped."]
+    review["warnings"] = [
+        "Questions 1 and 2 were not attempted; all visible work is accounted for."
+    ]
+    result, _gate = await _grade(
+        monkeypatch,
+        db,
+        {
+            "document_review": review,
+            "questions": [_attempted_diagram(), _attempted_explanation()],
+        },
+    )
+
+    assert result.status == "completed"
+    assert result.review_state == "ready"
+    assert result.document_review_required is False
+    assert result.warning_count == 0
+    responses = await db["evalpen_detected_responses"].find(
+        {"submission_id": "SUB-DOC-1"}
+    ).to_list(length=10)
+    assert len(responses) == 2
+    assert all(response["manual_review_required"] is False for response in responses)
+    assert all(response["eval_status"] == "evaluated" for response in responses)
+    submission = await db["evalpen_submissions"].find_one(
+        {"submission_id": "SUB-DOC-1"}
+    )
+    assert submission["document_review"]["required"] is False
+    assert submission["document_review"]["warnings"] == review["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_typed_document_coverage_remains_a_submission_gate(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    review = _document_review(complete=False, confidence=0.62)
+    review["warnings"] = ["A page edge is cropped and some writing may be missing."]
     result, _gate = await _grade(
         monkeypatch,
         db,
@@ -501,16 +575,50 @@ async def test_document_warning_is_one_submission_gate_not_every_question(
     assert result.review_state == "needs_review"
     assert result.document_review_required is True
     assert result.warning_count == 1
-    responses = await db["evalpen_detected_responses"].find(
-        {"submission_id": "SUB-DOC-1"}
-    ).to_list(length=10)
-    assert len(responses) == 2
-    assert all(response["manual_review_required"] is False for response in responses)
-    assert all(response["eval_status"] == "evaluated" for response in responses)
-    submission = await db["evalpen_submissions"].find_one(
-        {"submission_id": "SUB-DOC-1"}
+
+
+@pytest.mark.asyncio
+async def test_not_attempted_note_does_not_turn_proven_absence_into_unresolved(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    review = _document_review(complete=True, confidence=0.93)
+    review["warnings"] = [
+        "Only Q1 has visible work; Q2 was checked across the full copy and not attempted."
+    ]
+    result, _gate = await _grade(
+        monkeypatch,
+        db,
+        {
+            "document_review": review,
+            "questions": [
+                _attempted_diagram(),
+                {
+                    "question_number": 2,
+                    "attempt_status": "not_attempted",
+                    "confidence": 0.93,
+                    "student_answer": "",
+                    "content_type": "TEXT_ONLY",
+                    "evidence_regions": [],
+                    "criterion_marks": [],
+                    "total_score": 0,
+                    "overall_feedback": "Question not attempted.",
+                    "needs_review": False,
+                    "review_reason": "",
+                },
+            ],
+        },
     )
-    assert submission["document_review"]["required"] is True
+
+    assert result.review_state == "ready"
+    assert result.evaluated_count == 2
+    assert result.blocked_count == 0
+    q2 = await db["evalpen_detected_responses"].find_one(
+        {"question_id": "EXAM-DOC-1::Q2", "superseded_at": {"$exists": False}}
+    )
+    assert q2["answer_state"] == "not_attempted"
+    assert q2["absence_proven"] is True
 
 
 @pytest.mark.asyncio

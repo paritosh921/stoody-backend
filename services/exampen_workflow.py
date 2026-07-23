@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
+CURRENT_PCR_PIPELINE_VERSION = 2
+FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
 # A live worker renews ``updated_at`` every heartbeat. Waiting for the full
@@ -183,6 +185,30 @@ async def ensure_indexes(tenant_db: Any) -> None:
     await jobs.create_index([("exam_id", 1), ("status", 1)], name="idx_processing_exam_status")
 
 
+async def _required_processing_path(tenant_db: Any, exam_id: str) -> str:
+    """Resolve the immutable grading lane selected when the paper was finalized."""
+
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {"paper_version_id": 1},
+    )
+    paper_version_id = (exam or {}).get("paper_version_id")
+    if not paper_version_id:
+        return "legacy_ocr_mapping"
+    paper_version = await tenant_db["exampen_paper_versions"].find_one(
+        {"paper_version_id": paper_version_id},
+        {"paper_context": 1},
+    )
+    context = dict((paper_version or {}).get("paper_context") or {})
+    if (
+        context.get("ready")
+        and str(context.get("version") or "")
+        == "canonical-full-document-visual-v1"
+    ):
+        return FULL_DOCUMENT_PROCESSING_PATH
+    return "legacy_ocr_mapping"
+
+
 async def ensure_processing_job(
     tenant_db: Any,
     *,
@@ -193,6 +219,7 @@ async def ensure_processing_job(
 ) -> Tuple[Dict[str, Any], bool]:
     """Create the exactly-once processing record for a canonical submission."""
     await ensure_indexes(tenant_db)
+    required_processing_path = await _required_processing_path(tenant_db, exam_id)
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     job_id = _job_id(submission_id)
     now = _now()
@@ -205,7 +232,8 @@ async def ensure_processing_job(
                 "exam_id": exam_id,
                 "student_id": student_id,
                 "db_name": db_name,
-                "pipeline_version": 1,
+                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "required_processing_path": required_processing_path,
                 "status": "queued",
                 "attempts": 0,
                 "lease_generation": 0,
@@ -242,11 +270,17 @@ async def dispatch_processing_job(
         return job
 
     now = _now()
+    required_processing_path = await _required_processing_path(
+        tenant_db,
+        str(job.get("exam_id") or ""),
+    )
     queued = await jobs.update_one(
         {"job_id": job["job_id"], "status": {"$ne": "processing"}},
         {
             "$set": {
                 "status": "queued",
+                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "required_processing_path": required_processing_path,
                 "db_name": db_name,
                 "enqueue_attempted_at": now,
                 "updated_at": now,
@@ -282,7 +316,16 @@ async def dispatch_processing_job(
     try:
         from celery_app import process_exampen_pcr_submission
 
-        process_exampen_pcr_submission.delay(db_name, job_id)
+        # Passing the required pipeline version as an argument is deliberate.
+        # A stale Celery worker with the older two-argument task signature will
+        # reject this job before it can silently grade a student through the
+        # retired OCR-first path. The durable reconciler can then deliver the
+        # still-queued job to a current worker after deployment converges.
+        process_exampen_pcr_submission.delay(
+            db_name,
+            job_id,
+            CURRENT_PCR_PIPELINE_VERSION,
+        )
     except Exception as exc:
         logger.exception("Unable to enqueue PCR processing job %s", job_id)
         await jobs.update_one(
@@ -359,6 +402,10 @@ async def reprocess_processing_job(
         raise ValueError(f"Processing job {job_id} not found")
 
     now = _now()
+    required_processing_path = await _required_processing_path(
+        tenant_db,
+        str(job.get("exam_id") or ""),
+    )
     current_status = str(job.get("status") or "queued")
     if _lease_is_active(job, now=now):
         expiry = _lease_expiry(job)
@@ -400,6 +447,8 @@ async def reprocess_processing_job(
         {
             "$set": {
                 "status": "queued",
+                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "required_processing_path": required_processing_path,
                 "db_name": db_name,
                 "last_error": None,
                 "segmentation": {},
@@ -534,15 +583,23 @@ async def _claim_job(
     job_id: str,
     *,
     execution_token: Optional[str] = None,
+    required_pipeline_version: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     now = _now()
     lease_token = str(execution_token or uuid.uuid4().hex)
+    claim_filter: Dict[str, Any] = {
+        "job_id": job_id,
+        "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
+    }
+    if required_pipeline_version is not None:
+        claim_filter["pipeline_version"] = int(required_pipeline_version)
     result = await jobs.update_one(
-        {"job_id": job_id, "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)}},
+        claim_filter,
         {
             "$set": {
                 "status": "processing",
+                "worker_pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
                 "started_at": now,
                 "updated_at": now,
                 "lease_token": lease_token,
@@ -614,6 +671,7 @@ async def process_pcr_processing_job(
     job_id: str,
     *,
     execution_token: Optional[str] = None,
+    required_pipeline_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run OCR/segmentation/evaluation for one persisted PCR job.
 
@@ -625,6 +683,7 @@ async def process_pcr_processing_job(
         tenant_db,
         job_id,
         execution_token=execution_token,
+        required_pipeline_version=required_pipeline_version,
     )
     if job is None:
         existing = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one({"job_id": job_id})
@@ -710,6 +769,20 @@ async def process_pcr_processing_job(
         tenant_db,
         full_document_gate,
     )
+    required_processing_path = await _required_processing_path(
+        tenant_db,
+        str(submission.get("exam_id") or ""),
+    )
+    await jobs.update_one(
+        lease_filter,
+        {
+            "$set": {
+                "required_processing_path": required_processing_path,
+                "worker_pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "updated_at": _now(),
+            }
+        },
+    )
     try:
         document_result = await _run_with_lease_heartbeat(
             tenant_db,
@@ -783,6 +856,17 @@ async def process_pcr_processing_job(
             "blocked_count": document_result.blocked_count,
             "errors": document_result.errors,
         }
+
+    if required_processing_path == FULL_DOCUMENT_PROCESSING_PATH:
+        raise pcr_services.FullDocumentGradingError(
+            "Canonical full-document grading was required for this exam, but the "
+            "worker declined that path"
+            + (
+                f": {document_result.skipped_reason}"
+                if getattr(document_result, "skipped_reason", None)
+                else ""
+            )
+        )
 
     processor = await _build_submission_service(tenant_db)
     try:

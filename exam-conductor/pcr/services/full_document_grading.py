@@ -80,6 +80,7 @@ class FullDocumentGradingResult:
     handled: bool
     submission_id: str
     status: str = "not_applicable"
+    skipped_reason: Optional[str] = None
     page_count: int = 0
     response_count: int = 0
     evaluated_count: int = 0
@@ -164,10 +165,11 @@ class FullDocumentGradingService:
             raise FullDocumentGradingError("Canonical submission was not found")
 
         source = str(submission.get("source") or "camera").lower()
-        if not _feature_enabled() or source not in {"camera", "pdf", "scan"}:
+        if source not in {"camera", "pdf", "scan"}:
             return FullDocumentGradingResult(
                 handled=False,
                 submission_id=submission_id,
+                skipped_reason=f"Submission source {source or 'unknown'} is not visual",
             )
         exam_id = str(submission.get("exam_id") or "")
         student_id = str(submission.get("student_id") or "")
@@ -176,6 +178,22 @@ class FullDocumentGradingService:
             return FullDocumentGradingResult(
                 handled=False,
                 submission_id=submission_id,
+                skipped_reason="Submission is not attached to a PCR exam",
+            )
+        paper_version = await self._db["exampen_paper_versions"].find_one(
+            {"paper_version_id": exam.get("paper_version_id")}
+        )
+        canonical_visual_required = _paper_requires_canonical_visual(paper_version)
+        if not _feature_enabled():
+            if canonical_visual_required:
+                raise FullDocumentGradingError(
+                    "This exam is locked to canonical full-document visual grading, "
+                    "but that worker capability is disabled"
+                )
+            return FullDocumentGradingResult(
+                handled=False,
+                submission_id=submission_id,
+                skipped_reason="Full-document visual grading is disabled for a legacy exam",
             )
         grading_contract = dict(exam.get("pcr_grading_contract") or {})
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
@@ -194,6 +212,11 @@ class FullDocumentGradingService:
             grading_contract.get("reasoning_effort") or _DEFAULT_REASONING_EFFORT
         ).strip().lower()
         if not _is_openai_visual_model(model_id):
+            if canonical_visual_required:
+                raise FullDocumentGradingError(
+                    "This exam is locked to canonical full-document visual grading, "
+                    f"but worker model {model_id or 'unknown'} is not compatible"
+                )
             logger.info(
                 "Full-document grading skipped for non-OpenAI model %s",
                 model_id,
@@ -201,6 +224,7 @@ class FullDocumentGradingService:
             return FullDocumentGradingResult(
                 handled=False,
                 submission_id=submission_id,
+                skipped_reason=f"Worker model {model_id or 'unknown'} is not visual",
             )
 
         questions = await self._db["evalpen_questions"].find(
@@ -232,9 +256,6 @@ class FullDocumentGradingService:
                 f"Student copy has {len(answer_pages)} pages; maximum is {_MAX_PAGE_COUNT}"
             )
 
-        paper_version = await self._db["exampen_paper_versions"].find_one(
-            {"paper_version_id": exam.get("paper_version_id")}
-        )
         document_id = str(
             exam.get("prepared_document_id")
             or (paper_version or {}).get("document_id")
@@ -244,11 +265,17 @@ class FullDocumentGradingService:
             {"document_id": document_id}
         )
         if not document:
+            if canonical_visual_required:
+                raise FullDocumentGradingError(
+                    "The exam requires canonical visual grading, but its immutable "
+                    "question-paper record is unavailable"
+                )
             # Legacy sessions without the original PDF remain on the existing
-            # review-safe pipeline.  Do not accept a client-provided substitute.
+            # review-safe pipeline. Do not accept a client-provided substitute.
             return FullDocumentGradingResult(
                 handled=False,
                 submission_id=submission_id,
+                skipped_reason="Legacy exam has no immutable question-paper record",
             )
 
         paper_bytes = await _read_canonical_file(
@@ -256,9 +283,15 @@ class FullDocumentGradingService:
             expected_sha256=document.get("sha256"),
         )
         if not paper_bytes:
+            if canonical_visual_required:
+                raise FullDocumentGradingError(
+                    "The exam requires canonical visual grading, but its immutable "
+                    "question-paper asset could not be loaded"
+                )
             return FullDocumentGradingResult(
                 handled=False,
                 submission_id=submission_id,
+                skipped_reason="Legacy question-paper asset could not be loaded",
             )
         solution_bytes = await _read_canonical_file(
             str(document.get("answer_sheet_path") or ""),
@@ -1098,6 +1131,26 @@ def _feature_enabled() -> bool:
     }
 
 
+def _paper_requires_canonical_visual(
+    paper_version: Optional[Dict[str, Any]],
+) -> bool:
+    """Return whether this immutable paper forbids the legacy OCR grader.
+
+    Finalization records a typed capability contract on modern PCR papers.
+    Once that contract exists and is ready, every camera/PDF submission in the
+    cohort must use the same full-document visual path. A temporary storage,
+    provider, or worker problem is retryable infrastructure failure, never
+    permission to switch one student onto a different marking engine.
+    """
+
+    context = dict((paper_version or {}).get("paper_context") or {})
+    return bool(
+        context.get("ready")
+        and str(context.get("version") or "")
+        == "canonical-full-document-visual-v1"
+    )
+
+
 def _is_openai_visual_model(model_id: str) -> bool:
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
     if provider and provider != "openai":
@@ -1345,7 +1398,15 @@ def _system_instructions() -> str:
         "Do not exceed any criterion or question maximum. Set needs_review for low-quality "
         "images, ambiguous ownership, contradictory work, unreadable evidence, or any "
         "uncertain award. Coordinates are approximate vertical bands from 0 at page top "
-        "to 1000 at page bottom."
+        "to 1000 at page bottom.\n\n"
+        "For document_review, all_student_work_accounted means that every visible "
+        "student mark on every submitted page has been assigned to a catalog question "
+        "or the relevant questions were explicitly found not attempted. A routine note "
+        "that some questions were not attempted is not uncertainty. The warnings array "
+        "is explanatory only: if a warning describes cropped pages, unreadable work, "
+        "unassigned writing, or any other real coverage uncertainty, also set "
+        "all_student_work_accounted=false or lower confidence accordingly. Never put an "
+        "ordinary not-attempted summary in warnings."
     )
 
 
@@ -1531,12 +1592,13 @@ def _validate_ledger(
         required=(
             not coverage_complete
             or coverage_confidence < _AUTO_ACCEPT_CONFIDENCE
-            or bool(document_warnings)
         ),
     )
-    # Document-level uncertainty is a single publication gate. It is used to
-    # prove true blanks, but must not be copied onto every attempted answer.
-    absence_coverage_complete = coverage_complete and not document_warnings
+    # Machine decisions use typed coverage fields, never the wording of a
+    # free-text note. A note may explain that Q1/Q2 were absent without
+    # contradicting high-confidence full-copy coverage. Genuine uncertainty
+    # remains blocking through the typed boolean/confidence fields.
+    absence_coverage_complete = coverage_complete
 
     candidates: Dict[int, List[Dict[str, Any]]] = {}
     for item in payload.get("questions") or []:

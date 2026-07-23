@@ -16,10 +16,10 @@ def _fresh_db():
 
 class _RecordedTask:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, int]] = []
 
-    def delay(self, db_name: str, job_id: str) -> None:
-        self.calls.append((db_name, job_id))
+    def delay(self, db_name: str, job_id: str, pipeline_version: int) -> None:
+        self.calls.append((db_name, job_id, pipeline_version))
 
 
 @pytest.mark.asyncio
@@ -108,6 +108,123 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
 
 
 @pytest.mark.asyncio
+async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        process_pcr_processing_job,
+    )
+
+    db = _fresh_db()
+    await db[PROCESSING_JOBS_COLLECTION].insert_one(
+        {
+            "job_id": "pcr-job-SUB-VISUAL",
+            "submission_id": "SUB-VISUAL",
+            "exam_id": "EXAM-VISUAL",
+            "student_id": "STU-VISUAL",
+            "status": "queued",
+            "attempts": 0,
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-VISUAL",
+            "exam_id": "EXAM-VISUAL",
+            "student_id": "STU-VISUAL",
+            "source": "camera",
+        }
+    )
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-VISUAL",
+            "exam_type": "pcr",
+            "paper_version_id": "PV-VISUAL",
+        }
+    )
+    await db["exampen_paper_versions"].insert_one(
+        {
+            "paper_version_id": "PV-VISUAL",
+            "paper_context": {
+                "version": "canonical-full-document-visual-v1",
+                "mode": "full_document_visual",
+                "ready": True,
+            },
+        }
+    )
+
+    class _Gate:
+        def __init__(self, _db):
+            pass
+
+        async def initialize(self):
+            return None
+
+    class _FullDocError(RuntimeError):
+        pass
+
+    class _DocumentGrader:
+        def __init__(self, _db, _gate):
+            pass
+
+        async def grade_submission(self, _submission_id: str):
+            return SimpleNamespace(
+                handled=False,
+                skipped_reason="canonical paper asset temporarily unavailable",
+            )
+
+    def _load(name: str):
+        if name == "pcr.services":
+            return SimpleNamespace(
+                FullDocumentGradingService=_DocumentGrader,
+                FullDocumentGradingError=_FullDocError,
+            )
+        if name == "llm_gate":
+            return SimpleNamespace(LLMGate=_Gate)
+        raise AssertionError(f"Unexpected module load: {name}")
+
+    with (
+        patch("api.v1._exampen_imports.load_exampen", side_effect=_load),
+        patch(
+            "api.v1.evalpen_submissions_async._build_submission_service",
+            new=AsyncMock(side_effect=AssertionError("OCR fallback must not run")),
+        ),
+        pytest.raises(_FullDocError, match="required"),
+    ):
+        await process_pcr_processing_job(db, "pcr-job-SUB-VISUAL")
+
+
+@pytest.mark.asyncio
+async def test_worker_pipeline_contract_rejects_an_old_job_revision():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        process_pcr_processing_job,
+    )
+
+    db = _fresh_db()
+    await db[PROCESSING_JOBS_COLLECTION].insert_one(
+        {
+            "job_id": "pcr-job-OLD",
+            "submission_id": "SUB-OLD",
+            "status": "queued",
+            "pipeline_version": 1,
+            "attempts": 0,
+        }
+    )
+
+    result = await process_pcr_processing_job(
+        db,
+        "pcr-job-OLD",
+        required_pipeline_version=2,
+    )
+
+    assert result["claimed"] is False
+    stored = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "pcr-job-OLD"}
+    )
+    assert stored["status"] == "queued"
+    assert stored["attempts"] == 0
+
+
+@pytest.mark.asyncio
 async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatch):
     """A teacher retry must be a fresh, auditable mapping run, not a mutation race."""
     from services.exampen_workflow import (
@@ -152,7 +269,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1")]
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 2)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
@@ -264,7 +381,7 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired")]
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 2)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored

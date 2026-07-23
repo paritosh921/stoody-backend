@@ -17,6 +17,7 @@ from time import monotonic
 from typing import Any
 
 from services.exampen_workflow import (
+    CURRENT_PCR_PIPELINE_VERSION,
     DISPATCHABLE_JOB_STATUSES,
     PROCESSING_JOBS_COLLECTION,
     mark_processing_job_retryable_error,
@@ -176,6 +177,7 @@ class InlinePCRProcessor:
                     tenant_db,
                     job_id,
                     execution_token=execution_token,
+                    required_pipeline_version=CURRENT_PCR_PIPELINE_VERSION,
                 )
                 self._retry_not_before.pop(key, None)
             except asyncio.CancelledError:

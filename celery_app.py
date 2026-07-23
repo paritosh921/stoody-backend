@@ -157,7 +157,12 @@ def reconcile_exampen_processing_jobs(self) -> dict:
 
 
 @app.task(name="celery_app.process_exampen_pcr_submission", bind=True, max_retries=3)
-def process_exampen_pcr_submission(self, db_name: str, job_id: str) -> dict:
+def process_exampen_pcr_submission(
+    self,
+    db_name: str,
+    job_id: str,
+    required_pipeline_version: int,
+) -> dict:
     """Run the durable OCR/segmentation/evaluation workflow for one PCR copy."""
     from core.database import DatabaseManager
 
@@ -176,6 +181,7 @@ def process_exampen_pcr_submission(self, db_name: str, job_id: str) -> dict:
             tenant_db,
             job_id,
             execution_token=execution_token,
+            required_pipeline_version=required_pipeline_version,
         )
 
     async def _record_error(exc: Exception, terminal: bool) -> None:
