@@ -13,6 +13,10 @@ from typing import Any, Dict, List, Optional
 
 
 QUESTION_ANCHOR_RE = re.compile(r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})[\.\)]\s+", re.IGNORECASE)
+EXPLICIT_QUESTION_ANCHOR_RE = re.compile(
+    r"^\s*Q(?:uestion)?\.?\s*(\d{1,3})[\.\)]?\s+",
+    re.IGNORECASE,
+)
 ANSWER_ANCHOR_RE = re.compile(
     r"^\s*(?:(?:ans(?:wer)?|sol(?:ution)?|exp(?:lanation)?)\s*[:\-]?\s*)?(\d{1,3})[\.\)]\s+",
     re.IGNORECASE,
@@ -199,8 +203,17 @@ class DocumentLayoutProvider:
             line_text = str(line.get("text") or "").strip()
             q_match = QUESTION_ANCHOR_RE.match(line_text)
             if q_match:
-                question_anchors.append({"number": q_match.group(1), "x": line.get("x"), "y": line.get("y")})
-                question_line_indices.append({"index": idx, "number": q_match.group(1), "x": line.get("x"), "y": line.get("y")})
+                anchor = {
+                    "number": q_match.group(1),
+                    "x": line.get("x"),
+                    "y": line.get("y"),
+                    "explicit_question_prefix": bool(
+                        EXPLICIT_QUESTION_ANCHOR_RE.match(line_text)
+                    ),
+                    "text": line_text[:240],
+                }
+                question_anchors.append(anchor)
+                question_line_indices.append({"index": idx, **anchor})
             a_match = ANSWER_ANCHOR_RE.match(line_text)
             answer_cue = self._answer_cue(line_text)
             if a_match and answer_cue:

@@ -142,6 +142,115 @@ def test_question_layout_does_not_bypass_incomplete_or_untrusted_ocr_anchors():
     assert "Segment every printed question" in errors[0]
 
 
+def test_full_document_visual_contract_makes_ocr_layout_advisory(monkeypatch):
+    from services.exampen_paper_service import resolve_question_layout_for_finalization
+
+    monkeypatch.setenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "true")
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    monkeypatch.setenv("PCR_FULL_DOCUMENT_GRADING_MODEL", "gpt-5.1")
+    document = {
+        "document_id": "DOC-VISUAL",
+        "file_path": "s3://private/papers/doc-visual.pdf",
+        "sha256": "paper-hash",
+        "answer_sheet_path": "s3://private/solutions/doc-visual.pdf",
+        "answer_sheet_sha256": "solution-hash",
+        "pages_count": 1,
+        "ocr_manual_segmentation_recommended": True,
+        "ocr_layout_summary": {
+            "pages": [
+                {
+                    "page": 1,
+                    "question_anchors": [
+                        {"number": number, "y": index * 40}
+                        for index, number in enumerate(
+                            ("1", "2", "1", "2", "3", "1", "2", "4", "1", "2", "3", "4", "5"),
+                            start=1,
+                        )
+                    ],
+                }
+            ]
+        },
+    }
+    questions = [
+        {
+            "id": f"q-{number}",
+            "text": f"Question {number}",
+            "marks": 5,
+            "rubric": "Five marks",
+            "question_number": number,
+            "page_number": 1,
+        }
+        for number in range(1, 6)
+    ]
+
+    resolved = resolve_question_layout_for_finalization(document, questions, None)
+
+    assert resolved["ready"] is True
+    assert resolved["strategy"] == "full_document_visual"
+    assert resolved["question_layout"] == []
+    assert resolved["errors"] == []
+    assert resolved["warnings"]
+    assert resolved["paper_context"]["question_paper_sha256"] == "paper-hash"
+    assert resolved["paper_context"]["teacher_solution_sha256"] == "solution-hash"
+    assert resolved["paper_context"]["requires_question_regions"] is False
+
+
+def test_layout_remains_required_when_full_document_visual_grading_is_disabled(monkeypatch):
+    from services.exampen_paper_service import resolve_question_layout_for_finalization
+
+    monkeypatch.setenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "false")
+    document = {
+        "document_id": "DOC-LEGACY",
+        "file_path": "s3://private/papers/doc-legacy.pdf",
+        "pages_count": 1,
+        "ocr_manual_segmentation_recommended": True,
+    }
+
+    resolved = resolve_question_layout_for_finalization(
+        document,
+        [{"id": "q-1", "text": "First", "marks": 1, "rubric": "One mark"}],
+        None,
+    )
+
+    assert resolved["ready"] is False
+    assert resolved["strategy"] == "unavailable"
+    assert any("Segment every printed question" in error for error in resolved["errors"])
+    assert any("disabled" in error for error in resolved["errors"])
+
+
+def test_public_readiness_uses_structured_preflight_categories():
+    from api.v1.pdf_async import _public_pcr_finalization_readiness
+
+    result = _public_pcr_finalization_readiness(
+        {
+            "document_id": "DOC-READY",
+            "exam_mode": "pcr",
+            "ocr_status": "completed",
+        },
+        {
+            "ready": True,
+            "questions": [{"id": "q-1"}],
+            "errors": [],
+            "marking_errors": [],
+            "paper_context_errors": [],
+            "warnings": ["OCR regions are advisory"],
+            "marking_plan": {"questions_using_direct_solution": 1},
+            "strategy": "full_document_visual",
+            "paper_context": {
+                "mode": "full_document_visual",
+                "ready": True,
+            },
+        },
+    )
+
+    assert result["ready"] is True
+    assert result["strategy"] == "full_document_visual"
+    checks = {item["id"]: item for item in result["checks"]}
+    assert checks["marking-plan"]["ready"] is True
+    assert checks["paper-context"]["ready"] is True
+    assert "OCR regions are advisory" in result["warnings"]
+
+
 @pytest.mark.asyncio
 async def test_paper_snapshot_hash_and_rows_include_layout():
     from mongomock_motor import AsyncMongoMockClient
@@ -187,3 +296,38 @@ async def test_paper_snapshot_hash_and_rows_include_layout():
         question_layout=moved_layout,
     )
     assert moved["content_hash"] != version["content_hash"]
+
+
+@pytest.mark.asyncio
+async def test_paper_snapshot_freezes_full_document_visual_context():
+    from mongomock_motor import AsyncMongoMockClient
+
+    from services.exampen_paper_service import create_paper_snapshot
+
+    db = AsyncMongoMockClient()["paper_visual_context_test"]
+    document = {
+        "document_id": "DOC-VISUAL",
+        "exam_mode": "pcr",
+        "title": "Visual paper",
+        "sha256": "paper-hash",
+        "answer_sheet_sha256": "solution-hash",
+    }
+    context = {
+        "version": "canonical-full-document-visual-v1",
+        "mode": "full_document_visual",
+        "ready": True,
+        "question_paper_sha256": "paper-hash",
+        "teacher_solution_sha256": "solution-hash",
+        "requires_question_regions": False,
+    }
+
+    version = await create_paper_snapshot(
+        db,
+        document,
+        _questions(),
+        paper_context=context,
+    )
+
+    assert version["layout_status"] == "full_document_visual"
+    assert version["paper_context"] == context
+    assert version["snapshot_status"] == "ready"

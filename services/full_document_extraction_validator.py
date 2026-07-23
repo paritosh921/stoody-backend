@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Optional
 
 CRITICAL_REASONS = {"missing_question_text", "question_count_lower_than_layout_anchors"}
 HIGH_REASONS = {"missing_options_detected", "too_few_options_for_objective_question"}
-MEDIUM_REASONS = {"incomplete_question_text", "figure_or_formula_review", "missing_question_number"}
+MEDIUM_REASONS = {
+    "incomplete_question_text",
+    "figure_or_formula_review",
+    "missing_question_number",
+    "numbered_subparts_possible",
+}
 LOW_REASONS = {"duplicate_question_numbers", "empty_option", "duplicate_option_text"}
 QUESTION_ANCHOR_RE = re.compile(r"^\s*(?:Q(?:uestion)?\.?\s*)?(\d{1,3})[\.\)]\s+", re.IGNORECASE)
 OPTION_LABEL_RE = re.compile(r"^\s*[\(\[]?([a-zA-Z])[\.\)]\s*(.*)$")
@@ -103,17 +108,31 @@ class FullDocumentExtractionValidator:
         if duplicate_numbers:
             reasons.append("duplicate_question_numbers")
         if anchor_count and len(questions or []) < anchor_count:
-            reasons.append("question_count_lower_than_layout_anchors")
+            numbered_subparts_likely = self._numbered_subparts_likely(
+                layout_report,
+                question_numbers=question_numbers,
+                question_count=len(questions or []),
+            )
+            reason = (
+                "numbered_subparts_possible"
+                if numbered_subparts_likely
+                else "question_count_lower_than_layout_anchors"
+            )
+            severity = "medium" if numbered_subparts_likely else "critical"
+            reasons.append(reason)
             question_warnings.append(
                 {
                     "question_id": None,
                     "number": None,
-                    "reasons": ["question_count_lower_than_layout_anchors"],
-                    "reason_severities": {"question_count_lower_than_layout_anchors": "critical"},
-                    "manual_review_required": True,
-                    "manual_segmentation_recommended": True,
+                    "reasons": [reason],
+                    "reason_severities": {reason: severity},
+                    "manual_review_required": not numbered_subparts_likely,
+                    "manual_segmentation_recommended": not numbered_subparts_likely,
                     "observed_question_count": len(questions or []),
-                    "expected_question_count": anchor_count,
+                    "raw_numbered_line_count": anchor_count,
+                    "expected_question_count": (
+                        None if numbered_subparts_likely else anchor_count
+                    ),
                 }
             )
 
@@ -351,6 +370,57 @@ class FullDocumentExtractionValidator:
         if not layout_report:
             return 0
         return sum(len(page.get(key, []) or []) for page in layout_report.get("pages", []) or [])
+
+    def _numbered_subparts_likely(
+        self,
+        layout_report: Optional[Dict[str, Any]],
+        *,
+        question_numbers: List[str],
+        question_count: int,
+    ) -> bool:
+        """Recognise the common ``Q2 -> 1., 2.`` hierarchy.
+
+        Layout extraction intentionally emits numbered-line *candidates*.  A
+        repeated number is not proof of another top-level question.  When the
+        distinct candidate numbers cover exactly the extracted top-level
+        catalog and the excess candidates are repeats, keep the discrepancy as
+        an advisory signal instead of forcing manual segmentation.
+        """
+
+        if not layout_report or question_count <= 0:
+            return False
+        anchors = [
+            anchor
+            for page in layout_report.get("pages", []) or []
+            for anchor in page.get("question_anchors", []) or []
+            if isinstance(anchor, dict)
+        ]
+        numeric_anchors: List[int] = []
+        for anchor in anchors:
+            try:
+                number = int(str(anchor.get("number") or "").strip())
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                numeric_anchors.append(number)
+        if len(numeric_anchors) <= question_count:
+            return False
+
+        extracted_numbers: List[int] = []
+        for raw in question_numbers:
+            try:
+                number = int(str(raw or "").strip())
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                extracted_numbers.append(number)
+        expected = (
+            set(extracted_numbers)
+            if len(set(extracted_numbers)) == question_count
+            else set(range(1, question_count + 1))
+        )
+        observed = set(numeric_anchors)
+        return observed == expected and len(observed) < len(numeric_anchors)
 
     def _layout_has_risk(self, layout_report: Optional[Dict[str, Any]], risk: str) -> bool:
         if not layout_report:

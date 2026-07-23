@@ -276,6 +276,150 @@ async def _materialize_pcr_marking_plan(
     )
 
 
+async def _prepare_pcr_finalization(
+    tenant_db: Any,
+    *,
+    document: Dict[str, Any],
+    questions: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build the single authoritative PCR finalization preflight.
+
+    The primary camera/PDF grader reads the immutable question paper, teacher
+    solution, locked catalog, and complete student copy together. Consequently
+    OCR/manual regions are advisory whenever that canonical visual contract is
+    available; deployments using the legacy mapper retain the strict layout
+    requirement.
+    """
+
+    from services.exampen_paper_service import (
+        resolve_question_layout_for_finalization,
+        validate_pcr_questions,
+    )
+
+    try:
+        marking_policy = _pcr_marking_policy_module().normalize_marking_policy(
+            document.get("pcr_marking_policy")
+        )
+    except (ImportError, ValueError) as exc:
+        marking_errors = [f"Invalid PCR marking policy: {exc}"]
+        return {
+            "ready": False,
+            "errors": marking_errors,
+            "marking_errors": marking_errors,
+            "paper_context_errors": [],
+            "warnings": [],
+            "questions": questions,
+            "question_layout": [],
+            "marking_policy": None,
+            "marking_plan": {},
+            "strategy": "unavailable",
+            "paper_context": {},
+        }
+
+    finalized_questions, marking_plan_summary = await _materialize_pcr_marking_plan(
+        tenant_db,
+        document_id=str(document.get("document_id") or ""),
+        questions=questions,
+    )
+    marking_errors = validate_pcr_questions(
+        finalized_questions,
+        marking_policy=marking_policy,
+    )
+    regions_document = await tenant_db["document_regions"].find_one(
+        _document_regions_filter(str(document.get("document_id") or ""), "question")
+    )
+    layout_resolution = resolve_question_layout_for_finalization(
+        document,
+        finalized_questions,
+        regions_document,
+    )
+    paper_context_errors = list(layout_resolution.get("errors") or [])
+    readiness_errors = [*marking_errors, *paper_context_errors]
+    return {
+        "ready": not readiness_errors,
+        "errors": readiness_errors,
+        "marking_errors": marking_errors,
+        "paper_context_errors": paper_context_errors,
+        "warnings": list(layout_resolution.get("warnings") or []),
+        "questions": finalized_questions,
+        "question_layout": list(layout_resolution.get("question_layout") or []),
+        "marking_policy": marking_policy,
+        "marking_plan": marking_plan_summary,
+        "strategy": layout_resolution.get("strategy") or "unavailable",
+        "paper_context": dict(layout_resolution.get("paper_context") or {}),
+    }
+
+
+def _public_pcr_finalization_readiness(
+    document: Dict[str, Any],
+    preflight: Dict[str, Any],
+) -> Dict[str, Any]:
+    questions = list(preflight.get("questions") or [])
+    errors = list(preflight.get("errors") or [])
+    warnings = list(preflight.get("warnings") or [])
+    marking_plan = dict(preflight.get("marking_plan") or {})
+    strategy = str(preflight.get("strategy") or "unavailable")
+    marking_ready = not preflight.get("marking_errors")
+    paper_context_ready = strategy in {
+        "verified_question_regions",
+        "full_document_visual",
+    }
+    return {
+        "document_id": document.get("document_id"),
+        "exam_mode": document.get("exam_mode"),
+        "ready": bool(preflight.get("ready")),
+        "already_finalized": bool(document.get("exam_finalized")),
+        "strategy": strategy,
+        "question_count": len(questions),
+        "errors": errors,
+        "warnings": warnings,
+        "marking_plan": marking_plan,
+        "paper_context": preflight.get("paper_context") or {},
+        "checks": [
+            {
+                "id": "ocr",
+                "label": "Document processing",
+                "ready": document.get("ocr_status") == "completed",
+                "detail": (
+                    "Question paper processed"
+                    if document.get("ocr_status") == "completed"
+                    else f"OCR status: {document.get('ocr_status') or 'not started'}"
+                ),
+            },
+            {
+                "id": "questions",
+                "label": "Questions understood",
+                "ready": bool(questions),
+                "detail": f"{len(questions)} questions in the canonical catalog",
+            },
+            {
+                "id": "marking-plan",
+                "label": "Marking plan",
+                "ready": marking_ready,
+                "detail": (
+                    "Locked criteria and teacher solution context are ready"
+                    if marking_ready
+                    else "Resolve the marking-plan errors below"
+                ),
+            },
+            {
+                "id": "paper-context",
+                "label": "Visual paper context",
+                "ready": paper_context_ready,
+                "detail": (
+                    "Complete paper and solution will be read visually; OCR regions are advisory"
+                    if strategy == "full_document_visual"
+                    else (
+                        "Reviewed question regions are ready"
+                        if strategy == "verified_question_regions"
+                        else "No safe paper evidence strategy is available"
+                    )
+                ),
+            },
+        ],
+    }
+
+
 def _pcr_marking_policy_module() -> Any:
     """Load ExamPen's policy helpers through the hyphenated package bridge."""
 
@@ -4345,6 +4489,101 @@ async def draft_pcr_marking_plan(
     }
 
 
+@router.get("/documents/{document_id}/finalize-readiness")
+async def get_exam_finalize_readiness(
+    document_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Return the same readiness contract enforced by finalization."""
+
+    is_b2c = is_b2c_admin(current_user)
+    document = await (
+        db.b2c_find_one("documents", {"document_id": document_id})
+        if is_b2c
+        else db.mongo_find_one("documents", {"document_id": document_id})
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    exam_mode = document.get("exam_mode")
+    if not exam_mode:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document has no exam_mode set. Only DCR/PCR documents can be finalized.",
+        )
+    tenant_db = db.b2c_db if is_b2c else await db.get_tenant_db(
+        current_user.get("db_name")
+    )
+    questions = await tenant_db["questions"].find(
+        {"document_id": document_id}
+    ).to_list(length=10000)
+
+    if exam_mode == "pcr":
+        if document.get("ocr_status") != "completed":
+            return {
+                "document_id": document_id,
+                "exam_mode": exam_mode,
+                "ready": False,
+                "already_finalized": bool(document.get("exam_finalized")),
+                "strategy": "unavailable",
+                "question_count": len(questions),
+                "errors": ["OCR must be completed before finalizing."],
+                "warnings": [],
+                "checks": [],
+                "paper_context": {},
+                "marking_plan": {},
+            }
+        preflight = await _prepare_pcr_finalization(
+            tenant_db,
+            document=document,
+            questions=questions,
+        )
+        return _public_pcr_finalization_readiness(document, preflight)
+
+    template_errors: List[str] = []
+    if not document.get("exam_template_path"):
+        template_errors.append("Missing answer template (blank answer sheet for overlay)")
+    answer_key_errors: List[str] = []
+    if not questions:
+        answer_key_errors.append("No answer keys found for this DCR document")
+    for question in questions:
+        question_id = question.get("id", "?")
+        if question.get("question_type", "mcq") == "subjective":
+            answer_key_errors.append(
+                f"Q {question_id}: subjective questions not allowed in DCR paper"
+            )
+        if not question.get("correct_answer"):
+            answer_key_errors.append(f"Q {question_id}: missing correct answer")
+    errors = [*template_errors, *answer_key_errors]
+    return {
+        "document_id": document_id,
+        "exam_mode": exam_mode,
+        "ready": not errors,
+        "already_finalized": bool(document.get("exam_finalized")),
+        "strategy": "dcr_template",
+        "question_count": len(questions),
+        "errors": errors,
+        "warnings": [],
+        "paper_context": {},
+        "marking_plan": {},
+        "checks": [
+            {
+                "id": "template",
+                "label": "Answer template",
+                "ready": bool(document.get("exam_template_path")),
+                "detail": "Template uploaded" if document.get("exam_template_path") else "Template missing",
+            },
+            {
+                "id": "questions",
+                "label": "Answer keys",
+                "ready": bool(questions) and not answer_key_errors,
+                "detail": f"{len(questions)} answer keys",
+            },
+        ],
+    }
+
+
 @router.post("/documents/{document_id}/finalize-exam")
 @limiter.limit("5/minute")
 async def finalize_exam(
@@ -4451,19 +4690,7 @@ async def finalize_exam(
         sync_summary = {}
         pcr_marking_policy: Optional[Dict[str, Any]] = None
         question_layout: List[Dict[str, Any]] = []
-        if exam_mode == "pcr":
-            try:
-                # Documents created before structured rubrics did not store a
-                # policy.  They remain legacy-compatible; newly uploaded PCR
-                # documents are explicitly saved as criterion_rubric_v1.
-                pcr_marking_policy = _pcr_marking_policy_module().normalize_marking_policy(
-                    doc.get("pcr_marking_policy")
-                )
-            except (ImportError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"Invalid PCR marking policy: {exc}",
-                ) from exc
+        paper_context: Dict[str, Any] = {}
 
         if exam_mode == "dcr":
             # DCR: require answer template
@@ -4507,57 +4734,63 @@ async def finalize_exam(
             sync_summary = {"engine": "dcr", "answer_keys_upserted": (result or {}).get("upserted", 0)}
 
         elif exam_mode == "pcr":
-            # A subjective OCR result is not enough to mark a real paper.
-            # Require reviewed text, marks, and a teacher-approved solution or
-            # rubric before the document is frozen.  Approved answer-sheet
-            # mappings are merged into an in-memory marking plan here, so the
-            # normal Content Manager review flow can supply the authoritative
-            # solution without mutating the editable source question.
-            from services.exampen_paper_service import (
-                build_question_layout,
-                validate_pcr_questions,
-            )
-
-            finalized_questions, marking_plan_summary = await _materialize_pcr_marking_plan(
+            # Freeze the same authoritative contract exposed by the readiness
+            # endpoint. OCR regions are advisory when the canonical
+            # full-document visual grader can read the original paper,
+            # teacher solution, and complete student copy together.
+            preflight = await _prepare_pcr_finalization(
                 tenant_db,
-                document_id=document_id,
+                document=doc,
                 questions=questions,
             )
-            readiness_errors = validate_pcr_questions(
-                finalized_questions,
-                marking_policy=pcr_marking_policy,
-            )
-            regions_document = await tenant_db["document_regions"].find_one(
-                _document_regions_filter(document_id, "question")
-            )
-            question_layout, layout_errors = build_question_layout(
-                doc,
-                finalized_questions,
-                regions_document,
-            )
-            readiness_errors.extend(layout_errors)
+            readiness_errors = list(preflight.get("errors") or [])
             if readiness_errors:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail={
-                        "message": "PCR finalization requires a complete marking plan",
+                        "message": "PCR finalization requires a complete paper context",
                         "errors": readiness_errors[:50],
                     },
                 )
+            finalized_questions = list(preflight.get("questions") or [])
+            marking_plan_summary = dict(preflight.get("marking_plan") or {})
+            pcr_marking_policy = preflight.get("marking_policy")
+            question_layout = list(preflight.get("question_layout") or [])
+            paper_context = dict(preflight.get("paper_context") or {})
+            layout_warnings = list(preflight.get("warnings") or [])
 
-            # Printed page order is authoritative. Mongo insertion order is
-            # not a paper contract and previously produced Q2/Q3 shifts after
-            # partial OCR reruns.
+            # Prefer reviewed printed layout. The full-document visual path
+            # deliberately has no mandatory regions, so fall back to the
+            # immutable extracted question order instead of Mongo insertion
+            # order.
             layout_order = {
                 str(item["source_question_id"]): int(item["question_number"])
                 for item in question_layout
             }
-            finalized_questions.sort(
-                key=lambda item: layout_order.get(
-                    str(item.get("question_id") or item.get("id") or item.get("_id") or ""),
-                    10**9,
+            indexed_questions = list(enumerate(finalized_questions))
+
+            def _finalization_order(item: tuple[int, Dict[str, Any]]) -> tuple[int, int]:
+                position, question = item
+                question_id = str(
+                    question.get("question_id")
+                    or question.get("id")
+                    or question.get("_id")
+                    or ""
                 )
-            )
+                if question_id in layout_order:
+                    return layout_order[question_id], position
+                for key in ("question_number", "extraction_order"):
+                    try:
+                        value = int(question.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if value > 0:
+                        return value, position
+                return position + 1, position
+
+            finalized_questions = [
+                question for _, question in sorted(indexed_questions, key=_finalization_order)
+            ]
 
             # PCR: sync all questions to evalpen_questions
             from api.v1.tutor_async import sync_questions_to_exampen
@@ -4577,6 +4810,8 @@ async def finalize_exam(
                 "marking_policy": pcr_marking_policy,
                 "layout_schema_version": 1,
                 "layout_question_count": len(question_layout),
+                "paper_context_strategy": preflight.get("strategy"),
+                "paper_context_warnings": layout_warnings,
             }
 
             # The immutable snapshot below must use the same reviewed
@@ -4598,6 +4833,7 @@ async def finalize_exam(
             document=snapshot_document,
             questions=questions,
             question_layout=question_layout or None,
+            paper_context=paper_context or None,
         )
         sync_summary["paper_version_id"] = paper_snapshot["paper_version_id"]
         sync_summary["paper_content_hash"] = paper_snapshot["content_hash"]
@@ -4610,6 +4846,7 @@ async def finalize_exam(
                 "exam_sync_summary": sync_summary,
                 "exam_paper_version_id": paper_snapshot["paper_version_id"],
                 "exam_content_hash": paper_snapshot["content_hash"],
+                "exam_paper_context": paper_context or None,
                 "pcr_marking_policy": pcr_marking_policy,
                 "pcr_marking_policy_locked_at": datetime.utcnow()
                 if pcr_marking_policy is not None
@@ -4617,6 +4854,12 @@ async def finalize_exam(
                 "exam_readiness": {
                     "status": "paper_ready",
                     "question_count": paper_snapshot["question_count"],
+                    "strategy": (
+                        paper_context.get("mode")
+                        if paper_context
+                        else "dcr_template"
+                    ),
+                    "warnings": sync_summary.get("paper_context_warnings") or [],
                     "checked_at": datetime.utcnow(),
                 },
                 "exam_finalization_status": "completed",
@@ -4625,6 +4868,8 @@ async def finalize_exam(
             "$unset": {
                 "exam_finalization_token": "",
                 "exam_finalization_lease_expires_at": "",
+                "exam_finalization_error": "",
+                "exam_finalization_failed_at": "",
             },
         }
 

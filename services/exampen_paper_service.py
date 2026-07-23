@@ -15,6 +15,7 @@ import hashlib
 import importlib
 import json
 import logging
+import os
 import uuid
 from datetime import date, datetime, timezone
 from datetime import timedelta
@@ -254,6 +255,7 @@ def _content_hash(
     document: Dict[str, Any],
     questions: Iterable[Dict[str, Any]],
     question_layout: Optional[List[Dict[str, Any]]] = None,
+    paper_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Hash only fields that determine the exam paper and marking outcome."""
     normalized_questions: List[Dict[str, Any]] = []
@@ -278,8 +280,11 @@ def _content_hash(
         "title": _as_text(document.get("title")),
         "subject": _as_text(document.get("subject")),
         "pcr_marking_policy": document.get("pcr_marking_policy"),
+        "question_paper_sha256": _as_text(document.get("sha256")) or None,
+        "teacher_solution_sha256": _as_text(document.get("answer_sheet_sha256")) or None,
         "questions": normalized_questions,
         "question_layout": question_layout or [],
+        "paper_context": paper_context or {},
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=_json_default)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -586,6 +591,100 @@ def build_question_layout(
     return layout, errors
 
 
+def full_document_visual_contract(document: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the immutable full-document grading capability for one paper.
+
+    Semantic ownership for camera/PDF copies belongs to the multimodal grader,
+    which receives the original paper, teacher solution, frozen catalog, and
+    complete student copy together. OCR regions remain useful review metadata
+    but are not a prerequisite for that path.
+    """
+
+    enabled = os.getenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "true").strip().lower()
+    provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
+    model_id = (
+        os.getenv("PCR_FULL_DOCUMENT_GRADING_MODEL", "").strip()
+        or os.getenv("OPENAI_MODEL", "gpt-5.1").strip()
+    )
+    blockers: List[str] = []
+    if enabled in {"0", "false", "no", "off"}:
+        blockers.append("Full-document visual grading is disabled")
+    if provider and provider != "openai":
+        blockers.append("The configured AI provider does not support the canonical PDF grading path")
+    if not model_id.lower().startswith(("gpt-5", "gpt-4.1", "gpt-4o")):
+        blockers.append("The configured grading model does not support the canonical visual contract")
+    if not _as_text(document.get("file_path")):
+        blockers.append("The immutable question-paper asset is unavailable")
+
+    return {
+        "version": "canonical-full-document-visual-v1",
+        "mode": "full_document_visual",
+        "ready": not blockers,
+        "model_id": model_id,
+        "prompt_cache_scope": _as_text(document.get("document_id")),
+        "question_paper_sha256": _as_text(document.get("sha256")) or None,
+        "teacher_solution_sha256": _as_text(document.get("answer_sheet_sha256")) or None,
+        "has_teacher_solution_asset": bool(_as_text(document.get("answer_sheet_path"))),
+        "requires_question_regions": False,
+        "blockers": blockers,
+    }
+
+
+def resolve_question_layout_for_finalization(
+    document: Dict[str, Any],
+    questions: Iterable[Dict[str, Any]],
+    regions_document: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Resolve the paper evidence strategy without letting OCR gate vision.
+
+    Reviewed regions stay authoritative when available. If they are missing or
+    ambiguous, a ready canonical full-document visual contract makes those
+    layout errors advisory because the primary grader reads the complete source
+    documents directly. Deployments that disable the visual path retain the
+    strict region requirement for their legacy mapper.
+    """
+
+    question_list = list(questions)
+    layout, layout_errors = build_question_layout(
+        document,
+        question_list,
+        regions_document,
+    )
+    visual_contract = full_document_visual_contract(document)
+    if not layout_errors:
+        return {
+            "ready": True,
+            "strategy": "verified_question_regions",
+            "question_layout": layout,
+            "paper_context": {
+                **visual_contract,
+                "ready": True,
+                "mode": "verified_question_regions",
+                "requires_question_regions": True,
+                "blockers": [],
+            },
+            "warnings": [],
+            "errors": [],
+        }
+    if visual_contract["ready"]:
+        return {
+            "ready": True,
+            "strategy": "full_document_visual",
+            "question_layout": [],
+            "paper_context": visual_contract,
+            "warnings": layout_errors,
+            "errors": [],
+        }
+    return {
+        "ready": False,
+        "strategy": "unavailable",
+        "question_layout": [],
+        "paper_context": visual_contract,
+        "warnings": [],
+        "errors": [*layout_errors, *visual_contract["blockers"]],
+    }
+
+
 def validate_pcr_questions(
     questions: Iterable[Dict[str, Any]],
     *,
@@ -661,6 +760,7 @@ async def create_paper_snapshot(
     questions: List[Dict[str, Any]],
     *,
     question_layout: Optional[List[Dict[str, Any]]] = None,
+    paper_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist one immutable version of a reviewed document.
 
@@ -684,6 +784,7 @@ async def create_paper_snapshot(
         {**document, "pcr_marking_policy": marking_policy},
         questions,
         question_layout,
+        paper_context,
     )
     paper_version_id = f"paper-{document_id}-{content_hash[:16]}"
     versions = tenant_db[PAPER_VERSIONS_COLLECTION]
@@ -741,7 +842,16 @@ async def create_paper_snapshot(
         "question_count": len(question_docs),
         "layout_schema_version": PAPER_LAYOUT_SCHEMA_VERSION if question_layout else None,
         "question_layout": copy.deepcopy(question_layout or []),
-        "layout_status": "verified" if question_layout else "legacy_unverified",
+        "layout_status": (
+            "verified"
+            if question_layout
+            else (
+                "full_document_visual"
+                if (paper_context or {}).get("mode") == "full_document_visual"
+                else "legacy_unverified"
+            )
+        ),
+        "paper_context": copy.deepcopy(paper_context or {}),
         "pcr_marking_policy": copy.deepcopy(marking_policy),
         "created_at": now,
         "source_document_finalized_at": document.get("exam_finalized_at"),

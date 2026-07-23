@@ -166,6 +166,45 @@ def test_full_document_validator_marks_low_question_count_against_anchors():
     assert "question_count_lower_than_layout_anchors" in summary["reasons"]
 
 
+def test_full_document_validator_treats_repeated_numbered_subparts_as_advisory():
+    from api.v1.pdf_async import ExtractedQuestion
+    from services.full_document_extraction_validator import FullDocumentExtractionValidator
+
+    questions = [
+        ExtractedQuestion(
+            id=f"q{number}",
+            text=(
+                f"Calculate the equilibrium result for reaction {number} "
+                "and show every step in your method."
+            ),
+            metadata={"number": str(number)},
+        )
+        for number in range(1, 6)
+    ]
+    layout_report = {
+        "pages": [
+            {
+                "question_anchors": [
+                    {"number": number}
+                    for number in ("1", "2", "1", "2", "3", "1", "2", "4", "1", "2", "3", "4", "5")
+                ]
+            }
+        ]
+    }
+
+    summary = FullDocumentExtractionValidator().validate_questions(
+        questions=questions,
+        layout_report=layout_report,
+        skip_option_extraction=True,
+        objective_questions=False,
+    )
+
+    assert summary["status"] == "needs_review"
+    assert summary["manual_segmentation_recommended"] is False
+    assert "numbered_subparts_possible" in summary["reasons"]
+    assert "question_count_lower_than_layout_anchors" not in summary["reasons"]
+
+
 def test_full_document_validator_accepts_layout_supported_three_option_mcq():
     from api.v1.pdf_async import ExtractedQuestion
     from services.full_document_extraction_validator import FullDocumentExtractionValidator
