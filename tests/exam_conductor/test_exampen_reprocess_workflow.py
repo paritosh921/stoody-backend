@@ -108,7 +108,16 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
 
 
 @pytest.mark.asyncio
-async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping():
+@pytest.mark.parametrize(
+    "visual_contract_version",
+    [
+        "canonical-full-document-visual-v1",
+        "canonical-full-document-visual-v2",
+    ],
+)
+async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping(
+    visual_contract_version,
+):
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,
         process_pcr_processing_job,
@@ -144,7 +153,7 @@ async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping():
         {
             "paper_version_id": "PV-VISUAL",
             "paper_context": {
-                "version": "canonical-full-document-visual-v1",
+                "version": visual_contract_version,
                 "mode": "full_document_visual",
                 "ready": True,
             },

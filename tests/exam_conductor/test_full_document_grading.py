@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -52,6 +53,35 @@ class _SlowFakeGate(_FakeGate):
     async def call(self, model_id: str, prompt: str, caller_id: str, **kwargs: Any):
         await asyncio.sleep(0.05)
         return await super().call(model_id, prompt, caller_id, **kwargs)
+
+
+class _SequenceGate:
+    def __init__(self, payloads: list[dict[str, Any]]) -> None:
+        self.payloads = list(payloads)
+        self.calls: list[dict[str, Any]] = []
+
+    async def call(self, model_id: str, prompt: str, caller_id: str, **kwargs: Any):
+        self.calls.append(
+            {
+                "model_id": model_id,
+                "prompt": prompt,
+                "caller_id": caller_id,
+                **kwargs,
+            }
+        )
+        payload = self.payloads.pop(0)
+        return SimpleNamespace(
+            content=json.dumps(payload),
+            usage=SimpleNamespace(
+                model="gpt-5.1-2025-11-13",
+                caller=caller_id,
+                input_tokens=4_000,
+                output_tokens=800,
+                cache_read_tokens=2_000,
+                total_tokens=4_800,
+                estimated_cost_usd=0.05,
+            ),
+        )
 
 
 async def _seed(db, *, submission_id: str = "SUB-DOC-1") -> None:
@@ -279,6 +309,121 @@ async def _async_value(value):
     return value
 
 
+def _page_asset(module, page_number: int):
+    from PIL import Image
+
+    output = io.BytesIO()
+    Image.new("RGB", (1200, 1600), "white").save(output, format="JPEG")
+    value = output.getvalue()
+    return module._StudentPageAsset(
+        page_number=page_number,
+        original_bytes=value,
+        global_bytes=value,
+        global_media_type="image/jpeg",
+    )
+
+
+def test_close_visual_readings_keep_marks_but_require_review():
+    module = _module()
+    question = {
+        "question_id": "Q-AMBIGUOUS",
+        "question_number": 1,
+        "question_text": "Evaluate the expression.",
+        "max_marks": 1,
+        "marking_criteria": [
+            {
+                "criterion_id": "answer",
+                "description": "Correct interpretation and value",
+                "max_marks": 1,
+                "acceptable_evidence": "The superscript is read and evaluated correctly.",
+            }
+        ],
+    }
+    item = {
+        "question_number": 1,
+        "attempt_status": "attempted",
+        "confidence": 0.96,
+        "content_type": "MIXED",
+        "evidence_regions": [
+            {
+                "region_id": "q1-math",
+                "page_number": 1,
+                "x_start": 100,
+                "y_start": 100,
+                "x_end": 700,
+                "y_end": 400,
+                "evidence_kind": "mathematics",
+                "continuation_group": "",
+                "evidence": "A handwritten exponent is visible.",
+                "mapping_confidence": 0.96,
+            }
+        ],
+        "student_answer": "2 raised to 3",
+        "interpretation_hypotheses": [
+            {
+                "interpretation_id": "superscript",
+                "value": "2 raised to 3",
+                "confidence": 0.84,
+                "evidence_region_ids": ["q1-math"],
+                "ambiguity_notes": "The 3 is small and above the baseline.",
+            },
+            {
+                "interpretation_id": "adjacent",
+                "value": "23",
+                "confidence": 0.80,
+                "evidence_region_ids": ["q1-math"],
+                "ambiguity_notes": "The camera angle makes the baseline uncertain.",
+            },
+        ],
+        "visual_semantics": {
+            "summary": "A base and a small raised numeral are visible.",
+            "elements": [
+                {
+                    "element_id": "expression",
+                    "element_type": "mathematics",
+                    "label": "2^3",
+                    "region_id": "q1-math",
+                    "attributes": "possible superscript",
+                    "confidence": 0.84,
+                }
+            ],
+            "relationships": [],
+            "confidence": 0.90,
+        },
+        "method_analysis": _method_analysis(),
+        "criterion_marks": [
+            {
+                "criterion_id": "answer",
+                "decision": "met",
+                "confidence": 0.90,
+                "marks_awarded": 1,
+                "rationale": "The raised 3 is interpreted as an exponent.",
+                "evidence": "The exponent is visible in q1-math.",
+                "evidence_region_ids": ["q1-math"],
+                "missing_evidence": "",
+                "credit_basis": "direct_evidence",
+            }
+        ],
+        "total_score": 1,
+        "overall_feedback": "Correct.",
+        "needs_review": False,
+        "review_reason": "",
+    }
+
+    grade = module._validate_question_grade(
+        item,
+        question=question,
+        question_number=1,
+        page_count=1,
+        coverage_complete=True,
+        coverage_confidence=0.98,
+    )
+
+    assert grade.total_score == 1
+    assert grade.manual_review_required is True
+    assert "plausible visual readings" in grade.review_reason
+
+
 @pytest.mark.asyncio
 async def test_full_document_grading_keeps_diagram_visual_and_missing_question_unresolved(
     monkeypatch,
@@ -335,6 +480,230 @@ async def test_full_document_grading_keeps_diagram_visual_and_missing_question_u
     assert await db["evalpen_evaluations"].count_documents(
         {"question_id": "EXAM-DOC-1::Q2"}
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v2",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                }
+            }
+        },
+    )
+    await db["evalpen_answer_pages"].insert_one(
+        {
+            "page_id": "PAGE-2",
+            "submission_id": "SUB-DOC-1",
+            "page_number": 2,
+            "raw_image_ref": "private-page-2.jpg",
+            "content_hash": "page-hash-2",
+        }
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    assets = [_page_asset(module, 1), _page_asset(module, 2)]
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda pages: _async_value((assets, sum(len(a.global_bytes) for a in assets))),
+    )
+    mapping_payload = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "document_review": _document_review(),
+        "questions": [
+            {
+                "question_number": 1,
+                "attempt_status": "attempted",
+                "confidence": 0.96,
+                "content_type": "DIAGRAM_HEAVY",
+                "evidence_regions": [
+                    {
+                        "region_id": "q1-diagram",
+                        "page_number": 1,
+                        "x_start": 20,
+                        "y_start": 100,
+                        "x_end": 470,
+                        "y_end": 520,
+                        "evidence_kind": "diagram",
+                        "continuation_group": "q1",
+                        "evidence": "Circuit diagram and labels",
+                        "mapping_confidence": 0.97,
+                    },
+                    {
+                        "region_id": "q1-continuation",
+                        "page_number": 2,
+                        "x_start": 30,
+                        "y_start": 120,
+                        "x_end": 970,
+                        "y_end": 330,
+                        "evidence_kind": "handwriting",
+                        "continuation_group": "q1",
+                        "evidence": "Continuation explaining the circuit",
+                        "mapping_confidence": 0.94,
+                    },
+                ],
+                "mapping_reason": "Diagram semantics and continuation match Q1.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+            {
+                "question_number": 2,
+                "attempt_status": "attempted",
+                "confidence": 0.95,
+                "content_type": "TEXT_ONLY",
+                "evidence_regions": [
+                    {
+                        "region_id": "q2-explanation",
+                        "page_number": 1,
+                        "x_start": 530,
+                        "y_start": 100,
+                        "x_end": 980,
+                        "y_end": 520,
+                        "evidence_kind": "handwriting",
+                        "continuation_group": "",
+                        "evidence": "Written explanation beside the diagram",
+                        "mapping_confidence": 0.95,
+                    }
+                ],
+                "mapping_reason": "The explanation directly answers Q2.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+        ],
+        "unassigned_regions": [],
+    }
+    grading_payload = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [
+            {
+                "question_number": 1,
+                "confidence": 0.96,
+                "student_answer": "A closed labelled circuit is shown.",
+                "interpretation_hypotheses": [
+                    {
+                        "interpretation_id": "q1-primary",
+                        "value": "Closed battery-switch-lamp circuit",
+                        "confidence": 0.96,
+                        "evidence_region_ids": [
+                            "q1-diagram",
+                            "q1-continuation",
+                        ],
+                        "ambiguity_notes": "",
+                    }
+                ],
+                "visual_semantics": {
+                    "summary": "Battery, switch and lamp form a closed circuit.",
+                    "elements": [
+                        {
+                            "element_id": "battery",
+                            "element_type": "circuit_component",
+                            "label": "battery",
+                            "region_id": "q1-diagram",
+                            "attributes": "connected",
+                            "confidence": 0.96,
+                        }
+                    ],
+                    "relationships": [],
+                    "confidence": 0.95,
+                },
+                "method_analysis": _method_analysis(),
+                "criterion_marks": [
+                    {
+                        **_attempted_diagram()["criterion_marks"][0],
+                        "evidence_region_ids": [
+                            "q1-diagram",
+                            "q1-continuation",
+                        ],
+                    }
+                ],
+                "total_score": 2,
+                "overall_feedback": "Correct diagram.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+            {
+                "question_number": 2,
+                "confidence": 0.95,
+                "student_answer": "The observation follows because the circuit is complete.",
+                "interpretation_hypotheses": [
+                    {
+                        "interpretation_id": "q2-primary",
+                        "value": "Complete circuit explains the observation",
+                        "confidence": 0.95,
+                        "evidence_region_ids": ["q2-explanation"],
+                        "ambiguity_notes": "",
+                    }
+                ],
+                "visual_semantics": {
+                    "summary": "Readable written explanation.",
+                    "elements": [],
+                    "relationships": [],
+                    "confidence": 0.95,
+                },
+                "method_analysis": _method_analysis(),
+                "criterion_marks": [
+                    {
+                        **_attempted_explanation()["criterion_marks"][0],
+                        "evidence_region_ids": ["q2-explanation"],
+                    }
+                ],
+                "total_score": 2,
+                "overall_feedback": "Correct explanation.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+        ],
+    }
+    gate = _SequenceGate([mapping_payload, grading_payload])
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    result = await service.grade_submission("SUB-DOC-1")
+
+    assert result.status == "completed"
+    assert result.review_state == "ready"
+    assert result.evaluated_count == 2
+    assert len(gate.calls) == 2
+    assert gate.calls[0]["metadata"]["pcr_stage"] == "full_document_evidence_mapping"
+    assert gate.calls[1]["metadata"]["pcr_stage"] == "question_visual_grading"
+    q1 = await db["evalpen_detected_responses"].find_one(
+        {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
+    )
+    q2 = await db["evalpen_detected_responses"].find_one(
+        {"question_id": "EXAM-DOC-1::Q2", "superseded_at": {"$exists": False}}
+    )
+    assert q1["evidence_version"] == 3
+    assert len(q1["source_pages"]) == 2
+    assert q1["source_pages"][0]["region_id"] == "q1-diagram"
+    assert q2["source_pages"][0]["x_start"] > 100
+    assert q1["visual_evidence"]["visual_semantics"]["elements"][0]["label"] == "battery"
+    assert q1["semantic_evidence_signature"]
+    run = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": result.run_id}
+    )
+    assert run["prompt_version"] == "pcr-full-document-visual-v5"
+    assert run["evidence_graph_mapping"]["questions"][0]["evidence_regions"]
+    frozen_exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-DOC-1"})
+    assert frozen_exam["pcr_grading_contract"]["prompt_version"] == (
+        "pcr-full-document-visual-v5"
+    )
 
 
 @pytest.mark.asyncio

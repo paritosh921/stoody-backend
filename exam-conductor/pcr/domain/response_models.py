@@ -236,11 +236,41 @@ class SourcePageRef(BaseModel):
     """A reference to a page range contributing to a detected response."""
 
     page_number: int = Field(..., ge=1)
+    x_start: float = Field(
+        0.0,
+        description="Start X in mm on this page (0 = left)",
+    )
     y_start: float = Field(
         ..., description="Start Y in mm on this page (0 = top)"
     )
+    x_end: float | None = Field(
+        None,
+        description="End X in mm on this page; absent means full page width",
+    )
     y_end: float = Field(
         ..., description="End Y in mm on this page (page_height = bottom)"
+    )
+    region_id: str | None = Field(
+        None,
+        description="Stable visual evidence-region identifier",
+    )
+    evidence_kind: str | None = Field(
+        None,
+        description="handwriting | mathematics | diagram | table | graph | label | mixed",
+    )
+    continuation_group: str | None = Field(
+        None,
+        description="Links disconnected regions belonging to one continued answer",
+    )
+    evidence: str | None = Field(
+        None,
+        description="Short model description used for visual evidence audit",
+    )
+    mapping_confidence: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Question-ownership confidence for this region",
     )
 
 

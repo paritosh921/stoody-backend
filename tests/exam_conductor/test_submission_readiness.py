@@ -468,7 +468,22 @@ async def test_teacher_split_creates_disjoint_evidence_and_supersedes_the_source
     )
     await db["evalpen_detected_responses"].update_one(
         {"response_id": "RESP-READY-1"},
-        {"$set": {"evidence_atom_ids": ["original-full-region"]}},
+        {
+            "$set": {
+                "evidence_atom_ids": ["original-full-region"],
+                "source_pages": [
+                    {
+                        "page_number": 1,
+                        "x_start": 25,
+                        "y_start": 10,
+                        "x_end": 150,
+                        "y_end": 80,
+                        "region_id": "model-region-1",
+                        "evidence_kind": "mixed",
+                    }
+                ],
+            }
+        },
     )
 
     class _FakeEvalCore:
@@ -512,7 +527,13 @@ async def test_teacher_split_creates_disjoint_evidence_and_supersedes_the_source
                         detected_text="First corrected answer",
                         source_pages=[
                             ResponseRegionCorrection(
-                                page_number=1, y_start=10, y_end=45
+                                page_number=1,
+                                x_start=25,
+                                y_start=10,
+                                x_end=150,
+                                y_end=45,
+                                region_id="model-region-1",
+                                evidence_kind="mathematics",
                             )
                         ],
                     ),
@@ -521,7 +542,13 @@ async def test_teacher_split_creates_disjoint_evidence_and_supersedes_the_source
                         detected_text="Second corrected answer",
                         source_pages=[
                             ResponseRegionCorrection(
-                                page_number=1, y_start=45, y_end=80
+                                page_number=1,
+                                x_start=25,
+                                y_start=45,
+                                x_end=150,
+                                y_end=80,
+                                region_id="model-region-1",
+                                evidence_kind="diagram",
                             )
                         ],
                     ),
@@ -538,6 +565,14 @@ async def test_teacher_split_creates_disjoint_evidence_and_supersedes_the_source
     assert len(active) == 2
     assert active[0]["evidence_atom_ids"] != active[1]["evidence_atom_ids"]
     assert all(item["evidence_source"] == "teacher_split" for item in active)
+    assert all(item["source_pages"][0]["x_start"] == 25 for item in active)
+    assert all(item["source_pages"][0]["x_end"] == 150 for item in active)
+    assert active[0]["source_pages"][0]["region_id"].startswith("teacher-split-")
+    assert active[1]["source_pages"][0]["region_id"].startswith("teacher-split-")
+    assert (
+        active[0]["source_pages"][0]["region_id"]
+        != active[1]["source_pages"][0]["region_id"]
+    )
     original = await db["evalpen_detected_responses"].find_one(
         {"response_id": "RESP-READY-1"}
     )

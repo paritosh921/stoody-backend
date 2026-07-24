@@ -203,7 +203,10 @@ async def _required_processing_path(tenant_db: Any, exam_id: str) -> str:
     if (
         context.get("ready")
         and str(context.get("version") or "")
-        == "canonical-full-document-visual-v1"
+        in {
+            "canonical-full-document-visual-v1",
+            "canonical-full-document-visual-v2",
+        }
     ):
         return FULL_DOCUMENT_PROCESSING_PATH
     return "legacy_ocr_mapping"

@@ -190,6 +190,10 @@ def test_full_document_visual_contract_makes_ocr_layout_advisory(monkeypatch):
     assert resolved["question_layout"] == []
     assert resolved["errors"] == []
     assert resolved["warnings"]
+    assert (
+        resolved["paper_context"]["version"]
+        == "canonical-full-document-visual-v2"
+    )
     assert resolved["paper_context"]["question_paper_sha256"] == "paper-hash"
     assert resolved["paper_context"]["teacher_solution_sha256"] == "solution-hash"
     assert resolved["paper_context"]["requires_question_regions"] is False

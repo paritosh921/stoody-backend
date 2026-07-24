@@ -147,13 +147,22 @@ class DocumentCoverageReviewRequest(BaseModel):
 
 class ResponseRegionCorrection(BaseModel):
     page_number: int = Field(..., ge=1)
+    x_start: float = Field(0.0, ge=0)
     y_start: float = Field(..., ge=0)
+    x_end: Optional[float] = Field(None, gt=0)
     y_end: float = Field(..., gt=0)
+    region_id: Optional[str] = None
+    evidence_kind: Optional[str] = None
+    continuation_group: Optional[str] = None
+    evidence: Optional[str] = None
+    mapping_confidence: Optional[float] = Field(None, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_range(self) -> "ResponseRegionCorrection":
         if self.y_end <= self.y_start:
             raise ValueError("y_end must be greater than y_start")
+        if self.x_end is not None and self.x_end <= self.x_start:
+            raise ValueError("x_end must be greater than x_start")
         return self
 
 
@@ -2156,7 +2165,10 @@ async def _correct_response_assignment_impl(
         for region in regions:
             payload = (
                 f"teacher-region-v1|{submission_id}|{int(region['page_number'])}|"
-                f"{float(region['y_start']):.4f}|{float(region['y_end']):.4f}"
+                f"{float(region.get('x_start') or 0):.4f}|"
+                f"{float(region['y_start']):.4f}|"
+                f"{float(region.get('x_end') or 210):.4f}|"
+                f"{float(region['y_end']):.4f}"
             )
             atoms.append(
                 "teacher-region:"
@@ -2309,6 +2321,10 @@ async def _correct_response_assignment_impl(
             for region in pages:
                 contained = any(
                     int(original.get("page_number")) == int(region["page_number"])
+                    and float(region.get("x_start") or 0)
+                    >= float(original.get("x_start") or 0) - 0.01
+                    and float(region.get("x_end") or 210)
+                    <= float(original.get("x_end") or 210) + 0.01
                     and float(region["y_start"]) >= float(original["y_start"]) - 0.01
                     and float(region["y_end"]) <= float(original["y_end"]) + 0.01
                     for original in original_regions
@@ -2359,7 +2375,18 @@ async def _correct_response_assignment_impl(
                 replacing_response_ids={body.response_id},
             )
         for part in body.parts:
-            pages = [region.model_dump() for region in part.source_pages]
+            pages = [
+                {
+                    **region.model_dump(),
+                    # A teacher split creates new evidence regions. Reusing the
+                    # model mapper's identifier for two different questions
+                    # would make the evidence graph internally ambiguous.
+                    "region_id": f"teacher-split-{uuid.uuid4().hex[:16]}",
+                    "continuation_group": None,
+                    "mapping_confidence": 1.0,
+                }
+                for region in part.source_pages
+            ]
             created.append(
                 await _create_assigned_response(
                     source,
@@ -2393,7 +2420,13 @@ async def _correct_response_assignment_impl(
             for region in source.get("source_pages") or []:
                 if not isinstance(region, dict):
                     continue
-                key = (region.get("page_number"), region.get("y_start"), region.get("y_end"))
+                key = (
+                    region.get("page_number"),
+                    region.get("x_start"),
+                    region.get("y_start"),
+                    region.get("x_end"),
+                    region.get("y_end"),
+                )
                 if key not in seen_regions:
                     seen_regions.add(key)
                     merged_pages.append(region)

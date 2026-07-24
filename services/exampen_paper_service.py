@@ -617,7 +617,10 @@ def full_document_visual_contract(document: Dict[str, Any]) -> Dict[str, Any]:
         blockers.append("The immutable question-paper asset is unavailable")
 
     return {
-        "version": "canonical-full-document-visual-v1",
+        # V2 freezes the global-to-local evidence-graph contract. Existing V1
+        # paper versions remain valid and continue on their already locked
+        # single-call grading contract; newly finalized papers use V2.
+        "version": "canonical-full-document-visual-v2",
         "mode": "full_document_visual",
         "ready": not blockers,
         "model_id": model_id,

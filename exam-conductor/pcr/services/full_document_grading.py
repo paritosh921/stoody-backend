@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from pymongo.errors import DuplicateKeyError
 
@@ -43,10 +43,21 @@ from ..marking_policy import (
 from ..storage.evaluation_repo import EvaluationRepository
 from ..storage.response_repo import DetectedResponseRepository
 from .ocr_service import AssetIntegrityError, _resolve_image_base64
+from .visual_evidence_graph import (
+    EVIDENCE_GRAPH_VERSION,
+    PROMPT_VERSION as _EVIDENCE_GRAPH_PROMPT_VERSION,
+    evidence_mapping_schema,
+    grading_system_instructions,
+    mapping_system_instructions,
+    merge_mapping_and_grading,
+    question_grading_schema,
+    validate_mapping_payload,
+)
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_VERSION = "pcr-full-document-visual-v4"
+_SUPPORTED_PROMPT_VERSIONS = {_PROMPT_VERSION, _EVIDENCE_GRAPH_PROMPT_VERSION}
 _RUNS_COLLECTION = "evalpen_document_grading_runs"
 _PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 _CALLER_ID = "pcr_eval_core"
@@ -58,6 +69,7 @@ _DEFAULT_REASONING_EFFORT = "medium"
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
 _MAX_REQUEST_PAYLOAD_BYTES = 45 * 1024 * 1024
+_A4_WIDTH_MM = 210.0
 _A4_HEIGHT_MM = 297.0
 
 
@@ -100,7 +112,7 @@ class _DocumentReview:
     warnings: List[str]
     required: bool
 
-    def as_dict(self, *, run_id: str) -> Dict[str, Any]:
+    def as_dict(self, *, run_id: str, prompt_version: str) -> Dict[str, Any]:
         return {
             "status": "pending_review" if self.required else "verified",
             "required": self.required,
@@ -108,7 +120,7 @@ class _DocumentReview:
             "confidence": self.confidence,
             "warnings": list(self.warnings),
             "grading_run_id": run_id,
-            "prompt_version": _PROMPT_VERSION,
+            "prompt_version": prompt_version,
             "updated_at": datetime.now(timezone.utc),
         }
 
@@ -121,7 +133,7 @@ class _ValidatedGrade:
     confidence: float
     student_answer: str
     content_type: str
-    source_pages: List[Dict[str, float]]
+    source_pages: List[Dict[str, Any]]
     method_analysis: Dict[str, Any]
     criterion_marks: List[Dict[str, Any]]
     total_score: Optional[float]
@@ -129,6 +141,14 @@ class _ValidatedGrade:
     manual_review_required: bool
     review_reason: str
     validation_errors: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _StudentPageAsset:
+    page_number: int
+    original_bytes: bytes
+    global_bytes: bytes
+    global_media_type: str
 
 
 class FullDocumentGradingService:
@@ -184,6 +204,7 @@ class FullDocumentGradingService:
             {"paper_version_id": exam.get("paper_version_id")}
         )
         canonical_visual_required = _paper_requires_canonical_visual(paper_version)
+        evidence_graph_required = _paper_requires_evidence_graph(paper_version)
         if not _feature_enabled():
             if canonical_visual_required:
                 raise FullDocumentGradingError(
@@ -197,12 +218,24 @@ class FullDocumentGradingService:
             )
         grading_contract = dict(exam.get("pcr_grading_contract") or {})
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
-        if contract_version and contract_version != _PROMPT_VERSION:
+        prompt_version = (
+            _EVIDENCE_GRAPH_PROMPT_VERSION
+            if evidence_graph_required
+            else _PROMPT_VERSION
+        )
+        if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
             raise FullDocumentGradingError(
                 "This exam is locked to grading contract "
-                f"{contract_version}, but the worker runs {_PROMPT_VERSION}. "
+                f"{contract_version}, which this worker does not support. "
                 "Do not mix grading contracts within one exam; migrate and reprocess "
                 "the complete exam together."
+            )
+        if contract_version and contract_version != prompt_version:
+            raise FullDocumentGradingError(
+                "The immutable paper requires grading contract "
+                f"{prompt_version}, but this cohort is locked to {contract_version}. "
+                "Migrate and reprocess the complete cohort; never mix grading "
+                "contracts student by student."
             )
         model_id = str(
             grading_contract.get("model_id") or self._model_id
@@ -314,7 +347,7 @@ class FullDocumentGradingService:
             {
                 "submission_id": submission_id,
                 "grading_revision": grading_revision,
-                "prompt_version": _PROMPT_VERSION,
+                "prompt_version": prompt_version,
             }
         )
         if prior_revision_run:
@@ -343,6 +376,7 @@ class FullDocumentGradingService:
                 solution_hash=solution_file_hash,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                prompt_version=prompt_version,
             )
             run_id = f"DOCGR-{input_fingerprint[:24]}"
         materialization_id = f"{run_id}:r{grading_revision}"
@@ -378,6 +412,7 @@ class FullDocumentGradingService:
                 grading_revision=grading_revision,
                 requested_model_id=model_id,
                 page_count=len(answer_pages),
+                prompt_version=prompt_version,
             )
 
         if existing_run and existing_run.get("status") in {
@@ -396,7 +431,16 @@ class FullDocumentGradingService:
                 raise FullDocumentGradingError(
                     "The submission grading run could not acquire generation ownership"
                 )
-            student_content, student_image_bytes = await _student_copy_content(answer_pages)
+            student_assets: Optional[List[_StudentPageAsset]] = None
+            if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
+                student_assets, student_image_bytes = await _student_page_assets(
+                    answer_pages
+                )
+                student_content = _student_content_from_assets(student_assets)
+            else:
+                student_content, student_image_bytes = await _student_copy_content(
+                    answer_pages
+                )
             if (
                 len(paper_bytes)
                 + len(solution_bytes or b"")
@@ -407,44 +451,74 @@ class FullDocumentGradingService:
                     "Paper, solution, and optimized student pages exceed the visual "
                     "request size limit"
                 )
-            request_input = _build_responses_input(
-                questions=questions,
-                paper_bytes=paper_bytes,
-                solution_bytes=solution_bytes,
-                student_content=student_content,
-                paper_filename=str(document.get("filename") or "question-paper.pdf"),
-                solution_filename=str(
-                    document.get("answer_sheet_filename") or "teacher-solution.pdf"
-                ),
-            )
             try:
-                gate_response = await self._gate.call(
-                    model_id=model_id,
-                    prompt="",
-                    caller_id=_CALLER_ID,
-                    responses_input=request_input,
-                    json_schema=_evidence_ledger_schema(),
-                    prompt_cache_key=(
-                        "pcr-paper-"
-                        + _static_context_hash(
-                            exam,
-                            paper_hash=paper_file_hash,
-                            solution_hash=solution_file_hash,
-                        )[:32]
-                    ),
-                    reasoning_effort=reasoning_effort,
-                    temperature=temperature,
-                    max_output_tokens=min(30_000, max(8_000, 1_100 * len(questions))),
-                    metadata={
-                        "pcr_stage": "full_document_visual_grading",
-                        "prompt_version": _PROMPT_VERSION,
-                        "submission_id": submission_id,
-                        "exam_id": exam_id,
-                        "question_count": len(questions),
-                        "page_count": len(answer_pages),
-                        "run_id": run_id,
-                    },
-                )
+                if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
+                    raw_payload, raw_llm, usage = await self._run_evidence_graph(
+                        run_id=run_id,
+                        generation_lease_token=generation_lease_token,
+                        existing_run=await self._db[_RUNS_COLLECTION].find_one(
+                            {"run_id": run_id}
+                        ),
+                        submission_id=submission_id,
+                        exam_id=exam_id,
+                        questions=questions,
+                        answer_pages=answer_pages,
+                        student_assets=student_assets or [],
+                        paper_bytes=paper_bytes,
+                        solution_bytes=solution_bytes,
+                        student_content=student_content,
+                        document=document,
+                        model_id=model_id,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
+                        paper_file_hash=paper_file_hash,
+                        solution_file_hash=solution_file_hash,
+                    )
+                    gate_response = None
+                else:
+                    request_input = _build_responses_input(
+                        questions=questions,
+                        paper_bytes=paper_bytes,
+                        solution_bytes=solution_bytes,
+                        student_content=student_content,
+                        paper_filename=str(
+                            document.get("filename") or "question-paper.pdf"
+                        ),
+                        solution_filename=str(
+                            document.get("answer_sheet_filename")
+                            or "teacher-solution.pdf"
+                        ),
+                    )
+                    gate_response = await self._gate.call(
+                        model_id=model_id,
+                        prompt="",
+                        caller_id=_CALLER_ID,
+                        responses_input=request_input,
+                        json_schema=_evidence_ledger_schema(),
+                        prompt_cache_key=(
+                            "pcr-paper-"
+                            + _static_context_hash(
+                                exam,
+                                paper_hash=paper_file_hash,
+                                solution_hash=solution_file_hash,
+                                prompt_version=prompt_version,
+                            )[:32]
+                        ),
+                        reasoning_effort=reasoning_effort,
+                        temperature=temperature,
+                        max_output_tokens=min(
+                            30_000, max(8_000, 1_100 * len(questions))
+                        ),
+                        metadata={
+                            "pcr_stage": "full_document_visual_grading",
+                            "prompt_version": prompt_version,
+                            "submission_id": submission_id,
+                            "exam_id": exam_id,
+                            "question_count": len(questions),
+                            "page_count": len(answer_pages),
+                            "run_id": run_id,
+                        },
+                    )
             except Exception as exc:
                 await self._db[_RUNS_COLLECTION].update_one(
                     {
@@ -467,26 +541,14 @@ class FullDocumentGradingService:
                     f"Full-document model request failed: {str(exc)[:400]}"
                 ) from exc
 
-            raw_llm = str(getattr(gate_response, "content", "") or "")
-            raw_payload = _parse_json_object(raw_llm)
-            if raw_payload is None:
-                raise FullDocumentGradingError(
-                    "Full-document model returned an invalid evidence ledger"
-                )
-            usage_obj = getattr(gate_response, "usage", None)
-            usage = {
-                "model": str(getattr(usage_obj, "model", model_id)),
-                "caller": str(getattr(usage_obj, "caller", _CALLER_ID)),
-                "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
-                "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
-                "cache_read_tokens": int(
-                    getattr(usage_obj, "cache_read_tokens", 0) or 0
-                ),
-                "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
-                "estimated_cost_usd": float(
-                    getattr(usage_obj, "estimated_cost_usd", 0.0) or 0.0
-                ),
-            }
+            if gate_response is not None:
+                raw_llm = str(getattr(gate_response, "content", "") or "")
+                raw_payload = _parse_json_object(raw_llm)
+                if raw_payload is None:
+                    raise FullDocumentGradingError(
+                        "Full-document model returned an invalid evidence ledger"
+                    )
+                usage = _usage_dict(gate_response, fallback_model=model_id)
             try:
                 await _freeze_exam_grading_contract(
                     self._db,
@@ -494,6 +556,7 @@ class FullDocumentGradingService:
                     model_id=str(usage.get("model") or model_id),
                     temperature=temperature,
                     reasoning_effort=reasoning_effort,
+                    prompt_version=prompt_version,
                 )
             except Exception as exc:
                 await self._db[_RUNS_COLLECTION].update_one(
@@ -523,7 +586,7 @@ class FullDocumentGradingService:
                 {
                     "$set": {
                         "status": "validated",
-                        "prompt_version": _PROMPT_VERSION,
+                        "prompt_version": prompt_version,
                         "model_used": usage.get("model") or model_id,
                         "validated_payload": raw_payload,
                         "raw_llm_response": raw_llm,
@@ -553,7 +616,10 @@ class FullDocumentGradingService:
                 "$set": {
                     "status": "materializing",
                     "validation_errors": document_errors,
-                    "document_review": document_review.as_dict(run_id=run_id),
+                    "document_review": document_review.as_dict(
+                        run_id=run_id,
+                        prompt_version=prompt_version,
+                    ),
                     "updated_at": datetime.now(timezone.utc),
                 },
             },
@@ -572,6 +638,7 @@ class FullDocumentGradingService:
             document_review=document_review,
             resumed_grading_run=resumed_grading_run,
             grading_input_hash=input_fingerprint,
+            prompt_version=prompt_version,
         )
         await self._db[_RUNS_COLLECTION].update_one(
             {"run_id": run_id},
@@ -595,6 +662,323 @@ class FullDocumentGradingService:
         )
         return result
 
+    async def _run_evidence_graph(
+        self,
+        *,
+        run_id: str,
+        generation_lease_token: str,
+        existing_run: Optional[Dict[str, Any]],
+        submission_id: str,
+        exam_id: str,
+        questions: List[Dict[str, Any]],
+        answer_pages: List[Dict[str, Any]],
+        student_assets: List[_StudentPageAsset],
+        paper_bytes: bytes,
+        solution_bytes: Optional[bytes],
+        student_content: List[Dict[str, Any]],
+        document: Dict[str, Any],
+        model_id: str,
+        temperature: float,
+        reasoning_effort: str,
+        paper_file_hash: str,
+        solution_file_hash: Optional[str],
+    ) -> tuple[Dict[str, Any], str, Dict[str, Any]]:
+        """Build a global evidence graph, then grade bounded visual crop batches.
+
+        The global request owns only question association and full-copy coverage.
+        Question scoring receives high-resolution crops from the mapper's immutable
+        regions. Intermediate results are checkpointed on the run so a provider
+        retry does not repurchase completed work.
+        """
+
+        if not student_assets:
+            raise FullDocumentGradingError(
+                "Evidence-graph grading requires canonical student page assets"
+            )
+        current_run = dict(existing_run or {})
+        static_content = _multistage_static_content(
+            questions=questions,
+            paper_bytes=paper_bytes,
+            solution_bytes=solution_bytes,
+            paper_filename=str(document.get("filename") or "question-paper.pdf"),
+            solution_filename=str(
+                document.get("answer_sheet_filename") or "teacher-solution.pdf"
+            ),
+        )
+        cache_key = (
+            "pcr-evidence-graph-"
+            + _static_context_hash(
+                {"paper_version_id": document.get("document_id")},
+                paper_hash=paper_file_hash,
+                solution_hash=solution_file_hash,
+                prompt_version=_EVIDENCE_GRAPH_PROMPT_VERSION,
+            )[:32]
+        )
+
+        mapping_payload = current_run.get("evidence_graph_mapping")
+        mapping_usage = dict(current_run.get("evidence_graph_mapping_usage") or {})
+        mapping_raw = str(current_run.get("evidence_graph_mapping_raw") or "")
+        resolved_model = str(current_run.get("model_used") or model_id)
+        if not isinstance(mapping_payload, dict):
+            mapping_input = [
+                {
+                    "role": "developer",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": _multistage_system_instructions(),
+                        }
+                    ],
+                },
+                {"role": "user", "content": static_content},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "TASK: Build the complete student evidence graph. "
+                                "Do not grade any question."
+                            ),
+                        },
+                        *student_content,
+                    ],
+                },
+            ]
+            mapping_response = await self._gate.call(
+                model_id=resolved_model,
+                prompt="",
+                caller_id=_CALLER_ID,
+                responses_input=mapping_input,
+                json_schema=evidence_mapping_schema(),
+                prompt_cache_key=cache_key,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+                max_output_tokens=min(
+                    24_000,
+                    max(6_000, 650 * len(questions)),
+                ),
+                metadata={
+                    "pcr_stage": "full_document_evidence_mapping",
+                    "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
+                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
+                    "submission_id": submission_id,
+                    "exam_id": exam_id,
+                    "question_count": len(questions),
+                    "page_count": len(answer_pages),
+                    "run_id": run_id,
+                },
+            )
+            mapping_raw = str(getattr(mapping_response, "content", "") or "")
+            mapping_payload = _parse_json_object(mapping_raw)
+            if mapping_payload is None:
+                raise FullDocumentGradingError(
+                    "Evidence mapper returned an invalid evidence graph"
+                )
+            mapping_usage = _usage_dict(
+                mapping_response,
+                fallback_model=resolved_model,
+            )
+            resolved_model = str(mapping_usage.get("model") or resolved_model)
+            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                {
+                    "run_id": run_id,
+                    "generation_lease_token": generation_lease_token,
+                },
+                {
+                    "$set": {
+                        "evidence_graph_mapping": mapping_payload,
+                        "evidence_graph_mapping_raw": mapping_raw,
+                        "evidence_graph_mapping_usage": mapping_usage,
+                        "model_used": resolved_model,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            if checkpoint.matched_count != 1:
+                raise FullDocumentGradingError(
+                    "Submission grading ownership expired while saving evidence mapping"
+                )
+
+        mapping = validate_mapping_payload(
+            mapping_payload,
+            question_numbers=[
+                int(question.get("question_number") or index)
+                for index, question in enumerate(questions, start=1)
+            ],
+            page_count=len(answer_pages),
+            absence_confidence=_ABSENCE_CONFIDENCE,
+        )
+        saved_grades = dict(
+            current_run.get("evidence_graph_question_grades") or {}
+        )
+        saved_usages = dict(
+            current_run.get("evidence_graph_question_grade_usages") or {}
+        )
+        attempted_numbers = [
+            number
+            for number, item in mapping.questions.items()
+            if item.get("attempt_status") == "attempted"
+        ]
+        question_by_number = {
+            int(question.get("question_number") or index): question
+            for index, question in enumerate(questions, start=1)
+        }
+        missing_numbers = [
+            number for number in attempted_numbers if str(number) not in saved_grades
+        ]
+        for batch_index, batch_numbers in enumerate(
+            _question_batches(missing_numbers),
+            start=1,
+        ):
+            batch_questions = [
+                question_by_number[number]
+                for number in batch_numbers
+                if number in question_by_number
+            ]
+            grading_input, crop_bytes = _build_question_grading_input(
+                static_content=static_content,
+                questions=batch_questions,
+                mappings=mapping.questions,
+                student_assets=student_assets,
+            )
+            if len(paper_bytes) + len(solution_bytes or b"") + crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+                raise FullDocumentGradingError(
+                    "Question-specific visual evidence exceeds the request size limit"
+                )
+            grading_response = await self._gate.call(
+                model_id=resolved_model,
+                prompt="",
+                caller_id=_CALLER_ID,
+                responses_input=grading_input,
+                json_schema=question_grading_schema(),
+                prompt_cache_key=cache_key,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+                max_output_tokens=min(
+                    20_000,
+                    max(4_000, 1_200 * len(batch_questions)),
+                ),
+                metadata={
+                    "pcr_stage": "question_visual_grading",
+                    "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
+                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
+                    "submission_id": submission_id,
+                    "exam_id": exam_id,
+                    "question_numbers": batch_numbers,
+                    "batch_index": batch_index,
+                    "run_id": run_id,
+                },
+            )
+            grading_raw = str(getattr(grading_response, "content", "") or "")
+            grading_payload = _parse_json_object(grading_raw)
+            if grading_payload is None:
+                raise FullDocumentGradingError(
+                    "Question visual grader returned invalid structured output"
+                )
+            allowed = set(batch_numbers)
+            returned: Dict[str, Dict[str, Any]] = {}
+            unexpected_numbers: set[int] = set()
+            duplicate_numbers: set[int] = set()
+            if (
+                grading_payload.get("evidence_graph_version")
+                != EVIDENCE_GRAPH_VERSION
+            ):
+                raise FullDocumentGradingError(
+                    "Question visual grader returned the wrong evidence contract"
+                )
+            for item in grading_payload.get("questions") or []:
+                if not isinstance(item, dict):
+                    continue
+                number = _positive_int(item.get("question_number"))
+                if number not in allowed:
+                    if number is not None:
+                        unexpected_numbers.add(number)
+                    continue
+                if str(number) in returned:
+                    duplicate_numbers.add(number)
+                    continue
+                returned[str(number)] = dict(item)
+            if unexpected_numbers or duplicate_numbers:
+                reasons: List[str] = []
+                if unexpected_numbers:
+                    reasons.append(
+                        "unexpected "
+                        + ", ".join(
+                            f"Q{number}" for number in sorted(unexpected_numbers)
+                        )
+                    )
+                if duplicate_numbers:
+                    reasons.append(
+                        "duplicate "
+                        + ", ".join(
+                            f"Q{number}" for number in sorted(duplicate_numbers)
+                        )
+                    )
+                raise FullDocumentGradingError(
+                    "Question visual grader violated the requested batch: "
+                    + "; ".join(reasons)
+                )
+            if set(map(int, returned)) != allowed:
+                missing = sorted(allowed - set(map(int, returned)))
+                raise FullDocumentGradingError(
+                    "Question visual grader omitted requested question(s): "
+                    + ", ".join(f"Q{number}" for number in missing)
+                )
+            batch_usage = _usage_dict(
+                grading_response,
+                fallback_model=resolved_model,
+            )
+            resolved_model = str(batch_usage.get("model") or resolved_model)
+            saved_grades.update(returned)
+            usage_key = "questions-" + "-".join(
+                str(number) for number in sorted(allowed)
+            )
+            saved_usages[usage_key] = batch_usage
+            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                {
+                    "run_id": run_id,
+                    "generation_lease_token": generation_lease_token,
+                },
+                {
+                    "$set": {
+                        "evidence_graph_question_grades": saved_grades,
+                        "evidence_graph_question_grade_usages": saved_usages,
+                        "model_used": resolved_model,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            if checkpoint.matched_count != 1:
+                raise FullDocumentGradingError(
+                    "Submission grading ownership expired while saving question grades"
+                )
+
+        final_payload = merge_mapping_and_grading(
+            mapping,
+            [
+                {
+                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
+                    "questions": list(saved_grades.values()),
+                }
+            ],
+        )
+        if mapping.errors:
+            final_payload["evidence_graph_validation_errors"] = mapping.errors
+        usage = _aggregate_usages(
+            [mapping_usage, *saved_usages.values()],
+            fallback_model=resolved_model,
+        )
+        raw_llm = json.dumps(
+            {
+                "evidence_mapping": mapping_payload,
+                "question_grades": saved_grades,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return final_payload, raw_llm, usage
+
     async def _materialize(
         self,
         *,
@@ -610,6 +994,7 @@ class FullDocumentGradingService:
         document_review: _DocumentReview,
         resumed_grading_run: bool,
         grading_input_hash: str,
+        prompt_version: str,
     ) -> FullDocumentGradingResult:
         submission_id = str(submission.get("submission_id") or "")
         exam_id = str(submission.get("exam_id") or "")
@@ -625,6 +1010,26 @@ class FullDocumentGradingService:
         }
         for grade in grades:
             question_id = str(grade.question.get("question_id") or "")
+            raw_question_result = raw_by_number.get(grade.question_number, {})
+            visual_evidence = {
+                "evidence_graph_version": raw_payload.get(
+                    "evidence_graph_version"
+                ),
+                "mapping_reason": raw_question_result.get("mapping_reason"),
+                "interpretation_hypotheses": list(
+                    raw_question_result.get("interpretation_hypotheses") or []
+                ),
+                "visual_semantics": dict(
+                    raw_question_result.get("visual_semantics") or {}
+                ),
+            }
+            semantic_evidence_signature = _semantic_evidence_signature(
+                question_id=question_id,
+                student_answer=grade.student_answer,
+                source_pages=grade.source_pages,
+                visual_evidence=visual_evidence,
+                prompt_version=prompt_version,
+            )
             response_id = _stable_id(
                 "RESP-DOC", submission_id, materialization_id, question_id
             )
@@ -637,6 +1042,7 @@ class FullDocumentGradingService:
                         response_id,
                         severity="blocking",
                         reason=grade.review_reason,
+                        prompt_version=prompt_version,
                     )
                 )
             elif grade.manual_review_required:
@@ -645,6 +1051,7 @@ class FullDocumentGradingService:
                         response_id,
                         severity="warning",
                         reason=grade.review_reason,
+                        prompt_version=prompt_version,
                     )
                 )
 
@@ -657,7 +1064,7 @@ class FullDocumentGradingService:
                 "question_assignment": {
                     "method": "full_document_visual",
                     "confidence": grade.confidence,
-                    "prompt_version": _PROMPT_VERSION,
+                    "prompt_version": prompt_version,
                     "model_used": model_used,
                     "grading_run_id": run_id,
                     "materialization_id": materialization_id,
@@ -679,13 +1086,21 @@ class FullDocumentGradingService:
                 "student_id": student_id,
                 "detected_text": grade.student_answer,
                 "source_pages": grade.source_pages,
-                "evidence_version": 2,
+                "visual_evidence": visual_evidence,
+                "semantic_evidence_signature": semantic_evidence_signature,
+                "evidence_version": (
+                    3
+                    if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
+                    else 2
+                ),
                 "evidence_atom_ids": [
                     _stable_id(
                         "region",
                         submission_id,
                         str(item["page_number"]),
+                        str(item.get("x_start", "")),
                         str(item["y_start"]),
+                        str(item.get("x_end", "")),
                         str(item["y_end"]),
                     )
                     for item in grade.source_pages
@@ -717,7 +1132,6 @@ class FullDocumentGradingService:
             eval_id = _stable_id(
                 "EVAL-DOC", submission_id, materialization_id, question_id
             )
-            raw_question_result = raw_by_number.get(grade.question_number, {})
             evaluation_docs.append(
                 {
                     "evaluation_id": eval_id,
@@ -725,7 +1139,11 @@ class FullDocumentGradingService:
                     "mapping_version_id": materialization_id,
                     "response_id": response_id,
                     "question_id": question_id,
+                    "exam_id": exam_id,
                     "student_id": student_id,
+                    "prompt_version": prompt_version,
+                    "visual_evidence": visual_evidence,
+                    "semantic_evidence_signature": semantic_evidence_signature,
                     "eval_path": (
                         "full_document_visual_not_attempted"
                         if is_missing
@@ -846,7 +1264,10 @@ class FullDocumentGradingService:
                     "document_grading_materialization_id": materialization_id,
                     "grading_input_hash": grading_input_hash,
                     "resumed_grading_run": resumed_grading_run,
-                    "document_review": document_review.as_dict(run_id=run_id),
+                    "document_review": document_review.as_dict(
+                        run_id=run_id,
+                        prompt_version=prompt_version,
+                    ),
                     "review_state": review_state,
                     "updated_at": datetime.now(timezone.utc),
                 },
@@ -893,6 +1314,7 @@ async def _claim_or_wait_for_run(
     grading_revision: int,
     requested_model_id: str,
     page_count: int,
+    prompt_version: str,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Single-flight technical retries for one submission grading revision.
 
@@ -930,7 +1352,7 @@ async def _claim_or_wait_for_run(
                         "student_id": student_id,
                         "exam_id": exam_id,
                         "grading_revision": grading_revision,
-                        "prompt_version": _PROMPT_VERSION,
+                        "prompt_version": prompt_version,
                         "requested_model_id": requested_model_id,
                         "input_fingerprint": input_fingerprint,
                         "page_count": page_count,
@@ -1003,6 +1425,7 @@ async def _claim_or_wait_for_run(
                 grading_revision=grading_revision,
                 requested_model_id=requested_model_id,
                 page_count=page_count,
+                prompt_version=prompt_version,
             )
         if asyncio.get_running_loop().time() >= deadline:
             raise FullDocumentGradingError(
@@ -1039,6 +1462,7 @@ async def _freeze_exam_grading_contract(
     model_id: str,
     temperature: float,
     reasoning_effort: str,
+    prompt_version: str,
 ) -> None:
     """Freeze one prompt/model contract for every submission in an exam.
 
@@ -1051,7 +1475,7 @@ async def _freeze_exam_grading_contract(
 
     now = datetime.now(timezone.utc)
     contract = {
-        "prompt_version": _PROMPT_VERSION,
+        "prompt_version": prompt_version,
         "model_id": model_id,
         "temperature": temperature,
         "reasoning_effort": reasoning_effort,
@@ -1079,7 +1503,7 @@ async def _freeze_exam_grading_contract(
     await tenant_db["exampen_exams"].update_one(
         {
             "exam_id": exam_id,
-            "pcr_grading_contract.prompt_version": _PROMPT_VERSION,
+            "pcr_grading_contract.prompt_version": prompt_version,
             "pcr_grading_contract.model_id": model_id,
             "pcr_grading_contract.temperature": {"$exists": False},
         },
@@ -1093,7 +1517,7 @@ async def _freeze_exam_grading_contract(
     await tenant_db["exampen_exams"].update_one(
         {
             "exam_id": exam_id,
-            "pcr_grading_contract.prompt_version": _PROMPT_VERSION,
+            "pcr_grading_contract.prompt_version": prompt_version,
             "pcr_grading_contract.model_id": model_id,
             "pcr_grading_contract.reasoning_effort": {"$exists": False},
         },
@@ -1110,7 +1534,7 @@ async def _freeze_exam_grading_contract(
     )
     frozen = dict((frozen_exam or {}).get("pcr_grading_contract") or {})
     if (
-        str(frozen.get("prompt_version") or "") != _PROMPT_VERSION
+        str(frozen.get("prompt_version") or "") != prompt_version
         or str(frozen.get("model_id") or "") != model_id
         or abs(_temperature(frozen.get("temperature")) - temperature) > 0.0001
         or str(frozen.get("reasoning_effort") or "") != reasoning_effort
@@ -1147,7 +1571,21 @@ def _paper_requires_canonical_visual(
     return bool(
         context.get("ready")
         and str(context.get("version") or "")
-        == "canonical-full-document-visual-v1"
+        in {
+            "canonical-full-document-visual-v1",
+            "canonical-full-document-visual-v2",
+        }
+    )
+
+
+def _paper_requires_evidence_graph(
+    paper_version: Optional[Dict[str, Any]],
+) -> bool:
+    context = dict((paper_version or {}).get("paper_context") or {})
+    return bool(
+        context.get("ready")
+        and str(context.get("version") or "")
+        == "canonical-full-document-visual-v2"
     )
 
 
@@ -1255,6 +1693,307 @@ async def _student_copy_content(
     return content, total_bytes
 
 
+async def _student_page_assets(
+    answer_pages: List[Dict[str, Any]],
+) -> tuple[List[_StudentPageAsset], int]:
+    assets: List[_StudentPageAsset] = []
+    total_bytes = 0
+    for page in answer_pages:
+        page_number = int(page.get("page_number") or 0)
+        raw_ref = page.get("raw_image_ref")
+        if page_number <= 0 or not isinstance(raw_ref, str) or not raw_ref.strip():
+            raise FullDocumentGradingError(
+                f"Canonical student page {page_number or '?'} has no image asset"
+            )
+        image_b64 = await _resolve_image_base64(
+            raw_ref,
+            expected_sha256=page.get("asset_sha256"),
+        )
+        if not image_b64:
+            raise FullDocumentGradingError(
+                f"Canonical student page {page_number} could not be loaded"
+            )
+        try:
+            original = base64.b64decode(image_b64, validate=True)
+        except Exception as exc:
+            raise FullDocumentGradingError(
+                f"Canonical student page {page_number} is not a valid image"
+            ) from exc
+        optimized, media_type = await asyncio.to_thread(_optimize_image, original)
+        total_bytes += len(optimized)
+        assets.append(
+            _StudentPageAsset(
+                page_number=page_number,
+                original_bytes=original,
+                global_bytes=optimized,
+                global_media_type=media_type,
+            )
+        )
+    return assets, total_bytes
+
+
+def _student_content_from_assets(
+    assets: Sequence[_StudentPageAsset],
+) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "STUDENT ANSWER COPY. Inspect every page visually. Page labels below "
+                "are authoritative source-page numbers, not question numbers."
+            ),
+        }
+    ]
+    for asset in assets:
+        content.extend(
+            [
+                {
+                    "type": "input_text",
+                    "text": f"Student answer-copy page {asset.page_number}:",
+                },
+                {
+                    "type": "input_image",
+                    "image_url": (
+                        f"data:{asset.global_media_type};base64,"
+                        + base64.b64encode(asset.global_bytes).decode("ascii")
+                    ),
+                    "detail": "high",
+                },
+            ]
+        )
+    return content
+
+
+def _multistage_static_content(
+    *,
+    questions: List[Dict[str, Any]],
+    paper_bytes: bytes,
+    solution_bytes: Optional[bytes],
+    paper_filename: str,
+    solution_filename: str,
+) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "IMMUTABLE MARKING CATALOG. Question IDs, ordering, maximum marks, "
+                "criterion maximums, method policy, and acceptable evidence are "
+                "authoritative. The PDFs remain visual evidence and may contain "
+                "handwriting, formulae, diagrams, tables, or graphs.\n"
+                + json.dumps(
+                    [_catalog_question(question) for question in questions],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ),
+        },
+        {"type": "input_text", "text": "ORIGINAL QUESTION PAPER PDF:"},
+        {
+            "type": "input_file",
+            "filename": _safe_pdf_filename(paper_filename, "question-paper.pdf"),
+            "file_data": (
+                "data:application/pdf;base64,"
+                + base64.b64encode(paper_bytes).decode("ascii")
+            ),
+        },
+    ]
+    if solution_bytes:
+        content.extend(
+            [
+                {
+                    "type": "input_text",
+                    "text": "TEACHER-UPLOADED SOLUTION / MARKING-SCHEME PDF:",
+                },
+                {
+                    "type": "input_file",
+                    "filename": _safe_pdf_filename(
+                        solution_filename,
+                        "teacher-solution.pdf",
+                    ),
+                    "file_data": (
+                        "data:application/pdf;base64,"
+                        + base64.b64encode(solution_bytes).decode("ascii")
+                    ),
+                },
+            ]
+        )
+    return content
+
+
+def _multistage_system_instructions() -> str:
+    return (
+        mapping_system_instructions()
+        + "\n\n"
+        + grading_system_instructions()
+        + "\n\nFollow only the TASK in the final user message for this request."
+    )
+
+
+def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
+    try:
+        configured = int(
+            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
+        )
+    except (TypeError, ValueError):
+        configured = 6
+    size = max(1, min(10, configured))
+    numbers = [int(number) for number in question_numbers]
+    return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+
+
+def _build_question_grading_input(
+    *,
+    static_content: List[Dict[str, Any]],
+    questions: List[Dict[str, Any]],
+    mappings: Mapping[int, Dict[str, Any]],
+    student_assets: Sequence[_StudentPageAsset],
+) -> tuple[List[Dict[str, Any]], int]:
+    assets = {asset.page_number: asset for asset in student_assets}
+    dynamic: List[Dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": (
+                "TASK: Grade exactly the requested questions from the fixed evidence "
+                "regions below. Region ownership is immutable for this stage. Use the "
+                "original high-resolution crops, not the mapper's text description.\n"
+                "REQUESTED QUESTION CATALOG:\n"
+                + json.dumps(
+                    [_catalog_question(question) for question in questions],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ),
+        }
+    ]
+    crop_bytes = 0
+    for index, question in enumerate(questions, start=1):
+        number = int(question.get("question_number") or index)
+        mapped = mappings.get(number) or {}
+        regions = list(mapped.get("evidence_regions") or [])
+        dynamic.append(
+            {
+                "type": "input_text",
+                "text": (
+                    f"QUESTION {number} FIXED EVIDENCE MAP:\n"
+                    + json.dumps(
+                        {
+                            "question_number": number,
+                            "content_type": mapped.get("content_type"),
+                            "mapping_reason": mapped.get("mapping_reason"),
+                            "evidence_regions": regions,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                ),
+            }
+        )
+        for region in regions:
+            page_number = int(region.get("page_number") or 0)
+            asset = assets.get(page_number)
+            if asset is None:
+                raise FullDocumentGradingError(
+                    f"Mapped evidence for Q{number} refers to missing page {page_number}"
+                )
+            cropped, media_type = _crop_student_region(asset, region)
+            crop_bytes += len(cropped)
+            dynamic.extend(
+                [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"Q{number} evidence region "
+                            f"{region.get('region_id')} from page {page_number}:"
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": (
+                            f"data:{media_type};base64,"
+                            + base64.b64encode(cropped).decode("ascii")
+                        ),
+                        "detail": "high",
+                    },
+                ]
+            )
+    return (
+        [
+            {
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _multistage_system_instructions(),
+                    }
+                ],
+            },
+            {"role": "user", "content": static_content},
+            {"role": "user", "content": dynamic},
+        ],
+        crop_bytes,
+    )
+
+
+def _crop_student_region(
+    asset: _StudentPageAsset,
+    region: Mapping[str, Any],
+) -> tuple[bytes, str]:
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(asset.original_bytes)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            width, height = image.size
+            margin_x = max(8, int(width * 0.02))
+            margin_y = max(8, int(height * 0.02))
+            left = max(
+                0,
+                int(width * float(region.get("x_start") or 0) / 1000.0)
+                - margin_x,
+            )
+            top = max(
+                0,
+                int(height * float(region.get("y_start") or 0) / 1000.0)
+                - margin_y,
+            )
+            right = min(
+                width,
+                int(width * float(region.get("x_end") or 1000) / 1000.0)
+                + margin_x,
+            )
+            bottom = min(
+                height,
+                int(height * float(region.get("y_end") or 1000) / 1000.0)
+                + margin_y,
+            )
+            if right - left < 24 or bottom - top < 24:
+                raise ValueError("evidence crop is too small")
+            crop = image.crop((left, top, right, bottom))
+            if crop.mode not in {"RGB", "L"}:
+                background = Image.new("RGB", crop.size, "white")
+                if "A" in crop.getbands():
+                    background.paste(crop, mask=crop.getchannel("A"))
+                else:
+                    background.paste(crop.convert("RGB"))
+                crop = background
+            elif crop.mode == "L":
+                crop = crop.convert("RGB")
+            else:
+                crop = crop.copy()
+            crop.thumbnail((2600, 2600))
+            output = io.BytesIO()
+            crop.save(output, format="JPEG", quality=94, optimize=True)
+            value = output.getvalue()
+            if not value:
+                raise ValueError("evidence crop is empty")
+            return value, "image/jpeg"
+    except Exception as exc:
+        raise FullDocumentGradingError(
+            "Could not create a high-resolution student evidence crop for "
+            f"region {region.get('region_id') or '?'}"
+        ) from exc
+
+
 def _optimize_image(image_bytes: bytes) -> tuple[bytes, str]:
     """Bound request size while retaining handwriting and diagram detail."""
     try:
@@ -1283,6 +2022,50 @@ def _optimize_image(image_bytes: bytes) -> tuple[bytes, str]:
         logger.warning("Could not optimize a student page; using canonical bytes")
     media_type = "image/png" if image_bytes.startswith(b"\x89PNG") else "image/jpeg"
     return image_bytes, media_type
+
+
+def _usage_dict(response: Any, *, fallback_model: str) -> Dict[str, Any]:
+    usage_obj = getattr(response, "usage", None)
+    return {
+        "model": str(getattr(usage_obj, "model", fallback_model) or fallback_model),
+        "caller": str(getattr(usage_obj, "caller", _CALLER_ID) or _CALLER_ID),
+        "input_tokens": int(getattr(usage_obj, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage_obj, "output_tokens", 0) or 0),
+        "cache_read_tokens": int(
+            getattr(usage_obj, "cache_read_tokens", 0) or 0
+        ),
+        "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0),
+        "estimated_cost_usd": float(
+            getattr(usage_obj, "estimated_cost_usd", 0.0) or 0.0
+        ),
+    }
+
+
+def _aggregate_usages(
+    usages: Iterable[Mapping[str, Any]],
+    *,
+    fallback_model: str,
+) -> Dict[str, Any]:
+    items = [dict(item) for item in usages if isinstance(item, Mapping) and item]
+    model = next(
+        (str(item.get("model")) for item in reversed(items) if item.get("model")),
+        fallback_model,
+    )
+    return {
+        "model": model,
+        "caller": _CALLER_ID,
+        "input_tokens": sum(int(item.get("input_tokens") or 0) for item in items),
+        "output_tokens": sum(int(item.get("output_tokens") or 0) for item in items),
+        "cache_read_tokens": sum(
+            int(item.get("cache_read_tokens") or 0) for item in items
+        ),
+        "total_tokens": sum(int(item.get("total_tokens") or 0) for item in items),
+        "estimated_cost_usd": round(
+            sum(float(item.get("estimated_cost_usd") or 0.0) for item in items),
+            8,
+        ),
+        "stage_count": len(items),
+    }
 
 
 def _build_responses_input(
@@ -1571,6 +2354,11 @@ def _validate_ledger(
     page_count: int,
 ) -> tuple[List[_ValidatedGrade], List[str], _DocumentReview]:
     raw_document_review = payload.get("document_review")
+    structural_errors = [
+        str(error).strip()[:500]
+        for error in (payload.get("evidence_graph_validation_errors") or [])
+        if str(error).strip()
+    ]
     document_warnings: List[str] = []
     coverage_complete = False
     coverage_confidence = 0.0
@@ -1594,6 +2382,11 @@ def _validate_ledger(
             or coverage_confidence < _AUTO_ACCEPT_CONFIDENCE
         ),
     )
+    if structural_errors:
+        document_review.required = True
+        document_warnings.append(
+            "The visual evidence graph has structural validation errors"
+        )
     # Machine decisions use typed coverage fields, never the wording of a
     # free-text note. A note may explain that Q1/Q2 were absent without
     # contradicting high-confidence full-copy coverage. Genuine uncertainty
@@ -1642,7 +2435,7 @@ def _validate_ledger(
         )
         document_review.required = True
     _mark_overlapping_evidence_for_review(grades)
-    return grades, [], document_review
+    return grades, structural_errors, document_review
 
 
 def _not_applicable_method_analysis() -> Dict[str, Any]:
@@ -1809,6 +2602,12 @@ def _validate_question_grade(
         page_count=page_count,
     )
     validation_errors = list(region_errors)
+    evidence_region_ids = {
+        str(region.get("region_id") or "")
+        for region in source_pages
+        if str(region.get("region_id") or "")
+    }
+    evidence_graph_question = bool(evidence_region_ids)
     max_marks = _max_marks(question)
     criteria = _criteria(question)
     method_policy = _question_method_policy(question)
@@ -1903,6 +2702,131 @@ def _validate_question_grade(
         validation_errors.append("Attempted answer has no visual evidence region")
     if confidence < 0.50:
         validation_errors.append("Question ownership confidence is below 0.50")
+    if evidence_graph_question:
+        hypotheses = item.get("interpretation_hypotheses")
+        if not isinstance(hypotheses, list) or not hypotheses:
+            validation_errors.append(
+                "Attempted answer has no auditable visual interpretation hypothesis"
+            )
+        else:
+            hypothesis_confidences: List[float] = []
+            for hypothesis in hypotheses:
+                if not isinstance(hypothesis, dict):
+                    validation_errors.append(
+                        "Visual interpretation hypothesis is not an object"
+                    )
+                    continue
+                value = str(hypothesis.get("value") or "").strip()
+                hypothesis_region_ids = {
+                    str(region_id).strip()
+                    for region_id in (hypothesis.get("evidence_region_ids") or [])
+                    if str(region_id).strip()
+                }
+                hypothesis_confidence = _confidence(hypothesis.get("confidence"))
+                if not value:
+                    validation_errors.append(
+                        "Visual interpretation hypothesis has no value"
+                    )
+                if not hypothesis_region_ids:
+                    validation_errors.append(
+                        "Visual interpretation hypothesis cites no evidence region"
+                    )
+                elif not hypothesis_region_ids.issubset(evidence_region_ids):
+                    validation_errors.append(
+                        "Visual interpretation hypothesis cites evidence outside "
+                        "the fixed question map"
+                    )
+                hypothesis_confidences.append(hypothesis_confidence)
+            ranked_hypotheses = sorted(hypothesis_confidences, reverse=True)
+            if (
+                ranked_hypotheses
+                and ranked_hypotheses[0] < _CRITERION_MIN_SCORE_CONFIDENCE
+            ):
+                validation_errors.append(
+                    "No visual interpretation is reliable enough to score"
+                )
+            elif (
+                len(ranked_hypotheses) > 1
+                and ranked_hypotheses[1] >= ranked_hypotheses[0] - 0.10
+            ):
+                # A close second reading (for example 2^3 versus 23) is a
+                # genuine pixel-level ambiguity. Keep the calculated marks,
+                # but prevent automatic publication instead of guessing.
+                manual_review = True
+                if not review_reason:
+                    review_reason = (
+                        "Two plausible visual readings are too close to resolve "
+                        "automatically"
+                    )
+        visual_semantics = item.get("visual_semantics")
+        if not isinstance(visual_semantics, dict):
+            validation_errors.append(
+                "Attempted answer has no structured visual semantics"
+            )
+        else:
+            visual_confidence = _confidence(visual_semantics.get("confidence"))
+            if visual_confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
+                validation_errors.append(
+                    "Visual semantics could not be verified with sufficient confidence"
+                )
+            elif visual_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
+                manual_review = True
+                if not review_reason:
+                    review_reason = (
+                        "Visual semantics confidence is below the automatic threshold"
+                    )
+            if content_type in {
+                ContentType.DIAGRAM_HEAVY.value,
+                ContentType.TABLE_PRESENT.value,
+            } and not list(visual_semantics.get("elements") or []):
+                validation_errors.append(
+                    "Visual-heavy answer has no identified semantic elements"
+                )
+            visual_elements = visual_semantics.get("elements")
+            visual_elements = (
+                visual_elements if isinstance(visual_elements, list) else []
+            )
+            element_ids: set[str] = set()
+            for element in visual_elements:
+                if not isinstance(element, dict):
+                    validation_errors.append(
+                        "Visual semantic element is not an object"
+                    )
+                    continue
+                element_id = str(element.get("element_id") or "").strip()
+                region_id = str(element.get("region_id") or "").strip()
+                if not element_id or element_id in element_ids:
+                    validation_errors.append(
+                        "Visual semantic elements have missing or duplicate IDs"
+                    )
+                else:
+                    element_ids.add(element_id)
+                if region_id not in evidence_region_ids:
+                    validation_errors.append(
+                        "Visual semantic element cites evidence outside the fixed "
+                        "question map"
+                    )
+            visual_relationships = visual_semantics.get("relationships")
+            visual_relationships = (
+                visual_relationships
+                if isinstance(visual_relationships, list)
+                else []
+            )
+            for relationship in visual_relationships:
+                if not isinstance(relationship, dict):
+                    validation_errors.append(
+                        "Visual semantic relationship is not an object"
+                    )
+                    continue
+                if (
+                    str(relationship.get("source_element_id") or "").strip()
+                    not in element_ids
+                    or str(relationship.get("target_element_id") or "").strip()
+                    not in element_ids
+                ):
+                    validation_errors.append(
+                        "Visual semantic relationship refers to an unknown element"
+                    )
 
     method_analysis, method_errors, method_review_reasons = _validate_method_analysis(
         item.get("method_analysis"),
@@ -1968,6 +2892,11 @@ def _validate_question_grade(
             )
         rationale = str(raw.get("rationale") or "").strip()
         evidence = str(raw.get("evidence") or "").strip()
+        cited_region_ids = [
+            str(value).strip()
+            for value in (raw.get("evidence_region_ids") or [])
+            if str(value).strip()
+        ]
         missing_evidence = str(raw.get("missing_evidence") or "").strip()
         credit_basis = str(raw.get("credit_basis") or "").strip().lower()
         if credit_basis not in {
@@ -2011,6 +2940,15 @@ def _validate_question_grade(
             validation_errors.append(
                 f"Criterion {criterion_id} has no cited student evidence"
             )
+        if evidence_graph_question:
+            if not cited_region_ids:
+                validation_errors.append(
+                    f"Criterion {criterion_id} has no cited visual evidence region"
+                )
+            elif not set(cited_region_ids).issubset(evidence_region_ids):
+                validation_errors.append(
+                    f"Criterion {criterion_id} cites evidence outside the fixed question map"
+                )
         if decision == "partially_met" and not missing_evidence:
             validation_errors.append(
                 f"Criterion {criterion_id} has no stated missing evidence for partial credit"
@@ -2033,6 +2971,7 @@ def _validate_question_grade(
                 "confidence": criterion_confidence,
                 "rationale": rationale,
                 "evidence": evidence,
+                "evidence_region_ids": cited_region_ids,
                 "missing_evidence": missing_evidence,
                 "credit_basis": credit_basis,
             }
@@ -2124,8 +3063,12 @@ def _validate_question_grade(
     )
 
 
-def _validate_regions(raw_regions: Any, *, page_count: int) -> tuple[List[Dict[str, float]], List[str]]:
-    regions: List[Dict[str, float]] = []
+def _validate_regions(
+    raw_regions: Any,
+    *,
+    page_count: int,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    regions: List[Dict[str, Any]] = []
     errors: List[str] = []
     if not isinstance(raw_regions, list):
         return [], ["Evidence regions must be an array"]
@@ -2134,6 +3077,8 @@ def _validate_regions(raw_regions: Any, *, page_count: int) -> tuple[List[Dict[s
             errors.append("Evidence region is not an object")
             continue
         page_number = _positive_int(item.get("page_number"))
+        x_start = _finite_float(item.get("x_start"))
+        x_end = _finite_float(item.get("x_end"))
         start = _finite_float(item.get("y_start"))
         end = _finite_float(item.get("y_end"))
         if not page_number or page_number > page_count:
@@ -2142,13 +3087,34 @@ def _validate_regions(raw_regions: Any, *, page_count: int) -> tuple[List[Dict[s
         if start is None or end is None or start < 0 or end > 1000 or end <= start:
             errors.append("Evidence has an invalid vertical page band")
             continue
-        regions.append(
-            {
-                "page_number": page_number,
-                "y_start": round((start / 1000.0) * _A4_HEIGHT_MM, 3),
-                "y_end": round((end / 1000.0) * _A4_HEIGHT_MM, 3),
-            }
-        )
+        if x_start is None and x_end is None:
+            x_start, x_end = 0.0, 1000.0
+        if (
+            x_start is None
+            or x_end is None
+            or x_start < 0
+            or x_end > 1000
+            or x_end <= x_start
+        ):
+            errors.append("Evidence has an invalid horizontal page band")
+            continue
+        region: Dict[str, Any] = {
+            "page_number": page_number,
+            "x_start": round((x_start / 1000.0) * _A4_WIDTH_MM, 3),
+            "y_start": round((start / 1000.0) * _A4_HEIGHT_MM, 3),
+            "x_end": round((x_end / 1000.0) * _A4_WIDTH_MM, 3),
+            "y_end": round((end / 1000.0) * _A4_HEIGHT_MM, 3),
+        }
+        for key in (
+            "region_id",
+            "evidence_kind",
+            "continuation_group",
+            "evidence",
+            "mapping_confidence",
+        ):
+            if item.get(key) is not None:
+                region[key] = item.get(key)
+        regions.append(region)
     return regions, errors
 
 
@@ -2158,7 +3124,7 @@ def _unresolved_grade(
     reason: str,
     *,
     confidence: float = 0.0,
-    source_pages: Optional[List[Dict[str, float]]] = None,
+    source_pages: Optional[List[Dict[str, Any]]] = None,
     student_answer: str = "",
     content_type: str = ContentType.MIXED.value,
 ) -> _ValidatedGrade:
@@ -2206,16 +3172,34 @@ def _mark_overlapping_evidence_for_review(grades: List[_ValidatedGrade]) -> None
                 right.review_reason = right.review_reason or reason
 
 
-def _regions_overlap(left: List[Dict[str, float]], right: List[Dict[str, float]]) -> bool:
+def _regions_overlap(
+    left: List[Dict[str, Any]],
+    right: List[Dict[str, Any]],
+) -> bool:
     for a in left:
         for b in right:
             if a["page_number"] != b["page_number"]:
                 continue
-            overlap = min(a["y_end"], b["y_end"]) - max(a["y_start"], b["y_start"])
-            if overlap <= 0:
+            overlap_y = min(a["y_end"], b["y_end"]) - max(
+                a["y_start"], b["y_start"]
+            )
+            overlap_x = min(
+                float(a.get("x_end", _A4_WIDTH_MM)),
+                float(b.get("x_end", _A4_WIDTH_MM)),
+            ) - max(float(a.get("x_start", 0.0)), float(b.get("x_start", 0.0)))
+            if overlap_y <= 0 or overlap_x <= 0:
                 continue
-            smaller = min(a["y_end"] - a["y_start"], b["y_end"] - b["y_start"])
-            if smaller > 0 and overlap / smaller >= 0.50:
+            area_overlap = overlap_x * overlap_y
+            area_a = (
+                float(a.get("x_end", _A4_WIDTH_MM))
+                - float(a.get("x_start", 0.0))
+            ) * (a["y_end"] - a["y_start"])
+            area_b = (
+                float(b.get("x_end", _A4_WIDTH_MM))
+                - float(b.get("x_start", 0.0))
+            ) * (b["y_end"] - b["y_start"])
+            smaller = min(area_a, area_b)
+            if smaller > 0 and area_overlap / smaller >= 0.50:
                 return True
     return False
 
@@ -2342,7 +3326,13 @@ def _reference_solution(question: Dict[str, Any]) -> str:
     ).strip()
 
 
-def _review_flag(response_id: str, *, severity: str, reason: str) -> Dict[str, Any]:
+def _review_flag(
+    response_id: str,
+    *,
+    severity: str,
+    reason: str,
+    prompt_version: str,
+) -> Dict[str, Any]:
     return {
         "flag_id": _stable_id("FLG-DOC", response_id, reason),
         "response_id": response_id,
@@ -2351,7 +3341,7 @@ def _review_flag(response_id: str, *, severity: str, reason: str) -> Dict[str, A
         "severity": severity,
         "reason": reason,
         "suggested_action": "Review the cited pages against the original answer copy",
-        "metadata": {"prompt_version": _PROMPT_VERSION},
+        "metadata": {"prompt_version": prompt_version},
     }
 
 
@@ -2388,9 +3378,10 @@ def _input_fingerprint(
     solution_hash: Optional[str],
     temperature: float,
     reasoning_effort: str,
+    prompt_version: str,
 ) -> str:
     payload = {
-        "version": _PROMPT_VERSION,
+        "version": prompt_version,
         "model": model_id,
         # Student grading output is never content-addressed across people. The
         # immutable submission remains the ownership boundary. Reprocessing an
@@ -2420,15 +3411,60 @@ def _input_fingerprint(
     ).hexdigest()
 
 
+def _semantic_evidence_signature(
+    *,
+    question_id: str,
+    student_answer: str,
+    source_pages: Sequence[Mapping[str, Any]],
+    visual_evidence: Mapping[str, Any],
+    prompt_version: str,
+) -> str:
+    """Fingerprint model-interpreted evidence without including awarded marks.
+
+    This is an audit/calibration key, not plagiarism detection and not a source
+    of marks. Equivalent ledgers can be compared across a cohort without joining
+    or reusing student-owned response rows.
+    """
+
+    payload = {
+        "question_id": question_id,
+        "prompt_version": prompt_version,
+        "student_answer": " ".join(student_answer.lower().split()),
+        "regions": [
+            {
+                key: region.get(key)
+                for key in (
+                    "page_number",
+                    "x_start",
+                    "y_start",
+                    "x_end",
+                    "y_end",
+                    "evidence_kind",
+                )
+            }
+            for region in source_pages
+        ],
+        "interpretation_hypotheses": visual_evidence.get(
+            "interpretation_hypotheses"
+        )
+        or [],
+        "visual_semantics": visual_evidence.get("visual_semantics") or {},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _static_context_hash(
     exam: Dict[str, Any],
     *,
     paper_hash: str,
     solution_hash: Optional[str],
+    prompt_version: str,
 ) -> str:
     value = "\x1f".join(
         [
-            _PROMPT_VERSION,
+            prompt_version,
             str(exam.get("paper_version_id") or ""),
             paper_hash,
             solution_hash or "",
