@@ -43,9 +43,7 @@ def test_accepted_answer_key_is_exposed_as_read_only_mapped_answer():
 
     assert mapping is not None
     assert mapping["mapping_id"] == "doc-key-only:q1:answer-key"
-    assert mapping["answer_text"] == (
-        "Question:\nChoose the correct value.\n\nAnswer:\nB. 420 m"
-    )
+    assert mapping["answer_text"] == "B. 420 m"
     assert mapping["final_answer_text"] == "B. 420 m"
     assert mapping["mapped_question_text"] == "Choose the correct value."
     assert mapping["answer_kind"] == "answer_key"
@@ -95,9 +93,7 @@ def test_accepted_answer_key_beats_an_unreviewed_ocr_guess():
 
     assert mapping is not None
     assert mapping["answer_kind"] == "answer_key"
-    assert mapping["answer_text"] == (
-        "Question:\nChoose the correct value.\n\nAnswer:\nB. 420 m"
-    )
+    assert mapping["answer_text"] == "B. 420 m"
 
 
 def test_conflicting_uploaded_key_is_not_silently_trusted():

@@ -135,11 +135,6 @@ def build_answer_key_mapping(
     option_text = _option_text(question, label)
     answer_only = _format_answer_text(label, option_text)
     mapped_question_text = question_text(question)
-    answer_text = (
-        f"Question:\n{mapped_question_text}\n\nAnswer:\n{answer_only}"
-        if mapped_question_text
-        else answer_only
-    )
     evidence = str((candidate or {}).get("evidence") or "").strip()
     reasons: List[str] = []
     if conflict:
@@ -158,10 +153,10 @@ def build_answer_key_mapping(
         "question_id": current_question_id,
         "question_region_id": current_question_id,
         "answer_region_id": "",
-        "answer_text": answer_text,
-        # Keep the display mapping self-contained, but expose the pure answer
-        # separately so marking logic never treats the question text as part
-        # of the teacher answer.
+        # An answer-key mapping is an objective answer, not a worked solution.
+        # Keep the question text in its dedicated field and never duplicate it
+        # into the answer consumed by either the UI or the grader.
+        "answer_text": answer_only,
         "final_answer_text": answer_only,
         "mapped_question_text": mapped_question_text,
         "answer_kind": "answer_key",

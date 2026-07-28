@@ -38,6 +38,22 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _minimum_question_score(question: Dict[str, Any]) -> float:
+    """Return the immutable lower bound for one finalized question."""
+
+    grading_mode = str(
+        question.get("grading_mode") or question.get("question_type") or ""
+    ).strip().lower()
+    if grading_mode not in {"objective", "mcq", "integer"}:
+        return 0.0
+    penalty = _number(
+        question.get("penalty_marks")
+        if question.get("penalty_marks") is not None
+        else question.get("penalty")
+    )
+    return -max(0.0, penalty if penalty is not None else 1.0)
+
+
 def _has_unresolved_blocking_flag(response: Dict[str, Any]) -> bool:
     for flag in response.get("flags") or []:
         if not isinstance(flag, dict) or flag.get("severity") != "blocking":
@@ -359,6 +375,7 @@ async def assess_submission_readiness(
             )
 
         expected_max = _number(question.get("max_marks"))
+        minimum_score = _minimum_question_score(question)
         actual_max = _number(evaluation.get("max_score"))
         total_score = _number(evaluation.get("total_score"))
         if expected_max is None or expected_max <= 0:
@@ -375,7 +392,7 @@ async def assess_submission_readiness(
                     actual_max=actual_max,
                 )
             )
-        if total_score is None or total_score < 0 or (
+        if total_score is None or total_score < minimum_score - 0.01 or (
             expected_max is not None and total_score > expected_max + 0.01
         ):
             blockers.append(
@@ -384,6 +401,7 @@ async def assess_submission_readiness(
                     "Evaluation score is missing or outside the immutable bounds",
                     question_id=question_id,
                     total_score=total_score,
+                    minimum_score=minimum_score,
                 )
             )
         if response.get("is_missing_response") and total_score not in {0, 0.0}:

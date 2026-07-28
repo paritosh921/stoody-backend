@@ -4057,13 +4057,12 @@ async def upload_pdf(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Mixed question type is only allowed for online Practice Sets and Test Series",
             )
-        effective_document_question_type = (
-            "mcq"
-            if exam_mode == "dcr"
-            else "subjective"
-            if exam_mode == "pcr"
-            else question_type or "mcq"
-        )
+        if exam_mode == "dcr":
+            effective_document_question_type = "mcq"
+        elif exam_mode == "pcr":
+            effective_document_question_type = question_type or "subjective"
+        else:
+            effective_document_question_type = question_type or "mcq"
 
         # Validate exam_mode
         if exam_mode:
@@ -4081,6 +4080,14 @@ async def upload_pdf(
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="DCR documents must use Objective question type",
+                )
+            if exam_mode == "pcr" and effective_document_question_type not in {
+                "mcq",
+                "subjective",
+            }:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="PCR documents must use Objective or Subjective question type",
                 )
             if exam_mode == "dcr" and exam_template is None:
                 raise HTTPException(
@@ -7480,10 +7487,10 @@ async def update_document_metadata(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="DCR documents must remain objective",
                 )
-            if exam_mode == "pcr" and question_type != "subjective":
+            if exam_mode == "pcr" and question_type not in {"mcq", "subjective"}:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="PCR documents must remain subjective",
+                    detail="PCR documents must remain objective or subjective",
                 )
 
             update_data["question_type"] = question_type

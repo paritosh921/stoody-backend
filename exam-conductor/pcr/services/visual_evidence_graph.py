@@ -379,8 +379,10 @@ def mapping_system_instructions() -> str:
         "original page. Use stable unique region_id values. Give continuation regions "
         "the same non-empty continuation_group. Set not_attempted only after inspecting "
         "every page. Put any visible work that cannot be assigned safely into "
-        "unassigned_regions and set all_student_work_accounted=false. Never invent or "
-        "grade evidence."
+        "unassigned_regions and set all_student_work_accounted=false. Objective "
+        "answers may be written as a compact numbered list such as '1 B, 2 C'. Map "
+        "each visible label to its catalog question and keep its region independently "
+        "auditable. Never invent or grade evidence."
     )
 
 
@@ -404,7 +406,13 @@ def grading_system_instructions() -> str:
         "step marks for valid visible work and apply error-carried-forward only when "
         "the locked policy permits it. Cite one or more supplied evidence_region_ids "
         "for every criterion decision, including zero. Return exactly one result for "
-        "each requested question and never exceed locked criterion maxima."
+        "each requested question and never exceed locked criterion maxima. For a "
+        "catalog question with grading_mode=objective, only read the selected option "
+        "label from the fixed evidence crop and put that single label in "
+        "student_answer. Return empty criterion_marks, total_score 0, and "
+        "not_applicable method analysis. The server alone compares the label with the "
+        "answer key and applies positive or negative marks. If the label is ambiguous, "
+        "set needs_review instead of guessing."
     )
 
 

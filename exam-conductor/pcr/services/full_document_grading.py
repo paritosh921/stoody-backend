@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from pymongo.errors import DuplicateKeyError
+from services.objective_scoring_service import (
+    ObjectiveScoringContractError,
+    score_objective_response,
+)
 
 from ..domain.response_models import ContentType
 from ..marking_policy import (
@@ -1035,6 +1039,18 @@ class FullDocumentGradingService:
             )
             unresolved = grade.attempt_status == "unresolved"
             is_missing = grade.attempt_status == "not_attempted"
+            objective_result: Optional[Dict[str, Any]] = None
+            if _is_objective_question(grade.question) and not unresolved:
+                try:
+                    objective_result = score_objective_response(
+                        grade.question,
+                        grade.student_answer,
+                    )
+                except ObjectiveScoringContractError:
+                    # Readiness and grade validation already guard this path.
+                    # Keep persistence fail-closed if an immutable record is
+                    # nevertheless inconsistent.
+                    unresolved = True
             flags: List[Dict[str, Any]] = []
             if unresolved:
                 flags.append(
@@ -1119,6 +1135,12 @@ class FullDocumentGradingService:
                 "answer_state": (
                     "unresolved" if unresolved else "not_attempted" if is_missing else "detected"
                 ),
+                "grading_mode": (
+                    "objective"
+                    if _is_objective_question(grade.question)
+                    else "subjective"
+                ),
+                "objective_result": objective_result,
                 "eval_status": "blocked" if unresolved else "pending",
                 "mapping_version_id": materialization_id,
                 "_immutable": True,
@@ -1147,7 +1169,11 @@ class FullDocumentGradingService:
                     "eval_path": (
                         "full_document_visual_not_attempted"
                         if is_missing
-                        else "full_document_visual"
+                        else (
+                            "full_document_visual_objective"
+                            if objective_result is not None
+                            else "full_document_visual"
+                        )
                     ),
                     "model_used": model_used,
                     "total_score": grade.total_score,
@@ -1168,6 +1194,12 @@ class FullDocumentGradingService:
                     ],
                     "criterion_marks": grade.criterion_marks,
                     "overall_feedback": grade.overall_feedback,
+                    "grading_mode": (
+                        "objective"
+                        if objective_result is not None
+                        else "subjective"
+                    ),
+                    "objective_result": objective_result,
                     "reference_solution": _reference_solution(grade.question),
                     "token_usage": {
                         "document_call_id": run_id,
@@ -2139,6 +2171,13 @@ def _system_instructions() -> str:
         "teacher-solution content is never student evidence. Do not copy the answer key "
         "into student_answer or evidence. A student may answer in any order and may put "
         "several questions on one page or one question across several pages.\n\n"
+        "For catalog questions with grading_mode=objective, your role is extraction "
+        "only: transcribe the student's selected option label into student_answer "
+        "(for example A, B, C, or D). Do not decide whether it is correct and do not "
+        "calculate marks. Return empty criterion_marks, total_score 0, and "
+        "not_applicable method analysis; the server applies the immutable answer key "
+        "and negative-marking rule. If more than one option is plausible, return "
+        "unresolved instead of choosing one.\n\n"
         "Before awarding marks, reconstruct the student's own approach for each "
         "attempted question. Keep method identity separate from correctness: set "
         "method_classification to reference_method, alternative_method, "
@@ -2616,6 +2655,7 @@ def _validate_question_grade(
     total_score: Optional[float] = None
     manual_review = bool(item.get("needs_review"))
     review_reason = str(item.get("review_reason") or "").strip()
+    objective_question = _is_objective_question(question)
 
     if status == "unresolved":
         return _unresolved_grade(
@@ -2759,11 +2799,11 @@ def _validate_question_grade(
                         "automatically"
                     )
         visual_semantics = item.get("visual_semantics")
-        if not isinstance(visual_semantics, dict):
+        if not objective_question and not isinstance(visual_semantics, dict):
             validation_errors.append(
                 "Attempted answer has no structured visual semantics"
             )
-        else:
+        elif not objective_question:
             visual_confidence = _confidence(visual_semantics.get("confidence"))
             if visual_confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
                 validation_errors.append(
@@ -2827,6 +2867,60 @@ def _validate_question_grade(
                     validation_errors.append(
                         "Visual semantic relationship refers to an unknown element"
                     )
+
+    if objective_question:
+        if validation_errors:
+            return _unresolved_grade(
+                question,
+                question_number,
+                "; ".join(dict.fromkeys(validation_errors)),
+                confidence=confidence,
+                source_pages=source_pages,
+                student_answer=student_answer,
+                content_type=content_type,
+            )
+        try:
+            objective_result = score_objective_response(question, student_answer)
+        except ObjectiveScoringContractError as exc:
+            return _unresolved_grade(
+                question,
+                question_number,
+                str(exc),
+                confidence=confidence,
+                source_pages=source_pages,
+                student_answer=student_answer,
+                content_type=content_type,
+            )
+        if confidence < _AUTO_ACCEPT_CONFIDENCE:
+            manual_review = True
+            review_reason = review_reason or (
+                "The selected option could not be read with automatic-publish confidence"
+            )
+        selected = str(objective_result["selected_answer"])
+        correct = str(objective_result["correct_answer"])
+        points_earned = float(objective_result["points_earned"])
+        return _ValidatedGrade(
+            question=question,
+            question_number=question_number,
+            attempt_status="attempted",
+            confidence=confidence,
+            student_answer=selected,
+            content_type=content_type,
+            source_pages=source_pages,
+            method_analysis=_not_applicable_method_analysis(),
+            criterion_marks=[],
+            total_score=points_earned,
+            overall_feedback=(
+                f"Selected {selected}. Correct answer: {correct}."
+                if objective_result["is_correct"]
+                else (
+                    f"Selected {selected}. Correct answer: {correct}. "
+                    f"{objective_result['penalty_marks']:g} mark(s) deducted."
+                )
+            ),
+            manual_review_required=manual_review,
+            review_reason=review_reason,
+        )
 
     method_analysis, method_errors, method_review_reasons = _validate_method_analysis(
         item.get("method_analysis"),
@@ -3207,13 +3301,19 @@ def _regions_overlap(
 def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
     policy = _question_marking_policy(question)
     method_policy = _question_method_policy(question)
+    objective = _is_objective_question(question)
     return {
         "question_number": _positive_int(question.get("question_number")),
         "question_id": str(question.get("question_id") or ""),
         "question_text": str(question.get("question_text") or "")[:4000],
         "max_marks": _max_marks(question),
-        "reference_solution": _reference_solution(question)[:5000],
-        "marking_criteria": _criteria(question),
+        "grading_mode": "objective" if objective else "subjective",
+        "answer_format": "option_label" if objective else "worked_response",
+        "options": _objective_options(question) if objective else [],
+        "reference_solution": (
+            "" if objective else _reference_solution(question)[:5000]
+        ),
+        "marking_criteria": [] if objective else _criteria(question),
         "marking_policy": policy,
         "method_policy": method_policy,
         "method_standard": method_policy_instruction(method_policy),
@@ -3222,6 +3322,36 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "expects_diagram": bool(question.get("expects_diagram")),
     }
+
+
+def _is_objective_question(question: Dict[str, Any]) -> bool:
+    return str(
+        question.get("grading_mode")
+        or question.get("question_type")
+        or ""
+    ).strip().lower() in {"objective", "mcq", "integer"}
+
+
+def _objective_options(question: Dict[str, Any]) -> List[Dict[str, str]]:
+    options = question.get("options")
+    if not isinstance(options, list):
+        return []
+    normalized: List[Dict[str, str]] = []
+    for index, option in enumerate(options):
+        if isinstance(option, dict):
+            label = str(option.get("label") or chr(ord("A") + index)).strip().upper()
+            text = str(
+                option.get("text")
+                or option.get("content")
+                or option.get("value")
+                or ""
+            ).strip()
+        else:
+            label = chr(ord("A") + index)
+            text = str(option or "").strip()
+        if text:
+            normalized.append({"label": label, "text": text[:2000]})
+    return normalized
 
 
 def _validate_question_catalog(questions: List[Dict[str, Any]]) -> List[str]:

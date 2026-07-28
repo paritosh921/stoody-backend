@@ -192,3 +192,9 @@ def test_student_mark_breakdown_supports_legacy_step_marks_without_leaking_evide
             "feedback": "The formula is correct but substitution is missing.",
         }
     ]
+
+
+def test_student_score_transport_preserves_objective_negative_marks():
+    from api.v1.evalpen_student_bff_async import _safe_score
+
+    assert _safe_score(-1) == -1.0

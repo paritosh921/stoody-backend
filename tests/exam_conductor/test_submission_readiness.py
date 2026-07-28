@@ -144,6 +144,36 @@ async def test_readiness_accepts_only_evidence_backed_complete_paper():
 
 
 @pytest.mark.asyncio
+async def test_readiness_accepts_objective_negative_marking_within_frozen_penalty():
+    from services.exampen_submission_readiness import (
+        assess_submission_readiness,
+        build_publication_snapshot,
+    )
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_questions"].update_one(
+        {"question_id": "EXAM-READY::Q-1"},
+        {"$set": {"grading_mode": "objective", "penalty_marks": 1.0}},
+    )
+    await db["evalpen_evaluations"].update_one(
+        {"evaluation_id": "EVAL-READY-1"},
+        {"$set": {"total_score": -1.0}},
+    )
+
+    report = await assess_submission_readiness(db, "SUB-READY")
+    snapshot = await build_publication_snapshot(
+        db,
+        "SUB-READY",
+        actor_id="TEACHER-1",
+    )
+
+    assert report["ready"] is True
+    assert snapshot["score_rows"][0]["score"] == -1.0
+    assert snapshot["total_score"] == -1.0
+
+
+@pytest.mark.asyncio
 async def test_readiness_blocks_unproven_zero_and_missing_question_state():
     from services.exampen_submission_readiness import assess_submission_readiness
 

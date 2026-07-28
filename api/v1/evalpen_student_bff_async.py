@@ -235,6 +235,16 @@ def _safe_marks(value: Any) -> float:
         return 0.0
 
 
+def _safe_score(value: Any) -> float:
+    """Return a finite score while preserving objective negative marking."""
+
+    try:
+        numeric = float(value or 0.0)
+        return numeric if math.isfinite(numeric) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _safe_question_number(value: Any) -> Optional[int]:
     """Return a positive question number when legacy data provides one."""
     try:
@@ -424,7 +434,7 @@ async def list_student_exams(
                         pcr_scores[eid] = {"invalid": 1.0}
                         continue
                     pcr_scores[eid] = {
-                        "total_score": _safe_marks(snapshot.get("total_score")),
+                        "total_score": _safe_score(snapshot.get("total_score")),
                         "max_score": _safe_marks(snapshot.get("total_max_score")),
                     }
         except ImportError:
@@ -622,7 +632,7 @@ async def get_student_exam_scores(
                 if not ev:
                     continue
                 entry = {
-                    "score": _safe_marks(ev.get("total_score")),
+                    "score": _safe_score(ev.get("total_score")),
                     "max_score": _safe_marks(ev.get("max_score")),
                     "feedback": _student_safe_text(ev.get("overall_feedback")),
                     "answer_state": resp.get("answer_state")
@@ -652,7 +662,7 @@ async def get_student_exam_scores(
                 # after publication.
                 evaluated_by_question = {
                     str(row.get("question_id") or ""): {
-                        "score": _safe_marks(row.get("score")),
+                        "score": _safe_score(row.get("score")),
                         "max_score": _safe_marks(row.get("max_score")),
                         "feedback": _student_safe_text(row.get("overall_feedback")),
                         "answer_state": row.get("answer_state") or "detected",

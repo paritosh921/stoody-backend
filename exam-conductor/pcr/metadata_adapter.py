@@ -32,6 +32,8 @@ import logging
 import copy
 from typing import Any, Dict, List, Optional
 
+from services.answer_mapping_contract import normalize_answer_label
+
 from .marking_policy import normalize_marking_criteria, normalize_method_policy
 
 logger = logging.getLogger(__name__)
@@ -320,6 +322,55 @@ def adapt_question_to_pcr(
             or ""
         )
 
+    objective_options: List[Dict[str, str]] = []
+    enhanced_options = question_doc.get("enhanced_options")
+    if isinstance(enhanced_options, list):
+        for index, option in enumerate(enhanced_options):
+            if not isinstance(option, dict):
+                continue
+            content = str(
+                option.get("content")
+                or option.get("text")
+                or option.get("value")
+                or ""
+            ).strip()
+            if not content:
+                continue
+            label = normalize_answer_label(
+                option.get("label") or option.get("key") or option.get("id")
+            ) or chr(ord("A") + index)
+            objective_options.append({"label": label, "text": content})
+    if not objective_options:
+        options = question_doc.get("options")
+        if isinstance(options, list):
+            for index, option in enumerate(options):
+                content = str(
+                    (
+                        option.get("content")
+                        or option.get("text")
+                        or option.get("value")
+                        or ""
+                    )
+                    if isinstance(option, dict)
+                    else option or ""
+                ).strip()
+                if content:
+                    objective_options.append(
+                        {"label": chr(ord("A") + index), "text": content}
+                    )
+    correct_answer = normalize_answer_label(
+        question_doc.get("correct_answer") or question_doc.get("correctAnswer")
+    )
+    try:
+        penalty_marks = float(
+            question_doc.get(
+                "penalty",
+                question_doc.get("penalty_marks", 1),
+            )
+        )
+    except (TypeError, ValueError):
+        penalty_marks = 1.0
+
     raw_criteria = question_doc.get("marking_criteria")
     if raw_criteria is None and isinstance(question_doc.get("metadata"), dict):
         raw_criteria = question_doc["metadata"].get("marking_criteria")
@@ -375,6 +426,15 @@ def adapt_question_to_pcr(
         "question_number": question_number,
         "subject": subject,
         "question_type": question_type,
+        "grading_mode": (
+            "objective"
+            if str(question_type or "").strip().lower()
+            in {"mcq", "objective", "integer"}
+            else "subjective"
+        ),
+        "options": copy.deepcopy(objective_options),
+        "correct_answer": correct_answer or None,
+        "penalty_marks": max(0.0, penalty_marks),
         "complexity": complexity,
         "eval_template": eval_template,
         "max_marks": max_marks,

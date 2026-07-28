@@ -18,6 +18,11 @@ from core.cache import CacheManager
 from core.security import MongoSanitizer
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
+from services.objective_scoring_service import (
+    ObjectiveScoringContractError,
+    objective_points,
+    score_objective_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2215,70 +2220,34 @@ async def submit_test_series(
         total_points = document.get("total_points", 0)
         if total_points == 0:
             # Calculate from actual questions
-            total_points = sum(q.get("points", 4) for q in questions)
+            total_points = sum(objective_points(q) for q in questions)
 
         question_results = []
 
         for question in questions:
             question_id = question.get("id") or str(question.get("_id"))
-            correct_answer = question.get("correct_answer")
-            if correct_answer is not None:
-                correct_answer = str(correct_answer).strip()
-            else:
-                correct_answer = ""
             student_answer = str(student_answers.get(question_id, "")).strip()
-            question_points = question.get("points", 4)
-            penalty_marks = question.get("penalty", question.get("penalty_marks", 1))
+            try:
+                objective_result = score_objective_response(question, student_answer)
+            except ObjectiveScoringContractError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Question {question_id} cannot be scored: {exc}",
+                ) from exc
 
-            is_correct = False
-            # Check if question was skipped or not attempted
-            is_attempted = bool(student_answer) and student_answer.upper() != "SKIPPED"
-
-            # Determine question type for proper comparison
-            question_type = str(question.get("question_type", "")).lower() or "mcq"
-            
-            # Heuristic: treat as integer if no options and correct_answer looks numeric
-            def _is_numeric_string(val: str) -> bool:
-                try:
-                    float(val)
-                    return True
-                except (ValueError, TypeError):
-                    return False
-            
-            is_integer_type = (
-                question_type == "integer" or 
-                (not question.get("options") and _is_numeric_string(correct_answer) 
-                 and correct_answer.upper() not in ["A", "B", "C", "D", "E", "F"])
-            )
-
-            # Skipped questions get 0 points (no penalty, no positive marks)
-            if not is_attempted or student_answer.upper() == "SKIPPED":
+            correct_answer = objective_result["correct_answer"]
+            question_points = objective_result["points"]
+            penalty_marks = objective_result["penalty_marks"]
+            is_attempted = objective_result["attempted"]
+            is_correct = objective_result["is_correct"]
+            points_earned = objective_result["points_earned"]
+            if not is_attempted:
                 unanswered_count += 1
-                points_earned = 0
+            elif is_correct:
+                correct_count += 1
             else:
-                # For integer-type questions, use numerical comparison
-                if is_integer_type:
-                    try:
-                        # Normalize and compare numerically
-                        student_num = float(student_answer.strip().replace("+", ""))
-                        correct_num = float(correct_answer.strip().replace("+", ""))
-                        is_correct = abs(student_num - correct_num) < 1e-9  # Near-exact match
-                    except (ValueError, TypeError):
-                        # Fallback to string comparison
-                        is_correct = student_answer.lower() == correct_answer.lower()
-                else:
-                    # For MCQ, compare case-insensitively
-                    is_correct = student_answer.upper() == correct_answer.upper()
-                
-                if is_correct:
-                    correct_count += 1
-                    points_earned = question_points
-                    score += question_points
-                else:
-                    incorrect_count += 1
-                    # Use penalty_marks from the question itself
-                    points_earned = -penalty_marks
-                    score -= penalty_marks
+                incorrect_count += 1
+            score += points_earned
 
             mapped_answer = await _get_mapped_worked_answer(db, current_user, question, question_id)
             explanation = ""

@@ -23,6 +23,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
+from services.answer_mapping_contract import normalize_answer_label
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,50 @@ def _question_marks(question: Dict[str, Any]) -> Optional[float]:
         if marks > 0:
             return marks
     return None
+
+
+def _is_objective_question(question: Dict[str, Any]) -> bool:
+    return _as_text(question.get("question_type")).lower() in {
+        "mcq",
+        "objective",
+        "integer",
+    }
+
+
+def _objective_option_labels(question: Dict[str, Any]) -> List[str]:
+    labels: List[str] = []
+    enhanced_options = question.get("enhanced_options")
+    if isinstance(enhanced_options, list):
+        for index, option in enumerate(enhanced_options):
+            if not isinstance(option, dict):
+                continue
+            content = _as_text(
+                option.get("content") or option.get("text") or option.get("value")
+            )
+            if not content:
+                continue
+            label = normalize_answer_label(
+                option.get("label") or option.get("key") or option.get("id")
+            ) or chr(ord("A") + index)
+            if label not in labels:
+                labels.append(label)
+    options = question.get("options")
+    if isinstance(options, list):
+        for index, option in enumerate(options):
+            content = (
+                _as_text(
+                    option.get("content")
+                    or option.get("text")
+                    or option.get("value")
+                )
+                if isinstance(option, dict)
+                else _as_text(option)
+            )
+            if content:
+                label = chr(ord("A") + index)
+                if label not in labels:
+                    labels.append(label)
+    return labels
 
 
 def _question_reference_solution(question: Dict[str, Any]) -> str:
@@ -271,6 +316,18 @@ def _content_hash(
                 "rubric": _question_rubric(question),
                 "reference_solution": _question_reference_solution(question),
                 "marking_criteria": _question_marking_criteria(question),
+                "options": copy.deepcopy(question.get("options") or []),
+                "enhanced_options": copy.deepcopy(
+                    question.get("enhanced_options") or []
+                ),
+                "correct_answer": normalize_answer_label(
+                    question.get("correct_answer")
+                    or question.get("correctAnswer")
+                ),
+                "penalty_marks": question.get(
+                    "penalty",
+                    question.get("penalty_marks"),
+                ),
                 "expects_diagram": bool(question.get("has_diagram") or question.get("expects_diagram")),
             }
         )
@@ -716,6 +773,30 @@ def validate_pcr_questions(
             "manual_review_required"
         ):
             errors.append(f"Q {label}: resolve the OCR/layout review warning")
+        if _is_objective_question(question):
+            option_labels = _objective_option_labels(question)
+            correct_answer = normalize_answer_label(
+                question.get("correct_answer") or question.get("correctAnswer")
+            )
+            if len(option_labels) < 2:
+                errors.append(f"Q {label}: add at least two objective answer options")
+            if not correct_answer:
+                errors.append(f"Q {label}: select the correct objective answer")
+            elif option_labels and correct_answer not in option_labels:
+                errors.append(
+                    f"Q {label}: correct answer {correct_answer} is not one of the saved options"
+                )
+            raw_penalty = question.get("penalty", question.get("penalty_marks", 1))
+            try:
+                penalty = float(raw_penalty)
+            except (TypeError, ValueError):
+                penalty = -1
+            if penalty < 0:
+                errors.append(f"Q {label}: negative marking must be zero or greater")
+            # Objective PCR does not need an AI rubric. The camera grader only
+            # transcribes a selected option; the server applies the frozen key.
+            continue
+
         # A legacy paper still needs free-text marking material. A structured
         # PCR paper instead has a complete teacher-authored criterion plan,
         # so its optional worked solution/notes are helpful context rather
