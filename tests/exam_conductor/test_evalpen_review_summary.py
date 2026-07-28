@@ -652,3 +652,322 @@ async def test_teacher_criterion_review_recomputes_total_and_keeps_audit_history
     assert stored["criterion_marks"][1]["marks_awarded"] == 2.5
     assert stored["manual_review_required"] is False
     assert stored["audit_trail"][-1]["action"] == "criterion_marks_override"
+
+
+@pytest.mark.asyncio
+async def test_published_criterion_review_requires_explicit_amendment():
+    """A normal edit request cannot silently mutate a released student result."""
+    from fastapi import HTTPException
+    from api.v1.evalpen_review_async import (
+        CriterionMarkOverrideItem,
+        CriterionMarksOverrideRequest,
+        override_criterion_marks,
+    )
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-PUBLISHED-GUARD",
+            "exam_id": "EXAM-PUBLISHED-GUARD",
+            "student_id": "STU-1",
+            "publication_status": "published",
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-PUBLISHED-GUARD",
+            "submission_id": "SUB-PUBLISHED-GUARD",
+            "student_id": "STU-1",
+            "question_id": "EXAM-PUBLISHED-GUARD::Q-1",
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-PUBLISHED-GUARD",
+            "response_id": "RESP-PUBLISHED-GUARD",
+            "student_id": "STU-1",
+            "total_score": 1.0,
+            "max_score": 2.0,
+            "criterion_marks": [
+                {
+                    "criterion_id": "answer",
+                    "description": "Correct answer",
+                    "marks_awarded": 1.0,
+                    "max_marks": 2.0,
+                }
+            ],
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await override_criterion_marks(
+                evaluation_id="EVAL-PUBLISHED-GUARD",
+                body=CriterionMarksOverrideRequest(
+                    criteria=[
+                        CriterionMarkOverrideItem(
+                            criterion_id="answer",
+                            marks_awarded=2.0,
+                        )
+                    ],
+                    reason="The final answer is clearly visible",
+                ),
+                current_user=_admin_user(),
+                db=None,
+            )
+
+    assert exc_info.value.status_code == 409
+    stored = await db["evalpen_evaluations"].find_one(
+        {"evaluation_id": "EVAL-PUBLISHED-GUARD"}
+    )
+    assert stored["total_score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_published_criterion_review_releases_audited_revised_snapshot():
+    """A confirmed correction stays published and preserves the prior release."""
+    from api.v1.evalpen_review_async import (
+        CriterionMarkOverrideItem,
+        CriterionMarksOverrideRequest,
+        override_criterion_marks,
+    )
+    from services.exampen_submission_readiness import (
+        build_publication_snapshot,
+        validate_publication_snapshot,
+    )
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-PUBLISHED-AMEND",
+            "paper_version_id": "PAPER-V1",
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-PUBLISHED-AMEND::Q-1",
+            "exam_id": "EXAM-PUBLISHED-AMEND",
+            "question_number": 1,
+            "max_marks": 4.0,
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-PUBLISHED-AMEND",
+            "exam_id": "EXAM-PUBLISHED-AMEND",
+            "student_id": "STU-1",
+            "publication_status": "published",
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-PUBLISHED-AMEND",
+            "submission_id": "SUB-PUBLISHED-AMEND",
+            "student_id": "STU-1",
+            "question_id": "EXAM-PUBLISHED-AMEND::Q-1",
+            "question_number": 1,
+            "answer_state": "detected",
+            "eval_status": "evaluated",
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-PUBLISHED-AMEND",
+            "response_id": "RESP-PUBLISHED-AMEND",
+            "student_id": "STU-1",
+            "total_score": 1.0,
+            "max_score": 4.0,
+            "criterion_marks": [
+                {
+                    "criterion_id": "method",
+                    "description": "Uses the correct method",
+                    "marks_awarded": 1.0,
+                    "max_marks": 1.0,
+                },
+                {
+                    "criterion_id": "answer",
+                    "description": "Obtains the correct answer",
+                    "marks_awarded": 0.0,
+                    "max_marks": 3.0,
+                },
+            ],
+        }
+    )
+
+    first_snapshot = await build_publication_snapshot(
+        db,
+        "SUB-PUBLISHED-AMEND",
+        actor_id="admin-original",
+    )
+    original_published_at = first_snapshot.pop("published_at_dt")
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-PUBLISHED-AMEND"},
+        {
+            "$set": {
+                "published_at": original_published_at,
+                "published_by": "admin-original",
+                "publication_snapshot": first_snapshot,
+                "publication_snapshot_hash": first_snapshot["snapshot_hash"],
+            }
+        },
+    )
+    stored_original_published_at = (
+        await db["evalpen_submissions"].find_one(
+            {"submission_id": "SUB-PUBLISHED-AMEND"}
+        )
+    )["published_at"]
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await override_criterion_marks(
+            evaluation_id="EVAL-PUBLISHED-AMEND",
+            body=CriterionMarksOverrideRequest(
+                criteria=[
+                    CriterionMarkOverrideItem(
+                        criterion_id="method",
+                        marks_awarded=1.0,
+                    ),
+                    CriterionMarkOverrideItem(
+                        criterion_id="answer",
+                        marks_awarded=2.5,
+                    ),
+                ],
+                reason="The final calculation is legible on page two",
+                amend_published=True,
+            ),
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result["publication_status"] == "published"
+    assert result["result_revision"] == 1
+    assert result["total_score"] == 3.5
+
+    stored_submission = await db["evalpen_submissions"].find_one(
+        {"submission_id": "SUB-PUBLISHED-AMEND"}
+    )
+    assert stored_submission["publication_status"] == "published"
+    assert stored_submission["published_at"] == stored_original_published_at
+    assert stored_submission["publication_snapshot"]["total_score"] == 3.5
+    assert stored_submission["publication_snapshot_hash"] != first_snapshot["snapshot_hash"]
+    assert stored_submission["result_revision"] == 1
+    assert "review_mutation_lease_token" not in stored_submission
+    assert validate_publication_snapshot(
+        stored_submission["publication_snapshot"],
+        submission_id="SUB-PUBLISHED-AMEND",
+        exam_id="EXAM-PUBLISHED-AMEND",
+    )
+
+    history = stored_submission["publication_history"][-1]
+    assert history["action"] == "published_score_amended"
+    assert history["reason"] == "The final calculation is legible on page two"
+    assert history["previous_snapshot"]["snapshot_hash"] == first_snapshot["snapshot_hash"]
+    assert history["previous_total_score"] == 1.0
+    assert history["total_score"] == 3.5
+
+
+@pytest.mark.asyncio
+async def test_published_total_override_uses_the_same_revision_contract():
+    """Legacy non-rubric scores can be corrected without bypassing publication audit."""
+    from api.v1.evalpen_review_async import (
+        ScoreOverrideRequest,
+        override_evaluation_score,
+    )
+    from services.exampen_submission_readiness import build_publication_snapshot
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {"exam_id": "EXAM-PUBLISHED-TOTAL", "paper_version_id": "PAPER-V1"}
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-PUBLISHED-TOTAL::Q-1",
+            "exam_id": "EXAM-PUBLISHED-TOTAL",
+            "question_number": 1,
+            "max_marks": 5.0,
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-PUBLISHED-TOTAL",
+            "exam_id": "EXAM-PUBLISHED-TOTAL",
+            "student_id": "STU-1",
+            "publication_status": "published",
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-PUBLISHED-TOTAL",
+            "submission_id": "SUB-PUBLISHED-TOTAL",
+            "student_id": "STU-1",
+            "question_id": "EXAM-PUBLISHED-TOTAL::Q-1",
+            "question_number": 1,
+            "answer_state": "detected",
+            "eval_status": "evaluated",
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-PUBLISHED-TOTAL",
+            "response_id": "RESP-PUBLISHED-TOTAL",
+            "student_id": "STU-1",
+            "total_score": 2.0,
+            "max_score": 5.0,
+        }
+    )
+    first_snapshot = await build_publication_snapshot(
+        db,
+        "SUB-PUBLISHED-TOTAL",
+        actor_id="admin-original",
+    )
+    published_at = first_snapshot.pop("published_at_dt")
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-PUBLISHED-TOTAL"},
+        {
+            "$set": {
+                "published_at": published_at,
+                "published_by": "admin-original",
+                "publication_snapshot": first_snapshot,
+                "publication_snapshot_hash": first_snapshot["snapshot_hash"],
+            }
+        },
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await override_evaluation_score(
+            evaluation_id="EVAL-PUBLISHED-TOTAL",
+            body=ScoreOverrideRequest(
+                new_score=4.0,
+                reason="Teacher confirmed the complete working",
+                amend_published=True,
+            ),
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result["new_score"] == 4.0
+    assert result["publication_status"] == "published"
+    assert result["result_revision"] == 1
+    stored_submission = await db["evalpen_submissions"].find_one(
+        {"submission_id": "SUB-PUBLISHED-TOTAL"}
+    )
+    assert stored_submission["publication_snapshot"]["total_score"] == 4.0
+    assert stored_submission["publication_history"][-1]["previous_total_score"] == 2.0
+    assert stored_submission["publication_history"][-1]["total_score"] == 4.0

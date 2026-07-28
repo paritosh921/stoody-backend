@@ -88,6 +88,7 @@ class ExamSummaryItem(BaseModel):
     # Prepared-exam fields (from finalized documents)
     status: str = "active"  # "prepared" | "active"
     exam_mode: Optional[str] = None  # "dcr" | "pcr" | None
+    created_at: Optional[str] = None
     finalized_at: Optional[str] = None
     question_count: int = 0
 
@@ -385,6 +386,11 @@ async def list_exams(
                         published_count=0,
                         status="prepared",
                         exam_mode=fdoc.get("exam_mode"),
+                        created_at=(
+                            fdoc["exam_finalized_at"].isoformat()
+                            if fdoc.get("exam_finalized_at")
+                            else None
+                        ),
                         finalized_at=(
                             fdoc["exam_finalized_at"].isoformat()
                             if fdoc.get("exam_finalized_at")
@@ -406,6 +412,7 @@ async def list_exams(
                 "prepared_document_id": 1,
                 "created_by_tutor_id": 1,
                 "teacher_ids": 1,
+                "created_at": 1,
             },
         ).to_list(length=5000)
         active_exam_map: Dict[str, Dict[str, Any]] = {
@@ -449,6 +456,13 @@ async def list_exams(
                 published_count=published_count,
                 status="active",
                 exam_mode=prepared_meta.get("exam_mode") or exam_doc.get("exam_type"),
+                created_at=(
+                    exam_doc["created_at"].isoformat()
+                    if hasattr(exam_doc.get("created_at"), "isoformat")
+                    else str(exam_doc["created_at"])
+                    if exam_doc.get("created_at")
+                    else prepared_meta.get("finalized_at")
+                ),
                 finalized_at=prepared_meta.get("finalized_at"),
                 question_count=prepared_meta.get("question_count", 0),
             )
@@ -491,7 +505,13 @@ async def list_exams(
                     and prep.exam_id not in active_exam_map
                 ):
                     items.append(prep)
-            items.sort(key=lambda x: x.exam_id)
+            items.sort(
+                key=lambda item: (
+                    item.created_at or item.finalized_at or "",
+                    item.exam_id,
+                ),
+                reverse=True,
+            )
             return ExamListResponse(items=items)
 
         # ----- Group submissions by exam_id -----
@@ -697,8 +717,14 @@ async def list_exams(
             ):
                 items.append(prep)
 
-        # Sort by exam_id for deterministic order
-        items.sort(key=lambda x: x.exam_id)
+        # Teacher lists are chronological: newest exam first.
+        items.sort(
+            key=lambda item: (
+                item.created_at or item.finalized_at or "",
+                item.exam_id,
+            ),
+            reverse=True,
+        )
 
         return ExamListResponse(items=items)
 

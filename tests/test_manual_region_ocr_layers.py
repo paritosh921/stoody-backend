@@ -2051,9 +2051,9 @@ def test_test_series_activation_requires_correct_answers():
     errors = _build_test_series_activation_errors(
         document={"document_type": "Test Series", "total_minutes": 30},
         questions=[
-            {"id": "q1", "correct_answer": "A"},
-            {"id": "q2", "correct_answer": ""},
-            {"id": "q3"},
+            {"id": "q1", "options": ["A1", "B1"], "correct_answer": "A"},
+            {"id": "q2", "options": ["A2", "B2"], "correct_answer": ""},
+            {"id": "q3", "options": ["A3", "B3"]},
         ],
     )
 
@@ -2095,30 +2095,33 @@ def test_test_series_activation_allows_saved_answer_candidate_mismatch():
         questions=[
             {
                 "id": "q1",
+                "options": ["A1", "B1"],
                 "correct_answer": "A",
                 "answer_key_candidate": {"correct_answer": "B"},
                 "mapped_worked_answer": {"correct_answer_candidate": "B"},
             },
-            {"id": "q2", "correct_answer": "C"},
+            {"id": "q2", "options": ["A2", "B2", "C2"], "correct_answer": "C"},
         ],
     )
 
     assert errors == []
 
 
-def test_test_series_activation_requires_uploaded_answer_sheet_full_mapping():
+def test_subjective_test_series_activation_requires_uploaded_answer_sheet_full_mapping():
     from api.v1.pdf_async import _build_test_series_activation_errors
 
     errors = _build_test_series_activation_errors(
         document={
             "document_type": "Test Series",
+            "question_type": "subjective",
             "total_minutes": 30,
             "answer_sheet_path": "uploads/answers.pdf",
+            "answer_solution_mode": "upload",
         },
         questions=[
-            {"id": "q1", "correct_answer": "A"},
-            {"id": "q2", "correct_answer": "B"},
-            {"id": "q3", "correct_answer": "C"},
+            {"id": "q1", "question_type": "subjective"},
+            {"id": "q2", "question_type": "subjective"},
+            {"id": "q3", "question_type": "subjective"},
         ],
         answer_coverage={
             "answer_solution_coverage_status": "not_ready",
@@ -2131,7 +2134,8 @@ def test_test_series_activation_requires_uploaded_answer_sheet_full_mapping():
     )
 
     assert errors == [
-        "Uploaded answer sheet is not fully mapped. 2/3 question(s) have mapped solutions."
+        "Uploaded answer sheet is not fully mapped for subjective questions. "
+        "2/3 subjective question(s) have mapped solutions."
     ]
 
 
@@ -2141,12 +2145,14 @@ def test_test_series_activation_allows_ready_test_series():
     errors = _build_test_series_activation_errors(
         document={
             "document_type": "Test Series",
+            "question_type": "subjective",
             "total_minutes": 30,
             "answer_sheet_path": "uploads/answers.pdf",
+            "answer_solution_mode": "upload",
         },
         questions=[
-            {"id": "q1", "correct_answer": "A"},
-            {"id": "q2", "correct_answer": "B"},
+            {"id": "q1", "question_type": "subjective"},
+            {"id": "q2", "question_type": "subjective"},
         ],
         answer_coverage={
             "answer_solution_coverage_status": "ready",

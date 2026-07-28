@@ -2383,6 +2383,10 @@ def _is_objective_question_type(value: Any) -> bool:
     return question_type in {"mcq", "integer", "objective"}
 
 
+def _is_subjective_question_type(value: Any) -> bool:
+    return str(value or "").strip().lower() == "subjective"
+
+
 def _is_mixed_question_document(document: Dict[str, Any]) -> bool:
     return (
         document.get("document_type") in {"Practice Sets", "Test Series"}
@@ -2447,6 +2451,89 @@ def _missing_correct_answer_question_numbers(
     ]
 
 
+def _usable_option_count(question: Dict[str, Any]) -> int:
+    text_options = question.get("options") if isinstance(question.get("options"), list) else []
+    enhanced_options = (
+        question.get("enhanced_options")
+        if isinstance(question.get("enhanced_options"), list)
+        else []
+    )
+    usable_text_options = [
+        option
+        for option in text_options
+        if str(option or "").strip()
+    ]
+    usable_enhanced_options = [
+        option
+        for option in enhanced_options
+        if (
+            isinstance(option, dict)
+            and (
+                str(option.get("content") or "").strip()
+                or str(option.get("image_id") or "").strip()
+            )
+        )
+        or (not isinstance(option, dict) and str(option or "").strip())
+    ]
+    return max(len(usable_text_options), len(usable_enhanced_options))
+
+
+def _missing_objective_option_question_numbers(
+    questions: List[Dict[str, Any]],
+    document: Optional[Dict[str, Any]] = None,
+) -> List[int]:
+    """Return Test Series MCQs that cannot be served because choices are absent."""
+    document = document or {}
+    if document.get("document_type") != "Test Series":
+        # Practice Sets intentionally keep choices inline in the question text.
+        return []
+
+    missing: List[int] = []
+    for index, question in enumerate(questions or [], start=1):
+        question_type = str(
+            question.get("question_type") or document.get("question_type") or "mcq"
+        ).strip().lower()
+        if question_type not in {"mcq", "objective"}:
+            # Integer questions are objective but legitimately have no choices.
+            continue
+        if _usable_option_count(question) < 2:
+            missing.append(_question_activation_number(question, index))
+    return missing
+
+
+def _questions_requiring_worked_answer_mapping(
+    document: Dict[str, Any],
+    questions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Select questions whose activation depends on uploaded worked solutions.
+
+    Objective answer keys and subjective worked solutions are separate
+    contracts. A/B/C/D labels are sufficient for objective auto-grading; a
+    detailed answer-sheet mapping is required only for subjective marking.
+    """
+    exam_mode = str(document.get("exam_mode") or "").strip().lower()
+    if exam_mode in {"dcr", "tally"}:
+        return []
+    if exam_mode == "pcr" and document.get("exam_finalized") is True:
+        # Finalization already validated and froze the PCR marking plan.
+        return []
+
+    answer_solution_mode = str(document.get("answer_solution_mode") or "").strip().lower()
+    if answer_solution_mode and answer_solution_mode != "upload":
+        return []
+
+    document_question_type = str(document.get("question_type") or "mcq").strip().lower()
+    if document_question_type == "subjective":
+        return list(questions or [])
+    if document_question_type != "mixed":
+        return []
+    return [
+        question
+        for question in (questions or [])
+        if _is_subjective_question_type(question.get("question_type"))
+    ]
+
+
 def _missing_question_category_numbers(
     questions: List[Dict[str, Any]],
     document: Optional[Dict[str, Any]] = None,
@@ -2488,22 +2575,29 @@ def _build_test_series_activation_errors(
         if missing_correct_numbers:
             errors.append(", ".join(str(number) for number in missing_correct_numbers))
 
+    missing_option_numbers = _missing_objective_option_question_numbers(questions, document)
+    if missing_option_numbers:
+        errors.append(
+            "MCQ options are missing for: "
+            + ", ".join(str(number) for number in missing_option_numbers)
+        )
+
     if document.get("document_type") == "Test Series":
         total_minutes = document.get("total_minutes") or 0
         if total_minutes <= 0:
             errors.append("Test duration is not set. Set total minutes before activating.")
 
-    if _has_uploaded_answer_sheet(document):
+    worked_answer_questions = _questions_requiring_worked_answer_mapping(document, questions)
+    if _has_uploaded_answer_sheet(document) and worked_answer_questions:
         coverage_summary = (answer_coverage or {}).get("answer_solution_coverage_summary") or {}
-        coverage_status = (answer_coverage or {}).get("answer_solution_coverage_status")
-        question_count = coverage_summary.get("question_count") or len(questions)
+        question_count = coverage_summary.get("question_count") or len(worked_answer_questions)
         mapped_count = coverage_summary.get("mapped_answer_count") or 0
         manual_review_count = coverage_summary.get("manual_review_count") or 0
 
         if mapped_count < question_count:
             errors.append(
-                "Uploaded answer sheet is not fully mapped. "
-                f"{mapped_count}/{question_count} question(s) have mapped solutions."
+                "Uploaded answer sheet is not fully mapped for subjective questions. "
+                f"{mapped_count}/{question_count} subjective question(s) have mapped solutions."
             )
 
         if manual_review_count:
@@ -7358,21 +7452,38 @@ async def update_document_metadata(
             merged_doc = {**existing_doc, **update_data, "is_active": desired_active}
             questions = await db.mongo_find("questions", {"document_id": document_id})
             answer_coverage: Optional[Dict[str, Any]] = None
+            activation_answer_coverage: Optional[Dict[str, Any]] = None
 
             if _has_uploaded_answer_sheet(merged_doc):
                 mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
-                coverage_document = {**merged_doc, "answer_solution_mode": "upload"}
+                coverage_document = dict(merged_doc)
+                if not str(coverage_document.get("answer_solution_mode") or "").strip():
+                    coverage_document["answer_solution_mode"] = "upload"
                 answer_coverage = AnswerSolutionCoverageService().compute(
                     document=coverage_document,
                     questions=questions or [],
                     mappings=mappings or [],
                 )
                 update_data.update(answer_coverage)
+                worked_answer_questions = _questions_requiring_worked_answer_mapping(
+                    merged_doc,
+                    questions or [],
+                )
+                if worked_answer_questions:
+                    # Mixed papers require worked answers only for their
+                    # subjective questions. Keep the persisted document-wide
+                    # coverage for review UI, but validate activation against
+                    # the correctly scoped subset.
+                    activation_answer_coverage = AnswerSolutionCoverageService().compute(
+                        document=coverage_document,
+                        questions=worked_answer_questions,
+                        mappings=mappings or [],
+                    )
 
             activation_errors = _build_test_series_activation_errors(
                 document=merged_doc,
                 questions=questions or [],
-                answer_coverage=answer_coverage,
+                answer_coverage=activation_answer_coverage or answer_coverage,
             )
             if activation_errors:
                 missing_category_numbers = _missing_question_category_numbers(
@@ -7380,6 +7491,10 @@ async def update_document_metadata(
                     merged_doc,
                 )
                 missing_correct_numbers = _missing_correct_answer_question_numbers(
+                    questions or [],
+                    merged_doc,
+                )
+                missing_option_numbers = _missing_objective_option_question_numbers(
                     questions or [],
                     merged_doc,
                 )
@@ -7391,6 +7506,8 @@ async def update_document_metadata(
                     detail["missing_question_category_numbers"] = missing_category_numbers
                 if missing_correct_numbers:
                     detail["missing_correct_question_numbers"] = missing_correct_numbers
+                if missing_option_numbers:
+                    detail["missing_option_question_numbers"] = missing_option_numbers
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=detail,

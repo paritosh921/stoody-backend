@@ -91,6 +91,13 @@ class ScoreOverrideRequest(BaseModel):
         min_length=5,
         description="Human-readable justification (min 5 chars, per TAMPER_PROOF_SPEC)",
     )
+    amend_published: bool = Field(
+        default=False,
+        description=(
+            "Explicit confirmation that a published result may be revised. "
+            "The corrected result remains published and receives a new audited snapshot."
+        ),
+    )
 
     @field_validator("reason")
     @classmethod
@@ -112,6 +119,13 @@ class CriterionMarksOverrideRequest(BaseModel):
 
     criteria: List[CriterionMarkOverrideItem] = Field(..., min_length=1)
     reason: str = Field(..., min_length=5)
+    amend_published: bool = Field(
+        default=False,
+        description=(
+            "Explicit confirmation that a published result may be revised. "
+            "The corrected result remains published and receives a new audited snapshot."
+        ),
+    )
 
     @field_validator("reason")
     @classmethod
@@ -496,6 +510,107 @@ def _check_student_in_scope(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You do not have access to this student's data",
         )
+
+
+async def _amend_published_submission_snapshot(
+    tenant_db: Any,
+    submission: Dict[str, Any],
+    *,
+    evaluation_id: str,
+    actor_id: str,
+    reason: str,
+    review_lease_token: str,
+) -> Dict[str, Any]:
+    """Replace a published score snapshot while preserving its prior release.
+
+    Published results stay visible to the student.  The previous immutable
+    snapshot is retained in ``publication_history`` and the live snapshot is
+    replaced under the submission review lease, so a correction cannot race
+    publishing, reprocessing, or another teacher edit.
+    """
+
+    from services.exampen_submission_readiness import build_publication_snapshot
+
+    submission_id = str(submission.get("submission_id") or "")
+    previous_snapshot = submission.get("publication_snapshot")
+    previous_snapshot_hash = str(
+        submission.get("publication_snapshot_hash")
+        or (previous_snapshot or {}).get("snapshot_hash")
+        or ""
+    )
+    previous_total = (
+        (previous_snapshot or {}).get("total_score")
+        if isinstance(previous_snapshot, dict)
+        else None
+    )
+
+    next_snapshot = await build_publication_snapshot(
+        tenant_db,
+        submission_id,
+        actor_id=actor_id,
+    )
+    amended_at = next_snapshot.pop("published_at_dt")
+    next_revision = int(submission.get("result_revision") or 0) + 1
+
+    update_filter: Dict[str, Any] = {
+        "submission_id": submission_id,
+        "publication_status": "published",
+        "review_mutation_lease_token": review_lease_token,
+    }
+    if "publication_snapshot_hash" in submission:
+        update_filter["publication_snapshot_hash"] = submission.get(
+            "publication_snapshot_hash"
+        )
+    else:
+        update_filter["publication_snapshot_hash"] = {"$exists": False}
+
+    amended = await tenant_db["evalpen_submissions"].update_one(
+        update_filter,
+        {
+            "$set": {
+                "publication_snapshot": next_snapshot,
+                "publication_snapshot_hash": next_snapshot["snapshot_hash"],
+                "result_revision": next_revision,
+                "last_amended_at": amended_at,
+                "last_amended_by": actor_id,
+                "last_amendment_reason": reason,
+                "updated_at": amended_at,
+            },
+            "$push": {
+                "publication_history": {
+                    "action": "published_score_amended",
+                    "amended_at": amended_at,
+                    "amended_by": actor_id,
+                    "reason": reason,
+                    "evaluation_id": evaluation_id,
+                    "revision": next_revision,
+                    "previous_snapshot_hash": previous_snapshot_hash or None,
+                    "snapshot_hash": next_snapshot["snapshot_hash"],
+                    "previous_total_score": previous_total,
+                    "total_score": next_snapshot.get("total_score"),
+                    # Preserve exactly what the student saw before this
+                    # amendment.  The new release remains in
+                    # ``publication_snapshot``.
+                    "previous_snapshot": previous_snapshot,
+                }
+            },
+        },
+    )
+    if amended.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The published result changed while this amendment was being "
+                "saved. Refresh the paper and try again."
+            ),
+        )
+
+    return {
+        "publication_status": "published",
+        "result_revision": next_revision,
+        "amended_at": amended_at.isoformat(),
+        "snapshot_hash": next_snapshot["snapshot_hash"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1725,6 +1840,9 @@ async def override_evaluation_score(
     """
     tenant_db = await _get_tenant_db(db, current_user)
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    review_lease_token: Optional[str] = None
+    review_submission_id = ""
+    release_review_lease = None
 
     try:
         from api.v1._exampen_imports import load_exampen
@@ -1761,18 +1879,62 @@ async def override_evaluation_score(
         )
         _sub_doc = None
         if _resp_doc:
+            review_submission_id = str(_resp_doc.get("submission_id") or "")
             _sub_doc = await tenant_db["evalpen_submissions"].find_one(
-                {"submission_id": _resp_doc.get("submission_id", "")},
-                projection={"student_id": 1, "publication_status": 1},
+                {"submission_id": review_submission_id},
             )
             eval_student_id = eval_student_id or (_sub_doc or {}).get("student_id")
-        if (_sub_doc or {}).get("publication_status") == "published":
+        if (
+            (_sub_doc or {}).get("publication_status") == "published"
+            and not body.amend_published
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Published results are immutable; create a formal result revision instead",
+                detail=(
+                    "This result is already published. Confirm that you want "
+                    "to save an audited published-score amendment."
+                ),
             )
         if eval_student_id:
             _check_student_in_scope(eval_student_id, scoped_ids)
+
+        if review_submission_id:
+            from services.exampen_review_lease import (
+                SubmissionReviewBusyError,
+                acquire_submission_review_lease,
+                release_submission_review_lease,
+            )
+
+            release_review_lease = release_submission_review_lease
+            try:
+                review_lease_token = await acquire_submission_review_lease(
+                    tenant_db,
+                    review_submission_id,
+                    actor_id=str(current_user.get("user_id") or "unknown"),
+                    operation="score_amendment",
+                )
+            except SubmissionReviewBusyError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(exc),
+                ) from exc
+
+            # Publication may have completed after the first read but before
+            # this mutation acquired ownership.
+            _sub_doc = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": review_submission_id}
+            )
+            if (
+                (_sub_doc or {}).get("publication_status") == "published"
+                and not body.amend_published
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "This result was published while you were editing it. "
+                        "Refresh and confirm a published-score amendment."
+                    ),
+                )
 
         # Validate new_score against max_score
         max_score = existing.get("max_score", 0.0)
@@ -1811,12 +1973,47 @@ async def override_evaluation_score(
             body.reason,
         )
 
+        amendment: Dict[str, Any] = {}
+        if (
+            (_sub_doc or {}).get("publication_status") == "published"
+            and review_lease_token
+        ):
+            try:
+                amendment = await _amend_published_submission_snapshot(
+                    tenant_db,
+                    _sub_doc,
+                    evaluation_id=evaluation_id,
+                    actor_id=str(actor_id),
+                    reason=body.reason,
+                    review_lease_token=review_lease_token,
+                )
+            except Exception:
+                # Mongo deployments used by schools do not always support
+                # cross-collection transactions.  Keep the released snapshot
+                # and evaluation consistent if the second write cannot land.
+                rolled_back = await eval_repo.override_score(
+                    evaluation_id,
+                    new_total_score=old_score,
+                    actor_id=str(actor_id),
+                    reason=(
+                        "Automatic rollback: published result snapshot "
+                        "amendment did not complete"
+                    ),
+                )
+                if not rolled_back:
+                    logger.critical(
+                        "Published score amendment rollback failed for %s",
+                        evaluation_id,
+                    )
+                raise
+
         return {
             "evaluation_id": evaluation_id,
             "previous_score": old_score,
             "new_score": body.new_score,
             "actor_id": actor_id,
             "overridden_at": datetime.now(timezone.utc).isoformat(),
+            **amendment,
         }
 
     except HTTPException:
@@ -1838,6 +2035,25 @@ async def override_evaluation_score(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Score override encountered an internal error",
         )
+    finally:
+        if (
+            review_lease_token
+            and review_submission_id
+            and release_review_lease is not None
+        ):
+            try:
+                await release_review_lease(
+                    tenant_db,
+                    review_submission_id,
+                    review_lease_token,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to release score-amendment lease for %s: %s",
+                    review_submission_id,
+                    exc,
+                    exc_info=True,
+                )
 
 
 @router.post(
@@ -1865,6 +2081,9 @@ async def override_criterion_marks(
 
     tenant_db = await _get_tenant_db(db, current_user)
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    review_lease_token: Optional[str] = None
+    review_submission_id = ""
+    release_review_lease = None
     try:
         from api.v1._exampen_imports import load_exampen
 
@@ -1892,18 +2111,60 @@ async def override_criterion_marks(
         eval_student_id = eval_student_id or (response_doc or {}).get("student_id")
         submission_doc = None
         if response_doc:
+            review_submission_id = str(response_doc.get("submission_id") or "")
             submission_doc = await tenant_db["evalpen_submissions"].find_one(
-                {"submission_id": response_doc.get("submission_id", "")},
-                projection={"student_id": 1, "publication_status": 1},
+                {"submission_id": review_submission_id},
             )
             eval_student_id = eval_student_id or (submission_doc or {}).get("student_id")
-        if (submission_doc or {}).get("publication_status") == "published":
+        if (
+            (submission_doc or {}).get("publication_status") == "published"
+            and not body.amend_published
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Published results are immutable; create a formal result revision instead",
+                detail=(
+                    "This result is already published. Confirm that you want "
+                    "to save an audited published-score amendment."
+                ),
             )
         if eval_student_id:
             _check_student_in_scope(str(eval_student_id), scoped_ids)
+
+        if review_submission_id:
+            from services.exampen_review_lease import (
+                SubmissionReviewBusyError,
+                acquire_submission_review_lease,
+                release_submission_review_lease,
+            )
+
+            release_review_lease = release_submission_review_lease
+            try:
+                review_lease_token = await acquire_submission_review_lease(
+                    tenant_db,
+                    review_submission_id,
+                    actor_id=str(current_user.get("user_id") or "unknown"),
+                    operation="criterion_score_amendment",
+                )
+            except SubmissionReviewBusyError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=str(exc),
+                ) from exc
+
+            submission_doc = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": review_submission_id}
+            )
+            if (
+                (submission_doc or {}).get("publication_status") == "published"
+                and not body.amend_published
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "This result was published while you were editing it. "
+                        "Refresh and confirm a published-score amendment."
+                    ),
+                )
 
         expected: Dict[str, float] = {}
         for criterion in raw_criteria:
@@ -1972,12 +2233,52 @@ async def override_criterion_marks(
                 }
             },
         )
+
+        amendment: Dict[str, Any] = {}
+        if (
+            (submission_doc or {}).get("publication_status") == "published"
+            and review_lease_token
+        ):
+            try:
+                amendment = await _amend_published_submission_snapshot(
+                    tenant_db,
+                    submission_doc,
+                    evaluation_id=evaluation_id,
+                    actor_id=str(actor_id),
+                    reason=body.reason,
+                    review_lease_token=review_lease_token,
+                )
+            except Exception:
+                previous_marks = {
+                    str(item.get("criterion_id") or ""): float(
+                        item.get("marks_awarded") or 0.0
+                    )
+                    for item in raw_criteria
+                    if isinstance(item, dict) and item.get("criterion_id")
+                }
+                rolled_back = await eval_repo.override_criterion_marks(
+                    evaluation_id,
+                    marks_by_criterion=previous_marks,
+                    actor_id=str(actor_id),
+                    reason=(
+                        "Automatic rollback: published result snapshot "
+                        "amendment did not complete"
+                    ),
+                )
+                if rolled_back is None:
+                    logger.critical(
+                        "Published criterion amendment rollback failed for %s",
+                        evaluation_id,
+                    )
+                raise
+
         return {
             "evaluation_id": evaluation_id,
             "total_score": updated["total_score"],
             "max_score": updated.get("max_score"),
             "criterion_marks": updated["criterion_marks"],
             "actor_id": actor_id,
+            **amendment,
         }
     except HTTPException:
         raise
@@ -1998,6 +2299,25 @@ async def override_criterion_marks(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Criterion mark override encountered an internal error",
         ) from exc
+    finally:
+        if (
+            review_lease_token
+            and review_submission_id
+            and release_review_lease is not None
+        ):
+            try:
+                await release_review_lease(
+                    tenant_db,
+                    review_submission_id,
+                    review_lease_token,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to release criterion-amendment lease for %s: %s",
+                    review_submission_id,
+                    exc,
+                    exc_info=True,
+                )
 
 
 async def _correct_response_assignment_impl(

@@ -12,9 +12,10 @@ from api.v1.pdf_async import (
 
 
 class FakeContentDb:
-    def __init__(self, document, questions=None):
+    def __init__(self, document, questions=None, mappings=None):
         self.document = document
         self.questions = questions or []
+        self.mappings = mappings or []
         self.update = None
 
     async def mongo_find_one(self, collection, query):
@@ -26,7 +27,7 @@ class FakeContentDb:
         if collection == "questions" and query.get("document_id") == self.document.get("document_id"):
             return self.questions
         if collection == "answer_question_mappings":
-            return []
+            return self.mappings
         return []
 
     async def mongo_update_one(self, collection, query, update):
@@ -75,6 +76,150 @@ def test_mixed_content_activation_requires_question_categories_and_objective_ans
 
     assert "1" in errors
     assert "Question category is not selected for: 3, 4" in errors
+
+
+def test_objective_test_series_requires_usable_mcq_options():
+    document = {
+        "document_type": "Test Series",
+        "question_type": "mcq",
+        "total_minutes": 60,
+    }
+    questions = [
+        {
+            "question_number": 1,
+            "question_type": "mcq",
+            "options": ["One", "Two"],
+            "correct_answer": "A",
+        },
+        {
+            "question_number": 2,
+            "question_type": "mcq",
+            "options": [],
+            "correct_answer": "B",
+        },
+        {
+            "question_number": 3,
+            "question_type": "integer",
+            "options": [],
+            "correct_answer": "A",
+        },
+    ]
+
+    assert _build_test_series_activation_errors(
+        document=document,
+        questions=questions,
+    ) == ["MCQ options are missing for: 2"]
+
+
+def test_objective_test_series_accepts_image_options_without_text_options():
+    errors = _build_test_series_activation_errors(
+        document={
+            "document_type": "Test Series",
+            "question_type": "mcq",
+            "total_minutes": 60,
+        },
+        questions=[
+            {
+                "question_number": 1,
+                "question_type": "mcq",
+                "options": [],
+                "enhanced_options": [
+                    {"type": "image", "content": "data:image/png;base64,first"},
+                    {"type": "image", "content": "data:image/png;base64,second"},
+                ],
+                "correct_answer": "B",
+            },
+        ],
+    )
+
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_objective_activation_uses_complete_answer_key_without_worked_mappings(monkeypatch):
+    db = FakeContentDb(
+        {
+            "document_id": "OBJECTIVE1",
+            "document_type": "Test Series",
+            "question_type": "mcq",
+            "total_minutes": 60,
+            "is_active": False,
+            "answer_sheet_path": "uploads/answer-key.pdf",
+            "answer_solution_mode": "upload",
+        },
+        questions=[
+            {
+                "id": "q-1",
+                "question_number": 1,
+                "question_type": "mcq",
+                "options": ["One", "Two", "Three", "Four"],
+                "correct_answer": "C",
+            },
+        ],
+        mappings=[],
+    )
+    monkeypatch.setattr(pdf_async, "_notify_students_content_activated", AsyncMock())
+
+    response = await update_document_metadata.__wrapped__(
+        request=None,
+        document_id="OBJECTIVE1",
+        metadata={"is_active": True},
+        current_user={"user_id": "admin1"},
+        db=db,
+    )
+
+    assert response["updated_fields"]["is_active"] is True
+    assert db.update["update"]["$set"]["is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_mixed_activation_scopes_worked_solution_coverage_to_subjective_questions(monkeypatch):
+    db = FakeContentDb(
+        {
+            "document_id": "MIXED1",
+            "document_type": "Test Series",
+            "question_type": "mixed",
+            "total_minutes": 60,
+            "is_active": False,
+            "answer_sheet_path": "uploads/answers.pdf",
+            "answer_solution_mode": "upload",
+        },
+        questions=[
+            {
+                "id": "q-objective",
+                "question_number": 1,
+                "question_type": "mcq",
+                "options": ["One", "Two"],
+                "correct_answer": "A",
+            },
+            {
+                "id": "q-subjective",
+                "question_number": 2,
+                "question_type": "subjective",
+            },
+        ],
+        mappings=[
+            {
+                "question_id": "q-subjective",
+                "answer_text": "A complete worked solution",
+                "source": "answer_sheet",
+                "review_status": "accepted",
+                "manual_review_required": False,
+            },
+        ],
+    )
+    monkeypatch.setattr(pdf_async, "_notify_students_content_activated", AsyncMock())
+
+    response = await update_document_metadata.__wrapped__(
+        request=None,
+        document_id="MIXED1",
+        metadata={"is_active": True},
+        current_user={"user_id": "admin1"},
+        db=db,
+    )
+
+    assert response["updated_fields"]["is_active"] is True
+    assert db.update["update"]["$set"]["is_active"] is True
 
 
 @pytest.mark.asyncio
@@ -134,8 +279,11 @@ async def test_finalized_pcr_document_allows_operational_activation_only(monkeyp
             "total_minutes": 60,
             "is_active": False,
             "exam_finalized": True,
+            "answer_sheet_path": "uploads/finalized-pcr-solutions.pdf",
+            "answer_solution_mode": "upload",
         },
         questions=[{"question_number": 1, "question_type": "subjective"}],
+        mappings=[],
     )
     monkeypatch.setattr(pdf_async, "_notify_students_content_activated", AsyncMock())
 
