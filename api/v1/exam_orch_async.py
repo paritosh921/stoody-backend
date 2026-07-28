@@ -69,6 +69,8 @@ LIFECYCLE_TRANSITIONS = {
 PEN_MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 MAX_PEN_BINDINGS = 256
 CAPTURE_MODES = {"pen", "camera", "hybrid"}
+DEFAULT_PCR_CAMERA_MAX_PAGES = 40
+ACTIVE_COLLECTION_STATES = {"draft", "armed", "in_progress"}
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +642,11 @@ def _new_exam_id() -> str:
 def _session_request_key(current_user: Dict[str, Any], request_id: Optional[str]) -> Optional[str]:
     if not request_id:
         return None
+    # Automatic PCR camera collection belongs to the finalized paper, not to
+    # whichever admin happened to click Activate.  Keeping this key
+    # actor-independent makes concurrent/retried activation idempotent.
+    if str(request_id).startswith("auto-pcr-camera:"):
+        return str(request_id).strip()
     actor = str(current_user.get("user_id") or "unknown")
     return f"{actor}:{str(request_id).strip()}"
 
@@ -1090,6 +1097,212 @@ async def create_exam(
         current_user.get("user_id"),
     )
     return _doc_to_response(doc)
+
+
+async def _camera_roster_for_document(
+    tenant_db: Any,
+    document: Dict[str, Any],
+) -> List[str]:
+    """Return every active student owned by the paper's institution/class."""
+    standard = str(document.get("standard") or "").strip()
+    if not standard:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Set the paper class before activating camera answer-copy uploads",
+        )
+
+    query: Dict[str, Any] = {
+        "grade": standard,
+        "is_active": True,
+    }
+    if document.get("admin_id") is not None:
+        query["admin_id"] = document["admin_id"]
+
+    students = await tenant_db["students"].find(
+        query,
+        projection={"_id": 1, "student_id": 1},
+    ).to_list(length=5000)
+    roster = _normalize_roster(
+        [
+            str(student.get("student_id") or student.get("_id") or "")
+            for student in students
+        ]
+    )
+    if not roster:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"No active students were found in Class {standard}",
+        )
+    return roster
+
+
+def _automatic_camera_request_id(document: Dict[str, Any]) -> str:
+    finalized_at = document.get("exam_finalized_at") or "finalized"
+    if hasattr(finalized_at, "isoformat"):
+        finalized_at = finalized_at.isoformat()
+    return (
+        f"auto-pcr-camera:{str(document.get('document_id') or '').strip()}:"
+        f"{str(finalized_at)}"
+    )[:128]
+
+
+async def ensure_default_pcr_camera_collection(
+    *,
+    prepared_document_id: str,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> ExamDetailResponse:
+    """Ensure a finalized PCR paper has one live camera-only collection.
+
+    This is the server-side activation contract.  The ``exampen_exams``
+    record remains an internal lifecycle container, while student capture is
+    always camera upload: no hub, pen binding, or hybrid setup is involved.
+    Repeated calls are idempotent and also repair an active paper whose
+    automatic collection record is missing.
+    """
+    tenant_db = await _get_tenant_db(db, current_user)
+    document = await _load_prepared_document(tenant_db, prepared_document_id)
+    if str(document.get("exam_mode") or "").strip().lower() != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Automatic camera collection is available for finalized PCR papers only",
+        )
+
+    roster = await _camera_roster_for_document(tenant_db, document)
+    collection = tenant_db["exampen_exams"]
+    await _ensure_indexes(collection)
+
+    paper_sessions = await collection.find(
+        {"prepared_document_id": prepared_document_id}
+    ).sort("created_at", -1).to_list(length=100)
+    session = next(
+        (
+            item
+            for item in paper_sessions
+            if str(item.get("lifecycle_state") or "draft") in ACTIVE_COLLECTION_STATES
+        ),
+        None,
+    )
+
+    if session is None and paper_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This finalized paper already has a closed collection. "
+                "Create a new finalized paper before opening another class submission."
+            ),
+        )
+
+    if session is None:
+        created = await create_exam(
+            body=ExamCreateRequest(
+                prepared_document_id=prepared_document_id,
+                request_id=_automatic_camera_request_id(document),
+                roster=roster,
+                pen_bindings={},
+                capture_mode="camera",
+                student_self_submission_enabled=True,
+                student_submission_max_pages=DEFAULT_PCR_CAMERA_MAX_PAGES,
+            ),
+            current_user=current_user,
+            db=db,
+        )
+        session = await collection.find_one({"exam_id": created.exam_id})
+    else:
+        lifecycle = str(session.get("lifecycle_state") or "draft")
+        capture_mode = str(session.get("capture_mode") or "pen")
+        automatic = str(session.get("session_request_id") or "").startswith(
+            "auto-pcr-camera:"
+        )
+        if lifecycle != "draft" and capture_mode != "camera":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This paper already has a non-camera collection in progress. "
+                    "It cannot be converted while students may be submitting."
+                ),
+            )
+
+        if lifecycle == "draft" or automatic:
+            # For an automatic camera collection, refreshing activation safely
+            # adds newly enrolled class students and upgrades the page limit.
+            existing_roster = _normalize_roster(session.get("roster"))
+            desired_roster = (
+                roster
+                if lifecycle in {"draft", "armed"}
+                else _normalize_roster([*existing_roster, *roster])
+            )
+            await collection.update_one(
+                {"exam_id": session["exam_id"]},
+                {
+                    "$set": {
+                        "roster": desired_roster,
+                        "pen_bindings": {},
+                        "capture_mode": "camera",
+                        "student_self_submission_enabled": True,
+                        "student_submission_max_pages": DEFAULT_PCR_CAMERA_MAX_PAGES,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            session = await collection.find_one({"exam_id": session["exam_id"]})
+        elif not bool(session.get("student_self_submission_enabled", False)):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The existing camera collection does not allow student uploads",
+            )
+
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Camera answer-copy collection could not be created",
+        )
+
+    exam_id = str(session.get("exam_id") or "")
+    lifecycle = str(session.get("lifecycle_state") or "draft")
+    if lifecycle == "draft":
+        preflight = await _build_preflight(tenant_db, session)
+        if not preflight.ready_to_arm:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "Camera answer-copy collection is not ready",
+                    "preflight": preflight.model_dump(),
+                },
+            )
+        await collection.update_one(
+            {"exam_id": exam_id, "lifecycle_state": "draft"},
+            {
+                "$set": {
+                    "lifecycle_state": "armed",
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        session = await collection.find_one({"exam_id": exam_id})
+        lifecycle = str((session or {}).get("lifecycle_state") or "draft")
+
+    if lifecycle == "armed":
+        now = datetime.now(timezone.utc)
+        await collection.update_one(
+            {"exam_id": exam_id, "lifecycle_state": "armed"},
+            {
+                "$set": {
+                    "lifecycle_state": "in_progress",
+                    "started_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        session = await collection.find_one({"exam_id": exam_id})
+        lifecycle = str((session or {}).get("lifecycle_state") or "armed")
+
+    if lifecycle != "in_progress":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Camera answer-copy collection is not open",
+        )
+    return _doc_to_response(session)
 
 
 @router.get(

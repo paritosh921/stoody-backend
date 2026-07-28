@@ -100,6 +100,76 @@ async def _update_exam_setup(db, exam_id: str, current_user, **fields):
         )
 
 
+async def _ensure_camera_collection(db, current_user, document_id: str = "doc-1"):
+    from api.v1.exam_orch_async import ensure_default_pcr_camera_collection
+
+    with patch("api.v1.exam_orch_async._get_tenant_db", return_value=db):
+        return await ensure_default_pcr_camera_collection(
+            prepared_document_id=document_id,
+            current_user=current_user,
+            db=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalized_pcr_activation_opens_one_camera_only_class_collection():
+    db = _fresh_db()
+    await _seed_document(
+        db,
+        standard="11",
+        admin_id="admin-1",
+        is_active=False,
+    )
+    await db["students"].insert_many(
+        [
+            {
+                "student_id": "STU-11-A",
+                "grade": "11",
+                "admin_id": "admin-1",
+                "is_active": True,
+            },
+            {
+                "student_id": "STU-11-B",
+                "grade": "11",
+                "admin_id": "admin-1",
+                "is_active": True,
+            },
+            {
+                "student_id": "STU-INACTIVE",
+                "grade": "11",
+                "admin_id": "admin-1",
+                "is_active": False,
+            },
+            {
+                "student_id": "STU-OTHER-CLASS",
+                "grade": "12",
+                "admin_id": "admin-1",
+                "is_active": True,
+            },
+            {
+                "student_id": "STU-OTHER-INSTITUTE",
+                "grade": "11",
+                "admin_id": "admin-2",
+                "is_active": True,
+            },
+        ]
+    )
+
+    first = await _ensure_camera_collection(db, _admin_user())
+    second = await _ensure_camera_collection(db, _admin_user())
+
+    assert first.exam_id == second.exam_id
+    assert first.lifecycle_state == "in_progress"
+    assert first.capture_mode == "camera"
+    assert first.student_self_submission_enabled is True
+    assert first.student_submission_max_pages == 40
+    assert first.pen_bindings == {}
+    assert set(first.roster) == {"STU-11-A", "STU-11-B"}
+    assert await db["exampen_exams"].count_documents(
+        {"prepared_document_id": "doc-1"}
+    ) == 1
+
+
 @pytest.mark.asyncio
 async def test_create_exam_maps_prepared_document_to_tutor_owner():
     db = _fresh_db()

@@ -7606,6 +7606,17 @@ async def update_document_metadata(
                     detail=detail,
                 )
 
+        # A finalized PCR paper is not meaningfully "active" until its
+        # class-wide camera upload channel is live.  Keep this invariant on
+        # the backend so older clients or direct metadata calls cannot create
+        # the split state where Content says Active but students see nothing.
+        should_open_pcr_camera_collection = (
+            "is_active" in metadata
+            and desired_active
+            and str(existing_doc.get("exam_mode") or "").strip().lower() == "pcr"
+            and existing_doc.get("exam_finalized") is True
+        )
+
         if not update_data:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -7624,6 +7635,28 @@ async def update_document_metadata(
         # mongo_update_one returns False if no changes or not found
         # But we already verified document exists above, so just log and continue
         logger.info(f"Update result for {document_id}: {result}")
+
+        if should_open_pcr_camera_collection:
+            try:
+                from api.v1.exam_orch_async import ensure_default_pcr_camera_collection
+
+                await ensure_default_pcr_camera_collection(
+                    prepared_document_id=document_id,
+                    current_user=current_user,
+                    db=db,
+                )
+            except Exception:
+                # Activation and camera collection are one user operation.
+                # Roll back only a newly activated document; a reconciliation
+                # call for an already-active legacy paper must not alter its
+                # previous visibility if repair encounters a blocker.
+                if not bool(existing_doc.get("is_active", False)):
+                    await db.mongo_update_one(
+                        "documents",
+                        {"document_id": document_id},
+                        {"$set": {"is_active": False}},
+                    )
+                raise
 
         # --- Notification: content activated (false → true) ---
         was_inactive = not existing_doc.get("is_active", False)
