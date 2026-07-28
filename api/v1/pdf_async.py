@@ -45,6 +45,11 @@ from services.ai_gateway_service import (
     estimate_text_tokens,
 )
 from services.answer_question_mapping_service import AnswerQuestionMappingService
+from services.answer_mapping_contract import (
+    answer_mapping_rank,
+    effective_answer_mappings,
+    select_effective_answer_mapping,
+)
 from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
 from services.answer_sheet_mapping_service import AnswerSheetMappingService
 from services.answer_solution_coverage_service import AnswerSolutionCoverageService
@@ -199,6 +204,10 @@ def _serialize_answer_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
         "question_region_id": str(mapping.get("question_region_id") or mapping.get("question_id") or ""),
         "answer_region_id": str(mapping.get("answer_region_id") or ""),
         "answer_text": mapping.get("answer_text") or "",
+        "mapped_question_text": mapping.get("mapped_question_text") or "",
+        "answer_kind": mapping.get("answer_kind") or "worked_solution",
+        "virtual": bool(mapping.get("virtual")),
+        "editable": mapping.get("editable") is not False,
         "mapping_strategy": mapping.get("mapping_strategy") or "",
         "confidence": mapping.get("confidence"),
         "manual_review_required": bool(mapping.get("manual_review_required")),
@@ -221,26 +230,7 @@ def _serialize_answer_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _answer_mapping_rank(mapping: Dict[str, Any]) -> tuple:
-    source = str(mapping.get("source") or "").strip().lower()
-    strategy = str(mapping.get("mapping_strategy") or "").strip().lower()
-    source_rank = 0
-    if source == "manual_answer_segmentation":
-        source_rank = 40
-    elif source == "answer_sheet_full_ocr":
-        source_rank = 30
-    elif source in {"answer_sheet", "uploaded_answer_sheet", "upload"}:
-        source_rank = 25
-    elif source == "ai_generated" or strategy == "ai_generated_solution":
-        source_rank = 10
-    review_status = str(mapping.get("review_status") or "").strip().lower()
-    review_rank = 10 if review_status in {"accepted", "trusted"} else 0
-    if review_status == "rejected":
-        review_rank -= 20
-    try:
-        confidence_rank = float(mapping.get("confidence") or 0)
-    except (TypeError, ValueError):
-        confidence_rank = 0.0
-    return (source_rank, review_rank, confidence_rank)
+    return answer_mapping_rank(mapping)
 
 
 def _is_reviewed_pcr_answer_mapping(mapping: Dict[str, Any]) -> bool:
@@ -2900,6 +2890,79 @@ def _parse_pcr_marking_plan_draft(
     }
 
 
+def _build_answer_key_pcr_marking_plan_draft(
+    *,
+    document: Dict[str, Any],
+    question: Dict[str, Any],
+    mapping: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create a deterministic marking plan for a key-only teacher answer.
+
+    An answer key contains an outcome, not a worked method. Asking a language
+    model to invent steps or explanations would make the marking scheme
+    stricter than the uploaded teacher evidence. The correct contract is one
+    full-mark result criterion with no method requirement.
+    """
+
+    try:
+        question_marks = float(question.get("points") or question.get("max_marks") or 0)
+    except (TypeError, ValueError):
+        question_marks = 0.0
+    if question_marks <= 0:
+        raise ValueError("Set question marks before drafting marking criteria")
+
+    mapped_answer = str(
+        mapping.get("final_answer_text") or mapping.get("answer_text") or ""
+    ).strip()
+    if not mapped_answer:
+        raise ValueError("The mapped answer is empty")
+
+    label = str(mapping.get("correct_answer_candidate") or "").strip().upper()
+    readable_answer = mapped_answer
+    if label and mapped_answer.lower().startswith(f"{label.lower()}. "):
+        readable_answer = f"{label} - {mapped_answer[3:].strip()}"
+    description = f"Gives the correct answer: {readable_answer}."
+    acceptable_evidence = (
+        f"Accept {mapped_answer}, the equivalent option label"
+        f"{f' {label}' if label else ''}, or an equivalent response with the same result."
+    )
+    policy_module = _pcr_marking_policy_module()
+    criteria = policy_module.normalize_marking_criteria(
+        [
+            {
+                "criterion_id": "correct_answer",
+                "description": description,
+                "max_marks": question_marks,
+                "acceptable_evidence": acceptable_evidence,
+            }
+        ],
+        assign_missing_ids=False,
+    )
+    errors = policy_module.validate_marking_criteria(criteria, question_marks)
+    if errors:
+        raise ValueError("Could not build the answer-key marking plan: " + "; ".join(errors))
+    method_policy = policy_module.normalize_method_policy(
+        {
+            "mode": "no_method_required",
+            "required_method": None,
+            "allow_error_carried_forward": False,
+        }
+    )
+    authoring_policy = policy_module.normalize_marking_policy(
+        document.get("pcr_marking_policy"),
+        default_structured=True,
+    )
+    return {
+        "reference_solution": mapped_answer,
+        "marking_criteria": criteria,
+        "method_policy": method_policy,
+        "provider": "deterministic",
+        "model": "answer-key-v1",
+        "strictness": authoring_policy.get("strictness") or "balanced",
+        "temperature": 0.0,
+    }
+
+
 async def generate_pcr_marking_plan_draft(
     *,
     document: Dict[str, Any],
@@ -4519,20 +4582,40 @@ async def draft_pcr_marking_plan(
         "$or": [{"question_id": question_id}, {"question_region_id": question_id}],
     }
     mapping_id = str(body.mappingId or "").strip()
-    if mapping_id:
-        mapping_query["mapping_id"] = mapping_id
     mappings = await tenant_db["answer_question_mappings"].find(mapping_query).to_list(length=20)
-    if not mappings:
+    effective_mapping = select_effective_answer_mapping(
+        document,
+        question,
+        mappings,
+        include_answer_key=True,
+    )
+    if mapping_id:
+        mapping = next(
+            (
+                candidate
+                for candidate in mappings
+                if str(candidate.get("mapping_id") or "").strip() == mapping_id
+            ),
+            None,
+        )
+        if (
+            mapping is None
+            and effective_mapping is not None
+            and str(effective_mapping.get("mapping_id") or "").strip() == mapping_id
+        ):
+            mapping = effective_mapping
+    else:
+        mapping = effective_mapping
+    if mapping is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="No mapped answer-sheet solution is available for this question",
+            detail="No mapped teacher answer is available for this question",
         )
-    mapping = max(mappings, key=_answer_mapping_rank)
     if not _is_reviewed_pcr_answer_mapping(mapping):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "Review and accept the selected answer mapping before using it "
+                "Review and accept the selected teacher answer before using it "
                 "as a PCR marking-plan source"
             ),
         )
@@ -4542,23 +4625,33 @@ async def draft_pcr_marking_plan(
     if not mapped_solution:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The selected mapped answer has no usable worked solution text",
+            detail="The selected mapped answer has no usable answer text",
         )
 
     try:
-        draft = await generate_pcr_marking_plan_draft(
-            document=document,
-            question=question,
-            mapped_solution=mapped_solution,
-            gateway_context=_build_ai_gateway_context(
-                current_user=current_user,
-                db=db,
-                document_id=document_id,
-                region_id=question_id,
-                region_scope="pcr_marking_plan_draft",
-                is_b2c=is_b2c,
-            ),
-        )
+        if (
+            str(mapping.get("answer_kind") or "").lower() == "answer_key"
+            or str(mapping.get("mapping_strategy") or "").lower() == "answer_key"
+        ):
+            draft = _build_answer_key_pcr_marking_plan_draft(
+                document=document,
+                question=question,
+                mapping=mapping,
+            )
+        else:
+            draft = await generate_pcr_marking_plan_draft(
+                document=document,
+                question=question,
+                mapped_solution=mapped_solution,
+                gateway_context=_build_ai_gateway_context(
+                    current_user=current_user,
+                    db=db,
+                    document_id=document_id,
+                    region_id=question_id,
+                    region_scope="pcr_marking_plan_draft",
+                    is_b2c=is_b2c,
+                ),
+            )
     except (ImportError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -4579,7 +4672,7 @@ async def draft_pcr_marking_plan(
         "source_mapping": _serialize_answer_mapping(mapping),
         "draft": draft,
         "requires_teacher_review": True,
-        "message": "Draft created from the mapped solution. Review and save it before finalizing the paper.",
+        "message": "Draft created from the mapped answer. Review and save it before finalizing the paper.",
     }
 
 
@@ -7804,12 +7897,17 @@ async def get_document_questions(
                 "answer_solution_coverage_summary": refreshed_coverage.get("answer_solution_coverage_summary"),
             }
 
-            for mapping in answer_mappings:
-                question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
-                if question_id and mapping.get("answer_text"):
-                    existing = mappings_by_question_id.get(question_id)
-                    if existing is None or _answer_mapping_rank(mapping) > _answer_mapping_rank(existing):
-                        mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
+            for mapping in effective_answer_mappings(
+                document,
+                questions,
+                answer_mappings,
+                include_answer_key=str(document.get("exam_mode") or "").lower() == "pcr",
+            ):
+                question_id = str(
+                    mapping.get("question_id") or mapping.get("question_region_id") or ""
+                )
+                if question_id:
+                    mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
 
         # Convert ObjectId to string for JSON serialization and map field names
         serialized_questions = []
@@ -7977,7 +8075,13 @@ async def get_document_questions(
             "answer_key_auto_applied_count": document.get("answer_key_auto_applied_count"),
             "answer_key_review_required_count": document.get("answer_key_review_required_count"),
             "answer_sheet_manual_segmentation_recommended": document.get("answer_sheet_manual_segmentation_recommended"),
-            "answer_sheet_mapped_answers_count": document.get("answer_sheet_mapped_answers_count"),
+            "answer_sheet_mapped_answers_count": (
+                (coverage_fields.get("answer_solution_coverage_summary") or {}).get(
+                    "mapped_answer_count"
+                )
+                if include_worked_answers
+                else document.get("answer_sheet_mapped_answers_count")
+            ),
             "has_answer_sheet": bool(document.get("answer_sheet_path")),
             "answer_solution_mode": document.get("answer_solution_mode"),
             "generated_solutions_status": document.get("generated_solutions_status"),
@@ -9421,14 +9525,17 @@ async def get_document_answer_mappings(
                 _document_regions_filter(document_id, "answer")
             )
 
-        mappings_by_question_id: Dict[str, Dict[str, Any]] = {}
-        for mapping in mappings:
-            question_id = str(mapping.get("question_id") or mapping.get("question_region_id") or "")
-            if not question_id:
-                continue
-            existing = mappings_by_question_id.get(question_id)
-            if existing is None or _answer_mapping_rank(mapping) > _answer_mapping_rank(existing):
-                mappings_by_question_id[question_id] = _serialize_answer_mapping(mapping)
+        mappings_by_question_id: Dict[str, Dict[str, Any]] = {
+            str(mapping.get("question_id") or mapping.get("question_region_id") or ""):
+            _serialize_answer_mapping(mapping)
+            for mapping in effective_answer_mappings(
+                document,
+                questions,
+                mappings,
+                include_answer_key=str(document.get("exam_mode") or "").lower() == "pcr",
+            )
+            if mapping.get("question_id") or mapping.get("question_region_id")
+        }
 
         def _question_sort_key(question: Dict[str, Any]) -> tuple:
             region = question.get("region_metadata") or {}
@@ -9471,7 +9578,7 @@ async def get_document_answer_mappings(
 
         rows: List[Dict[str, Any]] = []
         for index, question in enumerate(sorted(questions, key=_question_sort_key), start=1):
-            question_id = str(question.get("id") or "")
+            question_id = str(question.get("id") or question.get("question_id") or "")
             mapping = mappings_by_question_id.get(question_id)
             rows.append({
                 "question_index": index,

@@ -5,6 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List
 
+from services.answer_mapping_contract import (
+    effective_answer_mappings,
+    mapping_question_id,
+)
+
 
 class AnswerSolutionCoverageService:
     """Compute answer readiness independently from question OCR quality."""
@@ -31,7 +36,7 @@ class AnswerSolutionCoverageService:
             and str(mapping.get("review_status") or "").strip().lower() != "rejected"
         ]
         answer_source = self._answer_source(document=document, mappings=all_answer_mappings)
-        mapped = [
+        source_mappings = [
             mapping
             for mapping in all_answer_mappings
             if self._mapping_matches_answer_source(mapping, answer_source)
@@ -39,11 +44,35 @@ class AnswerSolutionCoverageService:
         stale_mapping_count = len(
             [
                 mapping
-                for mapping in mapped
+                for mapping in source_mappings
                 if current_question_ids
                 and self._mapping_question_id(mapping)
                 and self._mapping_question_id(mapping) not in current_question_ids
             ]
+        )
+        current_source_mappings = [
+            mapping
+            for mapping in source_mappings
+            if (
+                not current_question_ids
+                or not self._mapping_question_id(mapping)
+                or self._mapping_question_id(mapping) in current_question_ids
+            )
+        ]
+        # A teacher answer can be a worked solution or an answer key. For an
+        # uploaded key-only PDF, expose the accepted key as the effective
+        # mapped answer instead of incorrectly reporting zero solutions.
+        mapped = effective_answer_mappings(
+            document,
+            questions,
+            current_source_mappings,
+            include_answer_key=(
+                str(document.get("exam_mode") or "").strip().lower() == "pcr"
+                and (
+                    bool(document.get("answer_sheet_path"))
+                    or answer_source in {"upload", "manual"}
+                )
+            ),
         )
         mapped_question_ids = {
             self._mapping_question_id(mapping)
@@ -105,6 +134,22 @@ class AnswerSolutionCoverageService:
         summary = {
             "question_count": question_count,
             "mapped_answer_count": mapped_answer_count,
+            "answer_key_mapped_count": len(
+                [
+                    mapping
+                    for mapping in mapped
+                    if str(mapping.get("answer_kind") or "").lower() == "answer_key"
+                    or str(mapping.get("source") or "").lower() == "answer_key"
+                ]
+            ),
+            "worked_solution_mapped_count": len(
+                [
+                    mapping
+                    for mapping in mapped
+                    if str(mapping.get("answer_kind") or "").lower() != "answer_key"
+                    and str(mapping.get("source") or "").lower() != "answer_key"
+                ]
+            ),
             "manual_review_count": manual_review_count,
             "stale_mapping_count": stale_mapping_count,
             "answer_source": answer_source,
@@ -161,6 +206,7 @@ class AnswerSolutionCoverageService:
             return source in {"manual_answer_segmentation", ""} or strategy in {"question_number", "region_order"}
         if answer_source == "upload":
             return source in {
+                "answer_key",
                 "answer_sheet",
                 "answer_sheet_full_ocr",
                 "upload",
@@ -168,6 +214,7 @@ class AnswerSolutionCoverageService:
                 "manual_answer_segmentation",
                 "",
             } or strategy in {
+                "answer_key",
                 "answer_number",
                 "document_order",
                 "gpt_vision_mapper",
@@ -177,7 +224,7 @@ class AnswerSolutionCoverageService:
         return False
 
     def _mapping_question_id(self, mapping: Dict[str, Any]) -> str:
-        return str(mapping.get("question_id") or mapping.get("question_region_id") or "").strip()
+        return mapping_question_id(mapping)
 
     def _processing_pending(self, *, document: Dict[str, Any], answer_source: str) -> bool:
         if answer_source == "generated":
