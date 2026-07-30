@@ -23,6 +23,9 @@ CURRENT_PCR_PIPELINE_VERSION = 2
 FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
+PROCESSING_MAX_AUTOMATIC_ATTEMPTS = 4
+PROCESSING_RETRY_BASE_SECONDS = 60
+PROCESSING_RETRY_MAX_SECONDS = 15 * 60
 # A live worker renews ``updated_at`` every heartbeat. Waiting for the full
 # 30-minute ownership lease after a process crash leaves the UI stuck on
 # "Checking" even though no worker exists. Three missed heartbeats provide a
@@ -277,8 +280,16 @@ async def dispatch_processing_job(
         tenant_db,
         str(job.get("exam_id") or ""),
     )
+    queue_filter: Dict[str, Any] = {
+        "job_id": job["job_id"],
+        "status": status,
+    }
+    if job.get("enqueue_attempted_at") is None:
+        queue_filter["enqueue_attempted_at"] = {"$exists": False}
+    else:
+        queue_filter["enqueue_attempted_at"] = job["enqueue_attempted_at"]
     queued = await jobs.update_one(
-        {"job_id": job["job_id"], "status": {"$ne": "processing"}},
+        queue_filter,
         {
             "$set": {
                 "status": "queued",
@@ -288,7 +299,8 @@ async def dispatch_processing_job(
                 "enqueue_attempted_at": now,
                 "updated_at": now,
                 "last_error": None,
-            }
+            },
+            "$unset": {"next_retry_at": ""},
         },
     )
     if not queued.matched_count:
@@ -460,6 +472,7 @@ async def reprocess_processing_job(
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
                 "mapping_pipeline_version": "full-document-visual-v2",
+                "attempts": 0,
                 "updated_at": now,
             },
             "$unset": {
@@ -467,6 +480,8 @@ async def reprocess_processing_job(
                 "started_at": "",
                 "lease_token": "",
                 "lease_expires_at": "",
+                "next_retry_at": "",
+                "failure_code": "",
             },
             "$inc": {"reprocess_count": 1},
             "$push": {"reprocess_history": {"$each": [history_entry], "$slice": -20}},
@@ -507,14 +522,57 @@ async def recover_stale_processing_jobs(
     heartbeat_stale_before = recovered_at - timedelta(
         seconds=PROCESSING_HEARTBEAT_STALE_SECONDS
     )
-    stale_result = await jobs.update_many(
+    stale_predicates: List[Dict[str, Any]] = [
+        {"status": "processing"},
         {
-            "status": "processing",
             "$or": [
                 {"lease_expires_at": {"$lte": recovered_at}},
                 {"updated_at": {"$lt": heartbeat_stale_before}},
                 {"updated_at": {"$exists": False}},
-            ],
+            ]
+        },
+    ]
+    exhausted_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                {"attempts": {"$gte": PROCESSING_MAX_AUTOMATIC_ATTEMPTS}},
+            ]
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "last_error": (
+                    "Processing worker heartbeat stopped and the automatic retry "
+                    "budget was exhausted"
+                ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "stale_worker_recovered_at": recovered_at,
+                "finished_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "next_retry_at": "",
+            },
+        },
+    )
+    retry_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                {
+                    "$or": [
+                        {
+                            "attempts": {
+                                "$lt": PROCESSING_MAX_AUTOMATIC_ATTEMPTS
+                            }
+                        },
+                        {"attempts": {"$exists": False}},
+                    ]
+                },
+            ]
         },
         {
             "$set": {
@@ -522,13 +580,47 @@ async def recover_stale_processing_jobs(
                 "last_error": (
                     "Processing worker heartbeat stopped; queued for automatic recovery"
                 ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "next_retry_at": recovered_at
+                + timedelta(seconds=PROCESSING_RETRY_BASE_SECONDS),
                 "stale_worker_recovered_at": recovered_at,
                 "updated_at": recovered_at,
             },
-            "$unset": {"lease_token": "", "lease_expires_at": ""},
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
         },
     )
-    return int(stale_result.modified_count)
+    # Malformed legacy attempt counters must fail closed instead of producing an
+    # unbounded crash/reclaim loop. Valid numeric rows were consumed above.
+    malformed_result = await jobs.update_many(
+        {"$and": stale_predicates},
+        {
+            "$set": {
+                "status": "failed",
+                "last_error": (
+                    "Processing worker heartbeat stopped and its retry counter "
+                    "is invalid"
+                ),
+                "failure_code": "InvalidProcessingAttemptCounter",
+                "stale_worker_recovered_at": recovered_at,
+                "finished_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "next_retry_at": "",
+            },
+        },
+    )
+    return int(
+        exhausted_result.modified_count
+        + retry_result.modified_count
+        + malformed_result.modified_count
+    )
 
 
 async def reconcile_processing_jobs(
@@ -557,9 +649,19 @@ async def reconcile_processing_jobs(
     cursor = jobs.find(
         {
             "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
-            "$or": [
-                {"enqueue_attempted_at": {"$exists": False}},
-                {"enqueue_attempted_at": {"$lt": retry_after}},
+            "$and": [
+                {
+                    "$or": [
+                        {"enqueue_attempted_at": {"$exists": False}},
+                        {"enqueue_attempted_at": {"$lt": retry_after}},
+                    ]
+                },
+                {
+                    "$or": [
+                        {"next_retry_at": {"$exists": False}},
+                        {"next_retry_at": {"$lte": now}},
+                    ]
+                },
             ],
         }
     ).sort("updated_at", 1)
@@ -594,6 +696,11 @@ async def _claim_job(
     claim_filter: Dict[str, Any] = {
         "job_id": job_id,
         "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
+        "$or": [
+            {"next_retry_at": {"$exists": False}},
+            {"next_retry_at": None},
+            {"next_retry_at": {"$lte": now}},
+        ],
     }
     if required_pipeline_version is not None:
         claim_filter["pipeline_version"] = int(required_pipeline_version)
@@ -678,9 +785,10 @@ async def process_pcr_processing_job(
 ) -> Dict[str, Any]:
     """Run OCR/segmentation/evaluation for one persisted PCR job.
 
-    Exceptions from transient infrastructure are allowed to reach Celery so it
-    can retry.  Expected content-quality failures are persisted as a terminal
-    ``failed`` job for teacher/admin action rather than retried indefinitely.
+    Exceptions reach the worker boundary, which records them through the
+    lease-fenced durable retry scheduler. Deterministic failures become
+    terminal; transient failures are redelivered only when ``next_retry_at`` is
+    due and only within the global attempt budget.
     """
     job = await _claim_job(
         tenant_db,
@@ -1332,6 +1440,94 @@ async def mark_processing_job_retryable_error(
         },
     )
     return result.matched_count == 1
+
+
+async def record_processing_job_failure(
+    tenant_db: Any,
+    job_id: str,
+    error: Exception | str,
+    *,
+    expected_lease_token: str,
+) -> Dict[str, Any]:
+    """Persist one worker failure and let MongoDB own bounded retry scheduling.
+
+    Celery delivery is at-least-once, so mixing ``self.retry`` with the durable
+    reconciler creates parallel retry chains. This function records exactly one
+    next attempt behind the worker lease fence. Deterministic errors may opt out
+    of retries with ``retryable = False`` on their exception class.
+    """
+
+    jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
+    query: Dict[str, Any] = {
+        "job_id": job_id,
+        "status": "processing",
+        "lease_token": str(expected_lease_token),
+    }
+    job = await jobs.find_one(query)
+    if job is None:
+        return {
+            "recorded": False,
+            "terminal": False,
+            "status": "lease_lost",
+        }
+
+    try:
+        attempts = max(1, int(job.get("attempts") or 1))
+    except (TypeError, ValueError):
+        attempts = PROCESSING_MAX_AUTOMATIC_ATTEMPTS
+    retryable = bool(getattr(error, "retryable", True))
+    terminal = not retryable or attempts >= PROCESSING_MAX_AUTOMATIC_ATTEMPTS
+    now = _now()
+    error_text = _short_error(error)
+    failure_code = type(error).__name__
+
+    if terminal:
+        update: Dict[str, Any] = {
+            "$set": {
+                "status": "failed",
+                "last_error": error_text,
+                "failure_code": failure_code,
+                "finished_at": now,
+                "updated_at": now,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "next_retry_at": "",
+            },
+        }
+        status = "failed"
+        next_retry_at = None
+    else:
+        retry_delay = min(
+            PROCESSING_RETRY_MAX_SECONDS,
+            PROCESSING_RETRY_BASE_SECONDS * (2 ** (attempts - 1)),
+        )
+        next_retry_at = now + timedelta(seconds=retry_delay)
+        update = {
+            "$set": {
+                "status": "retryable_error",
+                "last_error": error_text,
+                "failure_code": failure_code,
+                "next_retry_at": next_retry_at,
+                "updated_at": now,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
+        }
+        status = "retryable_error"
+
+    result = await jobs.update_one(query, update)
+    return {
+        "recorded": result.matched_count == 1,
+        "terminal": terminal,
+        "status": status if result.matched_count == 1 else "lease_lost",
+        "attempts": attempts,
+        "next_retry_at": next_retry_at,
+    }
 
 
 async def mark_processing_job_failed(

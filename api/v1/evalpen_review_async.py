@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
@@ -280,6 +280,8 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
+    processing_retry_at: Optional[str] = None
+    processing_attempts: int = 0
     # ``available`` means all materialized evaluations can be displayed. A
     # separate review_state/readiness gate still prevents unsafe publication;
     # ``processing`` and ``unavailable`` must never render as a final zero.
@@ -646,7 +648,6 @@ async def get_submission_summary(
         _pcr_storage = load_exampen("pcr.storage")
         SubmissionRepository = _pcr_storage.SubmissionRepository
         DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
-        EvaluationRepository = _pcr_storage.EvaluationRepository
 
         # Fetch submission
         sub_repo = SubmissionRepository(tenant_db)
@@ -684,11 +685,27 @@ async def get_submission_summary(
             if isinstance(processing_job, dict) and processing_job.get("last_error")
             else None
         )
-        processing_failed = segmentation_status == "failed" or processing_status in {
-            "failed",
-            "retryable_error",
-            "enqueue_failed",
-        }
+        processing_retry_at = (
+            _dt_to_iso(processing_job.get("next_retry_at"))
+            if isinstance(processing_job, dict)
+            and processing_job.get("next_retry_at") is not None
+            else None
+        )
+        try:
+            processing_attempts = max(
+                0, int((processing_job or {}).get("attempts") or 0)
+            )
+        except (TypeError, ValueError):
+            processing_attempts = 0
+        retry_scheduled = (
+            processing_status == "retryable_error" and bool(processing_retry_at)
+        )
+        processing_active = processing_status in {"queued", "processing"} or retry_scheduled
+        processing_failed = (
+            (segmentation_status == "failed" and not processing_active)
+            or processing_status in {"failed", "enqueue_failed"}
+            or (processing_status == "retryable_error" and not retry_scheduled)
+        )
         question_catalog = await _get_pcr_question_catalog(
             tenant_db,
             str(sub_dict.get("exam_id") or ""),
@@ -930,7 +947,7 @@ async def get_submission_summary(
         # A missing response row is not proof that the student skipped the
         # question.  Keep the missing state explicit and blocking until the
         # document mapper or a teacher records evidence-backed absence.
-        if question_catalog and not processing_failed:
+        if question_catalog and not processing_failed and not processing_active:
             for question in question_catalog:
                 question_id = question["question_id"]
                 if question_id in observed_question_ids:
@@ -959,7 +976,7 @@ async def get_submission_summary(
         # publication; they must not hide already-materialized marks.
         if processing_failed:
             score_state = "unavailable"
-        elif segmentation_status != "complete" or pending_count > 0:
+        elif processing_active or segmentation_status != "complete" or pending_count > 0:
             score_state = "processing"
         else:
             score_state = "available"
@@ -974,7 +991,7 @@ async def get_submission_summary(
         # reprocess write; it must never hide a current blocker.
         review_state = (
             "blocked"
-            if processing_failed or blocked_count
+            if processing_failed or (blocked_count and score_state != "processing")
             else "processing"
             if score_state == "processing"
             else "needs_review"
@@ -1008,6 +1025,8 @@ async def get_submission_summary(
             segmentation_status=segmentation_status,
             processing_status=processing_status,
             processing_error=processing_error,
+            processing_retry_at=processing_retry_at,
+            processing_attempts=processing_attempts,
             score_state=score_state,
             publication_status=sub_dict.get("publication_status"),
             question_catalog=question_catalog,

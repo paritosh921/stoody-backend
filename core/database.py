@@ -350,14 +350,11 @@ class DatabaseManager:
                 name="uniq_tutors_tutor_id"
             )
 
-            # Note classification indexes
+            # Note classification lookup indexes. The legacy unique page index
+            # omitted ``copy_id`` and is incompatible with multiple copies of
+            # the same notebook page. Do not recreate it here: the copy-aware
+            # unique index is migrated below once every row has ``copy_id``.
             note_cls = db["note_classifications"]
-            await self._ensure_index_with_spec_check(
-                note_cls,
-                [("user_id", 1), ("pen_mac", 1), ("book_type", 1), ("page_number", 1)],
-                unique=True,
-                name="uniq_note_page"
-            )
             await self._ensure_index_with_spec_check(
                 note_cls,
                 [("user_id", 1), ("subject", 1)],

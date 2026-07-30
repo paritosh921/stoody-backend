@@ -160,12 +160,74 @@ async def test_inline_processor_recovers_stalled_processing_job_and_retries_it()
         "services.exampen_inline_processor.process_pcr_processing_job",
         new=fake_process,
     ):
-        assert await processor.run_once() == 1
+        # Recovery persists a short backoff first; it must not immediately
+        # reclaim the same crashed job in the recovery pass.
+        assert await processor.run_once() == 0
         await asyncio.sleep(0)
 
-    assert called == ["JOB-stalled"]
+    assert called == []
     recovered = await tenant_db["exampen_processing_jobs"].find_one(
         {"job_id": "JOB-stalled"}
     )
     assert recovered["status"] == "retryable_error"
     assert "lease_token" not in recovered
+    retry_at = recovered["next_retry_at"]
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    assert retry_at > now
+
+
+@pytest.mark.asyncio
+async def test_inline_processor_honors_durable_retry_schedule():
+    from services.exampen_inline_processor import InlinePCRProcessor
+
+    master_db = _database("skb_master")
+    tenant_db = _database("skb_test")
+    await master_db["tenants"].insert_one({"status": "active", "db_name": "skb_test"})
+    await tenant_db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-delayed",
+            "submission_id": "SUB-delayed",
+            "status": "retryable_error",
+            "next_retry_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+    )
+    called: list[str] = []
+
+    async def fake_process(
+        _db,
+        job_id: str,
+        *,
+        execution_token: str,
+        required_pipeline_version: int,
+    ):
+        assert execution_token.startswith("inline:")
+        assert required_pipeline_version == 2
+        called.append(job_id)
+        return {"job_id": job_id, "status": "completed"}
+
+    processor = InlinePCRProcessor(
+        _DbManager(master_db, {"skb_test": tenant_db}),
+        poll_seconds=1,
+        concurrency=1,
+    )
+
+    with patch(
+        "services.exampen_inline_processor.process_pcr_processing_job",
+        new=fake_process,
+    ):
+        assert await processor.run_once() == 0
+        assert called == []
+        await tenant_db["exampen_processing_jobs"].update_one(
+            {"job_id": "JOB-delayed"},
+            {
+                "$set": {
+                    "next_retry_at": datetime.now(timezone.utc)
+                    - timedelta(seconds=1)
+                }
+            },
+        )
+        assert await processor.run_once() == 1
+        await asyncio.sleep(0)
+
+    assert called == ["JOB-delayed"]

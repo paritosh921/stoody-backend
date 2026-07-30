@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -353,6 +354,60 @@ async def test_failed_ocr_does_not_look_like_a_zero_mark_blank_paper():
     assert result.responses == []
     assert result.evaluated_count == 0
     assert result.total_max_score == 12.0
+
+
+@pytest.mark.asyncio
+async def test_scheduled_retry_remains_processing_without_fake_missing_answers():
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    retry_at = datetime.now(timezone.utc) + timedelta(minutes=2)
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-RETRY-SCHEDULED",
+            "exam_id": "EXAM-RETRY-SCHEDULED",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "pending",
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-RETRY-SCHEDULED::Q-1",
+            "exam_id": "EXAM-RETRY-SCHEDULED",
+            "question_number": 1,
+            "max_marks": 4,
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "submission_id": "SUB-RETRY-SCHEDULED",
+            "status": "retryable_error",
+            "attempts": 2,
+            "next_retry_at": retry_at,
+            "last_error": "Temporary provider timeout",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-RETRY-SCHEDULED",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.score_state == "processing"
+    assert result.review_state == "processing"
+    assert result.processing_status == "retryable_error"
+    assert result.processing_attempts == 2
+    assert result.processing_retry_at is not None
+    assert result.responses == []
 
 
 @pytest.mark.asyncio

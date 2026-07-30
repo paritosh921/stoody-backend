@@ -175,49 +175,39 @@ def process_exampen_pcr_submission(
         if tenant_db is None:
             raise RuntimeError(f"Tenant database {db_name} is not available")
 
-        from services.exampen_workflow import process_pcr_processing_job
-
-        return await process_pcr_processing_job(
-            tenant_db,
-            job_id,
-            execution_token=execution_token,
-            required_pipeline_version=required_pipeline_version,
+        from services.exampen_workflow import (
+            process_pcr_processing_job,
+            record_processing_job_failure,
         )
 
-    async def _record_error(exc: Exception, terminal: bool) -> None:
         try:
-            db_mgr = DatabaseManager()
-            await db_mgr.initialize()
-            tenant_db = await db_mgr.get_tenant_db(db_name)
-            if tenant_db is None:
-                return
-            from services.exampen_workflow import (
-                mark_processing_job_failed,
-                mark_processing_job_retryable_error,
+            return await process_pcr_processing_job(
+                tenant_db,
+                job_id,
+                execution_token=execution_token,
+                required_pipeline_version=required_pipeline_version,
             )
-            if terminal:
-                await mark_processing_job_failed(
-                    tenant_db,
-                    job_id,
-                    exc,
-                    expected_lease_token=execution_token,
-                )
-            else:
-                await mark_processing_job_retryable_error(
-                    tenant_db,
-                    job_id,
-                    exc,
-                    expected_lease_token=execution_token,
-                )
-        except Exception:
-            logger.exception("Unable to record PCR processing failure for job %s", job_id)
+        except Exception as exc:
+            logger.exception("PCR processing task failed for job %s", job_id)
+            failure = await record_processing_job_failure(
+                tenant_db,
+                job_id,
+                exc,
+                expected_lease_token=execution_token,
+            )
+            return {
+                "job_id": job_id,
+                "status": failure.get("status") or "failed",
+                "terminal": bool(failure.get("terminal")),
+                "attempts": failure.get("attempts"),
+                "error": str(exc),
+            }
 
     try:
         return asyncio.run(_run())
     except Exception as exc:
-        terminal = self.request.retries >= self.max_retries
-        logger.exception("PCR processing task failed for job %s (terminal=%s)", job_id, terminal)
-        asyncio.run(_record_error(exc, terminal))
-        if terminal:
-            return {"job_id": job_id, "status": "failed", "error": str(exc)}
+        # Only infrastructure failures that prevented durable job-state access
+        # use Celery's transport retry. Once the tenant job is available, MongoDB
+        # is the single retry authority and the periodic reconciler redelivers it.
+        logger.exception("PCR worker infrastructure failed before job state was recorded")
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))

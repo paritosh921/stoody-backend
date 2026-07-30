@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -286,6 +287,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
     assert stored["mapping_pipeline_version"] == "full-document-visual-v2"
+    assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
     assert stored["reprocess_history"] == [
@@ -398,6 +400,239 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
 
 
 @pytest.mark.asyncio
+async def test_failure_record_schedules_one_bounded_durable_retry():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        record_processing_job_failure,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    now = datetime.now(timezone.utc)
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-retry",
+            "submission_id": "SUB-retry",
+            "status": "processing",
+            "attempts": 1,
+            "lease_token": "worker-one",
+            "lease_expires_at": now + timedelta(minutes=20),
+        }
+    )
+
+    result = await record_processing_job_failure(
+        db,
+        "pcr-job-retry",
+        RuntimeError("temporary provider outage"),
+        expected_lease_token="worker-one",
+    )
+
+    assert result["recorded"] is True
+    assert result["terminal"] is False
+    assert result["status"] == "retryable_error"
+    stored = await jobs.find_one({"job_id": "pcr-job-retry"})
+    assert stored["status"] == "retryable_error"
+    assert stored["failure_code"] == "RuntimeError"
+    assert "lease_token" not in stored
+    retry_at = stored["next_retry_at"]
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    assert 55 <= (retry_at - now).total_seconds() <= 65
+
+
+@pytest.mark.asyncio
+async def test_failure_record_stops_after_global_attempt_budget():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        PROCESSING_MAX_AUTOMATIC_ATTEMPTS,
+        record_processing_job_failure,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-exhausted",
+            "submission_id": "SUB-exhausted",
+            "status": "processing",
+            "attempts": PROCESSING_MAX_AUTOMATIC_ATTEMPTS,
+            "lease_token": "worker-final",
+        }
+    )
+
+    result = await record_processing_job_failure(
+        db,
+        "pcr-job-exhausted",
+        RuntimeError("provider remains unavailable"),
+        expected_lease_token="worker-final",
+    )
+
+    assert result["recorded"] is True
+    assert result["terminal"] is True
+    stored = await jobs.find_one({"job_id": "pcr-job-exhausted"})
+    assert stored["status"] == "failed"
+    assert "next_retry_at" not in stored
+    assert "finished_at" in stored
+
+
+@pytest.mark.asyncio
+async def test_deterministic_failure_is_not_retried():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        record_processing_job_failure,
+    )
+
+    class _DeterministicError(RuntimeError):
+        retryable = False
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-permanent",
+            "submission_id": "SUB-permanent",
+            "status": "processing",
+            "attempts": 1,
+            "lease_token": "worker-one",
+        }
+    )
+
+    result = await record_processing_job_failure(
+        db,
+        "pcr-job-permanent",
+        _DeterministicError("identity conflict"),
+        expected_lease_token="worker-one",
+    )
+
+    assert result["terminal"] is True
+    stored = await jobs.find_one({"job_id": "pcr-job-permanent"})
+    assert stored["status"] == "failed"
+    assert stored["failure_code"] == "_DeterministicError"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_reserves_job_once(monkeypatch):
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        dispatch_processing_job,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    job = {
+        "job_id": "pcr-job-dispatch-once",
+        "submission_id": "SUB-dispatch-once",
+        "status": "queued",
+    }
+    await jobs.insert_one(job)
+    task = _RecordedTask()
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=task),
+    )
+    monkeypatch.setattr(
+        "services.exampen_workflow._celery_broker_available",
+        lambda: True,
+    )
+
+    await asyncio.gather(
+        dispatch_processing_job(db, db_name="skb_test", job=dict(job)),
+        dispatch_processing_job(db, db_name="skb_test", job=dict(job)),
+    )
+
+    assert task.calls == [("skb_test", "pcr-job-dispatch-once", 2)]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_dispatches_only_due_retries(monkeypatch):
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        reconcile_processing_jobs,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    now = datetime.now(timezone.utc)
+    await jobs.insert_many(
+        [
+            {
+                "job_id": "pcr-job-future",
+                "submission_id": "SUB-future",
+                "status": "retryable_error",
+                "enqueue_attempted_at": now - timedelta(minutes=10),
+                "next_retry_at": now + timedelta(minutes=5),
+                "updated_at": now,
+            },
+            {
+                "job_id": "pcr-job-due",
+                "submission_id": "SUB-due",
+                "status": "retryable_error",
+                "enqueue_attempted_at": now - timedelta(minutes=10),
+                "next_retry_at": now - timedelta(seconds=1),
+                "updated_at": now,
+            },
+        ]
+    )
+    task = _RecordedTask()
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=task),
+    )
+    monkeypatch.setattr(
+        "services.exampen_workflow._celery_broker_available",
+        lambda: True,
+    )
+
+    result = await reconcile_processing_jobs(db, db_name="skb_test")
+
+    assert result["pending"] == 1
+    assert task.calls == [("skb_test", "pcr-job-due", 2)]
+    future = await jobs.find_one({"job_id": "pcr-job-future"})
+    due = await jobs.find_one({"job_id": "pcr-job-due"})
+    assert future["status"] == "retryable_error"
+    assert due["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_worker_delivery_cannot_bypass_retry_schedule():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        process_pcr_processing_job,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-early-duplicate",
+            "submission_id": "SUB-early-duplicate",
+            "status": "retryable_error",
+            "attempts": 1,
+            "next_retry_at": retry_at,
+        }
+    )
+
+    result = await process_pcr_processing_job(db, "pcr-job-early-duplicate")
+
+    assert result == {
+        "job_id": "pcr-job-early-duplicate",
+        "status": "retryable_error",
+        "claimed": False,
+    }
+    stored = await jobs.find_one({"job_id": "pcr-job-early-duplicate"})
+    assert stored["status"] == "retryable_error"
+    assert stored["attempts"] == 1
+    saved_retry_at = stored["next_retry_at"]
+    if saved_retry_at.tzinfo is None:
+        saved_retry_at = saved_retry_at.replace(tzinfo=timezone.utc)
+    assert abs((saved_retry_at - retry_at).total_seconds()) < 0.01
+    assert "lease_token" not in stored
+
+
+@pytest.mark.asyncio
 async def test_automatic_recovery_uses_missing_heartbeats_without_reclaiming_live_worker():
     from services.exampen_workflow import (
         PROCESSING_HEARTBEAT_STALE_SECONDS,
@@ -445,9 +680,49 @@ async def test_automatic_recovery_uses_missing_heartbeats_without_reclaiming_liv
     assert abs((recovered_at - now).total_seconds()) < 0.01
     assert "lease_token" not in stalled
     assert "lease_expires_at" not in stalled
+    retry_at = stalled["next_retry_at"]
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    assert 55 <= (retry_at - now).total_seconds() <= 65
     live = await jobs.find_one({"job_id": "pcr-job-live"})
     assert live["status"] == "processing"
     assert live["lease_token"] == "live-worker"
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_recovery_honors_global_attempt_budget():
+    from services.exampen_workflow import (
+        PROCESSING_HEARTBEAT_STALE_SECONDS,
+        PROCESSING_JOBS_COLLECTION,
+        PROCESSING_MAX_AUTOMATIC_ATTEMPTS,
+        recover_stale_processing_jobs,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    now = datetime.now(timezone.utc)
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-stalled-exhausted",
+            "submission_id": "SUB-stalled-exhausted",
+            "status": "processing",
+            "attempts": PROCESSING_MAX_AUTOMATIC_ATTEMPTS,
+            "lease_token": "dead-final-worker",
+            "lease_expires_at": now + timedelta(minutes=20),
+            "updated_at": now
+            - timedelta(seconds=PROCESSING_HEARTBEAT_STALE_SECONDS + 1),
+        }
+    )
+
+    recovered = await recover_stale_processing_jobs(db, now=now)
+
+    assert recovered == 1
+    stored = await jobs.find_one({"job_id": "pcr-job-stalled-exhausted"})
+    assert stored["status"] == "failed"
+    assert stored["failure_code"] == "ProcessingWorkerHeartbeatExpired"
+    assert "retry budget was exhausted" in stored["last_error"]
+    assert "next_retry_at" not in stored
+    assert "lease_token" not in stored
 
 
 @pytest.mark.asyncio

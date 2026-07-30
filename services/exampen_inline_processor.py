@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import datetime, timezone
 from time import monotonic
 from typing import Any
 
@@ -20,8 +21,8 @@ from services.exampen_workflow import (
     CURRENT_PCR_PIPELINE_VERSION,
     DISPATCHABLE_JOB_STATUSES,
     PROCESSING_JOBS_COLLECTION,
-    mark_processing_job_retryable_error,
     process_pcr_processing_job,
+    record_processing_job_failure,
     recover_stale_processing_jobs,
 )
 
@@ -131,8 +132,15 @@ class InlinePCRProcessor:
                     db_name,
                 )
 
+            now = datetime.now(timezone.utc)
             cursor = tenant_db[PROCESSING_JOBS_COLLECTION].find(
-                {"status": {"$in": list(DISPATCHABLE_JOB_STATUSES)}},
+                {
+                    "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
+                    "$or": [
+                        {"next_retry_at": {"$exists": False}},
+                        {"next_retry_at": {"$lte": now}},
+                    ],
+                },
                 {"job_id": 1},
             ).sort("updated_at", 1).limit(available_slots)
             jobs = await cursor.to_list(length=available_slots)
@@ -184,12 +192,18 @@ class InlinePCRProcessor:
                 raise
             except Exception as exc:
                 logger.exception("Inline PCR processing failed for job %s", job_id)
+                failure: dict[str, Any] = {}
                 try:
-                    await mark_processing_job_retryable_error(
+                    failure = await record_processing_job_failure(
                         tenant_db,
                         job_id,
                         exc,
                         expected_lease_token=execution_token,
                     )
                 finally:
-                    self._retry_not_before[key] = monotonic() + self._retry_delay_seconds
+                    if not failure.get("terminal"):
+                        self._retry_not_before[key] = (
+                            monotonic() + self._retry_delay_seconds
+                        )
+                    else:
+                        self._retry_not_before.pop(key, None)

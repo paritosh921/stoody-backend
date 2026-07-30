@@ -91,6 +91,12 @@ class FullDocumentGradingError(RuntimeError):
     """Raised when the primary document request cannot be completed safely."""
 
 
+class GradingRunIdentityError(FullDocumentGradingError):
+    """Raised for a deterministic grading-run ownership or identity conflict."""
+
+    retryable = False
+
+
 @dataclass
 class FullDocumentGradingResult:
     handled: bool
@@ -343,51 +349,75 @@ class FullDocumentGradingService:
             hashlib.sha256(solution_bytes).hexdigest() if solution_bytes else None
         )
 
-        grading_revision = await _materialization_revision(
+        generation_revision = await _materialization_revision(
             self._db,
             submission_id,
         )
         prior_revision_run = await self._db[_RUNS_COLLECTION].find_one(
             {
                 "submission_id": submission_id,
-                "grading_revision": grading_revision,
                 "prompt_version": prompt_version,
-            }
+                "$or": [
+                    {"generation_revision": generation_revision},
+                    {"grading_revision": generation_revision},
+                ],
+            },
+            sort=[("updated_at", -1), ("created_at", -1)],
         )
         if prior_revision_run:
             # Resume the exact technical run that already owns this revision.
             # This also remains stable when the first provider response froze a
             # dated model snapshot for subsequent students in the cohort.
-            input_fingerprint = str(
-                prior_revision_run.get("input_fingerprint") or ""
-            )
             run_id = str(prior_revision_run.get("run_id") or "")
             model_id = str(
                 prior_revision_run.get("requested_model_id") or model_id
             )
-            if not input_fingerprint or not run_id:
-                raise FullDocumentGradingError(
+            if not run_id:
+                raise GradingRunIdentityError(
                     "Saved submission grading run is missing its immutable identity"
                 )
-        else:
-            input_fingerprint = _input_fingerprint(
+        input_fingerprint = _input_fingerprint(
+            submission_id=submission_id,
+            exam=exam,
+            answer_pages=answer_pages,
+            questions=questions,
+            model_id=model_id,
+            paper_hash=paper_file_hash,
+            solution_hash=solution_file_hash,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            prompt_version=prompt_version,
+        )
+        generation_fingerprint = _generation_fingerprint(
+            submission_id=submission_id,
+            input_fingerprint=input_fingerprint,
+            generation_revision=generation_revision,
+        )
+        if prior_revision_run:
+            _assert_run_identity(
+                prior_revision_run,
                 submission_id=submission_id,
-                exam=exam,
-                answer_pages=answer_pages,
-                questions=questions,
-                model_id=model_id,
-                paper_hash=paper_file_hash,
-                solution_hash=solution_file_hash,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                prompt_version=prompt_version,
+                input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
+                generation_revision=generation_revision,
+                allow_legacy_generation_fingerprint=True,
             )
-            run_id = f"DOCGR-{input_fingerprint[:24]}"
-        materialization_id = f"{run_id}:r{grading_revision}"
+        else:
+            run_id = f"DOCGR-{generation_fingerprint[:24]}"
+        materialization_id = f"{run_id}:r{generation_revision}"
         await self._db[_RUNS_COLLECTION].create_index(
             "run_id", unique=True, name="uniq_document_grading_run"
         )
         existing_run = await self._db[_RUNS_COLLECTION].find_one({"run_id": run_id})
+        if existing_run:
+            _assert_run_identity(
+                existing_run,
+                submission_id=submission_id,
+                input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
+                generation_revision=generation_revision,
+                allow_legacy_generation_fingerprint=True,
+            )
         resumed_grading_run = False
         if existing_run and existing_run.get("status") == "completed":
             active_count = await self._db["evalpen_detected_responses"].count_documents(
@@ -410,10 +440,11 @@ class FullDocumentGradingService:
                 self._db,
                 run_id=run_id,
                 input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
                 submission_id=submission_id,
                 student_id=student_id,
                 exam_id=exam_id,
-                grading_revision=grading_revision,
+                generation_revision=generation_revision,
                 requested_model_id=model_id,
                 page_count=len(answer_pages),
                 prompt_version=prompt_version,
@@ -1340,20 +1371,23 @@ async def _claim_or_wait_for_run(
     *,
     run_id: str,
     input_fingerprint: str,
+    generation_fingerprint: str,
     submission_id: str,
     student_id: str,
     exam_id: str,
-    grading_revision: int,
+    generation_revision: int,
     requested_model_id: str,
     page_count: int,
     prompt_version: str,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Single-flight technical retries for one submission grading revision.
+    """Single-flight technical retries for one submission grading generation.
 
-    ``run_id`` is submission- and revision-scoped.  Another student's upload,
+    ``run_id`` is submission- and generation-scoped. Another student's upload,
     even when its bytes are identical, therefore cannot join or reuse this
-    run.  The lease only prevents duplicate paid calls when workers race on
-    the same immutable job revision.
+    run. Automatic worker retries keep the same generation; an explicit
+    operator reprocess increments it and intentionally creates a fresh model
+    interpretation. The lease prevents duplicate paid calls when workers race
+    on the same immutable generation.
     """
 
     now = datetime.now(timezone.utc)
@@ -1361,16 +1395,14 @@ async def _claim_or_wait_for_run(
     lease_expires_at = now + timedelta(minutes=15)
     collection = tenant_db[_RUNS_COLLECTION]
     existing = await collection.find_one({"run_id": run_id})
-    try:
-        existing_revision = int((existing or {}).get("grading_revision") or 0)
-    except (TypeError, ValueError):
-        existing_revision = -1
-    if existing is not None and (
-        str(existing.get("submission_id") or "") != submission_id
-        or existing_revision != grading_revision
-    ):
-        raise FullDocumentGradingError(
-            "Submission grading run ownership does not match the requested revision"
+    if existing is not None:
+        _assert_run_identity(
+            existing,
+            submission_id=submission_id,
+            input_fingerprint=input_fingerprint,
+            generation_fingerprint=generation_fingerprint,
+            generation_revision=generation_revision,
+            allow_legacy_generation_fingerprint=True,
         )
 
     if existing is None:
@@ -1383,10 +1415,12 @@ async def _claim_or_wait_for_run(
                         "submission_id": submission_id,
                         "student_id": student_id,
                         "exam_id": exam_id,
-                        "grading_revision": grading_revision,
+                        "grading_revision": generation_revision,
+                        "generation_revision": generation_revision,
                         "prompt_version": prompt_version,
                         "requested_model_id": requested_model_id,
                         "input_fingerprint": input_fingerprint,
+                        "generation_fingerprint": generation_fingerprint,
                         "page_count": page_count,
                         "status": "generating",
                         "generation_lease_token": lease_token,
@@ -1418,6 +1452,9 @@ async def _claim_or_wait_for_run(
             {
                 "$set": {
                     "status": "generating",
+                    "grading_revision": generation_revision,
+                    "generation_revision": generation_revision,
+                    "generation_fingerprint": generation_fingerprint,
                     "generation_lease_token": lease_token,
                     "generation_lease_expires_at": lease_expires_at,
                     "generation_error": None,
@@ -1438,6 +1475,15 @@ async def _claim_or_wait_for_run(
     deadline = asyncio.get_running_loop().time() + wait_seconds
     while True:
         existing = await collection.find_one({"run_id": run_id})
+        if existing is not None:
+            _assert_run_identity(
+                existing,
+                submission_id=submission_id,
+                input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
+                generation_revision=generation_revision,
+                allow_legacy_generation_fingerprint=True,
+            )
         if existing and existing.get("status") in {
             "validated",
             "materializing",
@@ -1451,10 +1497,11 @@ async def _claim_or_wait_for_run(
                 tenant_db,
                 run_id=run_id,
                 input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
                 submission_id=submission_id,
                 student_id=student_id,
                 exam_id=exam_id,
-                grading_revision=grading_revision,
+                generation_revision=generation_revision,
                 requested_model_id=requested_model_id,
                 page_count=page_count,
                 prompt_version=prompt_version,
@@ -1467,13 +1514,62 @@ async def _claim_or_wait_for_run(
         await asyncio.sleep(0.5)
 
 
+def _run_generation_revision(run: Mapping[str, Any]) -> int:
+    raw_revision = run.get("generation_revision")
+    if raw_revision is None:
+        raw_revision = run.get("grading_revision")
+    try:
+        return max(0, int(raw_revision or 0))
+    except (TypeError, ValueError) as exc:
+        raise GradingRunIdentityError(
+            "Saved submission grading run has an invalid generation revision"
+        ) from exc
+
+
+def _assert_run_identity(
+    run: Mapping[str, Any],
+    *,
+    submission_id: str,
+    input_fingerprint: str,
+    generation_fingerprint: str,
+    generation_revision: int,
+    allow_legacy_generation_fingerprint: bool = False,
+) -> None:
+    """Fail closed before joining, reclaiming, or replaying a grading run."""
+
+    if str(run.get("submission_id") or "") != submission_id:
+        raise GradingRunIdentityError(
+            "Submission grading run ownership does not match the requested generation"
+        )
+    saved_input_fingerprint = str(run.get("input_fingerprint") or "")
+    if not saved_input_fingerprint or saved_input_fingerprint != input_fingerprint:
+        raise GradingRunIdentityError(
+            "Submission grading run input does not match the requested generation"
+        )
+    if _run_generation_revision(run) != generation_revision:
+        raise GradingRunIdentityError(
+            "Submission grading run revision does not match the requested generation"
+        )
+    saved_generation_fingerprint = str(
+        run.get("generation_fingerprint") or ""
+    )
+    if saved_generation_fingerprint:
+        if saved_generation_fingerprint != generation_fingerprint:
+            raise GradingRunIdentityError(
+                "Submission grading run identity does not match the requested generation"
+            )
+    elif not allow_legacy_generation_fingerprint:
+        raise GradingRunIdentityError(
+            "Saved submission grading run is missing its generation identity"
+        )
+
+
 async def _materialization_revision(tenant_db: Any, submission_id: str) -> int:
-    """Return a retry-stable grading revision for this submission job.
+    """Return a retry-stable grading generation for this submission job.
 
     Technical retries keep the same revision. An explicit reprocess increments
-    the materialization revision and creates new immutable response/evaluation
-    rows, but the model ledger is reused while the paper, rubric, model,
-    sampling contract, and student evidence remain byte-for-byte unchanged.
+    the generation and creates both a fresh model ledger and new immutable
+    response/evaluation rows. Previous completed generations remain untouched.
     """
 
     jobs = await tenant_db[_PROCESSING_JOBS_COLLECTION].find(
@@ -3514,9 +3610,8 @@ def _input_fingerprint(
         "version": prompt_version,
         "model": model_id,
         # Student grading output is never content-addressed across people. The
-        # immutable submission remains the ownership boundary. Reprocessing an
-        # unchanged copy rematerializes this same ledger instead of purchasing
-        # a new stochastic interpretation.
+        # immutable submission remains the ownership boundary. The separate
+        # generation fingerprint adds explicit operator reprocess intent.
         "submission_id": submission_id,
         "exam_id": exam.get("exam_id"),
         "paper_version_id": exam.get("paper_version_id"),
@@ -3535,6 +3630,25 @@ def _input_fingerprint(
             ]
             for page in answer_pages
         ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _generation_fingerprint(
+    *,
+    submission_id: str,
+    input_fingerprint: str,
+    generation_revision: int,
+) -> str:
+    """Derive one paid-call identity from immutable input plus operator intent."""
+
+    payload = {
+        "version": "pcr-grading-generation-v1",
+        "submission_id": submission_id,
+        "input_fingerprint": input_fingerprint,
+        "generation_revision": max(0, int(generation_revision)),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")

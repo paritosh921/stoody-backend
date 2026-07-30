@@ -1201,7 +1201,7 @@ async def test_same_submission_revision_retry_is_idempotent_after_model_freeze(
 
 
 @pytest.mark.asyncio
-async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
+async def test_explicit_reprocess_creates_fresh_generation_and_auditable_rows(
     monkeypatch,
 ):
     db = _fresh_db()
@@ -1250,8 +1250,9 @@ async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
 
     second = await service.grade_submission("SUB-DOC-1")
 
-    assert first.run_id == second.run_id
-    assert len(gate.calls) == 1
+    assert first.run_id != second.run_id
+    assert len(gate.calls) == 2
+    assert await db["evalpen_document_grading_runs"].count_documents({}) == 2
     active_rows = await db["evalpen_detected_responses"].find(
         {"submission_id": "SUB-DOC-1", "superseded_at": {"$exists": False}}
     ).to_list(length=10)
@@ -1269,7 +1270,224 @@ async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
     submission = await db["evalpen_submissions"].find_one(
         {"submission_id": "SUB-DOC-1"}
     )
-    assert submission["resumed_grading_run"] is True
+    assert submission["resumed_grading_run"] is False
+
+
+@pytest.mark.asyncio
+async def test_reprocess_does_not_collide_with_stale_previous_generation(
+    monkeypatch,
+):
+    """Regression: the SGTB rev-1 request must not join the stale rev-0 run."""
+
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "pcr-job-SUB-DOC-1",
+            "submission_id": "SUB-DOC-1",
+            "status": "completed",
+            "reprocess_count": 0,
+        }
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_student_copy_content",
+        lambda pages: _async_value(
+            ([{"type": "input_text", "text": "student page fixture"}], 100)
+        ),
+    )
+    gate = _FakeGate(
+        {
+            "document_review": _document_review(),
+            "questions": [_attempted_diagram(), _attempted_explanation()],
+        }
+    )
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    first = await service.grade_submission("SUB-DOC-1")
+    await db["evalpen_document_grading_runs"].update_one(
+        {"run_id": first.run_id},
+        {
+            "$set": {
+                "status": "generating",
+                "generation_lease_expires_at": module.datetime.now(
+                    module.timezone.utc
+                )
+                - module.timedelta(minutes=1),
+            },
+            "$unset": {
+                "validated_payload": "",
+                "raw_llm_response": "",
+                "result": "",
+            },
+        },
+    )
+    await db["exampen_processing_jobs"].update_one(
+        {"job_id": "pcr-job-SUB-DOC-1"},
+        {"$set": {"reprocess_count": 1}},
+    )
+
+    second = await service.grade_submission("SUB-DOC-1")
+
+    assert second.run_id != first.run_id
+    assert len(gate.calls) == 2
+    stale = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": first.run_id}
+    )
+    current = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": second.run_id}
+    )
+    assert stale["status"] == "generating"
+    assert stale["generation_revision"] == 0
+    assert current["status"] == "completed"
+    assert current["generation_revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_workers_share_one_generation_call(monkeypatch):
+    db = _fresh_db()
+    await _seed(db)
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_student_copy_content",
+        lambda pages: _async_value(
+            ([{"type": "input_text", "text": "student page fixture"}], 100)
+        ),
+    )
+    gate = _SlowFakeGate(
+        {
+            "document_review": _document_review(),
+            "questions": [_attempted_diagram(), _attempted_explanation()],
+        }
+    )
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    first, second = await asyncio.gather(
+        service.grade_submission("SUB-DOC-1"),
+        service.grade_submission("SUB-DOC-1"),
+    )
+
+    assert first.run_id == second.run_id
+    assert len(gate.calls) == 1
+    assert await db["evalpen_document_grading_runs"].count_documents({}) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_same_generation_run_is_atomically_reclaimed():
+    db = _fresh_db()
+    module = _module()
+    input_fingerprint = "a" * 64
+    generation_fingerprint = module._generation_fingerprint(
+        submission_id="SUB-DOC-1",
+        input_fingerprint=input_fingerprint,
+        generation_revision=2,
+    )
+    run_id = f"DOCGR-{generation_fingerprint[:24]}"
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": run_id,
+            "submission_id": "SUB-DOC-1",
+            "student_id": "STU-1",
+            "exam_id": "EXAM-DOC-1",
+            "grading_revision": 2,
+            "generation_revision": 2,
+            "input_fingerprint": input_fingerprint,
+            "generation_fingerprint": generation_fingerprint,
+            "status": "generating",
+            "generation_lease_token": "dead-worker",
+            "generation_lease_expires_at": module.datetime.now(module.timezone.utc)
+            - module.timedelta(minutes=1),
+        }
+    )
+
+    existing, lease_token = await module._claim_or_wait_for_run(
+        db,
+        run_id=run_id,
+        input_fingerprint=input_fingerprint,
+        generation_fingerprint=generation_fingerprint,
+        submission_id="SUB-DOC-1",
+        student_id="STU-1",
+        exam_id="EXAM-DOC-1",
+        generation_revision=2,
+        requested_model_id="gpt-5.1-2025-11-13",
+        page_count=1,
+        prompt_version="pcr-full-document-visual-v4",
+    )
+
+    assert existing is None
+    assert lease_token and lease_token != "dead-worker"
+    reclaimed = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": run_id}
+    )
+    assert reclaimed["status"] == "generating"
+    assert reclaimed["generation_lease_token"] == lease_token
+
+
+@pytest.mark.asyncio
+async def test_run_identity_collision_fails_closed_without_mutation():
+    db = _fresh_db()
+    module = _module()
+    input_fingerprint = "b" * 64
+    generation_fingerprint = module._generation_fingerprint(
+        submission_id="SUB-DOC-1",
+        input_fingerprint=input_fingerprint,
+        generation_revision=1,
+    )
+    run_id = f"DOCGR-{generation_fingerprint[:24]}"
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": run_id,
+            "submission_id": "OTHER-SUBMISSION",
+            "grading_revision": 1,
+            "generation_revision": 1,
+            "input_fingerprint": input_fingerprint,
+            "generation_fingerprint": generation_fingerprint,
+            "status": "completed",
+            "result": {"evaluated_count": 99},
+        }
+    )
+
+    with pytest.raises(module.GradingRunIdentityError):
+        await module._claim_or_wait_for_run(
+            db,
+            run_id=run_id,
+            input_fingerprint=input_fingerprint,
+            generation_fingerprint=generation_fingerprint,
+            submission_id="SUB-DOC-1",
+            student_id="STU-1",
+            exam_id="EXAM-DOC-1",
+            generation_revision=1,
+            requested_model_id="gpt-5.1-2025-11-13",
+            page_count=1,
+            prompt_version="pcr-full-document-visual-v4",
+        )
+
+    untouched = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": run_id}
+    )
+    assert untouched["submission_id"] == "OTHER-SUBMISSION"
+    assert untouched["status"] == "completed"
+    assert untouched["result"] == {"evaluated_count": 99}
 
 
 @pytest.mark.asyncio
