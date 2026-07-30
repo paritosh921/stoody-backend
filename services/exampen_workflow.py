@@ -471,7 +471,7 @@ async def reprocess_processing_job(
                 "reprocess_requested_at": now,
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": "full-document-visual-v2",
+                "mapping_pipeline_version": "full-document-rubric-v3",
                 "attempts": 0,
                 "updated_at": now,
             },

@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 
-EVIDENCE_GRAPH_VERSION = "pcr-multimodal-evidence-graph-v1"
+# The external prompt version remains stable for already-finalized cohorts.
+# This internal evidence version identifies the lean rubric-grading response
+# introduced without invalidating an in-progress exam's frozen model contract.
+EVIDENCE_GRAPH_VERSION = "pcr-multimodal-evidence-graph-v2"
 PROMPT_VERSION = "pcr-full-document-visual-v5"
 
 _CONTENT_TYPES = {"TEXT_ONLY", "MIXED", "DIAGRAM_HEAVY", "TABLE_PRESENT"}
@@ -159,74 +162,6 @@ def evidence_mapping_schema() -> Dict[str, Any]:
 
 
 def question_grading_schema() -> Dict[str, Any]:
-    hypothesis = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "interpretation_id": {"type": "string"},
-            "value": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_region_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "ambiguity_notes": {"type": "string"},
-        },
-        "required": [
-            "interpretation_id",
-            "value",
-            "confidence",
-            "evidence_region_ids",
-            "ambiguity_notes",
-        ],
-    }
-    element = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "element_id": {"type": "string"},
-            "element_type": {"type": "string"},
-            "label": {"type": "string"},
-            "region_id": {"type": "string"},
-            "attributes": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": [
-            "element_id",
-            "element_type",
-            "label",
-            "region_id",
-            "attributes",
-            "confidence",
-        ],
-    }
-    relationship = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "source_element_id": {"type": "string"},
-            "relation": {"type": "string"},
-            "target_element_id": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": [
-            "source_element_id",
-            "relation",
-            "target_element_id",
-            "confidence",
-        ],
-    }
-    visual_semantics = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "summary": {"type": "string"},
-            "elements": {"type": "array", "items": element},
-            "relationships": {"type": "array", "items": relationship},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": ["summary", "elements", "relationships", "confidence"],
-    }
     method_analysis = {
         "type": "object",
         "additionalProperties": False,
@@ -283,7 +218,7 @@ def question_grading_schema() -> Dict[str, Any]:
             "criterion_id": {"type": "string"},
             "decision": {
                 "type": "string",
-                "enum": ["met", "partially_met", "not_met", "unresolved"],
+                "enum": ["met", "partially_met", "not_met"],
             },
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "marks_awarded": {"type": "number", "minimum": 0},
@@ -300,7 +235,6 @@ def question_grading_schema() -> Dict[str, Any]:
                     "direct_evidence",
                     "error_carried_forward",
                     "no_credit",
-                    "unresolved",
                 ],
             },
         },
@@ -323,11 +257,6 @@ def question_grading_schema() -> Dict[str, Any]:
             "question_number": {"type": "integer", "minimum": 1},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "student_answer": {"type": "string"},
-            "interpretation_hypotheses": {
-                "type": "array",
-                "items": hypothesis,
-            },
-            "visual_semantics": visual_semantics,
             "method_analysis": method_analysis,
             "criterion_marks": {"type": "array", "items": criterion},
             "total_score": {"type": "number", "minimum": 0},
@@ -339,8 +268,6 @@ def question_grading_schema() -> Dict[str, Any]:
             "question_number",
             "confidence",
             "student_answer",
-            "interpretation_hypotheses",
-            "visual_semantics",
             "method_analysis",
             "criterion_marks",
             "total_score",
@@ -397,25 +324,27 @@ def grading_system_instructions() -> str:
         "You are the question-level visual examiner for a high-stakes handwritten "
         "exam. The evidence mapper has already fixed question ownership. Grade only "
         "the supplied high-resolution evidence crops, their surrounding page context, "
-        "and their stated region IDs against the immutable question, teacher solution, "
-        "and locked criteria. Full-page context is supplied to recover clipped symbols, "
+        "and their stated region IDs against the supplied immutable question catalog, "
+        "reference solution, and locked criteria. Full-page context is supplied to recover clipped symbols, "
         "final answers, and immediately adjacent continuation work belonging to the "
         "mapped answer; never borrow unrelated work from another question. "
         "Never use OCR text as the authority and never move evidence to another "
         "question. Read mathematical layout spatially: distinguish superscripts, "
         "fractions, roots, signs, matrices, and overwritten work. Evaluate diagrams "
-        "visually and describe their semantic elements and relationships: label-arrow "
-        "endpoints, biological structures, circuit topology, vector direction, graph "
-        "axes, chemical atoms/bonds/charges/stereochemistry, or other subject-specific "
-        "relations. Preserve plausible alternative readings in "
-        "interpretation_hypotheses. If a symbol or relation remains ambiguous, mark "
-        "the affected criterion unresolved instead of guessing. The teacher solution "
+        "visually. For a diagram criterion, describe the relevant label-arrow endpoint, "
+        "structure, circuit connection, vector direction, graph axis, chemical bond, "
+        "or other subject-specific relationship directly in that criterion's evidence "
+        "and rationale. The reference solution "
         "is a correctness anchor, not the only acceptable method. Equivalent methods "
         "and equivalent representations receive the same criterion decisions. Award "
         "step marks for valid visible work and apply error-carried-forward only when "
         "the locked policy permits it. Cite one or more supplied evidence_region_ids "
         "for every criterion decision, including zero. Return exactly one result for "
-        "each requested question and never exceed locked criterion maxima. For a "
+        "each requested question and never exceed locked criterion maxima. Make the "
+        "best evidence-supported provisional criterion decision even when handwriting "
+        "is imperfect; express genuine uncertainty with confidence, needs_review, and "
+        "review_reason instead of omitting the question or inventing extra metadata. "
+        "For a "
         "catalog question with grading_mode=objective, only read the selected option "
         "label from the fixed evidence crop and put that single label in "
         "student_answer. Return empty criterion_marks, total_score 0, and "
@@ -596,12 +525,10 @@ def merge_mapping_and_grading(
                     _confidence(grade.get("confidence")),
                 ),
                 "student_answer": str(grade.get("student_answer") or "").strip(),
-                "interpretation_hypotheses": list(
-                    grade.get("interpretation_hypotheses") or []
-                ),
-                "visual_semantics": dict(
-                    grade.get("visual_semantics") or _empty_visual_semantics()
-                ),
+                # Retain the legacy materialized fields for API compatibility.
+                # They are no longer model-generated scoring requirements.
+                "interpretation_hypotheses": [],
+                "visual_semantics": _empty_visual_semantics(),
                 "method_analysis": dict(grade.get("method_analysis") or {}),
                 "criterion_marks": list(grade.get("criterion_marks") or []),
                 "total_score": grade.get("total_score", 0),

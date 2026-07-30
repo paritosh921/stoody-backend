@@ -970,15 +970,14 @@ class FullDocumentGradingService:
             batch_numbers: List[int],
             *,
             batch_index: str,
-            budget_minimum: int = 8_000,
+            budget_minimum: int = 4_000,
         ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
             grading_input, crop_bytes = _build_question_grading_input(
-                static_content=static_content,
                 questions=batch_questions,
                 mappings=mapping.questions,
                 student_assets=student_assets,
             )
-            if len(paper_bytes) + len(solution_bytes or b"") + crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+            if crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
                 raise FullDocumentGradingError(
                     "Question-specific visual evidence exceeds the request size limit"
                 )
@@ -1040,34 +1039,12 @@ class FullDocumentGradingService:
                     continue
                 returned[str(number)] = dict(item)
             if unexpected_numbers or duplicate_numbers:
-                reasons: List[str] = []
-                if unexpected_numbers:
-                    reasons.append(
-                        "unexpected "
-                        + ", ".join(
-                            f"Q{number}" for number in sorted(unexpected_numbers)
-                        )
-                    )
-                if duplicate_numbers:
-                    reasons.append(
-                        "duplicate "
-                        + ", ".join(
-                            f"Q{number}" for number in sorted(duplicate_numbers)
-                        )
-                    )
-                raise QuestionVisualGraderContractError(
-                    "Question visual grader violated the requested batch: "
-                    + "; ".join(reasons),
-                    requested_numbers=sorted(allowed),
-                    returned_numbers=sorted(observed_numbers),
-                )
-            if set(map(int, returned)) != allowed:
-                missing = sorted(allowed - set(map(int, returned)))
-                raise QuestionVisualGraderContractError(
-                    "Question visual grader omitted requested question(s): "
-                    + ", ".join(f"Q{number}" for number in missing),
-                    requested_numbers=sorted(allowed),
-                    returned_numbers=sorted(observed_numbers),
+                logger.warning(
+                    "Question grader returned ignored IDs for batch %s: unexpected=%s "
+                    "duplicate=%s",
+                    batch_index,
+                    sorted(unexpected_numbers),
+                    sorted(duplicate_numbers),
                 )
             batch_usage = _usage_dict(
                 grading_response,
@@ -1092,125 +1069,85 @@ class FullDocumentGradingService:
             batch_numbers: List[int],
             *,
             batch_index: str,
-            budget_minimum: int = 8_000,
+            budget_minimum: int = 4_000,
             can_split: bool = True,
         ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
             try:
-                return await _grade_question_subset(
+                returned, usage = await _grade_question_subset(
                     batch_questions,
                     batch_numbers,
                     batch_index=batch_index,
                     budget_minimum=budget_minimum,
                 )
-            except QuestionVisualGraderContractError as exc:
-                logger.warning(
-                    "Question visual grader violated contract on %s for requested %s and "
-                    "returned %s.",
-                    batch_index,
-                    exc.requested_numbers,
-                    exc.returned_numbers,
-                )
-                if len(batch_numbers) > 1:
+                missing = [
+                    number for number in batch_numbers if str(number) not in returned
+                ]
+                if missing and can_split:
                     logger.warning(
-                        "Question visual grader contract mismatch on %s; "
-                        "splitting %d questions and retrying individually.",
+                        "Question grader omitted %s from batch %s; retrying only the "
+                        "missing question IDs once.",
+                        missing,
                         batch_index,
-                        len(batch_questions),
                     )
-                    aggregated: Dict[str, Dict[str, Any]] = {}
-                    aggregated_usage: Dict[str, Any] = {}
-                    for index, number in enumerate(batch_numbers, start=1):
-                        question = question_by_number[number]
-                        sub_returned, sub_usage = await _grade_question_subset_with_fallback(
-                            [question],
-                            [number],
-                            batch_index=f"{batch_index}.{index}",
-                            budget_minimum=budget_minimum,
+                    retry_questions = [
+                        question_by_number[number]
+                        for number in missing
+                        if number in question_by_number
+                    ]
+                    retry_returned, retry_usage = (
+                        await _grade_question_subset_with_fallback(
+                            retry_questions,
+                            missing,
+                            batch_index=f"{batch_index}.missing",
+                            budget_minimum=_fallback_question_output_tokens(
+                                budget_minimum
+                            ),
                             can_split=False,
                         )
-                        aggregated.update(sub_returned)
-                        aggregated_usage = _merge_usages(aggregated_usage, sub_usage)
-                    return aggregated, aggregated_usage
-                if batch_numbers:
-                    number = batch_numbers[0]
-                    logger.warning(
-                        "Question visual grader contract mismatch on %s for Q%s; "
-                        "marking unresolved to keep grading flow complete.",
-                        batch_index,
+                    )
+                    returned.update(retry_returned)
+                    usage = _merge_usages(usage, retry_usage)
+                still_missing = [
+                    number for number in batch_numbers if str(number) not in returned
+                ]
+                for number in still_missing:
+                    returned[str(number)] = _unresolved_grade_for_output_budget(
                         number,
+                        "The question grader omitted this question after one targeted "
+                        "retry. Its evidence remains available for teacher review.",
                     )
-                    return (
-                        {
-                            str(number): _unresolved_grade_for_output_budget(
-                                number,
-                                (
-                                    "The question grader returned an output that did "
-                                    "not match the requested question and was marked "
-                                    "unresolved for teacher review."
-                                ),
-                            )
-                        },
-                        {},
-                    )
-                raise
+                return returned, usage
             except StructuredOutputContractError as exc:
-                if len(batch_numbers) > 1 and can_split:
+                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
+                if can_split and fallback_minimum > budget_minimum:
                     logger.warning(
                         "Question visual grader returned incomplete structured output "
-                        "for batch %s; splitting %d questions and retrying individually.",
+                        "for batch %s; retrying that batch once with a larger budget.",
                         batch_index,
-                        len(batch_questions),
                     )
-                    aggregated: Dict[str, Dict[str, Any]] = {}
-                    aggregated_usage: Dict[str, Any] = {}
-                    for index, number in enumerate(batch_numbers, start=1):
-                        question = question_by_number[number]
-                        sub_returned, sub_usage = await _grade_question_subset_with_fallback(
-                            [question],
-                            [number],
-                            batch_index=f"{batch_index}.{index}",
-                            budget_minimum=budget_minimum,
-                            can_split=False,
-                        )
-                        aggregated.update(sub_returned)
-                        aggregated_usage = _merge_usages(aggregated_usage, sub_usage)
-                    return aggregated, aggregated_usage
-
-                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
-                if fallback_minimum == budget_minimum:
-                    if len(batch_numbers) == 1:
-                        number = batch_numbers[0]
-                        logger.warning(
-                            "Question visual grader could not produce valid structured "
-                            "output for %s after bounded retries. Marking Q%s unresolved "
-                            "instead of failing the complete submission.",
-                            batch_index,
-                            number,
-                        )
-                        return (
-                            {
-                                str(number): _unresolved_grade_for_output_budget(
-                                    number,
-                                    "The question grader could not return a complete "
-                                    "strict result after bounded retries and was marked "
-                                    "unresolved for teacher review.",
-                                )
-                            },
-                            {},
-                        )
-                    raise
-
+                    return await _grade_question_subset_with_fallback(
+                        batch_questions,
+                        batch_numbers,
+                        batch_index=f"{batch_index}.retry",
+                        budget_minimum=fallback_minimum,
+                        can_split=False,
+                    )
                 logger.warning(
-                    "Question visual grader returned incomplete structured output for "
-                    "%s; retrying the same question with a larger bounded output budget.",
+                    "Question grader could not produce structured output for batch %s "
+                    "after one bounded retry; preserving review placeholders.",
                     batch_index,
                 )
-                return await _grade_question_subset_with_fallback(
-                    batch_questions,
-                    batch_numbers,
-                    batch_index=batch_index,
-                    budget_minimum=fallback_minimum,
-                    can_split=False,
+                return (
+                    {
+                        str(number): _unresolved_grade_for_output_budget(
+                            number,
+                            "The question grader could not return a complete strict "
+                            "result after one bounded retry. The mapped evidence remains "
+                            "available for teacher review.",
+                        )
+                        for number in batch_numbers
+                    },
+                    {},
                 )
 
         batch_specs = list(
@@ -1218,10 +1155,10 @@ class FullDocumentGradingService:
         )
         try:
             configured_concurrency = int(
-                os.getenv("PCR_VISUAL_BATCH_CONCURRENCY", "2") or 2
+                os.getenv("PCR_VISUAL_BATCH_CONCURRENCY", "3") or 3
             )
         except (TypeError, ValueError):
-            configured_concurrency = 2
+            configured_concurrency = 3
         batch_semaphore = asyncio.Semaphore(
             max(1, min(4, configured_concurrency))
         )
@@ -2383,11 +2320,11 @@ def _multistage_system_instructions() -> str:
 def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
     try:
         configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "2") or 2
+            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
         )
     except (TypeError, ValueError):
-        configured = 2
-    size = max(1, min(4, configured))
+        configured = 6
+    size = max(1, min(8, configured))
     numbers = [int(number) for number in question_numbers]
     return [numbers[index : index + size] for index in range(0, len(numbers), size)]
 
@@ -2401,28 +2338,28 @@ def _configured_output_tokens(name: str, default: int) -> int:
 
 
 def _mapping_output_token_budget(question_count: int) -> int:
-    """Reserve room for reasoning plus a complete 11-question evidence graph."""
+    """Reserve room for a concise whole-copy ownership map."""
 
     per_question = _configured_output_tokens(
-        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 1_200
+        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 800
     )
-    return min(24_000, max(10_000, per_question * max(1, question_count)))
+    return min(20_000, max(6_000, per_question * max(1, question_count)))
 
 
 def _question_output_token_budget(
     question_count: int,
-    minimum_output_tokens: int = 8_000,
+    minimum_output_tokens: int = 4_000,
 ) -> int:
-    """Reserve enough capacity for strict rubric JSON, not just its prose."""
+    """Reserve enough capacity for the lean criterion-scoring JSON."""
 
     per_question = _configured_output_tokens(
-        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 2_400
+        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 1_200
     )
-    return min(30_000, max(minimum_output_tokens, per_question * max(1, question_count)))
+    return min(20_000, max(minimum_output_tokens, per_question * max(1, question_count)))
 
 
 def _fallback_question_output_tokens(min_tokens: int) -> int:
-    return max(8_000, min(30_000, min_tokens * 2))
+    return max(6_000, min(20_000, min_tokens * 2))
 
 
 def _require_structured_payload(
@@ -2471,7 +2408,6 @@ def _is_max_output_token_exhaustion_error(exc: Exception) -> bool:
 
 def _build_question_grading_input(
     *,
-    static_content: List[Dict[str, Any]],
     questions: List[Dict[str, Any]],
     mappings: Mapping[int, Dict[str, Any]],
     student_assets: Sequence[_StudentPageAsset],
@@ -2480,11 +2416,14 @@ def _build_question_grading_input(
     dynamic: List[Dict[str, Any]] = [
         {
             "type": "input_text",
-            "text": (
-                "TASK: Grade exactly the requested questions from the fixed evidence "
-                "regions below. Region ownership is immutable for this stage. Use the "
-                "original high-resolution crops, not the mapper's text description.\n"
-                "REQUESTED QUESTION CATALOG:\n"
+                "text": (
+                    "TASK: Grade exactly the requested questions from the fixed evidence "
+                    "regions below. Region ownership is immutable for this stage. The "
+                    "catalog below already contains the authoritative question text, "
+                    "reference solution, marking criteria, method policy, and maximum "
+                    "marks. Use the original high-resolution student images as answer "
+                    "evidence; no question-paper or solution PDF is needed in this stage.\n"
+                    "REQUESTED IMMUTABLE QUESTION CATALOG:\n"
                 + json.dumps(
                     [_catalog_question(question) for question in questions],
                     ensure_ascii=False,
@@ -2589,11 +2528,10 @@ def _build_question_grading_input(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": _multistage_system_instructions(),
+                        "text": grading_system_instructions(),
                     }
                 ],
             },
-            {"role": "user", "content": static_content},
             {"role": "user", "content": dynamic},
         ],
         crop_bytes,
@@ -3387,132 +3325,12 @@ def _validate_question_grade(
     if not source_pages:
         validation_errors.append("Attempted answer has no visual evidence region")
     if confidence < 0.50:
-        validation_errors.append("Question ownership confidence is below 0.50")
-    if evidence_graph_question:
-        hypotheses = item.get("interpretation_hypotheses")
-        if not isinstance(hypotheses, list) or not hypotheses:
-            validation_errors.append(
-                "Attempted answer has no auditable visual interpretation hypothesis"
+        manual_review = True
+        if not review_reason:
+            review_reason = (
+                "Question ownership confidence is low; the provisional marks require "
+                "teacher confirmation"
             )
-        else:
-            hypothesis_confidences: List[float] = []
-            for hypothesis in hypotheses:
-                if not isinstance(hypothesis, dict):
-                    validation_errors.append(
-                        "Visual interpretation hypothesis is not an object"
-                    )
-                    continue
-                value = str(hypothesis.get("value") or "").strip()
-                hypothesis_region_ids = {
-                    str(region_id).strip()
-                    for region_id in (hypothesis.get("evidence_region_ids") or [])
-                    if str(region_id).strip()
-                }
-                hypothesis_confidence = _confidence(hypothesis.get("confidence"))
-                if not value:
-                    validation_errors.append(
-                        "Visual interpretation hypothesis has no value"
-                    )
-                if not hypothesis_region_ids:
-                    validation_errors.append(
-                        "Visual interpretation hypothesis cites no evidence region"
-                    )
-                elif not hypothesis_region_ids.issubset(evidence_region_ids):
-                    validation_errors.append(
-                        "Visual interpretation hypothesis cites evidence outside "
-                        "the fixed question map"
-                    )
-                hypothesis_confidences.append(hypothesis_confidence)
-            ranked_hypotheses = sorted(hypothesis_confidences, reverse=True)
-            if (
-                ranked_hypotheses
-                and ranked_hypotheses[0] < _CRITERION_MIN_SCORE_CONFIDENCE
-            ):
-                validation_errors.append(
-                    "No visual interpretation is reliable enough to score"
-                )
-            elif (
-                len(ranked_hypotheses) > 1
-                and ranked_hypotheses[1] >= ranked_hypotheses[0] - 0.10
-            ):
-                # A close second reading (for example 2^3 versus 23) is a
-                # genuine pixel-level ambiguity. Keep the calculated marks,
-                # but prevent automatic publication instead of guessing.
-                manual_review = True
-                if not review_reason:
-                    review_reason = (
-                        "Two plausible visual readings are too close to resolve "
-                        "automatically"
-                    )
-        visual_semantics = item.get("visual_semantics")
-        if not objective_question and not isinstance(visual_semantics, dict):
-            validation_errors.append(
-                "Attempted answer has no structured visual semantics"
-            )
-        elif not objective_question:
-            visual_confidence = _confidence(visual_semantics.get("confidence"))
-            if visual_confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
-                validation_errors.append(
-                    "Visual semantics could not be verified with sufficient confidence"
-                )
-            elif visual_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
-                manual_review = True
-                if not review_reason:
-                    review_reason = (
-                        "Visual semantics confidence is below the automatic threshold"
-                    )
-            if content_type in {
-                ContentType.DIAGRAM_HEAVY.value,
-                ContentType.TABLE_PRESENT.value,
-            } and not list(visual_semantics.get("elements") or []):
-                validation_errors.append(
-                    "Visual-heavy answer has no identified semantic elements"
-                )
-            visual_elements = visual_semantics.get("elements")
-            visual_elements = (
-                visual_elements if isinstance(visual_elements, list) else []
-            )
-            element_ids: set[str] = set()
-            for element in visual_elements:
-                if not isinstance(element, dict):
-                    validation_errors.append(
-                        "Visual semantic element is not an object"
-                    )
-                    continue
-                element_id = str(element.get("element_id") or "").strip()
-                region_id = str(element.get("region_id") or "").strip()
-                if not element_id or element_id in element_ids:
-                    validation_errors.append(
-                        "Visual semantic elements have missing or duplicate IDs"
-                    )
-                else:
-                    element_ids.add(element_id)
-                if region_id not in evidence_region_ids:
-                    validation_errors.append(
-                        "Visual semantic element cites evidence outside the fixed "
-                        "question map"
-                    )
-            visual_relationships = visual_semantics.get("relationships")
-            visual_relationships = (
-                visual_relationships
-                if isinstance(visual_relationships, list)
-                else []
-            )
-            for relationship in visual_relationships:
-                if not isinstance(relationship, dict):
-                    validation_errors.append(
-                        "Visual semantic relationship is not an object"
-                    )
-                    continue
-                if (
-                    str(relationship.get("source_element_id") or "").strip()
-                    not in element_ids
-                    or str(relationship.get("target_element_id") or "").strip()
-                    not in element_ids
-                ):
-                    validation_errors.append(
-                        "Visual semantic relationship refers to an unknown element"
-                    )
 
     if objective_question:
         if validation_errors:
@@ -3693,9 +3511,9 @@ def _validate_question_grade(
             validation_errors.append(
                 f"Criterion {criterion_id} has no stated missing evidence for partial credit"
             )
-        if decision == "unresolved" or criterion_confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
-            criterion_unresolved_reasons.append(
-                f"Criterion {criterion_id} could not be judged with sufficient confidence"
+        if decision == "unresolved":
+            criterion_review_reasons.append(
+                f"Criterion {criterion_id} requires teacher confirmation"
             )
         elif criterion_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
             criterion_review_reasons.append(
@@ -3755,20 +3573,6 @@ def _validate_question_grade(
             question_number,
             "; ".join(dict.fromkeys(validation_errors)),
             confidence=confidence,
-            source_pages=source_pages,
-            student_answer=student_answer,
-            content_type=content_type,
-        )
-
-    if criterion_unresolved_reasons:
-        return _unresolved_grade(
-            question,
-            question_number,
-            "; ".join(dict.fromkeys(criterion_unresolved_reasons)),
-            confidence=min(
-                [confidence]
-                + [float(item.get("confidence") or 0.0) for item in criterion_marks]
-            ),
             source_pages=source_pages,
             student_answer=student_answer,
             content_type=content_type,
