@@ -750,7 +750,7 @@ async def test_full_document_grading_keeps_diagram_visual_and_missing_question_u
     ]["enum"]
     assert "method_requirement_satisfied" not in method_schema["properties"]
     assert gate.calls[0]["temperature"] == 0.10
-    assert gate.calls[0]["reasoning_effort"] == "medium"
+    assert gate.calls[0]["reasoning_effort"] == "low"
     assert gate.calls[0]["prompt_cache_key"].startswith("pcr-paper-")
     static_catalog = gate.calls[0]["responses_input"][1]["content"][0]["text"]
     assert "acceptable_evidence" in static_catalog
@@ -1325,7 +1325,7 @@ async def test_identical_bytes_for_different_students_are_graded_independently(
         "prompt_version": "pcr-full-document-visual-v4",
         "model_id": "gpt-5.1-2025-11-13",
         "temperature": 0.10,
-        "reasoning_effort": "medium",
+        "reasoning_effort": "low",
         "locked_at": frozen_exam["pcr_grading_contract"]["locked_at"],
     }
     # Provider-side prefix caching is safe: only the immutable paper, solution,
@@ -1362,7 +1362,7 @@ async def test_identical_bytes_for_different_students_are_graded_independently(
                 "locked_at": "legacy-lock",
             },
             0.35,
-            "medium",
+            "low",
         ),
         (
             {
@@ -1489,6 +1489,226 @@ async def test_same_submission_revision_retry_is_idempotent_after_model_freeze(
     assert len(gate.calls) == 1
     assert await db["evalpen_document_grading_runs"].count_documents({}) == 1
     assert await db["evalpen_detected_responses"].count_documents({}) == 2
+
+
+@pytest.mark.asyncio
+async def test_subjective_visual_grade_batches_run_in_parallel(monkeypatch):
+    """Multiple grade batches should overlap to cut wall-clock time."""
+
+    db = _fresh_db()
+    await _seed(db)
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-DOC-1::Q{number}",
+                "exam_id": "EXAM-DOC-1",
+                "question_number": number,
+                "question_text": f"Subjective question {number}",
+                "reference_solution": "A correct answer.",
+                "max_marks": 1,
+                "marking_criteria": [
+                    {
+                        "criterion_id": "answer",
+                        "description": "Correct answer",
+                        "max_marks": 1,
+                        "acceptable_evidence": "A correct visible answer.",
+                    }
+                ],
+            }
+            for number in range(3, 7)
+        ]
+    )
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v2",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                }
+            }
+        },
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    assets = [_page_asset(module, 1)]
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda pages: _async_value((assets, sum(len(a.global_bytes) for a in assets))),
+    )
+    monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "3")
+    monkeypatch.setenv("PCR_VISUAL_GRADE_CONCURRENCY", "3")
+
+    def _mapped(number: int):
+        return {
+            "question_number": number,
+            "attempt_status": "attempted",
+            "confidence": 0.95,
+            "content_type": "TEXT_ONLY",
+            "evidence_regions": [
+                {
+                    "region_id": f"q{number}-text",
+                    "page_number": 1,
+                    "x_start": 50,
+                    "y_start": 50 + number * 20,
+                    "x_end": 400,
+                    "y_end": 80 + number * 20,
+                    "evidence_kind": "handwriting",
+                    "continuation_group": "",
+                    "evidence": f"Work for Q{number}",
+                    "mapping_confidence": 0.95,
+                }
+            ],
+            "mapping_reason": f"Mapped Q{number}",
+            "needs_review": False,
+            "review_reason": "",
+        }
+
+    def _graded(number: int):
+        criterion_id = (
+            "diagram" if number == 1 else "explain" if number == 2 else "answer"
+        )
+        marks = 2 if number <= 2 else 1
+        return {
+            "question_number": number,
+            "confidence": 0.94,
+            "student_answer": f"Answer {number}",
+            "interpretation_hypotheses": [
+                {
+                    "interpretation_id": f"q{number}-primary",
+                    "value": f"Answer {number}",
+                    "confidence": 0.94,
+                    "evidence_region_ids": [f"q{number}-text"],
+                    "ambiguity_notes": "",
+                }
+            ],
+            "visual_semantics": {
+                "summary": "Readable work",
+                "elements": [],
+                "relationships": [],
+                "confidence": 0.9,
+            },
+            "method_analysis": _method_analysis(),
+            "criterion_marks": [
+                {
+                    "criterion_id": criterion_id,
+                    "decision": "met",
+                    "confidence": 0.94,
+                    "marks_awarded": marks,
+                    "rationale": "Visible correct work.",
+                    "evidence": f"Page 1 Q{number}",
+                    "evidence_region_ids": [f"q{number}-text"],
+                    "missing_evidence": "",
+                    "credit_basis": "direct_evidence",
+                }
+            ],
+            "total_score": marks,
+            "overall_feedback": "OK",
+            "needs_review": False,
+            "review_reason": "",
+        }
+
+    mapping_payload = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "document_review": _document_review(),
+        "questions": [_mapped(n) for n in range(1, 7)],
+        "unassigned_regions": [],
+    }
+    batch_a = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [_graded(1), _graded(2), _graded(3)],
+    }
+    batch_b = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [_graded(4), _graded(5), _graded(6)],
+    }
+
+    class _ParallelAwareGate:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+            self._grade_payloads = [batch_a, batch_b]
+            self._active_grade = 0
+            self.max_parallel_grade = 0
+            self._lock = asyncio.Lock()
+
+        async def call(self, model_id: str, prompt: str, caller_id: str, **kwargs: Any):
+            stage = (kwargs.get("metadata") or {}).get("pcr_stage")
+            self.calls.append(
+                {
+                    "model_id": model_id,
+                    "prompt": prompt,
+                    "caller_id": caller_id,
+                    **kwargs,
+                }
+            )
+            if stage == "full_document_evidence_mapping":
+                content = json.dumps(mapping_payload)
+            else:
+                async with self._lock:
+                    self._active_grade += 1
+                    self.max_parallel_grade = max(
+                        self.max_parallel_grade, self._active_grade
+                    )
+                await asyncio.sleep(0.05)
+                async with self._lock:
+                    self._active_grade -= 1
+                    payload = self._grade_payloads.pop(0)
+                content = json.dumps(payload)
+            return SimpleNamespace(
+                content=content,
+                usage=SimpleNamespace(
+                    model="gpt-5.1-2025-11-13",
+                    caller=caller_id,
+                    input_tokens=1000,
+                    output_tokens=400,
+                    cache_read_tokens=0,
+                    total_tokens=1400,
+                    estimated_cost_usd=0.01,
+                ),
+            )
+
+    gate = _ParallelAwareGate()
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+    started = asyncio.get_running_loop().time()
+    result = await service.grade_submission("SUB-DOC-1")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result.status == "completed"
+    assert result.response_count == 6
+    assert gate.max_parallel_grade >= 2
+    # Sequential would take ~0.10s+; parallel should finish near one sleep.
+    assert elapsed < 0.18
+
+
+def test_subjective_single_shot_only_when_not_locked_to_evidence_graph():
+    module = _module()
+    questions = [{"grading_mode": "subjective", "question_type": "subjective"}]
+    assert module._should_use_subjective_single_shot(
+        evidence_graph_required=False,
+        objective_ledger_required=False,
+        contract_version="",
+        question_count=4,
+        page_count=2,
+        questions=questions,
+    )
+    assert not module._should_use_subjective_single_shot(
+        evidence_graph_required=True,
+        objective_ledger_required=False,
+        contract_version="",
+        question_count=4,
+        page_count=2,
+        questions=questions,
+    )
 
 
 @pytest.mark.asyncio

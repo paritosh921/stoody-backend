@@ -98,13 +98,22 @@ _AUTO_ACCEPT_CONFIDENCE = 0.80
 _ABSENCE_CONFIDENCE = 0.85
 _CRITERION_AUTO_ACCEPT_CONFIDENCE = 0.85
 _CRITERION_MIN_SCORE_CONFIDENCE = 0.65
+# Subjective default: low reasoning is much faster and was the practical
+# speed win for school handwriting papers. Frozen exam contracts still win.
 _DEFAULT_REASONING_EFFORT = "medium"
+_DEFAULT_SUBJECTIVE_REASONING_EFFORT = "low"
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
 _MAX_REQUEST_PAYLOAD_BYTES = 45 * 1024 * 1024
-# Subjective visual batches: smaller groups reduce truncated/invalid JSON.
-_DEFAULT_VISUAL_QUESTIONS_PER_BATCH = 3
+# Subjective visual batches: 4 balances latency vs truncation risk when
+# multiple batches run in parallel.
+_DEFAULT_VISUAL_QUESTIONS_PER_BATCH = 4
+_DEFAULT_VISUAL_GRADE_CONCURRENCY = 3
 _VISUAL_GRADE_BATCH_ATTEMPTS = 2
+# Small pure-subjective copies can skip the multi-stage graph and use one
+# full-document visual call (only when the paper is not locked to v2 graph).
+_DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_PAGES = 2
+_DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_QUESTIONS = 8
 _A4_WIDTH_MM = 210.0
 _A4_HEIGHT_MM = 297.0
 
@@ -263,29 +272,6 @@ class FullDocumentGradingService:
 
         grading_contract = dict(exam.get("pcr_grading_contract") or {})
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
-        prompt_version = (
-            OBJECTIVE_PROMPT_VERSION
-            if objective_ledger_required
-            else (
-                _EVIDENCE_GRAPH_PROMPT_VERSION
-                if evidence_graph_required
-                else _PROMPT_VERSION
-            )
-        )
-        if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
-            raise FullDocumentGradingError(
-                "This exam is locked to grading contract "
-                f"{contract_version}, which this worker does not support. "
-                "Do not mix grading contracts within one exam; migrate and reprocess "
-                "the complete exam together."
-            )
-        if contract_version and contract_version != prompt_version:
-            raise FullDocumentGradingError(
-                "The immutable paper requires grading contract "
-                f"{prompt_version}, but this cohort is locked to {contract_version}. "
-                "Migrate and reprocess the complete cohort; never mix grading "
-                "contracts student by student."
-            )
         model_id = str(
             grading_contract.get("model_id")
             or (
@@ -298,14 +284,6 @@ class FullDocumentGradingService:
             )
         ).strip()
         temperature = _contract_temperature(grading_contract)
-        reasoning_effort = str(
-            grading_contract.get("reasoning_effort")
-            or (
-                os.getenv("PCR_OBJECTIVE_REASONING_EFFORT", "medium")
-                if objective_ledger_required
-                else _DEFAULT_REASONING_EFFORT
-            )
-        ).strip().lower()
         if not _is_openai_visual_model(model_id):
             if canonical_visual_required:
                 raise FullDocumentGradingError(
@@ -334,6 +312,62 @@ class FullDocumentGradingService:
                 "Immutable PCR question catalog is invalid: "
                 + "; ".join(catalog_errors[:10])
             )
+
+        answer_pages = await self._db["evalpen_answer_pages"].find(
+            {"submission_id": submission_id}
+        ).sort("page_number", 1).to_list(length=_MAX_PAGE_COUNT + 1)
+        if not answer_pages:
+            raise FullDocumentGradingError("Canonical student answer pages are missing")
+        if len(answer_pages) > _MAX_PAGE_COUNT:
+            raise FullDocumentGradingError(
+                f"Student copy has {len(answer_pages)} pages; maximum is {_MAX_PAGE_COUNT}"
+            )
+        use_subjective_single_shot = _should_use_subjective_single_shot(
+            evidence_graph_required=evidence_graph_required,
+            objective_ledger_required=objective_ledger_required,
+            contract_version=contract_version,
+            question_count=len(questions),
+            page_count=len(answer_pages),
+            questions=questions,
+        )
+        prompt_version = (
+            OBJECTIVE_PROMPT_VERSION
+            if objective_ledger_required
+            else (
+                _PROMPT_VERSION
+                if use_subjective_single_shot
+                else (
+                    _EVIDENCE_GRAPH_PROMPT_VERSION
+                    if evidence_graph_required
+                    else _PROMPT_VERSION
+                )
+            )
+        )
+        if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
+            raise FullDocumentGradingError(
+                "This exam is locked to grading contract "
+                f"{contract_version}, which this worker does not support. "
+                "Do not mix grading contracts within one exam; migrate and reprocess "
+                "the complete exam together."
+            )
+        if contract_version and contract_version != prompt_version:
+            raise FullDocumentGradingError(
+                "The immutable paper requires grading contract "
+                f"{prompt_version}, but this cohort is locked to {contract_version}. "
+                "Migrate and reprocess the complete cohort; never mix grading "
+                "contracts student by student."
+            )
+        default_effort = (
+            os.getenv("PCR_OBJECTIVE_REASONING_EFFORT", "medium")
+            if objective_ledger_required
+            else os.getenv(
+                "PCR_SUBJECTIVE_REASONING_EFFORT",
+                _DEFAULT_SUBJECTIVE_REASONING_EFFORT,
+            )
+        )
+        reasoning_effort = str(
+            grading_contract.get("reasoning_effort") or default_effort
+        ).strip().lower()
         if objective_ledger_required and not all_questions_are_objective(questions):
             raise FullDocumentGradingError(
                 "The immutable paper is locked to objective answer-ledger grading, "
@@ -344,16 +378,6 @@ class FullDocumentGradingService:
         if reasoning_effort not in {"none", "minimal", "low", "medium", "high"}:
             raise FullDocumentGradingError(
                 "Immutable PCR grading contract has an unsupported reasoning effort"
-            )
-
-        answer_pages = await self._db["evalpen_answer_pages"].find(
-            {"submission_id": submission_id}
-        ).sort("page_number", 1).to_list(length=_MAX_PAGE_COUNT + 1)
-        if not answer_pages:
-            raise FullDocumentGradingError("Canonical student answer pages are missing")
-        if len(answer_pages) > _MAX_PAGE_COUNT:
-            raise FullDocumentGradingError(
-                f"Student copy has {len(answer_pages)} pages; maximum is {_MAX_PAGE_COUNT}"
             )
 
         document_id = str(
@@ -1233,28 +1257,66 @@ class FullDocumentGradingService:
         missing_numbers = [
             number for number in attempted_numbers if str(number) not in saved_grades
         ]
-        batch_index = 0
-        for batch_numbers in _question_batches(missing_numbers):
-            batch_index += 1
-            resolved_model = await self._grade_evidence_batch_resilient(
-                batch_numbers=batch_numbers,
-                batch_index=batch_index,
-                question_by_number=question_by_number,
-                mapping_questions=mapping.questions,
-                student_assets=student_assets,
-                static_content=static_content,
-                paper_bytes=paper_bytes,
-                solution_bytes=solution_bytes,
-                model_id=resolved_model,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                cache_key=cache_key,
-                submission_id=submission_id,
-                exam_id=exam_id,
-                run_id=run_id,
-                generation_lease_token=generation_lease_token,
-                saved_grades=saved_grades,
-                saved_usages=saved_usages,
+        batches = list(enumerate(_question_batches(missing_numbers), start=1))
+        if batches:
+            concurrency = _visual_grade_concurrency()
+            checkpoint_lock = asyncio.Lock()
+            sem = asyncio.Semaphore(max(1, concurrency))
+            model_holder = {"model": resolved_model}
+
+            async def _run_batch(batch_index: int, batch_numbers: List[int]) -> None:
+                async with sem:
+                    model_holder["model"] = await self._grade_evidence_batch_resilient(
+                        batch_numbers=batch_numbers,
+                        batch_index=batch_index,
+                        question_by_number=question_by_number,
+                        mapping_questions=mapping.questions,
+                        student_assets=student_assets,
+                        static_content=static_content,
+                        paper_bytes=paper_bytes,
+                        solution_bytes=solution_bytes,
+                        model_id=model_holder["model"],
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
+                        cache_key=cache_key,
+                        submission_id=submission_id,
+                        exam_id=exam_id,
+                        run_id=run_id,
+                        generation_lease_token=generation_lease_token,
+                        saved_grades=saved_grades,
+                        saved_usages=saved_usages,
+                        checkpoint_lock=checkpoint_lock,
+                    )
+
+            results = await asyncio.gather(
+                *[
+                    _run_batch(batch_index, list(batch_numbers))
+                    for batch_index, batch_numbers in batches
+                ],
+                return_exceptions=True,
+            )
+            hard_errors = [
+                item for item in results if isinstance(item, BaseException)
+            ]
+            if hard_errors:
+                # Prefer ownership/lease errors so operators see the real blocker.
+                ownership = next(
+                    (
+                        err
+                        for err in hard_errors
+                        if isinstance(err, FullDocumentGradingError)
+                        and "ownership" in str(err).lower()
+                    ),
+                    None,
+                )
+                raise ownership if ownership is not None else hard_errors[0]
+            resolved_model = str(model_holder["model"] or resolved_model)
+            logger.info(
+                "Subjective visual grade batches finished submission=%s "
+                "batches=%s concurrency=%s",
+                submission_id,
+                len(batches),
+                concurrency,
             )
 
         final_payload = merge_mapping_and_grading(
@@ -1303,6 +1365,7 @@ class FullDocumentGradingService:
         generation_lease_token: str,
         saved_grades: Dict[str, Any],
         saved_usages: Dict[str, Any],
+        checkpoint_lock: Optional[asyncio.Lock] = None,
         depth: int = 0,
     ) -> str:
         """Grade one question batch with retry and split-on-failure recovery.
@@ -1310,14 +1373,16 @@ class FullDocumentGradingService:
         Subjective visual grading frequently returns truncated or non-JSON
         payloads for large batches.  Retry once, then split the batch, and
         finally mark a single unrecoverable question unresolved so the rest of
-        the student copy can still finish.
+        the student copy can still finish.  Checkpoint writes are serialized so
+        parallel top-level batches cannot clobber each other.
         """
 
+        lock = checkpoint_lock or asyncio.Lock()
         numbers = [int(number) for number in batch_numbers if int(number) in question_by_number]
         if not numbers:
             return model_id
-        # Skip already-checkpointed questions (resume after partial failure).
-        numbers = [number for number in numbers if str(number) not in saved_grades]
+        async with lock:
+            numbers = [number for number in numbers if str(number) not in saved_grades]
         if not numbers:
             return model_id
 
@@ -1343,31 +1408,40 @@ class FullDocumentGradingService:
                     exam_id=exam_id,
                     run_id=run_id,
                 )
-                saved_grades.update(returned)
-                usage_key = "questions-" + "-".join(
-                    str(number) for number in sorted(numbers)
-                )
-                if attempt > 1:
-                    usage_key = f"{usage_key}-retry{attempt}"
-                saved_usages[usage_key] = batch_usage
-                checkpoint = await self._db[_RUNS_COLLECTION].update_one(
-                    {
-                        "run_id": run_id,
-                        "generation_lease_token": generation_lease_token,
-                    },
-                    {
-                        "$set": {
-                            "evidence_graph_question_grades": saved_grades,
-                            "evidence_graph_question_grade_usages": saved_usages,
-                            "model_used": resolved_model,
-                            "updated_at": datetime.now(timezone.utc),
-                        }
-                    },
-                )
-                if checkpoint.matched_count != 1:
-                    raise FullDocumentGradingError(
-                        "Submission grading ownership expired while saving question grades"
+                async with lock:
+                    # Another parallel worker may have finished overlapping work.
+                    returned = {
+                        key: value
+                        for key, value in returned.items()
+                        if key not in saved_grades
+                    }
+                    if not returned:
+                        return resolved_model
+                    saved_grades.update(returned)
+                    usage_key = "questions-" + "-".join(
+                        str(number) for number in sorted(map(int, returned))
                     )
+                    if attempt > 1:
+                        usage_key = f"{usage_key}-retry{attempt}"
+                    saved_usages[usage_key] = batch_usage
+                    checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                        {
+                            "run_id": run_id,
+                            "generation_lease_token": generation_lease_token,
+                        },
+                        {
+                            "$set": {
+                                "evidence_graph_question_grades": saved_grades,
+                                "evidence_graph_question_grade_usages": saved_usages,
+                                "model_used": resolved_model,
+                                "updated_at": datetime.now(timezone.utc),
+                            }
+                        },
+                    )
+                    if checkpoint.matched_count != 1:
+                        raise FullDocumentGradingError(
+                            "Submission grading ownership expired while saving question grades"
+                        )
                 return resolved_model
             except FullDocumentGradingError as exc:
                 last_error = str(exc)
@@ -1380,12 +1454,15 @@ class FullDocumentGradingService:
                     numbers,
                     last_error[:240],
                 )
+                if "ownership" in last_error.lower():
+                    raise
                 if attempt < _VISUAL_GRADE_BATCH_ATTEMPTS:
                     continue
                 break
 
         # Persistent failure: split multi-question batches so one bad crop/schema
-        # response cannot discard the whole student copy.
+        # response cannot discard the whole student copy. Split halves run in
+        # parallel to keep wall-clock time down.
         if len(numbers) > 1:
             mid = max(1, len(numbers) // 2)
             left = numbers[:mid]
@@ -1397,86 +1474,107 @@ class FullDocumentGradingService:
                 left,
                 right,
             )
-            resolved_model = await self._grade_evidence_batch_resilient(
-                batch_numbers=left,
-                batch_index=batch_index,
-                question_by_number=question_by_number,
-                mapping_questions=mapping_questions,
-                student_assets=student_assets,
-                static_content=static_content,
-                paper_bytes=paper_bytes,
-                solution_bytes=solution_bytes,
-                model_id=resolved_model,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                cache_key=cache_key,
-                submission_id=submission_id,
-                exam_id=exam_id,
-                run_id=run_id,
-                generation_lease_token=generation_lease_token,
-                saved_grades=saved_grades,
-                saved_usages=saved_usages,
-                depth=depth + 1,
+            split_results = await asyncio.gather(
+                self._grade_evidence_batch_resilient(
+                    batch_numbers=left,
+                    batch_index=batch_index,
+                    question_by_number=question_by_number,
+                    mapping_questions=mapping_questions,
+                    student_assets=student_assets,
+                    static_content=static_content,
+                    paper_bytes=paper_bytes,
+                    solution_bytes=solution_bytes,
+                    model_id=resolved_model,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    cache_key=cache_key,
+                    submission_id=submission_id,
+                    exam_id=exam_id,
+                    run_id=run_id,
+                    generation_lease_token=generation_lease_token,
+                    saved_grades=saved_grades,
+                    saved_usages=saved_usages,
+                    checkpoint_lock=lock,
+                    depth=depth + 1,
+                ),
+                self._grade_evidence_batch_resilient(
+                    batch_numbers=right,
+                    batch_index=batch_index,
+                    question_by_number=question_by_number,
+                    mapping_questions=mapping_questions,
+                    student_assets=student_assets,
+                    static_content=static_content,
+                    paper_bytes=paper_bytes,
+                    solution_bytes=solution_bytes,
+                    model_id=resolved_model,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    cache_key=cache_key,
+                    submission_id=submission_id,
+                    exam_id=exam_id,
+                    run_id=run_id,
+                    generation_lease_token=generation_lease_token,
+                    saved_grades=saved_grades,
+                    saved_usages=saved_usages,
+                    checkpoint_lock=lock,
+                    depth=depth + 1,
+                ),
+                return_exceptions=True,
             )
-            resolved_model = await self._grade_evidence_batch_resilient(
-                batch_numbers=right,
-                batch_index=batch_index,
-                question_by_number=question_by_number,
-                mapping_questions=mapping_questions,
-                student_assets=student_assets,
-                static_content=static_content,
-                paper_bytes=paper_bytes,
-                solution_bytes=solution_bytes,
-                model_id=resolved_model,
-                temperature=temperature,
-                reasoning_effort=reasoning_effort,
-                cache_key=cache_key,
-                submission_id=submission_id,
-                exam_id=exam_id,
-                run_id=run_id,
-                generation_lease_token=generation_lease_token,
-                saved_grades=saved_grades,
-                saved_usages=saved_usages,
-                depth=depth + 1,
-            )
-            return resolved_model
+            hard = [item for item in split_results if isinstance(item, BaseException)]
+            if hard:
+                ownership = next(
+                    (
+                        err
+                        for err in hard
+                        if isinstance(err, FullDocumentGradingError)
+                        and "ownership" in str(err).lower()
+                    ),
+                    None,
+                )
+                raise ownership if ownership is not None else hard[0]
+            models = [item for item in split_results if isinstance(item, str)]
+            return models[-1] if models else resolved_model
 
         # Single question still failing: record unresolved and continue.
         number = numbers[0]
-        saved_grades[str(number)] = _unresolved_visual_grade_item(
-            number,
-            reason=(
-                "Question visual grader failed after retries: "
-                + last_error[:300]
-            ),
-        )
-        usage_key = f"questions-{number}-failed"
-        saved_usages[usage_key] = {
-            "model": resolved_model,
-            "caller": _CALLER_ID,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "error": last_error[:300],
-        }
-        checkpoint = await self._db[_RUNS_COLLECTION].update_one(
-            {
-                "run_id": run_id,
-                "generation_lease_token": generation_lease_token,
-            },
-            {
-                "$set": {
-                    "evidence_graph_question_grades": saved_grades,
-                    "evidence_graph_question_grade_usages": saved_usages,
-                    "model_used": resolved_model,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            },
-        )
-        if checkpoint.matched_count != 1:
-            raise FullDocumentGradingError(
-                "Submission grading ownership expired while saving question grades"
+        async with lock:
+            if str(number) in saved_grades:
+                return resolved_model
+            saved_grades[str(number)] = _unresolved_visual_grade_item(
+                number,
+                reason=(
+                    "Question visual grader failed after retries: "
+                    + last_error[:300]
+                ),
             )
+            usage_key = f"questions-{number}-failed"
+            saved_usages[usage_key] = {
+                "model": resolved_model,
+                "caller": _CALLER_ID,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "error": last_error[:300],
+            }
+            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                {
+                    "run_id": run_id,
+                    "generation_lease_token": generation_lease_token,
+                },
+                {
+                    "$set": {
+                        "evidence_graph_question_grades": saved_grades,
+                        "evidence_graph_question_grade_usages": saved_usages,
+                        "model_used": resolved_model,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            if checkpoint.matched_count != 1:
+                raise FullDocumentGradingError(
+                    "Submission grading ownership expired while saving question grades"
+                )
         logger.error(
             "Subjective visual grade left Q%s unresolved after retries submission=%s",
             number,
@@ -2972,6 +3070,81 @@ def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
     size = max(1, min(10, configured))
     numbers = [int(number) for number in question_numbers]
     return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+
+
+def _visual_grade_concurrency() -> int:
+    try:
+        configured = int(
+            os.getenv(
+                "PCR_VISUAL_GRADE_CONCURRENCY",
+                str(_DEFAULT_VISUAL_GRADE_CONCURRENCY),
+            )
+            or _DEFAULT_VISUAL_GRADE_CONCURRENCY
+        )
+    except (TypeError, ValueError):
+        configured = _DEFAULT_VISUAL_GRADE_CONCURRENCY
+    return max(1, min(6, configured))
+
+
+def _should_use_subjective_single_shot(
+    *,
+    evidence_graph_required: bool,
+    objective_ledger_required: bool,
+    contract_version: str,
+    question_count: int,
+    page_count: int,
+    questions: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Fast path for small pure-subjective copies when the paper is not v2-locked.
+
+    Modern papers freeze ``canonical-full-document-visual-v2`` and must stay on
+    the evidence graph for cohort fairness.  Legacy / unfrozen papers can use
+    one full-document call when the copy is small enough.
+    """
+
+    if objective_ledger_required or evidence_graph_required:
+        return False
+    if contract_version and contract_version != _PROMPT_VERSION:
+        return False
+    if not _subjective_single_shot_enabled():
+        return False
+    if any(_is_objective_question(dict(question)) for question in questions):
+        return False
+    try:
+        max_pages = int(
+            os.getenv(
+                "PCR_SUBJECTIVE_SINGLE_SHOT_MAX_PAGES",
+                str(_DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_PAGES),
+            )
+            or _DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_PAGES
+        )
+    except (TypeError, ValueError):
+        max_pages = _DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_PAGES
+    try:
+        max_questions = int(
+            os.getenv(
+                "PCR_SUBJECTIVE_SINGLE_SHOT_MAX_QUESTIONS",
+                str(_DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_QUESTIONS),
+            )
+            or _DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_QUESTIONS
+        )
+    except (TypeError, ValueError):
+        max_questions = _DEFAULT_SUBJECTIVE_SINGLE_SHOT_MAX_QUESTIONS
+    return (
+        page_count > 0
+        and page_count <= max(1, max_pages)
+        and question_count > 0
+        and question_count <= max(1, max_questions)
+    )
+
+
+def _subjective_single_shot_enabled() -> bool:
+    return os.getenv("PCR_SUBJECTIVE_SINGLE_SHOT_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _unresolved_visual_grade_item(question_number: int, *, reason: str) -> Dict[str, Any]:
