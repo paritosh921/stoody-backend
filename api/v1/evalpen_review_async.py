@@ -298,6 +298,10 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
+    # A failed explicit reprocess does not invalidate an already committed
+    # grading generation. The UI can keep showing that immutable result while
+    # making the failed candidate generation visible to staff.
+    active_result_retained: bool = False
     # ``available`` means all materialized evaluations can be displayed. A
     # separate review_state/readiness gate still prevents unsafe publication;
     # ``processing`` and ``unavailable`` must never render as a final zero.
@@ -728,11 +732,15 @@ async def get_submission_summary(
             if isinstance(processing_job, dict) and processing_job.get("last_error")
             else None
         )
-        processing_failed = segmentation_status == "failed" or processing_status in {
-            "failed",
-            "retryable_error",
-            "enqueue_failed",
-        }
+        processing_failed_status = (
+            segmentation_status == "failed"
+            or processing_status
+            in {
+                "failed",
+                "retryable_error",
+                "enqueue_failed",
+            }
+        )
         question_catalog = await _get_pcr_question_catalog(
             tenant_db,
             str(sub_dict.get("exam_id") or ""),
@@ -745,6 +753,20 @@ async def get_submission_summary(
         resp_repo = DetectedResponseRepository(tenant_db)
         response_docs = await resp_repo.get_responses_by_submission(
             submission_id
+        )
+        active_materialization_id = str(
+            sub_dict.get("document_grading_materialization_id") or ""
+        )
+        active_result_available = bool(
+            active_materialization_id
+            and segmentation_status == "complete"
+            and response_docs
+        )
+        active_result_retained = bool(
+            processing_failed_status and active_result_available
+        )
+        processing_failed = bool(
+            processing_failed_status and not active_result_available
         )
 
         # Fetch all evaluations in one query. The previous per-response lookup
@@ -1071,6 +1093,7 @@ async def get_submission_summary(
             segmentation_status=segmentation_status,
             processing_status=processing_status,
             processing_error=processing_error,
+            active_result_retained=active_result_retained,
             score_state=score_state,
             publication_status=sub_dict.get("publication_status"),
             question_catalog=question_catalog,
@@ -1669,6 +1692,11 @@ async def get_exam_roster(
         publication = str((submission or {}).get("publication_status") or "").lower()
         job_status = str((job or {}).get("status") or "").lower()
         review_state = str((submission or {}).get("review_state") or "").lower()
+        active_result_available = bool(
+            (submission or {}).get("document_grading_materialization_id")
+            and str((submission or {}).get("segmentation_status") or "")
+            == "complete"
+        )
         source = str((submission or {}).get("source") or "").lower() or None
         if source and source not in {"pen", "camera", "mixed"}:
             source = "camera" if source in {"upload", "pdf", "image"} else source
@@ -1680,11 +1708,19 @@ async def get_exam_roster(
             total_published += 1
             total_submitted += 1
             total_ready += 1
-        elif submission_id in blocked_submissions or review_state == "blocked" or job_status in {
-            "failed",
-            "retryable_error",
-            "enqueue_failed",
-        }:
+        elif (
+            submission_id in blocked_submissions
+            or review_state == "blocked"
+            or (
+                job_status
+                in {
+                    "failed",
+                    "retryable_error",
+                    "enqueue_failed",
+                }
+                and not active_result_available
+            )
+        ):
             status_value = "blocked"
             total_blocked += 1
             total_submitted += 1
@@ -1699,7 +1735,12 @@ async def get_exam_roster(
             submission_id in ready_submissions
             or job_status == "completed"
             or publication in {"ready", "unpublished"}
-        ):
+        ) and job_status not in {
+            "queued",
+            "processing",
+            "retryable_error",
+            "enqueue_failed",
+        }:
             status_value = "ready"
             total_ready += 1
             total_submitted += 1

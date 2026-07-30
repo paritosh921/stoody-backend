@@ -43,6 +43,7 @@ from services.objective_scoring_service import (
     ObjectiveScoringContractError,
     score_objective_response,
 )
+from services.canonical_asset_storage import read_canonical_asset
 
 from ..domain.response_models import ContentType
 from ..marking_policy import (
@@ -107,6 +108,10 @@ class FullDocumentGradingError(RuntimeError):
     """Raised when the primary document request cannot be completed safely."""
 
 
+class CanonicalAssetUnavailableError(FullDocumentGradingError):
+    """Raised when a required immutable grading asset cannot be loaded."""
+
+
 @dataclass
 class FullDocumentGradingResult:
     handled: bool
@@ -120,6 +125,7 @@ class FullDocumentGradingResult:
     warning_count: int = 0
     processing_path: str = "full_document_visual"
     run_id: Optional[str] = None
+    materialization_id: Optional[str] = None
     errors: List[str] = field(default_factory=list)
     document_review_required: bool = False
     review_state: str = "not_applicable"
@@ -345,7 +351,7 @@ class FullDocumentGradingService:
         )
         if not document:
             if canonical_visual_required:
-                raise FullDocumentGradingError(
+                raise CanonicalAssetUnavailableError(
                     "The exam requires canonical visual grading, but its immutable "
                     "question-paper record is unavailable"
                 )
@@ -357,13 +363,20 @@ class FullDocumentGradingService:
                 skipped_reason="Legacy exam has no immutable question-paper record",
             )
 
-        paper_bytes = await _read_canonical_file(
-            str(document.get("file_path") or ""),
-            expected_sha256=document.get("sha256"),
-        )
+        try:
+            paper_bytes = await _read_canonical_file(
+                str(document.get("file_path") or ""),
+                expected_sha256=document.get("sha256"),
+            )
+        except AssetIntegrityError:
+            raise
+        except Exception as exc:
+            raise CanonicalAssetUnavailableError(
+                "The immutable question-paper asset could not be loaded from storage"
+            ) from exc
         if not paper_bytes:
             if canonical_visual_required:
-                raise FullDocumentGradingError(
+                raise CanonicalAssetUnavailableError(
                     "The exam requires canonical visual grading, but its immutable "
                     "question-paper asset could not be loaded"
                 )
@@ -372,10 +385,17 @@ class FullDocumentGradingService:
                 submission_id=submission_id,
                 skipped_reason="Legacy question-paper asset could not be loaded",
             )
-        solution_bytes = await _read_canonical_file(
-            str(document.get("answer_sheet_path") or ""),
-            expected_sha256=document.get("answer_sheet_sha256"),
-        )
+        try:
+            solution_bytes = await _read_canonical_file(
+                str(document.get("answer_sheet_path") or ""),
+                expected_sha256=document.get("answer_sheet_sha256"),
+            )
+        except AssetIntegrityError:
+            raise
+        except Exception as exc:
+            raise CanonicalAssetUnavailableError(
+                "The immutable teacher-solution asset could not be loaded from storage"
+            ) from exc
         if (
             not objective_ledger_required
             and len(paper_bytes) + len(solution_bytes or b"")
@@ -389,29 +409,37 @@ class FullDocumentGradingService:
             hashlib.sha256(solution_bytes).hexdigest() if solution_bytes else None
         )
 
-        grading_revision = await _materialization_revision(
+        generation_revision = await _generation_revision(
             self._db,
             submission_id,
         )
         prior_revision_run = await self._db[_RUNS_COLLECTION].find_one(
             {
                 "submission_id": submission_id,
-                "grading_revision": grading_revision,
                 "prompt_version": prompt_version,
+                "$or": [
+                    {"generation_revision": generation_revision},
+                    {"grading_revision": generation_revision},
+                ],
             }
         )
         if prior_revision_run:
-            # Resume the exact technical run that already owns this revision.
+            # Resume the exact technical run that already owns this generation.
             # This also remains stable when the first provider response froze a
             # dated model snapshot for subsequent students in the cohort.
             input_fingerprint = str(
                 prior_revision_run.get("input_fingerprint") or ""
             )
+            generation_fingerprint = str(
+                prior_revision_run.get("generation_fingerprint")
+                or prior_revision_run.get("input_fingerprint")
+                or ""
+            )
             run_id = str(prior_revision_run.get("run_id") or "")
             model_id = str(
                 prior_revision_run.get("requested_model_id") or model_id
             )
-            if not input_fingerprint or not run_id:
+            if not input_fingerprint or not generation_fingerprint or not run_id:
                 raise FullDocumentGradingError(
                     "Saved submission grading run is missing its immutable identity"
                 )
@@ -428,10 +456,23 @@ class FullDocumentGradingService:
                 reasoning_effort=reasoning_effort,
                 prompt_version=prompt_version,
             )
-            run_id = f"DOCGR-{input_fingerprint[:24]}"
-        materialization_id = f"{run_id}:r{grading_revision}"
+            generation_fingerprint = _generation_fingerprint(
+                submission_id=submission_id,
+                input_fingerprint=input_fingerprint,
+                generation_revision=generation_revision,
+            )
+            run_id = f"DOCGR-{generation_fingerprint[:24]}"
+        materialization_id = f"{run_id}:g{generation_revision}"
         await self._db[_RUNS_COLLECTION].create_index(
             "run_id", unique=True, name="uniq_document_grading_run"
+        )
+        await self._db[_RUNS_COLLECTION].create_index(
+            [
+                ("submission_id", 1),
+                ("prompt_version", 1),
+                ("generation_revision", 1),
+            ],
+            name="submission_grading_generation",
         )
         await self._db[_LLM_DEBUG_TRACES_COLLECTION].create_index(
             "trace_id", unique=True, name="uniq_llm_debug_trace"
@@ -463,10 +504,11 @@ class FullDocumentGradingService:
                 self._db,
                 run_id=run_id,
                 input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
                 submission_id=submission_id,
                 student_id=student_id,
                 exam_id=exam_id,
-                grading_revision=grading_revision,
+                generation_revision=generation_revision,
                 requested_model_id=model_id,
                 page_count=len(answer_pages),
                 prompt_version=prompt_version,
@@ -729,6 +771,7 @@ class FullDocumentGradingService:
                         "blocked_count": result.blocked_count,
                         "warning_count": result.warning_count,
                         "processing_path": result.processing_path,
+                        "materialization_id": result.materialization_id,
                         "errors": result.errors,
                         "document_review_required": result.document_review_required,
                         "review_state": result.review_state,
@@ -1647,6 +1690,7 @@ class FullDocumentGradingService:
             warning_count=warnings,
             processing_path=processing_path,
             run_id=run_id,
+            materialization_id=materialization_id,
             errors=errors,
             document_review_required=document_review.required,
             review_state=review_state,
@@ -1688,20 +1732,22 @@ async def _claim_or_wait_for_run(
     *,
     run_id: str,
     input_fingerprint: str,
+    generation_fingerprint: str,
     submission_id: str,
     student_id: str,
     exam_id: str,
-    grading_revision: int,
+    generation_revision: int,
     requested_model_id: str,
     page_count: int,
     prompt_version: str,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Single-flight technical retries for one submission grading revision.
+    """Single-flight technical retries for one submission grading generation.
 
-    ``run_id`` is submission- and revision-scoped.  Another student's upload,
+    ``run_id`` is submission- and generation-scoped. Another student's upload,
     even when its bytes are identical, therefore cannot join or reuse this
-    run.  The lease only prevents duplicate paid calls when workers race on
-    the same immutable job revision.
+    run. Automatic worker retries keep the same generation; an explicit
+    operator reprocess increments it and intentionally creates a fresh model
+    interpretation even when the immutable input bytes did not change.
     """
 
     now = datetime.now(timezone.utc)
@@ -1710,15 +1756,26 @@ async def _claim_or_wait_for_run(
     collection = tenant_db[_RUNS_COLLECTION]
     existing = await collection.find_one({"run_id": run_id})
     try:
-        existing_revision = int((existing or {}).get("grading_revision") or 0)
+        existing_revision = int(
+            (existing or {}).get("generation_revision")
+            if (existing or {}).get("generation_revision") is not None
+            else (existing or {}).get("grading_revision")
+            or 0
+        )
     except (TypeError, ValueError):
         existing_revision = -1
+    existing_generation_fingerprint = str(
+        (existing or {}).get("generation_fingerprint")
+        or (existing or {}).get("input_fingerprint")
+        or ""
+    )
     if existing is not None and (
         str(existing.get("submission_id") or "") != submission_id
-        or existing_revision != grading_revision
+        or existing_revision != generation_revision
+        or existing_generation_fingerprint != generation_fingerprint
     ):
         raise FullDocumentGradingError(
-            "Submission grading run ownership does not match the requested revision"
+            "Submission grading run ownership does not match the requested generation"
         )
 
     if existing is None:
@@ -1731,7 +1788,11 @@ async def _claim_or_wait_for_run(
                         "submission_id": submission_id,
                         "student_id": student_id,
                         "exam_id": exam_id,
-                        "grading_revision": grading_revision,
+                        # Keep grading_revision during the compatibility window
+                        # so old reporting readers can still inspect new runs.
+                        "grading_revision": generation_revision,
+                        "generation_revision": generation_revision,
+                        "generation_fingerprint": generation_fingerprint,
                         "prompt_version": prompt_version,
                         "requested_model_id": requested_model_id,
                         "input_fingerprint": input_fingerprint,
@@ -1799,29 +1860,31 @@ async def _claim_or_wait_for_run(
                 tenant_db,
                 run_id=run_id,
                 input_fingerprint=input_fingerprint,
+                generation_fingerprint=generation_fingerprint,
                 submission_id=submission_id,
                 student_id=student_id,
                 exam_id=exam_id,
-                grading_revision=grading_revision,
+                generation_revision=generation_revision,
                 requested_model_id=requested_model_id,
                 page_count=page_count,
                 prompt_version=prompt_version,
             )
         if asyncio.get_running_loop().time() >= deadline:
             raise FullDocumentGradingError(
-                "This submission revision is already being graded; retry after its "
+                "This submission generation is already being graded; retry after its "
                 "current run finishes"
             )
         await asyncio.sleep(0.5)
 
 
-async def _materialization_revision(tenant_db: Any, submission_id: str) -> int:
-    """Return a retry-stable grading revision for this submission job.
+async def _generation_revision(tenant_db: Any, submission_id: str) -> int:
+    """Return the retry-stable model-generation revision for this submission.
 
-    Technical retries keep the same revision. An explicit reprocess increments
-    the materialization revision and creates new immutable response/evaluation
-    rows, but the model ledger is reused while the paper, rubric, model,
-    sampling contract, and student evidence remain byte-for-byte unchanged.
+    Technical retries keep the same generation. An explicit reprocess
+    increments the generation and therefore creates both a fresh provider
+    request and fresh immutable response/evaluation rows. ``reprocess_count``
+    remains a backward-compatible fallback for jobs created before the
+    generation contract was introduced.
     """
 
     jobs = await tenant_db[_PROCESSING_JOBS_COLLECTION].find(
@@ -1830,7 +1893,10 @@ async def _materialization_revision(tenant_db: Any, submission_id: str) -> int:
     if not jobs:
         return 0
     try:
-        return max(0, int(jobs[0].get("reprocess_count") or 0))
+        raw_revision = jobs[0].get("generation_revision")
+        if raw_revision is None:
+            raw_revision = jobs[0].get("reprocess_count")
+        return max(0, int(raw_revision or 0))
     except (TypeError, ValueError):
         return 0
 
@@ -2009,34 +2075,10 @@ async def _read_canonical_file(
     *,
     expected_sha256: Any = None,
 ) -> Optional[bytes]:
-    if not storage_path:
-        return None
-    data: Optional[bytes]
-    if storage_path.startswith("s3://"):
-        from utils.s3_storage import download_file
-
-        data = await download_file(storage_path)
-    else:
-        backend_root = Path(__file__).resolve().parents[3]
-        candidate = Path(storage_path)
-        if not candidate.is_absolute():
-            candidate = backend_root / candidate
-        candidate = candidate.resolve(strict=False)
-        allowed_roots = [(backend_root / "uploads").resolve(strict=False)]
-        try:
-            from config_async import settings
-
-            allowed_roots.append(
-                Path(settings.UPLOAD_PRIVATE_LOCAL_DIR).resolve(strict=False)
-            )
-        except Exception:
-            pass
-        if not any(root == candidate or root in candidate.parents for root in allowed_roots):
-            logger.error("Refusing canonical PDF outside approved upload roots: %s", candidate)
-            return None
-        if not candidate.is_file():
-            return None
-        data = await asyncio.to_thread(candidate.read_bytes)
+    data = await read_canonical_asset(
+        storage_path,
+        max_bytes=_MAX_STATIC_PDF_BYTES,
+    )
     if not data:
         return None
     expected = str(expected_sha256 or "").strip().lower()
@@ -2062,15 +2104,22 @@ async def _student_copy_content(
         page_number = int(page.get("page_number") or 0)
         raw_ref = page.get("raw_image_ref")
         if page_number <= 0 or not isinstance(raw_ref, str) or not raw_ref.strip():
-            raise FullDocumentGradingError(
+            raise CanonicalAssetUnavailableError(
                 f"Canonical student page {page_number or '?'} has no image asset"
             )
-        image_b64 = await _resolve_image_base64(
-            raw_ref,
-            expected_sha256=page.get("asset_sha256"),
-        )
+        try:
+            image_b64 = await _resolve_image_base64(
+                raw_ref,
+                expected_sha256=page.get("asset_sha256"),
+            )
+        except AssetIntegrityError:
+            raise
+        except Exception as exc:
+            raise CanonicalAssetUnavailableError(
+                f"Canonical student page {page_number} could not be loaded from storage"
+            ) from exc
         if not image_b64:
-            raise FullDocumentGradingError(
+            raise CanonicalAssetUnavailableError(
                 f"Canonical student page {page_number} could not be loaded"
             )
         try:
@@ -4201,6 +4250,25 @@ def _input_fingerprint(
     ).hexdigest()
 
 
+def _generation_fingerprint(
+    *,
+    submission_id: str,
+    input_fingerprint: str,
+    generation_revision: int,
+) -> str:
+    """Derive one paid-call identity from immutable input plus operator intent."""
+
+    payload = {
+        "version": "pcr-grading-generation-v1",
+        "submission_id": submission_id,
+        "input_fingerprint": input_fingerprint,
+        "generation_revision": max(0, int(generation_revision)),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 def _semantic_evidence_signature(
     *,
     question_id: str,
@@ -4347,6 +4415,9 @@ def _result_from_run(
             result.get("processing_path") or "full_document_visual"
         ),
         run_id=str(run.get("run_id") or "") or None,
+        materialization_id=(
+            str(result.get("materialization_id") or "") or None
+        ),
         errors=[str(value) for value in (result.get("errors") or [])],
         document_review_required=bool(
             result.get("document_review_required")

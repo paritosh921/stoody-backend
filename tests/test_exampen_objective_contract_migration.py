@@ -242,6 +242,7 @@ async def test_migration_upgrades_legacy_objective_contract_and_requeues_cohort(
     assert job["status"] == "queued"
     assert job["attempts"] == 0
     assert job["reprocess_count"] == 1
+    assert job["generation_revision"] == 1
     assert job["processing_path"] == "objective_answer_ledger"
     assert job["evaluation"]["path"] == "objective_answer_ledger"
     assert job["last_error"] is None

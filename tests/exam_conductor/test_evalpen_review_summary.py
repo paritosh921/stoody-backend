@@ -356,6 +356,80 @@ async def test_failed_ocr_does_not_look_like_a_zero_mark_blank_paper():
 
 
 @pytest.mark.asyncio
+async def test_failed_reprocess_keeps_last_committed_score_visible():
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-RETAINED",
+            "exam_id": "EXAM-RETAINED",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "complete",
+            "document_grading_run_id": "DOCGR-active",
+            "document_grading_materialization_id": "DOCGR-active:g0",
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-RETAINED::Q-1",
+            "exam_id": "EXAM-RETAINED",
+            "question_number": 1,
+            "max_marks": 4,
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-RETAINED-1",
+            "submission_id": "SUB-RETAINED",
+            "question_id": "EXAM-RETAINED::Q-1",
+            "question_number": 1,
+            "eval_status": "evaluated",
+            "flags": [],
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-RETAINED-1",
+            "response_id": "RESP-RETAINED-1",
+            "question_id": "EXAM-RETAINED::Q-1",
+            "total_score": 3,
+            "max_score": 4,
+            "manual_review_required": False,
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "submission_id": "SUB-RETAINED",
+            "status": "failed",
+            "last_error": "new grading generation could not load the canonical paper",
+            "active_result_retained": True,
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-RETAINED",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.score_state == "available"
+    assert result.active_result_retained is True
+    assert result.processing_status == "failed"
+    assert result.processing_error is not None
+    assert result.total_score == 3
+    assert result.review_state == "ready"
+
+
+@pytest.mark.asyncio
 async def test_review_summary_keeps_unassigned_evidence_out_of_question_navigator():
     """An extra OCR segment must not become a fake twelfth paper question."""
     from api.v1.evalpen_review_async import get_submission_summary

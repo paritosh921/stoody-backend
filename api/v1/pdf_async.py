@@ -54,6 +54,13 @@ from services.answer_key_reconciliation_service import AnswerKeyReconciliationSe
 from services.answer_sheet_mapping_service import AnswerSheetMappingService
 from services.answer_solution_coverage_service import AnswerSolutionCoverageService
 from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
+from services.canonical_asset_storage import (
+    CanonicalAssetStorageError,
+    CanonicalAssetTransfer,
+    finalize_canonical_transfer,
+    rollback_canonical_transfers,
+    store_canonical_asset,
+)
 from services.document_layout_provider import DocumentLayoutProvider, compact_layout_context
 from services.extraction_validator import ExtractionValidator
 from services.full_document_extraction_validator import FullDocumentExtractionValidator
@@ -4266,6 +4273,7 @@ async def upload_pdf(
     - Saves file to appropriate folder based on document_type
     - Stores metadata in MongoDB
     """
+    canonical_transfers: List[CanonicalAssetTransfer] = []
     try:
         # Validate document_id (alphanumeric only, no spaces or special chars)
         if not document_id.isalnum():
@@ -4414,6 +4422,44 @@ async def upload_pdf(
 
         logger.info(f"Uploading document: {document_id}, Title: {title}, Type: {document_type}, Size: {file_size} bytes")
         relative_path = clean_document_upload.released_storage_path
+        canonical_tenant_db = (
+            settings.MONGODB_DB_STOODY
+            if is_b2c
+            else str(
+                current_user.get("db_name")
+                or current_user.get("tenant_db")
+                or current_user.get("tenant_id")
+                or ""
+            ).strip()
+        )
+        if exam_mode == "pcr":
+            if not canonical_tenant_db:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Tenant context is required for a PCR paper upload",
+                )
+            try:
+                paper_transfer = await store_canonical_asset(
+                    data=file_content,
+                    local_path=clean_document_upload.released_storage_path,
+                    upload_id=clean_document_upload.upload_id,
+                    tenant_db=canonical_tenant_db,
+                    document_id=document_id,
+                    artifact_kind="question-paper",
+                    filename=clean_document_upload.original_filename,
+                    content_type=clean_document_upload.content_type,
+                    sha256=clean_document_upload.sha256,
+                )
+            except CanonicalAssetStorageError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        "Private canonical-paper storage is temporarily unavailable. "
+                        "The PCR paper was not created; please retry."
+                    ),
+                ) from exc
+            canonical_transfers.append(paper_transfer)
+            relative_path = paper_transfer.storage_path
 
         # Validate total_points for Test Series
         if document_type == "Test Series" and total_points is not None:
@@ -4542,6 +4588,29 @@ async def upload_pdf(
             answer_sheet_path = clean_answer_sheet_upload.released_storage_path
             answer_sheet_upload_id = clean_answer_sheet_upload.upload_id
             answer_sheet_sha256 = clean_answer_sheet_upload.sha256
+            if exam_mode == "pcr":
+                try:
+                    answer_transfer = await store_canonical_asset(
+                        data=answer_sheet_content,
+                        local_path=clean_answer_sheet_upload.released_storage_path,
+                        upload_id=clean_answer_sheet_upload.upload_id,
+                        tenant_db=canonical_tenant_db,
+                        document_id=document_id,
+                        artifact_kind="teacher-solution",
+                        filename=clean_answer_sheet_upload.original_filename,
+                        content_type=clean_answer_sheet_upload.content_type,
+                        sha256=clean_answer_sheet_upload.sha256,
+                    )
+                except CanonicalAssetStorageError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            "Private canonical-solution storage is temporarily unavailable. "
+                            "The PCR paper was not created; please retry."
+                        ),
+                    ) from exc
+                canonical_transfers.append(answer_transfer)
+                answer_sheet_path = answer_transfer.storage_path
 
             try:
                 import io
@@ -4654,11 +4723,29 @@ async def upload_pdf(
             )
         )
 
+        # Resolve the audit database before committing the document.  Once the
+        # document points at an immutable S3 object, a later setup failure must
+        # not roll that object back and leave a dangling database reference.
+        canonical_audit_db = None
+        if canonical_transfers:
+            canonical_audit_db = (
+                await db.get_b2c_db()
+                if is_b2c
+                else await db.get_tenant_db(canonical_tenant_db)
+            )
+
         # Save to appropriate MongoDB database (B2C or regular)
         if is_b2c:
             await db.b2c_insert_one("documents", document_metadata)
         else:
             await db.mongo_insert_one("documents", document_metadata)
+
+        for transfer in canonical_transfers:
+            await finalize_canonical_transfer(
+                transfer,
+                tenant_db=canonical_audit_db,
+            )
+        canonical_transfers.clear()
 
         logger.info(f"Document {document_id} uploaded successfully to {'B2C' if is_b2c else 'regular'} database")
         
@@ -4690,8 +4777,10 @@ async def upload_pdf(
         }
 
     except HTTPException:
+        await rollback_canonical_transfers(canonical_transfers)
         raise
     except Exception as e:
+        await rollback_canonical_transfers(canonical_transfers)
         logger.error(f"Upload error: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

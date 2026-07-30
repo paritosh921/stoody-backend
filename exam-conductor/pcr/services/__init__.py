@@ -34,6 +34,7 @@ from .solution_cache import SolutionCache
 from .submission_service import SubmissionService
 from .eval_core import EvalCore
 from .full_document_grading import (
+    CanonicalAssetUnavailableError,
     FullDocumentGradingError,
     FullDocumentGradingResult,
     FullDocumentGradingService,
@@ -54,6 +55,7 @@ __all__ = [
     # Evaluation core
     "EvalCore",
     # Submission-level visual grading
+    "CanonicalAssetUnavailableError",
     "FullDocumentGradingError",
     "FullDocumentGradingResult",
     "FullDocumentGradingService",

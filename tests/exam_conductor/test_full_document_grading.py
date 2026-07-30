@@ -1394,7 +1394,7 @@ async def test_same_submission_revision_retry_is_idempotent_after_model_freeze(
 
 
 @pytest.mark.asyncio
-async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
+async def test_explicit_reprocess_creates_a_new_generation_and_auditable_rows(
     monkeypatch,
 ):
     db = _fresh_db()
@@ -1405,6 +1405,7 @@ async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
             "submission_id": "SUB-DOC-1",
             "status": "completed",
             "reprocess_count": 0,
+            "generation_revision": 0,
         }
     )
     module = _module()
@@ -1438,18 +1439,19 @@ async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
     ).to_list(length=10)
     await db["exampen_processing_jobs"].update_one(
         {"job_id": "pcr-job-SUB-DOC-1"},
-        {"$set": {"reprocess_count": 1}},
+        {"$set": {"reprocess_count": 1, "generation_revision": 1}},
     )
 
     second = await service.grade_submission("SUB-DOC-1")
 
-    assert first.run_id == second.run_id
-    assert len(gate.calls) == 1
+    assert first.run_id != second.run_id
+    assert len(gate.calls) == 2
+    assert await db["evalpen_document_grading_runs"].count_documents({}) == 2
     active_rows = await db["evalpen_detected_responses"].find(
         {"submission_id": "SUB-DOC-1", "superseded_at": {"$exists": False}}
     ).to_list(length=10)
     assert len(active_rows) == 2
-    assert all(row["mapping_version_id"].endswith(":r1") for row in active_rows)
+    assert all(row["mapping_version_id"].endswith(":g1") for row in active_rows)
     assert {row["response_id"] for row in first_rows}.isdisjoint(
         {row["response_id"] for row in active_rows}
     )
@@ -1462,7 +1464,7 @@ async def test_explicit_reprocess_reuses_ledger_and_creates_auditable_rows(
     submission = await db["evalpen_submissions"].find_one(
         {"submission_id": "SUB-DOC-1"}
     )
-    assert submission["resumed_grading_run"] is True
+    assert submission["resumed_grading_run"] is False
 
 
 @pytest.mark.asyncio

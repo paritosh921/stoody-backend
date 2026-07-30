@@ -144,6 +144,72 @@ async def test_readiness_accepts_only_evidence_backed_complete_paper():
 
 
 @pytest.mark.asyncio
+async def test_readiness_keeps_committed_result_after_failed_reprocess():
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "document_grading_run_id": "DOCGR-active",
+                "document_grading_materialization_id": "DOCGR-active:g0",
+            }
+        },
+    )
+    await db["exampen_processing_jobs"].update_one(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "status": "failed",
+                "last_error": "candidate generation could not load the paper",
+                "active_result_retained": True,
+            }
+        },
+    )
+
+    report = await assess_submission_readiness(db, "SUB-READY")
+
+    assert report["ready"] is True
+    assert report["active_result_available"] is True
+    assert report["active_result_retained"] is True
+    assert report["processing_status"] == "failed"
+    assert not any(
+        blocker["code"] == "processing_not_completed"
+        for blocker in report["blockers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_readiness_blocks_publication_while_new_generation_is_running():
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "document_grading_run_id": "DOCGR-active",
+                "document_grading_materialization_id": "DOCGR-active:g0",
+            }
+        },
+    )
+    await db["exampen_processing_jobs"].update_one(
+        {"submission_id": "SUB-READY"},
+        {"$set": {"status": "processing", "generation_revision": 1}},
+    )
+
+    report = await assess_submission_readiness(db, "SUB-READY")
+
+    assert report["ready"] is False
+    assert {
+        blocker["code"] for blocker in report["blockers"]
+    } == {"reprocess_in_progress"}
+
+
+@pytest.mark.asyncio
 async def test_readiness_accepts_objective_negative_marking_within_frozen_penalty():
     from services.exampen_submission_readiness import (
         assess_submission_readiness,

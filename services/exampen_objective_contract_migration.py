@@ -432,7 +432,10 @@ async def _commit_objective_contract_migration(
                 },
             }
             if migration_mode == "upgrade_legacy_objective_contract":
-                job_update["$inc"] = {"reprocess_count": 1}
+                job_update["$inc"] = {
+                    "reprocess_count": 1,
+                    "generation_revision": 1,
+                }
             await tenant_db["exampen_processing_jobs"].update_many(
                 {
                     "submission_id": {"$in": submission_ids},

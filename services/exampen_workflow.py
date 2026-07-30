@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
-CURRENT_PCR_PIPELINE_VERSION = 3
+CURRENT_PCR_PIPELINE_VERSION = 4
 FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
@@ -267,6 +267,10 @@ async def ensure_processing_job(
                 "required_processing_path": required_processing_path,
                 "status": "queued",
                 "attempts": 0,
+                "generation_revision": 0,
+                "reprocess_count": 0,
+                "reprocess_state": "initial",
+                "active_result_retained": False,
                 "lease_generation": 0,
                 "created_at": now,
                 "updated_at": now,
@@ -477,6 +481,37 @@ async def reprocess_processing_job(
         "previous_pipeline_version": job.get("pipeline_version"),
         "force_reclaim": current_status == "processing",
     }
+    try:
+        current_generation_revision = int(
+            job.get("generation_revision")
+            if job.get("generation_revision") is not None
+            else job.get("reprocess_count")
+            or 0
+        )
+    except (TypeError, ValueError):
+        current_generation_revision = 0
+    next_generation_revision = max(0, current_generation_revision) + 1
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": str(job.get("submission_id") or "")},
+        {
+            "document_grading_materialization_id": 1,
+            "document_grading_run_id": 1,
+        },
+    )
+    active_materialization_id = str(
+        (submission or {}).get("document_grading_materialization_id") or ""
+    ) or None
+    active_run_id = str(
+        (submission or {}).get("document_grading_run_id") or ""
+    ) or None
+    history_entry.update(
+        {
+            "previous_generation_revision": current_generation_revision,
+            "requested_generation_revision": next_generation_revision,
+            "active_materialization_id_at_request": active_materialization_id,
+            "active_run_id_at_request": active_run_id,
+        }
+    )
     reset = await jobs.update_one(
         reset_filter,
         {
@@ -492,6 +527,14 @@ async def reprocess_processing_job(
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
                 "mapping_pipeline_version": "full-document-visual-v2",
+                "generation_revision": next_generation_revision,
+                "candidate_generation_revision": next_generation_revision,
+                "active_result_at_request": {
+                    "materialization_id": active_materialization_id,
+                    "run_id": active_run_id,
+                },
+                "active_result_retained": False,
+                "reprocess_state": "pending",
                 "attempts": 0,
                 "updated_at": now,
             },
@@ -850,6 +893,11 @@ async def process_pcr_processing_job(
         processing_path = str(
             document_result.processing_path or "full_document_visual"
         )
+        materialization_id = getattr(
+            document_result,
+            "materialization_id",
+            None,
+        )
         finished = await jobs.update_one(
             lease_filter,
             {
@@ -857,6 +905,10 @@ async def process_pcr_processing_job(
                     "status": final_status,
                     "processing_path": processing_path,
                     "document_grading_run_id": document_result.run_id,
+                    "document_grading_materialization_id": materialization_id,
+                    "active_result_materialization_id": materialization_id,
+                    "active_result_retained": False,
+                    "reprocess_state": "succeeded",
                     "segmentation": {
                         "path": processing_path,
                         "page_count": document_result.page_count,
@@ -1377,13 +1429,36 @@ async def mark_processing_job_retryable_error(
         # but must never fence out an active worker.
         query["status"] = {"$ne": "processing"}
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
-    current = await jobs.find_one(query, {"attempts": 1})
+    current = await jobs.find_one(
+        query,
+        {
+            "attempts": 1,
+            "submission_id": 1,
+            "active_result_at_request": 1,
+            "generation_revision": 1,
+            "reprocess_count": 1,
+        },
+    )
     if current is None:
         return False
     attempts = max(0, int(current.get("attempts") or 0))
     now = _now()
     terminal = attempts >= PROCESSING_MAX_AUTOMATIC_ATTEMPTS
     status_value = "failed" if terminal else "retryable_error"
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": str(current.get("submission_id") or "")},
+        {
+            "document_grading_materialization_id": 1,
+            "document_grading_run_id": 1,
+        },
+    )
+    active_materialization_id = str(
+        (submission or {}).get("document_grading_materialization_id") or ""
+    ) or None
+    active_run_id = str(
+        (submission or {}).get("document_grading_run_id") or ""
+    ) or None
+    active_result_retained = bool(active_materialization_id)
     update: Dict[str, Any] = {
         "$set": {
             "status": status_value,
@@ -1393,6 +1468,10 @@ async def mark_processing_job_retryable_error(
                 if isinstance(error, Exception)
                 else "worker_error"
             ),
+            "active_result_retained": active_result_retained,
+            "active_result_materialization_id": active_materialization_id,
+            "active_result_run_id": active_run_id,
+            "reprocess_state": "failed" if terminal else "retrying",
             "updated_at": now,
         },
         "$unset": {"lease_token": "", "lease_expires_at": ""},

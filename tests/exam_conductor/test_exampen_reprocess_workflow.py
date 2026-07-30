@@ -75,6 +75,7 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
                 warning_count=1,
                 processing_path="full_document_visual",
                 run_id="DOCGR-1",
+                materialization_id="DOCGR-1:g0",
                 errors=["Q5 requires teacher review"],
                 review_state="blocked",
                 document_review_required=True,
@@ -103,6 +104,7 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
         {"job_id": "pcr-job-SUB-DOC"}
     )
     assert stored["processing_path"] == "full_document_visual"
+    assert stored["document_grading_materialization_id"] == "DOCGR-1:g0"
     assert stored["evaluation"]["evaluated_count"] == 11
     assert stored["review"]["state"] == "blocked"
     assert stored["last_error"] is None
@@ -261,6 +263,13 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
             "pipeline_version": 1,
         }
     )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-1",
+            "document_grading_run_id": "DOCGR-OLD",
+            "document_grading_materialization_id": "DOCGR-OLD:g0",
+        }
+    )
     task = _RecordedTask()
     monkeypatch.setitem(
         sys.modules,
@@ -281,7 +290,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1", 3)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 4)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
@@ -291,6 +300,13 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     assert stored["mapping_pipeline_version"] == "full-document-visual-v2"
     assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
+    assert stored["generation_revision"] == 1
+    assert stored["candidate_generation_revision"] == 1
+    assert stored["reprocess_state"] == "pending"
+    assert stored["active_result_at_request"] == {
+        "materialization_id": "DOCGR-OLD:g0",
+        "run_id": "DOCGR-OLD",
+    }
     assert stored["reprocess_requested_by"] == "TUT-1"
     assert stored["reprocess_history"] == [
         {
@@ -302,6 +318,10 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
             "previous_last_error": "OCR produced a collapsed full-page response",
             "previous_pipeline_version": 1,
             "force_reclaim": False,
+            "previous_generation_revision": 0,
+            "requested_generation_revision": 1,
+            "active_materialization_id_at_request": "DOCGR-OLD:g0",
+            "active_run_id_at_request": "DOCGR-OLD",
         }
     ]
 
@@ -394,7 +414,7 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 3)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 4)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored
@@ -567,3 +587,51 @@ async def test_worker_error_write_cannot_overwrite_a_newer_lease_owner():
     assert stored["status"] == "retryable_error"
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored
+
+
+@pytest.mark.asyncio
+async def test_failed_candidate_generation_retains_the_committed_result():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        mark_processing_job_retryable_error,
+    )
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-retained",
+            "segmentation_status": "complete",
+            "document_grading_run_id": "DOCGR-active",
+            "document_grading_materialization_id": "DOCGR-active:g0",
+        }
+    )
+    await db[PROCESSING_JOBS_COLLECTION].insert_one(
+        {
+            "job_id": "pcr-job-retained",
+            "submission_id": "SUB-retained",
+            "status": "processing",
+            "attempts": 3,
+            "generation_revision": 1,
+            "lease_token": "candidate-worker",
+        }
+    )
+
+    written = await mark_processing_job_retryable_error(
+        db,
+        "pcr-job-retained",
+        RuntimeError("canonical question paper temporarily unavailable"),
+        expected_lease_token="candidate-worker",
+    )
+
+    assert written is True
+    stored = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "pcr-job-retained"}
+    )
+    assert stored["status"] == "failed"
+    assert stored["reprocess_state"] == "failed"
+    assert stored["active_result_retained"] is True
+    assert stored["active_result_materialization_id"] == "DOCGR-active:g0"
+    submission = await db["evalpen_submissions"].find_one(
+        {"submission_id": "SUB-retained"}
+    )
+    assert submission["document_grading_materialization_id"] == "DOCGR-active:g0"
