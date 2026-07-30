@@ -85,6 +85,24 @@ class _SequenceGate:
         )
 
 
+class _IncompleteGate:
+    async def call(self, model_id: str, prompt: str, caller_id: str, **kwargs: Any):
+        return SimpleNamespace(
+            content='{"ledger_version":"pcr-objective-page-observations-v3"',
+            provider_status="incomplete",
+            incomplete_reason="max_output_tokens",
+            usage=SimpleNamespace(
+                model=model_id,
+                caller=caller_id,
+                input_tokens=4_000,
+                output_tokens=4_500,
+                cache_read_tokens=2_000,
+                total_tokens=8_500,
+                estimated_cost_usd=0.1,
+            ),
+        )
+
+
 async def _seed(db, *, submission_id: str = "SUB-DOC-1") -> None:
     await db["evalpen_submissions"].insert_one(
         {
@@ -506,6 +524,64 @@ def test_objective_output_budget_scales_for_full_omr_and_reasoning():
         question_count=500,
         reasoning_effort="high",
     ) == 20_000
+
+
+@pytest.mark.asyncio
+async def test_objective_incomplete_response_retains_provider_reason_and_model():
+    module = _module()
+    db = _fresh_db()
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": "RUN-TRUNCATED",
+            "submission_id": "SUB-TRUNCATED",
+            "generation_lease_token": "lease-1",
+            "status": "generating",
+        }
+    )
+    service = module.FullDocumentGradingService(
+        db,
+        _IncompleteGate(),
+        model_id="gpt-5.6-sol",
+    )
+
+    with pytest.raises(
+        module.FullDocumentGradingError,
+        match="provider reached max_output_tokens",
+    ):
+        await service._run_objective_answer_ledger(
+            run_id="RUN-TRUNCATED",
+            generation_lease_token="lease-1",
+            existing_run={},
+            submission_id="SUB-TRUNCATED",
+            exam_id="EXAM-TRUNCATED",
+            questions=[
+                {
+                    "question_number": 1,
+                    "question_type": "mcq",
+                    "options": [
+                        {"label": "A", "text": "One"},
+                        {"label": "B", "text": "Two"},
+                    ],
+                }
+            ],
+            student_assets=[_page_asset(module, 1)],
+            model_id="gpt-5.6-sol",
+            temperature=0.1,
+            reasoning_effort="medium",
+            paper_file_hash="paper-hash",
+        )
+
+    trace = await db["evalpen_llm_debug_traces"].find_one(
+        {"run_id": "RUN-TRUNCATED"}
+    )
+    run = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": "RUN-TRUNCATED"}
+    )
+    assert trace["status"] == "incomplete"
+    assert trace["provider_status"] == "incomplete"
+    assert trace["incomplete_reason"] == "max_output_tokens"
+    assert trace["raw_response"].startswith('{"ledger_version"')
+    assert run["model_used"] == "gpt-5.6-sol"
 
 
 @pytest.mark.asyncio
@@ -1413,6 +1489,236 @@ async def test_same_submission_revision_retry_is_idempotent_after_model_freeze(
     assert len(gate.calls) == 1
     assert await db["evalpen_document_grading_runs"].count_documents({}) == 1
     assert await db["evalpen_detected_responses"].count_documents({}) == 2
+
+
+@pytest.mark.asyncio
+async def test_subjective_visual_batch_invalid_json_splits_and_continues(
+    monkeypatch,
+):
+    """A bad second batch must not discard already-saved question grades."""
+
+    db = _fresh_db()
+    await _seed(db)
+    # Expand catalog so default batch size (3) needs multiple calls.
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": f"EXAM-DOC-1::Q{number}",
+                "exam_id": "EXAM-DOC-1",
+                "question_number": number,
+                "question_text": f"Subjective question {number}",
+                "reference_solution": "A correct answer.",
+                "max_marks": 1,
+                "marking_criteria": [
+                    {
+                        "criterion_id": "answer",
+                        "description": "Correct answer",
+                        "max_marks": 1,
+                        "acceptable_evidence": "A correct visible answer.",
+                    }
+                ],
+            }
+            for number in range(3, 7)
+        ]
+    )
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v2",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                }
+            }
+        },
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    assets = [_page_asset(module, 1)]
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda pages: _async_value((assets, sum(len(a.global_bytes) for a in assets))),
+    )
+    monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "3")
+
+    def _mapped(number: int):
+        return {
+            "question_number": number,
+            "attempt_status": "attempted",
+            "confidence": 0.95,
+            "content_type": "TEXT_ONLY",
+            "evidence_regions": [
+                {
+                    "region_id": f"q{number}-text",
+                    "page_number": 1,
+                    "x_start": 50,
+                    "y_start": 50 + number * 20,
+                    "x_end": 400,
+                    "y_end": 80 + number * 20,
+                    "evidence_kind": "handwriting",
+                    "continuation_group": "",
+                    "evidence": f"Work for Q{number}",
+                    "mapping_confidence": 0.95,
+                }
+            ],
+            "mapping_reason": f"Mapped Q{number}",
+            "needs_review": False,
+            "review_reason": "",
+        }
+
+    def _graded(number: int):
+        return {
+            "question_number": number,
+            "confidence": 0.94,
+            "student_answer": f"Answer {number}",
+            "interpretation_hypotheses": [
+                {
+                    "interpretation_id": f"q{number}-primary",
+                    "value": f"Answer {number}",
+                    "confidence": 0.94,
+                    "evidence_region_ids": [f"q{number}-text"],
+                    "ambiguity_notes": "",
+                }
+            ],
+            "visual_semantics": {
+                "summary": "Readable work",
+                "elements": [],
+                "relationships": [],
+                "confidence": 0.9,
+            },
+            "method_analysis": _method_analysis(),
+            "criterion_marks": [
+                {
+                    "criterion_id": "answer" if number > 2 else (
+                        "diagram" if number == 1 else "explain"
+                    ),
+                    "decision": "met",
+                    "confidence": 0.94,
+                    "marks_awarded": 1 if number > 2 else 2,
+                    "rationale": "Visible correct work.",
+                    "evidence": f"Page 1 Q{number}",
+                    "evidence_region_ids": [f"q{number}-text"],
+                    "missing_evidence": "",
+                    "credit_basis": "direct_evidence",
+                }
+            ],
+            "total_score": 1 if number > 2 else 2,
+            "overall_feedback": "OK",
+            "needs_review": False,
+            "review_reason": "",
+        }
+
+    mapping_payload = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "document_review": _document_review(),
+        "questions": [_mapped(n) for n in range(1, 7)],
+        "unassigned_regions": [],
+    }
+    first_batch = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [_graded(1), _graded(2), _graded(3)],
+    }
+    # Second batch fails once as invalid JSON, then succeeds after retry/split.
+    bad_payload = "not-json{"
+    second_ok = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [_graded(4), _graded(5), _graded(6)],
+    }
+
+    class _FlakyGate(_SequenceGate):
+        pass
+
+    # mapping + batch1 success + batch2 invalid + batch2 retry success
+    gate = _FlakyGate([mapping_payload, first_batch, bad_payload, second_ok])
+    # _SequenceGate expects dicts - need to support raw string responses
+    original_call = gate.call
+
+    async def call_with_raw(model_id, prompt, caller_id, **kwargs):
+        if not gate.payloads:
+            raise RuntimeError("no payloads left")
+        payload = gate.payloads.pop(0)
+        gate.calls.append(
+            {"model_id": model_id, "prompt": prompt, "caller_id": caller_id, **kwargs}
+        )
+        if isinstance(payload, str):
+            content = payload
+        else:
+            content = json.dumps(payload)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            content=content,
+            usage=SimpleNamespace(
+                model="gpt-5.1-2025-11-13",
+                caller=caller_id,
+                input_tokens=1000,
+                output_tokens=500,
+                cache_read_tokens=0,
+                total_tokens=1500,
+                estimated_cost_usd=0.01,
+            ),
+        )
+
+    gate.call = call_with_raw  # type: ignore
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+    result = await service.grade_submission("SUB-DOC-1")
+    assert result.handled is True
+    assert result.status == "completed"
+    # All six questions should materialize; none left missing because of one bad batch.
+    assert result.response_count == 6
+    run = await db["evalpen_document_grading_runs"].find_one({"run_id": result.run_id})
+    grades = run["evidence_graph_question_grades"]
+    assert set(grades) >= {"1", "2", "3", "4", "5", "6"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_failed_run_reclaim_on_generation_mismatch():
+    module = _module()
+    db = _fresh_db()
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": "DOCGR-legacy-collision",
+            "submission_id": "SUB-LEGACY",
+            "student_id": "STU-1",
+            "exam_id": "EXAM-1",
+            "status": "failed",
+            "grading_revision": 0,
+            "input_fingerprint": "legacy-input",
+            "generation_error": "old failure",
+        }
+    )
+    existing, token = await module._claim_or_wait_for_run(
+        db,
+        run_id="DOCGR-legacy-collision",
+        input_fingerprint="new-input",
+        generation_fingerprint="new-generation",
+        submission_id="SUB-LEGACY",
+        student_id="STU-1",
+        exam_id="EXAM-1",
+        generation_revision=1,
+        requested_model_id="gpt-5.1",
+        page_count=1,
+        prompt_version="pcr-full-document-visual-v5",
+    )
+    assert existing is None
+    assert token
+    run = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": "DOCGR-legacy-collision"}
+    )
+    assert run["status"] == "generating"
+    assert run["generation_revision"] == 1
+    assert run["generation_fingerprint"] == "new-generation"
+    assert run.get("generation_error") in (None, "")
 
 
 @pytest.mark.asyncio

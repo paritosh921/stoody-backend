@@ -334,6 +334,40 @@ async def read_canonical_asset(
             )
             return None
         return await asyncio.to_thread(candidate.read_bytes)
+
+    # Stale absolute paths sometimes keep a UUID parent folder that was moved
+    # while the file content still exists under the same basename in the
+    # private upload tree. Search only for that exact filename under the
+    # private root so we do not open arbitrary files.
+    basename = Path(str(storage_path or "")).name.strip()
+    if basename and not basename.startswith(".") and len(basename) >= 8:
+        private = Path(settings.UPLOAD_PRIVATE_LOCAL_DIR).resolve(strict=False)
+        if private.is_dir():
+            try:
+                matches = [
+                    path
+                    for path in private.rglob(basename)
+                    if path.is_file()
+                ]
+            except OSError:
+                matches = []
+            # Prefer a unique match so we never guess among different assets.
+            if len(matches) == 1:
+                candidate = matches[0].resolve(strict=False)
+                if private == candidate or private in candidate.parents:
+                    try:
+                        size = candidate.stat().st_size
+                    except OSError:
+                        size = 0
+                    if 0 < size <= max_bytes:
+                        logger.warning(
+                            "Resolved stale canonical path %s via unique basename "
+                            "match %s",
+                            storage_path,
+                            candidate,
+                        )
+                        return await asyncio.to_thread(candidate.read_bytes)
+
     logger.error(
         "Canonical asset is absent from every approved local candidate: %s",
         storage_path,

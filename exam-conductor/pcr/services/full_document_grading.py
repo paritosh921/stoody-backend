@@ -102,6 +102,9 @@ _DEFAULT_REASONING_EFFORT = "medium"
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
 _MAX_REQUEST_PAYLOAD_BYTES = 45 * 1024 * 1024
+# Subjective visual batches: smaller groups reduce truncated/invalid JSON.
+_DEFAULT_VISUAL_QUESTIONS_PER_BATCH = 3
+_VISUAL_GRADE_BATCH_ATTEMPTS = 2
 _A4_WIDTH_MM = 210.0
 _A4_HEIGHT_MM = 297.0
 
@@ -924,16 +927,19 @@ class FullDocumentGradingService:
                         str(getattr(response, "incomplete_reason", "") or "").strip()
                         or None
                     )
-                    payload = _parse_json_object(raw)
-                    trace_status = (
-                        "completed"
-                        if payload is not None
-                        else (
-                            "incomplete"
-                            if incomplete_reason or provider_status == "incomplete"
-                            else "invalid_response"
+                    # Provider incomplete status always wins over partial JSON
+                    # repair — a truncated stream is never a finished ledger.
+                    if (
+                        incomplete_reason == "max_output_tokens"
+                        or provider_status == "incomplete"
+                    ):
+                        payload = None
+                        trace_status = "incomplete"
+                    else:
+                        payload = _parse_json_object(raw)
+                        trace_status = (
+                            "completed" if payload is not None else "invalid_response"
                         )
-                    )
                     completed_at = datetime.now(timezone.utc)
                     await self._db[_LLM_DEBUG_TRACES_COLLECTION].update_one(
                         {"trace_id": trace_id},
@@ -1227,132 +1233,29 @@ class FullDocumentGradingService:
         missing_numbers = [
             number for number in attempted_numbers if str(number) not in saved_grades
         ]
-        for batch_index, batch_numbers in enumerate(
-            _question_batches(missing_numbers),
-            start=1,
-        ):
-            batch_questions = [
-                question_by_number[number]
-                for number in batch_numbers
-                if number in question_by_number
-            ]
-            grading_input, crop_bytes = _build_question_grading_input(
-                static_content=static_content,
-                questions=batch_questions,
-                mappings=mapping.questions,
+        batch_index = 0
+        for batch_numbers in _question_batches(missing_numbers):
+            batch_index += 1
+            resolved_model = await self._grade_evidence_batch_resilient(
+                batch_numbers=batch_numbers,
+                batch_index=batch_index,
+                question_by_number=question_by_number,
+                mapping_questions=mapping.questions,
                 student_assets=student_assets,
-            )
-            if len(paper_bytes) + len(solution_bytes or b"") + crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
-                raise FullDocumentGradingError(
-                    "Question-specific visual evidence exceeds the request size limit"
-                )
-            grading_response = await self._gate.call(
+                static_content=static_content,
+                paper_bytes=paper_bytes,
+                solution_bytes=solution_bytes,
                 model_id=resolved_model,
-                prompt="",
-                caller_id=_CALLER_ID,
-                responses_input=grading_input,
-                json_schema=question_grading_schema(),
-                prompt_cache_key=cache_key,
-                reasoning_effort=reasoning_effort,
                 temperature=temperature,
-                max_output_tokens=min(
-                    20_000,
-                    max(4_000, 1_200 * len(batch_questions)),
-                ),
-                metadata={
-                    "pcr_stage": "question_visual_grading",
-                    "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
-                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
-                    "submission_id": submission_id,
-                    "exam_id": exam_id,
-                    "question_numbers": batch_numbers,
-                    "batch_index": batch_index,
-                    "run_id": run_id,
-                },
+                reasoning_effort=reasoning_effort,
+                cache_key=cache_key,
+                submission_id=submission_id,
+                exam_id=exam_id,
+                run_id=run_id,
+                generation_lease_token=generation_lease_token,
+                saved_grades=saved_grades,
+                saved_usages=saved_usages,
             )
-            grading_raw = str(getattr(grading_response, "content", "") or "")
-            grading_payload = _parse_json_object(grading_raw)
-            if grading_payload is None:
-                raise FullDocumentGradingError(
-                    "Question visual grader returned invalid structured output"
-                )
-            allowed = set(batch_numbers)
-            returned: Dict[str, Dict[str, Any]] = {}
-            unexpected_numbers: set[int] = set()
-            duplicate_numbers: set[int] = set()
-            if (
-                grading_payload.get("evidence_graph_version")
-                != EVIDENCE_GRAPH_VERSION
-            ):
-                raise FullDocumentGradingError(
-                    "Question visual grader returned the wrong evidence contract"
-                )
-            for item in grading_payload.get("questions") or []:
-                if not isinstance(item, dict):
-                    continue
-                number = _positive_int(item.get("question_number"))
-                if number not in allowed:
-                    if number is not None:
-                        unexpected_numbers.add(number)
-                    continue
-                if str(number) in returned:
-                    duplicate_numbers.add(number)
-                    continue
-                returned[str(number)] = dict(item)
-            if unexpected_numbers or duplicate_numbers:
-                reasons: List[str] = []
-                if unexpected_numbers:
-                    reasons.append(
-                        "unexpected "
-                        + ", ".join(
-                            f"Q{number}" for number in sorted(unexpected_numbers)
-                        )
-                    )
-                if duplicate_numbers:
-                    reasons.append(
-                        "duplicate "
-                        + ", ".join(
-                            f"Q{number}" for number in sorted(duplicate_numbers)
-                        )
-                    )
-                raise FullDocumentGradingError(
-                    "Question visual grader violated the requested batch: "
-                    + "; ".join(reasons)
-                )
-            if set(map(int, returned)) != allowed:
-                missing = sorted(allowed - set(map(int, returned)))
-                raise FullDocumentGradingError(
-                    "Question visual grader omitted requested question(s): "
-                    + ", ".join(f"Q{number}" for number in missing)
-                )
-            batch_usage = _usage_dict(
-                grading_response,
-                fallback_model=resolved_model,
-            )
-            resolved_model = str(batch_usage.get("model") or resolved_model)
-            saved_grades.update(returned)
-            usage_key = "questions-" + "-".join(
-                str(number) for number in sorted(allowed)
-            )
-            saved_usages[usage_key] = batch_usage
-            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
-                {
-                    "run_id": run_id,
-                    "generation_lease_token": generation_lease_token,
-                },
-                {
-                    "$set": {
-                        "evidence_graph_question_grades": saved_grades,
-                        "evidence_graph_question_grade_usages": saved_usages,
-                        "model_used": resolved_model,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                },
-            )
-            if checkpoint.matched_count != 1:
-                raise FullDocumentGradingError(
-                    "Submission grading ownership expired while saving question grades"
-                )
 
         final_payload = merge_mapping_and_grading(
             mapping,
@@ -1378,6 +1281,336 @@ class FullDocumentGradingService:
             separators=(",", ":"),
         )
         return final_payload, raw_llm, usage
+
+    async def _grade_evidence_batch_resilient(
+        self,
+        *,
+        batch_numbers: Sequence[int],
+        batch_index: int,
+        question_by_number: Mapping[int, Dict[str, Any]],
+        mapping_questions: Mapping[int, Dict[str, Any]],
+        student_assets: List[_StudentPageAsset],
+        static_content: List[Dict[str, Any]],
+        paper_bytes: bytes,
+        solution_bytes: Optional[bytes],
+        model_id: str,
+        temperature: float,
+        reasoning_effort: str,
+        cache_key: str,
+        submission_id: str,
+        exam_id: str,
+        run_id: str,
+        generation_lease_token: str,
+        saved_grades: Dict[str, Any],
+        saved_usages: Dict[str, Any],
+        depth: int = 0,
+    ) -> str:
+        """Grade one question batch with retry and split-on-failure recovery.
+
+        Subjective visual grading frequently returns truncated or non-JSON
+        payloads for large batches.  Retry once, then split the batch, and
+        finally mark a single unrecoverable question unresolved so the rest of
+        the student copy can still finish.
+        """
+
+        numbers = [int(number) for number in batch_numbers if int(number) in question_by_number]
+        if not numbers:
+            return model_id
+        # Skip already-checkpointed questions (resume after partial failure).
+        numbers = [number for number in numbers if str(number) not in saved_grades]
+        if not numbers:
+            return model_id
+
+        last_error = "Question visual grader returned invalid structured output"
+        resolved_model = model_id
+        for attempt in range(1, _VISUAL_GRADE_BATCH_ATTEMPTS + 1):
+            try:
+                returned, batch_usage, resolved_model = await self._call_question_visual_grader(
+                    batch_numbers=numbers,
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    question_by_number=question_by_number,
+                    mapping_questions=mapping_questions,
+                    student_assets=student_assets,
+                    static_content=static_content,
+                    paper_bytes=paper_bytes,
+                    solution_bytes=solution_bytes,
+                    model_id=resolved_model,
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    cache_key=cache_key,
+                    submission_id=submission_id,
+                    exam_id=exam_id,
+                    run_id=run_id,
+                )
+                saved_grades.update(returned)
+                usage_key = "questions-" + "-".join(
+                    str(number) for number in sorted(numbers)
+                )
+                if attempt > 1:
+                    usage_key = f"{usage_key}-retry{attempt}"
+                saved_usages[usage_key] = batch_usage
+                checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                    {
+                        "run_id": run_id,
+                        "generation_lease_token": generation_lease_token,
+                    },
+                    {
+                        "$set": {
+                            "evidence_graph_question_grades": saved_grades,
+                            "evidence_graph_question_grade_usages": saved_usages,
+                            "model_used": resolved_model,
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                )
+                if checkpoint.matched_count != 1:
+                    raise FullDocumentGradingError(
+                        "Submission grading ownership expired while saving question grades"
+                    )
+                return resolved_model
+            except FullDocumentGradingError as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "Subjective visual grade batch failed submission=%s batch=%s "
+                    "attempt=%s questions=%s error=%s",
+                    submission_id,
+                    batch_index,
+                    attempt,
+                    numbers,
+                    last_error[:240],
+                )
+                if attempt < _VISUAL_GRADE_BATCH_ATTEMPTS:
+                    continue
+                break
+
+        # Persistent failure: split multi-question batches so one bad crop/schema
+        # response cannot discard the whole student copy.
+        if len(numbers) > 1:
+            mid = max(1, len(numbers) // 2)
+            left = numbers[:mid]
+            right = numbers[mid:]
+            logger.info(
+                "Splitting subjective visual grade batch submission=%s %s -> %s | %s",
+                submission_id,
+                numbers,
+                left,
+                right,
+            )
+            resolved_model = await self._grade_evidence_batch_resilient(
+                batch_numbers=left,
+                batch_index=batch_index,
+                question_by_number=question_by_number,
+                mapping_questions=mapping_questions,
+                student_assets=student_assets,
+                static_content=static_content,
+                paper_bytes=paper_bytes,
+                solution_bytes=solution_bytes,
+                model_id=resolved_model,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                cache_key=cache_key,
+                submission_id=submission_id,
+                exam_id=exam_id,
+                run_id=run_id,
+                generation_lease_token=generation_lease_token,
+                saved_grades=saved_grades,
+                saved_usages=saved_usages,
+                depth=depth + 1,
+            )
+            resolved_model = await self._grade_evidence_batch_resilient(
+                batch_numbers=right,
+                batch_index=batch_index,
+                question_by_number=question_by_number,
+                mapping_questions=mapping_questions,
+                student_assets=student_assets,
+                static_content=static_content,
+                paper_bytes=paper_bytes,
+                solution_bytes=solution_bytes,
+                model_id=resolved_model,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                cache_key=cache_key,
+                submission_id=submission_id,
+                exam_id=exam_id,
+                run_id=run_id,
+                generation_lease_token=generation_lease_token,
+                saved_grades=saved_grades,
+                saved_usages=saved_usages,
+                depth=depth + 1,
+            )
+            return resolved_model
+
+        # Single question still failing: record unresolved and continue.
+        number = numbers[0]
+        saved_grades[str(number)] = _unresolved_visual_grade_item(
+            number,
+            reason=(
+                "Question visual grader failed after retries: "
+                + last_error[:300]
+            ),
+        )
+        usage_key = f"questions-{number}-failed"
+        saved_usages[usage_key] = {
+            "model": resolved_model,
+            "caller": _CALLER_ID,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "error": last_error[:300],
+        }
+        checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+            {
+                "run_id": run_id,
+                "generation_lease_token": generation_lease_token,
+            },
+            {
+                "$set": {
+                    "evidence_graph_question_grades": saved_grades,
+                    "evidence_graph_question_grade_usages": saved_usages,
+                    "model_used": resolved_model,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if checkpoint.matched_count != 1:
+            raise FullDocumentGradingError(
+                "Submission grading ownership expired while saving question grades"
+            )
+        logger.error(
+            "Subjective visual grade left Q%s unresolved after retries submission=%s",
+            number,
+            submission_id,
+        )
+        return resolved_model
+
+    async def _call_question_visual_grader(
+        self,
+        *,
+        batch_numbers: Sequence[int],
+        batch_index: int,
+        attempt: int,
+        question_by_number: Mapping[int, Dict[str, Any]],
+        mapping_questions: Mapping[int, Dict[str, Any]],
+        student_assets: List[_StudentPageAsset],
+        static_content: List[Dict[str, Any]],
+        paper_bytes: bytes,
+        solution_bytes: Optional[bytes],
+        model_id: str,
+        temperature: float,
+        reasoning_effort: str,
+        cache_key: str,
+        submission_id: str,
+        exam_id: str,
+        run_id: str,
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any], str]:
+        batch_questions = [
+            question_by_number[number]
+            for number in batch_numbers
+            if number in question_by_number
+        ]
+        if not batch_questions:
+            return {}, {}, model_id
+        grading_input, crop_bytes = _build_question_grading_input(
+            static_content=static_content,
+            questions=batch_questions,
+            mappings=mapping_questions,
+            student_assets=student_assets,
+        )
+        if len(paper_bytes) + len(solution_bytes or b"") + crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+            raise FullDocumentGradingError(
+                "Question-specific visual evidence exceeds the request size limit"
+            )
+        # Larger per-question budget on retries when the first response truncated.
+        per_question = 1_600 if attempt > 1 else 1_400
+        max_output_tokens = min(
+            24_000,
+            max(6_000, per_question * len(batch_questions)),
+        )
+        grading_response = await self._gate.call(
+            model_id=model_id,
+            prompt="",
+            caller_id=_CALLER_ID,
+            responses_input=grading_input,
+            json_schema=question_grading_schema(),
+            prompt_cache_key=cache_key,
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            metadata={
+                "pcr_stage": "question_visual_grading",
+                "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
+                "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
+                "submission_id": submission_id,
+                "exam_id": exam_id,
+                "question_numbers": list(batch_numbers),
+                "batch_index": batch_index,
+                "attempt": attempt,
+                "run_id": run_id,
+            },
+        )
+        grading_raw = str(getattr(grading_response, "content", "") or "")
+        provider_status = str(
+            getattr(grading_response, "provider_status", "") or ""
+        ).strip()
+        incomplete_reason = str(
+            getattr(grading_response, "incomplete_reason", "") or ""
+        ).strip()
+        if incomplete_reason == "max_output_tokens" or provider_status == "incomplete":
+            raise FullDocumentGradingError(
+                "Question visual grader response was incomplete"
+                + (f" ({incomplete_reason})" if incomplete_reason else "")
+            )
+        grading_payload = _parse_json_object(grading_raw)
+        if grading_payload is None:
+            raise FullDocumentGradingError(
+                "Question visual grader returned invalid structured output"
+            )
+        allowed = {int(number) for number in batch_numbers}
+        returned: Dict[str, Dict[str, Any]] = {}
+        unexpected_numbers: set[int] = set()
+        duplicate_numbers: set[int] = set()
+        if grading_payload.get("evidence_graph_version") != EVIDENCE_GRAPH_VERSION:
+            raise FullDocumentGradingError(
+                "Question visual grader returned the wrong evidence contract"
+            )
+        for item in grading_payload.get("questions") or []:
+            if not isinstance(item, dict):
+                continue
+            number = _positive_int(item.get("question_number"))
+            if number not in allowed:
+                if number is not None:
+                    unexpected_numbers.add(number)
+                continue
+            if str(number) in returned:
+                duplicate_numbers.add(number)
+                continue
+            returned[str(number)] = dict(item)
+        if unexpected_numbers or duplicate_numbers:
+            reasons: List[str] = []
+            if unexpected_numbers:
+                reasons.append(
+                    "unexpected "
+                    + ", ".join(f"Q{number}" for number in sorted(unexpected_numbers))
+                )
+            if duplicate_numbers:
+                reasons.append(
+                    "duplicate "
+                    + ", ".join(f"Q{number}" for number in sorted(duplicate_numbers))
+                )
+            raise FullDocumentGradingError(
+                "Question visual grader violated the requested batch: "
+                + "; ".join(reasons)
+            )
+        if set(map(int, returned)) != allowed:
+            missing = sorted(allowed - set(map(int, returned)))
+            raise FullDocumentGradingError(
+                "Question visual grader omitted requested question(s): "
+                + ", ".join(f"Q{number}" for number in missing)
+            )
+        batch_usage = _usage_dict(grading_response, fallback_model=model_id)
+        resolved_model = str(batch_usage.get("model") or model_id)
+        return returned, batch_usage, resolved_model
 
     async def _materialize(
         self,
@@ -1829,11 +2062,80 @@ async def _claim_or_wait_for_run(
         or (existing or {}).get("input_fingerprint")
         or ""
     )
-    if existing is not None and (
-        str(existing.get("submission_id") or "") != submission_id
-        or existing_revision != generation_revision
-        or existing_generation_fingerprint != generation_fingerprint
-    ):
+    existing_submission = str((existing or {}).get("submission_id") or "")
+    if existing is not None and existing_submission and existing_submission != submission_id:
+        raise FullDocumentGradingError(
+            "Submission grading run ownership does not match the requested generation"
+        )
+    # Legacy rows used input_fingerprint as run_id and lacked generation_*.
+    # When reprocess bumps generation_revision, the same run_id can collide with
+    # a failed/expired row from an earlier generation. Reclaim that terminal row
+    # for the new generation instead of looping on ownership errors forever.
+    identity_mismatch = existing is not None and (
+        existing_revision != generation_revision
+        or (
+            bool(existing_generation_fingerprint)
+            and existing_generation_fingerprint != generation_fingerprint
+        )
+    )
+    if identity_mismatch:
+        status = str((existing or {}).get("status") or "")
+        reclaimable = status in {"failed", "generating"}
+        lease_expired = False
+        expires_at = (existing or {}).get("generation_lease_expires_at")
+        if expires_at is not None:
+            try:
+                if getattr(expires_at, "tzinfo", None) is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                lease_expired = expires_at <= now
+            except Exception:
+                lease_expired = True
+        # Never silently overwrite a completed generation on a run_id collision.
+        if reclaimable or (status == "generating" and lease_expired):
+            reclaimed_legacy = await collection.update_one(
+                {"run_id": run_id, "submission_id": submission_id},
+                {
+                    "$set": {
+                        "status": "generating",
+                        "student_id": student_id,
+                        "exam_id": exam_id,
+                        "grading_revision": generation_revision,
+                        "generation_revision": generation_revision,
+                        "generation_fingerprint": generation_fingerprint,
+                        "prompt_version": prompt_version,
+                        "requested_model_id": requested_model_id,
+                        "input_fingerprint": input_fingerprint,
+                        "page_count": page_count,
+                        "generation_lease_token": lease_token,
+                        "generation_lease_expires_at": lease_expires_at,
+                        "generation_error": None,
+                        "updated_at": now,
+                    },
+                    "$unset": {
+                        "validated_payload": "",
+                        "raw_llm_response": "",
+                        "result": "",
+                        "token_usage": "",
+                        "completed_at": "",
+                        "evidence_graph_mapping": "",
+                        "evidence_graph_mapping_raw": "",
+                        "evidence_graph_mapping_usage": "",
+                        "evidence_graph_question_grades": "",
+                        "evidence_graph_question_grade_usages": "",
+                    },
+                },
+            )
+            if reclaimed_legacy.matched_count == 1:
+                logger.warning(
+                    "Reclaimed legacy grading run_id=%s for submission=%s "
+                    "generation_revision=%s (was revision=%s status=%s)",
+                    run_id,
+                    submission_id,
+                    generation_revision,
+                    existing_revision,
+                    (existing or {}).get("status"),
+                )
+                return None, lease_token
         raise FullDocumentGradingError(
             "Submission grading run ownership does not match the requested generation"
         )
@@ -2659,13 +2961,48 @@ def _multistage_system_instructions() -> str:
 def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
     try:
         configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
+            os.getenv(
+                "PCR_VISUAL_QUESTIONS_PER_BATCH",
+                str(_DEFAULT_VISUAL_QUESTIONS_PER_BATCH),
+            )
+            or _DEFAULT_VISUAL_QUESTIONS_PER_BATCH
         )
     except (TypeError, ValueError):
-        configured = 6
+        configured = _DEFAULT_VISUAL_QUESTIONS_PER_BATCH
     size = max(1, min(10, configured))
     numbers = [int(number) for number in question_numbers]
     return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+
+
+def _unresolved_visual_grade_item(question_number: int, *, reason: str) -> Dict[str, Any]:
+    """Placeholder grade so a single bad model call cannot fail the whole copy."""
+
+    return {
+        "question_number": int(question_number),
+        "confidence": 0.0,
+        "student_answer": "",
+        "interpretation_hypotheses": [],
+        "visual_semantics": {
+            "summary": "",
+            "elements": [],
+            "relationships": [],
+            "confidence": 0,
+        },
+        "method_analysis": {
+            "detected_method": "",
+            "method_classification": "unresolved",
+            "method_validity": "unresolved",
+            "confidence": 0.0,
+            "explanation": reason[:500],
+            "error_carried_forward": "not_applicable",
+            "error_carried_forward_reason": "",
+        },
+        "criterion_marks": [],
+        "total_score": 0,
+        "overall_feedback": "Automatic visual grading failed for this question.",
+        "needs_review": True,
+        "review_reason": reason[:500],
+    }
 
 
 def _build_question_grading_input(
@@ -4290,16 +4627,68 @@ def _text_coverage_for_type(content_type: str) -> float:
 
 
 def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    cleaned = raw.strip()
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
     if cleaned.startswith("```"):
         cleaned = cleaned.strip("`")
         if cleaned.startswith("json"):
             cleaned = cleaned[4:].lstrip()
-    try:
-        parsed = json.loads(cleaned)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    candidates = [cleaned]
+    # Extract the outermost JSON object when the model wraps prose around it.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            repaired = _repair_truncated_json_object(candidate)
+            if repaired is None:
+                continue
+            try:
+                parsed = json.loads(repaired)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _repair_truncated_json_object(raw: str) -> Optional[str]:
+    """Best-effort close of truncated JSON objects from long visual grades.
+
+    Only runs when the body already closed at least one nested structure, so a
+    half-written top-level object like ``{"ledger_version":"x"`` is not
+    falsely accepted as complete.
+    """
+
+    text = str(raw or "").strip()
+    if not text.startswith("{"):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    # Only attempt when the payload looks truncated mid-object.
+    if text.endswith("}"):
+        return None
+    # Require some already-closed structure so repair is not inventing a
+    # finished document from a short prefix.
+    if "}" not in text and "]" not in text:
+        return None
+    open_braces = text.count("{") - text.count("}")
+    open_brackets = text.count("[") - text.count("]")
+    if open_braces <= 0 and open_brackets <= 0:
+        return None
+    # Drop a trailing incomplete key/value fragment after the last comma.
+    last_comma = text.rfind(",")
+    last_brace = max(text.rfind("}"), text.rfind("]"))
+    if last_comma > last_brace:
+        text = text[:last_comma]
+    text = text.rstrip().rstrip(",")
+    open_braces = text.count("{") - text.count("}")
+    open_brackets = text.count("[") - text.count("]")
+    if open_braces < 0 or open_brackets < 0:
+        return None
+    return text + ("]" * open_brackets) + ("}" * open_braces)
 
 
 def _input_fingerprint(
