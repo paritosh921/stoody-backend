@@ -1,9 +1,10 @@
 """Submission-level visual grading for PCR answer copies.
 
 This is the primary camera/PDF path for papers where handwriting, diagrams,
-tables, and answer ownership cannot safely be reduced to OCR text first.  One
-GPT-5 Responses request receives the immutable question paper, the teacher's
-uploaded solution document (when present), and every canonical student page.
+tables, and answer ownership cannot safely be reduced to OCR text first.
+Subjective papers use the full visual evidence graph. Objective papers use one
+compact Responses request per canonical student page and are scored
+deterministically after answer transcription.
 
 Deterministic code does not decide what the handwriting means.  It validates
 the model's evidence ledger against immutable question IDs, page bounds, and
@@ -28,6 +29,16 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from pymongo.errors import DuplicateKeyError
+from services.objective_answer_ledger_contract import (
+    OBJECTIVE_LEDGER_VERSION,
+    OBJECTIVE_PAPER_CONTEXT_VERSION,
+    OBJECTIVE_PROMPT_VERSION,
+    all_questions_are_objective,
+    merge_objective_page_ledgers,
+    objective_extraction_catalog,
+    objective_page_observation_schema,
+    objective_reader_instructions,
+)
 from services.objective_scoring_service import (
     ObjectiveScoringContractError,
     score_objective_response,
@@ -61,8 +72,13 @@ from .visual_evidence_graph import (
 logger = logging.getLogger(__name__)
 
 _PROMPT_VERSION = "pcr-full-document-visual-v4"
-_SUPPORTED_PROMPT_VERSIONS = {_PROMPT_VERSION, _EVIDENCE_GRAPH_PROMPT_VERSION}
+_SUPPORTED_PROMPT_VERSIONS = {
+    _PROMPT_VERSION,
+    _EVIDENCE_GRAPH_PROMPT_VERSION,
+    OBJECTIVE_PROMPT_VERSION,
+}
 _RUNS_COLLECTION = "evalpen_document_grading_runs"
+_LLM_DEBUG_TRACES_COLLECTION = "evalpen_llm_debug_traces"
 _PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 _CALLER_ID = "pcr_eval_core"
 _AUTO_ACCEPT_CONFIDENCE = 0.80
@@ -102,6 +118,7 @@ class FullDocumentGradingResult:
     evaluated_count: int = 0
     blocked_count: int = 0
     warning_count: int = 0
+    processing_path: str = "full_document_visual"
     run_id: Optional[str] = None
     errors: List[str] = field(default_factory=list)
     document_review_required: bool = False
@@ -153,6 +170,7 @@ class _StudentPageAsset:
     original_bytes: bytes
     global_bytes: bytes
     global_media_type: str
+    original_media_type: str = "image/jpeg"
 
 
 class FullDocumentGradingService:
@@ -209,6 +227,7 @@ class FullDocumentGradingService:
         )
         canonical_visual_required = _paper_requires_canonical_visual(paper_version)
         evidence_graph_required = _paper_requires_evidence_graph(paper_version)
+        objective_ledger_required = _paper_requires_objective_ledger(paper_version)
         if not _feature_enabled():
             if canonical_visual_required:
                 raise FullDocumentGradingError(
@@ -220,12 +239,17 @@ class FullDocumentGradingService:
                 submission_id=submission_id,
                 skipped_reason="Full-document visual grading is disabled for a legacy exam",
             )
+
         grading_contract = dict(exam.get("pcr_grading_contract") or {})
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
         prompt_version = (
-            _EVIDENCE_GRAPH_PROMPT_VERSION
-            if evidence_graph_required
-            else _PROMPT_VERSION
+            OBJECTIVE_PROMPT_VERSION
+            if objective_ledger_required
+            else (
+                _EVIDENCE_GRAPH_PROMPT_VERSION
+                if evidence_graph_required
+                else _PROMPT_VERSION
+            )
         )
         if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
             raise FullDocumentGradingError(
@@ -242,11 +266,24 @@ class FullDocumentGradingService:
                 "contracts student by student."
             )
         model_id = str(
-            grading_contract.get("model_id") or self._model_id
+            grading_contract.get("model_id")
+            or (
+                os.getenv(
+                    "PCR_OBJECTIVE_GRADING_MODEL",
+                    "gpt-5.6-sol",
+                ).strip()
+                if objective_ledger_required
+                else self._model_id
+            )
         ).strip()
         temperature = _contract_temperature(grading_contract)
         reasoning_effort = str(
-            grading_contract.get("reasoning_effort") or _DEFAULT_REASONING_EFFORT
+            grading_contract.get("reasoning_effort")
+            or (
+                os.getenv("PCR_OBJECTIVE_REASONING_EFFORT", "medium")
+                if objective_ledger_required
+                else _DEFAULT_REASONING_EFFORT
+            )
         ).strip().lower()
         if not _is_openai_visual_model(model_id):
             if canonical_visual_required:
@@ -275,6 +312,11 @@ class FullDocumentGradingService:
             raise FullDocumentGradingError(
                 "Immutable PCR question catalog is invalid: "
                 + "; ".join(catalog_errors[:10])
+            )
+        if objective_ledger_required and not all_questions_are_objective(questions):
+            raise FullDocumentGradingError(
+                "The immutable paper is locked to objective answer-ledger grading, "
+                "but its question catalog contains a non-objective question"
             )
         if temperature is None:
             temperature = _grading_temperature(questions)
@@ -334,7 +376,11 @@ class FullDocumentGradingService:
             str(document.get("answer_sheet_path") or ""),
             expected_sha256=document.get("answer_sheet_sha256"),
         )
-        if len(paper_bytes) + len(solution_bytes or b"") > _MAX_STATIC_PDF_BYTES:
+        if (
+            not objective_ledger_required
+            and len(paper_bytes) + len(solution_bytes or b"")
+            > _MAX_STATIC_PDF_BYTES
+        ):
             raise FullDocumentGradingError(
                 "Question paper and teacher solution exceed the document-input size limit"
             )
@@ -387,6 +433,13 @@ class FullDocumentGradingService:
         await self._db[_RUNS_COLLECTION].create_index(
             "run_id", unique=True, name="uniq_document_grading_run"
         )
+        await self._db[_LLM_DEBUG_TRACES_COLLECTION].create_index(
+            "trace_id", unique=True, name="uniq_llm_debug_trace"
+        )
+        await self._db[_LLM_DEBUG_TRACES_COLLECTION].create_index(
+            [("submission_id", 1), ("run_id", 1), ("page_number", 1)],
+            name="submission_llm_debug_trace",
+        )
         existing_run = await self._db[_RUNS_COLLECTION].find_one({"run_id": run_id})
         resumed_grading_run = False
         if existing_run and existing_run.get("status") == "completed":
@@ -436,18 +489,28 @@ class FullDocumentGradingService:
                     "The submission grading run could not acquire generation ownership"
                 )
             student_assets: Optional[List[_StudentPageAsset]] = None
-            if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
+            if prompt_version in {
+                _EVIDENCE_GRAPH_PROMPT_VERSION,
+                OBJECTIVE_PROMPT_VERSION,
+            }:
                 student_assets, student_image_bytes = await _student_page_assets(
                     answer_pages
                 )
-                student_content = _student_content_from_assets(student_assets)
+                student_content = (
+                    _student_content_from_assets(student_assets)
+                    if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
+                    else []
+                )
             else:
                 student_content, student_image_bytes = await _student_copy_content(
                     answer_pages
                 )
             if (
-                len(paper_bytes)
-                + len(solution_bytes or b"")
+                (
+                    0
+                    if prompt_version == OBJECTIVE_PROMPT_VERSION
+                    else len(paper_bytes) + len(solution_bytes or b"")
+                )
                 + student_image_bytes
                 > _MAX_REQUEST_PAYLOAD_BYTES
             ):
@@ -456,7 +519,26 @@ class FullDocumentGradingService:
                     "request size limit"
                 )
             try:
-                if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
+                if prompt_version == OBJECTIVE_PROMPT_VERSION:
+                    raw_payload, raw_llm, usage = (
+                        await self._run_objective_answer_ledger(
+                            run_id=run_id,
+                            generation_lease_token=generation_lease_token,
+                            existing_run=await self._db[_RUNS_COLLECTION].find_one(
+                                {"run_id": run_id}
+                            ),
+                            submission_id=submission_id,
+                            exam_id=exam_id,
+                            questions=questions,
+                            student_assets=student_assets or [],
+                            model_id=model_id,
+                            temperature=temperature,
+                            reasoning_effort=reasoning_effort,
+                            paper_file_hash=paper_file_hash,
+                        )
+                    )
+                    gate_response = None
+                elif prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
                     raw_payload, raw_llm, usage = await self._run_evidence_graph(
                         run_id=run_id,
                         generation_lease_token=generation_lease_token,
@@ -523,23 +605,20 @@ class FullDocumentGradingService:
                             "run_id": run_id,
                         },
                     )
+            except asyncio.CancelledError:
+                await _fail_generation_run(
+                    self._db,
+                    run_id=run_id,
+                    generation_lease_token=generation_lease_token,
+                    error="Worker shutdown interrupted model generation",
+                )
+                raise
             except Exception as exc:
-                await self._db[_RUNS_COLLECTION].update_one(
-                    {
-                        "run_id": run_id,
-                        "generation_lease_token": generation_lease_token,
-                    },
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "generation_error": str(exc)[:500],
-                            "updated_at": datetime.now(timezone.utc),
-                        },
-                        "$unset": {
-                            "generation_lease_token": "",
-                            "generation_lease_expires_at": "",
-                        },
-                    },
+                await _fail_generation_run(
+                    self._db,
+                    run_id=run_id,
+                    generation_lease_token=generation_lease_token,
+                    error=exc,
                 )
                 raise FullDocumentGradingError(
                     f"Full-document model request failed: {str(exc)[:400]}"
@@ -549,6 +628,12 @@ class FullDocumentGradingService:
                 raw_llm = str(getattr(gate_response, "content", "") or "")
                 raw_payload = _parse_json_object(raw_llm)
                 if raw_payload is None:
+                    await _fail_generation_run(
+                        self._db,
+                        run_id=run_id,
+                        generation_lease_token=generation_lease_token,
+                        error="Full-document model returned an invalid evidence ledger",
+                    )
                     raise FullDocumentGradingError(
                         "Full-document model returned an invalid evidence ledger"
                     )
@@ -563,22 +648,11 @@ class FullDocumentGradingService:
                     prompt_version=prompt_version,
                 )
             except Exception as exc:
-                await self._db[_RUNS_COLLECTION].update_one(
-                    {
-                        "run_id": run_id,
-                        "generation_lease_token": generation_lease_token,
-                    },
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "generation_error": str(exc)[:500],
-                            "updated_at": datetime.now(timezone.utc),
-                        },
-                        "$unset": {
-                            "generation_lease_token": "",
-                            "generation_lease_expires_at": "",
-                        },
-                    },
+                await _fail_generation_run(
+                    self._db,
+                    run_id=run_id,
+                    generation_lease_token=generation_lease_token,
+                    error=exc,
                 )
                 raise
             now = datetime.now(timezone.utc)
@@ -654,6 +728,7 @@ class FullDocumentGradingService:
                         "evaluated_count": result.evaluated_count,
                         "blocked_count": result.blocked_count,
                         "warning_count": result.warning_count,
+                        "processing_path": result.processing_path,
                         "errors": result.errors,
                         "document_review_required": result.document_review_required,
                         "review_state": result.review_state,
@@ -665,6 +740,224 @@ class FullDocumentGradingService:
             },
         )
         return result
+
+    async def _run_objective_answer_ledger(
+        self,
+        *,
+        run_id: str,
+        generation_lease_token: str,
+        existing_run: Optional[Dict[str, Any]],
+        submission_id: str,
+        exam_id: str,
+        questions: List[Dict[str, Any]],
+        student_assets: List[_StudentPageAsset],
+        model_id: str,
+        temperature: float,
+        reasoning_effort: str,
+        paper_file_hash: str,
+    ) -> tuple[Dict[str, Any], str, Dict[str, Any]]:
+        """Read objective answers page-by-page, then merge and score server-side.
+
+        Page requests are independent and run with bounded concurrency.  A
+        one-page OMR therefore needs one model call, while a multi-page answer
+        book needs one call per page rather than one call per question batch.
+        The prompt contains permitted answer values but never the correct key.
+        """
+
+        if not student_assets:
+            raise FullDocumentGradingError(
+                "Objective answer-ledger grading requires canonical student pages"
+            )
+        current_run = dict(existing_run or {})
+        saved_ledgers = dict(current_run.get("objective_page_ledgers") or {})
+        saved_usages = dict(current_run.get("objective_page_ledger_usages") or {})
+        catalog = objective_extraction_catalog(questions)
+        cache_key = (
+            "pcr-objective-ledger-"
+            + hashlib.sha256(
+                (
+                    paper_file_hash
+                    + "|"
+                    + OBJECTIVE_PROMPT_VERSION
+                    + "|"
+                    + json.dumps(catalog, sort_keys=True, separators=(",", ":"))
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        resolved_model = str(current_run.get("model_used") or model_id)
+
+        try:
+            configured_concurrency = int(
+                os.getenv("PCR_OBJECTIVE_PAGE_CONCURRENCY", "3") or 3
+            )
+        except (TypeError, ValueError):
+            configured_concurrency = 3
+        semaphore = asyncio.Semaphore(max(1, min(6, configured_concurrency)))
+
+        async def _read_page(
+            asset: _StudentPageAsset,
+        ) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
+            async with semaphore:
+                call_spec, request_bytes = build_objective_page_call_spec(
+                    asset=asset,
+                    catalog=catalog,
+                    model_id=resolved_model,
+                    prompt_cache_key=cache_key,
+                    reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                    submission_id=submission_id,
+                    exam_id=exam_id,
+                    run_id=run_id,
+                    question_count=len(questions),
+                )
+                if request_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+                    raise FullDocumentGradingError(
+                        f"Objective page {asset.page_number} exceeds the visual "
+                        "request size limit"
+                    )
+                request_manifest, image_assets, _ = build_llm_debug_request_manifest(
+                    call_spec
+                )
+                trace_id = (
+                    f"{run_id}:objective_answer_page_reading:"
+                    f"{asset.page_number}"
+                )
+                requested_at = datetime.now(timezone.utc)
+                await self._db[_LLM_DEBUG_TRACES_COLLECTION].update_one(
+                    {"trace_id": trace_id},
+                    {
+                        "$setOnInsert": {
+                            "trace_id": trace_id,
+                            "run_id": run_id,
+                            "submission_id": submission_id,
+                            "exam_id": exam_id,
+                            "stage": "objective_answer_page_reading",
+                            "page_number": asset.page_number,
+                            "created_at": requested_at,
+                        },
+                        "$set": {
+                            "status": "requested",
+                            "request": request_manifest,
+                            "image_assets": image_assets,
+                            "requested_at": requested_at,
+                            "updated_at": requested_at,
+                        },
+                        "$unset": {
+                            "raw_response": "",
+                            "parsed_response": "",
+                            "usage": "",
+                            "response_error": "",
+                            "completed_at": "",
+                        },
+                    },
+                    upsert=True,
+                )
+                try:
+                    response = await self._gate.call(**call_spec)
+                    raw = str(getattr(response, "content", "") or "")
+                    usage = _usage_dict(response, fallback_model=resolved_model)
+                    payload = _parse_json_object(raw)
+                    completed_at = datetime.now(timezone.utc)
+                    await self._db[_LLM_DEBUG_TRACES_COLLECTION].update_one(
+                        {"trace_id": trace_id},
+                        {
+                            "$set": {
+                                "status": (
+                                    "completed"
+                                    if payload is not None
+                                    else "invalid_response"
+                                ),
+                                "raw_response": raw,
+                                "parsed_response": payload,
+                                "usage": usage,
+                                "completed_at": completed_at,
+                                "updated_at": completed_at,
+                            }
+                        },
+                    )
+                    if payload is None:
+                        raise FullDocumentGradingError(
+                            f"Objective reader returned invalid JSON for page "
+                            f"{asset.page_number}"
+                        )
+                    return str(asset.page_number), payload, usage
+                except Exception as exc:
+                    failed_at = datetime.now(timezone.utc)
+                    await self._db[_LLM_DEBUG_TRACES_COLLECTION].update_one(
+                        {"trace_id": trace_id},
+                        {
+                            "$set": {
+                                "status": "failed",
+                                "response_error": str(exc)[:1000],
+                                "completed_at": failed_at,
+                                "updated_at": failed_at,
+                            }
+                        },
+                    )
+                    raise
+
+        missing_assets = [
+            asset
+            for asset in student_assets
+            if str(asset.page_number) not in saved_ledgers
+        ]
+        if missing_assets:
+            page_results = await asyncio.gather(
+                *(_read_page(asset) for asset in missing_assets)
+            )
+            for page_key, page_payload, page_usage in page_results:
+                saved_ledgers[page_key] = page_payload
+                saved_usages[page_key] = page_usage
+            resolved_model = str(
+                next(
+                    (
+                        usage.get("model")
+                        for usage in reversed(list(saved_usages.values()))
+                        if isinstance(usage, dict) and usage.get("model")
+                    ),
+                    resolved_model,
+                )
+            )
+            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
+                {
+                    "run_id": run_id,
+                    "generation_lease_token": generation_lease_token,
+                },
+                {
+                    "$set": {
+                        "objective_page_ledgers": saved_ledgers,
+                        "objective_page_ledger_usages": saved_usages,
+                        "model_used": resolved_model,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            if checkpoint.matched_count != 1:
+                raise FullDocumentGradingError(
+                    "Submission grading ownership expired while saving the "
+                    "objective answer ledger"
+                )
+
+        ordered_page_payloads = [
+            saved_ledgers[str(asset.page_number)]
+            for asset in student_assets
+            if str(asset.page_number) in saved_ledgers
+        ]
+        final_payload, _validation_errors = merge_objective_page_ledgers(
+            ordered_page_payloads,
+            questions=questions,
+            page_count=len(student_assets),
+        )
+        usage = _aggregate_usages(
+            saved_usages.values(),
+            fallback_model=resolved_model,
+        )
+        raw_llm = json.dumps(
+            {"page_ledgers": saved_ledgers},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return final_payload, raw_llm, usage
 
     async def _run_evidence_graph(
         self,
@@ -1006,6 +1299,11 @@ class FullDocumentGradingService:
         model_used = str(usage.get("model") or self._model_id)
         response_docs: List[Dict[str, Any]] = []
         evaluation_docs: List[Dict[str, Any]] = []
+        processing_path = (
+            "objective_answer_ledger"
+            if prompt_version == OBJECTIVE_PROMPT_VERSION
+            else "full_document_visual"
+        )
 
         raw_by_number = {
             int(item.get("question_number")): item
@@ -1018,6 +1316,9 @@ class FullDocumentGradingService:
             visual_evidence = {
                 "evidence_graph_version": raw_payload.get(
                     "evidence_graph_version"
+                ),
+                "source_page_numbers": list(
+                    raw_question_result.get("source_page_numbers") or []
                 ),
                 "mapping_reason": raw_question_result.get("mapping_reason"),
                 "interpretation_hypotheses": list(
@@ -1078,7 +1379,11 @@ class FullDocumentGradingService:
                 "question_number": grade.question_number,
                 "sub_part": None,
                 "question_assignment": {
-                    "method": "full_document_visual",
+                    "method": (
+                        "objective_answer_ledger"
+                        if prompt_version == OBJECTIVE_PROMPT_VERSION
+                        else "full_document_visual"
+                    ),
                     "confidence": grade.confidence,
                     "prompt_version": prompt_version,
                     "model_used": model_used,
@@ -1090,7 +1395,11 @@ class FullDocumentGradingService:
                     "absence_proof": (
                         {
                             "verified": True,
-                            "method": "full_document_visual_coverage",
+                            "method": (
+                                "objective_answer_ledger_coverage"
+                                if prompt_version == OBJECTIVE_PROMPT_VERSION
+                                else "full_document_visual_coverage"
+                            ),
                             "confidence": document_review.confidence,
                             "grading_run_id": run_id,
                         }
@@ -1105,9 +1414,13 @@ class FullDocumentGradingService:
                 "visual_evidence": visual_evidence,
                 "semantic_evidence_signature": semantic_evidence_signature,
                 "evidence_version": (
-                    3
-                    if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
-                    else 2
+                    4
+                    if prompt_version == OBJECTIVE_PROMPT_VERSION
+                    else (
+                        3
+                        if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
+                        else 2
+                    )
                 ),
                 "evidence_atom_ids": [
                     _stable_id(
@@ -1167,13 +1480,9 @@ class FullDocumentGradingService:
                     "visual_evidence": visual_evidence,
                     "semantic_evidence_signature": semantic_evidence_signature,
                     "eval_path": (
-                        "full_document_visual_not_attempted"
+                        f"{processing_path}_not_attempted"
                         if is_missing
-                        else (
-                            "full_document_visual_objective"
-                            if objective_result is not None
-                            else "full_document_visual"
-                        )
+                        else processing_path
                     ),
                     "model_used": model_used,
                     "total_score": grade.total_score,
@@ -1236,14 +1545,19 @@ class FullDocumentGradingService:
                             "after": {
                                 "total_score": grade.total_score,
                                 "max_score": max_marks,
-                                "eval_path": "full_document_visual",
+                                "eval_path": processing_path,
                                 "model_used": model_used,
                                 "grading_run_id": run_id,
                                 "manual_review_required": grade.manual_review_required,
                             },
                             "reason": (
-                                "Full-document visual evaluation against immutable paper "
-                                "and teacher solution"
+                                "Objective answer-ledger evaluation against the "
+                                "immutable answer key"
+                                if processing_path == "objective_answer_ledger"
+                                else (
+                                    "Full-document visual evaluation against "
+                                    "immutable paper and teacher solution"
+                                )
                             ),
                         }
                     ],
@@ -1270,7 +1584,7 @@ class FullDocumentGradingService:
         await self._responses.supersede_responses_for_submission(
             submission_id,
             keep_response_ids=[doc["response_id"] for doc in response_docs],
-            reason="full_document_visual_grading",
+            reason=f"{processing_path}_grading",
         )
         blocked = sum(1 for grade in grades if grade.attempt_status == "unresolved")
         question_warnings = sum(
@@ -1291,7 +1605,11 @@ class FullDocumentGradingService:
             {
                 "$set": {
                     "segmentation_status": "complete",
-                    "processing_path": "full_document_visual",
+                    "processing_path": (
+                        "objective_answer_ledger"
+                        if prompt_version == OBJECTIVE_PROMPT_VERSION
+                        else "full_document_visual"
+                    ),
                     "document_grading_run_id": run_id,
                     "document_grading_materialization_id": materialization_id,
                     "grading_input_hash": grading_input_hash,
@@ -1327,12 +1645,42 @@ class FullDocumentGradingService:
             evaluated_count=evaluated,
             blocked_count=blocked,
             warning_count=warnings,
+            processing_path=processing_path,
             run_id=run_id,
             errors=errors,
             document_review_required=document_review.required,
             review_state=review_state,
             review_reasons=list(dict.fromkeys(review_reasons)),
         )
+
+
+async def _fail_generation_run(
+    tenant_db: Any,
+    *,
+    run_id: str,
+    generation_lease_token: str,
+    error: Exception | str,
+) -> bool:
+    """Release a paid-call lease after failure or orderly worker shutdown."""
+
+    result = await tenant_db[_RUNS_COLLECTION].update_one(
+        {
+            "run_id": run_id,
+            "generation_lease_token": generation_lease_token,
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "generation_error": str(error)[:500],
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {
+                "generation_lease_token": "",
+                "generation_lease_expires_at": "",
+            },
+        },
+    )
+    return result.matched_count == 1
 
 
 async def _claim_or_wait_for_run(
@@ -1606,6 +1954,7 @@ def _paper_requires_canonical_visual(
         in {
             "canonical-full-document-visual-v1",
             "canonical-full-document-visual-v2",
+            OBJECTIVE_PAPER_CONTEXT_VERSION,
         }
     )
 
@@ -1621,12 +1970,38 @@ def _paper_requires_evidence_graph(
     )
 
 
+def _paper_requires_objective_ledger(
+    paper_version: Optional[Dict[str, Any]],
+) -> bool:
+    context = dict((paper_version or {}).get("paper_context") or {})
+    return bool(
+        context.get("ready")
+        and str(context.get("version") or "")
+        == OBJECTIVE_PAPER_CONTEXT_VERSION
+    )
+
+
 def _is_openai_visual_model(model_id: str) -> bool:
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
     if provider and provider != "openai":
         return False
     normalized = model_id.strip().lower()
     return normalized.startswith(("gpt-5", "gpt-4.1", "gpt-4o"))
+
+
+def _model_supports_original_image_detail(model_id: str) -> bool:
+    normalized = model_id.strip().lower()
+    return normalized.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6"))
+
+
+def _responses_temperature_is_effective(
+    model_id: str,
+    reasoning_effort: str,
+) -> bool:
+    normalized = model_id.strip().lower()
+    if normalized.startswith("gpt-5"):
+        return reasoning_effort.strip().lower() == "none"
+    return True
 
 
 async def _read_canonical_file(
@@ -1759,9 +2134,28 @@ async def _student_page_assets(
                 original_bytes=original,
                 global_bytes=optimized,
                 global_media_type=media_type,
+                original_media_type=_detect_image_media_type(original),
             )
         )
     return assets, total_bytes
+
+
+def _detect_image_media_type(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if (
+        len(image_bytes) >= 12
+        and image_bytes[:4] == b"RIFF"
+        and image_bytes[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+    raise FullDocumentGradingError(
+        "Canonical student page uses an unsupported image format"
+    )
 
 
 def _student_content_from_assets(
@@ -1794,6 +2188,262 @@ def _student_content_from_assets(
             ]
         )
     return content
+
+
+def _build_objective_page_input(
+    *,
+    asset: _StudentPageAsset,
+    catalog: Sequence[Mapping[str, Any]],
+    model_id: str,
+) -> tuple[List[Dict[str, Any]], int]:
+    page_content, page_bytes = _objective_page_visual_content(
+        asset,
+        model_id=model_id,
+    )
+    return (
+        [
+            {
+                "role": "developer",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": objective_reader_instructions(),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "IMMUTABLE EXTRACTION CATALOG. This catalog contains "
+                            "only conducted question numbers, answer formats, and "
+                            "permitted option labels. "
+                            "It does not contain the correct-answer key:\n"
+                            + json.dumps(
+                                list(catalog),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            f"TASK: Inspect the complete submitted page "
+                            f"{asset.page_number} once and return its compact answer "
+                            f"ledger with page_number={asset.page_number}."
+                        ),
+                    },
+                    *page_content,
+                ],
+            },
+        ],
+        page_bytes,
+    )
+
+
+def build_objective_page_call_spec(
+    *,
+    asset: _StudentPageAsset,
+    catalog: Sequence[Mapping[str, Any]],
+    model_id: str,
+    prompt_cache_key: str,
+    reasoning_effort: str,
+    temperature: Optional[float],
+    submission_id: str,
+    exam_id: str,
+    run_id: str,
+    question_count: int,
+) -> tuple[Dict[str, Any], int]:
+    """Build the authoritative provider contract for one objective page.
+
+    The grader and staff debugger both call this function.  This prevents the
+    UI from displaying an approximation of what the provider saw.
+    """
+
+    request_input, request_bytes = _build_objective_page_input(
+        asset=asset,
+        catalog=catalog,
+        model_id=model_id,
+    )
+    question_numbers = [
+        int(item["question_number"])
+        for item in catalog
+        if _positive_int(item.get("question_number"))
+    ]
+    call_spec: Dict[str, Any] = {
+        "model_id": model_id,
+        "prompt": "",
+        "caller_id": _CALLER_ID,
+        "responses_input": request_input,
+        "json_schema": objective_page_observation_schema(question_numbers),
+        "prompt_cache_key": prompt_cache_key,
+        "reasoning_effort": reasoning_effort,
+        "max_output_tokens": min(
+            10_000,
+            max(4_000, 60 * question_count),
+        ),
+        "metadata": {
+            "pcr_stage": "objective_answer_page_reading",
+            "prompt_version": OBJECTIVE_PROMPT_VERSION,
+            "submission_id": submission_id,
+            "exam_id": exam_id,
+            "page_number": asset.page_number,
+            "question_count": question_count,
+            "run_id": run_id,
+        },
+    }
+    if _responses_temperature_is_effective(model_id, reasoning_effort):
+        call_spec["temperature"] = temperature
+    return call_spec, request_bytes
+
+
+def build_llm_debug_request_manifest(
+    call_spec: Mapping[str, Any],
+) -> tuple[
+    Dict[str, Any],
+    List[Dict[str, Any]],
+    Dict[str, tuple[bytes, str]],
+]:
+    """Replace inline image bodies with auditable asset descriptors.
+
+    Request text, schema, model parameters and metadata remain exact.  Image
+    bytes are not duplicated into MongoDB; their hashes are stored and the
+    authorized preview endpoint regenerates the provider bytes from the
+    immutable canonical page, then verifies the hash before returning them.
+    """
+
+    metadata = dict(call_spec.get("metadata") or {})
+    page_number = int(metadata.get("page_number") or 0)
+    image_assets: List[Dict[str, Any]] = []
+    image_blobs: Dict[str, tuple[bytes, str]] = {}
+    redacted_messages: List[Dict[str, Any]] = []
+    image_index = 0
+
+    for raw_message in call_spec.get("responses_input") or []:
+        message = dict(raw_message) if isinstance(raw_message, Mapping) else {}
+        redacted_content: List[Dict[str, Any]] = []
+        preceding_text = ""
+        for raw_item in message.get("content") or []:
+            item = dict(raw_item) if isinstance(raw_item, Mapping) else {}
+            if item.get("type") != "input_image":
+                redacted_content.append(item)
+                if item.get("type") == "input_text":
+                    preceding_text = str(item.get("text") or "").strip()
+                continue
+
+            image_url = str(item.get("image_url") or "")
+            if not image_url.startswith("data:") or ";base64," not in image_url:
+                raise FullDocumentGradingError(
+                    "LLM debug tracing received an unsupported image reference"
+                )
+            header, encoded = image_url.split(",", 1)
+            media_type = header[5:].split(";", 1)[0].strip().lower()
+            try:
+                image_bytes = base64.b64decode(encoded, validate=True)
+            except Exception as exc:
+                raise FullDocumentGradingError(
+                    "LLM debug tracing could not decode a provider image"
+                ) from exc
+            digest = hashlib.sha256(image_bytes).hexdigest()
+            image_index += 1
+            asset_id = (
+                f"page-{page_number}-image-{image_index}-"
+                f"{digest[:16]}"
+            )
+            asset = {
+                "asset_id": asset_id,
+                "page_number": page_number,
+                "sequence": image_index,
+                "label": preceding_text[:500],
+                "media_type": media_type,
+                "byte_count": len(image_bytes),
+                "sha256": digest,
+                "detail": str(item.get("detail") or "auto"),
+            }
+            image_assets.append(asset)
+            image_blobs[asset_id] = (image_bytes, media_type)
+            redacted_content.append(
+                {
+                    "type": "input_image",
+                    "asset_id": asset_id,
+                    "media_type": media_type,
+                    "byte_count": len(image_bytes),
+                    "sha256": digest,
+                    "detail": str(item.get("detail") or "auto"),
+                    "image_url": "[available through authorized debug asset endpoint]",
+                }
+            )
+        message["content"] = redacted_content
+        redacted_messages.append(message)
+
+    manifest = {
+        key: value
+        for key, value in call_spec.items()
+        if key != "responses_input"
+    }
+    manifest["responses_input"] = redacted_messages
+    manifest["security"] = {
+        "answer_key_included": False,
+        "api_credentials_collected": False,
+        "inline_image_bodies_persisted": False,
+    }
+    return manifest, image_assets, image_blobs
+
+
+def _objective_page_visual_content(
+    asset: _StudentPageAsset,
+    *,
+    model_id: str,
+) -> tuple[List[Dict[str, Any]], int]:
+    """Return exactly one canonical page image at the best supported detail."""
+
+    detail = (
+        "original"
+        if _model_supports_original_image_detail(model_id)
+        else "high"
+    )
+    return (
+        [
+            {
+                "type": "input_text",
+                "text": (
+                    f"Complete original answer-copy page {asset.page_number}. "
+                    "Inspect the whole sheet, including all OMR columns and any "
+                    "handwritten numbered answers."
+                ),
+            },
+            _input_image_content(
+                asset.original_bytes,
+                asset.original_media_type,
+                detail=detail,
+            ),
+        ],
+        len(asset.original_bytes),
+    )
+
+
+def _input_image_content(
+    image_bytes: bytes,
+    media_type: str,
+    *,
+    detail: str = "high",
+) -> Dict[str, Any]:
+    return {
+        "type": "input_image",
+        "image_url": (
+            f"data:{media_type};base64,"
+            + base64.b64encode(image_bytes).decode("ascii")
+        ),
+        "detail": detail,
+    }
 
 
 def _multistage_static_content(
@@ -2392,6 +3042,10 @@ def _validate_ledger(
     questions: List[Dict[str, Any]],
     page_count: int,
 ) -> tuple[List[_ValidatedGrade], List[str], _DocumentReview]:
+    objective_ledger = (
+        str(payload.get("evidence_graph_version") or "")
+        == OBJECTIVE_LEDGER_VERSION
+    )
     raw_document_review = payload.get("document_review")
     structural_errors = [
         str(error).strip()[:500]
@@ -2459,6 +3113,7 @@ def _validate_ledger(
             page_count=page_count,
             coverage_complete=absence_coverage_complete,
             coverage_confidence=coverage_confidence,
+            objective_ledger=objective_ledger,
         )
         grades.append(grade)
 
@@ -2473,7 +3128,8 @@ def _validate_ledger(
             + ", ".join(str(value) for value in unexpected)
         )
         document_review.required = True
-    _mark_overlapping_evidence_for_review(grades)
+    if not objective_ledger:
+        _mark_overlapping_evidence_for_review(grades)
     return grades, structural_errors, document_review
 
 
@@ -2627,6 +3283,7 @@ def _validate_question_grade(
     page_count: int,
     coverage_complete: bool,
     coverage_confidence: float,
+    objective_ledger: bool = False,
 ) -> _ValidatedGrade:
     status = str(item.get("attempt_status") or "unresolved").strip().lower()
     if status not in {"attempted", "not_attempted", "unresolved"}:
@@ -2689,14 +3346,17 @@ def _validate_question_grade(
                 student_answer=student_answer,
                 content_type=content_type,
             )
-        if not coverage_complete or coverage_confidence < _ABSENCE_CONFIDENCE:
+        absence_threshold = (
+            0.55 if objective_ledger else _ABSENCE_CONFIDENCE
+        )
+        if not coverage_complete or coverage_confidence < absence_threshold:
             return _unresolved_grade(
                 question,
                 question_number,
                 "The full-copy scan did not prove that this question was unattempted",
                 confidence=min(confidence, coverage_confidence),
             )
-        if confidence < _ABSENCE_CONFIDENCE:
+        if confidence < absence_threshold:
             return _unresolved_grade(
                 question,
                 question_number,
@@ -2738,9 +3398,9 @@ def _validate_question_grade(
 
     if not student_answer:
         validation_errors.append("Attempted answer has no student transcription")
-    if not source_pages:
+    if not source_pages and not objective_ledger:
         validation_errors.append("Attempted answer has no visual evidence region")
-    if confidence < 0.50:
+    if confidence < (0.55 if objective_ledger else 0.50):
         validation_errors.append("Question ownership confidence is below 0.50")
     if evidence_graph_question:
         hypotheses = item.get("interpretation_hypotheses")
@@ -2891,7 +3551,7 @@ def _validate_question_grade(
                 student_answer=student_answer,
                 content_type=content_type,
             )
-        if confidence < _AUTO_ACCEPT_CONFIDENCE:
+        if confidence < _AUTO_ACCEPT_CONFIDENCE and not objective_ledger:
             manual_review = True
             review_reason = review_reason or (
                 "The selected option could not be read with automatic-publish confidence"
@@ -3683,6 +4343,9 @@ def _result_from_run(
         evaluated_count=int(result.get("evaluated_count") or 0),
         blocked_count=blocked,
         warning_count=warnings,
+        processing_path=str(
+            result.get("processing_path") or "full_document_visual"
+        ),
         run_id=str(run.get("run_id") or "") or None,
         errors=[str(value) for value in (result.get("errors") or [])],
         document_review_required=bool(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import io
 import json
 from types import SimpleNamespace
@@ -321,6 +322,198 @@ def _page_asset(module, page_number: int):
         global_bytes=value,
         global_media_type="image/jpeg",
     )
+
+
+@pytest.mark.asyncio
+async def test_objective_answer_ledger_reads_one_page_and_scores_with_frozen_key(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "objective-answer-ledger-v3",
+                    "mode": "objective_answer_ledger",
+                    "ready": True,
+                }
+            }
+        },
+    )
+    await db["evalpen_questions"].delete_many({"exam_id": "EXAM-DOC-1"})
+    await db["evalpen_questions"].insert_many(
+        [
+            {
+                "question_id": "EXAM-DOC-1::Q1",
+                "exam_id": "EXAM-DOC-1",
+                "question_number": 1,
+                "question_text": "Choose one.",
+                "question_type": "mcq",
+                "grading_mode": "objective",
+                "max_marks": 4,
+                "penalty_marks": 1,
+                "options": [
+                    {"label": "A", "text": "One"},
+                    {"label": "B", "text": "Two"},
+                    {"label": "C", "text": "Three"},
+                    {"label": "D", "text": "Four"},
+                ],
+                "correct_answer": "B",
+            },
+            {
+                "question_id": "EXAM-DOC-1::Q2",
+                "exam_id": "EXAM-DOC-1",
+                "question_number": 2,
+                "question_text": "Choose one.",
+                "question_type": "mcq",
+                "grading_mode": "objective",
+                "max_marks": 4,
+                "penalty_marks": 1,
+                "options": [
+                    {"label": "A", "text": "One"},
+                    {"label": "B", "text": "Two"},
+                    {"label": "C", "text": "Three"},
+                    {"label": "D", "text": "Four"},
+                ],
+                "correct_answer": "A",
+            },
+        ]
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    asset = _page_asset(module, 1)
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda pages: _async_value(([asset], len(asset.global_bytes))),
+    )
+    gate = _FakeGate(
+        {
+            "ledger_version": "pcr-objective-page-observations-v3",
+            "page_number": 1,
+            "sheet_format": "omr_grid",
+            "page_fully_reviewed": True,
+            "observations": [
+                {
+                    "question_number": 1,
+                    "state": "selected",
+                    "selected_answer": "C",
+                    "alternative_answers": [],
+                    "confidence": 0.98,
+                },
+                {
+                    "question_number": 2,
+                    "state": "blank",
+                    "selected_answer": "",
+                    "alternative_answers": [],
+                    "confidence": 0.96,
+                },
+            ],
+        }
+    )
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    result = await service.grade_submission("SUB-DOC-1")
+
+    assert result.status == "completed"
+    assert result.review_state == "ready"
+    assert result.processing_path == "objective_answer_ledger"
+    assert result.evaluated_count == 2
+    assert result.blocked_count == 0
+    assert len(gate.calls) == 1
+    assert (
+        gate.calls[0]["metadata"]["pcr_stage"]
+        == "objective_answer_page_reading"
+    )
+    assert gate.calls[0]["reasoning_effort"] == "medium"
+    assert gate.calls[0]["model_id"] == "gpt-5.6-sol"
+    model_catalog = gate.calls[0]["responses_input"][1]["content"][0]["text"]
+    assert "correct_answer" not in model_catalog
+    assert '"text"' not in model_catalog
+    q1 = await db["evalpen_detected_responses"].find_one(
+        {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
+    )
+    q2 = await db["evalpen_detected_responses"].find_one(
+        {"question_id": "EXAM-DOC-1::Q2", "superseded_at": {"$exists": False}}
+    )
+    q1_evaluation = await db["evalpen_evaluations"].find_one(
+        {"response_id": q1["response_id"]}
+    )
+    q2_evaluation = await db["evalpen_evaluations"].find_one(
+        {"response_id": q2["response_id"]}
+    )
+    assert q1["detected_text"] == "C"
+    assert q1["evidence_version"] == 4
+    assert q1_evaluation["total_score"] == -1
+    assert q1_evaluation["eval_path"] == "objective_answer_ledger"
+    assert q2["answer_state"] == "not_attempted"
+    assert q2_evaluation["total_score"] == 0
+    frozen_exam = await db["exampen_exams"].find_one(
+        {"exam_id": "EXAM-DOC-1"}
+    )
+    assert (
+        frozen_exam["pcr_grading_contract"]["prompt_version"]
+        == "pcr-objective-answer-ledger-v3"
+    )
+    trace = await db["evalpen_llm_debug_traces"].find_one(
+        {
+            "submission_id": "SUB-DOC-1",
+            "stage": "objective_answer_page_reading",
+            "page_number": 1,
+        }
+    )
+    assert trace["status"] == "completed"
+    assert trace["raw_response"] == json.dumps(gate.payload)
+    assert trace["parsed_response"] == gate.payload
+    assert len(trace["image_assets"]) == 1
+    assert trace["image_assets"][0]["detail"] == "original"
+    serialized_request = json.dumps(trace["request"])
+    assert '"correct_answer"' not in serialized_request
+    assert "base64," not in serialized_request
+    assert all(
+        asset["sha256"] and asset["byte_count"] > 0
+        for asset in trace["image_assets"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_releases_single_flight_lease_immediately():
+    module = _module()
+    db = _fresh_db()
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": "RUN-INTERRUPTED",
+            "status": "generating",
+            "generation_lease_token": "worker-lease",
+            "generation_lease_expires_at": datetime.now(timezone.utc),
+        }
+    )
+
+    released = await module._fail_generation_run(
+        db,
+        run_id="RUN-INTERRUPTED",
+        generation_lease_token="worker-lease",
+        error="Worker shutdown interrupted model generation",
+    )
+
+    run = await db["evalpen_document_grading_runs"].find_one(
+        {"run_id": "RUN-INTERRUPTED"}
+    )
+    assert released is True
+    assert run["status"] == "failed"
+    assert "shutdown" in run["generation_error"]
+    assert "generation_lease_token" not in run
+    assert "generation_lease_expires_at" not in run
 
 
 def test_close_visual_readings_keep_marks_but_require_review():

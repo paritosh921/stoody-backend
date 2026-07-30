@@ -71,13 +71,14 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
                 page_count=4,
                 response_count=11,
                 evaluated_count=11,
-                blocked_count=0,
-                warning_count=0,
+                blocked_count=1,
+                warning_count=1,
+                processing_path="full_document_visual",
                 run_id="DOCGR-1",
-                errors=[],
-                review_state="ready",
-                document_review_required=False,
-                review_reasons=[],
+                errors=["Q5 requires teacher review"],
+                review_state="blocked",
+                document_review_required=True,
+                review_reasons=["Q5 is visually ambiguous"],
             )
 
     def _load(name: str):
@@ -103,7 +104,9 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
     )
     assert stored["processing_path"] == "full_document_visual"
     assert stored["evaluation"]["evaluated_count"] == 11
-    assert stored["review"]["state"] == "ready"
+    assert stored["review"]["state"] == "blocked"
+    assert stored["last_error"] is None
+    assert stored["diagnostics"]["errors"] == ["Q5 requires teacher review"]
     assert "lease_token" not in stored
 
 
@@ -222,7 +225,7 @@ async def test_worker_pipeline_contract_rejects_an_old_job_revision():
     result = await process_pcr_processing_job(
         db,
         "pcr-job-OLD",
-        required_pipeline_version=2,
+        required_pipeline_version=3,
     )
 
     assert result["claimed"] is False
@@ -278,7 +281,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1", 2)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 3)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
@@ -286,6 +289,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
     assert stored["mapping_pipeline_version"] == "full-document-visual-v2"
+    assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
     assert stored["reprocess_history"] == [
@@ -390,7 +394,7 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
     )
 
     assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 2)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 3)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored

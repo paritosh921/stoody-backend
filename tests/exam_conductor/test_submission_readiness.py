@@ -482,6 +482,116 @@ async def test_teacher_confirmed_blank_is_audited_evaluated_and_can_complete_rea
 
 
 @pytest.mark.asyncio
+async def test_teacher_objective_answer_is_scored_deterministically_and_unblocked():
+    from api.v1.evalpen_review_async import (
+        ResponseAssignmentCorrectionRequest,
+        correct_response_assignment,
+        get_submission_summary,
+    )
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["exampen_processing_jobs"].update_one(
+        {"submission_id": "SUB-READY"},
+        {"$set": {"status": "blocked_for_review"}},
+    )
+    await db["evalpen_questions"].update_one(
+        {"question_id": "EXAM-READY::Q-1"},
+        {
+            "$set": {
+                "question_type": "mcq",
+                "grading_mode": "objective",
+                "options": [
+                    {"label": "A", "text": "One"},
+                    {"label": "B", "text": "Two"},
+                    {"label": "C", "text": "Three"},
+                    {"label": "D", "text": "Four"},
+                ],
+                "correct_answer": "B",
+                "penalty_marks": 1.0,
+            }
+        },
+    )
+    await db["evalpen_detected_responses"].update_one(
+        {"response_id": "RESP-READY-1"},
+        {
+            "$set": {
+                "detected_text": "",
+                "answer_state": "unresolved",
+                "eval_status": "blocked",
+                "grading_mode": "objective",
+                "flags": [
+                    {
+                        "flag_id": "FLAG-OBJECTIVE-1",
+                        "severity": "blocking",
+                        "reason": "No reliable option transcription",
+                    }
+                ],
+            }
+        },
+    )
+
+    build_eval_core = AsyncMock()
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+        patch(
+            "api.v1.evalpen_evaluate_async._build_eval_core",
+            new=build_eval_core,
+        ),
+    ):
+        result = await correct_response_assignment(
+            "SUB-READY",
+            ResponseAssignmentCorrectionRequest(
+                action="set_objective_answer",
+                response_id="RESP-READY-1",
+                question_id="EXAM-READY::Q-1",
+                selected_answer="Option C",
+                reason="Confirmed option C on the original answer copy",
+            ),
+            current_user=_admin_user(),
+            db=None,
+        )
+        summary = await get_submission_summary(
+            "SUB-READY",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    build_eval_core.assert_not_awaited()
+    assert result["readiness"]["ready"] is True
+    assert summary.total_score == -1
+    replacement = await db["evalpen_detected_responses"].find_one(
+        {
+            "submission_id": "SUB-READY",
+            "question_id": "EXAM-READY::Q-1",
+            "superseded_at": {"$exists": False},
+        }
+    )
+    evaluation = await db["evalpen_evaluations"].find_one(
+        {"response_id": replacement["response_id"]}
+    )
+    original = await db["evalpen_detected_responses"].find_one(
+        {"response_id": "RESP-READY-1"}
+    )
+    audit = await db["evalpen_response_assignment_audit"].find_one(
+        {"submission_id": "SUB-READY", "action": "set_objective_answer"}
+    )
+
+    assert replacement["detected_text"] == "C"
+    assert replacement["eval_status"] == "evaluated"
+    assert replacement["objective_result"]["points_earned"] == -1
+    assert evaluation["eval_path"] == "teacher_objective_answer"
+    assert evaluation["model_used"] == "deterministic-objective-scorer-v1"
+    assert evaluation["total_score"] == -1
+    assert original["eval_status"] == "superseded"
+    assert audit["actor_id"] == "TEACHER-1"
+
+
+@pytest.mark.asyncio
 async def test_teacher_split_creates_disjoint_evidence_and_supersedes_the_source():
     from api.v1.evalpen_review_async import (
         ResponseAssignmentCorrectionRequest,

@@ -33,6 +33,7 @@ API authority:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import hashlib
@@ -40,11 +41,20 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from services.objective_answer_ledger_contract import (
+    is_objective_question,
+    objective_option_labels,
+)
+from services.objective_scoring_service import (
+    ObjectiveScoringContractError,
+    is_integer_question,
+    score_objective_response,
+)
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
 
@@ -191,12 +201,16 @@ class ResponseAssignmentCorrectionRequest(BaseModel):
 
     action: str = Field(
         ...,
-        pattern="^(assign|split|merge|confirm_not_attempted|discard_non_answer)$",
+        pattern=(
+            "^(assign|split|merge|set_objective_answer|"
+            "confirm_not_attempted|discard_non_answer)$"
+        ),
     )
     reason: str = Field(..., min_length=5, max_length=1000)
     response_id: Optional[str] = None
     response_ids: List[str] = Field(default_factory=list)
     question_id: Optional[str] = None
+    selected_answer: Optional[str] = Field(default=None, max_length=100)
     parts: List[ResponseSplitPart] = Field(default_factory=list)
 
     @field_validator("reason")
@@ -253,6 +267,7 @@ class ResponseSummaryAPI(BaseModel):
     source_pages: List[Dict[str, Any]] = Field(default_factory=list)
     question_assignment: Optional[Dict[str, Any]] = None
     manual_review_reason: Optional[str] = None
+    grading_mode: Optional[str] = None
 
 
 class QuestionCatalogItemAPI(BaseModel):
@@ -266,6 +281,9 @@ class QuestionCatalogItemAPI(BaseModel):
     source_page_number: Optional[int] = None
     source_region_id: Optional[str] = None
     source_bbox_percent: Optional[Dict[str, Any]] = None
+    grading_mode: str = "subjective"
+    answer_format: str = "worked_response"
+    option_labels: List[str] = Field(default_factory=list)
 
 
 class SubmissionSummaryReviewAPI(BaseModel):
@@ -384,6 +402,16 @@ def _safe_marks(value: Any) -> float:
         return 0.0
 
 
+def _safe_score(value: Any) -> float:
+    """Return a finite signed score, preserving objective negative marking."""
+
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
 async def _get_pcr_question_catalog(
     tenant_db: Any,
     exam_id: str,
@@ -407,6 +435,10 @@ async def _get_pcr_question_catalog(
             "source_page_number": 1,
             "source_region_id": 1,
             "source_bbox_percent": 1,
+            "grading_mode": 1,
+            "question_type": 1,
+            "options": 1,
+            "enhanced_options": 1,
         },
     ).sort([("question_number", 1), ("question_id", 1)])
     docs = await cursor.to_list(length=1000)
@@ -416,6 +448,7 @@ async def _get_pcr_question_catalog(
         if not question_id:
             continue
         question_number = doc.get("question_number")
+        objective = is_objective_question(doc)
         catalog.append(
             {
                 "question_id": question_id,
@@ -432,6 +465,17 @@ async def _get_pcr_question_catalog(
                 "source_page_number": doc.get("source_page_number"),
                 "source_region_id": doc.get("source_region_id"),
                 "source_bbox_percent": doc.get("source_bbox_percent"),
+                "grading_mode": "objective" if objective else "subjective",
+                "answer_format": (
+                    "integer_or_numeric_text"
+                    if objective and is_integer_question(doc)
+                    else "option_label"
+                    if objective
+                    else "worked_response"
+                ),
+                "option_labels": (
+                    objective_option_labels(doc) if objective else []
+                ),
             }
         )
     return catalog
@@ -826,7 +870,23 @@ async def get_submission_summary(
                     # current submissions block this situation before eval.
                     completion_key = question_id or response_id
                     if not question_id or question_id not in scored_question_ids:
-                        total_score += _safe_marks(resp_score)
+                        objective_score = bool(
+                            str(
+                                evaluation.get("grading_mode")
+                                or resp_doc.get("grading_mode")
+                                or (
+                                    catalog_question.get("grading_mode")
+                                    if catalog_question is not None
+                                    else ""
+                                )
+                            ).lower()
+                            == "objective"
+                        )
+                        total_score += (
+                            _safe_score(resp_score)
+                            if objective_score
+                            else _safe_marks(resp_score)
+                        )
                         evaluated_max += _safe_marks(resp_max)
                         if question_id:
                             scored_question_ids.add(question_id)
@@ -921,6 +981,9 @@ async def get_submission_summary(
                         else None
                     ),
                     manual_review_reason=resp_doc.get("manual_review_reason"),
+                    grading_mode=(
+                        str(resp_doc.get("grading_mode") or "").strip() or None
+                    ),
                 )
             if is_unassigned:
                 unassigned_summaries.append(response_summary)
@@ -1163,6 +1226,140 @@ async def confirm_document_coverage_review(
         "document_review": accepted_review,
         "readiness": readiness,
     }
+
+
+async def _authorize_submission_debug_access(
+    tenant_db: Any,
+    submission_id: str,
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> Dict[str, Any]:
+    """Apply the normal staff + tutor scope before exposing model traces."""
+
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id},
+        projection={"student_id": 1, "exam_id": 1},
+    )
+    if submission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Submission {submission_id} not found",
+        )
+    _check_student_in_scope(str(submission.get("student_id") or ""), scoped_ids)
+    return submission
+
+
+@router.get(
+    "/submissions/{submission_id}/llm-debug",
+    summary="Inspect the redacted LLM request and response for one PCR copy",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Submission not found"},
+        409: {"description": "A reconstructable LLM trace is not available"},
+    },
+)
+async def get_submission_llm_debug(
+    submission_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Return exact request text/schema/parameters and authorized image handles.
+
+    API credentials and inline image bodies are never returned.  For runs made
+    after trace capture was introduced, the provider's verbatim response and
+    persisted image hashes are authoritative.  Older objective runs are
+    explicitly labelled as reconstructed from their immutable inputs.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    await _authorize_submission_debug_access(
+        tenant_db,
+        submission_id,
+        current_user,
+        db,
+    )
+    from services.exampen_llm_debug_service import (
+        LlmDebugTraceError,
+        build_submission_llm_debug_bundle,
+    )
+
+    try:
+        result = await build_submission_llm_debug_bundle(
+            tenant_db,
+            submission_id,
+        )
+    except LlmDebugTraceError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or current_user.get("username")
+        or "unknown"
+    )
+    logger.info(
+        "PCR LLM debug trace viewed: submission=%s actor=%s run=%s",
+        submission_id,
+        actor_id,
+        (result.get("run") or {}).get("run_id"),
+    )
+    return result
+
+
+@router.get(
+    "/submissions/{submission_id}/llm-debug/assets/{asset_id}",
+    summary="Preview one exact image body from a PCR LLM request",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Submission or request image not found"},
+        409: {"description": "Request image integrity verification failed"},
+    },
+)
+async def get_submission_llm_debug_asset_preview(
+    submission_id: str,
+    asset_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Response:
+    tenant_db = await _get_tenant_db(db, current_user)
+    await _authorize_submission_debug_access(
+        tenant_db,
+        submission_id,
+        current_user,
+        db,
+    )
+    from services.exampen_llm_debug_service import (
+        LlmDebugTraceError,
+        get_submission_llm_debug_asset,
+    )
+
+    try:
+        image_bytes, media_type, digest = await get_submission_llm_debug_asset(
+            tenant_db,
+            submission_id,
+            asset_id,
+        )
+    except LlmDebugTraceError as exc:
+        message = str(exc)
+        code = (
+            status.HTTP_409_CONFLICT
+            if "match" in message.lower() or "integrity" in message.lower()
+            else status.HTTP_404_NOT_FOUND
+        )
+        raise HTTPException(status_code=code, detail=message) from exc
+    return Response(
+        content=image_bytes,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+            "X-LLM-Asset-SHA256": digest,
+        },
+    )
 
 
 @router.get(
@@ -1601,6 +1798,11 @@ async def get_exam_results(
             catalog_question_ids = {
                 question["question_id"] for question in question_catalog
             }
+            objective_question_ids = {
+                question["question_id"]
+                for question in question_catalog
+                if question.get("grading_mode") == "objective"
+            }
 
             # Find submissions for this exam (tutor-scoped)
             sub_query: Dict[str, Any] = {"exam_id": exam_id}
@@ -1716,7 +1918,11 @@ async def get_exam_results(
                             and question_id in scored_question_ids
                         ):
                             continue
-                        pcr_total += _safe_marks(ev.get("total_score"))
+                        pcr_total += (
+                            _safe_score(ev.get("total_score"))
+                            if question_id in objective_question_ids
+                            else _safe_marks(ev.get("total_score"))
+                        )
                         evaluated_max += _safe_marks(ev.get("max_score"))
                         if question_id and question_id in catalog_question_ids:
                             scored_question_ids.add(question_id)
@@ -2505,6 +2711,7 @@ async def _correct_response_assignment_impl(
         operation: str,
         replacing_response_ids: Optional[set[str]] = None,
         evidence_atom_ids: Optional[List[str]] = None,
+        objective_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         await _clear_target_slot(
             question_id,
@@ -2571,6 +2778,30 @@ async def _correct_response_assignment_impl(
                 "_immutable": True,
             }
         )
+        if objective_result is not None:
+            evidence_payload = json.dumps(
+                {
+                    "submission_id": submission_id,
+                    "question_id": question_id,
+                    "selected_answer": objective_result.get("selected_answer"),
+                    "source_pages": pages or [],
+                    "actor_id": actor_id,
+                },
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+            response.update(
+                {
+                    "content_type": "TEXT_ONLY",
+                    "grading_mode": "objective",
+                    "objective_result": dict(objective_result),
+                    "semantic_evidence_signature": hashlib.sha256(
+                        evidence_payload.encode("utf-8")
+                    ).hexdigest(),
+                    "eval_status": "evaluated",
+                }
+            )
         await tenant_db["evalpen_detected_responses"].insert_one(response)
         return response
 
@@ -2590,6 +2821,7 @@ async def _correct_response_assignment_impl(
 
     created: List[Dict[str, Any]] = []
     source_ids: List[str] = []
+    deterministic_evaluation_response_ids: set[str] = set()
 
     if body.action == "assign":
         if not body.response_id or not body.question_id:
@@ -2772,6 +3004,141 @@ async def _correct_response_assignment_impl(
             await _supersede(source, "merge")
         source_ids.extend(merge_ids)
 
+    elif body.action == "set_objective_answer":
+        if not body.response_id or not body.question_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "set_objective_answer requires response_id and question_id"
+                ),
+            )
+        selected_answer = str(body.selected_answer or "").strip()
+        if not selected_answer:
+            raise HTTPException(
+                status_code=400,
+                detail="set_objective_answer requires selected_answer",
+            )
+        question = catalog[body.question_id]
+        if not is_objective_question(question):
+            raise HTTPException(
+                status_code=400,
+                detail="The selected paper question is not objective",
+            )
+        source = await _active_response(body.response_id)
+        if str(source.get("question_id") or "") != body.question_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The response belongs to another question. Correct its ownership "
+                    "before confirming an objective answer."
+                ),
+            )
+        await _assert_target_slot_available(
+            body.question_id,
+            replacing_response_ids={body.response_id},
+        )
+        try:
+            objective_result = score_objective_response(
+                question,
+                selected_answer,
+            )
+        except ObjectiveScoringContractError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        replacement = await _create_assigned_response(
+            source,
+            question_id=body.question_id,
+            detected_text=str(objective_result["selected_answer"]),
+            operation="objective_answer",
+            replacing_response_ids={body.response_id},
+            objective_result=objective_result,
+        )
+        created.append(replacement)
+        await _supersede(source, "set_objective_answer")
+        source_ids.append(body.response_id)
+
+        response_id = str(replacement["response_id"])
+        evaluation_id = f"EVAL-TEACH-OBJ-{uuid.uuid4().hex[:16]}"
+        points_earned = float(objective_result["points_earned"])
+        max_score = float(objective_result["points"])
+        selected = str(objective_result["selected_answer"])
+        correct = str(objective_result["correct_answer"])
+        feedback = (
+            f"Selected {selected}. Correct answer: {correct}."
+            if objective_result["is_correct"]
+            else (
+                f"Selected {selected}. Correct answer: {correct}. "
+                f"{float(objective_result['penalty_marks']):g} mark(s) deducted."
+            )
+        )
+        await tenant_db["evalpen_evaluations"].insert_one(
+            {
+                "evaluation_id": evaluation_id,
+                "evaluation_input_version": 2,
+                "mapping_version_id": replacement.get("mapping_version_id"),
+                "response_id": response_id,
+                "question_id": body.question_id,
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "prompt_version": "teacher-objective-answer-v1",
+                "semantic_evidence_signature": replacement.get(
+                    "semantic_evidence_signature"
+                ),
+                "eval_path": "teacher_objective_answer",
+                "model_used": "deterministic-objective-scorer-v1",
+                "total_score": points_earned,
+                "max_score": max_score,
+                "scoreable_max": max_score,
+                "marking_policy": dict(question.get("marking_policy") or {}),
+                "method_policy": dict(question.get("method_policy") or {}),
+                "method_analysis": {
+                    "detected_method": "",
+                    "method_classification": "not_applicable",
+                    "method_validity": "not_applicable",
+                    "method_requirement_satisfied": True,
+                    "confidence": 1.0,
+                    "explanation": "Objective answer confirmed by teacher.",
+                    "error_carried_forward": "not_applicable",
+                    "error_carried_forward_reason": "",
+                },
+                "manual_review_required": False,
+                "step_marks": [],
+                "criterion_marks": [],
+                "overall_feedback": feedback,
+                "grading_mode": "objective",
+                "objective_result": dict(objective_result),
+                "reference_solution": "",
+                "token_usage": {
+                    "model": "deterministic-objective-scorer-v1",
+                    "caller": "teacher_review",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "raw_llm_response": "",
+                "eval_flags": [],
+                "audit_trail": [
+                    {
+                        "actor_id": actor_id,
+                        "timestamp": now,
+                        "action": "objective_answer_confirmed",
+                        "before": {
+                            "response_id": body.response_id,
+                            "detected_text": source.get("detected_text"),
+                        },
+                        "after": {
+                            "response_id": response_id,
+                            "selected_answer": selected,
+                            "total_score": points_earned,
+                            "max_score": max_score,
+                        },
+                        "reason": body.reason,
+                    }
+                ],
+                "created_at": now,
+            }
+        )
+        deterministic_evaluation_response_ids.add(response_id)
+
     elif body.action == "confirm_not_attempted":
         if not body.question_id:
             raise HTTPException(status_code=400, detail="confirm_not_attempted requires question_id")
@@ -2842,11 +3209,17 @@ async def _correct_response_assignment_impl(
     )
 
     evaluation_errors: List[str] = []
-    if created:
+    responses_requiring_evaluation = [
+        response
+        for response in created
+        if str(response.get("response_id") or "")
+        not in deterministic_evaluation_response_ids
+    ]
+    if responses_requiring_evaluation:
         from api.v1.evalpen_evaluate_async import _build_eval_core
 
         eval_core = await _build_eval_core(tenant_db)
-        for response in created:
+        for response in responses_requiring_evaluation:
             try:
                 result = await eval_core.evaluate_response(
                     str(response["response_id"]),

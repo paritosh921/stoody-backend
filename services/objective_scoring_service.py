@@ -64,6 +64,25 @@ def is_integer_question(question: Dict[str, Any]) -> bool:
     )
 
 
+def _option_labels(question: Dict[str, Any]) -> list[str]:
+    options = question.get("options")
+    if not isinstance(options, list) or not options:
+        options = question.get("enhanced_options")
+    if not isinstance(options, list):
+        return []
+    labels: list[str] = []
+    for index, option in enumerate(options):
+        raw_label = (
+            option.get("label") or option.get("key") or option.get("id")
+            if isinstance(option, dict)
+            else None
+        )
+        label = normalize_answer_label(raw_label) or chr(ord("A") + index)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 def score_objective_response(
     question: Dict[str, Any],
     student_answer: Any,
@@ -121,6 +140,11 @@ def score_objective_response(
         if not selected:
             raise ObjectiveScoringContractError(
                 "Student response is not a recognizable objective option"
+            )
+        allowed_labels = _option_labels(question)
+        if allowed_labels and selected not in allowed_labels:
+            raise ObjectiveScoringContractError(
+                "Student response is not one of the frozen objective options"
             )
         is_correct = selected == correct
 

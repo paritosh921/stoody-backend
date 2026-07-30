@@ -599,6 +599,51 @@ async def test_staff_page_preview_uses_short_lived_private_s3_url():
 
 
 @pytest.mark.asyncio
+async def test_staff_llm_debug_endpoint_uses_normal_submission_scope():
+    from api.v1.evalpen_review_async import get_submission_llm_debug
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-LLM-DEBUG",
+            "exam_id": "EXAM-DEBUG",
+            "student_id": "STU-1",
+        }
+    )
+    payload = {
+        "submission_id": "SUB-LLM-DEBUG",
+        "exam_id": "EXAM-DEBUG",
+        "run": {"run_id": "RUN-DEBUG"},
+        "security": {
+            "answer_key_sent_to_llm": False,
+            "api_credentials_exposed": False,
+        },
+        "pages": [],
+    }
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ) as scope,
+        patch(
+            "services.exampen_llm_debug_service.build_submission_llm_debug_bundle",
+            return_value=payload,
+        ) as build,
+    ):
+        result = await get_submission_llm_debug(
+            submission_id="SUB-LLM-DEBUG",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result == payload
+    assert scope.await_count == 1
+    build.assert_awaited_once_with(db, "SUB-LLM-DEBUG")
+
+
+@pytest.mark.asyncio
 async def test_teacher_criterion_review_recomputes_total_and_keeps_audit_history():
     """Teachers can adjust only frozen criterion awards, never the rubric itself."""
     import os
