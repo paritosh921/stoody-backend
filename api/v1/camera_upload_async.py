@@ -225,7 +225,6 @@ async def complete_camera_submission(
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
-        allow_in_progress=True,
     )
     camera_col = tenant_db["exampen_camera_uploads"]
     await _ensure_indexes(camera_col)
@@ -356,6 +355,7 @@ async def upload_complete_answer_copy(
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
+        allow_in_progress=True,
     )
     if not confirm_submission:
         raise HTTPException(
