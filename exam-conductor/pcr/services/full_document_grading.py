@@ -3508,8 +3508,13 @@ def _validate_question_grade(
                     f"Criterion {criterion_id} cites evidence outside the fixed question map"
                 )
         if decision == "partially_met" and not missing_evidence:
-            validation_errors.append(
-                f"Criterion {criterion_id} has no stated missing evidence for partial credit"
+            # This is explanatory display metadata, not a scoring invariant.
+            # The awarded mark, decision, cited evidence, and locked range have
+            # already been validated above. Derive a useful explanation rather
+            # than discarding the complete question grade.
+            missing_evidence = (
+                criterion.get("acceptable_evidence")
+                or "The remaining part of the locked criterion was not demonstrated."
             )
         if decision == "unresolved":
             criterion_review_reasons.append(

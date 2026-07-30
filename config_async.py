@@ -411,7 +411,7 @@ class AsyncSettings(BaseSettings):
     )
     EXAMPEN_INLINE_PROCESSOR_CONCURRENCY: int = max(
         1,
-        min(4, int(os.getenv("EXAMPEN_INLINE_PROCESSOR_CONCURRENCY", "2"))),
+        min(4, int(os.getenv("EXAMPEN_INLINE_PROCESSOR_CONCURRENCY", "3"))),
     )
 
     # Performance tuning

@@ -523,6 +523,7 @@ async def _canonical_ingest(
     student_id: str,
     admin_id: str,
     pages: List[Dict[str, Any]],
+    source: str = "camera",
 ) -> Any:
     """Write the immutable canonical record used by the existing PCR engine."""
     from api.v1._exampen_imports import load_exampen
@@ -534,7 +535,7 @@ async def _canonical_ingest(
         exam_id=exam_id,
         student_id=student_id,
         admin_id=admin_id,
-        source="camera",
+        source=source,
         pen_mac=None,
         pages=pages,
     )
@@ -705,6 +706,8 @@ async def _secure_student_copy_pages(
     student_id: str,
     attempt_id: str,
     max_pages: int,
+    upload_actor_id: Optional[str] = None,
+    authorization_scope: str = "student-answer-copy",
 ) -> tuple[
     List[Dict[str, Any]],
     str,
@@ -737,9 +740,9 @@ async def _secure_student_copy_pages(
                     "exam_id": exam_id,
                     "student_id": student_id,
                     "attempt_id": attempt_id,
-                    "created_by": student_id,
+                    "created_by": upload_actor_id or student_id,
                 },
-                authorization_subject=f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:pdf",
+                authorization_subject=f"{authorization_scope}:{exam_id}:{student_id}:{attempt_id}:pdf",
                 include_bytes=True,
             )
             released_local_paths.append(clean_pdf.released_storage_path)
@@ -795,10 +798,10 @@ async def _secure_student_copy_pages(
                     "student_id": student_id,
                     "attempt_id": attempt_id,
                     "page_number": index + 1,
-                    "created_by": student_id,
+                    "created_by": upload_actor_id or student_id,
                 },
                 authorization_subject_factory=lambda upload, index: (
-                    f"student-answer-copy:{exam_id}:{student_id}:{attempt_id}:page-{index + 1}"
+                    f"{authorization_scope}:{exam_id}:{student_id}:{attempt_id}:page-{index + 1}"
                 ),
                 include_bytes=True,
             )

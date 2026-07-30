@@ -28,7 +28,9 @@ API authority:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -288,6 +290,16 @@ class ProcessingJobResponse(BaseModel):
 class ProcessingJobListResponse(BaseModel):
     exam_id: str
     items: List[ProcessingJobResponse]
+
+
+class ProcessingBatchResponse(BaseModel):
+    exam_id: str
+    requested: int
+    queued: int
+    skipped: int
+    failed: int
+    items: List[ProcessingJobResponse]
+    errors: List[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -2116,3 +2128,156 @@ async def retry_exam_processing_job(
             review_lease_token,
         )
     return _processing_job_to_response(retried)
+
+
+@router.post(
+    "/{exam_id}/processing/batch",
+    response_model=ProcessingBatchResponse,
+    summary="Queue AI checking for every unpublished submitted answer copy",
+)
+async def batch_reprocess_exam_submissions(
+    exam_id: str,
+    body: Optional[ProcessingJobReprocessRequest] = None,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> ProcessingBatchResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Exam {exam_id} not found",
+        )
+    _require_tutor_visibility(exam, current_user)
+
+    submissions = await tenant_db["evalpen_submissions"].find(
+        {
+            "exam_id": exam_id,
+            "publication_status": {"$ne": "published"},
+        },
+        {
+            "submission_id": 1,
+            "student_id": 1,
+        },
+    ).to_list(length=5000)
+    jobs = await tenant_db["exampen_processing_jobs"].find(
+        {"exam_id": exam_id}
+    ).sort("created_at", -1).to_list(length=5000)
+    jobs_by_submission: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        submission_id = str(job.get("submission_id") or "")
+        if submission_id and submission_id not in jobs_by_submission:
+            jobs_by_submission[submission_id] = job
+
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or current_user.get("username")
+        or "unknown"
+    )
+    try:
+        configured_concurrency = int(
+            os.getenv("EXAMPEN_BATCH_REPROCESS_CONCURRENCY", "3") or 3
+        )
+    except (TypeError, ValueError):
+        configured_concurrency = 3
+    semaphore = asyncio.Semaphore(max(1, min(8, configured_concurrency)))
+
+    from services.exampen_review_lease import (
+        SubmissionReviewBusyError,
+        acquire_submission_review_lease,
+        release_submission_review_lease,
+    )
+    from services.exampen_workflow import (
+        ProcessingJobBusyError,
+        reprocess_processing_job,
+        schedule_submission_processing,
+    )
+
+    async def _queue_submission(
+        submission: Dict[str, Any],
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        submission_id = str(submission.get("submission_id") or "")
+        student_id = str(submission.get("student_id") or "")
+        if not submission_id:
+            return "failed", None, "Submission is missing its canonical ID"
+        async with semaphore:
+            lease_token: Optional[str] = None
+            try:
+                lease_token = await acquire_submission_review_lease(
+                    tenant_db,
+                    submission_id,
+                    actor_id=actor_id,
+                    operation="batch_reprocess",
+                )
+                existing_job = jobs_by_submission.get(submission_id)
+                if existing_job:
+                    queued_job = await reprocess_processing_job(
+                        tenant_db,
+                        db_name=str(current_user.get("db_name") or ""),
+                        job_id=str(existing_job.get("job_id") or ""),
+                        requested_by=actor_id,
+                        reason=(
+                            body.reason
+                            if body and body.reason
+                            else "Teacher requested batch AI checking"
+                        ),
+                    )
+                else:
+                    queued_job = await schedule_submission_processing(
+                        tenant_db,
+                        db_name=str(current_user.get("db_name") or ""),
+                        exam_id=exam_id,
+                        submission_id=submission_id,
+                        student_id=student_id,
+                    )
+                return "queued", queued_job, None
+            except (SubmissionReviewBusyError, ProcessingJobBusyError) as exc:
+                return "skipped", None, str(exc)[:240]
+            except Exception as exc:
+                logger.exception(
+                    "Batch PCR queue failed for submission %s",
+                    submission_id,
+                )
+                return (
+                    "failed",
+                    None,
+                    f"{type(exc).__name__}: {str(exc)[:200]}",
+                )
+            finally:
+                if lease_token:
+                    await release_submission_review_lease(
+                        tenant_db,
+                        submission_id,
+                        lease_token,
+                    )
+
+    results = await asyncio.gather(
+        *(_queue_submission(submission) for submission in submissions)
+    )
+    queued_items: List[ProcessingJobResponse] = []
+    errors: List[str] = []
+    skipped = 0
+    failed = 0
+    for outcome, job, error in results:
+        if outcome == "queued" and job:
+            queued_items.append(_processing_job_to_response(job))
+        elif outcome == "skipped":
+            skipped += 1
+            if error:
+                errors.append(error)
+        else:
+            failed += 1
+            if error:
+                errors.append(error)
+
+    return ProcessingBatchResponse(
+        exam_id=exam_id,
+        requested=len(submissions),
+        queued=len(queued_items),
+        skipped=skipped,
+        failed=failed,
+        items=queued_items,
+        errors=errors[:20],
+    )

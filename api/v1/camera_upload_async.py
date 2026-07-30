@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -319,6 +320,170 @@ async def complete_camera_submission(
         processing_status=processing_status,
         accepted_at=datetime.now(timezone.utc).isoformat(),
     )
+
+
+@router.post(
+    "/{exam_id}/{student_id}/answer-copy",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=CameraSubmissionAck,
+    summary="Upload and queue one student's complete answer copy as staff",
+    responses={
+        400: {"description": "Invalid PDF/images or exam not uploadable"},
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Exam or student not found"},
+        409: {"description": "A canonical submission already exists"},
+    },
+)
+async def upload_complete_answer_copy(
+    exam_id: str,
+    student_id: str,
+    pages: Optional[List[UploadFile]] = File(None),
+    answer_pdf: Optional[UploadFile] = File(None),
+    confirm_submission: bool = Form(True),
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> CameraSubmissionAck:
+    """Let staff submit the same canonical PDF/image copy a student can submit."""
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam_doc = await _require_camera_upload_context(
+        tenant_db,
+        exam_id=exam_id,
+        student_id=student_id,
+        current_user=current_user,
+    )
+    if not confirm_submission:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Confirm the final answer-copy upload before submitting it",
+        )
+
+    image_files = [item for item in (pages or []) if item and item.filename]
+    has_pdf = bool(answer_pdf and answer_pdf.filename)
+    if has_pdf and image_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload either one PDF or one or more JPG/PNG pages, not both",
+        )
+    if not has_pdf and not image_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload one PDF or at least one answer-page image",
+        )
+
+    existing = await tenant_db["evalpen_submissions"].find_one(
+        {"exam_id": exam_id, "student_id": student_id},
+        {"submission_id": 1},
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A final answer copy already exists for this student",
+        )
+
+    max_pages = max(1, min(50, int(exam_doc.get("student_submission_max_pages") or 20)))
+    if len(image_files) > max_pages:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This exam allows at most {max_pages} answer pages",
+        )
+    canonical_admin_id = str(exam_doc.get("admin_id") or "").strip()
+    if not canonical_admin_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Exam is missing its canonical admin owner",
+        )
+
+    from api.v1.evalpen_student_submission_async import (
+        _canonical_ingest,
+        _cleanup_released_student_copy_paths,
+        _delete_private_student_copy_objects,
+        _queue_pcr_processing,
+        _secure_student_copy_pages,
+    )
+
+    attempt_id = f"staff-{uuid.uuid4().hex}"
+    released_local_paths: List[str] = []
+    uploaded_storage_paths: List[str] = []
+    try:
+        (
+            page_records,
+            source_format,
+            _original_asset,
+            released_local_paths,
+            uploaded_storage_paths,
+            _verdict_transfers,
+        ) = await _secure_student_copy_pages(
+            image_files=image_files,
+            answer_pdf=answer_pdf if has_pdf else None,
+            current_user=current_user,
+            tenant_db=tenant_db,
+            db_name=str(current_user.get("db_name") or ""),
+            exam_id=exam_id,
+            student_id=student_id,
+            attempt_id=attempt_id,
+            max_pages=max_pages,
+            upload_actor_id=str(
+                current_user.get("user_id")
+                or current_user.get("tutor_id")
+                or current_user.get("admin_id")
+                or "staff"
+            ),
+            authorization_scope="staff-answer-copy",
+        )
+        result = await _canonical_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            student_id=student_id,
+            admin_id=canonical_admin_id,
+            pages=page_records,
+            source="scan" if source_format == "pdf" else "camera",
+        )
+    except HTTPException:
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        raise
+    except Exception as exc:
+        await _delete_private_student_copy_objects(uploaded_storage_paths)
+        logger.exception(
+            "Staff answer-copy ingest failed: exam=%s student=%s",
+            exam_id,
+            student_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create the canonical answer-copy submission",
+        ) from exc
+    finally:
+        await _cleanup_released_student_copy_paths(released_local_paths)
+
+    processing_job_id = None
+    processing_status = None
+    try:
+        job = await _queue_pcr_processing(
+            tenant_db,
+            db_name=str(current_user.get("db_name") or ""),
+            exam_id=exam_id,
+            submission_id=result.submission_id,
+            student_id=student_id,
+        )
+        processing_job_id = job.get("job_id")
+        processing_status = job.get("status")
+    except Exception:
+        logger.exception(
+            "Unable to schedule staff-uploaded PCR copy %s",
+            result.submission_id,
+        )
+
+    return CameraSubmissionAck(
+        exam_id=exam_id,
+        student_id=student_id,
+        submission_id=result.submission_id,
+        page_count=len(page_records),
+        processing_job_id=processing_job_id,
+        processing_status=processing_status,
+        accepted_at=datetime.now(timezone.utc).isoformat(),
+    )
+
 
 @router.post(
     "/{exam_id}/{student_id}/{page_num}",
