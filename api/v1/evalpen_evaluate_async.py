@@ -33,7 +33,9 @@ Test IDs:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -515,43 +517,54 @@ async def evaluate_batch(
     try:
         eval_core = await _build_eval_core(tenant_db)
 
-        results = []
-        for item in body.items:
-            try:
-                result = await eval_core.evaluate_response(
-                    item.response_id,
-                    question_id=item.question_id,
-                )
-                if result.skipped:
-                    results.append({
-                        "response_id": item.response_id,
-                        "status": "queued",
-                        "note": "Blocked by flags — requires manual review",
-                    })
-                elif result.error:
-                    results.append({
-                        "response_id": item.response_id,
-                        "status": "queued",
-                        "note": f"Error: {result.error}",
-                    })
-                else:
-                    results.append({
+        try:
+            configured_concurrency = int(
+                os.getenv("PCR_BATCH_EVALUATION_CONCURRENCY", "4") or 4
+            )
+        except (TypeError, ValueError):
+            configured_concurrency = 4
+        semaphore = asyncio.Semaphore(max(1, min(8, configured_concurrency)))
+
+        async def _evaluate_item(item: EvaluateRequest) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    result = await eval_core.evaluate_response(
+                        item.response_id,
+                        question_id=item.question_id,
+                    )
+                    if result.skipped:
+                        return {
+                            "response_id": item.response_id,
+                            "status": "queued",
+                            "note": "Blocked by flags - requires manual review",
+                        }
+                    if result.error:
+                        return {
+                            "response_id": item.response_id,
+                            "status": "queued",
+                            "note": f"Error: {result.error}",
+                        }
+                    return {
                         "evaluation_id": result.evaluation_id,
                         "response_id": result.response_id,
                         "status": "evaluating",
-                    })
-            except Exception as exc:
-                logger.error(
-                    "Batch eval failed for response=%s: %s",
-                    item.response_id,
-                    exc,
-                    exc_info=True,
-                )
-                results.append({
-                    "response_id": item.response_id,
-                    "status": "queued",
-                    "note": f"Error: {str(exc)}",
-                })
+                    }
+                except Exception as exc:
+                    logger.error(
+                        "Batch eval failed for response=%s: %s",
+                        item.response_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    return {
+                        "response_id": item.response_id,
+                        "status": "queued",
+                        "note": f"Error: {str(exc)}",
+                    }
+
+        results = await asyncio.gather(
+            *[_evaluate_item(item) for item in body.items]
+        )
 
         return {
             "total": len(body.items),

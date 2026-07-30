@@ -382,7 +382,13 @@ def mapping_system_instructions() -> str:
         "unassigned_regions and set all_student_work_accounted=false. Objective "
         "answers may be written as a compact numbered list such as '1 B, 2 C'. Map "
         "each visible label to its catalog question and keep its region independently "
-        "auditable. Never invent or grade evidence."
+        "auditable. Names, roll numbers, class/section details, dates, signatures, "
+        "page numbers, copy labels, invigilator marks, and other administrative header "
+        "content are not answer work: ignore them and never put them in "
+        "unassigned_regions. Make each answer region generous enough to include the "
+        "complete line, final answer, nearby working, and immediately adjacent labels. "
+        "When an answer continues elsewhere, return every continuation region rather "
+        "than one representative crop. Never invent or grade evidence."
     )
 
 
@@ -390,8 +396,11 @@ def grading_system_instructions() -> str:
     return (
         "You are the question-level visual examiner for a high-stakes handwritten "
         "exam. The evidence mapper has already fixed question ownership. Grade only "
-        "the supplied high-resolution evidence crops and their stated region IDs "
-        "against the immutable question, teacher solution, and locked criteria. "
+        "the supplied high-resolution evidence crops, their surrounding page context, "
+        "and their stated region IDs against the immutable question, teacher solution, "
+        "and locked criteria. Full-page context is supplied to recover clipped symbols, "
+        "final answers, and immediately adjacent continuation work belonging to the "
+        "mapped answer; never borrow unrelated work from another question. "
         "Never use OCR text as the authority and never move evidence to another "
         "question. Read mathematical layout spatially: distinguish superscripts, "
         "fractions, roots, signs, matrices, and overwritten work. Evaluate diagrams "

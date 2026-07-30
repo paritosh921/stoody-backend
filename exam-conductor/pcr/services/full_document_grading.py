@@ -122,6 +122,23 @@ class StructuredOutputContractError(FullDocumentGradingError):
         }
 
 
+class QuestionVisualGraderContractError(FullDocumentGradingError):
+    """Raised when a batch request is answered with the wrong question set."""
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        requested_numbers: Sequence[int],
+        returned_numbers: Sequence[int],
+    ) -> None:
+        super().__init__(message)
+        self.requested_numbers = list(requested_numbers)
+        self.returned_numbers = list(returned_numbers)
+
+
 class GradingRunIdentityError(FullDocumentGradingError):
     """Raised for a deterministic grading-run ownership or identity conflict."""
 
@@ -919,6 +936,35 @@ class FullDocumentGradingService:
             number for number in attempted_numbers if str(number) not in saved_grades
         ]
 
+        def _unresolved_grade_for_output_budget(
+            question_number: int,
+            reason: str,
+            *,
+            confidence: float = 0.0,
+        ) -> Dict[str, Any]:
+            return {
+                "question_number": question_number,
+                "attempt_status": "unresolved",
+                "confidence": confidence,
+                "student_answer": "",
+                "content_type": ContentType.MIXED.value,
+                "evidence_regions": [],
+                "method_analysis": {
+                    **_not_applicable_method_analysis(),
+                    "method_classification": "unresolved",
+                    "method_validity": "unresolved",
+                    "method_requirement_satisfied": False,
+                    "confidence": confidence,
+                    "explanation": reason[:800],
+                    "error_carried_forward": "unresolved",
+                },
+                "criterion_marks": [],
+                "total_score": 0.0,
+                "overall_feedback": "No verified answer state exists for this question.",
+                "needs_review": True,
+                "review_reason": reason[:800],
+            }
+
         async def _grade_question_subset(
             batch_questions: List[Dict[str, Any]],
             batch_numbers: List[int],
@@ -971,6 +1017,7 @@ class FullDocumentGradingService:
             returned: Dict[str, Dict[str, Any]] = {}
             unexpected_numbers: set[int] = set()
             duplicate_numbers: set[int] = set()
+            observed_numbers: set[int] = set()
             if (
                 grading_payload.get("evidence_graph_version")
                 != EVIDENCE_GRAPH_VERSION
@@ -982,6 +1029,8 @@ class FullDocumentGradingService:
                 if not isinstance(item, dict):
                     continue
                 number = _positive_int(item.get("question_number"))
+                if number is not None:
+                    observed_numbers.add(number)
                 if number not in allowed:
                     if number is not None:
                         unexpected_numbers.add(number)
@@ -1006,15 +1055,19 @@ class FullDocumentGradingService:
                             f"Q{number}" for number in sorted(duplicate_numbers)
                         )
                     )
-                raise FullDocumentGradingError(
+                raise QuestionVisualGraderContractError(
                     "Question visual grader violated the requested batch: "
-                    + "; ".join(reasons)
+                    + "; ".join(reasons),
+                    requested_numbers=sorted(allowed),
+                    returned_numbers=sorted(observed_numbers),
                 )
             if set(map(int, returned)) != allowed:
                 missing = sorted(allowed - set(map(int, returned)))
-                raise FullDocumentGradingError(
+                raise QuestionVisualGraderContractError(
                     "Question visual grader omitted requested question(s): "
-                    + ", ".join(f"Q{number}" for number in missing)
+                    + ", ".join(f"Q{number}" for number in missing),
+                    requested_numbers=sorted(allowed),
+                    returned_numbers=sorted(observed_numbers),
                 )
             batch_usage = _usage_dict(
                 grading_response,
@@ -1049,14 +1102,62 @@ class FullDocumentGradingService:
                     batch_index=batch_index,
                     budget_minimum=budget_minimum,
                 )
-            except Exception as exc:
-                if not _is_max_output_token_exhaustion_error(exc):
-                    raise
-
+            except QuestionVisualGraderContractError as exc:
+                logger.warning(
+                    "Question visual grader violated contract on %s for requested %s and "
+                    "returned %s.",
+                    batch_index,
+                    exc.requested_numbers,
+                    exc.returned_numbers,
+                )
+                if len(batch_numbers) > 1:
+                    logger.warning(
+                        "Question visual grader contract mismatch on %s; "
+                        "splitting %d questions and retrying individually.",
+                        batch_index,
+                        len(batch_questions),
+                    )
+                    aggregated: Dict[str, Dict[str, Any]] = {}
+                    aggregated_usage: Dict[str, Any] = {}
+                    for index, number in enumerate(batch_numbers, start=1):
+                        question = question_by_number[number]
+                        sub_returned, sub_usage = await _grade_question_subset_with_fallback(
+                            [question],
+                            [number],
+                            batch_index=f"{batch_index}.{index}",
+                            budget_minimum=budget_minimum,
+                            can_split=False,
+                        )
+                        aggregated.update(sub_returned)
+                        aggregated_usage = _merge_usages(aggregated_usage, sub_usage)
+                    return aggregated, aggregated_usage
+                if batch_numbers:
+                    number = batch_numbers[0]
+                    logger.warning(
+                        "Question visual grader contract mismatch on %s for Q%s; "
+                        "marking unresolved to keep grading flow complete.",
+                        batch_index,
+                        number,
+                    )
+                    return (
+                        {
+                            str(number): _unresolved_grade_for_output_budget(
+                                number,
+                                (
+                                    "The question grader returned an output that did "
+                                    "not match the requested question and was marked "
+                                    "unresolved for teacher review."
+                                ),
+                            )
+                        },
+                        {},
+                    )
+                raise
+            except StructuredOutputContractError as exc:
                 if len(batch_numbers) > 1 and can_split:
                     logger.warning(
-                        "Question visual grader hit output budget for batch %s; "
-                        "splitting %d questions and retrying individually.",
+                        "Question visual grader returned incomplete structured output "
+                        "for batch %s; splitting %d questions and retrying individually.",
                         batch_index,
                         len(batch_questions),
                     )
@@ -1077,11 +1178,31 @@ class FullDocumentGradingService:
 
                 fallback_minimum = _fallback_question_output_tokens(budget_minimum)
                 if fallback_minimum == budget_minimum:
+                    if len(batch_numbers) == 1:
+                        number = batch_numbers[0]
+                        logger.warning(
+                            "Question visual grader could not produce valid structured "
+                            "output for %s after bounded retries. Marking Q%s unresolved "
+                            "instead of failing the complete submission.",
+                            batch_index,
+                            number,
+                        )
+                        return (
+                            {
+                                str(number): _unresolved_grade_for_output_budget(
+                                    number,
+                                    "The question grader could not return a complete "
+                                    "strict result after bounded retries and was marked "
+                                    "unresolved for teacher review.",
+                                )
+                            },
+                            {},
+                        )
                     raise
 
                 logger.warning(
-                    "Question visual grader hit output budget for %s; retrying "
-                    "same question with larger output budget.",
+                    "Question visual grader returned incomplete structured output for "
+                    "%s; retrying the same question with a larger bounded output budget.",
                     batch_index,
                 )
                 return await _grade_question_subset_with_fallback(
@@ -1092,20 +1213,59 @@ class FullDocumentGradingService:
                     can_split=False,
                 )
 
-        for batch_index, batch_numbers in enumerate(
-            _question_batches(missing_numbers),
-            start=1,
-        ):
+        batch_specs = list(
+            enumerate(_question_batches(missing_numbers), start=1)
+        )
+        try:
+            configured_concurrency = int(
+                os.getenv("PCR_VISUAL_BATCH_CONCURRENCY", "2") or 2
+            )
+        except (TypeError, ValueError):
+            configured_concurrency = 2
+        batch_semaphore = asyncio.Semaphore(
+            max(1, min(4, configured_concurrency))
+        )
+
+        async def _run_question_batch(
+            batch_index: int,
+            batch_numbers: List[int],
+        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
             batch_questions = [
                 question_by_number[number]
                 for number in batch_numbers
                 if number in question_by_number
             ]
-            returned, batch_usage = await _grade_question_subset_with_fallback(
-                batch_questions,
-                batch_numbers,
-                batch_index=str(batch_index),
-            )
+            async with batch_semaphore:
+                return await _grade_question_subset_with_fallback(
+                    batch_questions,
+                    batch_numbers,
+                    batch_index=str(batch_index),
+                )
+
+        batch_results = await asyncio.gather(
+            *[
+                _run_question_batch(batch_index, batch_numbers)
+                for batch_index, batch_numbers in batch_specs
+            ],
+            return_exceptions=True,
+        )
+        first_batch_error: Optional[BaseException] = None
+        for (batch_index, batch_numbers), batch_result in zip(
+            batch_specs,
+            batch_results,
+        ):
+            if isinstance(batch_result, BaseException):
+                if isinstance(batch_result, asyncio.CancelledError):
+                    raise batch_result
+                logger.exception(
+                    "Question visual grading batch %s failed",
+                    batch_index,
+                    exc_info=batch_result,
+                )
+                if first_batch_error is None:
+                    first_batch_error = batch_result
+                continue
+            returned, batch_usage = batch_result
             if returned:
                 resolved_model = str(batch_usage.get("model") or resolved_model)
                 saved_grades.update(returned)
@@ -1131,6 +1291,8 @@ class FullDocumentGradingService:
                 raise FullDocumentGradingError(
                     "Submission grading ownership expired while saving question grades"
                 )
+        if first_batch_error is not None:
+            raise first_batch_error
 
         final_payload = merge_mapping_and_grading(
             mapping,
@@ -1208,6 +1370,118 @@ class FullDocumentGradingService:
                 visual_evidence=visual_evidence,
                 prompt_version=prompt_version,
             )
+            grading_consistency_key = _grading_consistency_key(
+                question_id=question_id,
+                student_answer=grade.student_answer,
+                method_analysis=grade.method_analysis,
+                prompt_version=prompt_version,
+                model_used=model_used,
+            )
+            consistency_calibration: Optional[Dict[str, Any]] = None
+            if (
+                grading_consistency_key
+                and grade.attempt_status == "attempted"
+                and grade.total_score is not None
+                and not grade.manual_review_required
+                and not _is_objective_question(grade.question)
+            ):
+                peer_cursor = self._db["evalpen_evaluations"].find(
+                    {
+                        "exam_id": exam_id,
+                        "question_id": question_id,
+                        "student_id": {"$ne": student_id},
+                        "prompt_version": prompt_version,
+                        "model_used": model_used,
+                        "grading_consistency_key": grading_consistency_key,
+                        "manual_review_required": False,
+                    },
+                    {
+                        "evaluation_id": 1,
+                        "student_id": 1,
+                        "total_score": 1,
+                        "max_score": 1,
+                        "criterion_marks": 1,
+                        "created_at": 1,
+                    },
+                ).sort("created_at", -1).limit(100)
+                peer_docs = await peer_cursor.to_list(length=100)
+                latest_by_student: Dict[str, Dict[str, Any]] = {}
+                current_max = _max_marks(grade.question)
+                current_ids = {
+                    str(item.get("criterion_id") or "")
+                    for item in grade.criterion_marks
+                }
+                for peer in peer_docs:
+                    peer_student = str(peer.get("student_id") or "")
+                    peer_ids = {
+                        str(item.get("criterion_id") or "")
+                        for item in (peer.get("criterion_marks") or [])
+                        if isinstance(item, dict)
+                    }
+                    peer_max = _finite_float(peer.get("max_score"))
+                    if (
+                        not peer_student
+                        or peer_student in latest_by_student
+                        or peer_max is None
+                        or abs(peer_max - current_max) > 0.01
+                        or peer_ids != current_ids
+                    ):
+                        continue
+                    latest_by_student[peer_student] = peer
+
+                variants: Dict[str, List[Dict[str, Any]]] = {}
+                for peer in latest_by_student.values():
+                    variants.setdefault(
+                        _criterion_award_signature(peer),
+                        [],
+                    ).append(peer)
+                if len(variants) == 1 and latest_by_student:
+                    canonical = next(iter(variants.values()))[0]
+                    canonical_marks = {
+                        str(item.get("criterion_id") or ""): item
+                        for item in (canonical.get("criterion_marks") or [])
+                        if isinstance(item, dict)
+                    }
+                    calibrated_marks: List[Dict[str, Any]] = []
+                    for current_mark in grade.criterion_marks:
+                        calibrated = dict(current_mark)
+                        canonical_mark = canonical_marks.get(
+                            str(current_mark.get("criterion_id") or "")
+                        )
+                        if canonical_mark:
+                            for key in (
+                                "marks_awarded",
+                                "decision",
+                                "credit_basis",
+                                "rationale",
+                                "missing_evidence",
+                            ):
+                                if key in canonical_mark:
+                                    calibrated[key] = canonical_mark[key]
+                        calibrated_marks.append(calibrated)
+                    grade.criterion_marks = calibrated_marks
+                    grade.total_score = float(canonical.get("total_score") or 0.0)
+                    consistency_calibration = {
+                        "status": "reused_unanimous_peer_award",
+                        "source_evaluation_id": canonical.get("evaluation_id"),
+                        "peer_student_count": len(latest_by_student),
+                    }
+                elif len(variants) > 1:
+                    grade.manual_review_required = True
+                    conflict_reason = (
+                        "Equivalent normalized work has conflicting prior awards "
+                        "within this exam and requires consistency review"
+                    )
+                    grade.review_reason = (
+                        f"{grade.review_reason}; {conflict_reason}"
+                        if grade.review_reason
+                        else conflict_reason
+                    )
+                    consistency_calibration = {
+                        "status": "conflicting_peer_awards",
+                        "peer_student_count": len(latest_by_student),
+                        "award_variant_count": len(variants),
+                    }
             response_id = _stable_id(
                 "RESP-DOC", submission_id, materialization_id, question_id
             )
@@ -1278,6 +1552,8 @@ class FullDocumentGradingService:
                 "source_pages": grade.source_pages,
                 "visual_evidence": visual_evidence,
                 "semantic_evidence_signature": semantic_evidence_signature,
+                "grading_consistency_key": grading_consistency_key or None,
+                "consistency_calibration": consistency_calibration,
                 "evidence_version": (
                     3
                     if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
@@ -1340,6 +1616,8 @@ class FullDocumentGradingService:
                     "prompt_version": prompt_version,
                     "visual_evidence": visual_evidence,
                     "semantic_evidence_signature": semantic_evidence_signature,
+                    "grading_consistency_key": grading_consistency_key or None,
+                    "consistency_calibration": consistency_calibration,
                     "eval_path": (
                         "full_document_visual_not_attempted"
                         if is_missing
@@ -1493,9 +1771,11 @@ class FullDocumentGradingService:
         return FullDocumentGradingResult(
             handled=True,
             submission_id=submission_id,
-            # Technical processing completed successfully. Review and
-            # publication eligibility are independent states.
-            status="completed",
+            status=(
+                "completed"
+                if review_state == "ready"
+                else "blocked_for_review"
+            ),
             page_count=page_count,
             response_count=len(response_docs),
             evaluated_count=evaluated,
@@ -2103,11 +2383,11 @@ def _multistage_system_instructions() -> str:
 def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
     try:
         configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
+            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "2") or 2
         )
     except (TypeError, ValueError):
-        configured = 6
-    size = max(1, min(10, configured))
+        configured = 2
+    size = max(1, min(4, configured))
     numbers = [int(number) for number in question_numbers]
     return [numbers[index : index + size] for index in range(0, len(numbers), size)]
 
@@ -2214,6 +2494,44 @@ def _build_question_grading_input(
         }
     ]
     crop_bytes = 0
+    relevant_page_numbers = sorted(
+        {
+            int(region.get("page_number") or 0)
+            for question in questions
+            for region in (
+                (mappings.get(int(question.get("question_number") or 0)) or {}).get(
+                    "evidence_regions"
+                )
+                or []
+            )
+            if int(region.get("page_number") or 0) > 0
+        }
+    )
+    for page_number in relevant_page_numbers:
+        asset = assets.get(page_number)
+        if asset is None:
+            continue
+        crop_bytes += len(asset.global_bytes)
+        dynamic.extend(
+            [
+                {
+                    "type": "input_text",
+                    "text": (
+                        f"Full page {page_number} context for the mapped evidence "
+                        "below. Use it only to recover clipped or immediately adjacent "
+                        "work belonging to the same mapped question."
+                    ),
+                },
+                {
+                    "type": "input_image",
+                    "image_url": (
+                        f"data:{asset.global_media_type};base64,"
+                        + base64.b64encode(asset.global_bytes).decode("ascii")
+                    ),
+                    "detail": "high",
+                },
+            ]
+        )
     for index, question in enumerate(questions, start=1):
         number = int(question.get("question_number") or index)
         mapped = mappings.get(number) or {}
@@ -2292,8 +2610,20 @@ def _crop_student_region(
         with Image.open(io.BytesIO(asset.original_bytes)) as opened:
             image = ImageOps.exif_transpose(opened)
             width, height = image.size
-            margin_x = max(8, int(width * 0.02))
-            margin_y = max(8, int(height * 0.02))
+            normalized_width = max(
+                1.0,
+                float(region.get("x_end") or 1000)
+                - float(region.get("x_start") or 0),
+            )
+            normalized_height = max(
+                1.0,
+                float(region.get("y_end") or 1000)
+                - float(region.get("y_start") or 0),
+            )
+            region_width = int(width * normalized_width / 1000.0)
+            region_height = int(height * normalized_height / 1000.0)
+            margin_x = max(12, int(width * 0.04), int(region_width * 0.18))
+            margin_y = max(12, int(height * 0.04), int(region_height * 0.18))
             left = max(
                 0,
                 int(width * float(region.get("x_start") or 0) / 1000.0)
@@ -3917,6 +4247,74 @@ def _semantic_evidence_signature(
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+
+
+def _grading_consistency_key(
+    *,
+    question_id: str,
+    student_answer: str,
+    method_analysis: Mapping[str, Any],
+    prompt_version: str,
+    model_used: str,
+) -> str:
+    """Key equivalent normalized work within one immutable grading contract.
+
+    Coordinates, page numbers, handwriting style, confidence, and awarded marks
+    are deliberately excluded. Exact normalized work can therefore share a
+    cohort precedent, while different steps or methods remain independent.
+    """
+
+    normalized_answer = " ".join(str(student_answer or "").casefold().split())
+    if len(normalized_answer) < 2:
+        return ""
+    payload = {
+        "version": "pcr-cohort-consistency-v1",
+        "question_id": str(question_id or ""),
+        "student_answer": normalized_answer,
+        "method_analysis": {
+            key: method_analysis.get(key)
+            for key in (
+                "method_used",
+                "method_requirement_satisfied",
+                "error_carried_forward",
+            )
+        },
+        "prompt_version": str(prompt_version or ""),
+        "model_used": str(model_used or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _criterion_award_signature(evaluation: Mapping[str, Any]) -> str:
+    """Return the score-only identity used to detect cohort disagreement."""
+
+    marks = [
+        {
+            "criterion_id": str(item.get("criterion_id") or ""),
+            "marks_awarded": round(
+                float(_finite_float(item.get("marks_awarded")) or 0.0),
+                2,
+            ),
+            "max_marks": round(
+                float(_finite_float(item.get("max_marks")) or 0.0),
+                2,
+            ),
+            "decision": str(item.get("decision") or ""),
+            "credit_basis": str(item.get("credit_basis") or ""),
+        }
+        for item in (evaluation.get("criterion_marks") or [])
+        if isinstance(item, Mapping)
+    ]
+    payload = {
+        "total_score": round(
+            float(_finite_float(evaluation.get("total_score")) or 0.0),
+            2,
+        ),
+        "criterion_marks": sorted(marks, key=lambda item: item["criterion_id"]),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _static_context_hash(
