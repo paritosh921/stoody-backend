@@ -16,7 +16,7 @@ from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
-POLICY_VERSION = "criterion-rubric-v1"
+POLICY_VERSION = "criterion-rubric-v2"
 METHOD_POLICY_VERSION = "method-policy-v1"
 STRUCTURED_RUBRIC_MODE = "criterion_rubric_v1"
 LEGACY_AI_MODE = "legacy_ai_v1"
@@ -43,7 +43,11 @@ STRICTNESS_PROFILES: Dict[str, str] = {
     "balanced": (
         "Apply ordinary teacher partial credit. Accept valid alternative "
         "methods, but require the criterion's stated outcome or evidence "
-        "before awarding its marks."
+        "before awarding its marks. If a legacy criterion is worth more than "
+        "one mark, award proportional credit for each independently correct "
+        "visible step supported by the reference solution; do not turn it into "
+        "an all-or-nothing result unless the method policy explicitly says that "
+        "only the result is required."
     ),
     "strict": (
         "Apply the criterion exactly. Do not infer missing method, units, "
@@ -63,7 +67,7 @@ def default_structured_marking_policy() -> Dict[str, Any]:
         "version": POLICY_VERSION,
         "mode": STRUCTURED_RUBRIC_MODE,
         "strictness": "balanced",
-        "temperature": 0.10,
+        "temperature": 0.0,
     }
 
 
@@ -326,6 +330,8 @@ def normalize_marking_criteria(
 def validate_marking_criteria(
     criteria: Iterable[Mapping[str, Any]],
     question_max_marks: Any,
+    *,
+    require_atomic: bool = False,
 ) -> List[str]:
     """Return finalisation errors for a locked teacher marking rubric."""
 
@@ -359,6 +365,11 @@ def validate_marking_criteria(
             marks = 0.0
         if not math.isfinite(marks) or marks <= 0:
             errors.append(f"criterion {position}: assign marks greater than zero")
+        elif require_atomic and marks > 1.0 + _MARK_TOLERANCE:
+            errors.append(
+                f"criterion {position}: split this {marks:g}-mark row into "
+                "independently assessable criteria worth at most 1 mark each"
+            )
         total += marks
 
     if abs(total - max_marks) > _MARK_TOLERANCE:

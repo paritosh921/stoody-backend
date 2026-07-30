@@ -149,6 +149,7 @@ async def _require_camera_upload_context(
     exam_id: str,
     student_id: str,
     current_user: Dict[str, Any],
+    allow_in_progress: bool = False,
 ) -> Dict[str, Any]:
     """Validate a camera copy against its conducted-session boundary."""
     exam_doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
@@ -170,12 +171,15 @@ async def _require_camera_upload_context(
             detail="Camera capture was not enabled when this exam session was created",
         )
     lifecycle = exam_doc.get("lifecycle_state", "draft")
-    if lifecycle not in ("collection_closed", "uploading"):
+    allowed_lifecycles = {"collection_closed", "uploading"}
+    if allow_in_progress:
+        allowed_lifecycles.add("in_progress")
+    if lifecycle not in allowed_lifecycles:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Exam {exam_id} is in state '{lifecycle}' — must be "
-                "'collection_closed' or 'uploading' for camera upload"
+                f"Exam {exam_id} is in state '{lifecycle}' and is not accepting "
+                "this answer-copy upload"
             ),
         )
     roster = [str(item) for item in (exam_doc.get("roster") or [])]
@@ -221,6 +225,7 @@ async def complete_camera_submission(
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
+        allow_in_progress=True,
     )
     camera_col = tenant_db["exampen_camera_uploads"]
     await _ensure_indexes(camera_col)

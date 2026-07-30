@@ -2870,10 +2870,6 @@ def _parse_pcr_marking_plan_draft(
     except ValueError as exc:
         raise ValueError(f"The AI returned invalid criterion rows: {exc}") from exc
 
-    errors = policy_module.validate_marking_criteria(criteria, question_marks)
-    if errors:
-        raise ValueError("The AI draft needs regeneration: " + "; ".join(errors[:3]))
-
     reference_solution = str(
         payload.get("reference_solution") or payload.get("teacher_reference_solution") or ""
     ).strip()
@@ -2883,6 +2879,15 @@ def _parse_pcr_marking_plan_draft(
         )
     except ValueError as exc:
         raise ValueError(f"The AI returned an invalid method policy: {exc}") from exc
+    errors = policy_module.validate_marking_criteria(
+        criteria,
+        question_marks,
+        require_atomic=(
+            method_policy.get("mode") != policy_module.NO_METHOD_REQUIRED
+        ),
+    )
+    if errors:
+        raise ValueError("The AI draft needs regeneration: " + "; ".join(errors[:3]))
     return {
         "reference_solution": reference_solution,
         "marking_criteria": criteria,
@@ -2998,8 +3003,7 @@ async def generate_pcr_marking_plan_draft(
         default_structured=True,
     )
     strictness = str(policy.get("strictness") or "balanced")
-    temperature = float(policy.get("temperature") or 0.10)
-    temperature = max(0.0, min(0.20, temperature))
+    temperature = 0.0
 
     if GROQ_API_KEY:
         client = AsyncOpenAI(
@@ -3027,6 +3031,9 @@ async def generate_pcr_marking_plan_draft(
         "Use specified_method_required only when the question explicitly names a compulsory method, and copy that requirement into required_method. "
         "Use no_method_required when a result alone earns the available marks. Enable error-carried-forward unless the question or scheme clearly forbids it.\n"
         f"The question is worth exactly {question_marks:g} marks. The sum of all criterion max_marks MUST be exactly {question_marks:g}.\n"
+        "For a worked subjective solution, make every awarded mark an independently assessable criterion worth at most 1 mark. "
+        "For example, a 2-mark calculation normally needs two 1-mark criteria for distinct correct achievements, so a correct method step can retain credit after a later arithmetic error. "
+        "The only exception is a genuine result-only question whose method_policy is no_method_required.\n"
         "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the uploaded solution's own method and conclusion plus clearly equivalent valid alternatives. "
         "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"

@@ -1078,13 +1078,17 @@ def validate_pcr_questions(
             )
         if uses_structured_criteria:
             try:
-                _question_method_policy(question)
+                method_policy = _question_method_policy(question)
             except ValueError as exc:
                 errors.append(f"Q {label}: {exc}")
+                method_policy = policy_module.default_method_policy()
             criteria = _question_marking_criteria(question)
             criterion_errors = policy_module.validate_marking_criteria(
                 criteria,
                 _question_marks(question),
+                require_atomic=(
+                    method_policy.get("mode") != policy_module.NO_METHOD_REQUIRED
+                ),
             )
             errors.extend(f"Q {label}: {error}" for error in criterion_errors)
     return errors
