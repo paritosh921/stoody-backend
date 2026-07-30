@@ -918,15 +918,14 @@ class FullDocumentGradingService:
         missing_numbers = [
             number for number in attempted_numbers if str(number) not in saved_grades
         ]
-        for batch_index, batch_numbers in enumerate(
-            _question_batches(missing_numbers),
-            start=1,
-        ):
-            batch_questions = [
-                question_by_number[number]
-                for number in batch_numbers
-                if number in question_by_number
-            ]
+
+        async def _grade_question_subset(
+            batch_questions: List[Dict[str, Any]],
+            batch_numbers: List[int],
+            *,
+            batch_index: str,
+            budget_minimum: int = 8_000,
+        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
             grading_input, crop_bytes = _build_question_grading_input(
                 static_content=static_content,
                 questions=batch_questions,
@@ -947,7 +946,8 @@ class FullDocumentGradingService:
                 reasoning_effort=reasoning_effort,
                 temperature=temperature,
                 max_output_tokens=_question_output_token_budget(
-                    len(batch_questions)
+                    len(batch_questions),
+                    minimum_output_tokens=budget_minimum,
                 ),
                 metadata={
                     "pcr_stage": "question_visual_grading",
@@ -958,6 +958,7 @@ class FullDocumentGradingService:
                     "question_numbers": batch_numbers,
                     "batch_index": batch_index,
                     "run_id": run_id,
+                    "budget_minimum": budget_minimum,
                 },
             )
             grading_raw = str(getattr(grading_response, "content", "") or "")
@@ -1019,12 +1020,99 @@ class FullDocumentGradingService:
                 grading_response,
                 fallback_model=resolved_model,
             )
-            resolved_model = str(batch_usage.get("model") or resolved_model)
-            saved_grades.update(returned)
-            usage_key = "questions-" + "-".join(
-                str(number) for number in sorted(allowed)
+            return returned, batch_usage
+
+        def _merge_usages(
+            *usages: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            merged: Dict[str, Any] = {}
+            for usage in usages:
+                for key, value in usage.items():
+                    if isinstance(value, (int, float)):
+                        merged[key] = int(merged.get(key, 0)) + int(value)
+                    elif key not in merged:
+                        merged[key] = value
+            return merged
+
+        async def _grade_question_subset_with_fallback(
+            batch_questions: List[Dict[str, Any]],
+            batch_numbers: List[int],
+            *,
+            batch_index: str,
+            budget_minimum: int = 8_000,
+            can_split: bool = True,
+        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+            try:
+                return await _grade_question_subset(
+                    batch_questions,
+                    batch_numbers,
+                    batch_index=batch_index,
+                    budget_minimum=budget_minimum,
+                )
+            except Exception as exc:
+                if not _is_max_output_token_exhaustion_error(exc):
+                    raise
+
+                if len(batch_numbers) > 1 and can_split:
+                    logger.warning(
+                        "Question visual grader hit output budget for batch %s; "
+                        "splitting %d questions and retrying individually.",
+                        batch_index,
+                        len(batch_questions),
+                    )
+                    aggregated: Dict[str, Dict[str, Any]] = {}
+                    aggregated_usage: Dict[str, Any] = {}
+                    for index, number in enumerate(batch_numbers, start=1):
+                        question = question_by_number[number]
+                        sub_returned, sub_usage = await _grade_question_subset_with_fallback(
+                            [question],
+                            [number],
+                            batch_index=f"{batch_index}.{index}",
+                            budget_minimum=budget_minimum,
+                            can_split=False,
+                        )
+                        aggregated.update(sub_returned)
+                        aggregated_usage = _merge_usages(aggregated_usage, sub_usage)
+                    return aggregated, aggregated_usage
+
+                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
+                if fallback_minimum == budget_minimum:
+                    raise
+
+                logger.warning(
+                    "Question visual grader hit output budget for %s; retrying "
+                    "same question with larger output budget.",
+                    batch_index,
+                )
+                return await _grade_question_subset_with_fallback(
+                    batch_questions,
+                    batch_numbers,
+                    batch_index=batch_index,
+                    budget_minimum=fallback_minimum,
+                    can_split=False,
+                )
+
+        for batch_index, batch_numbers in enumerate(
+            _question_batches(missing_numbers),
+            start=1,
+        ):
+            batch_questions = [
+                question_by_number[number]
+                for number in batch_numbers
+                if number in question_by_number
+            ]
+            returned, batch_usage = await _grade_question_subset_with_fallback(
+                batch_questions,
+                batch_numbers,
+                batch_index=str(batch_index),
             )
-            saved_usages[usage_key] = batch_usage
+            if returned:
+                resolved_model = str(batch_usage.get("model") or resolved_model)
+                saved_grades.update(returned)
+                usage_key = "questions-" + "-".join(
+                    str(number) for number in sorted(set(batch_numbers))
+                )
+                saved_usages[usage_key] = batch_usage
             checkpoint = await self._db[_RUNS_COLLECTION].update_one(
                 {
                     "run_id": run_id,
@@ -2041,13 +2129,20 @@ def _mapping_output_token_budget(question_count: int) -> int:
     return min(24_000, max(10_000, per_question * max(1, question_count)))
 
 
-def _question_output_token_budget(question_count: int) -> int:
+def _question_output_token_budget(
+    question_count: int,
+    minimum_output_tokens: int = 8_000,
+) -> int:
     """Reserve enough capacity for strict rubric JSON, not just its prose."""
 
     per_question = _configured_output_tokens(
         "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 2_400
     )
-    return min(24_000, max(8_000, per_question * max(1, question_count)))
+    return min(30_000, max(minimum_output_tokens, per_question * max(1, question_count)))
+
+
+def _fallback_question_output_tokens(min_tokens: int) -> int:
+    return max(8_000, min(30_000, min_tokens * 2))
 
 
 def _require_structured_payload(
@@ -2083,6 +2178,15 @@ def _require_structured_payload(
             raw=raw,
         )
     return payload
+
+
+def _is_max_output_token_exhaustion_error(exc: Exception) -> bool:
+    failure = getattr(exc, "structured_output_failure", None)
+    if not isinstance(failure, dict):
+        return False
+    completion = str(failure.get("completion_status") or "").strip().lower()
+    reason = str(failure.get("incomplete_reason") or "").strip().lower()
+    return completion == "incomplete" and reason == "max_output_tokens"
 
 
 def _build_question_grading_input(

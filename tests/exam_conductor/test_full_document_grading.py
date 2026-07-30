@@ -84,6 +84,49 @@ class _SequenceGate:
         )
 
 
+class _ScriptedGate:
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    async def call(self, model_id: str, prompt: str, caller_id: str, **kwargs: Any):
+        self.calls.append(
+            {
+                "model_id": model_id,
+                "prompt": prompt,
+                "caller_id": caller_id,
+                **kwargs,
+            }
+        )
+        payload = self.responses.pop(0)
+        if isinstance(payload, BaseException):
+            raise payload
+        if hasattr(payload, "content"):
+            if getattr(payload, "usage", None) is None:
+                payload.usage = SimpleNamespace(
+                    model="gpt-5.1-2025-11-13",
+                    caller=caller_id,
+                    input_tokens=3_500,
+                    output_tokens=750,
+                    cache_read_tokens=2_000,
+                    total_tokens=4_250,
+                    estimated_cost_usd=0.05,
+                )
+            return payload
+        return SimpleNamespace(
+            content=json.dumps(payload),
+            usage=SimpleNamespace(
+                model="gpt-5.1-2025-11-13",
+                caller=caller_id,
+                input_tokens=3_500,
+                output_tokens=750,
+                cache_read_tokens=2_000,
+                total_tokens=4_250,
+                estimated_cost_usd=0.05,
+            ),
+        )
+
+
 async def _seed(db, *, submission_id: str = "SUB-DOC-1") -> None:
     await db["evalpen_submissions"].insert_one(
         {
@@ -725,6 +768,222 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
     assert frozen_exam["pcr_grading_contract"]["prompt_version"] == (
         "pcr-full-document-visual-v5"
     )
+
+
+@pytest.mark.asyncio
+async def test_evidence_graph_question_grading_splits_batch_on_output_token_exhaustion(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v2",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                },
+                "paper_assets": {
+                    "question_paper": {
+                        "asset_id": "asset-question",
+                        "storage_uri": "s3://private/exampen/paper-assets/test/question.pdf",
+                        "sha256": "test-question-hash",
+                        "filename": "question.pdf",
+                    },
+                    "teacher_solution": {
+                        "asset_id": "asset-solution",
+                        "storage_uri": "s3://private/exampen/paper-assets/test/solution.pdf",
+                        "sha256": "test-solution-hash",
+                        "filename": "solution.pdf",
+                    },
+                },
+            },
+        },
+    )
+    module = _module()
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    import services.exampen_paper_service as paper_service
+
+    monkeypatch.setattr(
+        paper_service,
+        "load_canonical_paper_asset",
+        lambda *_args, **_kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    assets = [_page_asset(module, 1)]
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda pages: _async_value((assets, sum(len(a.global_bytes) for a in assets))),
+    )
+    monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "2")
+
+    mapping_payload = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "document_review": _document_review(),
+        "questions": [
+            {
+                "question_number": 1,
+                "attempt_status": "attempted",
+                "confidence": 0.96,
+                "content_type": "DIAGRAM_HEAVY",
+                "evidence_regions": [
+                    {
+                        "region_id": "q1-diagram",
+                        "page_number": 1,
+                        "x_start": 20,
+                        "y_start": 100,
+                        "x_end": 470,
+                        "y_end": 520,
+                        "evidence_kind": "diagram",
+                        "continuation_group": "q1",
+                        "evidence": "Circuit diagram and labels",
+                        "mapping_confidence": 0.97,
+                    },
+                ],
+                "mapping_reason": "Diagram semantics and continuation match Q1.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+            {
+                "question_number": 2,
+                "attempt_status": "attempted",
+                "confidence": 0.95,
+                "content_type": "TEXT_ONLY",
+                "evidence_regions": [
+                    {
+                        "region_id": "q2-explanation",
+                        "page_number": 1,
+                        "x_start": 530,
+                        "y_start": 100,
+                        "x_end": 980,
+                        "y_end": 520,
+                        "evidence_kind": "handwriting",
+                        "continuation_group": "",
+                        "evidence": "Written explanation beside the diagram",
+                        "mapping_confidence": 0.95,
+                    },
+                ],
+                "mapping_reason": "The explanation directly answers Q2.",
+                "needs_review": False,
+                "review_reason": "",
+            },
+        ],
+        "unassigned_regions": [],
+    }
+    incomplete_payload = SimpleNamespace(
+        content='{"questions": [',
+        completion_status="incomplete",
+        incomplete_reason="max_output_tokens",
+    )
+    grade_payload_one = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [
+            {
+                "question_number": 1,
+                "confidence": 0.96,
+                "student_answer": "A closed labelled circuit is shown.",
+                "interpretation_hypotheses": [
+                    {
+                        "interpretation_id": "q1-primary",
+                        "value": "Closed battery-switch-lamp circuit",
+                        "confidence": 0.96,
+                        "evidence_region_ids": ["q1-diagram"],
+                        "ambiguity_notes": "",
+                    }
+                ],
+                "visual_semantics": {
+                    "summary": "Battery, switch and lamp form a closed circuit.",
+                    "elements": [
+                        {
+                            "element_id": "battery",
+                            "element_type": "circuit_component",
+                            "label": "battery",
+                            "region_id": "q1-diagram",
+                            "attributes": "connected",
+                            "confidence": 0.96,
+                        }
+                    ],
+                    "relationships": [],
+                    "confidence": 0.95,
+                },
+                "method_analysis": _method_analysis(),
+                "criterion_marks": [
+                    {
+                        **_attempted_diagram()["criterion_marks"][0],
+                        "evidence_region_ids": ["q1-diagram"],
+                    }
+                ],
+                "total_score": 2,
+                "overall_feedback": "Correct diagram.",
+                "needs_review": False,
+                "review_reason": "",
+            }
+        ],
+    }
+    grade_payload_two = {
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "questions": [
+            {
+                "question_number": 2,
+                "confidence": 0.95,
+                "student_answer": "The observation follows because the circuit is complete.",
+                "interpretation_hypotheses": [
+                    {
+                        "interpretation_id": "q2-primary",
+                        "value": "Complete circuit explains the observation",
+                        "confidence": 0.95,
+                        "evidence_region_ids": ["q2-explanation"],
+                        "ambiguity_notes": "",
+                    }
+                ],
+                "visual_semantics": {
+                    "summary": "Readable written explanation.",
+                    "elements": [],
+                    "relationships": [],
+                    "confidence": 0.95,
+                },
+                "method_analysis": _method_analysis(),
+                "criterion_marks": [
+                    {
+                        **_attempted_explanation()["criterion_marks"][0],
+                        "evidence_region_ids": ["q2-explanation"],
+                    }
+                ],
+                "total_score": 2,
+                "overall_feedback": "Correct explanation.",
+                "needs_review": False,
+                "review_reason": "",
+            }
+        ],
+    }
+    gate = _ScriptedGate(
+        [
+            mapping_payload,
+            incomplete_payload,
+            grade_payload_one,
+            grade_payload_two,
+        ]
+    )
+    service = module.FullDocumentGradingService(
+        db,
+        gate,
+        model_id="gpt-5.1-2025-11-13",
+    )
+
+    result = await service.grade_submission("SUB-DOC-1")
+
+    assert result.status == "completed"
+    assert result.evaluated_count == 2
+    assert len(gate.calls) == 4
+    assert gate.calls[1]["metadata"]["question_numbers"] == [1, 2]
+    assert gate.calls[2]["metadata"]["question_numbers"] == [1]
+    assert gate.calls[3]["metadata"]["question_numbers"] == [2]
 
 
 @pytest.mark.asyncio

@@ -405,3 +405,39 @@ async def test_pcr_snapshot_materializes_and_reuses_hash_verified_private_assets
         paper_assets=assets,
     )
     assert snapshot["paper_assets"] == assets
+
+
+@pytest.mark.asyncio
+async def test_legacy_asset_backfill_refuses_a_document_that_drifted_after_finalization():
+    from mongomock_motor import AsyncMongoMockClient
+
+    from services.exampen_paper_service import (
+        CanonicalPaperAssetError,
+        migrate_legacy_paper_snapshot_assets,
+    )
+
+    db = AsyncMongoMockClient()["legacy_asset_safety_test"]
+    await db["exampen_paper_versions"].insert_one(
+        {
+            "paper_version_id": "paper-legacy",
+            "document_id": "DOC-LEGACY",
+            "paper_context": {
+                "question_paper_sha256": "frozen-question-sha",
+                "teacher_solution_sha256": "frozen-solution-sha",
+            },
+        }
+    )
+
+    with pytest.raises(
+        CanonicalPaperAssetError,
+        match="cannot prove the question-paper SHA-256",
+    ):
+        await migrate_legacy_paper_snapshot_assets(
+            db,
+            {
+                "document_id": "DOC-LEGACY",
+                "sha256": "later-edited-question-sha",
+                "answer_sheet_sha256": "frozen-solution-sha",
+            },
+            paper_version_id="paper-legacy",
+        )

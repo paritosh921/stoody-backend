@@ -276,8 +276,25 @@ async def migrate_legacy_paper_snapshot_assets(
         await load_canonical_paper_asset(dict(existing_assets["question_paper"]))
         return version
 
-    assets = await materialize_paper_assets(tenant_db, document)
+    # A historical migration is safe only when the currently reachable source
+    # still has the exact bytes that the finalized snapshot recorded. Never
+    # silently bind an old exam to a later-edited authoring document.
     context = dict(version.get("paper_context") or {})
+    expected_question_sha = _as_text(context.get("question_paper_sha256")).lower()
+    actual_question_sha = _as_text(document.get("sha256")).lower()
+    if not expected_question_sha or expected_question_sha != actual_question_sha:
+        raise CanonicalPaperAssetError(
+            "Legacy paper migration cannot prove the question-paper SHA-256"
+        )
+    expected_solution_sha = _as_text(context.get("teacher_solution_sha256")).lower()
+    if expected_solution_sha:
+        actual_solution_sha = _as_text(document.get("answer_sheet_sha256")).lower()
+        if expected_solution_sha != actual_solution_sha:
+            raise CanonicalPaperAssetError(
+                "Legacy paper migration cannot prove the teacher-solution SHA-256"
+            )
+
+    assets = await materialize_paper_assets(tenant_db, document)
     context["question_paper_asset_id"] = assets["question_paper"]["asset_id"]
     if assets.get("teacher_solution"):
         context["teacher_solution_asset_id"] = assets["teacher_solution"]["asset_id"]
