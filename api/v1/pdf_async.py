@@ -5331,8 +5331,6 @@ async def map_completed_answer_sheet_after_question_ocr(
     if document.get("answer_sheet_ocr_status") != "completed":
         return {}
 
-    answer_blocks = document.get("answer_sheet_extracted_answers") or []
-
     mapping_summary = document.get("answer_sheet_mapping_summary") or {}
     mapped_count = int(document.get("answer_sheet_mapped_answers_count") or 0)
     if mapped_count > 0 and not mapping_summary.get("mapping_deferred"):
@@ -5345,6 +5343,19 @@ async def map_completed_answer_sheet_after_question_ocr(
         question_docs = await db.mongo_find("questions", {"document_id": document_id})
     if not question_docs:
         return {}
+
+    answer_blocks = document.get("answer_sheet_extracted_answers") or []
+    page_summaries = document.get("answer_sheet_ocr_pages") or []
+    if page_summaries:
+        reparsed_answers = AnswerSheetBlockNormalizer().normalize(
+            pages=page_summaries,
+            layout_report=document.get("answer_sheet_layout_summary") or {},
+            question_docs=question_docs,
+        ).get("answers") or []
+        # Keep a previous richer parse, but allow a deferred pass to recover an
+        # annotated question paper once the saved question numbers exist.
+        if len(reparsed_answers) > len(answer_blocks):
+            answer_blocks = reparsed_answers
 
     answer_pdf_bytes: Optional[bytes] = None
     answer_sheet_path = str(document.get("answer_sheet_path") or "").replace("\\", "/")
@@ -5370,7 +5381,6 @@ async def map_completed_answer_sheet_after_question_ocr(
         )
         return {}
 
-    page_summaries = document.get("answer_sheet_ocr_pages") or []
     stored_text = str(document.get("answer_sheet_extracted_text") or "")
     layout_report = document.get("answer_sheet_layout_summary") or {}
     mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
@@ -5410,6 +5420,8 @@ async def map_completed_answer_sheet_after_question_ocr(
         question_count=len(question_docs),
     )
     update_data = {
+        "answer_sheet_extracted_answers": answer_blocks,
+        "answer_sheet_extracted_answers_count": len(answer_blocks),
         "answer_sheet_mapped_answers_count": new_mapped_count,
         "answer_sheet_mapping_summary": new_mapping_summary,
         "answer_key_extraction_summary": answer_key_result.get("summary") or {},
@@ -5479,16 +5491,17 @@ async def run_answer_sheet_ocr_pipeline(
         )
         extracted_text = _ocr_pages_to_plain_text(ocr_result)
         page_summaries = _ocr_pages_for_storage(ocr_result)
-        answer_blocks = AnswerSheetBlockNormalizer().normalize(
-            pages=page_summaries,
-            layout_report=layout_report,
-            anchor_text=document_anchor_text,
-        )
-
         if is_b2c:
             question_docs = await db.b2c_find("questions", {"document_id": document_id})
         else:
             question_docs = await db.mongo_find("questions", {"document_id": document_id})
+
+        answer_blocks = AnswerSheetBlockNormalizer().normalize(
+            pages=page_summaries,
+            layout_report=layout_report,
+            anchor_text=document_anchor_text,
+            question_docs=question_docs,
+        )
 
         answer_mapping_result: Dict[str, Any] = {
             "mapped_count": 0,
@@ -5579,6 +5592,37 @@ async def run_answer_sheet_ocr_pipeline(
                 {"document_id": document_id},
                 {"$set": update_data},
             )
+
+        # The jobs may finish in either order.  This job starts with a stale
+        # document snapshot, so a mapping deferred while question OCR was in
+        # progress must be retried after this completed state is persisted.
+        if mapping_summary.get("mapping_deferred"):
+            try:
+                if is_b2c:
+                    completed_document = await db.b2c_find_one(
+                        "documents", {"document_id": document_id}
+                    )
+                else:
+                    completed_document = await db.mongo_find_one(
+                        "documents", {"document_id": document_id}
+                    )
+                if completed_document:
+                    deferred_mapping_result = await map_completed_answer_sheet_after_question_ocr(
+                        document=completed_document,
+                        current_user=current_user,
+                        db=db,
+                    )
+                    if deferred_mapping_result:
+                        mapped_count = int(deferred_mapping_result.get("mapped_count") or 0)
+                        mapping_summary = deferred_mapping_result.get("summary") or mapping_summary
+            except Exception:
+                # Answer-sheet OCR itself succeeded and is persisted above.  A
+                # later question-OCR completion can safely retry this idempotent
+                # mapping operation, so do not turn a successful OCR job into
+                # an error solely because the optional reconciliation failed.
+                logger.exception(
+                    "Deferred answer-sheet mapping retry failed for %s", document_id
+                )
         await refresh_answer_solution_coverage(
             db=db,
             is_b2c=is_b2c,

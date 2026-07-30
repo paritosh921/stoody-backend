@@ -439,6 +439,87 @@ def test_answer_sheet_block_normalizer_does_not_split_plain_numbered_steps():
     assert "2. simplify" in result["answers"][0]["text"]
 
 
+def test_answer_sheet_block_normalizer_recovers_annotated_question_paper_for_review():
+    from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
+
+    result = AnswerSheetBlockNormalizer().normalize(
+        pages=[
+            {
+                "index": 0,
+                "markdown": (
+                    "1. Find the sum of 2 and 3. [1]\n"
+                    "5\n"
+                    "2. Find the product of 4 and 5. [1]\n"
+                    "20"
+                ),
+            }
+        ],
+        question_docs=[
+            {"id": "q1", "question_number": 1},
+            {"id": "q2", "question_number": 2},
+        ],
+    )
+
+    assert result["annotated_question_paper_detected"] is True
+    assert result["normalizer"] == "annotated_question_paper_block_normalizer"
+    assert [block["number"] for block in result["answers"]] == ["1", "2"]
+    assert all(block["manual_review_required"] for block in result["answers"])
+
+
+def test_full_answer_sheet_mapping_keeps_annotated_question_paper_review_only():
+    from services.answer_sheet_mapping_service import AnswerSheetMappingService
+
+    class FakeDb:
+        def __init__(self):
+            self.mappings = []
+
+        async def mongo_find(self, collection_name, query):
+            return []
+
+        async def mongo_delete_many(self, collection_name, query):
+            return 0
+
+        async def mongo_update_one(self, collection_name, query, update, upsert=False):
+            self.mappings.append(update["$set"])
+            return True
+
+    result = asyncio.run(
+        AnswerSheetMappingService(vision_mapper=None).map_full_document_blocks(
+            db=FakeDb(),
+            is_b2c=False,
+            document_id="doc-annotated",
+            question_docs=[
+                {"id": "q1", "question_number": 1},
+                {"id": "q2", "question_number": 2},
+            ],
+            answer_blocks=[
+                {
+                    "number": "1",
+                    "text": "Find the sum of 2 and 3.\n5",
+                    "confidence": 0.62,
+                    "manual_review_required": True,
+                    "reasons": ["annotated_question_paper_requires_review"],
+                },
+                {
+                    "number": "2",
+                    "text": "Find the product of 4 and 5.\n20",
+                    "confidence": 0.62,
+                    "manual_review_required": True,
+                    "reasons": ["annotated_question_paper_requires_review"],
+                },
+            ],
+        )
+    )
+
+    assert len(result["mappings"]) == 2
+    assert result["mapped_count"] == 0
+    assert all(mapping["review_status"] == "needs_review" for mapping in result["mappings"])
+    assert all(
+        "annotated_question_paper_requires_review" in mapping["mapping_reasons"]
+        for mapping in result["mappings"]
+    )
+
+
 def test_document_layout_provider_answer_anchors_require_solution_cue(monkeypatch):
     import fitz
 

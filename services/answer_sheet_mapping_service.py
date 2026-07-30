@@ -273,6 +273,13 @@ class AnswerSheetMappingService:
                 reasons.append("no_question_match")
             if len(text) < 20:
                 reasons.append("answer_text_too_short")
+            if block.get("manual_review_required"):
+                reasons.append("answer_block_requires_review")
+            reasons.extend(
+                str(reason)
+                for reason in (block.get("reasons") or [])
+                if str(reason).strip()
+            )
             if confidence < self.REVIEW_THRESHOLD:
                 reasons.append("low_mapping_confidence")
 
