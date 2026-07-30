@@ -101,6 +101,11 @@ class GateResponse(BaseModel):
 
     content: str
     usage: TokenUsage
+    # The Responses API can return HTTP 200 with an incomplete generation.
+    # Callers that require strict JSON must distinguish that from malformed
+    # JSON; otherwise they retry the same guaranteed-truncated request.
+    completion_status: str = "completed"
+    incomplete_reason: str = ""
 
 
 # ---------------------------------------------------------------------------

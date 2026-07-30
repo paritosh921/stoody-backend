@@ -813,6 +813,105 @@ async def test_canonical_visual_exam_never_silently_falls_back_when_asset_is_mis
     assert await db["evalpen_detected_responses"].count_documents({}) == 0
 
 
+def test_incomplete_strict_response_is_terminal_and_keeps_a_debuggable_record():
+    module = _module()
+    response = SimpleNamespace(
+        completion_status="incomplete",
+        incomplete_reason="max_output_tokens",
+    )
+
+    with pytest.raises(module.StructuredOutputContractError) as error:
+        module._require_structured_payload(
+            response,
+            raw='{"questions": [',
+            stage="Question visual grader",
+    )
+
+    assert error.value.retryable is False
+    failure = error.value.structured_output_failure
+    assert failure["stage"] == "Question visual grader"
+    assert failure["completion_status"] == "incomplete"
+    assert failure["incomplete_reason"] == "max_output_tokens"
+    assert failure["raw_response"] == '{"questions": ['
+    assert failure["recorded_at"]
+
+
+def test_visual_grading_reserves_completion_capacity_for_strict_rubric_json(monkeypatch):
+    module = _module()
+    monkeypatch.delenv("PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", raising=False)
+    monkeypatch.delenv("PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", raising=False)
+
+    assert module._mapping_output_token_budget(11) == 13_200
+    assert module._question_output_token_budget(5) == 12_000
+
+
+@pytest.mark.asyncio
+async def test_incomplete_v5_response_is_audited_and_not_retried_as_transient(
+    monkeypatch,
+):
+    db = _fresh_db()
+    await _seed(db)
+    await db["exampen_paper_versions"].update_one(
+        {"paper_version_id": "paper-version-1"},
+        {
+            "$set": {
+                "paper_context": {
+                    "version": "canonical-full-document-visual-v2",
+                    "mode": "full_document_visual",
+                    "ready": True,
+                },
+                "paper_assets": {
+                    "question_paper": {
+                        "storage_uri": "s3://private/exampen/paper-assets/test/paper.pdf",
+                        "sha256": "paper-hash",
+                    }
+                },
+            }
+        },
+    )
+    import services.exampen_paper_service as paper_service
+
+    monkeypatch.setattr(
+        paper_service,
+        "load_canonical_paper_asset",
+        lambda *_args, **_kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    module = _module()
+    asset = _page_asset(module, 1)
+    monkeypatch.setattr(
+        module,
+        "_student_page_assets",
+        lambda _pages: _async_value(([asset], len(asset.global_bytes))),
+    )
+
+    class _IncompleteGate:
+        async def call(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                content='{"questions": [',
+                completion_status="incomplete",
+                incomplete_reason="max_output_tokens",
+            )
+
+    service = module.FullDocumentGradingService(
+        db,
+        _IncompleteGate(),
+        model_id="gpt-5.1-2025-11-13",
+    )
+    with pytest.raises(module.StructuredOutputContractError):
+        await service.grade_submission("SUB-DOC-1")
+
+    run = await db["evalpen_document_grading_runs"].find_one(
+        {"submission_id": "SUB-DOC-1"}
+    )
+    assert run["status"] == "failed"
+    failure = run["structured_output_failure"]
+    assert failure["stage"] == "Evidence mapper"
+    assert failure["completion_status"] == "incomplete"
+    assert failure["incomplete_reason"] == "max_output_tokens"
+    assert failure["raw_response"] == '{"questions": ['
+    assert failure["recorded_at"]
+
+
 @pytest.mark.asyncio
 async def test_invalid_criterion_award_is_blocked_instead_of_clamped_or_scored(
     monkeypatch,

@@ -270,7 +270,12 @@ class LLMGate:
             )
 
         # ── Step 7: Return content + usage metadata ─────────────────────
-        return GateResponse(content=provider_resp.content, usage=usage)
+        return GateResponse(
+            content=provider_resp.content,
+            usage=usage,
+            completion_status=provider_resp.completion_status,
+            incomplete_reason=provider_resp.incomplete_reason,
+        )
 
     # ------------------------------------------------------------------
     # Repository access (for rollup jobs and usage APIs)

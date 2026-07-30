@@ -520,6 +520,7 @@ class TestOpenAIResponsesDocumentInput:
             def json(self):
                 return {
                     "model": "gpt-5.1-2025-11-13",
+                    "status": "completed",
                     "output": [
                         {
                             "type": "message",
@@ -581,6 +582,54 @@ class TestOpenAIResponsesDocumentInput:
             assert "temperature" not in client.payload
             assert result.content == '{"questions":[]}'
             assert result.cache_read_tokens == 1500
+            assert result.completion_status == "completed"
+            assert result.incomplete_reason == ""
+
+        asyncio.run(_run())
+
+    def test_openai_responses_surfaces_incomplete_generation_status(self):
+        class _HTTPResponse:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "model": "gpt-5.1-2025-11-13",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": '{"questions": ['},
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 8},
+                }
+
+        class _HTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                return _HTTPResponse()
+
+        async def _run():
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=_HTTPClient()):
+                result = await _call_openai_responses(
+                    "gpt-5.1-2025-11-13",
+                    responses_input=[{"role": "user", "content": [{"type": "input_text", "text": "x"}]}],
+                    api_key="secret",
+                )
+            assert result.completion_status == "incomplete"
+            assert result.incomplete_reason == "max_output_tokens"
 
         asyncio.run(_run())
 

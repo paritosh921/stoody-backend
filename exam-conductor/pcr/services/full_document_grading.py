@@ -91,6 +91,37 @@ class FullDocumentGradingError(RuntimeError):
     """Raised when the primary document request cannot be completed safely."""
 
 
+class StructuredOutputContractError(FullDocumentGradingError):
+    """A strict model response was incomplete or violated its JSON contract.
+
+    A Responses API HTTP 200 does not mean a JSON-schema response completed.
+    Repeating an incomplete or malformed deterministic request burns budget
+    without creating a score, so this is terminal and auditable.
+    """
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        completion_status: str,
+        incomplete_reason: str,
+        raw: str,
+    ) -> None:
+        super().__init__(message)
+        self.structured_output_failure = {
+            "stage": stage,
+            "completion_status": completion_status,
+            "incomplete_reason": incomplete_reason,
+            # This is model output, not a copy of student pages. It is needed
+            # to diagnose a schema/provider regression without blind retries.
+            "raw_response": raw[:64_000],
+            "recorded_at": datetime.now(timezone.utc),
+        }
+
+
 class GradingRunIdentityError(FullDocumentGradingError):
     """Raised for a deterministic grading-run ownership or identity conflict."""
 
@@ -577,23 +608,29 @@ class FullDocumentGradingService:
                         },
                     )
             except Exception as exc:
+                failure_update: Dict[str, Any] = {
+                    "status": "failed",
+                    "generation_error": str(exc)[:500],
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                structured_failure = getattr(exc, "structured_output_failure", None)
+                if isinstance(structured_failure, dict):
+                    failure_update["structured_output_failure"] = structured_failure
                 await self._db[_RUNS_COLLECTION].update_one(
                     {
                         "run_id": run_id,
                         "generation_lease_token": generation_lease_token,
                     },
                     {
-                        "$set": {
-                            "status": "failed",
-                            "generation_error": str(exc)[:500],
-                            "updated_at": datetime.now(timezone.utc),
-                        },
+                        "$set": failure_update,
                         "$unset": {
                             "generation_lease_token": "",
                             "generation_lease_expires_at": "",
                         },
                     },
                 )
+                if getattr(exc, "retryable", True) is False:
+                    raise
                 raise FullDocumentGradingError(
                     f"Full-document model request failed: {str(exc)[:400]}"
                 ) from exc
@@ -811,10 +848,7 @@ class FullDocumentGradingService:
                 prompt_cache_key=cache_key,
                 reasoning_effort=reasoning_effort,
                 temperature=temperature,
-                max_output_tokens=min(
-                    24_000,
-                    max(6_000, 650 * len(questions)),
-                ),
+                max_output_tokens=_mapping_output_token_budget(len(questions)),
                 metadata={
                     "pcr_stage": "full_document_evidence_mapping",
                     "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
@@ -827,11 +861,11 @@ class FullDocumentGradingService:
                 },
             )
             mapping_raw = str(getattr(mapping_response, "content", "") or "")
-            mapping_payload = _parse_json_object(mapping_raw)
-            if mapping_payload is None:
-                raise FullDocumentGradingError(
-                    "Evidence mapper returned an invalid evidence graph"
-                )
+            mapping_payload = _require_structured_payload(
+                mapping_response,
+                raw=mapping_raw,
+                stage="Evidence mapper",
+            )
             mapping_usage = _usage_dict(
                 mapping_response,
                 fallback_model=resolved_model,
@@ -912,9 +946,8 @@ class FullDocumentGradingService:
                 prompt_cache_key=cache_key,
                 reasoning_effort=reasoning_effort,
                 temperature=temperature,
-                max_output_tokens=min(
-                    20_000,
-                    max(4_000, 1_200 * len(batch_questions)),
+                max_output_tokens=_question_output_token_budget(
+                    len(batch_questions)
                 ),
                 metadata={
                     "pcr_stage": "question_visual_grading",
@@ -928,11 +961,11 @@ class FullDocumentGradingService:
                 },
             )
             grading_raw = str(getattr(grading_response, "content", "") or "")
-            grading_payload = _parse_json_object(grading_raw)
-            if grading_payload is None:
-                raise FullDocumentGradingError(
-                    "Question visual grader returned invalid structured output"
-                )
+            grading_payload = _require_structured_payload(
+                grading_response,
+                raw=grading_raw,
+                stage="Question visual grader",
+            )
             allowed = set(batch_numbers)
             returned: Dict[str, Dict[str, Any]] = {}
             unexpected_numbers: set[int] = set()
@@ -1989,6 +2022,67 @@ def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
     size = max(1, min(10, configured))
     numbers = [int(number) for number in question_numbers]
     return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+
+
+def _configured_output_tokens(name: str, default: int) -> int:
+    try:
+        configured = int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        configured = default
+    return max(1_000, min(30_000, configured))
+
+
+def _mapping_output_token_budget(question_count: int) -> int:
+    """Reserve room for reasoning plus a complete 11-question evidence graph."""
+
+    per_question = _configured_output_tokens(
+        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 1_200
+    )
+    return min(24_000, max(10_000, per_question * max(1, question_count)))
+
+
+def _question_output_token_budget(question_count: int) -> int:
+    """Reserve enough capacity for strict rubric JSON, not just its prose."""
+
+    per_question = _configured_output_tokens(
+        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 2_400
+    )
+    return min(24_000, max(8_000, per_question * max(1, question_count)))
+
+
+def _require_structured_payload(
+    response: Any,
+    *,
+    raw: str,
+    stage: str,
+) -> Dict[str, Any]:
+    """Accept only a completed strict-schema response from the model gate."""
+
+    completion_status = str(
+        getattr(response, "completion_status", "completed") or "completed"
+    ).strip().lower()
+    incomplete_reason = str(
+        getattr(response, "incomplete_reason", "") or ""
+    ).strip()
+    if completion_status != "completed":
+        suffix = f" ({incomplete_reason})" if incomplete_reason else ""
+        raise StructuredOutputContractError(
+            f"{stage} did not complete its strict JSON response{suffix}",
+            stage=stage,
+            completion_status=completion_status,
+            incomplete_reason=incomplete_reason,
+            raw=raw,
+        )
+    payload = _parse_json_object(raw)
+    if payload is None:
+        raise StructuredOutputContractError(
+            f"{stage} returned invalid structured output",
+            stage=stage,
+            completion_status=completion_status,
+            incomplete_reason=incomplete_reason,
+            raw=raw,
+        )
+    return payload
 
 
 def _build_question_grading_input(

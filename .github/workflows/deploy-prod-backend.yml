@@ -11,6 +11,7 @@ on:
       - "middleware/**"
       - "models/**"
       - "utils/**"
+      - "exam-conductor/**"
       - "main_async.py"
       - "config_async.py"
       - "mentorAI/**"

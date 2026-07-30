@@ -36,6 +36,8 @@ class ProviderResponse:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     model: str = ""
+    completion_status: str = "completed"
+    incomplete_reason: str = ""
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -337,6 +339,15 @@ async def _call_openai_responses(
                 output_text_parts.append(str(part.get("text") or ""))
     usage = data.get("usage") or {}
     input_details = usage.get("input_tokens_details") or {}
+    incomplete_details = data.get("incomplete_details") or {}
+    incomplete_reason = ""
+    if isinstance(incomplete_details, dict):
+        incomplete_reason = str(
+            incomplete_details.get("reason")
+            or incomplete_details.get("code")
+            or incomplete_details.get("message")
+            or ""
+        )
     return ProviderResponse(
         content="".join(output_text_parts),
         input_tokens=int(usage.get("input_tokens") or 0),
@@ -344,6 +355,8 @@ async def _call_openai_responses(
         cache_read_tokens=int(input_details.get("cached_tokens") or 0),
         cache_creation_tokens=0,
         model=str(data.get("model") or model_id),
+        completion_status=str(data.get("status") or "completed"),
+        incomplete_reason=incomplete_reason,
         raw=data,
     )
 
