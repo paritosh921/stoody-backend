@@ -528,6 +528,16 @@ async def _canonical_ingest(
     """Write the immutable canonical record used by the existing PCR engine."""
     from api.v1._exampen_imports import load_exampen
 
+    normalized_source = str(source or "camera").strip().lower()
+    if normalized_source in {
+        "image",
+        "pdf",
+        "photographed_copy",
+        "scan",
+        "upload",
+    }:
+        normalized_source = "camera"
+
     IngestService = load_exampen("ingest.service").IngestService
     service = IngestService(tenant_db)
     await service.initialize()
@@ -535,7 +545,7 @@ async def _canonical_ingest(
         exam_id=exam_id,
         student_id=student_id,
         admin_id=admin_id,
-        source=source,
+        source=normalized_source,
         pen_mac=None,
         pages=pages,
     )
