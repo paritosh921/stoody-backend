@@ -174,6 +174,29 @@ async def build_submission_llm_debug_bundle(
     persisted_traces = await tenant_db["evalpen_llm_debug_traces"].find(
         {"submission_id": submission_id, "run_id": run_id}
     ).sort("page_number", 1).to_list(length=100)
+    effective_model = str(
+        run.get("model_used")
+        or run.get("requested_model_id")
+        or next(
+            (
+                (item.get("usage") or {}).get("model")
+                for item in persisted_traces
+                if isinstance(item.get("usage"), dict)
+                and (item.get("usage") or {}).get("model")
+            ),
+            "",
+        )
+        or next(
+            (
+                (item.get("request") or {}).get("model_id")
+                for item in persisted_traces
+                if isinstance(item.get("request"), dict)
+                and (item.get("request") or {}).get("model_id")
+            ),
+            "",
+        )
+        or "unknown"
+    )
     persisted_by_page = {
         int(item.get("page_number") or 0): item
         for item in persisted_traces
@@ -211,6 +234,8 @@ async def build_submission_llm_debug_bundle(
             response_source = "verbatim_provider_response"
             trace_status = str(trace.get("status") or "unknown")
             response_error = trace.get("response_error")
+            provider_status = trace.get("provider_status")
+            incomplete_reason = trace.get("incomplete_reason")
             requested_at = trace.get("requested_at")
             completed_at = trace.get("completed_at")
         else:
@@ -231,6 +256,8 @@ async def build_submission_llm_debug_bundle(
             response_source = "parsed_run_checkpoint"
             trace_status = "historical_trace_reconstructed"
             response_error = None
+            provider_status = None
+            incomplete_reason = None
             requested_at = run.get("created_at")
             completed_at = run.get("completed_at")
 
@@ -260,6 +287,8 @@ async def build_submission_llm_debug_bundle(
                     "parsed": parsed_response,
                     "usage": usage,
                     "error": response_error,
+                    "provider_status": provider_status,
+                    "incomplete_reason": incomplete_reason,
                 },
             }
         )
@@ -271,7 +300,7 @@ async def build_submission_llm_debug_bundle(
             "run_id": run_id,
             "status": run.get("status"),
             "prompt_version": run.get("prompt_version"),
-            "model_used": run.get("model_used"),
+            "model_used": effective_model,
             "input_fingerprint": run.get("input_fingerprint"),
             "created_at": run.get("created_at"),
             "completed_at": run.get("completed_at"),

@@ -95,11 +95,15 @@ class GateResponse(BaseModel):
     Return value of ``gate.call()``.
 
     ``content`` contains the LLM's text output; ``usage`` contains full
-    token accounting.
+    token accounting.  Provider completion metadata is normalized separately
+    from the response body so callers can distinguish malformed output from a
+    provider response that was deliberately stopped at its output ceiling.
     """
 
     content: str
     usage: TokenUsage
+    provider_status: Optional[str] = None
+    incomplete_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

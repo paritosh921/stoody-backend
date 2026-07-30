@@ -82,6 +82,18 @@ _RUNS_COLLECTION = "evalpen_document_grading_runs"
 _LLM_DEBUG_TRACES_COLLECTION = "evalpen_llm_debug_traces"
 _PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 _CALLER_ID = "pcr_eval_core"
+_OBJECTIVE_OUTPUT_BUDGET_POLICY = "objective-ledger-cardinality-v1"
+_OBJECTIVE_OUTPUT_TOKEN_FLOOR = 6_000
+_OBJECTIVE_OUTPUT_TOKEN_CEILING = 20_000
+_OBJECTIVE_OUTPUT_BASE_TOKENS = 2_500
+_OBJECTIVE_OUTPUT_TOKENS_PER_QUESTION = 100
+_OBJECTIVE_REASONING_TOKEN_RESERVE = {
+    "none": 0,
+    "minimal": 1_000,
+    "low": 2_000,
+    "medium": 4_000,
+    "high": 6_000,
+}
 _AUTO_ACCEPT_CONFIDENCE = 0.80
 _ABSENCE_CONFIDENCE = 0.85
 _CRITERION_AUTO_ACCEPT_CONFIDENCE = 0.85
@@ -895,30 +907,74 @@ class FullDocumentGradingService:
                     },
                     upsert=True,
                 )
+                response_received = False
+                trace_status = "failed"
+                provider_status: Optional[str] = None
+                incomplete_reason: Optional[str] = None
                 try:
                     response = await self._gate.call(**call_spec)
+                    response_received = True
                     raw = str(getattr(response, "content", "") or "")
                     usage = _usage_dict(response, fallback_model=resolved_model)
+                    provider_status = (
+                        str(getattr(response, "provider_status", "") or "").strip()
+                        or None
+                    )
+                    incomplete_reason = (
+                        str(getattr(response, "incomplete_reason", "") or "").strip()
+                        or None
+                    )
                     payload = _parse_json_object(raw)
+                    trace_status = (
+                        "completed"
+                        if payload is not None
+                        else (
+                            "incomplete"
+                            if incomplete_reason or provider_status == "incomplete"
+                            else "invalid_response"
+                        )
+                    )
                     completed_at = datetime.now(timezone.utc)
                     await self._db[_LLM_DEBUG_TRACES_COLLECTION].update_one(
                         {"trace_id": trace_id},
                         {
                             "$set": {
-                                "status": (
-                                    "completed"
-                                    if payload is not None
-                                    else "invalid_response"
-                                ),
+                                "status": trace_status,
                                 "raw_response": raw,
                                 "parsed_response": payload,
                                 "usage": usage,
+                                "provider_status": provider_status,
+                                "incomplete_reason": incomplete_reason,
                                 "completed_at": completed_at,
                                 "updated_at": completed_at,
                             }
                         },
                     )
+                    # A failed structured-output parse must still retain the
+                    # provider-selected model on the immutable run audit.
+                    if usage.get("model"):
+                        await self._db[_RUNS_COLLECTION].update_one(
+                            {
+                                "run_id": run_id,
+                                "generation_lease_token": generation_lease_token,
+                            },
+                            {
+                                "$set": {
+                                    "model_used": usage["model"],
+                                    "updated_at": completed_at,
+                                }
+                            },
+                        )
                     if payload is None:
+                        if (
+                            incomplete_reason == "max_output_tokens"
+                            or provider_status == "incomplete"
+                        ):
+                            raise FullDocumentGradingError(
+                                "Objective reader response was incomplete for page "
+                                f"{asset.page_number}: provider reached "
+                                f"{incomplete_reason or 'its output limit'}"
+                            )
                         raise FullDocumentGradingError(
                             f"Objective reader returned invalid JSON for page "
                             f"{asset.page_number}"
@@ -930,7 +986,11 @@ class FullDocumentGradingService:
                         {"trace_id": trace_id},
                         {
                             "$set": {
-                                "status": "failed",
+                                "status": (
+                                    trace_status
+                                    if response_received
+                                    else "failed"
+                                ),
                                 "response_error": str(exc)[:1000],
                                 "completed_at": failed_at,
                                 "updated_at": failed_at,
@@ -2335,13 +2395,14 @@ def build_objective_page_call_spec(
         "json_schema": objective_page_observation_schema(question_numbers),
         "prompt_cache_key": prompt_cache_key,
         "reasoning_effort": reasoning_effort,
-        "max_output_tokens": min(
-            10_000,
-            max(4_000, 60 * question_count),
+        "max_output_tokens": _objective_page_output_token_budget(
+            question_count=question_count,
+            reasoning_effort=reasoning_effort,
         ),
         "metadata": {
             "pcr_stage": "objective_answer_page_reading",
             "prompt_version": OBJECTIVE_PROMPT_VERSION,
+            "output_budget_policy": _OBJECTIVE_OUTPUT_BUDGET_POLICY,
             "submission_id": submission_id,
             "exam_id": exam_id,
             "page_number": asset.page_number,
@@ -2352,6 +2413,41 @@ def build_objective_page_call_spec(
     if _responses_temperature_is_effective(model_id, reasoning_effort):
         call_spec["temperature"] = temperature
     return call_spec, request_bytes
+
+
+def _objective_page_output_token_budget(
+    *,
+    question_count: int,
+    reasoning_effort: str,
+) -> int:
+    """Size an objective ledger response from its contracted row count.
+
+    ``max_output_tokens`` covers both visible structured output and reasoning
+    tokens for Responses reasoning models.  A fixed 60-token allowance per
+    question left a 75-row OMR with almost no reasoning headroom and could cut
+    valid JSON near the end of the ledger.  This policy reserves independent
+    capacity for the JSON envelope, every row, and the configured reasoning
+    effort.  It is a ceiling, not prepaid usage; a completed ledger stops
+    naturally before consuming the allowance.
+    """
+
+    try:
+        normalized_count = max(1, int(question_count))
+    except (TypeError, ValueError):
+        normalized_count = 1
+    reasoning_reserve = _OBJECTIVE_REASONING_TOKEN_RESERVE.get(
+        str(reasoning_effort or "").strip().lower(),
+        _OBJECTIVE_REASONING_TOKEN_RESERVE["medium"],
+    )
+    requested = (
+        _OBJECTIVE_OUTPUT_BASE_TOKENS
+        + _OBJECTIVE_OUTPUT_TOKENS_PER_QUESTION * normalized_count
+        + reasoning_reserve
+    )
+    return min(
+        _OBJECTIVE_OUTPUT_TOKEN_CEILING,
+        max(_OBJECTIVE_OUTPUT_TOKEN_FLOOR, requested),
+    )
 
 
 def build_llm_debug_request_manifest(

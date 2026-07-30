@@ -270,7 +270,25 @@ class LLMGate:
             )
 
         # ── Step 7: Return content + usage metadata ─────────────────────
-        return GateResponse(content=provider_resp.content, usage=usage)
+        # OpenAI Responses can return HTTP 200 with ``status=incomplete``.
+        # Preserve that signal instead of forcing every downstream caller to
+        # infer truncation from an invalid JSON tail.
+        provider_raw = (
+            provider_resp.raw if isinstance(provider_resp.raw, dict) else {}
+        )
+        incomplete_details = provider_raw.get("incomplete_details")
+        if not isinstance(incomplete_details, dict):
+            incomplete_details = {}
+        provider_status = str(provider_raw.get("status") or "").strip() or None
+        incomplete_reason = (
+            str(incomplete_details.get("reason") or "").strip() or None
+        )
+        return GateResponse(
+            content=provider_resp.content,
+            usage=usage,
+            provider_status=provider_status,
+            incomplete_reason=incomplete_reason,
+        )
 
     # ------------------------------------------------------------------
     # Repository access (for rollup jobs and usage APIs)

@@ -437,6 +437,11 @@ async def test_objective_answer_ledger_reads_one_page_and_scores_with_frozen_key
     )
     assert gate.calls[0]["reasoning_effort"] == "medium"
     assert gate.calls[0]["model_id"] == "gpt-5.6-sol"
+    assert gate.calls[0]["max_output_tokens"] == 6_700
+    assert (
+        gate.calls[0]["metadata"]["output_budget_policy"]
+        == "objective-ledger-cardinality-v1"
+    )
     model_catalog = gate.calls[0]["responses_input"][1]["content"][0]["text"]
     assert "correct_answer" not in model_catalog
     assert '"text"' not in model_catalog
@@ -484,6 +489,23 @@ async def test_objective_answer_ledger_reads_one_page_and_scores_with_frozen_key
         asset["sha256"] and asset["byte_count"] > 0
         for asset in trace["image_assets"]
     )
+
+
+def test_objective_output_budget_scales_for_full_omr_and_reasoning():
+    module = _module()
+
+    assert module._objective_page_output_token_budget(
+        question_count=75,
+        reasoning_effort="medium",
+    ) == 14_000
+    assert module._objective_page_output_token_budget(
+        question_count=75,
+        reasoning_effort="high",
+    ) == 16_000
+    assert module._objective_page_output_token_budget(
+        question_count=500,
+        reasoning_effort="high",
+    ) == 20_000
 
 
 @pytest.mark.asyncio
