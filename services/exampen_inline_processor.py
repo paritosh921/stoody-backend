@@ -13,16 +13,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from time import monotonic
 from typing import Any
 
 from services.exampen_workflow import (
     CURRENT_PCR_PIPELINE_VERSION,
+    DISPATCHABLE_JOB_STATUSES,
     PROCESSING_JOBS_COLLECTION,
-    dispatchable_job_filter,
     mark_processing_job_retryable_error,
     process_pcr_processing_job,
     recover_stale_processing_jobs,
-    release_processing_job_for_restart,
 )
 
 
@@ -44,12 +44,15 @@ class InlinePCRProcessor:
         *,
         poll_seconds: float = 3.0,
         concurrency: int = 1,
+        retry_delay_seconds: float = 60.0,
     ) -> None:
         self._db_manager = db_manager
         self._poll_seconds = max(1.0, float(poll_seconds))
+        self._retry_delay_seconds = max(1.0, float(retry_delay_seconds))
         self._concurrency = max(1, int(concurrency))
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
+        self._retry_not_before: dict[str, float] = {}
         self._stop_event = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
 
@@ -129,7 +132,7 @@ class InlinePCRProcessor:
                 )
 
             cursor = tenant_db[PROCESSING_JOBS_COLLECTION].find(
-                dispatchable_job_filter(),
+                {"status": {"$in": list(DISPATCHABLE_JOB_STATUSES)}},
                 {"job_id": 1},
             ).sort("updated_at", 1).limit(available_slots)
             jobs = await cursor.to_list(length=available_slots)
@@ -138,7 +141,7 @@ class InlinePCRProcessor:
                 if not job_id:
                     continue
                 key = f"{db_name}:{job_id}"
-                if key in self._active_jobs:
+                if key in self._active_jobs or monotonic() < self._retry_not_before.get(key, 0):
                     continue
                 task = asyncio.create_task(
                     self._process_job(key, tenant_db, job_id),
@@ -176,21 +179,8 @@ class InlinePCRProcessor:
                     execution_token=execution_token,
                     required_pipeline_version=CURRENT_PCR_PIPELINE_VERSION,
                 )
+                self._retry_not_before.pop(key, None)
             except asyncio.CancelledError:
-                # A development hot reload is an orderly worker shutdown, not
-                # a 30-minute live lease. Release ownership immediately so the
-                # replacement process can resume the durable job.
-                try:
-                    await release_processing_job_for_restart(
-                        tenant_db,
-                        job_id,
-                        expected_lease_token=execution_token,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Could not release PCR job %s during worker shutdown",
-                        job_id,
-                    )
                 raise
             except Exception as exc:
                 logger.exception("Inline PCR processing failed for job %s", job_id)
@@ -201,8 +191,5 @@ class InlinePCRProcessor:
                         exc,
                         expected_lease_token=execution_token,
                     )
-                except Exception:
-                    logger.exception(
-                        "Could not persist PCR failure state for job %s",
-                        job_id,
-                    )
+                finally:
+                    self._retry_not_before[key] = monotonic() + self._retry_delay_seconds

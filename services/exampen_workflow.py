@@ -19,13 +19,10 @@ logger = logging.getLogger(__name__)
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
-CURRENT_PCR_PIPELINE_VERSION = 4
+CURRENT_PCR_PIPELINE_VERSION = 2
 FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
-PROCESSING_MAX_AUTOMATIC_ATTEMPTS = 3
-PROCESSING_RETRY_BASE_SECONDS = 60
-PROCESSING_RETRY_MAX_SECONDS = 15 * 60
 # A live worker renews ``updated_at`` every heartbeat. Waiting for the full
 # 30-minute ownership lease after a process crash leaves the UI stuck on
 # "Checking" even though no worker exists. Three missed heartbeats provide a
@@ -128,28 +125,6 @@ def _owned_lease_filter(job: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def dispatchable_job_filter(*, now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Return the database-authoritative eligibility predicate for workers."""
-
-    ready_at = now or _now()
-    return {
-        "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
-        "$or": [
-            {"next_attempt_at": {"$exists": False}},
-            {"next_attempt_at": None},
-            {"next_attempt_at": {"$lte": ready_at}},
-        ],
-    }
-
-
-def _retry_delay_seconds(attempts: int) -> int:
-    exponent = max(0, int(attempts) - 1)
-    return min(
-        PROCESSING_RETRY_MAX_SECONDS,
-        PROCESSING_RETRY_BASE_SECONDS * (2**exponent),
-    )
-
-
 async def _heartbeat_processing_job(tenant_db: Any, job: Dict[str, Any]) -> None:
     """Renew a worker lease, failing closed if another worker fenced it out."""
     now = _now()
@@ -231,9 +206,6 @@ async def _required_processing_path(tenant_db: Any, exam_id: str) -> str:
         in {
             "canonical-full-document-visual-v1",
             "canonical-full-document-visual-v2",
-            "objective-answer-ledger-v1",
-            "objective-answer-ledger-v2",
-            "objective-answer-ledger-v3",
         }
     ):
         return FULL_DOCUMENT_PROCESSING_PATH
@@ -267,10 +239,6 @@ async def ensure_processing_job(
                 "required_processing_path": required_processing_path,
                 "status": "queued",
                 "attempts": 0,
-                "generation_revision": 0,
-                "reprocess_count": 0,
-                "reprocess_state": "initial",
-                "active_result_retained": False,
                 "lease_generation": 0,
                 "created_at": now,
                 "updated_at": now,
@@ -305,9 +273,6 @@ async def dispatch_processing_job(
         return job
 
     now = _now()
-    next_attempt_at = _as_utc(job.get("next_attempt_at"))
-    if not force and next_attempt_at is not None and next_attempt_at > now:
-        return job
     required_processing_path = await _required_processing_path(
         tenant_db,
         str(job.get("exam_id") or ""),
@@ -323,8 +288,7 @@ async def dispatch_processing_job(
                 "enqueue_attempted_at": now,
                 "updated_at": now,
                 "last_error": None,
-            },
-            "$unset": {"next_attempt_at": ""},
+            }
         },
     )
     if not queued.matched_count:
@@ -481,37 +445,6 @@ async def reprocess_processing_job(
         "previous_pipeline_version": job.get("pipeline_version"),
         "force_reclaim": current_status == "processing",
     }
-    try:
-        current_generation_revision = int(
-            job.get("generation_revision")
-            if job.get("generation_revision") is not None
-            else job.get("reprocess_count")
-            or 0
-        )
-    except (TypeError, ValueError):
-        current_generation_revision = 0
-    next_generation_revision = max(0, current_generation_revision) + 1
-    submission = await tenant_db["evalpen_submissions"].find_one(
-        {"submission_id": str(job.get("submission_id") or "")},
-        {
-            "document_grading_materialization_id": 1,
-            "document_grading_run_id": 1,
-        },
-    )
-    active_materialization_id = str(
-        (submission or {}).get("document_grading_materialization_id") or ""
-    ) or None
-    active_run_id = str(
-        (submission or {}).get("document_grading_run_id") or ""
-    ) or None
-    history_entry.update(
-        {
-            "previous_generation_revision": current_generation_revision,
-            "requested_generation_revision": next_generation_revision,
-            "active_materialization_id_at_request": active_materialization_id,
-            "active_run_id_at_request": active_run_id,
-        }
-    )
     reset = await jobs.update_one(
         reset_filter,
         {
@@ -527,15 +460,6 @@ async def reprocess_processing_job(
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
                 "mapping_pipeline_version": "full-document-visual-v2",
-                "generation_revision": next_generation_revision,
-                "candidate_generation_revision": next_generation_revision,
-                "active_result_at_request": {
-                    "materialization_id": active_materialization_id,
-                    "run_id": active_run_id,
-                },
-                "active_result_retained": False,
-                "reprocess_state": "pending",
-                "attempts": 0,
                 "updated_at": now,
             },
             "$unset": {
@@ -543,8 +467,6 @@ async def reprocess_processing_job(
                 "started_at": "",
                 "lease_token": "",
                 "lease_expires_at": "",
-                "next_attempt_at": "",
-                "failure_code": "",
             },
             "$inc": {"reprocess_count": 1},
             "$push": {"reprocess_history": {"$each": [history_entry], "$slice": -20}},
@@ -601,7 +523,6 @@ async def recover_stale_processing_jobs(
                     "Processing worker heartbeat stopped; queued for automatic recovery"
                 ),
                 "stale_worker_recovered_at": recovered_at,
-                "next_attempt_at": recovered_at,
                 "updated_at": recovered_at,
             },
             "$unset": {"lease_token": "", "lease_expires_at": ""},
@@ -635,15 +556,11 @@ async def reconcile_processing_jobs(
     retry_after = now - timedelta(seconds=60)
     cursor = jobs.find(
         {
-            "$and": [
-                dispatchable_job_filter(now=now),
-                {
-                    "$or": [
-                        {"enqueue_attempted_at": {"$exists": False}},
-                        {"enqueue_attempted_at": {"$lt": retry_after}},
-                    ],
-                },
-            ]
+            "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
+            "$or": [
+                {"enqueue_attempted_at": {"$exists": False}},
+                {"enqueue_attempted_at": {"$lt": retry_after}},
+            ],
         }
     ).sort("updated_at", 1)
     pending = await cursor.to_list(length=max(1, min(limit, 1000)))
@@ -675,15 +592,11 @@ async def _claim_job(
     now = _now()
     lease_token = str(execution_token or uuid.uuid4().hex)
     claim_filter: Dict[str, Any] = {
-        "$and": [
-            {"job_id": job_id},
-            dispatchable_job_filter(now=now),
-        ]
+        "job_id": job_id,
+        "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
     }
     if required_pipeline_version is not None:
-        claim_filter["$and"].append(
-            {"pipeline_version": int(required_pipeline_version)}
-        )
+        claim_filter["pipeline_version"] = int(required_pipeline_version)
     result = await jobs.update_one(
         claim_filter,
         {
@@ -696,7 +609,6 @@ async def _claim_job(
                 "lease_expires_at": now + timedelta(minutes=PROCESSING_LEASE_MINUTES),
                 "last_error": None,
             },
-            "$unset": {"next_attempt_at": ""},
             "$inc": {"attempts": 1, "lease_generation": 1},
         },
     )
@@ -890,34 +802,22 @@ async def process_pcr_processing_job(
     if document_result.handled:
         now = _now()
         final_status = str(document_result.status or "blocked_for_review")
-        processing_path = str(
-            document_result.processing_path or "full_document_visual"
-        )
-        materialization_id = getattr(
-            document_result,
-            "materialization_id",
-            None,
-        )
         finished = await jobs.update_one(
             lease_filter,
             {
                 "$set": {
                     "status": final_status,
-                    "processing_path": processing_path,
+                    "processing_path": "full_document_visual",
                     "document_grading_run_id": document_result.run_id,
-                    "document_grading_materialization_id": materialization_id,
-                    "active_result_materialization_id": materialization_id,
-                    "active_result_retained": False,
-                    "reprocess_state": "succeeded",
                     "segmentation": {
-                        "path": processing_path,
+                        "path": "full_document_visual",
                         "page_count": document_result.page_count,
                         "response_count": document_result.response_count,
                         "blocked_count": document_result.blocked_count,
                         "warning_count": document_result.warning_count,
                     },
                     "evaluation": {
-                        "path": processing_path,
+                        "path": "full_document_visual",
                         "evaluated_count": document_result.evaluated_count,
                         "blocked_count": document_result.blocked_count,
                         "error_count": len(document_result.errors),
@@ -932,15 +832,7 @@ async def process_pcr_processing_job(
                         ),
                         "reasons": document_result.review_reasons[:20],
                     },
-                    # A handled grading result is an operational success even
-                    # when individual answers require teacher review.  Keep
-                    # those diagnostics for audit, but never expose them as a
-                    # worker failure through ``last_error``.
-                    "diagnostics": {
-                        "errors": document_result.errors[:50],
-                        "recorded_at": now,
-                    },
-                    "last_error": None,
+                    "last_error": "; ".join(document_result.errors[:10]) or None,
                     "finished_at": now,
                     "updated_at": now,
                 },
@@ -961,7 +853,7 @@ async def process_pcr_processing_job(
             "job_id": job_id,
             "status": final_status,
             "submission_id": submission_id,
-            "processing_path": processing_path,
+            "processing_path": "full_document_visual",
             "document_grading_run_id": document_result.run_id,
             "evaluated_count": document_result.evaluated_count,
             "blocked_count": document_result.blocked_count,
@@ -1414,7 +1306,7 @@ async def mark_processing_job_retryable_error(
     *,
     expected_lease_token: Optional[str] = None,
 ) -> bool:
-    """Persist bounded retry state owned by MongoDB, not worker memory."""
+    """Persist a retryable failure only for the worker that owned the lease."""
 
     query: Dict[str, Any] = {"job_id": job_id}
     if expected_lease_token:
@@ -1428,103 +1320,13 @@ async def mark_processing_job_retryable_error(
         # Legacy callers have no ownership proof. They may update an idle job,
         # but must never fence out an active worker.
         query["status"] = {"$ne": "processing"}
-    jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
-    current = await jobs.find_one(
-        query,
-        {
-            "attempts": 1,
-            "submission_id": 1,
-            "active_result_at_request": 1,
-            "generation_revision": 1,
-            "reprocess_count": 1,
-        },
-    )
-    if current is None:
-        return False
-    attempts = max(0, int(current.get("attempts") or 0))
-    now = _now()
-    terminal = attempts >= PROCESSING_MAX_AUTOMATIC_ATTEMPTS
-    status_value = "failed" if terminal else "retryable_error"
-    submission = await tenant_db["evalpen_submissions"].find_one(
-        {"submission_id": str(current.get("submission_id") or "")},
-        {
-            "document_grading_materialization_id": 1,
-            "document_grading_run_id": 1,
-        },
-    )
-    active_materialization_id = str(
-        (submission or {}).get("document_grading_materialization_id") or ""
-    ) or None
-    active_run_id = str(
-        (submission or {}).get("document_grading_run_id") or ""
-    ) or None
-    active_result_retained = bool(active_materialization_id)
-    update: Dict[str, Any] = {
-        "$set": {
-            "status": status_value,
-            "last_error": _short_error(error),
-            "failure_code": (
-                type(error).__name__
-                if isinstance(error, Exception)
-                else "worker_error"
-            ),
-            "active_result_retained": active_result_retained,
-            "active_result_materialization_id": active_materialization_id,
-            "active_result_run_id": active_run_id,
-            "reprocess_state": "failed" if terminal else "retrying",
-            "updated_at": now,
-        },
-        "$unset": {"lease_token": "", "lease_expires_at": ""},
-        "$push": {
-            "failure_history": {
-                "$each": [
-                    {
-                        "attempt": attempts,
-                        "status": status_value,
-                        "error": _short_error(error),
-                        "failed_at": now,
-                    }
-                ],
-                "$slice": -20,
-            }
-        },
-    }
-    if terminal:
-        update["$set"]["finished_at"] = now
-        update["$unset"]["next_attempt_at"] = ""
-    else:
-        update["$set"]["next_attempt_at"] = now + timedelta(
-            seconds=_retry_delay_seconds(attempts)
-        )
-        update["$unset"]["finished_at"] = ""
-    result = await jobs.update_one(
-        query,
-        update,
-    )
-    return result.matched_count == 1
-
-
-async def release_processing_job_for_restart(
-    tenant_db: Any,
-    job_id: str,
-    *,
-    expected_lease_token: str,
-) -> bool:
-    """Release a cancelled worker lease without consuming failure budget."""
-
-    now = _now()
     result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-        {
-            "job_id": job_id,
-            "status": "processing",
-            "lease_token": str(expected_lease_token),
-        },
+        query,
         {
             "$set": {
                 "status": "retryable_error",
-                "last_error": "Processing worker restarted; queued for recovery",
-                "next_attempt_at": now,
-                "updated_at": now,
+                "last_error": _short_error(error),
+                "updated_at": _now(),
             },
             "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
@@ -1557,19 +1359,10 @@ async def mark_processing_job_failed(
             "$set": {
                 "status": "failed",
                 "last_error": _short_error(error),
-                "failure_code": (
-                    type(error).__name__
-                    if isinstance(error, Exception)
-                    else "worker_error"
-                ),
                 "finished_at": _now(),
                 "updated_at": _now(),
             },
-            "$unset": {
-                "lease_token": "",
-                "lease_expires_at": "",
-                "next_attempt_at": "",
-            },
+            "$unset": {"lease_token": "", "lease_expires_at": ""},
         },
     )
     return result.matched_count == 1

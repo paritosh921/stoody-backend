@@ -24,10 +24,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from fastapi import HTTPException, status
 from pymongo.errors import DuplicateKeyError
 from services.answer_mapping_contract import normalize_answer_label
-from services.objective_answer_ledger_contract import (
-    OBJECTIVE_PAPER_CONTEXT_VERSION,
-    all_questions_are_objective,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -652,10 +648,7 @@ def build_question_layout(
     return layout, errors
 
 
-def full_document_visual_contract(
-    document: Dict[str, Any],
-    questions: Optional[Iterable[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
+def full_document_visual_contract(document: Dict[str, Any]) -> Dict[str, Any]:
     """Return the immutable full-document grading capability for one paper.
 
     Semantic ownership for camera/PDF copies belongs to the multimodal grader,
@@ -666,21 +659,9 @@ def full_document_visual_contract(
 
     enabled = os.getenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "true").strip().lower()
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
-    objective_only = (
-        all_questions_are_objective(list(questions))
-        if questions is not None
-        else False
-    )
     model_id = (
-        (
-            os.getenv("PCR_OBJECTIVE_GRADING_MODEL", "").strip()
-            or "gpt-5.6-sol"
-        )
-        if objective_only
-        else (
-            os.getenv("PCR_FULL_DOCUMENT_GRADING_MODEL", "").strip()
-            or os.getenv("OPENAI_MODEL", "gpt-5.1").strip()
-        )
+        os.getenv("PCR_FULL_DOCUMENT_GRADING_MODEL", "").strip()
+        or os.getenv("OPENAI_MODEL", "gpt-5.1").strip()
     )
     blockers: List[str] = []
     if enabled in {"0", "false", "no", "off"}:
@@ -693,20 +674,11 @@ def full_document_visual_contract(
         blockers.append("The immutable question-paper asset is unavailable")
 
     return {
-        # Objective-only papers use a separate image-to-answer ledger. The
-        # correct key never enters the model request; deterministic scoring
-        # applies it after the page observations have been validated.
-        # Subjective and mixed papers retain the V2 evidence graph.
-        "version": (
-            OBJECTIVE_PAPER_CONTEXT_VERSION
-            if objective_only
-            else "canonical-full-document-visual-v2"
-        ),
-        "mode": (
-            "objective_answer_ledger"
-            if objective_only
-            else "full_document_visual"
-        ),
+        # V2 freezes the global-to-local evidence-graph contract. Existing V1
+        # paper versions remain valid and continue on their already locked
+        # single-call grading contract; newly finalized papers use V2.
+        "version": "canonical-full-document-visual-v2",
+        "mode": "full_document_visual",
         "ready": not blockers,
         "model_id": model_id,
         "prompt_cache_scope": _as_text(document.get("document_id")),
@@ -738,7 +710,7 @@ def resolve_question_layout_for_finalization(
         question_list,
         regions_document,
     )
-    visual_contract = full_document_visual_contract(document, question_list)
+    visual_contract = full_document_visual_contract(document)
     if not layout_errors:
         return {
             "ready": True,
@@ -958,9 +930,8 @@ async def create_paper_snapshot(
             "verified"
             if question_layout
             else (
-                str((paper_context or {}).get("mode"))
-                if (paper_context or {}).get("mode")
-                in {"full_document_visual", "objective_answer_ledger"}
+                "full_document_visual"
+                if (paper_context or {}).get("mode") == "full_document_visual"
                 else "legacy_unverified"
             )
         ),

@@ -275,18 +275,10 @@ class ProcessingJobResponse(BaseModel):
     status: str
     attempts: int = 0
     last_error: Optional[str] = None
-    failure_code: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     finished_at: Optional[str] = None
     reprocess_count: int = 0
-    generation_revision: int = 0
-    candidate_generation_revision: Optional[int] = None
-    reprocess_state: Optional[str] = None
-    active_result_retained: bool = False
-    active_result_materialization_id: Optional[str] = None
-    document_grading_run_id: Optional[str] = None
-    document_grading_materialization_id: Optional[str] = None
     reprocess_requested_at: Optional[str] = None
     reprocess_requested_by: Optional[str] = None
     segmentation: Dict[str, Any] = Field(default_factory=dict)
@@ -450,31 +442,10 @@ def _processing_job_to_response(doc: Dict[str, Any]) -> ProcessingJobResponse:
         status=str(doc.get("status") or "queued"),
         attempts=int(doc.get("attempts") or 0),
         last_error=_fmt(doc.get("last_error")),
-        failure_code=_fmt(doc.get("failure_code")),
         created_at=_fmt(doc.get("created_at")),
         updated_at=_fmt(doc.get("updated_at")),
         finished_at=_fmt(doc.get("finished_at")),
         reprocess_count=int(doc.get("reprocess_count") or 0),
-        generation_revision=int(
-            doc.get("generation_revision")
-            if doc.get("generation_revision") is not None
-            else doc.get("reprocess_count")
-            or 0
-        ),
-        candidate_generation_revision=(
-            int(doc["candidate_generation_revision"])
-            if doc.get("candidate_generation_revision") is not None
-            else None
-        ),
-        reprocess_state=_fmt(doc.get("reprocess_state")),
-        active_result_retained=bool(doc.get("active_result_retained")),
-        active_result_materialization_id=_fmt(
-            doc.get("active_result_materialization_id")
-        ),
-        document_grading_run_id=_fmt(doc.get("document_grading_run_id")),
-        document_grading_materialization_id=_fmt(
-            doc.get("document_grading_materialization_id")
-        ),
         reprocess_requested_at=_fmt(doc.get("reprocess_requested_at")),
         reprocess_requested_by=_fmt(doc.get("reprocess_requested_by")),
         segmentation=dict(doc.get("segmentation") or {}),

@@ -46,10 +46,6 @@ class ProviderResponse:
 # Format: model_prefix -> (input_cost_per_M, output_cost_per_M)
 _COST_TABLE: Dict[str, tuple[float, float]] = {
     # OpenAI
-    "gpt-5.6-sol": (5.00, 30.00),
-    "gpt-5.6-terra": (2.50, 15.00),
-    "gpt-5.6-luna": (1.00, 6.00),
-    "gpt-5.6": (5.00, 30.00),
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4-turbo": (10.00, 30.00),

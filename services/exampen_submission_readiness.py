@@ -115,36 +115,7 @@ async def assess_submission_readiness(
         )
         job = job_docs[0] if job_docs else None
     processing_status = str(job.get("status") or "") if job else "missing"
-    segmentation_status = str(submission.get("segmentation_status") or "")
-    active_materialization_id = str(
-        submission.get("document_grading_materialization_id") or ""
-    )
-    active_result_available = bool(
-        active_materialization_id and segmentation_status == "complete"
-    )
-    failed_reprocess_statuses = {
-        "failed",
-        "retryable_error",
-        "enqueue_failed",
-    }
-    active_result_retained = bool(
-        active_result_available and processing_status in failed_reprocess_statuses
-    )
-    if active_result_available and processing_status in {
-        "queued",
-        "processing",
-        "retryable_error",
-        "enqueue_failed",
-    }:
-        blockers.append(
-            _blocker(
-                "reprocess_in_progress",
-                "A new answer-copy grading generation is still in progress",
-                processing_status=processing_status,
-                active_materialization_id=active_materialization_id,
-            )
-        )
-    elif processing_status != "completed" and not active_result_retained:
+    if processing_status != "completed":
         blockers.append(
             _blocker(
                 "processing_not_completed",
@@ -170,6 +141,7 @@ async def assess_submission_readiness(
             )
         )
 
+    segmentation_status = str(submission.get("segmentation_status") or "")
     if segmentation_status != "complete":
         blockers.append(
             _blocker(
@@ -454,12 +426,6 @@ async def assess_submission_readiness(
             "blocker_count": len(blockers),
         },
         "processing_status": processing_status,
-        "processing_error": (
-            str(job.get("last_error") or "")[:500] if job else None
-        ),
-        "active_result_available": active_result_available,
-        "active_result_retained": active_result_retained,
-        "active_materialization_id": active_materialization_id or None,
         "segmentation_status": segmentation_status,
         "paper_version_id": expected_paper_version or None,
     }

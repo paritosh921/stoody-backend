@@ -374,45 +374,6 @@ class TestUGate04:
         assert resp.content == "test output"
         assert resp.usage.caller == "dcr_ai"
         assert resp.usage.total_tokens == 100
-        assert resp.provider_status is None
-        assert resp.incomplete_reason is None
-
-    def test_u_gate_04_gate_preserves_provider_incomplete_reason(self):
-        async def _run():
-            db = MagicMock()
-            gate = LLMGate(db)
-            gate._repo = _make_mock_repo(config=GateConfig())
-            provider_resp = _make_provider_response('{"partial":')
-            provider_resp.raw = {
-                "status": "incomplete",
-                "incomplete_details": {"reason": "max_output_tokens"},
-            }
-
-            with patch(
-                "llm_gate.gate.call_provider",
-                new_callable=AsyncMock,
-                return_value=provider_resp,
-            ), patch(
-                "llm_gate.gate.estimate_tokens",
-                return_value=100,
-            ), patch(
-                "llm_gate.gate.estimate_tokens_for_messages",
-                return_value=100,
-            ), patch(
-                "llm_gate.gate.estimate_cost",
-                return_value=0.001,
-            ):
-                response = await gate.call(
-                    model_id="gpt-5.6-sol",
-                    prompt="Return JSON",
-                    caller_id="pcr_eval_core",
-                    max_output_tokens=4_500,
-                )
-
-            assert response.provider_status == "incomplete"
-            assert response.incomplete_reason == "max_output_tokens"
-
-        asyncio.run(_run())
 
 
 # ===========================================================================

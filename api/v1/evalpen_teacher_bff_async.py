@@ -978,18 +978,11 @@ async def get_exam_queue(
             # Fully evaluated = PCR done AND DCR done (if applicable)
             all_evaluated = pcr_all_evaluated and dcr_complete
 
-            active_result_retained = bool(
-                readiness.get("active_result_retained")
-            )
-            job_needs_attention = (
-                processing_status
-                in {
-                    "failed",
-                    "retryable_error",
-                    "enqueue_failed",
-                }
-                and not active_result_retained
-            )
+            job_needs_attention = processing_status in {
+                "failed",
+                "retryable_error",
+                "enqueue_failed",
+            }
 
             # Bucket logic
             if (
@@ -1070,11 +1063,6 @@ async def get_exam_queue(
                     )
                 )
             elif all_evaluated and pub_status != "published":
-                ready_summary = (
-                    "Verified result retained; latest reprocess failed"
-                    if active_result_retained
-                    else "Fully evaluated, ready to publish"
-                )
                 ready_items.append(
                     QueueItem(
                         submission_id=sub_id,
@@ -1082,7 +1070,7 @@ async def get_exam_queue(
                         response_count=response_count,
                         page_count=page_count,
                         source=submission_source,
-                        status_summary=ready_summary,
+                        status_summary="Fully evaluated, ready to publish",
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
                         processing_error=processing_error,
