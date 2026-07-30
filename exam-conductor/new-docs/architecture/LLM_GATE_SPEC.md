@@ -49,6 +49,7 @@ All LLM callers
   ├── dcr_ai
   ├── dcr_devanagari
   ├── pcr_eval_core
+  ├── pcr_objective_extraction
   ├── pcr_cache_warmup
   ├── pcr_clubbed_h4
   └── pcr_practice
@@ -115,6 +116,7 @@ Only registered callers may invoke the gate. Any unregistered `caller_id` is rej
 | caller_id | Pipeline | Purpose |
 |---|---|---|
 | `pcr_eval_core` | PCR | Evaluate student response on cache hit or miss |
+| `pcr_objective_extraction` | PCR | Transcribe pure Objective PCR answer sheets before deterministic scoring |
 | `pcr_cache_warmup` | PCR | Generate or refresh reference solutions |
 | `pcr_clubbed_h4` | PCR | Topic discontinuity check for clubbed detection |
 | `pcr_practice` | PCR | Stateless live practice evaluation |

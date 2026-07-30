@@ -120,9 +120,10 @@ class TestUGate01:
     """U-GATE-01: Allowed caller validation (LLM_GATE_SPEC section 5)."""
 
     def test_u_gate_01_allowed_callers_match_spec(self):
-        """All six spec-defined caller IDs are present in the allow-list."""
+        """All spec-defined caller IDs are present in the allow-list."""
         expected = {
             "pcr_eval_core",
+            "pcr_objective_extraction",
             "pcr_cache_warmup",
             "pcr_clubbed_h4",
             "pcr_practice",
@@ -132,10 +133,11 @@ class TestUGate01:
         assert ALLOWED_CALLER_IDS == expected
 
     def test_u_gate_01_caller_enum_values(self):
-        """CallerID enum has exactly the six registered identities."""
+        """CallerID enum has exactly the registered identities."""
         values = {c.value for c in CallerID}
-        assert len(values) == 6
+        assert len(values) == 7
         assert "pcr_eval_core" in values
+        assert "pcr_objective_extraction" in values
         assert "dcr_ai" in values
 
     def test_u_gate_01_unregistered_caller_rejected(self):

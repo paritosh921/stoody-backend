@@ -45,6 +45,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from services.answer_mapping_contract import normalize_answer_label
+from services.objective_scoring_service import is_integer_question
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
 
@@ -191,12 +193,16 @@ class ResponseAssignmentCorrectionRequest(BaseModel):
 
     action: str = Field(
         ...,
-        pattern="^(assign|split|merge|confirm_not_attempted|discard_non_answer)$",
+        pattern=(
+            "^(assign|split|merge|confirm_not_attempted|"
+            "discard_non_answer|set_objective_answer)$"
+        ),
     )
     reason: str = Field(..., min_length=5, max_length=1000)
     response_id: Optional[str] = None
     response_ids: List[str] = Field(default_factory=list)
     question_id: Optional[str] = None
+    selected_answer: Optional[str] = None
     parts: List[ResponseSplitPart] = Field(default_factory=list)
 
     @field_validator("reason")
@@ -253,6 +259,7 @@ class ResponseSummaryAPI(BaseModel):
     source_pages: List[Dict[str, Any]] = Field(default_factory=list)
     question_assignment: Optional[Dict[str, Any]] = None
     manual_review_reason: Optional[str] = None
+    grading_mode: Optional[str] = None
 
 
 class QuestionCatalogItemAPI(BaseModel):
@@ -266,6 +273,8 @@ class QuestionCatalogItemAPI(BaseModel):
     source_page_number: Optional[int] = None
     source_region_id: Optional[str] = None
     source_bbox_percent: Optional[Dict[str, Any]] = None
+    grading_mode: Optional[str] = None
+    option_labels: List[str] = Field(default_factory=list)
 
 
 class SubmissionSummaryReviewAPI(BaseModel):
@@ -386,6 +395,48 @@ def _safe_marks(value: Any) -> float:
         return 0.0
 
 
+def _safe_score(value: Any) -> float:
+    """Return a finite score while preserving Objective negative marking."""
+
+    try:
+        parsed = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _catalog_grading_mode(question: Dict[str, Any]) -> str:
+    grading_mode = str(question.get("grading_mode") or "").strip().lower()
+    question_type = str(question.get("question_type") or "").strip().lower()
+    if (
+        grading_mode in {"objective", "mcq"}
+        or question_type in {"objective", "mcq"}
+    ) and not is_integer_question(question):
+        return "objective"
+    return "subjective"
+
+
+def _catalog_option_labels(question: Dict[str, Any]) -> List[str]:
+    """Return the immutable option labels without exposing the answer key."""
+
+    options = question.get("options") or question.get("enhanced_options") or []
+    if not isinstance(options, list):
+        return []
+    labels: List[str] = []
+    for index, option in enumerate(options):
+        raw_label = (
+            option.get("label") or option.get("key") or option.get("id")
+            if isinstance(option, dict)
+            else ""
+        )
+        label = normalize_answer_label(raw_label) or (
+            chr(ord("A") + index) if index < 6 else ""
+        )
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
 async def _get_pcr_question_catalog(
     tenant_db: Any,
     exam_id: str,
@@ -409,6 +460,10 @@ async def _get_pcr_question_catalog(
             "source_page_number": 1,
             "source_region_id": 1,
             "source_bbox_percent": 1,
+            "grading_mode": 1,
+            "question_type": 1,
+            "options": 1,
+            "enhanced_options": 1,
         },
     ).sort([("question_number", 1), ("question_id", 1)])
     docs = await cursor.to_list(length=1000)
@@ -434,6 +489,8 @@ async def _get_pcr_question_catalog(
                 "source_page_number": doc.get("source_page_number"),
                 "source_region_id": doc.get("source_region_id"),
                 "source_bbox_percent": doc.get("source_bbox_percent"),
+                "grading_mode": _catalog_grading_mode(doc),
+                "option_labels": _catalog_option_labels(doc),
             }
         )
     return catalog
@@ -843,7 +900,7 @@ async def get_submission_summary(
                     # current submissions block this situation before eval.
                     completion_key = question_id or response_id
                     if not question_id or question_id not in scored_question_ids:
-                        total_score += _safe_marks(resp_score)
+                        total_score += _safe_score(resp_score)
                         evaluated_max += _safe_marks(resp_max)
                         if question_id:
                             scored_question_ids.add(question_id)
@@ -938,6 +995,12 @@ async def get_submission_summary(
                         else None
                     ),
                     manual_review_reason=resp_doc.get("manual_review_reason"),
+                    grading_mode=(
+                        str(resp_doc.get("grading_mode") or "").strip()
+                        or str((evaluation or {}).get("grading_mode") or "").strip()
+                        or str((catalog_question or {}).get("grading_mode") or "").strip()
+                        or None
+                    ),
                 )
             if is_unassigned:
                 unassigned_summaries.append(response_summary)
@@ -967,6 +1030,7 @@ async def get_submission_summary(
                         has_blocking_flags=True,
                         is_missing_response=False,
                         answer_state="unresolved",
+                        grading_mode=question.get("grading_mode"),
                     )
                 )
                 blocked_count += 1
@@ -1735,7 +1799,7 @@ async def get_exam_results(
                             and question_id in scored_question_ids
                         ):
                             continue
-                        pcr_total += _safe_marks(ev.get("total_score"))
+                        pcr_total += _safe_score(ev.get("total_score"))
                         evaluated_max += _safe_marks(ev.get("max_score"))
                         if question_id and question_id in catalog_question_ids:
                             scored_question_ids.add(question_id)
@@ -2524,6 +2588,7 @@ async def _correct_response_assignment_impl(
         operation: str,
         replacing_response_ids: Optional[set[str]] = None,
         evidence_atom_ids: Optional[List[str]] = None,
+        clear_flags: bool = False,
     ) -> Dict[str, Any]:
         await _clear_target_slot(
             question_id,
@@ -2543,6 +2608,7 @@ async def _correct_response_assignment_impl(
                 "evidence_atom_ids",
                 "evidence_version",
                 "evidence_source",
+                "objective_result",
             }
         }
         text_source = source.get("detected_text") if detected_text is None else detected_text
@@ -2568,7 +2634,11 @@ async def _correct_response_assignment_impl(
                 "evidence_version": 1,
                 "evidence_atom_ids": sorted(set(resolved_atoms)),
                 "evidence_source": f"teacher_{operation}",
-                "flags": _resolved_flags(source.get("flags")),
+                "flags": (
+                    []
+                    if clear_flags
+                    else _resolved_flags(source.get("flags"))
+                ),
                 "question_assignment": {
                     "method": f"teacher_{operation}",
                     "confidence": 1.0,
@@ -2584,6 +2654,7 @@ async def _correct_response_assignment_impl(
                 "absence_proven": False,
                 "answer_state": "detected",
                 "eval_status": "ready",
+                "grading_mode": _catalog_grading_mode(question),
                 "word_count": len(text.split()),
                 "created_at": now,
                 "updated_at": now,
@@ -2610,7 +2681,67 @@ async def _correct_response_assignment_impl(
     created: List[Dict[str, Any]] = []
     source_ids: List[str] = []
 
-    if body.action == "assign":
+    if body.action == "set_objective_answer":
+        if not body.response_id or not body.question_id or not body.selected_answer:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "set_objective_answer requires response_id, question_id, "
+                    "and selected_answer"
+                ),
+            )
+        source = await _active_response(body.response_id)
+        if str(source.get("question_id") or "") != body.question_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This action only corrects the selected option. Move the "
+                    "evidence to the correct question first."
+                ),
+            )
+        question = catalog[body.question_id]
+        if _catalog_grading_mode(question) != "objective":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Selected-option correction is available only for "
+                    "Objective PCR questions"
+                ),
+            )
+        option_labels = _catalog_option_labels(question)
+        selected_answer = normalize_answer_label(body.selected_answer)
+        if (
+            len(option_labels) < 2
+            or not selected_answer
+            or selected_answer not in option_labels
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Choose one of the immutable question options: "
+                    + ", ".join(option_labels)
+                    if option_labels
+                    else "This Objective question has no valid option catalog"
+                ),
+            )
+        await _assert_target_slot_available(
+            body.question_id,
+            replacing_response_ids={body.response_id},
+        )
+        created.append(
+            await _create_assigned_response(
+                source,
+                question_id=body.question_id,
+                detected_text=selected_answer,
+                operation="objective_answer",
+                replacing_response_ids={body.response_id},
+                clear_flags=True,
+            )
+        )
+        await _supersede(source, "set_objective_answer")
+        source_ids.append(body.response_id)
+
+    elif body.action == "assign":
         if not body.response_id or not body.question_id:
             raise HTTPException(status_code=400, detail="assign requires response_id and question_id")
         source = await _active_response(body.response_id)
@@ -2854,6 +2985,11 @@ async def _correct_response_assignment_impl(
             "source_response_ids": source_ids,
             "created_response_ids": [str(item.get("response_id") or "") for item in created],
             "question_ids": sorted(requested_question_ids),
+            "selected_answer": (
+                normalize_answer_label(body.selected_answer)
+                if body.action == "set_objective_answer"
+                else None
+            ),
             "reason": body.reason,
             "actor_id": actor_id,
             "created_at": now,

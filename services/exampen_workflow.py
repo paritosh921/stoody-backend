@@ -867,18 +867,19 @@ async def process_pcr_processing_job(
     from api.v1.evalpen_evaluate_async import _build_eval_core
     from api.v1.evalpen_submissions_async import _build_submission_service
 
-    # Primary PCR camera/PDF path: the model sees the immutable question
-    # paper, teacher solution, and complete student copy in one visual request.
-    # OCR/segmentation remains a legacy fallback only when a session predates
-    # the canonical paper assets or the feature is explicitly disabled.
+    # Pure multiple-choice PCR papers use an isolated answer-sheet lane. It
+    # transcribes only student selections and never receives the answer key;
+    # immutable server code applies positive/negative marking afterwards.
+    # Subjective, integer-answer, and mixed papers explicitly decline this lane
+    # and continue through the full-document evidence graph unchanged.
     pcr_services = load_exampen("pcr.services")
     LLMGate = load_exampen("llm_gate").LLMGate
-    full_document_gate = LLMGate(tenant_db)
-    if hasattr(full_document_gate, "initialize"):
-        await full_document_gate.initialize()
-    full_document_grader = pcr_services.FullDocumentGradingService(
+    visual_gate = LLMGate(tenant_db)
+    if hasattr(visual_gate, "initialize"):
+        await visual_gate.initialize()
+    objective_grader = pcr_services.ObjectiveAnswerSheetGradingService(
         tenant_db,
-        full_document_gate,
+        visual_gate,
     )
     required_processing_path = await _required_processing_path(
         tenant_db,
@@ -895,19 +896,59 @@ async def process_pcr_processing_job(
         },
     )
     try:
+        await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "progress": {
+                        "stage": "objective_answer_extraction",
+                        "message": "Checking the Objective answer-sheet contract",
+                    },
+                    "updated_at": _now(),
+                }
+            },
+        )
         document_result = await _run_with_lease_heartbeat(
             tenant_db,
             job,
-            full_document_grader.grade_submission(submission_id),
+            objective_grader.grade_submission(submission_id),
         )
+        if not document_result.handled:
+            # Construct the Subjective grader only after the Objective service
+            # proves the immutable catalog is subjective, integer, or mixed.
+            full_document_grader = pcr_services.FullDocumentGradingService(
+                tenant_db,
+                visual_gate,
+            )
+            await jobs.update_one(
+                lease_filter,
+                {
+                    "$set": {
+                        "progress": {
+                            "stage": "full_document_visual",
+                            "message": "Reading the complete Subjective answer copy",
+                        },
+                        "updated_at": _now(),
+                    }
+                },
+            )
+            document_result = await _run_with_lease_heartbeat(
+                tenant_db,
+                job,
+                full_document_grader.grade_submission(submission_id),
+            )
     except ProcessingJobBusyError:
         logger.warning(
-            "PCR worker lost its lease for job %s during full-document grading",
+            "PCR worker lost its lease for job %s during visual grading",
             job_id,
         )
         return {"job_id": job_id, "status": "lease_lost", "claimed": False}
 
     if document_result.handled:
+        processing_path = str(
+            getattr(document_result, "processing_path", "")
+            or FULL_DOCUMENT_PROCESSING_PATH
+        )
         now = _now()
         final_status = str(document_result.status or "blocked_for_review")
         finished = await jobs.update_one(
@@ -915,17 +956,17 @@ async def process_pcr_processing_job(
             {
                 "$set": {
                     "status": final_status,
-                    "processing_path": "full_document_visual",
+                    "processing_path": processing_path,
                     "document_grading_run_id": document_result.run_id,
                     "segmentation": {
-                        "path": "full_document_visual",
+                        "path": processing_path,
                         "page_count": document_result.page_count,
                         "response_count": document_result.response_count,
                         "blocked_count": document_result.blocked_count,
                         "warning_count": document_result.warning_count,
                     },
                     "evaluation": {
-                        "path": "full_document_visual",
+                        "path": processing_path,
                         "evaluated_count": document_result.evaluated_count,
                         "blocked_count": document_result.blocked_count,
                         "error_count": len(document_result.errors),
@@ -961,7 +1002,7 @@ async def process_pcr_processing_job(
             "job_id": job_id,
             "status": final_status,
             "submission_id": submission_id,
-            "processing_path": "full_document_visual",
+            "processing_path": processing_path,
             "document_grading_run_id": document_result.run_id,
             "evaluated_count": document_result.evaluated_count,
             "blocked_count": document_result.blocked_count,

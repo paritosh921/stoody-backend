@@ -139,7 +139,7 @@ class LLMGate:
             The full prompt text.  For pure vision/multimodal calls where
             all content is in *messages*, pass an empty string.
         caller_id : str
-            One of the six registered caller identities.
+            One of the registered caller identities.
         messages : list of dict, optional
             Pre-built messages array for multimodal / vision calls.  When
             provided the array is forwarded to the provider as-is and

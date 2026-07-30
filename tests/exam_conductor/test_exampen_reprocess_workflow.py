@@ -24,6 +24,99 @@ class _RecordedTask:
 
 
 @pytest.mark.asyncio
+async def test_processing_job_uses_objective_lane_without_subjective_grader():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        process_pcr_processing_job,
+    )
+
+    db = _fresh_db()
+    await db[PROCESSING_JOBS_COLLECTION].insert_one(
+        {
+            "job_id": "pcr-job-SUB-OBJ",
+            "submission_id": "SUB-OBJ",
+            "exam_id": "EXAM-OBJ",
+            "student_id": "STU-OBJ",
+            "status": "queued",
+            "attempts": 0,
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-OBJ",
+            "exam_id": "EXAM-OBJ",
+            "student_id": "STU-OBJ",
+            "source": "camera",
+        }
+    )
+    await db["exampen_exams"].insert_one(
+        {"exam_id": "EXAM-OBJ", "exam_type": "pcr", "lifecycle_state": "in_progress"}
+    )
+
+    class _Gate:
+        def __init__(self, _db):
+            pass
+
+        async def initialize(self):
+            return None
+
+    class _ObjectiveGrader:
+        def __init__(self, _db, _gate):
+            pass
+
+        async def grade_submission(self, submission_id: str):
+            assert submission_id == "SUB-OBJ"
+            return SimpleNamespace(
+                handled=True,
+                status="completed",
+                page_count=1,
+                response_count=75,
+                evaluated_count=75,
+                blocked_count=0,
+                warning_count=0,
+                run_id="OBJGR-1",
+                errors=[],
+                review_state="ready",
+                document_review_required=False,
+                review_reasons=[],
+                processing_path="objective_answer_sheet",
+            )
+
+    class _SubjectiveGrader:
+        def __init__(self, _db, _gate):
+            raise AssertionError(
+                "A handled Objective paper must not construct the Subjective grader"
+            )
+
+    def _load(name: str):
+        if name == "pcr.services":
+            return SimpleNamespace(
+                ObjectiveAnswerSheetGradingService=_ObjectiveGrader,
+                FullDocumentGradingService=_SubjectiveGrader,
+            )
+        if name == "llm_gate":
+            return SimpleNamespace(LLMGate=_Gate)
+        raise AssertionError(f"Unexpected module load: {name}")
+
+    with (
+        patch("api.v1._exampen_imports.load_exampen", side_effect=_load),
+        patch(
+            "api.v1.evalpen_submissions_async._build_submission_service",
+            new=AsyncMock(side_effect=AssertionError("OCR fallback must not run")),
+        ),
+    ):
+        result = await process_pcr_processing_job(db, "pcr-job-SUB-OBJ")
+
+    assert result["status"] == "completed"
+    assert result["processing_path"] == "objective_answer_sheet"
+    stored = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "pcr-job-SUB-OBJ"}
+    )
+    assert stored["processing_path"] == "objective_answer_sheet"
+    assert stored["evaluation"]["evaluated_count"] == 75
+
+
+@pytest.mark.asyncio
 async def test_processing_job_uses_full_document_result_without_running_ocr():
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,
@@ -81,9 +174,22 @@ async def test_processing_job_uses_full_document_result_without_running_ocr():
                 review_reasons=[],
             )
 
+    class _ObjectiveGrader:
+        def __init__(self, _db, _gate):
+            pass
+
+        async def grade_submission(self, _submission_id: str):
+            return SimpleNamespace(
+                handled=False,
+                skipped_reason="paper is subjective",
+            )
+
     def _load(name: str):
         if name == "pcr.services":
-            return SimpleNamespace(FullDocumentGradingService=_DocumentGrader)
+            return SimpleNamespace(
+                ObjectiveAnswerSheetGradingService=_ObjectiveGrader,
+                FullDocumentGradingService=_DocumentGrader,
+            )
         if name == "llm_gate":
             return SimpleNamespace(LLMGate=_Gate)
         raise AssertionError(f"Unexpected module load: {name}")

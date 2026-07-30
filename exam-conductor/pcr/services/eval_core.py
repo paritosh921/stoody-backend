@@ -48,6 +48,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
+from services.objective_scoring_service import (
+    ObjectiveScoringContractError,
+    is_integer_question,
+    score_objective_response,
+)
+
 from ..domain.content_classifier import compute_scoreable_marks
 from ..domain.response_models import ContentType, FlagSeverity, FlagType
 from ..marking_policy import (
@@ -61,6 +67,28 @@ from ..marking_policy import (
 from .solution_cache import CacheLookupResult, SolutionCache
 
 logger = logging.getLogger(__name__)
+
+
+def _is_objective_mcq(question: Dict[str, Any]) -> bool:
+    """Return whether this immutable catalog item uses label-based scoring."""
+
+    grading_mode = str(question.get("grading_mode") or "").strip().lower()
+    question_type = str(question.get("question_type") or "").strip().lower()
+    return (
+        grading_mode in {"objective", "mcq"}
+        or question_type in {"objective", "mcq"}
+    ) and not is_integer_question(question)
+
+
+def _objective_feedback(result: Dict[str, Any]) -> str:
+    """Keep Objective feedback direct; the server, not an LLM, decided it."""
+
+    if not result.get("attempted"):
+        return "Not attempted."
+    selected = str(result.get("selected_answer") or "")
+    if result.get("is_correct"):
+        return f"Selected {selected}. Correct."
+    return f"Selected {selected}. Incorrect."
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1169,140 @@ class EvalCore:
         # A criterion rubric is frozen with the conducted session.  Unlike the
         # legacy path, it never generates or substitutes a new answer key.
         marking_policy = normalize_marking_policy(question_doc.get("marking_policy"))
+
+        # Objective PCR corrections and legacy objective responses use the
+        # same deterministic contract as Online Test Series. This branch is
+        # before rubric/cache/LLM evaluation and is limited to label-based
+        # Objective questions, leaving Subjective PCR behavior untouched.
+        if _is_objective_mcq(question_doc) and not response_doc.get(
+            "is_missing_response"
+        ):
+            try:
+                objective_result = score_objective_response(
+                    question_doc,
+                    detected_text,
+                )
+            except ObjectiveScoringContractError as exc:
+                message = str(exc)
+                logger.warning(
+                    "Objective response %s requires teacher review: %s",
+                    response_id,
+                    message,
+                )
+                await self._responses.update_eval_status(
+                    response_id,
+                    "manual_review",
+                )
+                return EvalResult(
+                    evaluation_id=eval_id,
+                    response_id=response_id,
+                    question_id=question_id,
+                    student_id=resolved_student_id,
+                    eval_path="objective_deterministic",
+                    model_used="deterministic-objective-scorer-v1",
+                    max_score=max_marks,
+                    scoreable_max=max_marks,
+                    marking_policy=marking_policy,
+                    manual_review_required=True,
+                    error=message,
+                )
+
+            total_score = float(objective_result["points_earned"])
+            objective_max = float(objective_result["points"])
+            selected_answer = str(
+                objective_result.get("selected_answer") or ""
+            )
+            correct_answer = str(
+                objective_result.get("correct_answer") or ""
+            )
+            feedback = _objective_feedback(objective_result)
+            objective_eval_doc: Dict[str, Any] = {
+                "evaluation_id": eval_id,
+                "evaluation_input_version": 2,
+                "mapping_version_id": response_doc.get("mapping_version_id"),
+                "response_id": response_id,
+                "question_id": question_id,
+                "exam_id": response_doc.get("exam_id"),
+                "student_id": resolved_student_id,
+                "eval_path": "objective_deterministic",
+                "model_used": "deterministic-objective-scorer-v1",
+                "total_score": total_score,
+                "max_score": objective_max,
+                "scoreable_max": objective_max,
+                "marking_policy": marking_policy,
+                "manual_review_required": False,
+                "step_marks": [],
+                "criterion_marks": [],
+                "overall_feedback": feedback,
+                "reference_solution": correct_answer,
+                "grading_mode": "objective",
+                "objective_result": objective_result,
+                "token_usage": {},
+                "raw_llm_response": "",
+                "eval_flags": [],
+                "audit_trail": [
+                    {
+                        "actor_id": "system",
+                        "timestamp": datetime.now(timezone.utc),
+                        "action": "objective_response_scored",
+                        "before": None,
+                        "after": {
+                            "selected_answer": selected_answer,
+                            "total_score": total_score,
+                            "max_score": objective_max,
+                        },
+                        "reason": (
+                            "Selected option scored against the immutable "
+                            "answer key by deterministic server code"
+                        ),
+                    }
+                ],
+                "created_at": datetime.now(timezone.utc),
+            }
+            try:
+                await self._evals.insert_evaluation(objective_eval_doc)
+            except Exception:
+                logger.exception(
+                    "Failed to persist Objective evaluation %s for response %s",
+                    eval_id,
+                    response_id,
+                )
+                await self._responses.update_eval_status(
+                    response_id,
+                    "manual_review",
+                )
+                return EvalResult(
+                    evaluation_id=eval_id,
+                    response_id=response_id,
+                    question_id=question_id,
+                    student_id=resolved_student_id,
+                    eval_path="objective_deterministic",
+                    model_used="deterministic-objective-scorer-v1",
+                    total_score=total_score,
+                    max_score=objective_max,
+                    scoreable_max=objective_max,
+                    overall_feedback=feedback,
+                    reference_solution=correct_answer,
+                    marking_policy=marking_policy,
+                    error="Objective evaluation completed but persistence failed",
+                )
+
+            await self._responses.update_eval_status(response_id, "evaluated")
+            return EvalResult(
+                evaluation_id=eval_id,
+                response_id=response_id,
+                question_id=question_id,
+                student_id=resolved_student_id,
+                eval_path="objective_deterministic",
+                model_used="deterministic-objective-scorer-v1",
+                total_score=total_score,
+                max_score=objective_max,
+                scoreable_max=objective_max,
+                overall_feedback=feedback,
+                reference_solution=correct_answer,
+                marking_policy=marking_policy,
+            )
+
         uses_structured_rubric = (
             marking_policy.get("mode") == STRUCTURED_RUBRIC_MODE
         )

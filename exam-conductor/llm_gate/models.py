@@ -26,6 +26,7 @@ class CallerID(str, enum.Enum):
     """
 
     PCR_EVAL_CORE = "pcr_eval_core"
+    PCR_OBJECTIVE_EXTRACTION = "pcr_objective_extraction"
     PCR_CACHE_WARMUP = "pcr_cache_warmup"
     PCR_CLUBBED_H4 = "pcr_clubbed_h4"
     PCR_PRACTICE = "pcr_practice"

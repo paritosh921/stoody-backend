@@ -38,6 +38,14 @@ from .full_document_grading import (
     FullDocumentGradingResult,
     FullDocumentGradingService,
 )
+from .objective_answer_sheet import (
+    OBJECTIVE_EXTRACTION_VERSION,
+    OBJECTIVE_PROCESSING_PATH,
+    ObjectiveAnswerSheetError,
+    ObjectiveAnswerSheetGradingService,
+    ObjectiveAnswerSheetResult,
+    ObjectiveRunIdentityError,
+)
 
 __all__ = [
     # OCR
@@ -57,4 +65,11 @@ __all__ = [
     "FullDocumentGradingError",
     "FullDocumentGradingResult",
     "FullDocumentGradingService",
+    # Pure multiple-choice PCR answer-sheet extraction and deterministic scoring
+    "OBJECTIVE_EXTRACTION_VERSION",
+    "OBJECTIVE_PROCESSING_PATH",
+    "ObjectiveAnswerSheetError",
+    "ObjectiveAnswerSheetGradingService",
+    "ObjectiveAnswerSheetResult",
+    "ObjectiveRunIdentityError",
 ]
