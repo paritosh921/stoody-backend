@@ -10,6 +10,7 @@ session-scoped ExamPen metadata consumed by DCR/PCR engines.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import importlib
@@ -19,17 +20,40 @@ import os
 import uuid
 from datetime import date, datetime, timezone
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException, status
+from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
+from config_async import settings
+from core.upload_security.storage import safe_storage_segment
 from services.answer_mapping_contract import normalize_answer_label
+from utils.s3_storage import (
+    PrivateObjectStorageError,
+    download_file,
+    download_private_object,
+    upload_private_object,
+)
 
 logger = logging.getLogger(__name__)
 
 PAPER_VERSIONS_COLLECTION = "exampen_paper_versions"
 PAPER_QUESTIONS_COLLECTION = "exampen_paper_questions"
+PAPER_ASSETS_COLLECTION = "exampen_paper_assets"
 PAPER_LAYOUT_SCHEMA_VERSION = 1
+CANONICAL_PAPER_ASSET_PREFIX = "private/exampen/paper-assets"
+
+
+class CanonicalPaperAssetError(RuntimeError):
+    """The immutable paper asset is missing, altered, or not durable.
+
+    Retrying an AI worker cannot restore an asset that was never materialized,
+    so the durable PCR job scheduler must treat this as an operator-repair
+    condition rather than a transient provider failure.
+    """
+
+    retryable = False
 
 
 def _marking_policy_module() -> Any:
@@ -57,6 +81,232 @@ def _question_text(question: Dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _asset_reference(asset: Dict[str, Any], *, role: str) -> Dict[str, Any]:
+    """Return the only asset fields a paper snapshot is allowed to consume."""
+
+    return {
+        "asset_id": _as_text(asset.get("asset_id")),
+        "storage_uri": _as_text(asset.get("storage_uri")),
+        "sha256": _as_text(asset.get("sha256")),
+        "size_bytes": int(asset.get("size_bytes") or 0),
+        "filename": _as_text(asset.get("filename")),
+        "content_type": _as_text(asset.get("content_type")) or "application/pdf",
+        "role": role,
+    }
+
+
+def _paper_asset_id(sha256: str) -> str:
+    return f"paper-asset-sha256-{sha256.lower()}"
+
+
+def _paper_asset_tenant_segment(tenant_db: Any) -> str:
+    return safe_storage_segment(getattr(tenant_db, "name", None), fallback="tenant")
+
+
+def _authoring_asset_path(source_path: str) -> Path:
+    """Resolve a legacy authoring path without permitting arbitrary reads."""
+
+    backend_root = Path(__file__).resolve().parents[1]
+    candidate = Path(source_path)
+    if not candidate.is_absolute():
+        candidate = backend_root / candidate
+    candidate = candidate.resolve(strict=False)
+    roots = [
+        Path(settings.UPLOAD_PRIVATE_LOCAL_DIR).resolve(strict=False),
+        (backend_root / "uploads").resolve(strict=False),
+    ]
+    if not any(root == candidate or root in candidate.parents for root in roots):
+        raise CanonicalPaperAssetError("Paper source is outside approved upload storage")
+    return candidate
+
+
+async def _read_authoring_asset(source_path: str, *, expected_sha256: str) -> bytes:
+    """Read a scanned authoring upload once, before it becomes an exam asset."""
+
+    path = _as_text(source_path)
+    if not path:
+        raise CanonicalPaperAssetError("Paper source path is missing")
+    if path.startswith("s3://"):
+        data = await download_file(path)
+    else:
+        candidate = _authoring_asset_path(path)
+        if not candidate.is_file():
+            raise CanonicalPaperAssetError("Paper source file is unavailable")
+        data = await asyncio.to_thread(candidate.read_bytes)
+    if not data:
+        raise CanonicalPaperAssetError("Paper source file is empty or unavailable")
+    actual_sha256 = hashlib.sha256(data).hexdigest()
+    expected = _as_text(expected_sha256).lower()
+    if expected and actual_sha256 != expected:
+        raise CanonicalPaperAssetError("Paper source failed integrity verification")
+    return data
+
+
+async def load_canonical_paper_asset(asset: Dict[str, Any]) -> bytes:
+    """Load a snapshot-pinned paper asset from private object storage only."""
+
+    storage_uri = _as_text(asset.get("storage_uri"))
+    expected_sha256 = _as_text(asset.get("sha256")).lower()
+    if not storage_uri or not expected_sha256:
+        raise CanonicalPaperAssetError("Immutable paper asset manifest is incomplete")
+    try:
+        data = await download_private_object(
+            storage_uri,
+            allowed_key_prefix=CANONICAL_PAPER_ASSET_PREFIX,
+            max_bytes=50 * 1024 * 1024,
+        )
+    except PrivateObjectStorageError as exc:
+        raise CanonicalPaperAssetError("Immutable paper asset could not be loaded") from exc
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise CanonicalPaperAssetError("Immutable paper asset failed integrity verification")
+    return data
+
+
+async def _materialize_paper_asset(
+    tenant_db: Any,
+    *,
+    source_path: str,
+    sha256: str,
+    filename: str,
+    role: str,
+) -> Dict[str, Any]:
+    """Copy a verified authoring PDF to content-addressed private object storage."""
+
+    expected_sha256 = _as_text(sha256).lower()
+    if not expected_sha256:
+        raise CanonicalPaperAssetError(f"{role.replace('_', ' ').capitalize()} SHA-256 is missing")
+    assets = tenant_db[PAPER_ASSETS_COLLECTION]
+    asset_id = _paper_asset_id(expected_sha256)
+    existing = await assets.find_one({"asset_id": asset_id})
+    if existing and _as_text(existing.get("sha256")).lower() == expected_sha256:
+        # A manifest is not trusted merely because it exists. Verify that the
+        # pinned object can still be read before reusing it for a new session.
+        await load_canonical_paper_asset(existing)
+        return _asset_reference(existing, role=role)
+
+    data = await _read_authoring_asset(source_path, expected_sha256=expected_sha256)
+    tenant = _paper_asset_tenant_segment(tenant_db)
+    object_key = f"{CANONICAL_PAPER_ASSET_PREFIX}/{tenant}/{expected_sha256}.pdf"
+    try:
+        storage_uri = await upload_private_object(
+            data,
+            object_key=object_key,
+            content_type="application/pdf",
+            metadata={
+                "asset_id": asset_id,
+                "sha256": expected_sha256,
+                "role": role,
+                "source": "exampen_paper_snapshot",
+            },
+        )
+    except PrivateObjectStorageError as exc:
+        raise CanonicalPaperAssetError("Could not store immutable paper asset") from exc
+
+    asset = {
+        "asset_id": asset_id,
+        "storage_uri": storage_uri,
+        "sha256": expected_sha256,
+        "size_bytes": len(data),
+        "filename": safe_storage_segment(filename, fallback=f"{role}.pdf"),
+        "content_type": "application/pdf",
+        "created_at": datetime.now(timezone.utc),
+        "source": "exampen_paper_snapshot",
+    }
+    await assets.update_one(
+        {"asset_id": asset_id},
+        {"$setOnInsert": asset},
+        upsert=True,
+    )
+    stored = await assets.find_one({"asset_id": asset_id})
+    if not stored:
+        raise CanonicalPaperAssetError("Immutable paper asset manifest was not persisted")
+    return _asset_reference(stored, role=role)
+
+
+async def materialize_paper_assets(tenant_db: Any, document: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Freeze durable question/solution PDFs before a PCR paper is finalized."""
+
+    await ensure_indexes(tenant_db)
+    question_paper = await _materialize_paper_asset(
+        tenant_db,
+        source_path=_as_text(document.get("file_path")),
+        sha256=_as_text(document.get("sha256")),
+        filename=_as_text(document.get("filename")) or "question-paper.pdf",
+        role="question_paper",
+    )
+    assets: Dict[str, Dict[str, Any]] = {"question_paper": question_paper}
+    if _as_text(document.get("answer_sheet_path")):
+        assets["teacher_solution"] = await _materialize_paper_asset(
+            tenant_db,
+            source_path=_as_text(document.get("answer_sheet_path")),
+            sha256=_as_text(document.get("answer_sheet_sha256")),
+            filename=_as_text(document.get("answer_sheet_filename")) or "teacher-solution.pdf",
+            role="teacher_solution",
+        )
+    return assets
+
+
+async def migrate_legacy_paper_snapshot_assets(
+    tenant_db: Any,
+    document: Dict[str, Any],
+    *,
+    paper_version_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One-time, hash-verified migration for a finalized legacy PCR snapshot.
+
+    This is intentionally an explicit operator action. A grading worker must
+    never reconstruct an allegedly immutable paper from an arbitrary mutable
+    path while evaluating a student submission.
+    """
+
+    document_id = _as_text(document.get("document_id"))
+    if not document_id:
+        raise CanonicalPaperAssetError("Cannot migrate a paper without document_id")
+    versions = tenant_db[PAPER_VERSIONS_COLLECTION]
+    query: Dict[str, Any] = {"document_id": document_id}
+    if paper_version_id:
+        query["paper_version_id"] = _as_text(paper_version_id)
+    version = await versions.find_one(query)
+    if not version:
+        raise CanonicalPaperAssetError("Finalized paper snapshot was not found")
+    existing_assets = dict(version.get("paper_assets") or {})
+    if existing_assets.get("question_paper"):
+        await load_canonical_paper_asset(dict(existing_assets["question_paper"]))
+        return version
+
+    assets = await materialize_paper_assets(tenant_db, document)
+    context = dict(version.get("paper_context") or {})
+    context["question_paper_asset_id"] = assets["question_paper"]["asset_id"]
+    if assets.get("teacher_solution"):
+        context["teacher_solution_asset_id"] = assets["teacher_solution"]["asset_id"]
+    now = datetime.now(timezone.utc)
+    updated = await versions.find_one_and_update(
+        {
+            "paper_version_id": version["paper_version_id"],
+            "$or": [
+                {"paper_assets.question_paper": {"$exists": False}},
+                {"paper_assets.question_paper": None},
+            ],
+        },
+        {
+            "$set": {
+                "paper_assets": assets,
+                "paper_context": context,
+                "paper_assets_migrated_at": now,
+                "paper_assets_migration": "content-addressed-private-s3-v1",
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated:
+        return updated
+    current = await versions.find_one({"paper_version_id": version["paper_version_id"]})
+    if current and dict(current.get("paper_assets") or {}).get("question_paper"):
+        await load_canonical_paper_asset(dict(current["paper_assets"]["question_paper"]))
+        return current
+    raise CanonicalPaperAssetError("Paper asset migration lost ownership")
 
 
 def _question_marks(question: Dict[str, Any]) -> Optional[float]:
@@ -825,6 +1075,9 @@ def validate_pcr_questions(
 
 async def ensure_indexes(tenant_db: Any) -> None:
     """Create idempotent indexes for immutable paper snapshots."""
+    await tenant_db[PAPER_ASSETS_COLLECTION].create_index(
+        "asset_id", unique=True, name="uniq_paper_asset"
+    )
     await tenant_db[PAPER_VERSIONS_COLLECTION].create_index(
         "paper_version_id", unique=True, name="uniq_paper_version_id"
     )
@@ -845,6 +1098,7 @@ async def create_paper_snapshot(
     *,
     question_layout: Optional[List[Dict[str, Any]]] = None,
     paper_context: Optional[Dict[str, Any]] = None,
+    paper_assets: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Persist one immutable version of a reviewed document.
 
@@ -936,6 +1190,7 @@ async def create_paper_snapshot(
             )
         ),
         "paper_context": copy.deepcopy(paper_context or {}),
+        "paper_assets": copy.deepcopy(paper_assets or {}),
         "pcr_marking_policy": copy.deepcopy(marking_policy),
         "created_at": now,
         "source_document_finalized_at": document.get("exam_finalized_at"),

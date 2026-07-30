@@ -4885,6 +4885,7 @@ async def finalize_exam(
         pcr_marking_policy: Optional[Dict[str, Any]] = None
         question_layout: List[Dict[str, Any]] = []
         paper_context: Dict[str, Any] = {}
+        paper_assets: Dict[str, Dict[str, Any]] = {}
 
         if exam_mode == "dcr":
             # DCR: require answer template
@@ -4952,6 +4953,17 @@ async def finalize_exam(
             question_layout = list(preflight.get("question_layout") or [])
             paper_context = dict(preflight.get("paper_context") or {})
             layout_warnings = list(preflight.get("warnings") or [])
+
+            # A finalized PCR session must not depend on this API instance's
+            # local upload path. Copy the verified paper (and optional teacher
+            # solution) into content-addressed private object storage before
+            # syncing any session metadata or taking the irreversible lock.
+            from services.exampen_paper_service import materialize_paper_assets
+
+            paper_assets = await materialize_paper_assets(tenant_db, doc)
+            paper_context["question_paper_asset_id"] = paper_assets["question_paper"]["asset_id"]
+            if paper_assets.get("teacher_solution"):
+                paper_context["teacher_solution_asset_id"] = paper_assets["teacher_solution"]["asset_id"]
 
             # Prefer reviewed printed layout. The full-document visual path
             # deliberately has no mandatory regions, so fall back to the
@@ -5028,6 +5040,7 @@ async def finalize_exam(
             questions=questions,
             question_layout=question_layout or None,
             paper_context=paper_context or None,
+            paper_assets=paper_assets or None,
         )
         sync_summary["paper_version_id"] = paper_snapshot["paper_version_id"]
         sync_summary["paper_content_hash"] = paper_snapshot["content_hash"]
@@ -5041,6 +5054,7 @@ async def finalize_exam(
                 "exam_paper_version_id": paper_snapshot["paper_version_id"],
                 "exam_content_hash": paper_snapshot["content_hash"],
                 "exam_paper_context": paper_context or None,
+                "exam_paper_assets": paper_assets or None,
                 "pcr_marking_policy": pcr_marking_policy,
                 "pcr_marking_policy_locked_at": datetime.utcnow()
                 if pcr_marking_policy is not None

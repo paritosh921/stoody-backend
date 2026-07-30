@@ -496,7 +496,21 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
                     "version": "canonical-full-document-visual-v2",
                     "mode": "full_document_visual",
                     "ready": True,
-                }
+                },
+                "paper_assets": {
+                    "question_paper": {
+                        "asset_id": "asset-question",
+                        "storage_uri": "s3://private/exampen/paper-assets/test/question.pdf",
+                        "sha256": "test-question-hash",
+                        "filename": "question.pdf",
+                    },
+                    "teacher_solution": {
+                        "asset_id": "asset-solution",
+                        "storage_uri": "s3://private/exampen/paper-assets/test/solution.pdf",
+                        "sha256": "test-solution-hash",
+                        "filename": "solution.pdf",
+                    },
+                },
             }
         },
     )
@@ -513,6 +527,13 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
     monkeypatch.setattr(
         module,
         "_read_canonical_file",
+        lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
+    )
+    import services.exampen_paper_service as paper_service
+
+    monkeypatch.setattr(
+        paper_service,
+        "load_canonical_paper_asset",
         lambda *args, **kwargs: _async_value(b"%PDF-1.4 canonical"),
     )
     assets = [_page_asset(module, 1), _page_asset(module, 2)]
@@ -773,6 +794,8 @@ async def test_canonical_visual_exam_never_silently_falls_back_when_asset_is_mis
     monkeypatch.setenv("PCR_FULL_DOCUMENT_GRADING_ENABLED", "true")
     monkeypatch.setenv("AI_PROVIDER", "openai")
     module = _module()
+    from services.exampen_paper_service import CanonicalPaperAssetError
+
     service = module.FullDocumentGradingService(
         db,
         _FakeGate({}),
@@ -780,11 +803,12 @@ async def test_canonical_visual_exam_never_silently_falls_back_when_asset_is_mis
     )
 
     with pytest.raises(
-        module.FullDocumentGradingError,
-        match="immutable question-paper record is unavailable",
-    ):
+        CanonicalPaperAssetError,
+        match="immutable paper asset manifest is unavailable",
+    ) as error:
         await service.grade_submission("SUB-DOC-1")
 
+    assert error.value.retryable is False
     assert await db["evalpen_document_grading_runs"].count_documents({}) == 0
     assert await db["evalpen_detected_responses"].count_documents({}) == 0
 

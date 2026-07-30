@@ -299,47 +299,69 @@ class FullDocumentGradingService:
                 f"Student copy has {len(answer_pages)} pages; maximum is {_MAX_PAGE_COUNT}"
             )
 
+        paper_assets = dict((paper_version or {}).get("paper_assets") or {})
+        paper_asset = dict(paper_assets.get("question_paper") or {})
+        solution_asset = dict(paper_assets.get("teacher_solution") or {})
         document_id = str(
             exam.get("prepared_document_id")
             or (paper_version or {}).get("document_id")
             or ""
         )
-        document = await self._db["documents"].find_one(
-            {"document_id": document_id}
-        )
-        if not document:
-            if canonical_visual_required:
-                raise FullDocumentGradingError(
-                    "The exam requires canonical visual grading, but its immutable "
-                    "question-paper record is unavailable"
-                )
-            # Legacy sessions without the original PDF remain on the existing
-            # review-safe pipeline. Do not accept a client-provided substitute.
-            return FullDocumentGradingResult(
-                handled=False,
-                submission_id=submission_id,
-                skipped_reason="Legacy exam has no immutable question-paper record",
-            )
 
-        paper_bytes = await _read_canonical_file(
-            str(document.get("file_path") or ""),
-            expected_sha256=document.get("sha256"),
-        )
-        if not paper_bytes:
-            if canonical_visual_required:
-                raise FullDocumentGradingError(
-                    "The exam requires canonical visual grading, but its immutable "
-                    "question-paper asset could not be loaded"
-                )
-            return FullDocumentGradingResult(
-                handled=False,
-                submission_id=submission_id,
-                skipped_reason="Legacy question-paper asset could not be loaded",
+        if paper_asset:
+            # A modern PCR session must be independent from the mutable
+            # authoring document and from the API worker's filesystem. The
+            # snapshot pins a content-addressed private object and its hash.
+            from services.exampen_paper_service import load_canonical_paper_asset
+
+            paper_bytes = await load_canonical_paper_asset(paper_asset)
+            solution_bytes = (
+                await load_canonical_paper_asset(solution_asset)
+                if solution_asset
+                else None
             )
-        solution_bytes = await _read_canonical_file(
-            str(document.get("answer_sheet_path") or ""),
-            expected_sha256=document.get("answer_sheet_sha256"),
-        )
+            document = {
+                "document_id": document_id,
+                "filename": paper_asset.get("filename") or "question-paper.pdf",
+                "answer_sheet_filename": (
+                    solution_asset.get("filename") or "teacher-solution.pdf"
+                ),
+            }
+        else:
+            if canonical_visual_required:
+                from services.exampen_paper_service import CanonicalPaperAssetError
+
+                raise CanonicalPaperAssetError(
+                    "The exam requires canonical visual grading, but its immutable "
+                    "paper asset manifest is unavailable"
+                )
+
+            # Legacy sessions predate a frozen object-store asset. Keep their
+            # old review-safe behaviour for compatibility only; new finalised
+            # PCR papers never take this branch.
+            document = await self._db["documents"].find_one(
+                {"document_id": document_id}
+            )
+            if not document:
+                return FullDocumentGradingResult(
+                    handled=False,
+                    submission_id=submission_id,
+                    skipped_reason="Legacy exam has no immutable question-paper record",
+                )
+            paper_bytes = await _read_canonical_file(
+                str(document.get("file_path") or ""),
+                expected_sha256=document.get("sha256"),
+            )
+            if not paper_bytes:
+                return FullDocumentGradingResult(
+                    handled=False,
+                    submission_id=submission_id,
+                    skipped_reason="Legacy question-paper asset could not be loaded",
+                )
+            solution_bytes = await _read_canonical_file(
+                str(document.get("answer_sheet_path") or ""),
+                expected_sha256=document.get("answer_sheet_sha256"),
+            )
         if len(paper_bytes) + len(solution_bytes or b"") > _MAX_STATIC_PDF_BYTES:
             raise FullDocumentGradingError(
                 "Question paper and teacher solution exceed the document-input size limit"

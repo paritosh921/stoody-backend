@@ -335,3 +335,73 @@ async def test_paper_snapshot_freezes_full_document_visual_context():
     assert version["layout_status"] == "full_document_visual"
     assert version["paper_context"] == context
     assert version["snapshot_status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_pcr_snapshot_materializes_and_reuses_hash_verified_private_assets(monkeypatch):
+    """A finalized exam must survive deletion of its authoring upload path."""
+
+    from mongomock_motor import AsyncMongoMockClient
+
+    import services.exampen_paper_service as paper_service
+
+    db = AsyncMongoMockClient()["paper_assets_test"]
+    source_objects = {
+        "s3://legacy/question.pdf": b"%PDF-1.4 immutable-question-paper",
+        "s3://legacy/solution.pdf": b"%PDF-1.4 immutable-teacher-solution",
+    }
+    private_objects = {}
+
+    async def fake_legacy_download(uri):
+        return source_objects[uri]
+
+    async def fake_private_upload(data, *, object_key, content_type, metadata=None):
+        uri = f"s3://private-bucket/{object_key}"
+        private_objects[uri] = bytes(data)
+        return uri
+
+    async def fake_private_download(uri, *, allowed_key_prefix=None, max_bytes=0):
+        assert allowed_key_prefix == paper_service.CANONICAL_PAPER_ASSET_PREFIX
+        assert max_bytes >= len(private_objects[uri])
+        return private_objects[uri]
+
+    monkeypatch.setattr(paper_service, "download_file", fake_legacy_download)
+    monkeypatch.setattr(paper_service, "upload_private_object", fake_private_upload)
+    monkeypatch.setattr(paper_service, "download_private_object", fake_private_download)
+
+    import hashlib
+
+    document = {
+        "document_id": "DOC-ASSET",
+        "file_path": "s3://legacy/question.pdf",
+        "filename": "question.pdf",
+        "sha256": hashlib.sha256(source_objects["s3://legacy/question.pdf"]).hexdigest(),
+        "answer_sheet_path": "s3://legacy/solution.pdf",
+        "answer_sheet_filename": "solution.pdf",
+        "answer_sheet_sha256": hashlib.sha256(
+            source_objects["s3://legacy/solution.pdf"]
+        ).hexdigest(),
+    }
+
+    assets = await paper_service.materialize_paper_assets(db, document)
+    assert set(assets) == {"question_paper", "teacher_solution"}
+    assert assets["question_paper"]["storage_uri"].startswith(
+        "s3://private-bucket/private/exampen/paper-assets/"
+    )
+    assert await paper_service.load_canonical_paper_asset(assets["question_paper"]) == (
+        source_objects["s3://legacy/question.pdf"]
+    )
+
+    # Re-finalizing a paper with the same bytes checks the existing object,
+    # rather than treating a mutable source path as an exam dependency.
+    assets_again = await paper_service.materialize_paper_assets(db, document)
+    assert assets_again == assets
+    assert await db[paper_service.PAPER_ASSETS_COLLECTION].count_documents({}) == 2
+
+    snapshot = await paper_service.create_paper_snapshot(
+        db,
+        {**document, "exam_mode": "pcr"},
+        _questions(),
+        paper_assets=assets,
+    )
+    assert snapshot["paper_assets"] == assets
