@@ -3562,15 +3562,10 @@ def _validate_question_grade(
                 }
             ]
 
-    if (
-        total_score is not None
-        and method_policy.get("mode") == SPECIFIED_METHOD_REQUIRED
-        and not method_analysis.get("method_requirement_satisfied")
-        and abs(total_score - max_marks) <= 0.01
-    ):
-        validation_errors.append(
-            "Full marks cannot be awarded when the explicitly required method was not verified"
-        )
+    # Method compliance is enforced by the locked criterion rows that award
+    # marks for demonstrating a method.  It must not globally invalidate an
+    # otherwise complete score: many questions name an operation while their
+    # rubric awards marks only for correct, independently verifiable results.
 
     if validation_errors:
         return _unresolved_grade(
