@@ -3147,6 +3147,20 @@ def _subjective_single_shot_enabled() -> bool:
     }
 
 
+def _item_has_judged_criterion_marks(raw_marks: Any) -> bool:
+    """True when the model returned a complete criterion judgment payload."""
+
+    if not isinstance(raw_marks, list) or not raw_marks:
+        return False
+    for raw in raw_marks:
+        if not isinstance(raw, dict):
+            continue
+        decision = str(raw.get("decision") or "").strip().lower()
+        if decision in {"met", "partially_met", "not_met", "unresolved"}:
+            return True
+    return False
+
+
 def _unresolved_visual_grade_item(question_number: int, *, reason: str) -> Dict[str, Any]:
     """Placeholder grade so a single bad model call cannot fail the whole copy."""
 
@@ -3185,14 +3199,23 @@ def _build_question_grading_input(
     mappings: Mapping[int, Dict[str, Any]],
     student_assets: Sequence[_StudentPageAsset],
 ) -> tuple[List[Dict[str, Any]], int]:
+    """Build question-grader input with full pages + expanded crops.
+
+    Tight mapper crops frequently miss side/margin handwriting on real school
+    answer sheets. Full pages are authoritative; crops are optional zooms.
+    """
+
     assets = {asset.page_number: asset for asset in student_assets}
     dynamic: List[Dict[str, Any]] = [
         {
             "type": "input_text",
             "text": (
-                "TASK: Grade exactly the requested questions from the fixed evidence "
-                "regions below. Region ownership is immutable for this stage. Use the "
-                "original high-resolution crops, not the mapper's text description.\n"
+                "TASK: Grade exactly the requested questions. FULL PAGE images are "
+                "authoritative. Mapped regions are ownership hints only — students "
+                "often write beside, below, or outside printed blanks. Search the "
+                "whole page for work for each requested question number. Do not mark "
+                "a question blank because a crop is empty if handwriting is visible "
+                "elsewhere on the page for that question.\n"
                 "REQUESTED QUESTION CATALOG:\n"
                 + json.dumps(
                     [_catalog_question(question) for question in questions],
@@ -3202,7 +3225,57 @@ def _build_question_grading_input(
             ),
         }
     ]
-    crop_bytes = 0
+    payload_bytes = 0
+    # Attach each referenced full page once before per-question zooms.
+    pages_needed: set[int] = set()
+    for index, question in enumerate(questions, start=1):
+        number = int(question.get("question_number") or index)
+        mapped = mappings.get(number) or {}
+        for region in list(mapped.get("evidence_regions") or []):
+            page_number = int(region.get("page_number") or 0)
+            if page_number > 0:
+                pages_needed.add(page_number)
+        # If the mapper found no region, still show every student page so the
+        # grader can recover off-map handwriting for that question number.
+        if not list(mapped.get("evidence_regions") or []):
+            pages_needed.update(assets.keys())
+    if not pages_needed:
+        pages_needed.update(assets.keys())
+
+    dynamic.append(
+        {
+            "type": "input_text",
+            "text": (
+                "FULL STUDENT PAGES (authoritative). Inspect margins and side "
+                "writing. Page labels are source-page numbers, not question numbers."
+            ),
+        }
+    )
+    for page_number in sorted(pages_needed):
+        asset = assets.get(page_number)
+        if asset is None:
+            raise FullDocumentGradingError(
+                f"Mapped evidence refers to missing page {page_number}"
+            )
+        page_bytes, media_type = _full_student_page_image(asset)
+        payload_bytes += len(page_bytes)
+        dynamic.extend(
+            [
+                {
+                    "type": "input_text",
+                    "text": f"Student answer-copy FULL page {page_number}:",
+                },
+                {
+                    "type": "input_image",
+                    "image_url": (
+                        f"data:{media_type};base64,"
+                        + base64.b64encode(page_bytes).decode("ascii")
+                    ),
+                    "detail": "high",
+                },
+            ]
+        )
+
     for index, question in enumerate(questions, start=1):
         number = int(question.get("question_number") or index)
         mapped = mappings.get(number) or {}
@@ -3211,7 +3284,7 @@ def _build_question_grading_input(
             {
                 "type": "input_text",
                 "text": (
-                    f"QUESTION {number} FIXED EVIDENCE MAP:\n"
+                    f"QUESTION {number} MAPPER HINT (not exclusive bounds):\n"
                     + json.dumps(
                         {
                             "question_number": number,
@@ -3232,15 +3305,21 @@ def _build_question_grading_input(
                 raise FullDocumentGradingError(
                     f"Mapped evidence for Q{number} refers to missing page {page_number}"
                 )
-            cropped, media_type = _crop_student_region(asset, region)
-            crop_bytes += len(cropped)
+            # Wide padding so side-of-box working is still in the zoom crop.
+            cropped, media_type = _crop_student_region(
+                asset,
+                region,
+                pad_fraction=0.18,
+            )
+            payload_bytes += len(cropped)
             dynamic.extend(
                 [
                     {
                         "type": "input_text",
                         "text": (
-                            f"Q{number} evidence region "
-                            f"{region.get('region_id')} from page {page_number}:"
+                            f"Q{number} optional zoom crop "
+                            f"{region.get('region_id')} from page {page_number} "
+                            f"(full page above remains authoritative):"
                         ),
                     },
                     {
@@ -3267,13 +3346,46 @@ def _build_question_grading_input(
             {"role": "user", "content": static_content},
             {"role": "user", "content": dynamic},
         ],
-        crop_bytes,
+        payload_bytes,
     )
+
+
+def _full_student_page_image(asset: _StudentPageAsset) -> tuple[bytes, str]:
+    """Return a high-detail full-page JPEG for subjective grading authority."""
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(asset.original_bytes)) as opened:
+            image = ImageOps.exif_transpose(opened)
+            if image.mode not in {"RGB", "L"}:
+                background = Image.new("RGB", image.size, "white")
+                if "A" in image.getbands():
+                    background.paste(image, mask=image.getchannel("A"))
+                else:
+                    background.paste(image.convert("RGB"))
+                image = background
+            elif image.mode == "L":
+                image = image.convert("RGB")
+            else:
+                image = image.copy()
+            image.thumbnail((2800, 2800))
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=92, optimize=True)
+            value = output.getvalue()
+            if not value:
+                raise ValueError("full page encode empty")
+            return value, "image/jpeg"
+    except Exception:
+        # Fall back to the already-optimized global page bytes.
+        return asset.global_bytes, asset.global_media_type
 
 
 def _crop_student_region(
     asset: _StudentPageAsset,
     region: Mapping[str, Any],
+    *,
+    pad_fraction: float = 0.02,
 ) -> tuple[bytes, str]:
     try:
         from PIL import Image, ImageOps
@@ -3281,8 +3393,9 @@ def _crop_student_region(
         with Image.open(io.BytesIO(asset.original_bytes)) as opened:
             image = ImageOps.exif_transpose(opened)
             width, height = image.size
-            margin_x = max(8, int(width * 0.02))
-            margin_y = max(8, int(height * 0.02))
+            pad = max(0.0, min(0.45, float(pad_fraction)))
+            margin_x = max(8, int(width * pad))
+            margin_y = max(8, int(height * pad))
             left = max(
                 0,
                 int(width * float(region.get("x_start") or 0) / 1000.0)
@@ -4052,11 +4165,23 @@ def _validate_question_grade(
         )
 
     if not student_answer:
-        validation_errors.append("Attempted answer has no student transcription")
+        if _item_has_judged_criterion_marks(item.get("criterion_marks")):
+            manual_review = True
+            if not review_reason:
+                review_reason = "Attempted answer has no student transcription"
+        else:
+            validation_errors.append("Attempted answer has no student transcription")
     if not source_pages and not objective_ledger:
         validation_errors.append("Attempted answer has no visual evidence region")
     if confidence < (0.55 if objective_ledger else 0.50):
-        validation_errors.append("Question ownership confidence is below 0.50")
+        if _item_has_judged_criterion_marks(item.get("criterion_marks")) or bool(
+            student_answer.strip()
+        ):
+            manual_review = True
+            if not review_reason:
+                review_reason = "Question ownership confidence is below 0.50"
+        else:
+            validation_errors.append("Question ownership confidence is below 0.50")
     if evidence_graph_question:
         hypotheses = item.get("interpretation_hypotheses")
         if not isinstance(hypotheses, list) or not hypotheses:
@@ -4093,13 +4218,28 @@ def _validate_question_grade(
                     )
                 hypothesis_confidences.append(hypothesis_confidence)
             ranked_hypotheses = sorted(hypothesis_confidences, reverse=True)
+            has_transcription = bool(student_answer.strip())
+            has_scorable_marks = _item_has_judged_criterion_marks(
+                item.get("criterion_marks")
+            )
             if (
                 ranked_hypotheses
                 and ranked_hypotheses[0] < _CRITERION_MIN_SCORE_CONFIDENCE
             ):
-                validation_errors.append(
-                    "No visual interpretation is reliable enough to score"
-                )
+                # Low interpretation confidence must not wipe a question when the
+                # model already returned marks or a concrete transcription. Real
+                # sheets often have side writing that confuses the crop stage.
+                if has_transcription or has_scorable_marks:
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = (
+                            "Visual interpretation confidence is below the automatic "
+                            "threshold; teacher review required"
+                        )
+                else:
+                    validation_errors.append(
+                        "No visual interpretation is reliable enough to score"
+                    )
             elif (
                 len(ranked_hypotheses) > 1
                 and ranked_hypotheses[1] >= ranked_hypotheses[0] - 0.10
@@ -4115,15 +4255,32 @@ def _validate_question_grade(
                     )
         visual_semantics = item.get("visual_semantics")
         if not objective_question and not isinstance(visual_semantics, dict):
-            validation_errors.append(
-                "Attempted answer has no structured visual semantics"
-            )
+            # Missing semantics object is reviewable when marks/transcription exist.
+            if _item_has_judged_criterion_marks(item.get("criterion_marks")) or bool(
+                student_answer.strip()
+            ):
+                manual_review = True
+                if not review_reason:
+                    review_reason = "Attempted answer is missing structured visual semantics"
+            else:
+                validation_errors.append(
+                    "Attempted answer has no structured visual semantics"
+                )
         elif not objective_question:
             visual_confidence = _confidence(visual_semantics.get("confidence"))
             if visual_confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
-                validation_errors.append(
-                    "Visual semantics could not be verified with sufficient confidence"
-                )
+                if _item_has_judged_criterion_marks(
+                    item.get("criterion_marks")
+                ) or bool(student_answer.strip()):
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = (
+                            "Visual semantics confidence is below the automatic threshold"
+                        )
+                else:
+                    validation_errors.append(
+                        "Visual semantics could not be verified with sufficient confidence"
+                    )
             elif visual_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
                 manual_review = True
                 if not review_reason:
@@ -4134,9 +4291,11 @@ def _validate_question_grade(
                 ContentType.DIAGRAM_HEAVY.value,
                 ContentType.TABLE_PRESENT.value,
             } and not list(visual_semantics.get("elements") or []):
-                validation_errors.append(
-                    "Visual-heavy answer has no identified semantic elements"
-                )
+                manual_review = True
+                if not review_reason:
+                    review_reason = (
+                        "Visual-heavy answer has no identified semantic elements"
+                    )
             visual_elements = visual_semantics.get("elements")
             visual_elements = (
                 visual_elements if isinstance(visual_elements, list) else []
@@ -4144,44 +4303,56 @@ def _validate_question_grade(
             element_ids: set[str] = set()
             for element in visual_elements:
                 if not isinstance(element, dict):
-                    validation_errors.append(
-                        "Visual semantic element is not an object"
-                    )
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = "Visual semantic element is not an object"
                     continue
                 element_id = str(element.get("element_id") or "").strip()
                 region_id = str(element.get("region_id") or "").strip()
                 if not element_id or element_id in element_ids:
-                    validation_errors.append(
-                        "Visual semantic elements have missing or duplicate IDs"
-                    )
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = (
+                            "Visual semantic elements have missing or duplicate IDs"
+                        )
                 else:
                     element_ids.add(element_id)
-                if region_id not in evidence_region_ids:
-                    validation_errors.append(
-                        "Visual semantic element cites evidence outside the fixed "
-                        "question map"
-                    )
+                # Region cites outside the map are common when full-page reading
+                # finds work near the mapped box. Keep marks; force review.
+                if region_id and region_id not in evidence_region_ids:
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = (
+                            "Visual semantic element cites evidence outside the "
+                            "mapper hint map"
+                        )
             visual_relationships = visual_semantics.get("relationships")
             visual_relationships = (
                 visual_relationships
                 if isinstance(visual_relationships, list)
                 else []
             )
+            # Models often point relationships at criterion_id values. That is
+            # not a scoring error — strip invalid edges and keep criterion_marks.
+            cleaned_relationships: List[Dict[str, Any]] = []
             for relationship in visual_relationships:
                 if not isinstance(relationship, dict):
-                    validation_errors.append(
-                        "Visual semantic relationship is not an object"
-                    )
+                    manual_review = True
                     continue
-                if (
-                    str(relationship.get("source_element_id") or "").strip()
-                    not in element_ids
-                    or str(relationship.get("target_element_id") or "").strip()
-                    not in element_ids
-                ):
-                    validation_errors.append(
-                        "Visual semantic relationship refers to an unknown element"
-                    )
+                source_id = str(relationship.get("source_element_id") or "").strip()
+                target_id = str(relationship.get("target_element_id") or "").strip()
+                if source_id in element_ids and target_id in element_ids:
+                    cleaned_relationships.append(relationship)
+                else:
+                    manual_review = True
+                    if not review_reason:
+                        review_reason = (
+                            "Visual semantic relationship graph was partially ignored "
+                            "because some links did not reference known elements"
+                        )
+            if isinstance(visual_semantics, dict):
+                visual_semantics["relationships"] = cleaned_relationships
+                item["visual_semantics"] = visual_semantics
 
     if objective_question:
         if validation_errors:

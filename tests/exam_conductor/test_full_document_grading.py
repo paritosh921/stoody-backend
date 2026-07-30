@@ -614,6 +614,191 @@ async def test_failed_generation_releases_single_flight_lease_immediately():
     assert "generation_lease_expires_at" not in run
 
 
+def test_unknown_visual_relationship_does_not_block_scored_subjective_question():
+    """Models often link relationships to criterion_id; that must not zero the Q."""
+
+    module = _module()
+    question = {
+        "question_id": "Q-REL",
+        "question_number": 1,
+        "question_text": "Find the two integers.",
+        "max_marks": 1,
+        "marking_criteria": [
+            {
+                "criterion_id": "criterion_1",
+                "description": "Correct pair",
+                "max_marks": 1,
+                "acceptable_evidence": "Pair -12 and 3",
+            }
+        ],
+    }
+    item = {
+        "question_number": 1,
+        "attempt_status": "attempted",
+        "confidence": 0.92,
+        "content_type": "MIXED",
+        "student_answer": "-12 and 3",
+        "evidence_regions": [
+            {
+                "region_id": "p1_q1_main",
+                "page_number": 1,
+                "x_start": 100,
+                "y_start": 100,
+                "x_end": 700,
+                "y_end": 400,
+                "evidence_kind": "mathematics",
+                "continuation_group": "",
+                "evidence": "Working",
+                "mapping_confidence": 0.9,
+            }
+        ],
+        "interpretation_hypotheses": [
+            {
+                "interpretation_id": "h1",
+                "value": "-12 and 3",
+                "confidence": 0.9,
+                "evidence_region_ids": ["p1_q1_main"],
+                "ambiguity_notes": "",
+            }
+        ],
+        "visual_semantics": {
+            "summary": "Pair of integers",
+            "elements": [
+                {
+                    "element_id": "e1",
+                    "element_type": "math_expression",
+                    "label": "-12 and 3",
+                    "region_id": "p1_q1_main",
+                    "attributes": "",
+                    "confidence": 0.9,
+                }
+            ],
+            # Invalid: criterion_id is not an element_id (production failure mode).
+            "relationships": [
+                {
+                    "source_element_id": "e1",
+                    "relation": "supports",
+                    "target_element_id": "criterion_1",
+                    "confidence": 0.9,
+                }
+            ],
+            "confidence": 0.9,
+        },
+        "method_analysis": _method_analysis(),
+        "criterion_marks": [
+            {
+                "criterion_id": "criterion_1",
+                "decision": "met",
+                "confidence": 0.92,
+                "marks_awarded": 1,
+                "rationale": "Correct pair visible.",
+                "evidence": "Page 1 handwriting",
+                "evidence_region_ids": ["p1_q1_main"],
+                "missing_evidence": "",
+                "credit_basis": "direct_evidence",
+            }
+        ],
+        "total_score": 1,
+        "overall_feedback": "Correct",
+        "needs_review": False,
+        "review_reason": "",
+    }
+    grade = module._validate_question_grade(
+        item,
+        question=question,
+        question_number=1,
+        page_count=1,
+        coverage_complete=True,
+        coverage_confidence=0.95,
+    )
+    assert grade.attempt_status == "attempted"
+    assert grade.total_score == 1.0
+    assert grade.manual_review_required is True
+
+
+def test_low_hypothesis_confidence_keeps_marks_for_review():
+    module = _module()
+    question = {
+        "question_id": "Q-LOW",
+        "question_number": 1,
+        "question_text": "Find the two integers.",
+        "max_marks": 1,
+        "marking_criteria": [
+            {
+                "criterion_id": "criterion_1",
+                "description": "Correct pair",
+                "max_marks": 1,
+                "acceptable_evidence": "Pair -12 and 3",
+            }
+        ],
+    }
+    item = {
+        "question_number": 1,
+        "attempt_status": "attempted",
+        "confidence": 0.8,
+        "content_type": "TEXT_ONLY",
+        "student_answer": "-12 and 3",
+        "evidence_regions": [
+            {
+                "region_id": "p1_q1_main",
+                "page_number": 1,
+                "x_start": 100,
+                "y_start": 100,
+                "x_end": 700,
+                "y_end": 400,
+                "evidence_kind": "handwriting",
+                "continuation_group": "",
+                "evidence": "Working",
+                "mapping_confidence": 0.8,
+            }
+        ],
+        "interpretation_hypotheses": [
+            {
+                "interpretation_id": "h1",
+                "value": "-12 and 3",
+                "confidence": 0.55,
+                "evidence_region_ids": ["p1_q1_main"],
+                "ambiguity_notes": "",
+            }
+        ],
+        "visual_semantics": {
+            "summary": "Pair",
+            "elements": [],
+            "relationships": [],
+            "confidence": 0.7,
+        },
+        "method_analysis": _method_analysis(),
+        "criterion_marks": [
+            {
+                "criterion_id": "criterion_1",
+                "decision": "met",
+                "confidence": 0.9,
+                "marks_awarded": 1,
+                "rationale": "Correct pair",
+                "evidence": "visible pair",
+                "evidence_region_ids": ["p1_q1_main"],
+                "missing_evidence": "",
+                "credit_basis": "direct_evidence",
+            }
+        ],
+        "total_score": 1,
+        "overall_feedback": "OK",
+        "needs_review": False,
+        "review_reason": "",
+    }
+    grade = module._validate_question_grade(
+        item,
+        question=question,
+        question_number=1,
+        page_count=1,
+        coverage_complete=True,
+        coverage_confidence=0.9,
+    )
+    assert grade.attempt_status == "attempted"
+    assert grade.total_score == 1.0
+    assert grade.manual_review_required is True
+
+
 def test_close_visual_readings_keep_marks_but_require_review():
     module = _module()
     question = {
