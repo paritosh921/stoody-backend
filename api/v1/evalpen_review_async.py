@@ -2607,14 +2607,14 @@ async def override_evaluation_score(
         # response's canonical submission, even when the evaluation already
         # carries a student_id.
         eval_student_id = existing.get("student_id")
-            _resp_doc = await tenant_db["evalpen_detected_responses"].find_one(
-                {"response_id": existing.get("response_id", "")},
-                projection={
-                    "submission_id": 1,
-                    "student_id": 1,
-                    "flags": 1,
-                },
-            )
+        _resp_doc = await tenant_db["evalpen_detected_responses"].find_one(
+            {"response_id": existing.get("response_id", "")},
+            projection={
+                "submission_id": 1,
+                "student_id": 1,
+                "flags": 1,
+            },
+        )
         _sub_doc = None
         if _resp_doc:
             review_submission_id = str(_resp_doc.get("submission_id") or "")
