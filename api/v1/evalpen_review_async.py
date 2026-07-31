@@ -109,6 +109,51 @@ class ScoreOverrideRequest(BaseModel):
         return v.strip()
 
 
+class EvaluationApprovalRequest(BaseModel):
+    """Teacher confirmation of a nonblocking AI review."""
+
+    award_full_marks: bool = Field(
+        default=False,
+        description="Award every locked criterion its maximum before approving.",
+    )
+    reason: str = Field(
+        default="Teacher verified the answer against the original answer copy",
+        min_length=5,
+        max_length=500,
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def approval_reason_min_length(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 5:
+            raise ValueError("Reason must be at least 5 characters")
+        return value
+
+
+class QuestionTaxonomyUpdateRequest(BaseModel):
+    """Persisted teacher-owned topic classification for one frozen question."""
+
+    topic: str = Field(..., min_length=1, max_length=120)
+    sub_topic: Optional[str] = Field(default=None, max_length=120)
+
+    @field_validator("topic")
+    @classmethod
+    def normalized_topic(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Topic is required")
+        return value
+
+    @field_validator("sub_topic")
+    @classmethod
+    def normalized_sub_topic(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        return value or None
+
+
 class CriterionMarkOverrideItem(BaseModel):
     """One teacher-entered score for an already-locked rubric criterion."""
 
@@ -1634,6 +1679,389 @@ async def get_exam_roster(
 
 
 @router.get(
+    "/exams/{exam_id}/analytics",
+    summary="Get PCR analytics at class, question, topic, and student level",
+)
+async def get_exam_analytics(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Build stable analytics from persisted question evaluations.
+
+    Topic labels are teacher-owned metadata. Scores are never regenerated for
+    analytics, so this endpoint is fast and produces the same result as the
+    review and publication surfaces.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    question_catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+    if not question_catalog:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No finalized PCR questions found for exam {exam_id}",
+        )
+
+    taxonomy_docs = await tenant_db["evalpen_question_taxonomy"].find(
+        {"exam_id": exam_id},
+        {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1},
+    ).to_list(length=max(len(question_catalog), 100))
+    taxonomy_by_question = {
+        str(item.get("question_id") or ""): item
+        for item in taxonomy_docs
+        if str(item.get("question_id") or "")
+    }
+
+    questions: Dict[str, Dict[str, Any]] = {}
+    for index, raw_question in enumerate(question_catalog):
+        question_id = str(raw_question.get("question_id") or "")
+        if not question_id:
+            continue
+        taxonomy = taxonomy_by_question.get(question_id, {})
+        topic = str(
+            taxonomy.get("topic")
+            or raw_question.get("topic")
+            or "Uncategorized"
+        ).strip()
+        sub_topic = str(
+            taxonomy.get("sub_topic")
+            or raw_question.get("sub_topic")
+            or ""
+        ).strip() or None
+        questions[question_id] = {
+            "question_id": question_id,
+            "question_number": raw_question.get("question_number") or index + 1,
+            "question_text": str(raw_question.get("question_text") or ""),
+            "max_marks": float(raw_question.get("max_marks") or 0.0),
+            "topic": topic,
+            "sub_topic": sub_topic,
+            "assessed_count": 0,
+            "attempted_count": 0,
+            "full_count": 0,
+            "partial_count": 0,
+            "zero_count": 0,
+            "review_count": 0,
+            "total_score": 0.0,
+            "total_max": 0.0,
+        }
+
+    submission_query: Dict[str, Any] = {"exam_id": exam_id}
+    if scoped_ids is not None:
+        submission_query["student_id"] = {"$in": scoped_ids}
+    submissions = await tenant_db["evalpen_submissions"].find(
+        submission_query,
+        {
+            "_id": 0,
+            "submission_id": 1,
+            "student_id": 1,
+            "publication_status": 1,
+        },
+    ).to_list(length=5000)
+    submission_ids = [
+        str(item.get("submission_id") or "")
+        for item in submissions
+        if str(item.get("submission_id") or "")
+    ]
+
+    responses = (
+        await tenant_db["evalpen_detected_responses"]
+        .find(
+            {
+                "submission_id": {"$in": submission_ids},
+                "question_id": {"$in": list(questions)},
+                "eval_status": {"$ne": "superseded"},
+                "superseded_at": {"$exists": False},
+            },
+            {
+                "_id": 0,
+                "response_id": 1,
+                "submission_id": 1,
+                "question_id": 1,
+                "is_missing_response": 1,
+                "manual_review_required": 1,
+                "flags": 1,
+                "updated_at": 1,
+                "created_at": 1,
+            },
+        )
+        .sort([("updated_at", -1), ("created_at", -1)])
+        .to_list(length=max(len(submission_ids) * max(len(questions), 1) * 2, 5000))
+        if submission_ids
+        else []
+    )
+    response_ids = [
+        str(item.get("response_id") or "")
+        for item in responses
+        if str(item.get("response_id") or "")
+    ]
+    evaluations = (
+        await tenant_db["evalpen_evaluations"]
+        .find(
+            {"response_id": {"$in": response_ids}},
+            {
+                "_id": 0,
+                "evaluation_id": 1,
+                "response_id": 1,
+                "total_score": 1,
+                "max_score": 1,
+                "manual_review_required": 1,
+                "flags": 1,
+                "updated_at": 1,
+                "created_at": 1,
+            },
+        )
+        .sort([("updated_at", -1), ("created_at", -1)])
+        .to_list(length=max(len(response_ids) * 2, 5000))
+        if response_ids
+        else []
+    )
+    evaluation_by_response: Dict[str, Dict[str, Any]] = {}
+    for evaluation in evaluations:
+        response_id = str(evaluation.get("response_id") or "")
+        if response_id and response_id not in evaluation_by_response:
+            evaluation_by_response[response_id] = evaluation
+
+    def _has_unresolved_flags(document: Dict[str, Any]) -> bool:
+        return any(
+            isinstance(item, dict) and not bool(item.get("resolved"))
+            for item in document.get("flags") or []
+        )
+
+    student_rows: Dict[str, Dict[str, Any]] = {}
+    for submission in submissions:
+        submission_id = str(submission.get("submission_id") or "")
+        student_id = str(submission.get("student_id") or "")
+        if not submission_id or not student_id:
+            continue
+        student_rows[submission_id] = {
+            "student_id": student_id,
+            "submission_id": submission_id,
+            "publication_status": submission.get("publication_status"),
+            "total_score": 0.0,
+            "total_max": 0.0,
+            "review_count": 0,
+            "assessed_count": 0,
+            "topics": {},
+        }
+
+    seen_slots: set[tuple[str, str]] = set()
+    for response in responses:
+        response_id = str(response.get("response_id") or "")
+        submission_id = str(response.get("submission_id") or "")
+        question_id = str(response.get("question_id") or "")
+        evaluation = evaluation_by_response.get(response_id)
+        question = questions.get(question_id)
+        student = student_rows.get(submission_id)
+        slot = (submission_id, question_id)
+        if not evaluation or not question or not student or slot in seen_slots:
+            continue
+        seen_slots.add(slot)
+
+        maximum = float(evaluation.get("max_score") or question["max_marks"] or 0.0)
+        score = max(0.0, min(float(evaluation.get("total_score") or 0.0), maximum))
+        needs_review = bool(
+            response.get("manual_review_required")
+            or evaluation.get("manual_review_required")
+            or _has_unresolved_flags(response)
+            or _has_unresolved_flags(evaluation)
+        )
+        attempted = not bool(response.get("is_missing_response"))
+
+        question["assessed_count"] += 1
+        question["attempted_count"] += int(attempted)
+        question["review_count"] += int(needs_review)
+        question["total_score"] += score
+        question["total_max"] += maximum
+        if maximum > 0 and score >= maximum - 1e-6:
+            question["full_count"] += 1
+        elif score > 0:
+            question["partial_count"] += 1
+        else:
+            question["zero_count"] += 1
+
+        student["total_score"] += score
+        student["total_max"] += maximum
+        student["review_count"] += int(needs_review)
+        student["assessed_count"] += 1
+        topic_row = student["topics"].setdefault(
+            question["topic"],
+            {"score": 0.0, "max_score": 0.0},
+        )
+        topic_row["score"] += score
+        topic_row["max_score"] += maximum
+
+    question_rows: List[Dict[str, Any]] = []
+    topic_rows_by_name: Dict[str, Dict[str, Any]] = {}
+    for question in sorted(
+        questions.values(),
+        key=lambda item: (int(item.get("question_number") or 0), item["question_id"]),
+    ):
+        total_max = float(question.pop("total_max"))
+        total_score = float(question.pop("total_score"))
+        question["average_percent"] = (
+            round((total_score / total_max) * 100, 1) if total_max > 0 else 0.0
+        )
+        question["average_score"] = (
+            round(total_score / question["assessed_count"], 2)
+            if question["assessed_count"]
+            else 0.0
+        )
+        question_rows.append(question)
+        topic_row = topic_rows_by_name.setdefault(
+            question["topic"],
+            {
+                "topic": question["topic"],
+                "question_count": 0,
+                "assessed_answers": 0,
+                "review_count": 0,
+                "total_score": 0.0,
+                "total_max": 0.0,
+                "sub_topics": set(),
+            },
+        )
+        topic_row["question_count"] += 1
+        topic_row["assessed_answers"] += question["assessed_count"]
+        topic_row["review_count"] += question["review_count"]
+        topic_row["total_score"] += question["average_score"] * question["assessed_count"]
+        topic_row["total_max"] += question["max_marks"] * question["assessed_count"]
+        if question.get("sub_topic"):
+            topic_row["sub_topics"].add(question["sub_topic"])
+
+    topic_rows: List[Dict[str, Any]] = []
+    for topic_row in topic_rows_by_name.values():
+        total_score = float(topic_row.pop("total_score"))
+        total_max = float(topic_row.pop("total_max"))
+        topic_row["average_percent"] = (
+            round((total_score / total_max) * 100, 1) if total_max > 0 else 0.0
+        )
+        topic_row["sub_topics"] = sorted(topic_row["sub_topics"])
+        topic_rows.append(topic_row)
+    topic_rows.sort(key=lambda item: (item["average_percent"], item["topic"]))
+
+    student_results: List[Dict[str, Any]] = []
+    for student in student_rows.values():
+        topic_performance = []
+        for topic, values in student.pop("topics").items():
+            maximum = float(values["max_score"])
+            topic_performance.append(
+                {
+                    "topic": topic,
+                    "score": round(float(values["score"]), 2),
+                    "max_score": round(maximum, 2),
+                    "percent": (
+                        round((float(values["score"]) / maximum) * 100, 1)
+                        if maximum > 0
+                        else 0.0
+                    ),
+                }
+            )
+        topic_performance.sort(key=lambda item: (-item["percent"], item["topic"]))
+        strengths = [item for item in topic_performance if item["percent"] >= 70][:2]
+        focus = sorted(topic_performance, key=lambda item: (item["percent"], item["topic"]))[:2]
+        total_max = float(student["total_max"])
+        percent = (
+            round((float(student["total_score"]) / total_max) * 100, 1)
+            if total_max > 0
+            else 0.0
+        )
+        if not topic_performance:
+            feedback = "No evaluated answers are available yet."
+        else:
+            strength_text = (
+                ", ".join(f"{item['topic']} ({item['percent']:.0f}%)" for item in strengths)
+                if strengths
+                else "no topic is consistently secure yet"
+            )
+            focus_text = ", ".join(
+                f"{item['topic']} ({item['percent']:.0f}%)" for item in focus
+            )
+            feedback = (
+                f"Strongest area: {strength_text}. "
+                f"Next focus: {focus_text}. "
+                f"{student['review_count']} answer(s) still need teacher confirmation."
+                if student["review_count"]
+                else f"Strongest area: {strength_text}. Next focus: {focus_text}."
+            )
+        student.update(
+            {
+                "total_score": round(float(student["total_score"]), 2),
+                "total_max": round(total_max, 2),
+                "percent": percent,
+                "topic_performance": topic_performance,
+                "feedback": feedback,
+            }
+        )
+        student_results.append(student)
+    student_results.sort(key=lambda item: (-item["percent"], item["student_id"]))
+
+    percentages = [item["percent"] for item in student_results if item["total_max"] > 0]
+    return {
+        "exam_id": exam_id,
+        "scope": "PCR",
+        "class_summary": {
+            "submitted_students": len(submissions),
+            "evaluated_students": len(percentages),
+            "average_percent": round(sum(percentages) / len(percentages), 1) if percentages else 0.0,
+            "highest_percent": max(percentages) if percentages else 0.0,
+            "lowest_percent": min(percentages) if percentages else 0.0,
+            "questions": len(question_rows),
+            "review_answers": sum(item["review_count"] for item in question_rows),
+        },
+        "questions": question_rows,
+        "topics": topic_rows,
+        "students": student_results,
+    }
+
+
+@router.put(
+    "/exams/{exam_id}/questions/{question_id}/taxonomy",
+    summary="Assign a persisted topic and sub-topic to a frozen PCR question",
+)
+async def update_question_taxonomy(
+    exam_id: str,
+    question_id: str,
+    body: QuestionTaxonomyUpdateRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    tenant_db = await _get_tenant_db(db, current_user)
+    catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+    if question_id not in {
+        str(question.get("question_id") or "") for question in catalog
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Question is not part of this finalized exam",
+        )
+    actor_id = str(current_user.get("user_id") or current_user.get("_id") or "unknown")
+    now = datetime.now(timezone.utc)
+    await tenant_db["evalpen_question_taxonomy"].update_one(
+        {"exam_id": exam_id, "question_id": question_id},
+        {
+            "$set": {
+                "topic": body.topic,
+                "sub_topic": body.sub_topic,
+                "updated_at": now,
+                "updated_by": actor_id,
+            },
+            "$setOnInsert": {
+                "created_at": now,
+                "created_by": actor_id,
+            },
+        },
+        upsert=True,
+    )
+    return {
+        "exam_id": exam_id,
+        "question_id": question_id,
+        "topic": body.topic,
+        "sub_topic": body.sub_topic,
+        "updated_at": now.isoformat(),
+    }
+
+
+@router.get(
     "/exams/{exam_id}/results",
     response_model=ExamResultsAPI,
     summary="Get aggregated results for an entire exam",
@@ -2137,6 +2565,192 @@ async def override_evaluation_score(
                     exc,
                     exc_info=True,
                 )
+
+
+@router.post(
+    "/evaluations/{evaluation_id}/approve-review",
+    summary="Approve a nonblocking AI review or mark it fully correct",
+)
+async def approve_evaluation_review(
+    evaluation_id: str,
+    body: EvaluationApprovalRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Resolve a visual/manual warning without pretending a blocker is safe."""
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    evaluation = await tenant_db["evalpen_evaluations"].find_one(
+        {"evaluation_id": evaluation_id}
+    )
+    if not evaluation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Evaluation {evaluation_id} not found",
+        )
+    response = await tenant_db["evalpen_detected_responses"].find_one(
+        {"response_id": str(evaluation.get("response_id") or "")}
+    )
+    if not response:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The evaluated response no longer exists",
+        )
+    student_id = str(evaluation.get("student_id") or response.get("student_id") or "")
+    if student_id:
+        _check_student_in_scope(student_id, scoped_ids)
+    submission_id = str(response.get("submission_id") or "")
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id}
+    )
+    if (submission or {}).get("publication_status") == "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Published results must be amended through the audited marks editor",
+        )
+
+    def _unresolved_blockers(document: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            item
+            for item in document.get("flags") or []
+            if isinstance(item, dict)
+            and not bool(item.get("resolved"))
+            and str(item.get("severity") or "").lower() == "blocking"
+        ]
+
+    blockers = _unresolved_blockers(response) + _unresolved_blockers(evaluation)
+    if blockers:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This answer has an unresolved evidence blocker. Correct the "
+                "answer assignment or use the marks editor before approving it."
+            ),
+        )
+
+    actor_id = str(current_user.get("user_id") or current_user.get("_id") or "unknown")
+    now = datetime.now(timezone.utc)
+
+    def _resolve_nonblocking_flags(raw_flags: Any) -> List[Dict[str, Any]]:
+        resolved: List[Dict[str, Any]] = []
+        for raw_flag in raw_flags or []:
+            if not isinstance(raw_flag, dict):
+                continue
+            flag = dict(raw_flag)
+            if not flag.get("resolved"):
+                flag.update(
+                    {
+                        "resolved": True,
+                        "resolved_by": actor_id,
+                        "resolved_at": now,
+                        "resolution": body.reason,
+                    }
+                )
+            resolved.append(flag)
+        return resolved
+
+    previous_score = float(evaluation.get("total_score") or 0.0)
+    max_score = float(evaluation.get("max_score") or 0.0)
+    criterion_marks = [
+        dict(item)
+        for item in evaluation.get("criterion_marks") or []
+        if isinstance(item, dict)
+    ]
+    step_marks = [
+        dict(item)
+        for item in evaluation.get("step_marks") or []
+        if isinstance(item, dict)
+    ]
+    if body.award_full_marks:
+        for criterion in criterion_marks:
+            criterion["marks_awarded"] = float(criterion.get("max_marks") or 0.0)
+            criterion["credit_basis"] = "direct_evidence"
+            criterion["teacher_confirmed"] = True
+        criterion_maxima = {
+            str(item.get("criterion_id") or ""): float(item.get("max_marks") or 0.0)
+            for item in criterion_marks
+            if str(item.get("criterion_id") or "")
+        }
+        for step in step_marks:
+            criterion_id = str(step.get("criterion_id") or "")
+            if criterion_id in criterion_maxima:
+                step["marks_awarded"] = criterion_maxima[criterion_id]
+                step["credit_basis"] = "direct_evidence"
+                step["teacher_confirmed"] = True
+        new_score = max_score
+    else:
+        new_score = previous_score
+
+    evaluation_update: Dict[str, Any] = {
+        "total_score": new_score,
+        "manual_review_required": False,
+        "manual_review_reason": None,
+        "flags": _resolve_nonblocking_flags(evaluation.get("flags")),
+        "teacher_review_status": "approved",
+        "teacher_reviewed_by": actor_id,
+        "teacher_reviewed_at": now,
+        "updated_at": now,
+    }
+    if criterion_marks:
+        evaluation_update["criterion_marks"] = criterion_marks
+    if step_marks:
+        evaluation_update["step_marks"] = step_marks
+
+    await tenant_db["evalpen_evaluations"].update_one(
+        {"_id": evaluation["_id"]},
+        {"$set": evaluation_update},
+    )
+    await tenant_db["evalpen_detected_responses"].update_one(
+        {"_id": response["_id"]},
+        {
+            "$set": {
+                "eval_status": "evaluated",
+                "manual_review_required": False,
+                "manual_review_reason": None,
+                "question_assignment.manual_review_required": False,
+                "flags": _resolve_nonblocking_flags(response.get("flags")),
+                "teacher_review_status": "approved",
+                "teacher_reviewed_by": actor_id,
+                "teacher_reviewed_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    await tenant_db["evalpen_teacher_review_audit"].insert_one(
+        {
+            "audit_id": f"TRA-{uuid.uuid4().hex[:20]}",
+            "evaluation_id": evaluation_id,
+            "response_id": response.get("response_id"),
+            "submission_id": submission_id,
+            "exam_id": response.get("exam_id"),
+            "student_id": student_id,
+            "action": "award_full_marks" if body.award_full_marks else "approve_current_score",
+            "before": {
+                "total_score": previous_score,
+                "manual_review_required": bool(
+                    evaluation.get("manual_review_required")
+                    or response.get("manual_review_required")
+                ),
+            },
+            "after": {
+                "total_score": new_score,
+                "manual_review_required": False,
+            },
+            "reason": body.reason,
+            "actor_id": actor_id,
+            "created_at": now,
+        }
+    )
+    return {
+        "evaluation_id": evaluation_id,
+        "submission_id": submission_id,
+        "previous_score": previous_score,
+        "new_score": new_score,
+        "review_status": "approved",
+        "awarded_full_marks": body.award_full_marks,
+        "approved_at": now.isoformat(),
+    }
 
 
 @router.post(
