@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
 from services.answer_mapping_contract import normalize_answer_label
+from services.evalpen_flag_utils import is_flag_resolved, resolve_flag
 from services.objective_scoring_service import is_integer_question
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
@@ -871,7 +872,7 @@ async def get_submission_summary(
             flags = resp_doc.get("flags", [])
             has_blocking = any(
                 f.get("severity") == "blocking"
-                and not f.get("resolution", {}).get("resolved", False)
+                and not is_flag_resolved(f)
                 for f in flags
             )
 
@@ -999,9 +1000,7 @@ async def get_submission_summary(
                     "severity": f.get("severity", ""),
                     "reason": f.get("reason", ""),
                     "suggested_action": f.get("suggested_action"),
-                    "resolved": f.get("resolution", {}).get(
-                        "resolved", False
-                    ),
+                    "resolved": is_flag_resolved(f),
                 }
                 for f in flags
             ]
@@ -1830,7 +1829,7 @@ async def get_exam_analytics(
 
     def _has_unresolved_flags(document: Dict[str, Any]) -> bool:
         return any(
-            isinstance(item, dict) and not bool(item.get("resolved"))
+            isinstance(item, dict) and not is_flag_resolved(item)
             for item in document.get("flags") or []
         )
 
@@ -2808,7 +2807,7 @@ async def approve_evaluation_review(
             item
             for item in document.get("flags") or []
             if isinstance(item, dict)
-            and not bool(item.get("resolved"))
+            and not is_flag_resolved(item)
             and str(item.get("severity") or "").lower() == "blocking"
         ]
 
@@ -2830,16 +2829,16 @@ async def approve_evaluation_review(
         for raw_flag in raw_flags or []:
             if not isinstance(raw_flag, dict):
                 continue
-            flag = dict(raw_flag)
-            if not flag.get("resolved"):
-                flag.update(
-                    {
-                        "resolved": True,
-                        "resolved_by": actor_id,
-                        "resolved_at": now,
-                        "resolution": body.reason,
-                    }
+            flag = (
+                dict(raw_flag)
+                if is_flag_resolved(raw_flag)
+                else resolve_flag(
+                    raw_flag,
+                    actor_id=actor_id,
+                    resolved_at=now,
+                    reason=body.reason,
                 )
+            )
             resolved.append(flag)
         return resolved
 
@@ -2860,6 +2859,10 @@ async def approve_evaluation_review(
             criterion["marks_awarded"] = float(criterion.get("max_marks") or 0.0)
             criterion["credit_basis"] = "direct_evidence"
             criterion["teacher_confirmed"] = True
+            criterion["rationale"] = (
+                "Teacher verified this criterion against the original answer copy "
+                "and confirmed it as correct."
+            )
         criterion_maxima = {
             str(item.get("criterion_id") or ""): float(item.get("max_marks") or 0.0)
             for item in criterion_marks
@@ -2871,6 +2874,10 @@ async def approve_evaluation_review(
                 step["marks_awarded"] = criterion_maxima[criterion_id]
                 step["credit_basis"] = "direct_evidence"
                 step["teacher_confirmed"] = True
+                step["rationale"] = (
+                    "Teacher verified this step against the original answer copy "
+                    "and confirmed it as correct."
+                )
         new_score = max_score
     else:
         new_score = previous_score
@@ -2881,10 +2888,16 @@ async def approve_evaluation_review(
         "manual_review_reason": None,
         "flags": _resolve_nonblocking_flags(evaluation.get("flags")),
         "teacher_review_status": "approved",
+        "teacher_reviewed": True,
         "teacher_reviewed_by": actor_id,
         "teacher_reviewed_at": now,
         "updated_at": now,
     }
+    if body.award_full_marks:
+        evaluation_update["overall_feedback"] = (
+            "Your teacher reviewed the original answer and confirmed this answer as correct."
+        )
+        evaluation_update["teacher_feedback"] = body.reason
     if criterion_marks:
         evaluation_update["criterion_marks"] = criterion_marks
     if step_marks:
@@ -2925,22 +2938,102 @@ async def approve_evaluation_review(
                     evaluation.get("manual_review_required")
                     or response.get("manual_review_required")
                 ),
+                "overall_feedback": evaluation.get("overall_feedback"),
+                "criterion_marks": evaluation.get("criterion_marks"),
             },
             "after": {
                 "total_score": new_score,
                 "manual_review_required": False,
+                "overall_feedback": evaluation_update.get(
+                    "overall_feedback",
+                    evaluation.get("overall_feedback"),
+                ),
+                "criterion_marks": criterion_marks,
             },
             "reason": body.reason,
             "actor_id": actor_id,
             "created_at": now,
         }
     )
+
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    readiness = await assess_submission_readiness(tenant_db, submission_id)
+    blocker_codes = {
+        str(item.get("code") or "")
+        for item in (readiness.get("blockers") or [])
+        if str(item.get("code") or "")
+    }
+    reviewable_codes = {
+        "document_coverage_requires_review",
+        "response_assignment_requires_review",
+        "evaluation_requires_review",
+    }
+    review_state = (
+        "ready"
+        if readiness.get("ready")
+        else "needs_review"
+        if blocker_codes and blocker_codes.issubset(reviewable_codes)
+        else "blocked"
+    )
+    await tenant_db["evalpen_submissions"].update_one(
+        {"submission_id": submission_id},
+        {
+            "$set": {
+                "review_state": review_state,
+                "updated_at": now,
+            }
+        },
+    )
+
+    publication: Optional[Dict[str, Any]] = None
+    if readiness.get("ready"):
+        try:
+            publication = await publish_submission(
+                submission_id,
+                PublishRequest(
+                    note=(
+                        "Automatically published after the final teacher review "
+                        "was approved"
+                    )
+                ),
+                current_user=current_user,
+                db=db,
+            )
+        except HTTPException as exc:
+            latest_submission = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": submission_id},
+                {"publication_status": 1, "published_at": 1, "published_by": 1},
+            )
+            if (
+                exc.status_code == status.HTTP_409_CONFLICT
+                and (latest_submission or {}).get("publication_status") == "published"
+            ):
+                publication = {
+                    "submission_id": submission_id,
+                    "publication_status": "published",
+                    "published_at": _dt_to_iso(
+                        (latest_submission or {}).get("published_at")
+                    ),
+                    "published_by": (latest_submission or {}).get("published_by"),
+                }
+            else:
+                raise
+
     return {
         "evaluation_id": evaluation_id,
         "submission_id": submission_id,
         "previous_score": previous_score,
         "new_score": new_score,
         "review_status": "approved",
+        "review_state": "published" if publication else review_state,
+        "readiness": readiness,
+        "publication": publication,
+        "publication_status": (
+            publication.get("publication_status")
+            if publication
+            else (submission or {}).get("publication_status") or "pending"
+        ),
         "awarded_full_marks": body.award_full_marks,
         "approved_at": now.isoformat(),
     }
@@ -4007,7 +4100,7 @@ async def _publish_submission_impl(
             flags = resp.get("flags", [])
             has_unresolved = any(
                 f.get("severity") == "blocking"
-                and not f.get("resolution", {}).get("resolved", False)
+                and not is_flag_resolved(f)
                 for f in flags
             )
             if has_unresolved:
@@ -4055,6 +4148,7 @@ async def _publish_submission_impl(
             {
                 "$set": {
                     "publication_status": "published",
+                    "review_state": "published",
                     "published_at": now,
                     "published_by": actor_id,
                     "publication_note": body.note,

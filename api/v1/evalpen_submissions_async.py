@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from services.evalpen_flag_utils import is_flag_resolved
 from api.v1.exam_orch_async import (
     _current_tutor_id,
     _is_exam_visible_to_tutor,
@@ -715,13 +716,13 @@ async def resolve_flag(
             flags = updated_doc.get("flags", [])
             still_blocking = any(
                 f.get("severity") == "blocking"
-                and not f.get("resolution", {}).get("resolved", False)
+                and not is_flag_resolved(f)
                 for f in flags
             )
             if not still_blocking:
                 has_warnings = any(
                     f.get("severity") == "warning"
-                    and not f.get("resolution", {}).get("resolved", False)
+                    and not is_flag_resolved(f)
                     for f in flags
                 )
                 new_status = "ready_with_warnings" if has_warnings else "ready"

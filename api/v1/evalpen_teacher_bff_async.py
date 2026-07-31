@@ -46,6 +46,7 @@ from services.exampen_submission_readiness import (
     assess_submissions_readiness,
     readiness_message,
 )
+from services.evalpen_flag_utils import is_flag_resolved
 
 logger = logging.getLogger(__name__)
 
@@ -638,9 +639,7 @@ async def list_exams(
                     for f in flags:
                         if (
                             f.get("severity") == "blocking"
-                            and not f.get("resolution", {}).get(
-                                "resolved", False
-                            )
+                            and not is_flag_resolved(f)
                         ):
                             has_unresolved_blocking = True
                             break
@@ -960,9 +959,7 @@ async def get_exam_queue(
                 for f in flags:
                     if (
                         f.get("severity") == "blocking"
-                        and not f.get("resolution", {}).get(
-                            "resolved", False
-                        )
+                        and not is_flag_resolved(f)
                     ):
                         has_unresolved_blocking = True
                         unresolved_count += 1

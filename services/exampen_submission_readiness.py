@@ -14,6 +14,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
+from services.evalpen_flag_utils import is_flag_resolved
+
 
 TERMINAL_RESPONSE_STATUSES = {
     "evaluated",
@@ -58,8 +60,7 @@ def _has_unresolved_blocking_flag(response: Dict[str, Any]) -> bool:
     for flag in response.get("flags") or []:
         if not isinstance(flag, dict) or flag.get("severity") != "blocking":
             continue
-        resolution = flag.get("resolution")
-        if not isinstance(resolution, dict) or not resolution.get("resolved"):
+        if not is_flag_resolved(flag):
             return True
     return False
 

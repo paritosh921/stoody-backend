@@ -42,6 +42,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from services.evalpen_flag_utils import is_flag_resolved
 from utils.tutor_scoping import get_tutor_scoped_students
 
 logger = logging.getLogger(__name__)
@@ -584,7 +585,7 @@ async def review_flagged_response(
             f
             for f in flags
             if f.get("severity") == "blocking"
-            and not f.get("resolution", {}).get("resolved", False)
+            and not is_flag_resolved(f)
         ]
 
         if not unresolved_blocking and body.action != "manual_score":
@@ -629,7 +630,7 @@ async def review_flagged_response(
             # Determine new status
             remaining_warnings = any(
                 f.get("severity") == "warning"
-                and not f.get("resolution", {}).get("resolved", False)
+                and not is_flag_resolved(f)
                 for f in flags
                 if f.get("severity") != "blocking"
             )
