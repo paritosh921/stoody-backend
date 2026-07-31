@@ -154,6 +154,12 @@ class QuestionTaxonomyUpdateRequest(BaseModel):
         return value or None
 
 
+class AutoTagQuestionsRequest(BaseModel):
+    """Batch topic generation while preserving teacher-owned tags by default."""
+
+    replace_existing: bool = False
+
+
 class CriterionMarkOverrideItem(BaseModel):
     """One teacher-entered score for an already-locked rubric criterion."""
 
@@ -2058,6 +2064,193 @@ async def update_question_taxonomy(
         "topic": body.topic,
         "sub_topic": body.sub_topic,
         "updated_at": now.isoformat(),
+    }
+
+
+@router.post(
+    "/exams/{exam_id}/taxonomy/auto-tag",
+    summary="Classify all untagged PCR questions in one persisted AI batch",
+)
+async def auto_tag_exam_questions(
+    exam_id: str,
+    body: AutoTagQuestionsRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    tenant_db = await _get_tenant_db(db, current_user)
+    catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+    if not catalog:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No finalized PCR questions found for exam {exam_id}",
+        )
+
+    existing_docs = await tenant_db["evalpen_question_taxonomy"].find(
+        {"exam_id": exam_id},
+        {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1, "source": 1},
+    ).to_list(length=max(len(catalog), 100))
+    existing_by_question = {
+        str(item.get("question_id") or ""): item
+        for item in existing_docs
+        if str(item.get("question_id") or "")
+    }
+    candidates = [
+        question
+        for question in catalog
+        if body.replace_existing
+        or not str(
+            (existing_by_question.get(str(question.get("question_id") or "")) or {}).get("topic")
+            or ""
+        ).strip()
+    ]
+    if not candidates:
+        return {
+            "exam_id": exam_id,
+            "tagged_count": 0,
+            "preserved_count": len(existing_by_question),
+            "message": "Every question already has a persisted topic",
+        }
+
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {
+            "_id": 0,
+            "title": 1,
+            "exam_title": 1,
+            "subject": 1,
+            "exam_subject": 1,
+            "standard": 1,
+            "class_name": 1,
+            "grade": 1,
+        },
+    ) or {}
+    classifier_questions = [
+        {
+            "id": str(question.get("question_id") or ""),
+            "question_id": str(question.get("question_id") or ""),
+            "question_number": question.get("question_number") or index + 1,
+            "question_text": str(question.get("question_text") or ""),
+            "text": str(question.get("question_text") or ""),
+            "points": float(question.get("max_marks") or 0.0),
+        }
+        for index, question in enumerate(candidates)
+    ]
+
+    try:
+        from services.tally_question_map_service import build_tally_question_map
+
+        classification = await build_tally_question_map(
+            tally_document_id=f"evalpen-taxonomy:{exam_id}",
+            source_document_id=exam_id,
+            questions=classifier_questions,
+            subject=str(
+                exam.get("subject")
+                or exam.get("exam_subject")
+                or exam.get("title")
+                or exam.get("exam_title")
+                or ""
+            ).strip()
+            or None,
+            standard=str(
+                exam.get("standard")
+                or exam.get("class_name")
+                or exam.get("grade")
+                or ""
+            ).strip()
+            or None,
+            generated_by=str(
+                current_user.get("user_id") or current_user.get("_id") or "unknown"
+            ),
+        )
+    except Exception as exc:
+        logger.error(
+            "Automatic question taxonomy failed for exam %s: %s",
+            exam_id,
+            exc,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Automatic topic classification is temporarily unavailable",
+        ) from exc
+
+    valid_question_ids = {
+        str(question.get("question_id") or "") for question in candidates
+    }
+    actor_id = str(current_user.get("user_id") or current_user.get("_id") or "unknown")
+    now = datetime.now(timezone.utc)
+    tagged: List[Dict[str, Any]] = []
+    for item in classification.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        question_id = str(item.get("question_id") or "")
+        topic = " ".join(str(item.get("topic") or "").split())[:120]
+        sub_topic = " ".join(str(item.get("sub_topic") or "").split())[:120]
+        source = str(item.get("source") or "")
+        if (
+            question_id not in valid_question_ids
+            or not topic
+            or topic.lower() in {"unmapped", "uncategorized"}
+            or source != "ai"
+        ):
+            continue
+        document = {
+            "exam_id": exam_id,
+            "question_id": question_id,
+            "topic": topic,
+            "sub_topic": sub_topic or None,
+            "source": "ai_batch",
+            "confidence": float(item.get("confidence") or 0.0),
+            "updated_at": now,
+            "updated_by": actor_id,
+        }
+        await tenant_db["evalpen_question_taxonomy"].update_one(
+            {"exam_id": exam_id, "question_id": question_id},
+            {
+                "$set": document,
+                "$setOnInsert": {
+                    "created_at": now,
+                    "created_by": actor_id,
+                },
+            },
+            upsert=True,
+        )
+        tagged.append(
+            {
+                "question_id": question_id,
+                "topic": topic,
+                "sub_topic": sub_topic or None,
+                "confidence": document["confidence"],
+            }
+        )
+
+    if not tagged:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The topic classifier returned no reliable labels. Check the "
+                "configured AI provider and try again; no placeholder tags were saved."
+            ),
+        )
+
+    await tenant_db["evalpen_question_taxonomy_audit"].insert_one(
+        {
+            "audit_id": f"QTA-{uuid.uuid4().hex[:20]}",
+            "exam_id": exam_id,
+            "action": "replace_ai_taxonomy" if body.replace_existing else "tag_missing_questions",
+            "question_ids": [item["question_id"] for item in tagged],
+            "tagged_count": len(tagged),
+            "preserved_count": len(catalog) - len(candidates),
+            "actor_id": actor_id,
+            "created_at": now,
+        }
+    )
+    return {
+        "exam_id": exam_id,
+        "tagged_count": len(tagged),
+        "preserved_count": len(catalog) - len(candidates),
+        "items": tagged,
+        "generated_at": now.isoformat(),
     }
 
 
