@@ -139,7 +139,11 @@ async def assess_submission_readiness(
         )
         job = job_docs[0] if job_docs else None
     processing_status = str(job.get("status") or "") if job else "missing"
-    if processing_status != "completed":
+    # ``blocked_for_review`` means the processing pipeline reached a terminal
+    # review outcome.  It must not independently keep a fully materialized
+    # submission blocked: the evidence, response, evaluation, and flag checks
+    # below remain the authoritative publication gates.
+    if processing_status not in {"completed", "blocked_for_review"}:
         blockers.append(
             _blocker(
                 "processing_not_completed",
