@@ -1290,11 +1290,42 @@ async def confirm_document_coverage_review(
         {"submission_id": submission_id},
         {"$set": {"review_state": review_state, "updated_at": now}},
     )
+
+    publication: Optional[Dict[str, Any]] = None
+    publication_status: Optional[str] = None
+    if readiness.get("ready"):
+        try:
+            publication = await publish_submission(
+                submission_id=submission_id,
+                request=PublishRequest(
+                    note="Published after teacher confirmed full answer-copy coverage",
+                ),
+                current_user=current_user,
+                db=db,
+            )
+            publication_status = str(
+                publication.get("publication_status") or "published"
+            )
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_409_CONFLICT:
+                raise
+            latest_submission = await tenant_db["evalpen_submissions"].find_one(
+                {"submission_id": submission_id},
+                {"_id": 0, "publication_status": 1},
+            )
+            if str((latest_submission or {}).get("publication_status") or "") != "published":
+                raise
+            publication_status = "published"
+
     return {
         "submission_id": submission_id,
-        "review_state": review_state,
+        "review_state": (
+            "published" if publication_status == "published" else review_state
+        ),
         "document_review": accepted_review,
         "readiness": readiness,
+        "publication": publication,
+        "publication_status": publication_status,
     }
 
 

@@ -373,6 +373,7 @@ try:
     )
     from api.v1.evalpen_practice_async import router as evalpen_practice_router
     from api.v1.evalpen_review_async import router as evalpen_review_router
+    from api.v1.evalpen_recheck_async import router as evalpen_recheck_router
     from api.v1.evalpen_flagged_async import router as evalpen_flagged_router
     from api.v1.evalpen_invigilator_async import router as evalpen_invigilator_router
     from api.v1.evalpen_teacher_bff_async import router as evalpen_teacher_bff_router
@@ -395,6 +396,7 @@ except Exception as e:
     evalpen_questions_router = None
     evalpen_practice_router = None
     evalpen_review_router = None
+    evalpen_recheck_router = None
     evalpen_flagged_router = None
     evalpen_invigilator_router = None
     evalpen_teacher_bff_router = None
@@ -1519,6 +1521,11 @@ if _evalpen_available:
         evalpen_review_router,
         prefix=f"{API_V1_PREFIX}/evalpen/review",
         tags=["ExamPen Review"],
+    )
+    app.include_router(
+        evalpen_recheck_router,
+        prefix=f"{API_V1_PREFIX}/evalpen/recheck",
+        tags=["ExamPen Recheck"],
     )
     app.include_router(
         evalpen_flagged_router,

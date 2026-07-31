@@ -77,6 +77,9 @@ class StudentExamItem(BaseModel):
     total_score: float = 0.0
     max_score: float = 0.0
     published_at: Optional[str] = None
+    recheck_available: bool = True
+    recheck_count: int = 0
+    conversation_count: int = 0
 
 
 class StudentExamListResponse(BaseModel):
@@ -94,6 +97,24 @@ class StudentMarkBreakdownItem(BaseModel):
     feedback: Optional[str] = None
 
 
+class StudentRecheckStatusItem(BaseModel):
+    request_id: str
+    exam_id: str
+    student_id: str
+    question_id: str
+    submission_id: str
+    status: str
+    reason: str
+    teacher_response: Optional[str] = None
+    original_score: float = 0.0
+    original_max_score: float = 0.0
+    updated_score: Optional[float] = None
+    updated_max_score: Optional[float] = None
+    created_at: str
+    updated_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+
+
 class QuestionScoreItem(BaseModel):
     """Per-question score entry within an exam score breakdown."""
 
@@ -107,6 +128,7 @@ class QuestionScoreItem(BaseModel):
     mark_breakdown: List[StudentMarkBreakdownItem] = Field(default_factory=list)
     reference_answer: Optional[str] = None
     teacher_feedback: Optional[str] = None
+    recheck_status: Optional[StudentRecheckStatusItem] = None
 
 
 class StudentExamScoresResponse(BaseModel):
@@ -117,6 +139,7 @@ class StudentExamScoresResponse(BaseModel):
     total_score: float = 0.0
     max_score: float = 0.0
     questions: List[QuestionScoreItem] = Field(default_factory=list)
+    recheck_available: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +189,7 @@ def _get_student_id(current_user: Dict[str, Any]) -> str:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User identity could not be determined from token",
-        )
+        ).sort("published_at", -1)
     return student_id
 
 
@@ -395,11 +418,11 @@ async def list_student_exams(
             if eid:
                 exam_ids.append(eid)
                 sub_ids.append(sid)
-                exam_sub_map[eid] = {
+                exam_sub_map.setdefault(eid, {
                     "submission_id": sid,
                     "published_at": sub.get("published_at"),
                     "publication_snapshot": sub.get("publication_snapshot"),
-                }
+                })
 
         # ----- PCR: aggregate evaluations per exam -----
         from api.v1._exampen_imports import load_exampen
@@ -460,7 +483,7 @@ async def list_student_exams(
         except Exception as exc:
             logger.debug("DCR scores not available for student BFF: %s", exc)
 
-        # ----- Resolve exam titles from evalpen_questions -----
+        # ----- Resolve exam titles from canonical sessions and papers -----
         title_cursor = tenant_db["evalpen_questions"].aggregate([
             {"$match": {"exam_id": {"$in": exam_ids}}},
             {"$group": {
@@ -473,6 +496,46 @@ async def list_student_exams(
         title_map: Dict[str, Dict[str, Any]] = {
             d["_id"]: d for d in title_docs
         }
+        exam_documents = await tenant_db["exampen_exams"].find(
+            {"exam_id": {"$in": exam_ids}},
+            {
+                "_id": 0,
+                "exam_id": 1,
+                "title": 1,
+                "exam_type": 1,
+                "prepared_document_id": 1,
+            },
+        ).to_list(length=5000)
+        exam_document_map = {
+            str(item.get("exam_id") or ""): item for item in exam_documents
+        }
+        prepared_ids = [
+            str(item.get("prepared_document_id") or "")
+            for item in exam_documents
+            if str(item.get("prepared_document_id") or "")
+        ]
+        prepared_documents = (
+            await tenant_db["documents"].find(
+                {"document_id": {"$in": prepared_ids}},
+                {"_id": 0, "document_id": 1, "title": 1, "exam_mode": 1},
+            ).to_list(length=5000)
+            if prepared_ids
+            else []
+        )
+        prepared_document_map = {
+            str(item.get("document_id") or ""): item for item in prepared_documents
+        }
+        recheck_documents = await tenant_db["evalpen_recheck_requests"].find(
+            {
+                "exam_id": {"$in": exam_ids},
+                "student_id": {"$in": student_ids},
+            },
+            {"_id": 0, "exam_id": 1},
+        ).to_list(length=5000)
+        recheck_counts: Dict[str, int] = {}
+        for item in recheck_documents:
+            recheck_exam_id = str(item.get("exam_id") or "")
+            recheck_counts[recheck_exam_id] = recheck_counts.get(recheck_exam_id, 0) + 1
 
         # ----- Build response items -----
         items: List[StudentExamItem] = []
@@ -485,9 +548,21 @@ async def list_student_exams(
             combined_max = pcr["max_score"] + dcr["max_score"]
 
             title_info = title_map.get(eid, {})
-            exam_type = title_info.get("exam_type")
-            title = title_info.get("title") or (
-                f"{str(exam_type).upper()} Exam" if exam_type else "Exam Result"
+            exam_document = exam_document_map.get(eid, {})
+            prepared_document = prepared_document_map.get(
+                str(exam_document.get("prepared_document_id") or ""),
+                {},
+            )
+            exam_type = (
+                exam_document.get("exam_type")
+                or prepared_document.get("exam_mode")
+                or title_info.get("exam_type")
+            )
+            title = (
+                exam_document.get("title")
+                or prepared_document.get("title")
+                or title_info.get("title")
+                or (f"{str(exam_type).upper()} Exam" if exam_type else "Exam Result")
             )
 
             sub_info = exam_sub_map.get(eid, {})
@@ -501,11 +576,13 @@ async def list_student_exams(
                     total_score=combined_total,
                     max_score=combined_max,
                     published_at=published_at,
+                    recheck_available=True,
+                    recheck_count=recheck_counts.get(eid, 0),
+                    conversation_count=0,
                 )
             )
 
-        # Sort by exam_id for deterministic order
-        items.sort(key=lambda x: x.exam_id)
+        items.sort(key=lambda x: x.published_at or "", reverse=True)
 
         return StudentExamListResponse(items=items)
 
@@ -577,6 +654,32 @@ async def get_student_exam_scores(
             )
 
         submission_id = submission.get("submission_id", "")
+        recheck_documents = await tenant_db["evalpen_recheck_requests"].find(
+            {"submission_id": submission_id},
+            {"_id": 0, "active_key": 0, "resolution_lock": 0, "evaluation_id": 0},
+        ).sort("created_at", -1).to_list(length=5000)
+        recheck_by_question: Dict[str, StudentRecheckStatusItem] = {}
+        for item in recheck_documents:
+            recheck_question_id = str(item.get("question_id") or "")
+            if not recheck_question_id or recheck_question_id in recheck_by_question:
+                continue
+            recheck_by_question[recheck_question_id] = StudentRecheckStatusItem(
+                request_id=str(item.get("request_id") or ""),
+                exam_id=str(item.get("exam_id") or ""),
+                student_id=str(item.get("student_id") or ""),
+                question_id=recheck_question_id,
+                submission_id=str(item.get("submission_id") or ""),
+                status=str(item.get("status") or "open"),
+                reason=str(item.get("reason") or ""),
+                teacher_response=item.get("teacher_response"),
+                original_score=_safe_score(item.get("original_score")),
+                original_max_score=_safe_marks(item.get("original_max_score")),
+                updated_score=item.get("updated_score"),
+                updated_max_score=item.get("updated_max_score"),
+                created_at=_dt_to_iso(item.get("created_at")) or "",
+                updated_at=_dt_to_iso(item.get("updated_at")),
+                resolved_at=_dt_to_iso(item.get("resolved_at")),
+            )
 
         question_catalog_for_integrity = await _get_pcr_question_catalog(
             tenant_db, exam_id
@@ -705,6 +808,7 @@ async def get_student_exam_scores(
                             mark_breakdown=result["mark_breakdown"],
                             reference_answer=result["reference_answer"],
                             teacher_feedback=result["teacher_feedback"],
+                            recheck_status=recheck_by_question.get(question_id),
                         )
                     )
                 if missing_question_ids:
@@ -732,6 +836,9 @@ async def get_student_exam_scores(
                             mark_breakdown=result["mark_breakdown"],
                             reference_answer=result["reference_answer"],
                             teacher_feedback=result["teacher_feedback"],
+                            recheck_status=recheck_by_question.get(
+                                result["question_id"]
+                            ),
                         )
                     )
         except ImportError:
@@ -767,6 +874,9 @@ async def get_student_exam_scores(
                         max_score=q_max,
                         feedback=None,
                         eval_type="dcr",
+                        recheck_status=recheck_by_question.get(
+                            str(doc.get("question_id") or "")
+                        ),
                     )
                 )
         except Exception as exc:
@@ -781,6 +891,7 @@ async def get_student_exam_scores(
             total_score=total_score,
             max_score=total_max,
             questions=questions,
+            recheck_available=True,
         )
 
     except HTTPException:

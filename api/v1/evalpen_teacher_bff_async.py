@@ -109,6 +109,9 @@ class QueueItem(BaseModel):
     page_count: int = 0
     source: Optional[str] = None
     status_summary: str = ""
+    # Stable reason code for the remaining teacher action. A whole-copy
+    # confirmation is not the same state as an unresolved grading review.
+    review_kind: Optional[str] = None
     has_dcr_results: bool = False
     # PCR copy-upload jobs are durable and may still be queued before OCR
     # creates individual responses. Exposing that state prevents a teacher
@@ -950,6 +953,13 @@ async def get_exam_queue(
             needs_teacher_review = bool(blocker_codes) and blocker_codes.issubset(
                 reviewable_codes
             )
+            review_kind: Optional[str] = None
+            if blocker_codes == {"document_coverage_requires_review"}:
+                review_kind = "document_coverage"
+            elif "response_assignment_requires_review" in blocker_codes:
+                review_kind = "response_assignment"
+            elif "evaluation_requires_review" in blocker_codes:
+                review_kind = "evaluation"
 
             # Determine blocking status
             has_unresolved_blocking = False
@@ -995,7 +1005,12 @@ async def get_exam_queue(
                         response_count=response_count,
                         page_count=page_count,
                         source=submission_source,
-                        status_summary=readiness_message(readiness),
+                        status_summary=(
+                            "Confirm the full answer copy to publish"
+                            if review_kind == "document_coverage"
+                            else readiness_message(readiness)
+                        ),
+                        review_kind=review_kind,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
                         processing_error=processing_error,
