@@ -884,8 +884,10 @@ def _is_exam_visible_to_tutor(
     return False
 
 
-def _require_tutor_visibility(
-    exam_doc: Dict[str, Any], current_user: Dict[str, Any]
+async def _require_tutor_visibility(
+    exam_doc: Dict[str, Any],
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
 ) -> None:
     """Raise 403 if the calling tutor cannot see this exam.
 
@@ -899,6 +901,36 @@ def _require_tutor_visibility(
         # Non-tutor, non-admin caller already filtered by auth dep, but
         # be defensive.
         return
+    if _is_exam_visible_to_tutor(exam_doc, tutor_id):
+        return
+
+    from bson import ObjectId
+    from utils.tutor_scoping import get_tutor_scoped_students
+
+    try:
+        admin_oid = ObjectId(current_user.get("admin_id"))
+    except Exception:
+        admin_oid = None
+
+    scoped_students = await get_tutor_scoped_students(
+        tutor_id=str(tutor_id),
+        admin_oid=admin_oid,
+        db=db,
+        projection={"student_id": 1},
+    )
+    scoped_student_ids = {
+        str(student.get("student_id"))
+        for student in scoped_students
+        if student.get("student_id")
+    }
+    exam_roster = {
+        str(student_id)
+        for student_id in (exam_doc.get("roster") or [])
+        if student_id
+    }
+    if exam_roster.intersection(scoped_student_ids):
+        return
+
     if not _is_exam_visible_to_tutor(exam_doc, tutor_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2164,7 +2196,7 @@ async def batch_reprocess_exam_submissions(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {exam_id} not found",
         )
-    _require_tutor_visibility(exam, current_user)
+    await _require_tutor_visibility(exam, current_user, db)
 
     submissions = await tenant_db["evalpen_submissions"].find(
         {
@@ -2297,3 +2329,4 @@ async def batch_reprocess_exam_submissions(
         items=queued_items,
         errors=errors[:20],
     )
+

@@ -210,7 +210,10 @@ async def _get_tutor_scoped_student_ids(
     ]
 
 
-def _visible_exam_query_for_user(current_user: Dict[str, Any]) -> Dict[str, Any]:
+def _visible_exam_query_for_user(
+    current_user: Dict[str, Any],
+    scoped_student_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Return the ExamPen exam visibility query for the current actor."""
     if _is_tutor_admin_role(current_user):
         return {}
@@ -219,18 +222,20 @@ def _visible_exam_query_for_user(current_user: Dict[str, Any]) -> Dict[str, Any]
     if tutor_id is None:
         return {"exam_id": {"$in": []}}
 
-    return {
-        "$or": [
-            {"created_by_tutor_id": tutor_id},
-            {"teacher_ids": tutor_id},
-        ]
-    }
+    visibility = [
+        {"created_by_tutor_id": tutor_id},
+        {"teacher_ids": tutor_id},
+    ]
+    if scoped_student_ids:
+        visibility.append({"roster": {"$in": scoped_student_ids}})
+    return {"$or": visibility}
 
 
 async def _require_exam_visible_or_legacy_student_scope(
     tenant_db: Any,
     exam_id: str,
     current_user: Dict[str, Any],
+    scoped_student_ids: Optional[List[str]] = None,
 ) -> bool:
     """Return True if a tutor-visible exam doc exists.
 
@@ -254,11 +259,18 @@ async def _require_exam_visible_or_legacy_student_scope(
             "exam_id": 1,
             "created_by_tutor_id": 1,
             "teacher_ids": 1,
+            "roster": 1,
         },
     )
     if exam_doc is None:
         return False
-    if not _is_exam_visible_to_tutor(exam_doc, tutor_id):
+    roster = {
+        str(student_id)
+        for student_id in (exam_doc.get("roster") or [])
+        if student_id
+    }
+    scoped = {str(student_id) for student_id in (scoped_student_ids or []) if student_id}
+    if not _is_exam_visible_to_tutor(exam_doc, tutor_id) and not roster.intersection(scoped):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Exam is not visible to this tutor",
@@ -408,7 +420,7 @@ async def list_exams(
                 )
 
         # ----- Fetch orchestration exams even before submissions exist -----
-        active_exam_query = _visible_exam_query_for_user(current_user)
+        active_exam_query = _visible_exam_query_for_user(current_user, scoped_ids)
 
         active_exam_docs = await tenant_db["exampen_exams"].find(
             active_exam_query,
@@ -779,6 +791,7 @@ async def get_exam_queue(
             tenant_db,
             exam_id,
             current_user,
+            scoped_ids,
         )
 
         sub_query: Dict[str, Any] = {"exam_id": exam_id}
