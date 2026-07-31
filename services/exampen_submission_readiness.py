@@ -40,6 +40,29 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _teacher_finalized_evaluation(evaluation: Dict[str, Any]) -> bool:
+    """Return whether a teacher has already made an audited mark decision.
+
+    Older mark-edit endpoints appended an override audit but left the original
+    AI ``manual_review_required`` bit unchanged. That bit is not allowed to
+    overrule a later explicit teacher decision.
+    """
+
+    if evaluation.get("teacher_reviewed") or str(
+        evaluation.get("teacher_review_status") or ""
+    ).lower() == "approved":
+        return True
+    for entry in reversed(evaluation.get("audit_trail") or []):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action") or "") in {
+            "score_override",
+            "criterion_marks_override",
+        } and str(entry.get("actor_id") or "").strip():
+            return True
+    return False
+
+
 def _minimum_question_score(question: Dict[str, Any]) -> float:
     """Return the immutable lower bound for one finalized question."""
 
@@ -365,7 +388,10 @@ async def assess_submission_readiness(
                     response_id=response_id,
                 )
             )
-        if evaluation.get("manual_review_required"):
+        if (
+            evaluation.get("manual_review_required")
+            and not _teacher_finalized_evaluation(evaluation)
+        ):
             blockers.append(
                 _blocker(
                     "evaluation_requires_review",

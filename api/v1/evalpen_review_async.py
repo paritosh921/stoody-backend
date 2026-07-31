@@ -2607,10 +2607,14 @@ async def override_evaluation_score(
         # response's canonical submission, even when the evaluation already
         # carries a student_id.
         eval_student_id = existing.get("student_id")
-        _resp_doc = await tenant_db["evalpen_detected_responses"].find_one(
-            {"response_id": existing.get("response_id", "")},
-            projection={"submission_id": 1, "student_id": 1},
-        )
+            _resp_doc = await tenant_db["evalpen_detected_responses"].find_one(
+                {"response_id": existing.get("response_id", "")},
+                projection={
+                    "submission_id": 1,
+                    "student_id": 1,
+                    "flags": 1,
+                },
+            )
         _sub_doc = None
         if _resp_doc:
             review_submission_id = str(_resp_doc.get("submission_id") or "")
@@ -2696,6 +2700,40 @@ async def override_evaluation_score(
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Score override operation failed",
+            )
+
+        teacher_reviewed_at = datetime.now(timezone.utc)
+        await tenant_db["evalpen_evaluations"].update_one(
+            {"evaluation_id": evaluation_id},
+            {
+                "$set": {
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                    "flags": _resolve_nonblocking_flags(existing.get("flags")),
+                    "teacher_review_status": "approved",
+                    "teacher_reviewed": True,
+                    "teacher_reviewed_by": actor_id,
+                    "teacher_reviewed_at": teacher_reviewed_at,
+                    "updated_at": teacher_reviewed_at,
+                }
+            },
+        )
+        if _resp_doc:
+            await tenant_db["evalpen_detected_responses"].update_one(
+                {"response_id": existing.get("response_id", "")},
+                {
+                    "$set": {
+                        "eval_status": "evaluated_teacher_reviewed",
+                        "manual_review_required": False,
+                        "manual_review_reason": None,
+                        "question_assignment.manual_review_required": False,
+                        "flags": _resolve_nonblocking_flags(_resp_doc.get("flags")),
+                        "teacher_review_status": "approved",
+                        "teacher_reviewed_by": actor_id,
+                        "teacher_reviewed_at": teacher_reviewed_at,
+                        "updated_at": teacher_reviewed_at,
+                    }
+                },
             )
 
         logger.info(
@@ -3120,7 +3158,11 @@ async def override_criterion_marks(
         eval_student_id = existing.get("student_id")
         response_doc = await tenant_db["evalpen_detected_responses"].find_one(
             {"response_id": existing.get("response_id", "")},
-            projection={"submission_id": 1, "student_id": 1},
+            projection={
+                "submission_id": 1,
+                "student_id": 1,
+                "flags": 1,
+            },
         )
         eval_student_id = eval_student_id or (response_doc or {}).get("student_id")
         submission_doc = None
@@ -3237,13 +3279,37 @@ async def override_criterion_marks(
                 detail="Criterion marks could not be updated; reload and try again",
             )
 
+        teacher_reviewed_at = datetime.now(timezone.utc)
+        await tenant_db["evalpen_evaluations"].update_one(
+            {"evaluation_id": evaluation_id},
+            {
+                "$set": {
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                    "flags": _resolve_nonblocking_flags(existing.get("flags")),
+                    "teacher_review_status": "approved",
+                    "teacher_reviewed": True,
+                    "teacher_reviewed_by": actor_id,
+                    "teacher_reviewed_at": teacher_reviewed_at,
+                    "updated_at": teacher_reviewed_at,
+                }
+            },
+        )
         await tenant_db["evalpen_detected_responses"].update_one(
             {"response_id": existing.get("response_id", "")},
             {
                 "$set": {
                     "eval_status": "evaluated_teacher_reviewed",
-                    "teacher_reviewed_at": datetime.now(timezone.utc),
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                    "question_assignment.manual_review_required": False,
+                    "flags": _resolve_nonblocking_flags(
+                        (response_doc or {}).get("flags")
+                    ),
+                    "teacher_review_status": "approved",
+                    "teacher_reviewed_at": teacher_reviewed_at,
                     "teacher_reviewed_by": actor_id,
+                    "updated_at": teacher_reviewed_at,
                 }
             },
         )
