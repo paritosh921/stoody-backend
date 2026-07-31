@@ -1178,6 +1178,127 @@ async def get_submission_summary(
         )
 
 
+_REVIEWABLE_READINESS_CODES = frozenset(
+    {
+        "document_coverage_requires_review",
+        "response_assignment_requires_review",
+        "evaluation_requires_review",
+    }
+)
+
+
+def _review_transition_from_readiness(
+    readiness: Dict[str, Any],
+    *,
+    now: datetime,
+) -> tuple[str, Dict[str, Any]]:
+    """Move a reviewed submission toward publication without publishing it."""
+
+    blocker_codes = {
+        str(item.get("code") or "")
+        for item in (readiness.get("blockers") or [])
+        if str(item.get("code") or "")
+    }
+    review_state = (
+        "ready"
+        if readiness.get("ready")
+        else "needs_review"
+        if blocker_codes and blocker_codes.issubset(_REVIEWABLE_READINESS_CODES)
+        else "blocked"
+    )
+    state_update: Dict[str, Any] = {
+        "review_state": review_state,
+        "publication_status": "ready" if readiness.get("ready") else "pending",
+        "updated_at": now,
+    }
+    return review_state, state_update
+
+
+def _resolve_review_flags(
+    raw_flags: Any,
+    *,
+    actor_id: str,
+    resolved_at: datetime,
+    reason: str,
+) -> List[Dict[str, Any]]:
+    """Resolve review flags consistently for every teacher override path."""
+
+    resolved: List[Dict[str, Any]] = []
+    for raw_flag in raw_flags or []:
+        if not isinstance(raw_flag, dict):
+            continue
+        resolved.append(
+            dict(raw_flag)
+            if is_flag_resolved(raw_flag)
+            else resolve_flag(
+                raw_flag,
+                actor_id=actor_id,
+                resolved_at=resolved_at,
+                reason=reason,
+            )
+        )
+    return resolved
+
+
+def _teacher_reviewed_response_fields(
+    response: Dict[str, Any],
+    *,
+    actor_id: str,
+    reviewed_at: datetime,
+    reason: str,
+) -> Dict[str, Any]:
+    """Build a review update that is safe for legacy response documents."""
+
+    fields: Dict[str, Any] = {
+        "eval_status": "evaluated_teacher_reviewed",
+        "manual_review_required": False,
+        "manual_review_reason": None,
+        "flags": _resolve_review_flags(
+            response.get("flags"),
+            actor_id=actor_id,
+            resolved_at=reviewed_at,
+            reason=reason,
+        ),
+        "teacher_review_status": "approved",
+        "teacher_reviewed_by": actor_id,
+        "teacher_reviewed_at": reviewed_at,
+        "updated_at": reviewed_at,
+    }
+    if isinstance(response.get("question_assignment"), dict):
+        fields["question_assignment.manual_review_required"] = False
+    return fields
+
+
+async def _refresh_unpublished_review_state(
+    tenant_db: Any,
+    submission_id: str,
+    *,
+    now: datetime,
+) -> tuple[str, Dict[str, Any], str]:
+    """Recompute readiness after a teacher edit without publishing the result."""
+
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    readiness = await assess_submission_readiness(tenant_db, submission_id)
+    review_state, state_update = _review_transition_from_readiness(
+        readiness,
+        now=now,
+    )
+    changed = await tenant_db["evalpen_submissions"].update_one(
+        {
+            "submission_id": submission_id,
+            "publication_status": {"$ne": "published"},
+        },
+        {"$set": state_update},
+    )
+    if changed.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The result was published while the review was being saved",
+        )
+    return review_state, readiness, str(state_update["publication_status"])
+
+
 @router.post(
     "/submissions/{submission_id}/document-review",
     summary="Confirm full answer-copy coverage review",
@@ -1272,59 +1393,34 @@ async def confirm_document_coverage_review(
     from services.exampen_submission_readiness import assess_submission_readiness
 
     readiness = await assess_submission_readiness(tenant_db, submission_id)
-    blocker_codes = {
-        str(item.get("code") or "") for item in (readiness.get("blockers") or [])
-    }
-    reviewable_codes = {
-        "response_assignment_requires_review",
-        "evaluation_requires_review",
-    }
-    review_state = (
-        "ready"
-        if readiness.get("ready")
-        else "needs_review"
-        if blocker_codes and blocker_codes.issubset(reviewable_codes)
-        else "blocked"
+    review_state, state_update = _review_transition_from_readiness(
+        readiness,
+        now=now,
     )
-    await tenant_db["evalpen_submissions"].update_one(
-        {"submission_id": submission_id},
-        {"$set": {"review_state": review_state, "updated_at": now}},
+    state_changed = await tenant_db["evalpen_submissions"].update_one(
+        {
+            "submission_id": submission_id,
+            "publication_status": {"$ne": "published"},
+        },
+        {"$set": state_update},
     )
-
-    publication: Optional[Dict[str, Any]] = None
-    publication_status: Optional[str] = None
-    if readiness.get("ready"):
-        try:
-            publication = await publish_submission(
-                submission_id=submission_id,
-                request=PublishRequest(
-                    note="Published after teacher confirmed full answer-copy coverage",
-                ),
-                current_user=current_user,
-                db=db,
-            )
-            publication_status = str(
-                publication.get("publication_status") or "published"
-            )
-        except HTTPException as exc:
-            if exc.status_code != status.HTTP_409_CONFLICT:
-                raise
-            latest_submission = await tenant_db["evalpen_submissions"].find_one(
-                {"submission_id": submission_id},
-                {"_id": 0, "publication_status": 1},
-            )
-            if str((latest_submission or {}).get("publication_status") or "") != "published":
-                raise
-            publication_status = "published"
+    if state_changed.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The result was published while this review was being confirmed",
+        )
+    publication_status = str(
+        state_update.get("publication_status")
+        or submission.get("publication_status")
+        or "pending"
+    )
 
     return {
         "submission_id": submission_id,
-        "review_state": (
-            "published" if publication_status == "published" else review_state
-        ),
+        "review_state": review_state,
         "document_review": accepted_review,
         "readiness": readiness,
-        "publication": publication,
+        "publication": None,
         "publication_status": publication_status,
     }
 
@@ -2613,6 +2709,7 @@ async def override_evaluation_score(
                 "submission_id": 1,
                 "student_id": 1,
                 "flags": 1,
+                "question_assignment": 1,
             },
         )
         _sub_doc = None
@@ -2709,7 +2806,12 @@ async def override_evaluation_score(
                 "$set": {
                     "manual_review_required": False,
                     "manual_review_reason": None,
-                    "flags": _resolve_nonblocking_flags(existing.get("flags")),
+                    "flags": _resolve_review_flags(
+                        existing.get("flags"),
+                        actor_id=str(actor_id),
+                        resolved_at=teacher_reviewed_at,
+                        reason=body.reason,
+                    ),
                     "teacher_review_status": "approved",
                     "teacher_reviewed": True,
                     "teacher_reviewed_by": actor_id,
@@ -2722,17 +2824,12 @@ async def override_evaluation_score(
             await tenant_db["evalpen_detected_responses"].update_one(
                 {"response_id": existing.get("response_id", "")},
                 {
-                    "$set": {
-                        "eval_status": "evaluated_teacher_reviewed",
-                        "manual_review_required": False,
-                        "manual_review_reason": None,
-                        "question_assignment.manual_review_required": False,
-                        "flags": _resolve_nonblocking_flags(_resp_doc.get("flags")),
-                        "teacher_review_status": "approved",
-                        "teacher_reviewed_by": actor_id,
-                        "teacher_reviewed_at": teacher_reviewed_at,
-                        "updated_at": teacher_reviewed_at,
-                    }
+                    "$set": _teacher_reviewed_response_fields(
+                        _resp_doc,
+                        actor_id=str(actor_id),
+                        reviewed_at=teacher_reviewed_at,
+                        reason=body.reason,
+                    )
                 },
             )
 
@@ -2779,12 +2876,27 @@ async def override_evaluation_score(
                     )
                 raise
 
+        review_state = None
+        readiness: Dict[str, Any] = {}
+        publication_status = str((_sub_doc or {}).get("publication_status") or "pending")
+        if publication_status != "published" and review_submission_id:
+            review_state, readiness, publication_status = (
+                await _refresh_unpublished_review_state(
+                    tenant_db,
+                    review_submission_id,
+                    now=teacher_reviewed_at,
+                )
+            )
+
         return {
             "evaluation_id": evaluation_id,
             "previous_score": old_score,
             "new_score": body.new_score,
             "actor_id": actor_id,
             "overridden_at": datetime.now(timezone.utc).isoformat(),
+            "review_state": review_state,
+            "readiness": readiness,
+            "publication_status": publication_status,
             **amendment,
         }
 
@@ -3028,66 +3140,27 @@ async def approve_evaluation_review(
     from services.exampen_submission_readiness import assess_submission_readiness
 
     readiness = await assess_submission_readiness(tenant_db, submission_id)
-    blocker_codes = {
-        str(item.get("code") or "")
-        for item in (readiness.get("blockers") or [])
-        if str(item.get("code") or "")
-    }
-    reviewable_codes = {
-        "document_coverage_requires_review",
-        "response_assignment_requires_review",
-        "evaluation_requires_review",
-    }
-    review_state = (
-        "ready"
-        if readiness.get("ready")
-        else "needs_review"
-        if blocker_codes and blocker_codes.issubset(reviewable_codes)
-        else "blocked"
+    review_state, state_update = _review_transition_from_readiness(
+        readiness,
+        now=now,
     )
-    await tenant_db["evalpen_submissions"].update_one(
-        {"submission_id": submission_id},
+    state_changed = await tenant_db["evalpen_submissions"].update_one(
         {
-            "$set": {
-                "review_state": review_state,
-                "updated_at": now,
-            }
+            "submission_id": submission_id,
+            "publication_status": {"$ne": "published"},
         },
+        {"$set": state_update},
     )
-
-    publication: Optional[Dict[str, Any]] = None
-    if readiness.get("ready"):
-        try:
-            publication = await publish_submission(
-                submission_id,
-                PublishRequest(
-                    note=(
-                        "Automatically published after the final teacher review "
-                        "was approved"
-                    )
-                ),
-                current_user=current_user,
-                db=db,
-            )
-        except HTTPException as exc:
-            latest_submission = await tenant_db["evalpen_submissions"].find_one(
-                {"submission_id": submission_id},
-                {"publication_status": 1, "published_at": 1, "published_by": 1},
-            )
-            if (
-                exc.status_code == status.HTTP_409_CONFLICT
-                and (latest_submission or {}).get("publication_status") == "published"
-            ):
-                publication = {
-                    "submission_id": submission_id,
-                    "publication_status": "published",
-                    "published_at": _dt_to_iso(
-                        (latest_submission or {}).get("published_at")
-                    ),
-                    "published_by": (latest_submission or {}).get("published_by"),
-                }
-            else:
-                raise
+    if state_changed.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The result was published while this review was being approved",
+        )
+    publication_status = str(
+        state_update.get("publication_status")
+        or (submission or {}).get("publication_status")
+        or "pending"
+    )
 
     return {
         "evaluation_id": evaluation_id,
@@ -3095,14 +3168,10 @@ async def approve_evaluation_review(
         "previous_score": previous_score,
         "new_score": new_score,
         "review_status": "approved",
-        "review_state": "published" if publication else review_state,
+        "review_state": review_state,
         "readiness": readiness,
-        "publication": publication,
-        "publication_status": (
-            publication.get("publication_status")
-            if publication
-            else (submission or {}).get("publication_status") or "pending"
-        ),
+        "publication": None,
+        "publication_status": publication_status,
         "awarded_full_marks": body.award_full_marks,
         "approved_at": now.isoformat(),
     }
@@ -3162,6 +3231,7 @@ async def override_criterion_marks(
                 "submission_id": 1,
                 "student_id": 1,
                 "flags": 1,
+                "question_assignment": 1,
             },
         )
         eval_student_id = eval_student_id or (response_doc or {}).get("student_id")
@@ -3286,7 +3356,12 @@ async def override_criterion_marks(
                 "$set": {
                     "manual_review_required": False,
                     "manual_review_reason": None,
-                    "flags": _resolve_nonblocking_flags(existing.get("flags")),
+                    "flags": _resolve_review_flags(
+                        existing.get("flags"),
+                        actor_id=str(actor_id),
+                        resolved_at=teacher_reviewed_at,
+                        reason=body.reason,
+                    ),
                     "teacher_review_status": "approved",
                     "teacher_reviewed": True,
                     "teacher_reviewed_by": actor_id,
@@ -3298,19 +3373,12 @@ async def override_criterion_marks(
         await tenant_db["evalpen_detected_responses"].update_one(
             {"response_id": existing.get("response_id", "")},
             {
-                "$set": {
-                    "eval_status": "evaluated_teacher_reviewed",
-                    "manual_review_required": False,
-                    "manual_review_reason": None,
-                    "question_assignment.manual_review_required": False,
-                    "flags": _resolve_nonblocking_flags(
-                        (response_doc or {}).get("flags")
-                    ),
-                    "teacher_review_status": "approved",
-                    "teacher_reviewed_at": teacher_reviewed_at,
-                    "teacher_reviewed_by": actor_id,
-                    "updated_at": teacher_reviewed_at,
-                }
+                "$set": _teacher_reviewed_response_fields(
+                    response_doc or {},
+                    actor_id=str(actor_id),
+                    reviewed_at=teacher_reviewed_at,
+                    reason=body.reason,
+                )
             },
         )
 
@@ -3352,12 +3420,29 @@ async def override_criterion_marks(
                     )
                 raise
 
+        review_state = None
+        readiness: Dict[str, Any] = {}
+        publication_status = str(
+            (submission_doc or {}).get("publication_status") or "pending"
+        )
+        if publication_status != "published" and review_submission_id:
+            review_state, readiness, publication_status = (
+                await _refresh_unpublished_review_state(
+                    tenant_db,
+                    review_submission_id,
+                    now=teacher_reviewed_at,
+                )
+            )
+
         return {
             "evaluation_id": evaluation_id,
             "total_score": updated["total_score"],
             "max_score": updated.get("max_score"),
             "criterion_marks": updated["criterion_marks"],
             "actor_id": actor_id,
+            "review_state": review_state,
+            "readiness": readiness,
+            "publication_status": publication_status,
             **amendment,
         }
     except HTTPException:

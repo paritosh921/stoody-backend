@@ -223,9 +223,6 @@ def _visible_exam_query_for_user(current_user: Dict[str, Any]) -> Dict[str, Any]
         "$or": [
             {"created_by_tutor_id": tutor_id},
             {"teacher_ids": tutor_id},
-            {"teacher_ids": []},
-            {"teacher_ids": None},
-            {"teacher_ids": {"$exists": False}},
         ]
     }
 
@@ -320,20 +317,26 @@ async def list_exams(
                 {"exam_mode": "dcr"},
             ],
         }
-        # Tutor scoping: match existing document visibility model —
-        # tutors see docs mapped to them OR docs open to all tutors
-        # (teacher_ids is empty, null, or missing).
+        # Tutor scoping is explicit. A tutor sees papers assigned to them or
+        # legacy papers they personally created/uploaded; missing ownership is
+        # not interpreted as tenant-wide access.
         if current_user.get("user_type") == "tutor":
-            tutor_id = current_user.get("tutor_id") or current_user.get("user_id")
-            if tutor_id:
+            actor_ids = list(dict.fromkeys(
+                str(value)
+                for value in (
+                    current_user.get("tutor_id"),
+                    current_user.get("user_id"),
+                )
+                if value
+            ))
+            if actor_ids:
                 doc_query = {
                     "$and": [
                         doc_query,
                         {"$or": [
-                            {"teacher_ids": {"$in": [str(tutor_id)]}},
-                            {"teacher_ids": []},
-                            {"teacher_ids": None},
-                            {"teacher_ids": {"$exists": False}},
+                            {"teacher_ids": {"$in": actor_ids}},
+                            {"uploaded_by": {"$in": actor_ids}},
+                            {"created_by": {"$in": actor_ids}},
                         ]},
                     ]
                 }
@@ -475,10 +478,8 @@ async def list_exams(
         sub_query: Dict[str, Any] = {}
         if scoped_ids is not None:
             visible_exam_ids = list(active_exam_map.keys())
-            if visible_exam_ids:
-                sub_query["exam_id"] = {"$in": visible_exam_ids}
-            else:
-                sub_query["exam_id"] = {"$in": []}
+            sub_query["exam_id"] = {"$in": visible_exam_ids}
+            sub_query["student_id"] = {"$in": scoped_ids}
 
         submissions_cursor = tenant_db["evalpen_submissions"].find(
             sub_query,
@@ -782,8 +783,7 @@ async def get_exam_queue(
 
         sub_query: Dict[str, Any] = {"exam_id": exam_id}
         if scoped_ids is not None:
-            if not has_visible_exam_doc:
-                sub_query["student_id"] = {"$in": scoped_ids}
+            sub_query["student_id"] = {"$in": scoped_ids}
 
         submissions_cursor = tenant_db["evalpen_submissions"].find(
             sub_query,

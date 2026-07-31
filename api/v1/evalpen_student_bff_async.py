@@ -120,6 +120,7 @@ class QuestionScoreItem(BaseModel):
 
     question_id: str
     question_number: Optional[int] = None
+    question_text: Optional[str] = None
     score: float = 0.0
     max_score: float = 0.0
     feedback: Optional[str] = None
@@ -337,7 +338,12 @@ async def _get_pcr_question_catalog(
         return []
     cursor = tenant_db["evalpen_questions"].find(
         {"exam_id": exam_id},
-        projection={"question_id": 1, "question_number": 1, "max_marks": 1},
+        projection={
+            "question_id": 1,
+            "question_number": 1,
+            "question_text": 1,
+            "max_marks": 1,
+        },
     ).sort([("question_number", 1), ("question_id", 1)])
     docs = await cursor.to_list(length=1000)
     catalog: List[Dict[str, Any]] = []
@@ -350,6 +356,9 @@ async def _get_pcr_question_catalog(
             {
                 "question_id": question_id,
                 "question_number": _safe_question_number(number),
+                "question_text": _student_safe_text(
+                    doc.get("question_text"), limit=4000
+                ),
                 "max_marks": _safe_marks(doc.get("max_marks")),
             }
         )
@@ -800,6 +809,7 @@ async def get_student_exam_scores(
                         QuestionScoreItem(
                             question_id=question_id,
                             question_number=question["question_number"],
+                            question_text=question.get("question_text"),
                             score=result["score"],
                             max_score=question["max_marks"],
                             feedback=result["feedback"],
@@ -856,6 +866,7 @@ async def get_student_exam_scores(
                 projection={
                     "question_id": 1,
                     "question_number": 1,
+                    "question_text": 1,
                     "score": 1,
                     "max_score": 1,
                 },
@@ -870,6 +881,9 @@ async def get_student_exam_scores(
                     QuestionScoreItem(
                         question_id=doc.get("question_id", ""),
                         question_number=_safe_question_number(doc.get("question_number")),
+                        question_text=_student_safe_text(
+                            doc.get("question_text"), limit=4000
+                        ),
                         score=q_score,
                         max_score=q_max,
                         feedback=None,

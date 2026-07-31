@@ -866,19 +866,19 @@ async def _ready_for_eval_issues(tenant_db: Any, exam_doc: Dict[str, Any]) -> Li
 def _is_exam_visible_to_tutor(
     exam_doc: Dict[str, Any], tutor_id: str
 ) -> bool:
-    """Tutor visibility rule (matches prepared-document teacher_ids model).
+    """Return whether an exam is explicitly owned by or assigned to a tutor.
 
     Visible iff:
       - tutor created the exam (created_by_tutor_id matches), OR
-      - tutor is listed in teacher_ids, OR
-      - teacher_ids is empty / None / missing (open to all tutors)
+      - tutor is explicitly listed in teacher_ids.
+
+    Empty legacy ownership is deliberately admin-only. Treating missing
+    teacher_ids as public exposed one teacher's sessions to every tutor.
     """
     if exam_doc.get("created_by_tutor_id") == tutor_id:
         return True
 
     teacher_ids = exam_doc.get("teacher_ids")
-    if not teacher_ids:
-        return True
     if isinstance(teacher_ids, list) and tutor_id in teacher_ids:
         return True
     return False
@@ -967,19 +967,38 @@ async def create_exam(
     raw_teachers = source_document.get("teacher_ids") or []
     derived_teacher_ids = [str(t) for t in raw_teachers] if isinstance(raw_teachers, list) else []
 
-    # Tutor safety: a tutor may only create an exam from a prepared document
-    # whose teacher_ids is empty/open or explicitly lists the tutor. Admins
-    # and b2c_admin bypass this check.
+    # Tutor safety: a tutor may only create an exam from a paper explicitly
+    # assigned to them or one they own. Missing teacher_ids is not tenant-wide
+    # visibility; an owned legacy paper is normalized to an explicit assignment.
     created_by_tutor_id = _current_tutor_id(current_user)
-    if (
-        created_by_tutor_id is not None
-        and derived_teacher_ids
-        and created_by_tutor_id not in derived_teacher_ids
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Prepared document is not assigned to this tutor",
-        )
+    if created_by_tutor_id is not None:
+        actor_ids = {
+            str(value)
+            for value in (
+                created_by_tutor_id,
+                current_user.get("tutor_id"),
+                current_user.get("user_id"),
+            )
+            if value
+        }
+        document_owner_ids = {
+            str(value)
+            for value in (
+                source_document.get("uploaded_by"),
+                source_document.get("created_by"),
+                source_document.get("created_by_tutor_id"),
+            )
+            if value
+        }
+        explicitly_assigned = bool(actor_ids.intersection(derived_teacher_ids))
+        owns_document = bool(actor_ids.intersection(document_owner_ids))
+        if not explicitly_assigned and not owns_document:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Prepared document is not assigned to this tutor",
+            )
+        if not derived_teacher_ids:
+            derived_teacher_ids = [created_by_tutor_id]
 
     # Fallback admin_id when the prepared document predates owner metadata.
     if derived_admin_id is None:
@@ -1346,16 +1365,13 @@ async def list_exams(
             )
         query["lifecycle_state"] = lifecycle_filter
 
-    # Tutor visibility: only exams they created, are listed in teacher_ids,
-    # or that have empty/missing teacher_ids.
+    # Tutor visibility is explicit. Legacy exams with no owner remain visible
+    # to admins only until an administrator assigns them.
     tutor_id = _current_tutor_id(current_user)
     if tutor_id is not None:
         query["$or"] = [
             {"created_by_tutor_id": tutor_id},
             {"teacher_ids": tutor_id},
-            {"teacher_ids": []},
-            {"teacher_ids": None},
-            {"teacher_ids": {"$exists": False}},
         ]
 
     cursor = collection.find(query).sort("created_at", -1)
