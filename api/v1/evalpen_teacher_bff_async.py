@@ -86,6 +86,7 @@ class ExamSummaryItem(BaseModel):
     evaluated_count: int = 0
     blocked_count: int = 0
     published_count: int = 0
+    open_recheck_count: int = 0
     # Prepared-exam fields (from finalized documents)
     status: str = "active"  # "prepared" | "active"
     exam_mode: Optional[str] = None  # "dcr" | "pcr" | None
@@ -486,6 +487,36 @@ async def list_exams(
                 question_count=prepared_meta.get("question_count", 0),
             )
 
+        async def _attach_open_recheck_counts(
+            exam_items: List[ExamSummaryItem],
+        ) -> List[ExamSummaryItem]:
+            """Attach actionable request counts without changing exam visibility."""
+            visible_exam_ids = [
+                item.exam_id for item in exam_items if item.status == "active"
+            ]
+            if not visible_exam_ids:
+                return exam_items
+
+            match: Dict[str, Any] = {
+                "exam_id": {"$in": visible_exam_ids},
+                "status": {"$in": ["open", "under_review"]},
+            }
+            if scoped_ids is not None:
+                match["student_id"] = {"$in": scoped_ids}
+
+            count_docs = await tenant_db["evalpen_recheck_requests"].aggregate([
+                {"$match": match},
+                {"$group": {"_id": "$exam_id", "count": {"$sum": 1}}},
+            ]).to_list(length=5000)
+            count_by_exam = {
+                str(doc["_id"]): int(doc.get("count", 0))
+                for doc in count_docs
+                if doc.get("_id")
+            }
+            for item in exam_items:
+                item.open_recheck_count = count_by_exam.get(item.exam_id, 0)
+            return exam_items
+
         # ----- Fetch submissions (tutor-scoped) -----
         sub_query: Dict[str, Any] = {}
         if scoped_ids is not None:
@@ -529,7 +560,9 @@ async def list_exams(
                 ),
                 reverse=True,
             )
-            return ExamListResponse(items=items)
+            return ExamListResponse(
+                items=await _attach_open_recheck_counts(items),
+            )
 
         # ----- Group submissions by exam_id -----
         # exam_id -> list of submission dicts
@@ -741,7 +774,9 @@ async def list_exams(
             reverse=True,
         )
 
-        return ExamListResponse(items=items)
+        return ExamListResponse(
+            items=await _attach_open_recheck_counts(items),
+        )
 
     except HTTPException:
         raise

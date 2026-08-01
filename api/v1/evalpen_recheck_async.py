@@ -55,6 +55,7 @@ class RecheckItem(BaseModel):
     exam_id: str
     student_id: str
     question_id: str
+    question_number: Optional[int] = None
     submission_id: str
     status: str
     reason: str
@@ -66,6 +67,8 @@ class RecheckItem(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
+    assigned_to: Optional[str] = None
+    review_started_at: Optional[datetime] = None
 
 
 class RecheckListResponse(BaseModel):
@@ -78,6 +81,7 @@ def _public_item(document: Dict[str, Any]) -> RecheckItem:
         exam_id=str(document.get("exam_id") or ""),
         student_id=str(document.get("student_id") or ""),
         question_id=str(document.get("question_id") or ""),
+        question_number=document.get("question_number"),
         submission_id=str(document.get("submission_id") or ""),
         status=str(document.get("status") or "open"),
         reason=str(document.get("reason") or ""),
@@ -89,6 +93,8 @@ def _public_item(document: Dict[str, Any]) -> RecheckItem:
         created_at=document.get("created_at") or datetime.now(timezone.utc),
         updated_at=document.get("updated_at"),
         resolved_at=document.get("resolved_at"),
+        assigned_to=document.get("assigned_to"),
+        review_started_at=document.get("review_started_at"),
     )
 
 
@@ -198,6 +204,7 @@ async def create_recheck_request(
         "student_id": student_id,
         "submission_id": submission_id,
         "question_id": question_id,
+        "question_number": score_row.get("question_number"),
         "evaluation_id": evaluation_id,
         "status": "open",
         "reason": body.reason.strip(),
@@ -267,6 +274,71 @@ async def list_recheck_requests(
     return RecheckListResponse(items=[_public_item(item) for item in documents])
 
 
+@router.post("/requests/{request_id}/claim", response_model=RecheckItem)
+async def claim_recheck_request(
+    request_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> RecheckItem:
+    """Claim a request so two teachers cannot independently resolve it."""
+    tenant_db = await _get_tenant_db(db, current_user)
+    collection = tenant_db["evalpen_recheck_requests"]
+    await _ensure_indexes(collection)
+    request_document = await collection.find_one({"request_id": request_id})
+    if request_document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Recheck request not found",
+        )
+
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    _check_student_in_scope(str(request_document.get("student_id") or ""), scoped_ids)
+    request_status = str(request_document.get("status") or "open")
+    if request_status in RESOLVED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This recheck request is already resolved",
+        )
+
+    actor_id = str(current_user.get("user_id") or "unknown")
+    assigned_to = str(request_document.get("assigned_to") or "")
+    if request_status == "under_review" and assigned_to:
+        if assigned_to != actor_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another teacher is reviewing this request",
+            )
+        return _public_item(request_document)
+
+    now = datetime.now(timezone.utc)
+    claimed = await collection.find_one_and_update(
+        {
+            "request_id": request_id,
+            "status": {"$in": list(OPEN_STATUSES)},
+            "$or": [
+                {"assigned_to": {"$exists": False}},
+                {"assigned_to": None},
+                {"assigned_to": actor_id},
+            ],
+        },
+        {
+            "$set": {
+                "status": "under_review",
+                "assigned_to": actor_id,
+                "review_started_at": now,
+                "updated_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if claimed is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another teacher claimed this request",
+        )
+    return _public_item(claimed)
+
+
 @router.post("/requests/{request_id}/resolve", response_model=RecheckItem)
 async def resolve_recheck_request(
     request_id: str,
@@ -298,6 +370,18 @@ async def resolve_recheck_request(
     if str(request_document.get("status") or "") in RESOLVED_STATUSES:
         return _public_item(request_document)
 
+    actor_id = str(current_user.get("user_id") or "unknown")
+    assigned_to = str(request_document.get("assigned_to") or "")
+    if (
+        str(request_document.get("status") or "") == "under_review"
+        and assigned_to
+        and assigned_to != actor_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another teacher is reviewing this request",
+        )
+
     original_max = float(request_document.get("original_max_score") or 0.0)
     if body.updated_max_score is not None and abs(body.updated_max_score - original_max) > 1e-9:
         raise HTTPException(
@@ -317,10 +401,21 @@ async def resolve_recheck_request(
             "request_id": request_id,
             "status": {"$in": list(OPEN_STATUSES)},
             "resolution_lock": {"$exists": False},
+            "$or": [
+                {"status": "open"},
+                {"assigned_to": actor_id},
+                {"assigned_to": {"$exists": False}},
+                {"assigned_to": None},
+            ],
         },
         {
             "$set": {
                 "status": "under_review",
+                "assigned_to": actor_id,
+                "review_started_at": (
+                    request_document.get("review_started_at")
+                    or datetime.now(timezone.utc)
+                ),
                 "resolution_lock": lock_token,
                 "updated_at": datetime.now(timezone.utc),
             }
