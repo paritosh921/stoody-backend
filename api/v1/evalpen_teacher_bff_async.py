@@ -41,7 +41,7 @@ from api.v1.exam_orch_async import (
     _is_exam_visible_to_tutor,
     _is_tutor_admin_role,
 )
-from utils.tutor_scoping import get_tutor_scoped_students
+from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
 from services.exampen_submission_readiness import (
     assess_submissions_readiness,
     readiness_message,
@@ -214,6 +214,7 @@ async def _get_tutor_scoped_student_ids(
 def _visible_exam_query_for_user(
     current_user: Dict[str, Any],
     scoped_student_ids: Optional[List[str]] = None,
+    visible_prepared_document_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Return the ExamPen exam visibility query for the current actor."""
     if _is_tutor_admin_role(current_user):
@@ -229,6 +230,10 @@ def _visible_exam_query_for_user(
     ]
     if scoped_student_ids:
         visibility.append({"roster": {"$in": scoped_student_ids}})
+    if visible_prepared_document_ids:
+        visibility.append({
+            "prepared_document_id": {"$in": visible_prepared_document_ids}
+        })
     return {"$or": visibility}
 
 
@@ -261,6 +266,7 @@ async def _require_exam_visible_or_legacy_student_scope(
             "created_by_tutor_id": 1,
             "teacher_ids": 1,
             "roster": 1,
+            "prepared_document_id": 1,
         },
     )
     if exam_doc is None:
@@ -271,11 +277,38 @@ async def _require_exam_visible_or_legacy_student_scope(
         if student_id
     }
     scoped = {str(student_id) for student_id in (scoped_student_ids or []) if student_id}
-    if not _is_exam_visible_to_tutor(exam_doc, tutor_id) and not roster.intersection(scoped):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Exam is not visible to this tutor",
+    if _is_exam_visible_to_tutor(exam_doc, tutor_id) or roster.intersection(scoped):
+        return True
+
+    prepared_document_id = str(exam_doc.get("prepared_document_id") or "").strip()
+    if prepared_document_id:
+        source_document = await tenant_db["documents"].find_one(
+            {"document_id": prepared_document_id}
         )
+        tutor_doc = await tenant_db["tutors"].find_one(
+            {"tutor_id": str(tutor_id)}
+        )
+        actor_ids = [
+            str(value)
+            for value in (
+                current_user.get("tutor_id"),
+                current_user.get("teacher_id"),
+                current_user.get("user_id"),
+            )
+            if value
+        ]
+        if source_document and tutor_can_access_document(
+            tutor_doc or {},
+            source_document,
+            tutor_id=str(tutor_id),
+            actor_ids=actor_ids,
+        ):
+            return True
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Exam is not visible to this tutor",
+    )
     return True
 
 
@@ -323,6 +356,21 @@ async def list_exams(
         # teachers can see every exam they have prepared.
         prepared_items: List[ExamSummaryItem] = []
         prepared_doc_meta: Dict[str, Dict[str, Any]] = {}
+        tutor_doc: Dict[str, Any] = {}
+        tutor_id = _current_tutor_id(current_user)
+        actor_ids = [
+            str(value)
+            for value in (
+                current_user.get("tutor_id"),
+                current_user.get("teacher_id"),
+                current_user.get("user_id"),
+            )
+            if value
+        ]
+        if tutor_id is not None:
+            tutor_doc = await tenant_db["tutors"].find_one(
+                {"tutor_id": str(tutor_id)}
+            ) or {}
 
         doc_query: Dict[str, Any] = {
             "$or": [
@@ -330,30 +378,6 @@ async def list_exams(
                 {"exam_mode": "dcr"},
             ],
         }
-        # Tutor scoping is explicit. A tutor sees papers assigned to them or
-        # legacy papers they personally created/uploaded; missing ownership is
-        # not interpreted as tenant-wide access.
-        if current_user.get("user_type") == "tutor":
-            actor_ids = list(dict.fromkeys(
-                str(value)
-                for value in (
-                    current_user.get("tutor_id"),
-                    current_user.get("user_id"),
-                )
-                if value
-            ))
-            if actor_ids:
-                doc_query = {
-                    "$and": [
-                        doc_query,
-                        {"$or": [
-                            {"teacher_ids": {"$in": actor_ids}},
-                            {"uploaded_by": {"$in": actor_ids}},
-                            {"created_by": {"$in": actor_ids}},
-                        ]},
-                    ]
-                }
-
         doc_cursor = tenant_db["documents"].find(
             doc_query,
             projection={
@@ -361,9 +385,28 @@ async def list_exams(
                 "title": 1,
                 "exam_mode": 1,
                 "exam_finalized_at": 1,
+                "teacher_ids": 1,
+                "uploaded_by": 1,
+                "created_by": 1,
+                "created_by_tutor_id": 1,
+                "standard": 1,
+                "grade": 1,
+                "subject": 1,
+                "section": 1,
             },
         )
         finalized_docs = await doc_cursor.to_list(length=5000)
+        if tutor_id is not None:
+            finalized_docs = [
+                document
+                for document in finalized_docs
+                if tutor_can_access_document(
+                    tutor_doc,
+                    document,
+                    tutor_id=str(tutor_id),
+                    actor_ids=actor_ids,
+                )
+            ]
 
         # Get live question counts per document_id (avoids stale
         # extracted_questions_count which drifts after edits).
@@ -421,7 +464,11 @@ async def list_exams(
                 )
 
         # ----- Fetch orchestration exams even before submissions exist -----
-        active_exam_query = _visible_exam_query_for_user(current_user, scoped_ids)
+        active_exam_query = _visible_exam_query_for_user(
+            current_user,
+            scoped_ids,
+            finalized_doc_ids,
+        )
 
         active_exam_docs = await tenant_db["exampen_exams"].find(
             active_exam_query,

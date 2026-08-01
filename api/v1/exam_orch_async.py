@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
 
 logger = logging.getLogger(__name__)
 
@@ -905,8 +906,6 @@ async def _require_tutor_visibility(
         return
 
     from bson import ObjectId
-    from utils.tutor_scoping import get_tutor_scoped_students
-
     try:
         admin_oid = ObjectId(current_user.get("admin_id"))
     except Exception:
@@ -930,6 +929,31 @@ async def _require_tutor_visibility(
     }
     if exam_roster.intersection(scoped_student_ids):
         return
+
+    prepared_document_id = str(exam_doc.get("prepared_document_id") or "").strip()
+    if prepared_document_id:
+        source_document = await db.mongo_find_one(
+            "documents", {"document_id": prepared_document_id}
+        )
+        tutor_doc = await db.mongo_find_one(
+            "tutors", {"tutor_id": str(tutor_id)}
+        )
+        actor_ids = [
+            str(value)
+            for value in (
+                current_user.get("tutor_id"),
+                current_user.get("teacher_id"),
+                current_user.get("user_id"),
+            )
+            if value
+        ]
+        if source_document and tutor_can_access_document(
+            tutor_doc or {},
+            source_document,
+            tutor_id=str(tutor_id),
+            actor_ids=actor_ids,
+        ):
+            return
 
     if not _is_exam_visible_to_tutor(exam_doc, tutor_id):
         raise HTTPException(
@@ -999,35 +1023,33 @@ async def create_exam(
     raw_teachers = source_document.get("teacher_ids") or []
     derived_teacher_ids = [str(t) for t in raw_teachers] if isinstance(raw_teachers, list) else []
 
-    # Tutor safety: a tutor may only create an exam from a paper explicitly
-    # assigned to them or one they own. Missing teacher_ids is not tenant-wide
-    # visibility; an owned legacy paper is normalized to an explicit assignment.
+    # Tutor safety uses the same canonical rule as the teacher dashboard:
+    # explicit assignment/ownership first, then class-scoped sharing for an
+    # unassigned institute paper. Missing teacher_ids alone is never public.
     created_by_tutor_id = _current_tutor_id(current_user)
     if created_by_tutor_id is not None:
-        actor_ids = {
+        actor_ids = [
             str(value)
             for value in (
                 created_by_tutor_id,
                 current_user.get("tutor_id"),
+                current_user.get("teacher_id"),
                 current_user.get("user_id"),
             )
             if value
-        }
-        document_owner_ids = {
-            str(value)
-            for value in (
-                source_document.get("uploaded_by"),
-                source_document.get("created_by"),
-                source_document.get("created_by_tutor_id"),
-            )
-            if value
-        }
-        explicitly_assigned = bool(actor_ids.intersection(derived_teacher_ids))
-        owns_document = bool(actor_ids.intersection(document_owner_ids))
-        if not explicitly_assigned and not owns_document:
+        ]
+        tutor_doc = await db.mongo_find_one(
+            "tutors", {"tutor_id": str(created_by_tutor_id)}
+        )
+        if not tutor_can_access_document(
+            tutor_doc or {},
+            source_document,
+            tutor_id=str(created_by_tutor_id),
+            actor_ids=actor_ids,
+        ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Prepared document is not assigned to this tutor",
+                detail="Prepared document is outside this tutor's teaching scope",
             )
         if not derived_teacher_ids:
             derived_teacher_ids = [created_by_tutor_id]

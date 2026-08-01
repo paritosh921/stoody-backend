@@ -230,3 +230,144 @@ async def get_tutor_scoped_students(
             result.append(s)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Finalized paper visibility
+# ---------------------------------------------------------------------------
+
+def _normalise_scope_value(value: Any, *, standard: bool = False) -> str:
+    """Return a stable comparison value for academic ownership fields."""
+    normalised = " ".join(str(value or "").strip().lower().split())
+    if standard:
+        for prefix in ("class ", "grade ", "standard "):
+            if normalised.startswith(prefix):
+                normalised = normalised[len(prefix):].strip()
+                break
+    return normalised
+
+
+def _document_matches_assignment(
+    document: Dict[str, Any],
+    *,
+    standard: Any,
+    sections: Any = None,
+    subjects: Any = None,
+) -> bool:
+    """Match an unassigned institute paper to one teaching assignment.
+
+    Class is mandatory for implicit sharing. Subject restrictions are enforced
+    when the assignment contains subjects, while a paper without a section is
+    treated as class-wide. This keeps the fallback useful for admin-created
+    papers without turning a missing ``teacher_ids`` field into tenant-wide
+    access.
+    """
+    assignment_standard = _normalise_scope_value(standard, standard=True)
+    document_standard = _normalise_scope_value(
+        document.get("standard") or document.get("grade"),
+        standard=True,
+    )
+    if not assignment_standard or document_standard != assignment_standard:
+        return False
+
+    assignment_subjects = {
+        _normalise_scope_value(value)
+        for value in _subject_values(subjects)
+        if _normalise_scope_value(value)
+    }
+    document_subject = _normalise_scope_value(document.get("subject"))
+    if assignment_subjects and (
+        not document_subject or document_subject not in assignment_subjects
+    ):
+        return False
+
+    assignment_sections = {
+        _normalise_scope_value(value)
+        for value in _subject_values(sections)
+        if _normalise_scope_value(value)
+    }
+    document_section = _normalise_scope_value(document.get("section"))
+    if document_section and assignment_sections and document_section not in assignment_sections:
+        return False
+
+    return True
+
+
+def tutor_can_access_document(
+    tutor_doc: Dict[str, Any],
+    document: Dict[str, Any],
+    *,
+    tutor_id: str,
+    actor_ids: Optional[List[str]] = None,
+) -> bool:
+    """Return whether a tutor may use a finalized paper.
+
+    Resolution order is deliberate:
+      1. Papers explicitly assigned to or owned by the tutor are visible.
+      2. Papers explicitly assigned to another teacher are not shared.
+      3. Unassigned institute papers are visible only through a matching
+         class/subject/section teaching assignment.
+    """
+    identities = {
+        str(value)
+        for value in ([tutor_id] + list(actor_ids or []))
+        if value
+    }
+    teacher_ids = {
+        str(value)
+        for value in (document.get("teacher_ids") or [])
+        if value
+    }
+    owner_ids = {
+        str(value)
+        for value in (
+            document.get("uploaded_by"),
+            document.get("created_by"),
+            document.get("created_by_tutor_id"),
+        )
+        if value
+    }
+
+    if identities.intersection(teacher_ids) or identities.intersection(owner_ids):
+        return True
+    if teacher_ids:
+        return False
+
+    assignments = tutor_doc.get("teaching_assignments") or []
+    assignment_with_class = False
+    for assignment in assignments:
+        standard = assignment.get("standard") or assignment.get("grade")
+        if not standard:
+            continue
+        assignment_with_class = True
+        subjects = _subject_values(assignment.get("subject")) + _subject_values(
+            assignment.get("subjects")
+        )
+        if _document_matches_assignment(
+            document,
+            standard=standard,
+            sections=assignment.get("sections") or assignment.get("section"),
+            subjects=subjects,
+        ):
+            return True
+    if assignment_with_class:
+        return False
+
+    class_teacher_of = tutor_doc.get("class_teacher_of") or {}
+    if class_teacher_of.get("standard") or class_teacher_of.get("grade"):
+        return _document_matches_assignment(
+            document,
+            standard=class_teacher_of.get("standard") or class_teacher_of.get("grade"),
+            sections=class_teacher_of.get("section"),
+        )
+
+    standards = tutor_doc.get("standards") or []
+    for standard in standards:
+        if _document_matches_assignment(
+            document,
+            standard=standard,
+            sections=tutor_doc.get("sections"),
+            subjects=tutor_doc.get("subjects"),
+        ):
+            return True
+    return False
