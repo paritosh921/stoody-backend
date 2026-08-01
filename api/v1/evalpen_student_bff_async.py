@@ -126,6 +126,8 @@ class QuestionScoreItem(BaseModel):
     feedback: Optional[str] = None
     eval_type: str = "pcr"  # "pcr" or "dcr"
     answer_state: Optional[str] = None
+    student_answer: Optional[str] = None
+    answer_pages: List[int] = Field(default_factory=list)
     mark_breakdown: List[StudentMarkBreakdownItem] = Field(default_factory=list)
     reference_answer: Optional[str] = None
     teacher_feedback: Optional[str] = None
@@ -736,10 +738,30 @@ async def get_student_exam_scores(
             }
             evaluated_by_question: Dict[str, Dict[str, Any]] = {}
             legacy_evaluations: List[Dict[str, Any]] = []
+            answer_evidence_by_question: Dict[str, Dict[str, Any]] = {}
 
             for resp in responses:
                 response_id = resp.get("response_id", "")
                 question_id = str(resp.get("question_id") or "")
+                if question_id:
+                    evidence = answer_evidence_by_question.setdefault(
+                        question_id,
+                        {"texts": [], "pages": set()},
+                    )
+                    detected_text = _student_safe_text(
+                        resp.get("detected_text"), limit=5000
+                    )
+                    if detected_text and detected_text not in evidence["texts"]:
+                        evidence["texts"].append(detected_text)
+                    for region in resp.get("source_pages") or []:
+                        if not isinstance(region, Mapping):
+                            continue
+                        try:
+                            page_number = int(region.get("page_number") or 0)
+                        except (TypeError, ValueError):
+                            page_number = 0
+                        if page_number > 0:
+                            evidence["pages"].add(page_number)
                 ev = await eval_repo.get_evaluation_by_response(response_id)
                 if not ev:
                     continue
@@ -749,6 +771,10 @@ async def get_student_exam_scores(
                     "feedback": _student_safe_text(ev.get("overall_feedback")),
                     "answer_state": resp.get("answer_state")
                     or ("not_attempted" if resp.get("is_missing_response") else "detected"),
+                    "student_answer": detected_text,
+                    "answer_pages": sorted(
+                        answer_evidence_by_question.get(question_id, {}).get("pages", set())
+                    ),
                     "mark_breakdown": _student_mark_breakdown(ev),
                     "reference_answer": _student_safe_text(
                         ev.get("reference_solution"), limit=5000
@@ -778,6 +804,19 @@ async def get_student_exam_scores(
                         "max_score": _safe_marks(row.get("max_score")),
                         "feedback": _student_safe_text(row.get("overall_feedback")),
                         "answer_state": row.get("answer_state") or "detected",
+                        "student_answer": _student_safe_text(
+                            "\n\n".join(
+                                answer_evidence_by_question.get(
+                                    str(row.get("question_id") or ""), {}
+                                ).get("texts", [])
+                            ),
+                            limit=10000,
+                        ),
+                        "answer_pages": sorted(
+                            answer_evidence_by_question.get(
+                                str(row.get("question_id") or ""), {}
+                            ).get("pages", set())
+                        ),
                         "mark_breakdown": _student_mark_breakdown(row),
                         "reference_answer": _student_safe_text(
                             row.get("reference_solution"), limit=5000
@@ -815,6 +854,8 @@ async def get_student_exam_scores(
                             feedback=result["feedback"],
                             eval_type="pcr",
                             answer_state=result["answer_state"],
+                            student_answer=result.get("student_answer"),
+                            answer_pages=result.get("answer_pages") or [],
                             mark_breakdown=result["mark_breakdown"],
                             reference_answer=result["reference_answer"],
                             teacher_feedback=result["teacher_feedback"],
@@ -843,6 +884,8 @@ async def get_student_exam_scores(
                             feedback=result["feedback"],
                             eval_type="pcr",
                             answer_state=result["answer_state"],
+                            student_answer=result.get("student_answer"),
+                            answer_pages=result.get("answer_pages") or [],
                             mark_breakdown=result["mark_breakdown"],
                             reference_answer=result["reference_answer"],
                             teacher_feedback=result["teacher_feedback"],
@@ -869,6 +912,9 @@ async def get_student_exam_scores(
                     "question_text": 1,
                     "score": 1,
                     "max_score": 1,
+                    "selected_answer": 1,
+                    "student_answer": 1,
+                    "detected_text": 1,
                 },
             )
             dcr_docs = await dcr_cursor.to_list(length=5000)
@@ -888,6 +934,12 @@ async def get_student_exam_scores(
                         max_score=q_max,
                         feedback=None,
                         eval_type="dcr",
+                        student_answer=_student_safe_text(
+                            doc.get("student_answer")
+                            or doc.get("selected_answer")
+                            or doc.get("detected_text"),
+                            limit=10000,
+                        ),
                         recheck_status=recheck_by_question.get(
                             str(doc.get("question_id") or "")
                         ),
