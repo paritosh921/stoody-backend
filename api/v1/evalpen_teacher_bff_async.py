@@ -427,6 +427,7 @@ async def list_exams(
             active_exam_query,
             projection={
                 "exam_id": 1,
+                "title": 1,
                 "exam_type": 1,
                 "lifecycle_state": 1,
                 "prepared_document_id": 1,
@@ -440,6 +441,19 @@ async def list_exams(
             for doc in active_exam_docs
             if doc.get("exam_id")
         }
+
+        active_exam_ids = list(active_exam_map.keys())
+        session_question_counts: Dict[str, int] = {}
+        if active_exam_ids:
+            session_question_count_docs = await tenant_db["evalpen_questions"].aggregate([
+                {"$match": {"exam_id": {"$in": active_exam_ids}}},
+                {"$group": {"_id": "$exam_id", "count": {"$sum": 1}}},
+            ]).to_list(length=5000)
+            session_question_counts = {
+                str(item["_id"]): int(item.get("count", 0))
+                for item in session_question_count_docs
+                if item.get("_id")
+            }
 
         def _build_active_exam_item(
             exam_id: str,
@@ -461,6 +475,7 @@ async def list_exams(
             )
             title = (
                 title_override
+                or exam_doc.get("title")
                 or prepared_meta.get("title")
                 or exam_id
             )
@@ -484,7 +499,10 @@ async def list_exams(
                     else prepared_meta.get("finalized_at")
                 ),
                 finalized_at=prepared_meta.get("finalized_at"),
-                question_count=prepared_meta.get("question_count", 0),
+                question_count=(
+                    session_question_counts.get(exam_id)
+                    or prepared_meta.get("question_count", 0)
+                ),
             )
 
         async def _attach_open_recheck_counts(
@@ -705,7 +723,8 @@ async def list_exams(
                 {},
             )
             title = (
-                title_info.get("title")
+                exam_doc.get("title")
+                or title_info.get("title")
                 or prepared_meta.get("title")
                 or exam_id
             )
@@ -739,6 +758,7 @@ async def list_exams(
                         blocked_count=blocked,
                         published_count=published,
                         status="active",
+                        question_count=session_question_counts.get(exam_id, 0),
                     )
                 )
 
