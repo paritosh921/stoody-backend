@@ -142,6 +142,9 @@ NODE_ENV=development
 AI_PROVIDER=openai
 OPENAI_API_KEY=your-api-key
 OPENAI_MODEL=gpt-5.1
+PCR_FULL_DOCUMENT_GRADING_MODEL=gpt-5.1
+PCR_VISION_EVAL_MODEL=gpt-5.6-terra
+OCR_VISION_MODEL=gpt-5.6-terra
 
 # Mistral AI (OCR — primary, cheaper for handwriting)
 MISTRAL_API_KEY=your-mistral-key

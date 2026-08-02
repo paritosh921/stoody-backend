@@ -60,8 +60,8 @@ _A4_HEIGHT_MM = 297.0
 _RENDER_WIDTH_PX = 1240   # ~148 DPI at A4 width
 _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 
-# Last-resort OCR model when the shared gate provider default cannot be resolved.
-_DEFAULT_OCR_VISION_MODEL = "gpt-4o"
+# OpenAI OCR is intentionally independent from the primary grading model.
+_DEFAULT_OCR_VISION_MODEL = "gpt-5.6-terra"
 
 # LLM OCR extraction prompt
 #
@@ -451,12 +451,17 @@ def _get_ocr_vision_model() -> str:
     """Resolve the model to use for vision OCR calls.
 
     Reads from ``OCR_VISION_MODEL`` env var when an OCR-specific override is
-    configured. Otherwise, defer to the shared gate provider default so the
-    OCR adapter follows the active ``AI_PROVIDER`` configuration.
+    configured. OpenAI uses Terra by default while other providers continue to
+    use their provider-specific default.
     """
     override = os.getenv("OCR_VISION_MODEL", "").strip()
     if override:
         return override
+
+    provider_name = os.getenv("AI_PROVIDER", "openai").strip().lower()
+    if provider_name == "openai":
+        return _DEFAULT_OCR_VISION_MODEL
+
     try:
         # The package name contains a hyphen, so use importlib just like the
         # route-layer load_exampen helper.

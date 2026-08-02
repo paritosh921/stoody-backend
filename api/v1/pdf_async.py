@@ -3885,6 +3885,16 @@ class DocumentListResponse(BaseModel):
     limit: int
 
 
+def _effective_document_active_state(document: Dict[str, Any]) -> bool:
+    """Expose PCR papers as active only after immutable finalization."""
+    if (
+        str(document.get("exam_mode") or "").strip().lower() == "pcr"
+        and document.get("exam_finalized") is not True
+    ):
+        return False
+    return bool(document.get("is_active", True))
+
+
 def _document_file_candidates(document: Dict[str, Any]) -> List[Path]:
     backend_dir = Path(os.getcwd())
     stored_path = str(document.get("file_path", "") or "").replace("\\", "/")
@@ -5059,6 +5069,9 @@ async def finalize_exam(
             "$set": {
                 "exam_finalized": True,
                 "exam_finalized_at": datetime.utcnow(),
+                # Finalization approves the immutable marking contract. The
+                # separate activation transition opens student submissions.
+                "is_active": False,
                 "exam_sync_summary": sync_summary,
                 "exam_paper_version_id": paper_snapshot["paper_version_id"],
                 "exam_content_hash": paper_snapshot["content_hash"],
@@ -6449,7 +6462,7 @@ async def get_documents(
                 total_points=doc.get("total_points"),
                 total_minutes=doc.get("total_minutes"),
                 file_exists=file_exists,
-                is_active=doc.get("is_active", True),
+                is_active=_effective_document_active_state(doc),
                 instructions=doc.get("instructions"),
                 question_type=doc.get("question_type"),
                 exam_mode=doc.get("exam_mode"),
@@ -7103,7 +7116,7 @@ async def get_student_available_options(
                 extracted_questions_count=doc.get("extracted_questions_count", 0),
                 extracted_images_count=doc.get("extracted_images_count", 0),
                 file_exists=file_exists,
-                is_active=doc.get("is_active", True),
+                is_active=_effective_document_active_state(doc),
                 instructions=doc.get("instructions"),
                 question_type=doc.get("question_type"),
                 exam_mode=doc.get("exam_mode"),
@@ -7603,6 +7616,23 @@ async def update_document_metadata(
             if "is_active" in metadata
             else bool(existing_doc.get("is_active", False))
         )
+        if (
+            "is_active" in metadata
+            and desired_active
+            and str(existing_doc.get("exam_mode") or "").strip().lower() == "pcr"
+            and existing_doc.get("exam_finalized") is not True
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "PCR activation requires a finalized paper",
+                    "errors": [
+                        "Complete and save the marking plan for every question.",
+                        "Finalize the paper to create its immutable grading snapshot.",
+                        "Activate the paper only after both readiness steps pass.",
+                    ],
+                },
+            )
         if "is_active" in metadata:
             update_data["is_active"] = desired_active
 
