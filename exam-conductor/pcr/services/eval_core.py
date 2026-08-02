@@ -912,7 +912,11 @@ Return JSON only, using exactly this shape:
 
 Return every locked criterion exactly once. Award only within that criterion's
 max_marks. Do not return total_score or invent extra marks. Set needs_review to
-true when the evidence is too ambiguous to grade reliably."""
+true when the evidence is too ambiguous to grade reliably. Keep each rationale
+to one short sentence. Write overall_feedback like a teacher: one or two short,
+direct sentences stating what is correct and the specific correction needed.
+For a fully correct response, say "Correct method and answer." Do not mention AI,
+OCR, confidence, rubrics, or uploaded images in student-facing feedback."""
 
 
 def _select_vision_eval_model() -> str:
