@@ -344,6 +344,7 @@ def grading_system_instructions() -> str:
         "best evidence-supported provisional criterion decision even when handwriting "
         "is imperfect; express genuine uncertainty with confidence, needs_review, and "
         "review_reason instead of omitting the question or inventing extra metadata. "
+        "Use the frozen paper context, subject, class or standard, board or course, response genre, and teacher guidance when applying the locked criteria. Open-ended answers must be judged by meaning and the stated writing criteria, not by exact phrase matching. Return one criterion result for every locked criterion in the exact order supplied; internal criterion ids are server-owned and must not be invented or reordered. "
         "Use student_answer as a faithful, concise Work shown transcription that "
         "preserves meaningful steps, values, equations, and the final answer in reading "
         "order; do not correct it there. Keep criterion evidence literal and each "

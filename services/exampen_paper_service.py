@@ -1086,9 +1086,10 @@ def validate_pcr_questions(
             criterion_errors = policy_module.validate_marking_criteria(
                 criteria,
                 _question_marks(question),
-                require_atomic=(
-                    method_policy.get("mode") != policy_module.NO_METHOD_REQUIRED
-                ),
+                # Teachers may use broader multi-mark criteria for essays,
+                # speeches, language work, and other holistic responses. The
+                # grader still validates every award against the frozen range.
+                require_atomic=False,
             )
             errors.extend(f"Q {label}: {error}" for error in criterion_errors)
     return errors

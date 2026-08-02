@@ -38,7 +38,8 @@ STRICTNESS_PROFILES: Dict[str, str] = {
     "lenient": (
         "Accept scientifically or academically valid alternative methods and "
         "minor OCR/notation defects when the intended work is clear. Award "
-        "available method credit where the criterion is substantially met."
+        "available method credit where the criterion is substantially met. "
+        "For open-ended responses, judge meaning and task fulfilment rather than exact wording."
     ),
     "balanced": (
         "Apply ordinary teacher partial credit. Accept valid alternative "
@@ -47,12 +48,16 @@ STRICTNESS_PROFILES: Dict[str, str] = {
         "one mark, award proportional credit for each independently correct "
         "visible step supported by the reference solution; do not turn it into "
         "an all-or-nothing result unless the method policy explicitly says that "
-        "only the result is required."
+        "only the result is required. Apply the subject, class, board, response genre, "
+        "and teacher guidance shown in the frozen paper context. For essays, speeches, "
+        "paragraphs, and other open responses, accept original valid content and equivalent "
+        "wording while applying each content, organization, language, style, or format criterion."
     ),
     "strict": (
         "Apply the criterion exactly. Do not infer missing method, units, "
         "working, or conclusion. If handwriting/OCR makes evidence ambiguous, "
-        "mark it for teacher review instead of guessing a deduction."
+        "mark it for teacher review instead of guessing a deduction. Do not require exact "
+        "wording unless the frozen teacher criterion explicitly requires it."
     ),
 }
 

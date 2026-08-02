@@ -2805,6 +2805,7 @@ def _system_instructions() -> str:
         "images, ambiguous ownership, contradictory work, unreadable evidence, or any "
         "uncertain award. Coordinates are approximate vertical bands from 0 at page top "
         "to 1000 at page bottom.\n\n"
+        "Use the frozen paper context, including subject, board or course, class or standard, question genre, and teacher guidance, to apply an age- and subject-appropriate standard. Open-ended language and humanities responses need not match the reference wording; judge them only against the locked content, organization, language, style, format, or reasoning criteria. Return one criterion_marks row for every locked criterion, in the exact order shown; criterion ids are server-owned references and must not be invented or reordered. "
         "The student_answer field is the Work shown record. Transcribe the visible "
         "answer faithfully and concisely, preserving the student's meaningful steps, "
         "values, equations, and final answer in reading order. Do not evaluate or "
@@ -3330,7 +3331,7 @@ def _validate_question_grade(
             review_reason="",
         )
 
-    if not student_answer:
+    if not student_answer and objective_question:
         validation_errors.append("Attempted answer has no student transcription")
     if not source_pages:
         validation_errors.append("Attempted answer has no visual evidence region")
@@ -3408,23 +3409,40 @@ def _validate_question_grade(
 
     raw_marks = item.get("criterion_marks")
     raw_marks = raw_marks if isinstance(raw_marks, list) else []
-    by_id: Dict[str, List[Dict[str, Any]]] = {}
-    for raw in raw_marks:
-        if isinstance(raw, dict):
-            by_id.setdefault(str(raw.get("criterion_id") or "").strip(), []).append(raw)
-    expected_ids = {criterion["criterion_id"] for criterion in criteria}
-    if set(by_id) != expected_ids:
-        validation_errors.append("Criterion IDs do not match the locked marking plan")
+    if not student_answer:
+        # A readable visual response must not become ungradable merely because
+        # the model omitted the separate transcription field. Preserve an
+        # auditable Work shown summary from the criterion-level visual evidence.
+        evidence_fragments: List[str] = []
+        for raw in raw_marks:
+            if not isinstance(raw, dict):
+                continue
+            fragment = str(raw.get("evidence") or "").strip()
+            if fragment and fragment not in evidence_fragments:
+                evidence_fragments.append(fragment)
+        if evidence_fragments:
+            student_answer = " ".join(evidence_fragments)[:4000]
+        else:
+            validation_errors.append("Attempted answer has no readable student work")
+    # The frozen marking plan is an ordered server-owned contract. The model
+    # supplies one decision per position; it never owns criterion identity,
+    # maximum marks, descriptions, or the question total. This applies to all
+    # papers and avoids depending on an LLM to reproduce internal database ids.
+    if criteria and (
+        len(raw_marks) != len(criteria)
+        or not all(isinstance(raw, dict) for raw in raw_marks)
+    ):
+        validation_errors.append(
+            f"Expected {len(criteria)} criterion results but received {len(raw_marks)}"
+        )
     criterion_review_reasons: List[str] = []
     criterion_unresolved_reasons: List[str] = []
-    for criterion in criteria:
-        rows = by_id.get(criterion["criterion_id"], [])
-        if len(rows) != 1:
-            validation_errors.append(
-                f"Criterion {criterion['criterion_id']} is missing or duplicated"
-            )
+    for criterion_position, criterion in enumerate(criteria):
+        if criterion_position >= len(raw_marks):
             continue
-        raw = rows[0]
+        raw = raw_marks[criterion_position]
+        if not isinstance(raw, dict):
+            continue
         criterion_id = criterion["criterion_id"]
         decision = str(raw.get("decision") or "").strip().lower()
         if decision not in {"met", "partially_met", "not_met", "unresolved"}:
@@ -3551,9 +3569,8 @@ def _validate_question_grade(
         )
     if criteria and len(criterion_marks) == len(criteria):
         total_score = round(sum(mark["marks_awarded"] for mark in criterion_marks), 2)
-        raw_total = _finite_float(item.get("total_score"))
-        if raw_total is None or abs(raw_total - total_score) > 0.01:
-            validation_errors.append("Criterion awards do not add up to total_score")
+        # The model-reported total is advisory. The server-owned criterion sum
+        # is the only authoritative question total.
     elif not criteria:
         raw_total = _finite_float(item.get("total_score"))
         if raw_total is None or raw_total < 0 or raw_total > max_marks:
