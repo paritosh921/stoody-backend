@@ -146,6 +146,7 @@ def _fmt(v) -> Optional[str]:
 async def _require_camera_upload_context(
     tenant_db: Any,
     *,
+    db: DatabaseManager,
     exam_id: str,
     student_id: str,
     current_user: Dict[str, Any],
@@ -158,7 +159,7 @@ async def _require_camera_upload_context(
 
     from api.v1.exam_orch_async import _require_tutor_visibility
 
-    _require_tutor_visibility(exam_doc, current_user)
+    await _require_tutor_visibility(exam_doc, current_user, db)
     if exam_doc.get("exam_type") != "pcr":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -222,6 +223,7 @@ async def complete_camera_submission(
     tenant_db = await _get_tenant_db(db, current_user)
     exam_doc = await _require_camera_upload_context(
         tenant_db,
+        db=db,
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
@@ -352,6 +354,7 @@ async def upload_complete_answer_copy(
     tenant_db = await _get_tenant_db(db, current_user)
     exam_doc = await _require_camera_upload_context(
         tenant_db,
+        db=db,
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
@@ -521,6 +524,7 @@ async def upload_camera_page(
 
     await _require_camera_upload_context(
         tenant_db,
+        db=db,
         exam_id=exam_id,
         student_id=student_id,
         current_user=current_user,
