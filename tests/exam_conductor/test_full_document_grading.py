@@ -404,19 +404,32 @@ def test_subjective_grade_shell_is_not_semantically_complete():
     ) == []
 
 
-def test_question_grading_schema_can_report_unresolved_criteria():
+def test_question_grading_schema_locks_every_question_and_criterion():
     from api.v1._exampen_imports import load_exampen
 
     graph = load_exampen("pcr.services.visual_evidence_graph")
-    schema = graph.question_grading_schema()
-    root = schema.get("schema", schema)
-    criterion_properties = (
-        root["properties"]["questions"]["items"]["properties"]
-        ["criterion_marks"]["items"]["properties"]
+    schema = graph.question_grading_schema(
+        [
+            {
+                "question_number": 7,
+                "max_marks": 2,
+                "marking_criteria": [
+                    {"criterion_id": "height", "max_marks": 1},
+                    {"criterion_id": "range", "max_marks": 1},
+                ],
+            }
+        ]
     )
-
-    assert "unresolved" in criterion_properties["decision"]["enum"]
-    assert "unresolved" in criterion_properties["credit_basis"]["enum"]
+    root = schema.get("schema", schema)
+    questions = root["properties"]["questions"]
+    assert questions["type"] == "object"
+    assert questions["required"] == ["7"]
+    criteria = questions["properties"]["7"]["properties"]["criterion_marks"]
+    assert criteria["required"] == ["height", "range"]
+    assert criteria["additionalProperties"] is False
+    assert criteria["properties"]["height"]["properties"]["marks_awarded"][
+        "maximum"
+    ] == 1
 
 
 def test_close_visual_readings_keep_marks_but_require_review():
@@ -1656,7 +1669,7 @@ async def test_invalid_criterion_award_is_blocked_instead_of_clamped_or_scored(
         },
     )
 
-    assert result.status == "completed"
+    assert result.status == "blocked_for_review"
     assert result.review_state == "blocked"
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
@@ -1669,7 +1682,7 @@ async def test_invalid_criterion_award_is_blocked_instead_of_clamped_or_scored(
 
 
 @pytest.mark.asyncio
-async def test_criterion_decision_and_award_must_be_consistent(monkeypatch):
+async def test_criterion_decision_is_derived_from_the_locked_award(monkeypatch):
     db = _fresh_db()
     await _seed(db)
     contradictory = _attempted_diagram()
@@ -1686,15 +1699,14 @@ async def test_criterion_decision_and_award_must_be_consistent(monkeypatch):
         },
     )
 
-    assert result.review_state == "blocked"
+    assert result.review_state == "ready"
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
     )
-    assert q1["answer_state"] == "unresolved"
-    assert "met but was not awarded its full locked mark" in q1["manual_review_reason"]
+    assert q1["answer_state"] == "detected"
     assert await db["evalpen_evaluations"].count_documents(
         {"question_id": "EXAM-DOC-1::Q1"}
-    ) == 0
+    ) == 1
 
 
 @pytest.mark.asyncio

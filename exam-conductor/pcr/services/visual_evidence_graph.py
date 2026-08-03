@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 # This internal evidence version identifies the lean rubric-grading response
 # introduced without invalidating an in-progress exam's frozen model contract.
 EVIDENCE_GRAPH_VERSION = "pcr-multimodal-evidence-graph-v2"
-PROMPT_VERSION = "pcr-full-document-visual-v5"
+PROMPT_VERSION = "pcr-full-document-visual-v6"
 
 _CONTENT_TYPES = {"TEXT_ONLY", "MIXED", "DIAGRAM_HEAVY", "TABLE_PRESENT"}
 _EVIDENCE_KINDS = {
@@ -161,122 +161,152 @@ def evidence_mapping_schema() -> Dict[str, Any]:
     }
 
 
-def question_grading_schema() -> Dict[str, Any]:
-    method_analysis = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "detected_method": {"type": "string"},
-            "method_classification": {
-                "type": "string",
-                "enum": [
-                    "reference_method",
-                    "alternative_method",
-                    "specified_method",
-                    "no_method_visible",
-                    "not_applicable",
-                    "unresolved",
-                ],
+def question_grading_schema(
+    question_contracts: Sequence[Mapping[str, Any]] = (),
+) -> Dict[str, Any]:
+    """Build the exact scoring contract for the requested question batch.
+
+    Question and criterion identifiers are object keys instead of model-authored
+    array values. Structured output must therefore contain every requested
+    question and every locked criterion exactly once. The model only supplies
+    semantic judgments; server-owned bookkeeping is derived after the response.
+    """
+
+    def criterion_score(max_marks: float) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "marks_awarded": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": max(0.0, float(max_marks)),
+                },
+                "rationale": {"type": "string"},
+                "evidence": {"type": "string"},
+                "credit_basis": {
+                    "type": "string",
+                    "enum": [
+                        "direct_evidence",
+                        "error_carried_forward",
+                        "no_credit",
+                    ],
+                },
             },
-            "method_validity": {
-                "type": "string",
-                "enum": [
-                    "valid",
-                    "partially_valid",
-                    "invalid",
-                    "not_applicable",
-                    "unresolved",
+            "required": [
+                "confidence",
+                "marks_awarded",
+                "rationale",
+                "evidence",
+                "credit_basis",
+            ],
+        }
+
+    if question_contracts:
+        question_properties: Dict[str, Any] = {}
+        for position, contract in enumerate(question_contracts, start=1):
+            number = int(contract.get("question_number") or position)
+            criterion_properties: Dict[str, Any] = {}
+            for criterion_position, criterion in enumerate(
+                contract.get("marking_criteria") or [],
+                start=1,
+            ):
+                if not isinstance(criterion, Mapping):
+                    continue
+                criterion_id = str(
+                    criterion.get("criterion_id") or f"criterion_{criterion_position}"
+                ).strip()
+                criterion_properties[criterion_id] = criterion_score(
+                    float(criterion.get("max_marks") or 0)
+                )
+            max_marks = max(0.0, float(contract.get("max_marks") or 0))
+            question_properties[str(number)] = {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "student_answer": {"type": "string"},
+                    "criterion_marks": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": criterion_properties,
+                        "required": list(criterion_properties),
+                    },
+                    "total_score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": max_marks,
+                    },
+                    "overall_feedback": {"type": "string"},
+                    "needs_review": {"type": "boolean"},
+                    "review_reason": {"type": "string"},
+                },
+                "required": [
+                    "confidence",
+                    "student_answer",
+                    "criterion_marks",
+                    "total_score",
+                    "overall_feedback",
+                    "needs_review",
+                    "review_reason",
                 ],
-            },
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "explanation": {"type": "string"},
-            "error_carried_forward": {
-                "type": "string",
-                "enum": [
-                    "applied",
-                    "not_applied",
-                    "not_applicable",
-                    "unresolved",
-                ],
-            },
-            "error_carried_forward_reason": {"type": "string"},
-        },
-        "required": [
-            "detected_method",
-            "method_classification",
-            "method_validity",
-            "confidence",
-            "explanation",
-            "error_carried_forward",
-            "error_carried_forward_reason",
-        ],
-    }
-    criterion = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
+            }
+        questions_schema: Dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": question_properties,
+            "required": list(question_properties),
+        }
+    else:
+        generic_criterion = criterion_score(1_000_000.0)
+        generic_criterion["properties"] = {
             "criterion_id": {"type": "string"},
-            "decision": {
-                "type": "string",
-                            "enum": ["met", "partially_met", "not_met", "unresolved"],
-            },
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "marks_awarded": {"type": "number", "minimum": 0},
-            "rationale": {"type": "string"},
-            "evidence": {"type": "string"},
-            "evidence_region_ids": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
-            "missing_evidence": {"type": "string"},
-            "credit_basis": {
-                "type": "string",
-                "enum": [
-                                "direct_evidence",
-                                "error_carried_forward",
-                                "no_credit",
-                                "unresolved",
+            **generic_criterion["properties"],
+        }
+        generic_criterion["required"] = [
+            "criterion_id",
+            *generic_criterion["required"],
+        ]
+        questions_schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "question_number": {"type": "integer", "minimum": 1},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                    "student_answer": {"type": "string"},
+                    "criterion_marks": {
+                        "type": "array",
+                        "items": generic_criterion,
+                    },
+                    "total_score": {"type": "number", "minimum": 0},
+                    "overall_feedback": {"type": "string"},
+                    "needs_review": {"type": "boolean"},
+                    "review_reason": {"type": "string"},
+                },
+                "required": [
+                    "question_number",
+                    "confidence",
+                    "student_answer",
+                    "criterion_marks",
+                    "total_score",
+                    "overall_feedback",
+                    "needs_review",
+                    "review_reason",
                 ],
             },
-        },
-        "required": [
-            "criterion_id",
-            "decision",
-            "confidence",
-            "marks_awarded",
-            "rationale",
-            "evidence",
-            "evidence_region_ids",
-            "missing_evidence",
-            "credit_basis",
-        ],
-    }
-    question = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "question_number": {"type": "integer", "minimum": 1},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "student_answer": {"type": "string"},
-            "method_analysis": method_analysis,
-            "criterion_marks": {"type": "array", "items": criterion},
-            "total_score": {"type": "number", "minimum": 0},
-            "overall_feedback": {"type": "string"},
-            "needs_review": {"type": "boolean"},
-            "review_reason": {"type": "string"},
-        },
-        "required": [
-            "question_number",
-            "confidence",
-            "student_answer",
-            "method_analysis",
-            "criterion_marks",
-            "total_score",
-            "overall_feedback",
-            "needs_review",
-            "review_reason",
-        ],
-    }
+        }
+
     return {
         "type": "object",
         "additionalProperties": False,
@@ -285,7 +315,7 @@ def question_grading_schema() -> Dict[str, Any]:
                 "type": "string",
                 "enum": [EVIDENCE_GRAPH_VERSION],
             },
-            "questions": {"type": "array", "items": question},
+            "questions": questions_schema,
         },
         "required": ["evidence_graph_version", "questions"],
     }
@@ -339,13 +369,14 @@ def grading_system_instructions() -> str:
         "is a correctness anchor, not the only acceptable method. Equivalent methods "
         "and equivalent representations receive the same criterion decisions. Award "
         "step marks for valid visible work and apply error-carried-forward only when "
-        "the locked policy permits it. Cite one or more supplied evidence_region_ids "
-        "for every criterion decision, including zero. Return exactly one result for "
-        "each requested question and never exceed locked criterion maxima. Make the "
+        "the locked policy permits it. Return questions as an object keyed by the "
+        "requested question number and criterion_marks as an object keyed by the exact "
+        "locked criterion ID. Score every key in the supplied schema and never exceed "
+        "locked criterion maxima. Make the "
         "best evidence-supported provisional criterion decision even when handwriting "
         "is imperfect; express genuine uncertainty with confidence, needs_review, and "
         "review_reason instead of omitting the question or inventing extra metadata. "
-        "Use the frozen paper context, subject, class or standard, board or course, response genre, and teacher guidance when applying the locked criteria. Open-ended answers must be judged by meaning and the stated writing criteria, not by exact phrase matching. Return one criterion result for every locked criterion in the exact order supplied; internal criterion ids are server-owned and must not be invented or reordered. "
+        "Use the frozen paper context, subject, class or standard, board or course, response genre, and teacher guidance when applying the locked criteria. Open-ended answers must be judged by meaning and the stated writing criteria, not by exact phrase matching. Do not return method-analysis fields, evidence-region IDs, decision labels, or other server-owned bookkeeping. "
         "Use student_answer as a faithful, concise Work shown transcription that "
         "preserves meaningful steps, values, equations, and the final answer in reading "
         "order; do not correct it there. Keep criterion evidence literal and each "
@@ -357,8 +388,8 @@ def grading_system_instructions() -> str:
         "For a "
         "catalog question with grading_mode=objective, only read the selected option "
         "label from the fixed evidence crop and put that single label in "
-        "student_answer. Return empty criterion_marks, total_score 0, and "
-        "not_applicable method analysis. The server alone compares the label with the "
+        "student_answer. Return an empty criterion_marks object and total_score 0. "
+        "The server alone compares the label with the "
         "answer key and applies positive or negative marks. If the label is ambiguous, "
         "set needs_review instead of guessing."
     )

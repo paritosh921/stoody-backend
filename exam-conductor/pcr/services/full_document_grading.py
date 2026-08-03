@@ -986,7 +986,9 @@ class FullDocumentGradingService:
                 prompt="",
                 caller_id=_CALLER_ID,
                 responses_input=grading_input,
-                json_schema=question_grading_schema(),
+                json_schema=question_grading_schema(
+                    [_catalog_question(question) for question in batch_questions]
+                ),
                 prompt_cache_key=cache_key,
                 reasoning_effort=reasoning_effort,
                 temperature=temperature,
@@ -1024,7 +1026,29 @@ class FullDocumentGradingService:
                 raise FullDocumentGradingError(
                     "Question visual grader returned the wrong evidence contract"
                 )
-            for item in grading_payload.get("questions") or []:
+            raw_question_items = grading_payload.get("questions") or []
+            if isinstance(raw_question_items, Mapping):
+                normalized_question_items: List[Dict[str, Any]] = []
+                for raw_number, raw_item in raw_question_items.items():
+                    if not isinstance(raw_item, Mapping):
+                        continue
+                    normalized_item = dict(raw_item)
+                    normalized_item["question_number"] = _positive_int(raw_number)
+                    raw_criteria = normalized_item.get("criterion_marks")
+                    if isinstance(raw_criteria, Mapping):
+                        normalized_item["criterion_marks"] = [
+                            {"criterion_id": str(criterion_id), **dict(score)}
+                            for criterion_id, score in raw_criteria.items()
+                            if isinstance(score, Mapping)
+                        ]
+                    normalized_question_items.append(normalized_item)
+            else:
+                normalized_question_items = [
+                    dict(item)
+                    for item in raw_question_items
+                    if isinstance(item, Mapping)
+                ]
+            for item in normalized_question_items:
                 if not isinstance(item, dict):
                     continue
                 number = _positive_int(item.get("question_number"))
@@ -3320,6 +3344,23 @@ def _validate_question_grade(
     manual_review = bool(item.get("needs_review"))
     review_reason = str(item.get("review_reason") or "").strip()
     objective_question = _is_objective_question(question)
+    hypotheses = [
+        hypothesis
+        for hypothesis in (item.get("interpretation_hypotheses") or [])
+        if isinstance(hypothesis, Mapping)
+    ]
+    hypothesis_confidences = sorted(
+        (_confidence(hypothesis.get("confidence")) for hypothesis in hypotheses),
+        reverse=True,
+    )
+    if (
+        len(hypothesis_confidences) >= 2
+        and hypothesis_confidences[0] - hypothesis_confidences[1] < 0.10
+    ):
+        manual_review = True
+        review_reason = review_reason or (
+            "Two plausible visual readings are too close to choose automatically"
+        )
 
     if status == "unresolved":
         return _unresolved_grade(
@@ -3466,58 +3507,63 @@ def _validate_question_grade(
             review_reason=review_reason,
         )
 
-    method_analysis, method_errors, method_review_reasons = _validate_method_analysis(
-        item.get("method_analysis"),
-        method_policy=method_policy,
-    )
-    validation_errors.extend(method_errors)
-    if method_review_reasons:
-        manual_review = True
-        if not review_reason:
-            review_reason = "; ".join(dict.fromkeys(method_review_reasons))
-
-    raw_marks = item.get("criterion_marks")
-    raw_marks = raw_marks if isinstance(raw_marks, list) else []
+    # Method compliance and follow-through are expressed by locked criterion rows.
+    # The model does not reproduce a second bookkeeping object that can contradict
+    # those rows and erase an otherwise valid semantic grade.
+    method_analysis = _not_applicable_method_analysis()
+    raw_marks_value = item.get("criterion_marks")
+    if isinstance(raw_marks_value, Mapping):
+        raw_marks = [
+            {"criterion_id": str(criterion_id), **dict(score)}
+            for criterion_id, score in raw_marks_value.items()
+            if isinstance(score, Mapping)
+        ]
+    else:
+        raw_marks = (
+            [dict(raw) for raw in raw_marks_value if isinstance(raw, Mapping)]
+            if isinstance(raw_marks_value, list)
+            else []
+        )
     if not student_answer:
-        # A readable visual response must not become ungradable merely because
-        # the model omitted the separate transcription field. Preserve an
-        # auditable Work shown summary from the criterion-level visual evidence.
         evidence_fragments: List[str] = []
         for raw in raw_marks:
-            if not isinstance(raw, dict):
-                continue
             fragment = str(raw.get("evidence") or "").strip()
             if fragment and fragment not in evidence_fragments:
                 evidence_fragments.append(fragment)
         if evidence_fragments:
             student_answer = " ".join(evidence_fragments)[:4000]
         else:
-            validation_errors.append("Attempted answer has no readable student work")
-    # The frozen marking plan is an ordered server-owned contract. The model
-    # supplies one decision per position; it never owns criterion identity,
-    # maximum marks, descriptions, or the question total. This applies to all
-    # papers and avoids depending on an LLM to reproduce internal database ids.
+            student_answer = "Visible work is present in the mapped answer region."
+            manual_review = True
+            review_reason = review_reason or (
+                "The work was graded visually, but its text transcription is incomplete"
+            )
+
+    expected_ids = [str(criterion["criterion_id"]) for criterion in criteria]
+    raw_by_id: Dict[str, Dict[str, Any]] = {}
+    duplicate_ids: set[str] = set()
+    for position, raw in enumerate(raw_marks):
+        fallback_id = expected_ids[position] if position < len(expected_ids) else ""
+        criterion_id = str(raw.get("criterion_id") or fallback_id).strip()
+        if not criterion_id:
+            continue
+        if criterion_id in raw_by_id:
+            duplicate_ids.add(criterion_id)
+            continue
+        raw_by_id[criterion_id] = raw
+    returned_ids = set(raw_by_id)
     if criteria and (
-        len(raw_marks) != len(criteria)
-        or not all(isinstance(raw, dict) for raw in raw_marks)
+        duplicate_ids
+        or returned_ids != set(expected_ids)
     ):
         validation_errors.append(
-            f"Expected {len(criteria)} criterion results but received {len(raw_marks)}"
+            "Criterion results do not match the locked marking plan"
         )
     criterion_review_reasons: List[str] = []
-    criterion_unresolved_reasons: List[str] = []
-    for criterion_position, criterion in enumerate(criteria):
-        if criterion_position >= len(raw_marks):
-            continue
-        raw = raw_marks[criterion_position]
-        if not isinstance(raw, dict):
-            continue
-        criterion_id = criterion["criterion_id"]
-        decision = str(raw.get("decision") or "").strip().lower()
-        if decision not in {"met", "partially_met", "not_met", "unresolved"}:
-            validation_errors.append(
-                f"Criterion {criterion_id} has an invalid evidence decision"
-            )
+    for criterion in criteria:
+        criterion_id = str(criterion["criterion_id"])
+        raw = raw_by_id.get(criterion_id)
+        if raw is None:
             continue
         criterion_confidence = _confidence(raw.get("confidence"))
         awarded = _finite_float(raw.get("marks_awarded"))
@@ -3527,97 +3573,38 @@ def _validate_question_grade(
             )
             continue
         maximum = criterion["max_marks"]
-        if decision == "met" and abs(awarded - maximum) > 0.01:
-            validation_errors.append(
-                f"Criterion {criterion_id} is met but was not awarded its full locked mark"
-            )
-        elif decision == "not_met" and abs(awarded) > 0.01:
-            validation_errors.append(
-                f"Criterion {criterion_id} is not met but was awarded marks"
-            )
-        elif decision == "partially_met" and not (
-            awarded > 0.01 and awarded < maximum - 0.01
-        ):
-            validation_errors.append(
-                f"Criterion {criterion_id} partial decision has no valid partial award"
-            )
-        elif decision == "unresolved" and abs(awarded) > 0.01:
-            validation_errors.append(
-                f"Criterion {criterion_id} is unresolved but was awarded marks"
-            )
+        if abs(awarded - maximum) <= 0.01:
+            decision = "met"
+        elif awarded <= 0.01:
+            decision = "not_met"
+        else:
+            decision = "partially_met"
         rationale = str(raw.get("rationale") or "").strip()
         evidence = str(raw.get("evidence") or "").strip()
-        cited_region_ids = [
-            str(value).strip()
-            for value in (raw.get("evidence_region_ids") or [])
-            if str(value).strip()
-        ]
-        missing_evidence = str(raw.get("missing_evidence") or "").strip()
-        credit_basis = str(raw.get("credit_basis") or "").strip().lower()
-        if credit_basis not in {
-            "direct_evidence",
-            "error_carried_forward",
-            "no_credit",
-            "unresolved",
-        }:
-            validation_errors.append(
-                f"Criterion {criterion_id} has an invalid credit basis"
-            )
-        elif decision in {"met", "partially_met"} and credit_basis not in {
-            "direct_evidence",
-            "error_carried_forward",
-        }:
-            validation_errors.append(
-                f"Criterion {criterion_id} awarded marks without a positive credit basis"
-            )
-        elif decision == "not_met" and credit_basis != "no_credit":
-            validation_errors.append(
-                f"Criterion {criterion_id} gave no marks but has a positive credit basis"
-            )
-        elif decision == "unresolved" and credit_basis != "unresolved":
-            validation_errors.append(
-                f"Criterion {criterion_id} is unresolved but its credit basis is not"
-            )
-        if credit_basis == "error_carried_forward":
-            if method_analysis.get("error_carried_forward") != "applied":
-                validation_errors.append(
-                    f"Criterion {criterion_id} claims follow-through credit without a question-level decision"
-                )
-            if not method_policy.get("allow_error_carried_forward", True):
-                validation_errors.append(
-                    f"Criterion {criterion_id} claims follow-through credit although the policy forbids it"
-                )
         if not rationale:
-            validation_errors.append(
-                f"Criterion {criterion_id} has no decision rationale"
-            )
-        if decision != "unresolved" and not evidence:
-            validation_errors.append(
-                f"Criterion {criterion_id} has no cited student evidence"
-            )
-        if evidence_graph_question:
-            if not cited_region_ids:
-                validation_errors.append(
-                    f"Criterion {criterion_id} has no cited visual evidence region"
-                )
-            elif not set(cited_region_ids).issubset(evidence_region_ids):
-                validation_errors.append(
-                    f"Criterion {criterion_id} cites evidence outside the fixed question map"
-                )
-        if decision == "partially_met" and not missing_evidence:
-            # This is explanatory display metadata, not a scoring invariant.
-            # The awarded mark, decision, cited evidence, and locked range have
-            # already been validated above. Derive a useful explanation rather
-            # than discarding the complete question grade.
-            missing_evidence = (
+            rationale = {
+                "met": "Correct.",
+                "partially_met": "Part of the required step is correct.",
+                "not_met": "The required step is not shown correctly.",
+            }[decision]
+        evidence = evidence or student_answer[:500]
+        cited_region_ids = sorted(evidence_region_ids)
+        missing_evidence = ""
+        if decision != "met":
+            missing_evidence = str(
                 criterion.get("acceptable_evidence")
-                or "The remaining part of the locked criterion was not demonstrated."
-            )
-        if decision == "unresolved":
-            criterion_review_reasons.append(
-                f"Criterion {criterion_id} requires teacher confirmation"
-            )
-        elif criterion_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
+                or "The remaining required work was not demonstrated."
+            ).strip()
+        credit_basis = str(raw.get("credit_basis") or "").strip().lower()
+        if awarded <= 0.01:
+            credit_basis = "no_credit"
+        elif credit_basis == "error_carried_forward" and method_policy.get(
+            "allow_error_carried_forward", True
+        ):
+            credit_basis = "error_carried_forward"
+        else:
+            credit_basis = "direct_evidence"
+        if criterion_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
             criterion_review_reasons.append(
                 f"Criterion {criterion_id} confidence is below the automatic threshold"
             )
