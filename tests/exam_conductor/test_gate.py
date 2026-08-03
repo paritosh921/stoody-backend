@@ -48,6 +48,7 @@ from llm_gate.models import (
 from llm_gate.budget import BudgetChecker
 from llm_gate.gate import LLMGate
 from llm_gate.provider import (
+    ProviderHTTPError,
     ProviderResponse,
     _call_openai_responses,
     estimate_tokens_for_messages,
@@ -674,6 +675,67 @@ class TestOpenAIResponsesDocumentInput:
                 )
 
         asyncio.run(_run())
+
+    def test_openai_responses_preserves_safe_400_details_and_disables_retry(self):
+        class _HTTPResponse:
+            status_code = 400
+            text = "raw response must not be persisted"
+
+            def json(self):
+                return {
+                    "error": {
+                        "message": "Invalid schema for response_format",
+                        "type": "invalid_request_error",
+                        "param": "text.format.schema",
+                        "code": "invalid_json_schema",
+                    },
+                    "student_page": "must-not-leak",
+                }
+
+        class _HTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                return _HTTPResponse()
+
+        async def _run():
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=_HTTPClient()):
+                with pytest.raises(ProviderHTTPError) as caught:
+                    await _call_openai_responses(
+                        "gpt-5.1-2025-11-13",
+                        responses_input=[
+                            {"role": "user", "content": [{"type": "input_text", "text": "grade"}]}
+                        ],
+                        api_key="secret",
+                    )
+            error = caught.value
+            assert error.status_code == 400
+            assert error.retryable is False
+            assert "invalid_request_error" in str(error)
+            assert "param=text.format.schema" in str(error)
+            assert "Invalid schema for response_format" in str(error)
+            assert "student_page" not in str(error)
+            assert "raw response" not in str(error)
+
+        asyncio.run(_run())
+
+    def test_openai_responses_marks_rate_limit_as_retryable(self):
+        response = MagicMock()
+        response.status_code = 429
+        response.json.return_value = {
+            "error": {"message": "Rate limit reached", "type": "rate_limit_error"}
+        }
+
+        from llm_gate.provider import _provider_http_error
+
+        error = _provider_http_error(response, provider="OpenAI Responses API")
+
+        assert error.retryable is True
+        assert error.status_code == 429
 
 
 class TestIGate02UsageLogging:

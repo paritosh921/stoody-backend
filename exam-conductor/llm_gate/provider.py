@@ -23,6 +23,70 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Provider failures
+# ---------------------------------------------------------------------------
+
+class ProviderHTTPError(RuntimeError):
+    """Sanitised provider response error with an explicit retry contract.
+
+    Persist only the provider's documented error fields.  Request payloads can
+    contain student pages, so raw response bodies and request data must never
+    be copied into durable job errors.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        status_code: int,
+        message: str,
+        error_type: str = "",
+        error_code: str = "",
+        error_param: str = "",
+    ) -> None:
+        self.provider = provider
+        self.status_code = int(status_code)
+        self.error_type = error_type
+        self.error_code = error_code
+        self.error_param = error_param
+        self.retryable = self.status_code in {408, 409, 425, 429} or self.status_code >= 500
+
+        labels = [str(self.status_code)]
+        if error_type:
+            labels.append(error_type[:100])
+        if error_code:
+            labels.append(error_code[:100])
+        if error_param:
+            labels.append(f"param={error_param[:160]}")
+        safe_message = " ".join(str(message or "Provider request failed").split())[:800]
+        super().__init__(
+            f"{provider} request rejected ({', '.join(labels)}): {safe_message}"
+        )
+
+
+def _provider_http_error(resp: httpx.Response, *, provider: str) -> ProviderHTTPError:
+    """Extract the safe error envelope without persisting raw provider data."""
+
+    error: Dict[str, Any] = {}
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            candidate = body.get("error")
+            if isinstance(candidate, dict):
+                error = candidate
+    except Exception:
+        pass
+    return ProviderHTTPError(
+        provider=provider,
+        status_code=resp.status_code,
+        message=str(error.get("message") or "Provider request failed"),
+        error_type=str(error.get("type") or ""),
+        error_code=str(error.get("code") or ""),
+        error_param=str(error.get("param") or ""),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Unified provider response
 # ---------------------------------------------------------------------------
 
@@ -323,13 +387,14 @@ async def _call_openai_responses(
             json=payload,
         )
         if resp.status_code >= 400:
+            provider_error = _provider_http_error(resp, provider="OpenAI Responses API")
             logger.error(
                 "OpenAI Responses API error %s for model=%s: %s",
                 resp.status_code,
                 model_id,
-                resp.text[:500],
+                str(provider_error),
             )
-        resp.raise_for_status()
+            raise provider_error
         data = resp.json()
 
     output_text_parts: List[str] = []
