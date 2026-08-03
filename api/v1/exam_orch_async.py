@@ -1468,7 +1468,7 @@ async def get_exam(
             detail=f"Exam {exam_id} not found",
         )
 
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
 
     return _doc_to_response(doc)
 
@@ -1515,7 +1515,7 @@ async def update_exam_setup(
     doc = await collection.find_one({"exam_id": exam_id})
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
     if doc.get("lifecycle_state") != "draft":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1591,7 +1591,7 @@ async def get_preflight(
     doc = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
     return await _build_preflight(tenant_db, doc)
 
 
@@ -1616,7 +1616,7 @@ async def mark_student_absent(
     doc = await collection.find_one({"exam_id": exam_id})
     if doc is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
     if doc.get("lifecycle_state") not in {"collection_closed", "uploading"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1693,7 +1693,7 @@ async def transition_lifecycle(
             detail=f"Exam {exam_id} not found",
         )
 
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
 
     current_state = doc.get("lifecycle_state", "draft")
 
@@ -1802,7 +1802,7 @@ async def assign_hub(
             detail=f"Exam {exam_id} not found",
         )
 
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
 
     current_state = doc.get("lifecycle_state", "draft")
     if current_state != "draft":
@@ -1935,7 +1935,7 @@ async def unassign_hub(
             detail=f"Exam {exam_id} not found",
         )
 
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
 
     current_state = doc.get("lifecycle_state", "draft")
     if current_state != "draft":
@@ -2011,7 +2011,7 @@ async def get_upload_progress(
             detail=f"Exam {exam_id} not found",
         )
 
-    _require_tutor_visibility(doc, current_user)
+    await _require_tutor_visibility(doc, current_user, db)
 
     # Aggregate submissions for this exam
     pipeline = [
@@ -2090,7 +2090,7 @@ async def list_processing_jobs(
     exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
     if exam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
-    _require_tutor_visibility(exam, current_user)
+    await _require_tutor_visibility(exam, current_user, db)
     cursor = tenant_db["exampen_processing_jobs"].find({"exam_id": exam_id}).sort("created_at", -1)
     items = await cursor.to_list(length=5000)
     return ProcessingJobListResponse(
@@ -2115,7 +2115,7 @@ async def retry_exam_processing_job(
     exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
     if exam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
-    _require_tutor_visibility(exam, current_user)
+    await _require_tutor_visibility(exam, current_user, db)
     job = await tenant_db["exampen_processing_jobs"].find_one({"job_id": job_id, "exam_id": exam_id})
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Processing job {job_id} not found")

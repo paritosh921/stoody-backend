@@ -1151,7 +1151,13 @@ class FullDocumentGradingService:
                 )
 
         batch_specs = list(
-            enumerate(_question_batches(missing_numbers), start=1)
+            enumerate(
+                _question_batches(
+                    missing_numbers,
+                    mappings=mapping.questions,
+                ),
+                start=1,
+            )
         )
         try:
             configured_concurrency = int(
@@ -2317,7 +2323,19 @@ def _multistage_system_instructions() -> str:
     )
 
 
-def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
+def _question_batches(
+    question_numbers: Sequence[int],
+    *,
+    mappings: Optional[Mapping[int, Dict[str, Any]]] = None,
+) -> List[List[int]]:
+    """Build bounded batches while keeping questions from shared pages together.
+
+    The grading request includes page context for every page referenced by a
+    batch. Grouping only by question number can upload the same photographed
+    page in several concurrent requests. This deterministic greedy grouping
+    preserves the question catalogue order while preferentially consuming
+    questions whose mapped evidence overlaps the pages already in the batch.
+    """
     try:
         configured = int(
             os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
@@ -2326,7 +2344,44 @@ def _question_batches(question_numbers: Sequence[int]) -> List[List[int]]:
         configured = 6
     size = max(1, min(8, configured))
     numbers = [int(number) for number in question_numbers]
-    return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+    if not mappings or len(numbers) <= size:
+        return [numbers[index : index + size] for index in range(0, len(numbers), size)]
+
+    pages_by_question: Dict[int, set[int]] = {}
+    for number in numbers:
+        mapped = mappings.get(number) or {}
+        pages_by_question[number] = {
+            int(region.get("page_number") or 0)
+            for region in (mapped.get("evidence_regions") or [])
+            if int(region.get("page_number") or 0) > 0
+        }
+
+    pending = list(numbers)
+    batches: List[List[int]] = []
+    while pending:
+        seed = pending.pop(0)
+        batch = [seed]
+        batch_pages = set(pages_by_question.get(seed) or set())
+
+        overlapping = [
+            number
+            for number in pending
+            if batch_pages.intersection(pages_by_question.get(number) or set())
+        ]
+        for number in overlapping:
+            if len(batch) >= size:
+                break
+            batch.append(number)
+            batch_pages.update(pages_by_question.get(number) or set())
+            pending.remove(number)
+
+        while pending and len(batch) < size:
+            number = pending.pop(0)
+            batch.append(number)
+            batch_pages.update(pages_by_question.get(number) or set())
+
+        batches.append(sorted(batch, key=numbers.index))
+    return batches
 
 
 def _configured_output_tokens(name: str, default: int) -> int:
@@ -2467,7 +2522,9 @@ def _build_question_grading_input(
                         f"data:{asset.global_media_type};base64,"
                         + base64.b64encode(asset.global_bytes).decode("ascii")
                     ),
-                    "detail": "high",
+                    # The crop below remains high detail and is the authoritative
+                    # answer evidence. This full page is only navigation context.
+                    "detail": "low",
                 },
             ]
         )
