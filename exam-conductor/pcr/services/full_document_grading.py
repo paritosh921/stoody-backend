@@ -69,7 +69,10 @@ _AUTO_ACCEPT_CONFIDENCE = 0.80
 _ABSENCE_CONFIDENCE = 0.85
 _CRITERION_AUTO_ACCEPT_CONFIDENCE = 0.85
 _CRITERION_MIN_SCORE_CONFIDENCE = 0.65
-_DEFAULT_REASONING_EFFORT = "medium"
+_DEFAULT_REASONING_EFFORT = "minimal"
+_STRUCTURED_REASONING_EFFORT = str(
+    os.getenv("PCR_STRUCTURED_REASONING_EFFORT", "minimal") or "minimal"
+).strip().lower()
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
 _MAX_REQUEST_PAYLOAD_BYTES = 45 * 1024 * 1024
@@ -335,6 +338,16 @@ class FullDocumentGradingService:
         if reasoning_effort not in {"none", "minimal", "low", "medium", "high"}:
             raise FullDocumentGradingError(
                 "Immutable PCR grading contract has an unsupported reasoning effort"
+            )
+        if _STRUCTURED_REASONING_EFFORT not in {
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+        }:
+            raise FullDocumentGradingError(
+                "PCR structured grading reasoning effort override is unsupported"
             )
 
         answer_pages = await self._db["evalpen_answer_pages"].find(
@@ -609,10 +622,10 @@ class FullDocumentGradingService:
                                 prompt_version=prompt_version,
                             )[:32]
                         ),
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=_STRUCTURED_REASONING_EFFORT,
                         temperature=temperature,
                         max_output_tokens=min(
-                            30_000, max(8_000, 1_100 * len(questions))
+                            32_000, max(10_000, 1_400 * len(questions))
                         ),
                         metadata={
                             "pcr_stage": "full_document_visual_grading",
@@ -861,10 +874,12 @@ class FullDocumentGradingService:
                 prompt="",
                 caller_id=_CALLER_ID,
                 responses_input=mapping_input,
-                json_schema=evidence_mapping_schema(),
-                prompt_cache_key=cache_key,
-                reasoning_effort=reasoning_effort,
-                temperature=temperature,
+                json_schema=evidence_mapping_schema(
+                    [_catalog_question(question) for question in questions]
+                ),
+                prompt_cache_key=mapping_cache_key,
+                reasoning_effort=_STRUCTURED_REASONING_EFFORT,
+                temperature=mapping_temperature,
                 max_output_tokens=_mapping_output_token_budget(len(questions)),
                 metadata={
                     "pcr_stage": "full_document_evidence_mapping",
@@ -990,7 +1005,7 @@ class FullDocumentGradingService:
                     [_catalog_question(question) for question in batch_questions]
                 ),
                 prompt_cache_key=cache_key,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=_STRUCTURED_REASONING_EFFORT,
                 temperature=temperature,
                 max_output_tokens=_question_output_token_budget(
                     len(batch_questions),
@@ -1154,11 +1169,39 @@ class FullDocumentGradingService:
                     )
                 return returned, usage
             except StructuredOutputContractError as exc:
-                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
-                if can_split and fallback_minimum > budget_minimum:
+                if can_split and len(batch_questions) > 1:
                     logger.warning(
                         "Question visual grader returned incomplete structured output "
-                        "for batch %s; retrying that batch once with a larger budget.",
+                        "for batch %s; splitting into single-question retries with a "
+                        "larger budget.",
+                        batch_index,
+                    )
+                    split_returned: Dict[str, Dict[str, Any]] = {}
+                    split_usage: Dict[str, Any] = {}
+                    split_budget = _fallback_question_output_tokens(budget_minimum)
+                    for split_question in batch_questions:
+                        split_number = _positive_int(
+                            split_question.get("question_number")
+                        )
+                        if split_number is None:
+                            continue
+                        sub_returned, sub_usage = (
+                            await _grade_question_subset_with_fallback(
+                                [split_question],
+                                [split_number],
+                                batch_index=f"{batch_index}.{split_number}",
+                                budget_minimum=split_budget,
+                                can_split=False,
+                            )
+                        )
+                        split_returned.update(sub_returned)
+                        split_usage = _merge_usages(split_usage, sub_usage)
+                    return split_returned, split_usage
+                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
+                if fallback_minimum > budget_minimum:
+                    logger.warning(
+                        "Question visual grader returned incomplete structured output "
+                        "for batch %s; retrying once with a larger budget.",
                         batch_index,
                     )
                     return await _grade_question_subset_with_fallback(
@@ -1170,7 +1213,7 @@ class FullDocumentGradingService:
                     )
                 logger.warning(
                     "Question grader could not produce structured output for batch %s "
-                    "after one bounded retry; preserving review placeholders.",
+                    "after bounded retries; preserving review placeholders.",
                     batch_index,
                 )
                 return (
@@ -1178,7 +1221,7 @@ class FullDocumentGradingService:
                         str(number): _unresolved_grade_for_output_budget(
                             number,
                             "The question grader could not return a complete strict "
-                            "result after one bounded retry. The mapped evidence remains "
+                            "result after bounded retries. The mapped evidence remains "
                             "available for teacher review.",
                         )
                         for number in batch_numbers
@@ -2374,10 +2417,10 @@ def _question_batches(
     """
     try:
         configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "6") or 6
+            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "3") or 3
         )
     except (TypeError, ValueError):
-        configured = 6
+        configured = 3
     size = max(1, min(8, configured))
     numbers = [int(number) for number in question_numbers]
     if not mappings or len(numbers) <= size:
@@ -2432,7 +2475,7 @@ def _mapping_output_token_budget(question_count: int) -> int:
     """Reserve room for a concise whole-copy ownership map."""
 
     per_question = _configured_output_tokens(
-        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 800
+        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 1_200
     )
     return min(20_000, max(6_000, per_question * max(1, question_count)))
 
@@ -2444,7 +2487,7 @@ def _question_output_token_budget(
     """Reserve enough capacity for the lean criterion-scoring JSON."""
 
     per_question = _configured_output_tokens(
-        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 1_200
+        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 2_500
     )
     return min(20_000, max(minimum_output_tokens, per_question * max(1, question_count)))
 
