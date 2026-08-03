@@ -44,8 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _tenant_names() -> list[str]:
-    master_db = DatabaseManager.get_master_db()
+async def _tenant_names(db_manager: DatabaseManager) -> list[str]:
+    master_db = await db_manager.get_master_db()
+    if master_db is None:
+        raise RuntimeError("Master database is unavailable")
     rows = await master_db["tenants"].find(
         {"db_name": {"$type": "string"}}, {"_id": 0, "db_name": 1}
     ).to_list(length=None)
@@ -64,12 +66,19 @@ async def run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    await DatabaseManager.initialize()
+    db_manager = DatabaseManager()
+    await db_manager.initialize()
     try:
-        tenant_names = [args.tenant_db] if args.tenant_db else await _tenant_names()
+        tenant_names = (
+            [args.tenant_db]
+            if args.tenant_db
+            else await _tenant_names(db_manager)
+        )
         plans: list[dict[str, Any]] = []
         for db_name in tenant_names:
-            tenant_db = DatabaseManager.get_tenant_db(db_name)
+            tenant_db = await db_manager.get_tenant_db(db_name)
+            if tenant_db is None:
+                raise RuntimeError(f"Tenant database is unavailable: {db_name}")
             plans.extend(
                 await inspect_v5_contracts(
                     tenant_db, db_name=db_name, exam_id=args.exam_id
@@ -85,7 +94,11 @@ async def run(args: argparse.Namespace) -> int:
             if not plan["eligible"]:
                 results.append({**plan, "status": "skipped"})
                 continue
-            tenant_db = DatabaseManager.get_tenant_db(plan["db_name"])
+            tenant_db = await db_manager.get_tenant_db(plan["db_name"])
+            if tenant_db is None:
+                raise RuntimeError(
+                    f"Tenant database is unavailable: {plan['db_name']}"
+                )
             try:
                 results.append(
                     await migrate_v5_exam_to_v6(
@@ -107,7 +120,7 @@ async def run(args: argparse.Namespace) -> int:
         print(json.dumps({"mode": "apply", "results": results}, default=str, indent=2))
         return 1 if any(row.get("status") == "failed" for row in results) else 0
     finally:
-        await DatabaseManager.close()
+        await db_manager.close()
 
 
 def main(argv: list[str] | None = None) -> int:
