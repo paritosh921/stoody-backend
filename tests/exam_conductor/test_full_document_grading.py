@@ -550,7 +550,7 @@ async def test_full_document_grading_keeps_diagram_visual_and_missing_question_u
     )
 
     assert result.handled is True
-    assert result.status == "completed"
+    assert result.status == "blocked_for_review"
     assert result.review_state == "blocked"
     assert result.evaluated_count == 1
     assert result.blocked_count == 1
@@ -1032,8 +1032,13 @@ async def test_evidence_graph_question_grading_splits_batch_on_output_token_exha
         [
             mapping_payload,
             incomplete_payload,
-            grade_payload_one,
-            grade_payload_two,
+            {
+                "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
+                "questions": [
+                    *grade_payload_one["questions"],
+                    *grade_payload_two["questions"],
+                ],
+            },
         ]
     )
     service = module.FullDocumentGradingService(
@@ -1046,10 +1051,9 @@ async def test_evidence_graph_question_grading_splits_batch_on_output_token_exha
 
     assert result.status == "completed"
     assert result.evaluated_count == 2
-    assert len(gate.calls) == 4
+    assert len(gate.calls) == 3
     assert gate.calls[1]["metadata"]["question_numbers"] == [1, 2]
-    assert gate.calls[2]["metadata"]["question_numbers"] == [1]
-    assert gate.calls[3]["metadata"]["question_numbers"] == [2]
+    assert gate.calls[2]["metadata"]["question_numbers"] == [1, 2]
 
 
 @pytest.mark.asyncio
@@ -1433,11 +1437,10 @@ async def test_evidence_graph_question_grading_marks_question_unresolved_when_bu
     assert result.evaluated_count == 1
     assert result.blocked_count == 1
     assert result.review_state == "blocked"
-    assert len(gate.calls) == 5
+    assert len(gate.calls) == 4
     assert gate.calls[1]["metadata"]["question_numbers"] == [1]
     assert gate.calls[2]["metadata"]["question_numbers"] == [1]
-    assert gate.calls[3]["metadata"]["question_numbers"] == [1]
-    assert gate.calls[4]["metadata"]["question_numbers"] == [2]
+    assert gate.calls[3]["metadata"]["question_numbers"] == [2]
 
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
@@ -1565,7 +1568,7 @@ def test_visual_grading_reserves_completion_capacity_for_strict_rubric_json(monk
     monkeypatch.delenv("PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", raising=False)
 
     assert module._mapping_output_token_budget(11) == 13_200
-    assert module._question_output_token_budget(5) == 12_000
+    assert module._question_output_token_budget(5) == 12_500
 
 
 @pytest.mark.asyncio
@@ -1724,12 +1727,26 @@ async def test_low_confidence_criterion_is_review_gated(monkeypatch):
         },
     )
 
-    assert result.review_state == "blocked"
+    assert result.review_state == "needs_review"
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
     )
-    assert q1["answer_state"] == "unresolved"
-    assert "sufficient confidence" in q1["manual_review_reason"]
+    assert q1["answer_state"] == "detected"
+    assert q1["eval_status"] == "manual_review"
+    evaluation = await db["evalpen_evaluations"].find_one(
+        {"question_id": "EXAM-DOC-1::Q1"}
+    )
+    assert evaluation["total_score"] == 2
+
+
+def test_question_batches_default_to_eight_questions(monkeypatch):
+    module = _module()
+    monkeypatch.delenv("PCR_VISUAL_QUESTIONS_PER_BATCH", raising=False)
+
+    assert module._question_batches(list(range(1, 17))) == [
+        list(range(1, 9)),
+        list(range(9, 17)),
+    ]
 
 
 @pytest.mark.asyncio

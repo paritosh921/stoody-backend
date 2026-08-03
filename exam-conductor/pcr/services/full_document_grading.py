@@ -1101,7 +1101,7 @@ class FullDocumentGradingService:
             *,
             batch_index: str,
             budget_minimum: int = 4_000,
-            can_split: bool = True,
+            retry_available: bool = True,
         ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
             try:
                 returned, usage = await _grade_question_subset(
@@ -1123,7 +1123,7 @@ class FullDocumentGradingService:
                 missing = [
                     number for number in batch_numbers if str(number) not in returned
                 ]
-                if missing and can_split:
+                if missing and retry_available:
                     logger.warning(
                         "Question grader omitted or incompletely graded %s from batch "
                         "%s; retrying only those question IDs once. defects=%s",
@@ -1144,7 +1144,7 @@ class FullDocumentGradingService:
                             budget_minimum=_fallback_question_output_tokens(
                                 budget_minimum
                             ),
-                            can_split=False,
+                            retry_available=False,
                         )
                     )
                     returned.update(retry_returned)
@@ -1161,47 +1161,21 @@ class FullDocumentGradingService:
                     )
                 return returned, usage
             except StructuredOutputContractError as exc:
-                if can_split and len(batch_questions) > 1:
+                if retry_available:
                     logger.warning(
                         "Question visual grader returned incomplete structured output "
-                        "for batch %s; splitting into single-question retries with a "
+                        "for batch %s; retrying the same bounded batch once with a "
                         "larger budget.",
-                        batch_index,
-                    )
-                    split_returned: Dict[str, Dict[str, Any]] = {}
-                    split_usage: Dict[str, Any] = {}
-                    split_budget = _fallback_question_output_tokens(budget_minimum)
-                    for split_question in batch_questions:
-                        split_number = _positive_int(
-                            split_question.get("question_number")
-                        )
-                        if split_number is None:
-                            continue
-                        sub_returned, sub_usage = (
-                            await _grade_question_subset_with_fallback(
-                                [split_question],
-                                [split_number],
-                                batch_index=f"{batch_index}.{split_number}",
-                                budget_minimum=split_budget,
-                                can_split=False,
-                            )
-                        )
-                        split_returned.update(sub_returned)
-                        split_usage = _merge_usages(split_usage, sub_usage)
-                    return split_returned, split_usage
-                fallback_minimum = _fallback_question_output_tokens(budget_minimum)
-                if fallback_minimum > budget_minimum:
-                    logger.warning(
-                        "Question visual grader returned incomplete structured output "
-                        "for batch %s; retrying once with a larger budget.",
                         batch_index,
                     )
                     return await _grade_question_subset_with_fallback(
                         batch_questions,
                         batch_numbers,
                         batch_index=f"{batch_index}.retry",
-                        budget_minimum=fallback_minimum,
-                        can_split=False,
+                        budget_minimum=_fallback_question_output_tokens(
+                            budget_minimum
+                        ),
+                        retry_available=False,
                     )
                 logger.warning(
                     "Question grader could not produce structured output for batch %s "
@@ -2409,10 +2383,10 @@ def _question_batches(
     """
     try:
         configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "3") or 3
+            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "8") or 8
         )
     except (TypeError, ValueError):
-        configured = 3
+        configured = 8
     size = max(1, min(8, configured))
     numbers = [int(number) for number in question_numbers]
     if not mappings or len(numbers) <= size:
@@ -3542,10 +3516,21 @@ def _validate_question_grade(
             review_reason=review_reason,
         )
 
-    # Method compliance and follow-through are expressed by locked criterion rows.
-    # The model does not reproduce a second bookkeeping object that can contradict
-    # those rows and erase an otherwise valid semantic grade.
-    method_analysis = _not_applicable_method_analysis()
+    method_analysis, method_errors, method_review_reasons = (
+        _validate_method_analysis(
+            item.get("method_analysis"),
+            method_policy=method_policy,
+        )
+    )
+    validation_errors.extend(method_errors)
+    if (
+        str(method_policy.get("mode") or ANY_VALID_METHOD)
+        == SPECIFIED_METHOD_REQUIRED
+        and not method_analysis.get("method_requirement_satisfied")
+    ):
+        validation_errors.append(
+            "The specified required method was not verified in the student work"
+        )
     raw_marks_value = item.get("criterion_marks")
     if isinstance(raw_marks_value, Mapping):
         raw_marks = [
@@ -3700,6 +3685,11 @@ def _validate_question_grade(
         manual_review = True
         if not review_reason:
             review_reason = "; ".join(dict.fromkeys(criterion_review_reasons))
+
+    if method_review_reasons:
+        manual_review = True
+        if not review_reason:
+            review_reason = "; ".join(dict.fromkeys(method_review_reasons))
 
     if confidence < _AUTO_ACCEPT_CONFIDENCE:
         manual_review = True
@@ -4236,7 +4226,9 @@ def _grading_consistency_key(
         "method_analysis": {
             key: method_analysis.get(key)
             for key in (
-                "method_used",
+                "detected_method",
+                "method_classification",
+                "method_validity",
                 "method_requirement_satisfied",
                 "error_carried_forward",
             )
