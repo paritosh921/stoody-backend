@@ -69,10 +69,7 @@ _AUTO_ACCEPT_CONFIDENCE = 0.80
 _ABSENCE_CONFIDENCE = 0.85
 _CRITERION_AUTO_ACCEPT_CONFIDENCE = 0.85
 _CRITERION_MIN_SCORE_CONFIDENCE = 0.65
-_DEFAULT_REASONING_EFFORT = "minimal"
-_STRUCTURED_REASONING_EFFORT = str(
-    os.getenv("PCR_STRUCTURED_REASONING_EFFORT", "minimal") or "minimal"
-).strip().lower()
+_DEFAULT_REASONING_EFFORT = "medium"
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
 _MAX_REQUEST_PAYLOAD_BYTES = 45 * 1024 * 1024
@@ -345,17 +342,6 @@ class FullDocumentGradingService:
             raise FullDocumentGradingError(
                 "Immutable PCR grading contract has an unsupported reasoning effort"
             )
-        if _STRUCTURED_REASONING_EFFORT not in {
-            "none",
-            "minimal",
-            "low",
-            "medium",
-            "high",
-        }:
-            raise FullDocumentGradingError(
-                "PCR structured grading reasoning effort override is unsupported"
-            )
-
         answer_pages = await self._db["evalpen_answer_pages"].find(
             {"submission_id": submission_id}
         ).sort("page_number", 1).to_list(length=_MAX_PAGE_COUNT + 1)
@@ -628,7 +614,7 @@ class FullDocumentGradingService:
                                 prompt_version=prompt_version,
                             )[:32]
                         ),
-                        reasoning_effort=_STRUCTURED_REASONING_EFFORT,
+                        reasoning_effort=reasoning_effort,
                         temperature=temperature,
                         max_output_tokens=min(
                             32_000, max(10_000, 1_400 * len(questions))
@@ -884,7 +870,7 @@ class FullDocumentGradingService:
                     [_catalog_question(question) for question in questions]
                 ),
                 prompt_cache_key=cache_key,
-                reasoning_effort=_STRUCTURED_REASONING_EFFORT,
+                reasoning_effort=reasoning_effort,
                 temperature=temperature,
                 max_output_tokens=_mapping_output_token_budget(len(questions)),
                 metadata={
@@ -1011,7 +997,7 @@ class FullDocumentGradingService:
                     [_catalog_question(question) for question in batch_questions]
                 ),
                 prompt_cache_key=cache_key,
-                reasoning_effort=_STRUCTURED_REASONING_EFFORT,
+                reasoning_effort=reasoning_effort,
                 temperature=temperature,
                 max_output_tokens=_question_output_token_budget(
                     len(batch_questions),

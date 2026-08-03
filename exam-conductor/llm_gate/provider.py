@@ -86,6 +86,23 @@ def _provider_http_error(resp: httpx.Response, *, provider: str) -> ProviderHTTP
     )
 
 
+def _normalise_responses_reasoning_effort(
+    model_id: str,
+    reasoning_effort: str,
+) -> str:
+    """Translate a requested effort to the model's supported vocabulary.
+
+    GPT-5.1 does not accept the newer ``minimal`` value.  Treat ``minimal`` as
+    the caller's low-cost intent and use ``low`` rather than sending a request
+    that the provider will deterministically reject.
+    """
+
+    effort = str(reasoning_effort or "").strip().lower()
+    if effort == "minimal" and str(model_id or "").lower().startswith("gpt-5.1"):
+        return "low"
+    return effort
+
+
 # ---------------------------------------------------------------------------
 # Unified provider response
 # ---------------------------------------------------------------------------
@@ -365,7 +382,12 @@ async def _call_openai_responses(
     if prompt_cache_key:
         payload["prompt_cache_key"] = prompt_cache_key
     if reasoning_effort:
-        payload["reasoning"] = {"effort": reasoning_effort}
+        payload["reasoning"] = {
+            "effort": _normalise_responses_reasoning_effort(
+                model_id,
+                reasoning_effort,
+            )
+        }
     if json_schema:
         payload["text"] = {
             "format": {

@@ -737,6 +737,38 @@ class TestOpenAIResponsesDocumentInput:
         assert error.retryable is True
         assert error.status_code == 429
 
+    def test_openai_responses_maps_minimal_effort_to_low_for_gpt_5_1(self):
+        class _HTTPResponse:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"model": "gpt-5.1-2025-11-13", "output": [], "usage": {}}
+
+        class _HTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                assert json["reasoning"] == {"effort": "low"}
+                return _HTTPResponse()
+
+        async def _run():
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=_HTTPClient()):
+                await _call_openai_responses(
+                    "gpt-5.1-2025-11-13",
+                    responses_input=[
+                        {"role": "user", "content": [{"type": "input_text", "text": "grade"}]}
+                    ],
+                    reasoning_effort="minimal",
+                    api_key="secret",
+                )
+
+        asyncio.run(_run())
+
 
 class TestIGate02UsageLogging:
     """I-GATE-02: successful PCR calls append one usage record."""
