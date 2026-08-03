@@ -1786,9 +1786,9 @@ class FullDocumentGradingService:
             handled=True,
             submission_id=submission_id,
             status=(
-                "completed"
-                if review_state == "ready"
-                else "blocked_for_review"
+                "blocked_for_review"
+                if review_state == "blocked"
+                else "completed"
             ),
             page_count=page_count,
             response_count=len(response_docs),
