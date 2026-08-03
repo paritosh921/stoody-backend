@@ -21,6 +21,7 @@ SUBMISSIONS_COLLECTION = "evalpen_submissions"
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 GRADING_RUNS_COLLECTION = "evalpen_document_grading_runs"
 MIGRATIONS_COLLECTION = "exampen_grading_contract_migrations"
+PAPER_VERSIONS_COLLECTION = "exampen_paper_versions"
 
 ACTIVE_JOB_STATUSES = ("queued", "processing")
 
@@ -43,6 +44,60 @@ def _published_filter(exam_id: str) -> dict[str, Any]:
     }
 
 
+async def _validate_frozen_paper_version(
+    tenant_db: Any,
+    exam: dict[str, Any],
+) -> list[str]:
+    """Validate the immutable paper snapshot used by the grading worker."""
+
+    paper_version_id = str(exam.get("paper_version_id") or "").strip()
+    if not paper_version_id:
+        return ["exam has no frozen paper version"]
+
+    paper_version = await tenant_db[PAPER_VERSIONS_COLLECTION].find_one(
+        {"paper_version_id": paper_version_id},
+        {
+            "_id": 0,
+            "document_id": 1,
+            "paper_context": 1,
+            "paper_assets": 1,
+        },
+    )
+    if not paper_version:
+        return [f"frozen paper version {paper_version_id} was not found"]
+
+    blockers: list[str] = []
+    prepared_document_id = str(exam.get("prepared_document_id") or "").strip()
+    version_document_id = str(paper_version.get("document_id") or "").strip()
+    if prepared_document_id and version_document_id != prepared_document_id:
+        blockers.append("frozen paper version does not belong to the prepared document")
+
+    paper_context = dict(paper_version.get("paper_context") or {})
+    if not paper_context.get("ready"):
+        blockers.append("frozen paper context is not ready")
+    if str(paper_context.get("version") or "") != EVIDENCE_GRAPH_PAPER_VERSION:
+        blockers.append(
+            "frozen paper context is not the canonical full-document evidence graph"
+        )
+
+    paper_assets = dict(paper_version.get("paper_assets") or {})
+    question_asset = dict(paper_assets.get("question_paper") or {})
+    if not question_asset.get("asset_id") or not question_asset.get("storage_uri"):
+        blockers.append("frozen question-paper asset is unavailable")
+    elif paper_context.get("question_paper_asset_id") != question_asset.get("asset_id"):
+        blockers.append("frozen question-paper asset does not match its context")
+
+    if paper_context.get("has_teacher_solution_asset"):
+        solution_asset = dict(paper_assets.get("teacher_solution") or {})
+        if not solution_asset.get("asset_id") or not solution_asset.get("storage_uri"):
+            blockers.append("frozen teacher-solution asset is unavailable")
+        elif paper_context.get("teacher_solution_asset_id") != solution_asset.get(
+            "asset_id"
+        ):
+            blockers.append("frozen teacher-solution asset does not match its context")
+    return blockers
+
+
 async def inspect_v5_contracts(
     tenant_db: Any,
     *,
@@ -62,7 +117,8 @@ async def inspect_v5_contracts(
             "exam_id": 1,
             "exam_name": 1,
             "title": 1,
-            "paper_context": 1,
+            "prepared_document_id": 1,
+            "paper_version_id": 1,
             "pcr_grading_contract": 1,
         },
     ).to_list(length=None)
@@ -70,7 +126,6 @@ async def inspect_v5_contracts(
     plans: list[dict[str, Any]] = []
     for exam in exams:
         current_exam_id = str(exam.get("exam_id") or "")
-        paper_context = dict(exam.get("paper_context") or {})
         submission_count = await tenant_db[SUBMISSIONS_COLLECTION].count_documents(
             {"exam_id": current_exam_id}
         )
@@ -85,13 +140,7 @@ async def inspect_v5_contracts(
         )
         missing_job_count = max(submission_count - len(job_submission_ids), 0)
 
-        blockers: list[str] = []
-        if not paper_context.get("ready"):
-            blockers.append("paper context is not ready")
-        if str(paper_context.get("version") or "") != EVIDENCE_GRAPH_PAPER_VERSION:
-            blockers.append(
-                "paper context is not the canonical full-document evidence graph"
-            )
+        blockers = await _validate_frozen_paper_version(tenant_db, exam)
         if published_count:
             blockers.append(
                 f"{published_count} published submission(s) require an explicit "
@@ -203,9 +252,9 @@ async def migrate_v5_exam_to_v6(
             updated = await tenant_db[EXAMS_COLLECTION].update_one(
                 {
                     "exam_id": exam_id,
+                    "paper_version_id": exam.get("paper_version_id"),
+                    "prepared_document_id": exam.get("prepared_document_id"),
                     "pcr_grading_contract.prompt_version": SOURCE_PROMPT_VERSION,
-                    "paper_context.ready": True,
-                    "paper_context.version": EVIDENCE_GRAPH_PAPER_VERSION,
                 },
                 {
                     "$set": {

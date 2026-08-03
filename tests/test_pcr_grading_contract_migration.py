@@ -19,16 +19,37 @@ async def _seed(db, *, published: bool = False) -> None:
         {
             "exam_id": "EXAM-1",
             "exam_name": "Physics",
-            "paper_context": {
-                "ready": True,
-                "version": "canonical-full-document-visual-v2",
-            },
+            "prepared_document_id": "DOC-1",
+            "paper_version_id": "PAPER-1",
             "pcr_grading_contract": {
                 "prompt_version": "pcr-full-document-visual-v5",
                 "model_id": "gpt-5.1-2025-11-13",
                 "reasoning_effort": "medium",
                 "temperature": 0.1,
                 "locked_at": "original-lock",
+            },
+        }
+    )
+    await db["exampen_paper_versions"].insert_one(
+        {
+            "paper_version_id": "PAPER-1",
+            "document_id": "DOC-1",
+            "paper_context": {
+                "ready": True,
+                "version": "canonical-full-document-visual-v2",
+                "question_paper_asset_id": "ASSET-Q",
+                "teacher_solution_asset_id": "ASSET-S",
+                "has_teacher_solution_asset": True,
+            },
+            "paper_assets": {
+                "question_paper": {
+                    "asset_id": "ASSET-Q",
+                    "storage_uri": "s3://bucket/question.pdf",
+                },
+                "teacher_solution": {
+                    "asset_id": "ASSET-S",
+                    "storage_uri": "s3://bucket/solution.pdf",
+                },
             },
         }
     )
@@ -115,3 +136,15 @@ async def test_migration_refuses_to_mix_with_published_results():
     assert exam["pcr_grading_contract"]["prompt_version"] == (
         "pcr-full-document-visual-v5"
     )
+
+
+@pytest.mark.asyncio
+async def test_migration_requires_the_linked_frozen_paper_context():
+    db = _db()
+    await _seed(db)
+    await db["exampen_paper_versions"].delete_one({"paper_version_id": "PAPER-1"})
+
+    plans = await inspect_v5_contracts(db, db_name="skb_test", exam_id="EXAM-1")
+
+    assert plans[0]["eligible"] is False
+    assert plans[0]["blockers"] == ["frozen paper version PAPER-1 was not found"]
