@@ -132,6 +132,21 @@ class EvaluationApprovalRequest(BaseModel):
         return value
 
 
+class ResponseManualResolutionRequest(BaseModel):
+    """Teacher-owned final score when automated grading could not materialize."""
+
+    awarded_marks: float = Field(..., ge=0)
+    reason: str = Field(..., min_length=5, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def manual_resolution_reason(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 5:
+            raise ValueError("Reason must be at least 5 characters")
+        return value
+
+
 class QuestionTaxonomyUpdateRequest(BaseModel):
     """Persisted teacher-owned topic classification for one frozen question."""
 
@@ -338,6 +353,9 @@ class SubmissionSummaryReviewAPI(BaseModel):
     source: str = "camera"
     segmentation_status: str = "pending"
     processing_status: Optional[str] = None
+    processing_job_id: Optional[str] = None
+    can_reprocess: bool = False
+    reprocess_block_reason: Optional[str] = None
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
@@ -782,7 +800,13 @@ async def get_submission_summary(
         sub_dict = _sub_dict_for_scope
         segmentation_status = str(sub_dict.get("segmentation_status") or "pending")
         processing_job = await tenant_db["exampen_processing_jobs"].find_one(
-            {"submission_id": submission_id}
+            {"submission_id": submission_id},
+            sort=[("created_at", -1)],
+        )
+        processing_job_id = (
+            str(processing_job.get("job_id"))
+            if isinstance(processing_job, dict) and processing_job.get("job_id")
+            else None
         )
         processing_status = (
             str(processing_job.get("status"))
@@ -809,6 +833,29 @@ async def get_submission_summary(
         retry_scheduled = (
             processing_status == "retryable_error" and bool(processing_retry_at)
         )
+        terminal_reprocess_statuses = {
+            "completed",
+            "blocked_for_review",
+            "failed",
+            "retryable_error",
+            "enqueue_failed",
+        }
+        publication_status = str(sub_dict.get("publication_status") or "pending")
+        can_reprocess = bool(
+            processing_job_id
+            and publication_status != "published"
+            and not retry_scheduled
+            and processing_status in terminal_reprocess_statuses
+        )
+        reprocess_block_reason = None
+        if publication_status == "published":
+            reprocess_block_reason = "Published results must use the recheck workflow"
+        elif retry_scheduled:
+            reprocess_block_reason = "An automatic retry is already scheduled"
+        elif not processing_job_id:
+            reprocess_block_reason = "No canonical processing job is available yet"
+        elif processing_status not in terminal_reprocess_statuses:
+            reprocess_block_reason = "The current processing job is still active"
         processing_active = processing_status in {"queued", "processing"} or retry_scheduled
         processing_failed = (
             (segmentation_status == "failed" and not processing_active)
@@ -1138,6 +1185,9 @@ async def get_submission_summary(
             source=sub_dict.get("source", "camera"),
             segmentation_status=segmentation_status,
             processing_status=processing_status,
+            processing_job_id=processing_job_id,
+            can_reprocess=can_reprocess,
+            reprocess_block_reason=reprocess_block_reason,
             processing_error=processing_error,
             processing_retry_at=processing_retry_at,
             processing_attempts=processing_attempts,
@@ -2938,6 +2988,212 @@ async def override_evaluation_score(
                     exc,
                     exc_info=True,
                 )
+
+
+@router.post(
+    "/responses/{response_id}/manual-resolution",
+    summary="Resolve a mapped response that automated grading could not score",
+)
+async def resolve_response_manually(
+    response_id: str,
+    body: ResponseManualResolutionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Persist an audited teacher score, clear review flags, and recalculate readiness."""
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    response = await tenant_db["evalpen_detected_responses"].find_one(
+        {"response_id": response_id}
+    )
+    if response is None:
+        raise HTTPException(status_code=404, detail=f"Response {response_id} not found")
+
+    submission_id = str(response.get("submission_id") or "")
+    student_id = str(response.get("student_id") or "")
+    if student_id:
+        _check_student_in_scope(student_id, scoped_ids)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id}
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail="The answer-copy submission no longer exists")
+    if str(submission.get("publication_status") or "").lower() == "published":
+        raise HTTPException(
+            status_code=409,
+            detail="Published results must be changed through the audited amendment workflow",
+        )
+
+    exam_id = str(response.get("exam_id") or submission.get("exam_id") or "")
+    question_id = str(response.get("question_id") or "")
+    catalog = await _get_pcr_question_catalog(tenant_db, exam_id)
+    question = next(
+        (item for item in catalog if str(item.get("question_id") or "") == question_id),
+        None,
+    )
+    if question is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This response is not assigned to a finalized exam question",
+        )
+    max_score = float(question.get("max_marks") or 0.0)
+    awarded_marks = float(body.awarded_marks)
+    if max_score <= 0:
+        raise HTTPException(status_code=409, detail="The finalized question has no valid maximum mark")
+    if not math.isfinite(awarded_marks) or awarded_marks > max_score:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Awarded marks must be between 0 and {max_score:g}",
+        )
+
+    from services.exampen_review_lease import (
+        SubmissionReviewBusyError,
+        acquire_submission_review_lease,
+        release_submission_review_lease,
+    )
+
+    actor_id = str(current_user.get("user_id") or current_user.get("_id") or "unknown")
+    try:
+        lease_token = await acquire_submission_review_lease(
+            tenant_db,
+            submission_id,
+            actor_id=actor_id,
+            operation="manual_response_resolution",
+        )
+    except SubmissionReviewBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    try:
+        current_submission = await tenant_db["evalpen_submissions"].find_one(
+            {"submission_id": submission_id}
+        )
+        if str((current_submission or {}).get("publication_status") or "").lower() == "published":
+            raise HTTPException(
+                status_code=409,
+                detail="This result was published while the review was being saved",
+            )
+
+        existing = await tenant_db["evalpen_evaluations"].find_one(
+            {"response_id": response_id}
+        )
+        if existing and existing.get("criterion_marks"):
+            raise HTTPException(
+                status_code=409,
+                detail="This response has criterion marks. Use Edit marks to preserve the locked marking plan.",
+            )
+
+        now = datetime.now(timezone.utc)
+        evaluation_id = str((existing or {}).get("evaluation_id") or f"eval-{uuid.uuid4().hex}")
+        previous_score = (existing or {}).get("total_score")
+        evaluation_fields: Dict[str, Any] = {
+            "evaluation_id": evaluation_id,
+            "response_id": response_id,
+            "submission_id": submission_id,
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "question_id": question_id,
+            "eval_path": "teacher_manual_resolution",
+            "model_used": "teacher",
+            "total_score": awarded_marks,
+            "max_score": max_score,
+            "scoreable_max": max_score,
+            "step_marks": [],
+            "criterion_marks": [],
+            "overall_feedback": body.reason,
+            "teacher_feedback": body.reason,
+            "reference_solution": question.get("reference_solution"),
+            "manual_review_required": False,
+            "manual_review_reason": None,
+            "flags": _resolve_review_flags(
+                (existing or {}).get("flags"),
+                actor_id=actor_id,
+                resolved_at=now,
+                reason=body.reason,
+            ),
+            "teacher_review_status": "approved",
+            "teacher_reviewed": True,
+            "teacher_reviewed_by": actor_id,
+            "teacher_reviewed_at": now,
+            "updated_at": now,
+        }
+        audit_entry = {
+            "actor_id": actor_id,
+            "timestamp": now,
+            "action": "manual_response_resolution",
+            "before": {"total_score": previous_score},
+            "after": {"total_score": awarded_marks, "max_score": max_score},
+            "reason": body.reason,
+        }
+        if existing:
+            await tenant_db["evalpen_evaluations"].update_one(
+                {"_id": existing["_id"]},
+                {"$set": evaluation_fields, "$push": {"audit_trail": audit_entry}},
+            )
+        else:
+            await tenant_db["evalpen_evaluations"].insert_one(
+                {
+                    **evaluation_fields,
+                    "created_at": now,
+                    "audit_trail": [audit_entry],
+                    "token_usage": {},
+                    "raw_llm_response": None,
+                }
+            )
+
+        await tenant_db["evalpen_detected_responses"].update_one(
+            {"_id": response["_id"]},
+            {
+                "$set": {
+                    "eval_status": "evaluated",
+                    "manual_review_required": False,
+                    "manual_review_reason": None,
+                    "question_assignment.manual_review_required": False,
+                    "flags": _resolve_review_flags(
+                        response.get("flags"),
+                        actor_id=actor_id,
+                        resolved_at=now,
+                        reason=body.reason,
+                    ),
+                    "teacher_review_status": "approved",
+                    "teacher_reviewed_by": actor_id,
+                    "teacher_reviewed_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        await tenant_db["evalpen_teacher_review_audit"].insert_one(
+            {
+                "audit_id": f"TRA-{uuid.uuid4().hex[:20]}",
+                "evaluation_id": evaluation_id,
+                "response_id": response_id,
+                "submission_id": submission_id,
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "action": "manual_response_resolution",
+                "before": {"total_score": previous_score},
+                "after": {"total_score": awarded_marks, "max_score": max_score},
+                "reason": body.reason,
+                "actor_id": actor_id,
+                "created_at": now,
+            }
+        )
+        review_state, readiness, publication_status = await _refresh_unpublished_review_state(
+            tenant_db,
+            submission_id,
+            now=now,
+        )
+        return {
+            "response_id": response_id,
+            "evaluation_id": evaluation_id,
+            "total_score": awarded_marks,
+            "max_score": max_score,
+            "review_state": review_state,
+            "publication_status": publication_status,
+            "readiness": readiness,
+        }
+    finally:
+        await release_submission_review_lease(tenant_db, submission_id, lease_token)
 
 
 @router.post(
