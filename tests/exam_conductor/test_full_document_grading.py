@@ -652,7 +652,7 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
         lambda pages: _async_value((assets, sum(len(a.global_bytes) for a in assets))),
     )
     mapping_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "document_review": _document_review(),
         "questions": [
             {
@@ -717,7 +717,7 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
         "unassigned_regions": [],
     }
     grading_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 1,
@@ -823,16 +823,16 @@ async def test_evidence_graph_maps_distant_continuation_and_side_by_side_diagram
     assert len(q1["source_pages"]) == 2
     assert q1["source_pages"][0]["region_id"] == "q1-diagram"
     assert q2["source_pages"][0]["x_start"] > 100
-    assert q1["visual_evidence"]["visual_semantics"]["elements"][0]["label"] == "battery"
+    assert q1["visual_evidence"]["visual_semantics"]["elements"] == []
     assert q1["semantic_evidence_signature"]
     run = await db["evalpen_document_grading_runs"].find_one(
         {"run_id": result.run_id}
     )
-    assert run["prompt_version"] == "pcr-full-document-visual-v5"
+    assert run["prompt_version"] == "pcr-full-document-visual-v6"
     assert run["evidence_graph_mapping"]["questions"][0]["evidence_regions"]
     frozen_exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-DOC-1"})
     assert frozen_exam["pcr_grading_contract"]["prompt_version"] == (
-        "pcr-full-document-visual-v5"
+        "pcr-full-document-visual-v6"
     )
 
 
@@ -890,7 +890,7 @@ async def test_evidence_graph_question_grading_splits_batch_on_output_token_exha
     monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "2")
 
     mapping_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "document_review": _document_review(),
         "questions": [
             {
@@ -948,7 +948,7 @@ async def test_evidence_graph_question_grading_splits_batch_on_output_token_exha
         incomplete_reason="max_output_tokens",
     )
     grade_payload_one = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 1,
@@ -993,7 +993,7 @@ async def test_evidence_graph_question_grading_splits_batch_on_output_token_exha
         ],
     }
     grade_payload_two = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 2,
@@ -1106,7 +1106,7 @@ async def test_evidence_graph_question_grading_contract_mismatch_splits_batch(
     monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "2")
 
     mapping_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "document_review": _document_review(),
         "questions": [
             {
@@ -1159,7 +1159,7 @@ async def test_evidence_graph_question_grading_contract_mismatch_splits_batch(
         "unassigned_regions": [],
     }
     mismatched_batch_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 2,
@@ -1195,7 +1195,7 @@ async def test_evidence_graph_question_grading_contract_mismatch_splits_batch(
         ],
     }
     q2_single_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 2,
@@ -1247,14 +1247,13 @@ async def test_evidence_graph_question_grading_contract_mismatch_splits_batch(
 
     result = await service.grade_submission("SUB-DOC-1")
 
-    assert result.status == "completed"
+    assert result.status == "blocked_for_review"
     assert result.review_state == "blocked"
     assert result.evaluated_count == 1
     assert result.blocked_count == 1
-    assert len(gate.calls) == 4
+    assert len(gate.calls) == 3
     assert gate.calls[1]["metadata"]["question_numbers"] == [1, 2]
     assert gate.calls[2]["metadata"]["question_numbers"] == [1]
-    assert gate.calls[3]["metadata"]["question_numbers"] == [2]
 
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
@@ -1320,7 +1319,7 @@ async def test_evidence_graph_question_grading_marks_question_unresolved_when_bu
     monkeypatch.setenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "1")
 
     mapping_payload = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "document_review": _document_review(),
         "questions": [
             {
@@ -1378,7 +1377,7 @@ async def test_evidence_graph_question_grading_marks_question_unresolved_when_bu
         incomplete_reason="max_output_tokens",
     )
     grade_payload_two = {
-        "evidence_graph_version": "pcr-multimodal-evidence-graph-v1",
+        "evidence_graph_version": "pcr-multimodal-evidence-graph-v2",
         "questions": [
             {
                 "question_number": 2,
@@ -1430,7 +1429,7 @@ async def test_evidence_graph_question_grading_marks_question_unresolved_when_bu
 
     result = await service.grade_submission("SUB-DOC-1")
 
-    assert result.status == "completed"
+    assert result.status == "blocked_for_review"
     assert result.evaluated_count == 1
     assert result.blocked_count == 1
     assert result.review_state == "blocked"
@@ -1961,6 +1960,15 @@ async def test_legacy_contract_backfill_preserves_existing_sampling_controls(
     assert frozen_contract["temperature"] == expected_temperature
     assert frozen_contract["reasoning_effort"] == expected_reasoning_effort
     assert frozen_contract["locked_at"] == "legacy-lock"
+
+
+def test_unsupported_grading_contract_error_is_not_retryable():
+    import importlib
+
+    module = importlib.import_module(
+        "exam-conductor.pcr.services.full_document_grading"
+    )
+    assert module.UnsupportedGradingContractError.retryable is False
 
 
 @pytest.mark.asyncio

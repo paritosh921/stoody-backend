@@ -92,13 +92,34 @@ def evidence_region_schema() -> Dict[str, Any]:
     }
 
 
-def evidence_mapping_schema() -> Dict[str, Any]:
+def evidence_mapping_schema(
+    question_contracts: Sequence[Mapping[str, Any]] = (),
+) -> Dict[str, Any]:
+    """Build the mapping schema for one immutable question catalog.
+
+    The caller supplies the frozen catalog so structured output cannot invent
+    an out-of-paper question number or silently return a shorter mapping.  The
+    semantic validator still rejects duplicate numbers because JSON Schema
+    cannot express uniqueness of one property within an object array.
+    """
+
+    question_numbers = sorted(
+        {
+            int(contract["question_number"])
+            for contract in question_contracts
+            if contract.get("question_number") is not None
+        }
+    )
     region = evidence_region_schema()
     question = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "question_number": {"type": "integer", "minimum": 1},
+            "question_number": (
+                {"type": "integer", "enum": question_numbers}
+                if question_numbers
+                else {"type": "integer", "minimum": 1}
+            ),
             "attempt_status": {
                 "type": "string",
                 "enum": sorted(_ATTEMPT_STATES),
@@ -149,7 +170,15 @@ def evidence_mapping_schema() -> Dict[str, Any]:
                     "warnings",
                 ],
             },
-            "questions": {"type": "array", "items": question},
+            "questions": {
+                "type": "array",
+                "items": question,
+                **(
+                    {"minItems": len(question_numbers), "maxItems": len(question_numbers)}
+                    if question_numbers
+                    else {}
+                ),
+            },
             "unassigned_regions": {"type": "array", "items": region},
         },
         "required": [

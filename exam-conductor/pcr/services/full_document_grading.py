@@ -94,6 +94,12 @@ class FullDocumentGradingError(RuntimeError):
     """Raised when the primary document request cannot be completed safely."""
 
 
+class UnsupportedGradingContractError(FullDocumentGradingError):
+    """Raised when an exam contract requires an explicit cohort migration."""
+
+    retryable = False
+
+
 class StructuredOutputContractError(FullDocumentGradingError):
     """A strict model response was incomplete or violated its JSON contract.
 
@@ -285,14 +291,14 @@ class FullDocumentGradingService:
             else _PROMPT_VERSION
         )
         if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
-            raise FullDocumentGradingError(
+            raise UnsupportedGradingContractError(
                 "This exam is locked to grading contract "
                 f"{contract_version}, which this worker does not support. "
                 "Do not mix grading contracts within one exam; migrate and reprocess "
                 "the complete exam together."
             )
         if contract_version and contract_version != prompt_version:
-            raise FullDocumentGradingError(
+            raise UnsupportedGradingContractError(
                 "The immutable paper requires grading contract "
                 f"{prompt_version}, but this cohort is locked to {contract_version}. "
                 "Migrate and reprocess the complete cohort; never mix grading "
@@ -877,9 +883,9 @@ class FullDocumentGradingService:
                 json_schema=evidence_mapping_schema(
                     [_catalog_question(question) for question in questions]
                 ),
-                prompt_cache_key=mapping_cache_key,
+                prompt_cache_key=cache_key,
                 reasoning_effort=_STRUCTURED_REASONING_EFFORT,
-                temperature=mapping_temperature,
+                temperature=temperature,
                 max_output_tokens=_mapping_output_token_budget(len(questions)),
                 metadata={
                     "pcr_stage": "full_document_evidence_mapping",

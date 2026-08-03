@@ -359,6 +359,7 @@ class SubmissionSummaryReviewAPI(BaseModel):
     # Staff-only diagnostic.  Students continue to receive the safe status
     # surface from their BFF and are never shown worker/storage internals.
     processing_error: Optional[str] = None
+    processing_failure_code: Optional[str] = None
     processing_retry_at: Optional[str] = None
     processing_attempts: int = 0
     # ``available`` means all materialized evaluations can be displayed. A
@@ -818,6 +819,11 @@ async def get_submission_summary(
             if isinstance(processing_job, dict) and processing_job.get("last_error")
             else None
         )
+        processing_failure_code = (
+            str(processing_job.get("failure_code"))[:120]
+            if isinstance(processing_job, dict) and processing_job.get("failure_code")
+            else None
+        )
         processing_retry_at = (
             _dt_to_iso(processing_job.get("next_retry_at"))
             if isinstance(processing_job, dict)
@@ -841,15 +847,24 @@ async def get_submission_summary(
             "enqueue_failed",
         }
         publication_status = str(sub_dict.get("publication_status") or "pending")
+        contract_migration_required = (
+            processing_failure_code == "UnsupportedGradingContractError"
+        )
         can_reprocess = bool(
             processing_job_id
             and publication_status != "published"
             and not retry_scheduled
+            and not contract_migration_required
             and processing_status in terminal_reprocess_statuses
         )
         reprocess_block_reason = None
         if publication_status == "published":
             reprocess_block_reason = "Published results must use the recheck workflow"
+        elif contract_migration_required:
+            reprocess_block_reason = (
+                "This exam uses an unsupported frozen grading contract. "
+                "Migrate and reprocess the complete cohort."
+            )
         elif retry_scheduled:
             reprocess_block_reason = "An automatic retry is already scheduled"
         elif not processing_job_id:
@@ -1189,6 +1204,7 @@ async def get_submission_summary(
             can_reprocess=can_reprocess,
             reprocess_block_reason=reprocess_block_reason,
             processing_error=processing_error,
+            processing_failure_code=processing_failure_code,
             processing_retry_at=processing_retry_at,
             processing_attempts=processing_attempts,
             score_state=score_state,
