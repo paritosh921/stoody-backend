@@ -366,6 +366,59 @@ def _page_asset(module, page_number: int):
     )
 
 
+def test_subjective_grade_shell_is_not_semantically_complete():
+    module = _module()
+    question = {
+        "question_number": 1,
+        "max_marks": 2,
+        "marking_criteria": [
+            {
+                "criterion_id": "step-1",
+                "description": "First valid step",
+                "max_marks": 1,
+                "acceptable_evidence": "Shows the first step.",
+            },
+            {
+                "criterion_id": "step-2",
+                "description": "Correct conclusion",
+                "max_marks": 1,
+                "acceptable_evidence": "States the correct conclusion.",
+            },
+        ],
+    }
+
+    defects = module._semantic_grade_defects(
+        question,
+        {
+            "attempt_status": "attempted",
+            "student_answer": "",
+            "criterion_marks": [],
+        },
+    )
+
+    assert "expected 2 criterion results, received 0" in defects
+    assert "attempted answer has no readable student work" in defects
+    assert module._semantic_grade_defects(
+        question,
+        {"attempt_status": "not_attempted", "criterion_marks": []},
+    ) == []
+
+
+def test_question_grading_schema_can_report_unresolved_criteria():
+    from api.v1._exampen_imports import load_exampen
+
+    graph = load_exampen("pcr.services.visual_evidence_graph")
+    schema = graph.question_grading_schema()
+    root = schema.get("schema", schema)
+    criterion_properties = (
+        root["properties"]["questions"]["items"]["properties"]
+        ["criterion_marks"]["items"]["properties"]
+    )
+
+    assert "unresolved" in criterion_properties["decision"]["enum"]
+    assert "unresolved" in criterion_properties["credit_basis"]["enum"]
+
+
 def test_close_visual_readings_keep_marks_but_require_review():
     module = _module()
     question = {

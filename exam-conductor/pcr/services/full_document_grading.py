@@ -1079,15 +1079,26 @@ class FullDocumentGradingService:
                     batch_index=batch_index,
                     budget_minimum=budget_minimum,
                 )
+                semantic_failures: Dict[int, List[str]] = {}
+                for number in batch_numbers:
+                    item = returned.get(str(number))
+                    question = question_by_number.get(number)
+                    if not item or not question:
+                        continue
+                    defects = _semantic_grade_defects(question, item)
+                    if defects:
+                        semantic_failures[number] = defects
+                        returned.pop(str(number), None)
                 missing = [
                     number for number in batch_numbers if str(number) not in returned
                 ]
                 if missing and can_split:
                     logger.warning(
-                        "Question grader omitted %s from batch %s; retrying only the "
-                        "missing question IDs once.",
+                        "Question grader omitted or incompletely graded %s from batch "
+                        "%s; retrying only those question IDs once. defects=%s",
                         missing,
                         batch_index,
+                        semantic_failures,
                     )
                     retry_questions = [
                         question_by_number[number]
@@ -1113,8 +1124,9 @@ class FullDocumentGradingService:
                 for number in still_missing:
                     returned[str(number)] = _unresolved_grade_for_output_budget(
                         number,
-                        "The question grader omitted this question after one targeted "
-                        "retry. Its evidence remains available for teacher review.",
+                        "The question grader did not return a complete result aligned "
+                        "with the locked marking criteria after one targeted retry. "
+                        "Its evidence remains available for teacher review.",
                     )
                 return returned, usage
             except StructuredOutputContractError as exc:
@@ -3961,6 +3973,46 @@ def _criteria(question: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     return criteria
+
+
+def _semantic_grade_defects(
+    question: Mapping[str, Any],
+    grade: Mapping[str, Any],
+) -> List[str]:
+    """Validate that a model result actually fulfills the locked rubric contract."""
+
+    if _is_objective_question(dict(question)):
+        return []
+    attempt_status = str(grade.get("attempt_status") or "attempted").strip().lower()
+    if attempt_status != "attempted":
+        return []
+    expected = _criteria(dict(question))
+    if not expected:
+        return []
+    raw_rows = grade.get("criterion_marks")
+    rows = (
+        [dict(row) for row in raw_rows if isinstance(row, Mapping)]
+        if isinstance(raw_rows, list)
+        else []
+    )
+    defects: List[str] = []
+    if len(rows) != len(expected):
+        defects.append(
+            f"expected {len(expected)} criterion results, received {len(rows)}"
+        )
+    expected_ids = [str(row.get("criterion_id") or "") for row in expected]
+    returned_ids = [str(row.get("criterion_id") or "") for row in rows]
+    if len(rows) == len(expected) and sorted(returned_ids) != sorted(expected_ids):
+        defects.append("criterion IDs do not match the locked marking plan")
+    has_transcription = bool(str(grade.get("student_answer") or "").strip())
+    has_criterion_evidence = any(
+        bool(str(row.get("evidence") or "").strip())
+        or bool(row.get("evidence_region_ids"))
+        for row in rows
+    )
+    if not has_transcription and not has_criterion_evidence:
+        defects.append("attempted answer has no readable student work")
+    return defects
 
 
 def _question_marking_policy(question: Dict[str, Any]) -> Dict[str, Any]:

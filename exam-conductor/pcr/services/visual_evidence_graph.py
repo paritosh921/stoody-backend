@@ -218,7 +218,7 @@ def question_grading_schema() -> Dict[str, Any]:
             "criterion_id": {"type": "string"},
             "decision": {
                 "type": "string",
-                "enum": ["met", "partially_met", "not_met"],
+                            "enum": ["met", "partially_met", "not_met", "unresolved"],
             },
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "marks_awarded": {"type": "number", "minimum": 0},
@@ -232,9 +232,10 @@ def question_grading_schema() -> Dict[str, Any]:
             "credit_basis": {
                 "type": "string",
                 "enum": [
-                    "direct_evidence",
-                    "error_carried_forward",
-                    "no_credit",
+                                "direct_evidence",
+                                "error_carried_forward",
+                                "no_credit",
+                                "unresolved",
                 ],
             },
         },
