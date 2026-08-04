@@ -275,7 +275,7 @@ async def test_readiness_keeps_scored_review_notes_nonblocking():
 
 
 @pytest.mark.asyncio
-async def test_document_coverage_review_is_one_gate_and_teacher_can_confirm_it():
+async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_it():
     from api.v1.evalpen_review_async import (
         DocumentCoverageReviewRequest,
         confirm_document_coverage_review,
@@ -302,8 +302,9 @@ async def test_document_coverage_review_is_one_gate_and_teacher_can_confirm_it()
     )
 
     before = await assess_submission_readiness(db, "SUB-READY")
-    assert before["ready"] is False
-    assert [item["code"] for item in before["blockers"]] == [
+    assert before["ready"] is True
+    assert before["blockers"] == []
+    assert [item["code"] for item in before["review_notes"]] == [
         "document_coverage_requires_review"
     ]
 

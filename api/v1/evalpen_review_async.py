@@ -1192,7 +1192,7 @@ async def get_submission_summary(
             else "processing"
             if score_state == "processing"
             else "needs_review"
-            if review_count or (document_review and document_review.get("required"))
+            if review_count
             else "ready"
         )
 

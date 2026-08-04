@@ -156,10 +156,10 @@ async def assess_submission_readiness(
 
     document_review = submission.get("document_review")
     if isinstance(document_review, dict) and document_review.get("required"):
-        blockers.append(
+        review_notes.append(
             _blocker(
                 "document_coverage_requires_review",
-                "The full answer copy needs one teacher coverage confirmation",
+                "Some page-level work could not be assigned confidently to a question",
                 review_status=str(
                     document_review.get("status") or "pending_review"
                 ),
