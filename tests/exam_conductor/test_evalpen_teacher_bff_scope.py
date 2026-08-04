@@ -201,7 +201,7 @@ async def test_teacher_bff_queue_separates_review_from_technical_failure():
 
 
 @pytest.mark.asyncio
-async def test_teacher_bff_queue_treats_scored_manual_review_as_review_not_blocked():
+async def test_teacher_bff_queue_treats_scored_manual_review_as_ready_to_publish():
     from api.v1.evalpen_teacher_bff_async import get_exam_queue
 
     db = _fresh_db()
@@ -226,7 +226,7 @@ async def test_teacher_bff_queue_treats_scored_manual_review_as_review_not_block
         patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
         patch(
             "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
-            return_value=[{"student_id": "different-student-id"}],
+            return_value=[{"student_id": "lavyansh"}],
         ),
     ):
         result = await get_exam_queue(
@@ -236,9 +236,9 @@ async def test_teacher_bff_queue_treats_scored_manual_review_as_review_not_block
         )
 
     assert result.blocked == []
-    assert result.ready_to_publish == []
-    assert len(result.needs_review) == 1
-    assert result.needs_review[0].submission_id == "SUB-1"
+    assert result.needs_review == []
+    assert len(result.ready_to_publish) == 1
+    assert result.ready_to_publish[0].submission_id == "SUB-1"
 
 
 @pytest.mark.asyncio

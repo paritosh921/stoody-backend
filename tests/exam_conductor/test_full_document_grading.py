@@ -1712,7 +1712,7 @@ async def test_criterion_decision_is_derived_from_the_locked_award(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_low_confidence_criterion_is_review_gated(monkeypatch):
+async def test_low_confidence_criterion_is_a_nonblocking_review_note(monkeypatch):
     db = _fresh_db()
     await _seed(db)
     uncertain = _attempted_diagram()
@@ -1727,7 +1727,7 @@ async def test_low_confidence_criterion_is_review_gated(monkeypatch):
         },
     )
 
-    assert result.review_state == "needs_review"
+    assert result.review_state == "ready"
     q1 = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}
     )
@@ -2392,7 +2392,7 @@ async def test_valid_alternative_method_is_accepted_and_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_uncertain_legacy_alternative_method_preserves_criterion_score(
+async def test_uncertain_legacy_alternative_method_is_ready_with_review_note(
     monkeypatch,
 ):
     db = _fresh_db()
@@ -2414,7 +2414,7 @@ async def test_uncertain_legacy_alternative_method_preserves_criterion_score(
         },
     )
 
-    assert result.review_state == "needs_review"
+    assert result.review_state == "ready"
     assert result.blocked_count == 0
     response = await db["evalpen_detected_responses"].find_one(
         {"question_id": "EXAM-DOC-1::Q1", "superseded_at": {"$exists": False}}

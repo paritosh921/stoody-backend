@@ -238,7 +238,7 @@ async def test_readiness_blocks_duplicate_evidence_ownership():
 
 
 @pytest.mark.asyncio
-async def test_readiness_blocks_a_scored_response_with_uncertain_question_ownership():
+async def test_readiness_keeps_scored_review_notes_nonblocking():
     from services.exampen_submission_readiness import assess_submission_readiness
 
     db = _fresh_db()
@@ -253,17 +253,25 @@ async def test_readiness_blocks_a_scored_response_with_uncertain_question_owners
             }
         },
     )
+    await db["evalpen_evaluations"].update_one(
+        {"response_id": "RESP-READY-1"},
+        {"$set": {"manual_review_required": True}},
+    )
 
     report = await assess_submission_readiness(db, "SUB-READY")
 
-    assert report["ready"] is False
-    blocker = next(
-        item
-        for item in report["blockers"]
-        if item["code"] == "response_assignment_requires_review"
+    assert report["ready"] is True
+    assert report["blockers"] == []
+    notes_by_code = {item["code"]: item for item in report["review_notes"]}
+    assert notes_by_code["response_assignment_requires_review"]["response_id"] == (
+        "RESP-READY-1"
     )
-    assert blocker["response_id"] == "RESP-READY-1"
-    assert blocker["reason"] == "Number label was not readable"
+    assert notes_by_code["response_assignment_requires_review"]["reason"] == (
+        "Number label was not readable"
+    )
+    assert notes_by_code["evaluation_requires_review"]["response_id"] == (
+        "RESP-READY-1"
+    )
 
 
 @pytest.mark.asyncio

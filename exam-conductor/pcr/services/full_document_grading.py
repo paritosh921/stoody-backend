@@ -1723,7 +1723,7 @@ class FullDocumentGradingService:
             "blocked"
             if blocked
             else "needs_review"
-            if warnings
+            if document_review.required
             else "ready"
         )
         await self._db["evalpen_submissions"].update_one(

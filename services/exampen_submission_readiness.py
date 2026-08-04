@@ -122,11 +122,13 @@ async def assess_submission_readiness(
             "submission_id": submission_id,
             "ready": False,
             "blockers": [_blocker("submission_not_found", "Submission was not found")],
+            "review_notes": [],
             "counts": {},
         }
 
     exam_id = str(submission.get("exam_id") or "")
     blockers: List[Dict[str, Any]] = []
+    review_notes: List[Dict[str, Any]] = []
 
     if _preloaded is not None:
         job = _preloaded.get("job")
@@ -335,7 +337,7 @@ async def assess_submission_readiness(
             isinstance(assignment, dict)
             and assignment.get("manual_review_required")
         ):
-            blockers.append(
+            review_notes.append(
                 _blocker(
                     "response_assignment_requires_review",
                     "Question ownership or answer evidence still requires teacher review",
@@ -396,7 +398,7 @@ async def assess_submission_readiness(
             evaluation.get("manual_review_required")
             and not _teacher_finalized_evaluation(evaluation)
         ):
-            blockers.append(
+            review_notes.append(
                 _blocker(
                     "evaluation_requires_review",
                     "An evaluation still requires teacher review",
@@ -450,6 +452,7 @@ async def assess_submission_readiness(
         "exam_id": exam_id,
         "ready": not blockers,
         "blockers": blockers,
+        "review_notes": review_notes,
         "counts": {
             "question_count": len(catalog_by_id),
             "response_count": len(responses),

@@ -19,6 +19,7 @@ node_modules/
 uploads/
 images/
 data/tmp/
+data/private_uploads/
 logs/
 mentorAI/.mentor-ai.pid
 

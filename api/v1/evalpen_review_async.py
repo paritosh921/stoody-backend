@@ -1741,6 +1741,12 @@ async def get_exam_roster(
         for doc in sub_by_student.values()
         if doc.get("submission_id")
     ]
+    from services.exampen_submission_readiness import assess_submissions_readiness
+
+    readiness_by_submission = await assess_submissions_readiness(
+        tenant_db,
+        submission_ids,
+    )
     blocked_submissions: set[str] = set()
     review_submissions: set[str] = set()
     ready_submissions: set[str] = set()
@@ -1798,6 +1804,9 @@ async def get_exam_roster(
         publication = str((submission or {}).get("publication_status") or "").lower()
         job_status = str((job or {}).get("status") or "").lower()
         review_state = str((submission or {}).get("review_state") or "").lower()
+        readiness_ready = bool(
+            (readiness_by_submission.get(submission_id or "") or {}).get("ready")
+        )
         source = str((submission or {}).get("source") or "").lower() or None
         if source and source not in {"pen", "camera", "mixed"}:
             source = "camera" if source in {"upload", "pdf", "image"} else source
@@ -1816,6 +1825,10 @@ async def get_exam_roster(
         }:
             status_value = "blocked"
             total_blocked += 1
+            total_submitted += 1
+        elif readiness_ready:
+            status_value = "ready"
+            total_ready += 1
             total_submitted += 1
         elif review_state == "needs_review" or submission_id in review_submissions or (
             job_status == "blocked_for_review"

@@ -116,6 +116,18 @@ class PrivateUploadStorage:
         await _write_metadata_sidecar(path, content_type=content_type, metadata=metadata)
         return str(path)
 
+    async def read_released_path(self, released_path: str) -> bytes:
+        """Read a scanner-released artefact without permitting arbitrary paths."""
+        if not released_path:
+            raise FileNotFoundError("Released upload path is missing")
+        candidate = Path(released_path).resolve(strict=False)
+        released_root = (self.local_root / self.released_prefix).resolve(strict=False)
+        if candidate == released_root or released_root not in candidate.parents:
+            raise ValueError("Released upload path is outside private upload storage")
+        if not candidate.is_file():
+            raise FileNotFoundError(f"Released upload is unavailable: {candidate}")
+        return await _read_file(candidate)
+
     async def delete_released_path(self, released_path: str) -> bool:
         """Delete a released local artefact after durable object-store transfer.
 
@@ -165,6 +177,12 @@ async def _copy_file(source: Path, destination: Path) -> None:
     import asyncio
 
     await asyncio.to_thread(shutil.copyfile, source, destination)
+
+
+async def _read_file(path: Path) -> bytes:
+    import asyncio
+
+    return await asyncio.to_thread(path.read_bytes)
 
 
 async def _delete_file_and_empty_parents(path: Path, *, stop_at: Path) -> None:

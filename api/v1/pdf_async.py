@@ -4158,6 +4158,8 @@ async def upload_pdf(
                 detail="Document title must not exceed 100 characters"
             )
 
+        from core.upload_security.durable_authoring import promote_clean_authoring_pdf
+
         clean_document_upload = await secure_upload(
             file=file,
             policy_id="pdf_document",
@@ -4172,7 +4174,14 @@ async def upload_pdf(
             },
             authorization_subject=f"document:{document_id}:{current_user.get('user_id', 'unknown')}",
         )
-        file_content = clean_document_upload.bytes or b""
+        promoted_document = await promote_clean_authoring_pdf(
+            db,
+            clean_document_upload,
+            tenant_db=str(current_user.get("db_name") or "shared"),
+            document_id=document_id,
+            artifact_role="source_document",
+        )
+        file_content = promoted_document.data
         file_size = clean_document_upload.size_bytes
         
         # Count PDF pages using pypdf (already in requirements.txt)
@@ -4187,7 +4196,7 @@ async def upload_pdf(
             logger.warning(f"Failed to count PDF pages for {document_id}: {pdf_err}")
 
         logger.info(f"Uploading document: {document_id}, Title: {title}, Type: {document_type}, Size: {file_size} bytes")
-        relative_path = clean_document_upload.released_storage_path
+        relative_path = promoted_document.storage_uri
 
         # Validate total_points for Test Series
         if document_type == "Test Series" and total_points is not None:
@@ -4309,11 +4318,18 @@ async def upload_pdf(
                 },
                 authorization_subject=f"answer_sheet:{document_id}:{current_user.get('user_id', 'unknown')}",
             )
-            answer_sheet_content = clean_answer_sheet_upload.bytes or b""
+            promoted_answer_sheet = await promote_clean_authoring_pdf(
+                db,
+                clean_answer_sheet_upload,
+                tenant_db=str(current_user.get("db_name") or "shared"),
+                document_id=document_id,
+                artifact_role="teacher_solution",
+            )
+            answer_sheet_content = promoted_answer_sheet.data
             answer_sheet_file_size = clean_answer_sheet_upload.size_bytes
             answer_sheet_filename = clean_answer_sheet_upload.original_filename
             answer_sheet_uploaded_at = datetime.utcnow()
-            answer_sheet_path = clean_answer_sheet_upload.released_storage_path
+            answer_sheet_path = promoted_answer_sheet.storage_uri
             answer_sheet_upload_id = clean_answer_sheet_upload.upload_id
             answer_sheet_sha256 = clean_answer_sheet_upload.sha256
 
