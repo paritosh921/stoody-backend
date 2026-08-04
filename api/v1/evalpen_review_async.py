@@ -213,6 +213,27 @@ class PublishRequest(BaseModel):
     )
 
 
+class PublishReadyRequest(BaseModel):
+    """One bounded publish action for the ready submissions in an exam."""
+
+    submission_ids: List[str] = Field(..., min_length=1, max_length=500)
+    note: Optional[str] = Field(
+        default=None,
+        max_length=1000,
+        description="Optional note attached to every successful publication",
+    )
+
+    @field_validator("submission_ids")
+    @classmethod
+    def normalize_submission_ids(cls, values: List[str]) -> List[str]:
+        normalized = list(
+            dict.fromkeys(str(value).strip() for value in values if str(value).strip())
+        )
+        if not normalized:
+            raise ValueError("At least one submission is required")
+        return normalized
+
+
 class DocumentCoverageReviewRequest(BaseModel):
     """Teacher confirmation that every submitted page was visually reviewed."""
 
@@ -4512,11 +4533,6 @@ async def _publish_submission_impl(
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
 
     try:
-        from api.v1._exampen_imports import load_exampen
-
-        _pcr_storage = load_exampen("pcr.storage")
-        DetectedResponseRepository = _pcr_storage.DetectedResponseRepository
-
         submissions_col = tenant_db["evalpen_submissions"]
 
         # Verify submission exists
@@ -4553,46 +4569,6 @@ async def _publish_submission_impl(
                     "message": f"Cannot publish: {readiness_message(readiness)}",
                     "readiness": readiness,
                 },
-            )
-
-        # Check for unresolved blocking flags
-        resp_repo = DetectedResponseRepository(tenant_db)
-        blocked_responses = await resp_repo.get_responses_with_blocking_flags(
-            submission_id=submission_id
-        )
-
-        # Filter to only truly unresolved blocking flags
-        unresolved_blocking = []
-        for resp in blocked_responses:
-            flags = resp.get("flags", [])
-            has_unresolved = any(
-                f.get("severity") == "blocking"
-                and not is_flag_resolved(f)
-                for f in flags
-            )
-            if has_unresolved:
-                unresolved_blocking.append(resp.get("response_id", ""))
-
-        if unresolved_blocking:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Cannot publish: {len(unresolved_blocking)} response(s) "
-                    f"have unresolved blocking flags. Resolve all blocking "
-                    f"flags before publishing."
-                ),
-            )
-
-        manual_review_count = await tenant_db["evalpen_detected_responses"].count_documents(
-            {"submission_id": submission_id, "eval_status": "manual_review"}
-        )
-        if manual_review_count:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Cannot publish: {manual_review_count} response(s) still require "
-                    "teacher criterion review."
-                ),
             )
 
         actor_id = current_user.get("user_id", "unknown")
@@ -4734,3 +4710,102 @@ async def publish_submission(
             submission_id,
             lease_token,
         )
+
+
+@router.post(
+    "/exams/{exam_id}/publish-ready",
+    summary="Publish selected ready submissions for one exam",
+    responses={
+        403: {"description": "Insufficient permissions"},
+        422: {"description": "No submissions were supplied"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def publish_ready_submissions(
+    exam_id: str,
+    body: PublishReadyRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Publish an exam selection without unbounded browser-side requests.
+
+    Each submission still passes the same readiness assessment and review
+    lease as the single-submission endpoint. Failures are isolated and
+    returned per submission so one stale row cannot hide successful publishes.
+    """
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    submissions = await tenant_db["evalpen_submissions"].find(
+        {"submission_id": {"$in": body.submission_ids}},
+        {"submission_id": 1, "exam_id": 1, "publication_status": 1},
+    ).to_list(length=len(body.submission_ids))
+    submissions_by_id = {
+        str(submission.get("submission_id") or ""): submission
+        for submission in submissions
+    }
+
+    results: List[Dict[str, Any]] = []
+    published_count = 0
+    already_published_count = 0
+
+    for submission_id in body.submission_ids:
+        submission = submissions_by_id.get(submission_id)
+        if submission is None:
+            results.append(
+                {
+                    "submission_id": submission_id,
+                    "status": "failed",
+                    "detail": "Submission not found",
+                }
+            )
+            continue
+        if str(submission.get("exam_id") or "") != exam_id:
+            results.append(
+                {
+                    "submission_id": submission_id,
+                    "status": "failed",
+                    "detail": "Submission does not belong to this exam",
+                }
+            )
+            continue
+        if submission.get("publication_status") == "published":
+            already_published_count += 1
+            results.append(
+                {"submission_id": submission_id, "status": "already_published"}
+            )
+            continue
+
+        try:
+            published = await publish_submission(
+                submission_id,
+                PublishRequest(note=body.note),
+                current_user=current_user,
+                db=db,
+            )
+            published_count += 1
+            results.append(
+                {
+                    "submission_id": submission_id,
+                    "status": "published",
+                    "published_at": published.get("published_at"),
+                }
+            )
+        except HTTPException as exc:
+            results.append(
+                {
+                    "submission_id": submission_id,
+                    "status": "failed",
+                    "http_status": exc.status_code,
+                    "detail": exc.detail,
+                }
+            )
+
+    failed_count = sum(1 for result in results if result["status"] == "failed")
+    return {
+        "exam_id": exam_id,
+        "requested_count": len(body.submission_ids),
+        "published_count": published_count,
+        "already_published_count": already_published_count,
+        "failed_count": failed_count,
+        "results": results,
+    }

@@ -88,7 +88,6 @@ class ExamSummaryItem(BaseModel):
     published_count: int = 0
     open_recheck_count: int = 0
     class_label: Optional[str] = None
-    teacher_names: List[str] = Field(default_factory=list)
     # Prepared-exam fields (from finalized documents)
     status: str = "active"  # "prepared" | "active"
     exam_mode: Optional[str] = None  # "dcr" | "pcr" | None
@@ -521,7 +520,6 @@ async def list_exams(
                     "document_id": 1,
                     "standard": 1,
                     "section": 1,
-                    "teacher_ids": 1,
                 },
             ).to_list(length=5000)
             if overview_document_ids
@@ -532,76 +530,6 @@ async def list_exams(
             for document in overview_documents
             if document.get("document_id")
         }
-
-        teacher_ids = {
-            str(value).strip()
-            for source in [*active_exam_docs, *overview_documents]
-            for value in (source.get("teacher_ids") or [])
-            if str(value).strip()
-        }
-        teacher_name_by_id: Dict[str, str] = {}
-        if teacher_ids:
-            teacher_id_values: List[Any] = sorted(teacher_ids)
-            try:
-                from bson import ObjectId
-
-                teacher_id_values.extend(
-                    ObjectId(value) for value in teacher_ids if ObjectId.is_valid(value)
-                )
-            except ImportError:
-                pass
-            tutor_docs = await tenant_db["tutors"].find(
-                {
-                    "$or": [
-                        {"_id": {"$in": teacher_id_values}},
-                        {"tutor_id": {"$in": sorted(teacher_ids)}},
-                        {"user_id": {"$in": sorted(teacher_ids)}},
-                        {"username": {"$in": sorted(teacher_ids)}},
-                    ]
-                },
-                {
-                    "tutor_id": 1,
-                    "user_id": 1,
-                    "username": 1,
-                    "name": 1,
-                    "full_name": 1,
-                    "email": 1,
-                },
-            ).to_list(length=5000)
-            for tutor in tutor_docs:
-                display_name = str(
-                    tutor.get("name")
-                    or tutor.get("full_name")
-                    or tutor.get("username")
-                    or tutor.get("email")
-                    or ""
-                ).strip()
-                if not display_name:
-                    continue
-                for identity in (
-                    tutor.get("_id"),
-                    tutor.get("tutor_id"),
-                    tutor.get("user_id"),
-                    tutor.get("username"),
-                ):
-                    if identity is not None and str(identity).strip():
-                        teacher_name_by_id[str(identity).strip()] = display_name
-
-        current_teacher_name = str(
-            current_user.get("name")
-            or current_user.get("full_name")
-            or current_user.get("username")
-            or ""
-        ).strip()
-        if current_teacher_name:
-            for identity in (
-                current_user.get("_id"),
-                current_user.get("user_id"),
-                current_user.get("tutor_id"),
-                current_user.get("username"),
-            ):
-                if identity is not None and str(identity).strip():
-                    teacher_name_by_id[str(identity).strip()] = current_teacher_name
 
         def _build_active_exam_item(
             exam_id: str,
@@ -677,19 +605,6 @@ async def list_exams(
                     item.class_label = f"Class {standard}"
                 elif section:
                     item.class_label = f"Section {section}"
-
-                raw_teacher_ids = exam_doc.get("teacher_ids")
-                if not isinstance(raw_teacher_ids, list) or not raw_teacher_ids:
-                    raw_teacher_ids = source_document.get("teacher_ids") or []
-                resolved_teacher_names: List[str] = []
-                for raw_teacher_id in raw_teacher_ids:
-                    teacher_id = str(raw_teacher_id).strip()
-                    if not teacher_id:
-                        continue
-                    teacher_name = teacher_name_by_id.get(teacher_id, teacher_id)
-                    if teacher_name not in resolved_teacher_names:
-                        resolved_teacher_names.append(teacher_name)
-                item.teacher_names = resolved_teacher_names
 
             visible_exam_ids = [
                 item.exam_id for item in exam_items if item.status == "active"

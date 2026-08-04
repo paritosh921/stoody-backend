@@ -396,6 +396,81 @@ async def test_publication_builds_valid_hashed_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_publication_allows_nonblocking_manual_review_notes():
+    from api.v1.evalpen_review_async import PublishRequest, publish_submission
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    response = await db["evalpen_detected_responses"].find_one(
+        {"submission_id": "SUB-READY"}
+    )
+    await db["evalpen_detected_responses"].update_one(
+        {"response_id": response["response_id"]},
+        {
+            "$set": {
+                "eval_status": "manual_review",
+                "manual_review_required": True,
+            }
+        },
+    )
+    await db["evalpen_evaluations"].update_one(
+        {"response_id": response["response_id"]},
+        {"$set": {"manual_review_required": True}},
+    )
+
+    readiness = await assess_submission_readiness(db, "SUB-READY")
+    assert readiness["ready"] is True
+    assert readiness["review_notes"]
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await publish_submission(
+            "SUB-READY",
+            PublishRequest(),
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result["publication_status"] == "published"
+
+
+@pytest.mark.asyncio
+async def test_publish_ready_batch_uses_exam_scope_and_shared_publish_contract():
+    from api.v1.evalpen_review_async import (
+        PublishReadyRequest,
+        publish_ready_submissions,
+    )
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await publish_ready_submissions(
+            "EXAM-READY",
+            PublishReadyRequest(submission_ids=["SUB-READY", "SUB-MISSING"]),
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result["requested_count"] == 2
+    assert result["published_count"] == 1
+    assert result["failed_count"] == 1
+    assert result["results"][0]["status"] == "published"
+    assert result["results"][1]["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_publish_rejects_incomplete_question_coverage():
     from api.v1.evalpen_review_async import PublishRequest, publish_submission
 
