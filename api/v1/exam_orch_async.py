@@ -269,6 +269,7 @@ class ProcessingJobReprocessRequest(BaseModel):
     """Optional audit note recorded when staff rerun an answer-copy check."""
 
     reason: Optional[str] = Field(None, max_length=500)
+    submission_ids: Optional[List[str]] = None
 
 
 class ProcessingJobResponse(BaseModel):
@@ -2220,16 +2221,50 @@ async def batch_reprocess_exam_submissions(
         )
     await _require_tutor_visibility(exam, current_user, db)
 
+    requested_submission_ids = {
+        str(value).strip()
+        for value in ((body.submission_ids if body else None) or [])
+        if str(value).strip()
+    }
+    if body and body.submission_ids is not None and not requested_submission_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Choose at least one submitted answer copy",
+        )
+    if len(requested_submission_ids) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A maximum of 500 answer copies can be selected",
+        )
+
+    submission_filter: Dict[str, Any] = {
+        "exam_id": exam_id,
+        "publication_status": {"$ne": "published"},
+    }
+    if requested_submission_ids:
+        submission_filter["submission_id"] = {"$in": sorted(requested_submission_ids)}
+
     submissions = await tenant_db["evalpen_submissions"].find(
-        {
-            "exam_id": exam_id,
-            "publication_status": {"$ne": "published"},
-        },
+        submission_filter,
         {
             "submission_id": 1,
             "student_id": 1,
         },
     ).to_list(length=5000)
+    if requested_submission_ids:
+        found_submission_ids = {
+            str(item.get("submission_id") or "").strip()
+            for item in submissions
+            if str(item.get("submission_id") or "").strip()
+        }
+        if requested_submission_ids - found_submission_ids:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "One or more selected answer copies are unavailable, already published, "
+                    "or do not belong to this exam"
+                ),
+            )
     jobs = await tenant_db["exampen_processing_jobs"].find(
         {"exam_id": exam_id}
     ).sort("created_at", -1).to_list(length=5000)
