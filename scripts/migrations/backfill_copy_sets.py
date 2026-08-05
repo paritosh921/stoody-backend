@@ -9,6 +9,7 @@ This script:
 4. Deduplicates note_classifications where (user_id, copy_id, book_type, page_number)
    collides after removing pen_mac from the identity key
 5. Drops old unique indexes and creates new ones that include copy_id
+6. Claims one semantic Practice copy per user and creates its unique index
 
 IMPORTANT: Run this script BEFORE deploying the new code that writes copy_id.
 
@@ -294,6 +295,76 @@ async def migrate_database(
         stats.errors.append(f"note_classifications dedup failed: {e}")
         logger.warning("[%s] Dedup failed: %s", db_name, e)
 
+    # Step 3b: Give exactly one legacy Practice copy per user the semantic
+    # purpose used by web/mobile. Title remains display data only.
+    try:
+        practice_groups = copy_sets.aggregate(
+            [
+                {
+                    "$match": {
+                        "$or": [
+                            {"title": "Practice"},
+                            {"purpose": "practice"},
+                        ]
+                    }
+                },
+                {
+                    "$addFields": {
+                        "practice_purpose_rank": {
+                            "$cond": [{"$eq": ["$purpose", "practice"]}, 0, 1]
+                        }
+                    }
+                },
+                {
+                    "$sort": {
+                        "practice_purpose_rank": 1,
+                        "is_archived": 1,
+                        "created_at": 1,
+                        "_id": 1,
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$user_id",
+                        "copy_ids": {"$push": "$_id"},
+                    }
+                },
+            ]
+        )
+        async for group in practice_groups:
+            copy_ids = group.get("copy_ids") or []
+            if not copy_ids:
+                continue
+            canonical_id = copy_ids[0]
+            duplicate_ids = copy_ids[1:]
+            if dry_run:
+                logger.info(
+                    "[%s]   [DRY RUN] Would set Practice purpose for user %s on %s",
+                    db_name,
+                    group.get("_id"),
+                    canonical_id,
+                )
+                continue
+            if duplicate_ids:
+                await copy_sets.update_many(
+                    {"_id": {"$in": duplicate_ids}},
+                    {"$unset": {"purpose": ""}},
+                )
+            await copy_sets.update_one(
+                {"_id": canonical_id},
+                {
+                    "$set": {
+                        "title": "Practice",
+                        "purpose": "practice",
+                        "is_archived": False,
+                        "updated_at": now,
+                    }
+                },
+            )
+    except Exception as e:
+        stats.errors.append(f"practice copy purpose backfill failed: {e}")
+        logger.warning("[%s] Practice purpose backfill failed: %s", db_name, e)
+
     # Step 4: Update indexes
     if not dry_run:
         logger.info("[%s] Step 4: Updating indexes...", db_name)
@@ -317,6 +388,23 @@ async def migrate_database(
         except OperationFailure as e:
             stats.errors.append(f"uniq_canvas_page_v2 creation failed: {e}")
             logger.warning("[%s]   Failed to create uniq_canvas_page_v2: %s", db_name, e)
+
+        try:
+            await copy_sets.create_index(
+                [("user_id", 1), ("purpose", 1)],
+                unique=True,
+                partialFilterExpression={"purpose": {"$type": "string"}},
+                name="uniq_copy_sets_user_purpose",
+            )
+            stats.indexes_created += 1
+            logger.info("[%s]   Created uniq_copy_sets_user_purpose index", db_name)
+        except OperationFailure as e:
+            stats.errors.append(f"uniq_copy_sets_user_purpose creation failed: {e}")
+            logger.warning(
+                "[%s]   Failed to create uniq_copy_sets_user_purpose: %s",
+                db_name,
+                e,
+            )
 
         # note_classifications: drop old, create new
         try:

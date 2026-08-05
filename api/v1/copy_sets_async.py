@@ -23,6 +23,8 @@ from typing import Dict, Any, List, Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
 from core.database import DatabaseManager
@@ -34,6 +36,7 @@ router = APIRouter(prefix="/copy-sets", tags=["Copy Sets"])
 COPY_SET_TITLE_MAX_LENGTH = 11
 DEFAULT_NEW_COPY_TITLE = "New Copy"
 DEFAULT_PRACTICE_COPY_TITLE = "Practice"
+PRACTICE_COPY_PURPOSE = "practice"
 DEFAULT_COPY_SET_TITLES = (
     DEFAULT_NEW_COPY_TITLE,
     DEFAULT_PRACTICE_COPY_TITLE,
@@ -62,6 +65,7 @@ class CopySetResponse(BaseModel):
     copy_id: str
     user_id: str
     title: str
+    purpose: Optional[str] = None
     is_archived: bool
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -159,6 +163,7 @@ def _copy_set_to_response(doc: Dict[str, Any]) -> Dict[str, Any]:
         "copy_id": str(doc["_id"]),
         "user_id": doc.get("user_id", ""),
         "title": doc.get("title", "Copy 1"),
+        "purpose": doc.get("purpose"),
         "is_archived": doc.get("is_archived", False),
         "created_at": doc.get("created_at"),
         "updated_at": doc.get("updated_at"),
@@ -169,6 +174,100 @@ async def _next_copy_number(col, user_id: str) -> int:
     """Return the next auto-increment number for copy naming."""
     count = await col.count_documents({"user_id": user_id})
     return count + 1
+
+
+async def ensure_practice_copy_set_for_user(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> Dict[str, Any]:
+    """Resolve the one semantic Practice copy owned by the current user.
+
+    ``title`` is display data and is not a safe identity key. New deployments
+    enforce a partial unique ``(user_id, purpose)`` index; this helper also
+    claims one legacy title-only Practice copy so existing users keep their
+    pages. The final upsert is idempotent and duplicate-key retry makes the
+    endpoint safe when web and mobile enter Practice concurrently.
+    """
+    col = await get_copy_sets_collection(current_user, db)
+    user_id = canonical_canvas_user_id(current_user)
+    now = datetime.now(timezone.utc)
+
+    existing = await col.find_one(
+        {"user_id": user_id, "purpose": PRACTICE_COPY_PURPOSE}
+    )
+    if existing:
+        if (
+            existing.get("is_archived")
+            or existing.get("title") != DEFAULT_PRACTICE_COPY_TITLE
+        ):
+            await col.update_one(
+                {"_id": existing["_id"]},
+                {
+                    "$set": {
+                        "title": DEFAULT_PRACTICE_COPY_TITLE,
+                        "is_archived": False,
+                        "updated_at": now,
+                    }
+                },
+            )
+            existing.update(
+                {
+                    "title": DEFAULT_PRACTICE_COPY_TITLE,
+                    "is_archived": False,
+                    "updated_at": now,
+                }
+            )
+        return existing
+
+    legacy_filter = {
+        "user_id": user_id,
+        "title": DEFAULT_PRACTICE_COPY_TITLE,
+        "purpose": {"$exists": False},
+    }
+    try:
+        claimed = await col.find_one_and_update(
+            legacy_filter,
+            {
+                "$set": {
+                    "purpose": PRACTICE_COPY_PURPOSE,
+                    "is_archived": False,
+                    "updated_at": now,
+                }
+            },
+            sort=[("created_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        claimed = None
+    if claimed:
+        return claimed
+
+    semantic_filter = {"user_id": user_id, "purpose": PRACTICE_COPY_PURPOSE}
+    try:
+        resolved = await col.find_one_and_update(
+            semantic_filter,
+            {
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "purpose": PRACTICE_COPY_PURPOSE,
+                    "title": DEFAULT_PRACTICE_COPY_TITLE,
+                    "is_archived": False,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        resolved = await col.find_one(semantic_filter)
+
+    if not resolved:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The Practice notebook could not be resolved.",
+        )
+    return resolved
 
 
 async def ensure_default_copy_sets_for_user(
@@ -196,6 +295,10 @@ async def ensure_default_copy_sets_for_user(
 
     created_docs: List[Dict[str, Any]] = []
     for title in DEFAULT_COPY_SET_TITLES:
+        if title == DEFAULT_PRACTICE_COPY_TITLE:
+            doc = await ensure_practice_copy_set_for_user(current_user, db)
+            existing_by_title[title] = doc
+            continue
         if title in existing_by_title:
             continue
         doc: Dict[str, Any] = {
@@ -379,6 +482,19 @@ async def get_active_copy_set(
     }
 
 
+@router.post("/practice/resolve")
+async def resolve_practice_copy_set(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    db: DatabaseManager = Depends(get_database),
+):
+    """Return the caller's canonical Practice copy, creating it if needed."""
+    copy_set = await ensure_practice_copy_set_for_user(current_user, db)
+    return {
+        "success": True,
+        "copy_set": _copy_set_to_response(copy_set),
+    }
+
+
 @router.post("")
 async def create_copy_set(
     body: CopySetCreate,
@@ -391,6 +507,13 @@ async def create_copy_set(
 
     now = datetime.now(timezone.utc)
     title = body.title
+    if title == DEFAULT_PRACTICE_COPY_TITLE:
+        doc = await ensure_practice_copy_set_for_user(current_user, db)
+        await _set_active_copy_id(current_user, db, str(doc["_id"]))
+        return {
+            "success": True,
+            "copy_set": _copy_set_to_response(doc),
+        }
     if not title:
         number = await _next_copy_number(col, user_id)
         title = f"Copy {number}"[:COPY_SET_TITLE_MAX_LENGTH]
@@ -424,6 +547,14 @@ async def rename_copy_set(
     """Rename a copy set."""
     col = await get_copy_sets_collection(current_user, db)
     user_id = canonical_canvas_user_id(current_user)
+    copy_set = await col.find_one({"_id": ObjectId(copy_id), "user_id": user_id})
+    if not copy_set:
+        raise HTTPException(status_code=404, detail="Copy set not found")
+    if copy_set.get("purpose") == PRACTICE_COPY_PURPOSE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The system Practice notebook cannot be renamed.",
+        )
 
     now = datetime.now(timezone.utc)
     result = await col.update_one(
@@ -477,6 +608,11 @@ async def archive_copy_set(
     copy_set = await col.find_one({"_id": ObjectId(copy_id), "user_id": user_id})
     if not copy_set:
         raise HTTPException(status_code=404, detail="Copy set not found")
+    if copy_set.get("purpose") == PRACTICE_COPY_PURPOSE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The system Practice notebook cannot be archived.",
+        )
     if copy_set.get("is_archived"):
         return {"success": True, "copy_set": _copy_set_to_response(copy_set)}
 
@@ -548,6 +684,11 @@ async def delete_copy_set(
     copy_set = await col.find_one({"_id": ObjectId(copy_id), "user_id": user_id})
     if not copy_set:
         raise HTTPException(status_code=404, detail="Copy set not found")
+    if copy_set.get("purpose") == PRACTICE_COPY_PURPOSE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The system Practice notebook cannot be deleted.",
+        )
 
     # Resolve the target database for data collections.
     is_b2c = (

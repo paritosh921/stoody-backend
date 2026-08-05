@@ -464,7 +464,10 @@ def _raise_sanitized_canvas_write_error(exc: Exception) -> None:
                 "Canvas page write blocked by legacy Mongo index without copy_id. "
                 "Run the copy-set migration and drop the legacy canvas_pages unique index."
             )
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=detail,
+            ) from exc
 
     if isinstance(exc, (DuplicateKeyError, BulkWriteError)):
         raise HTTPException(

@@ -229,6 +229,7 @@ class DatabaseManager:
         name: str,
         unique: bool = False,
         sparse: bool = False,
+        partial_filter_expression: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Create index only when an equivalent spec does not already exist under another name."""
         target_keys = self._normalize_index_keys(keys)
@@ -241,7 +242,12 @@ class DatabaseManager:
 
             existing_unique = bool(existing_def.get("unique", False))
             existing_sparse = bool(existing_def.get("sparse", False))
-            if existing_unique == unique and existing_sparse == sparse:
+            existing_partial = existing_def.get("partialFilterExpression")
+            if (
+                existing_unique == unique
+                and existing_sparse == sparse
+                and existing_partial == partial_filter_expression
+            ):
                 if existing_name != name:
                     logger.info(
                         "Equivalent index already exists on %s as '%s'; skipping '%s'",
@@ -256,6 +262,8 @@ class DatabaseManager:
             create_kwargs["unique"] = True
         if sparse:
             create_kwargs["sparse"] = True
+        if partial_filter_expression is not None:
+            create_kwargs["partialFilterExpression"] = partial_filter_expression
         await collection.create_index(keys, **create_kwargs)
 
     async def _drop_matching_indexes(
@@ -472,19 +480,27 @@ class DatabaseManager:
                         names=["uniq_canvas_page", "uniq_canvas_pages_user_book_page"],
                         unique=True,
                     )
+                else:
+                    logger.error(
+                        "Canvas copy schema is not migration-ready on %s: "
+                        "canvas_pages rows are missing copy_id. Run "
+                        "scripts/migrations/backfill_copy_sets.py before deployment.",
+                        db_name,
+                    )
                 await self._ensure_index_with_spec_check(
                     canvas_pages,
                     [("user_id", 1), ("copy_id", 1), ("book_type", 1), ("page_number", 1)],
                     unique=True,
                     name="uniq_canvas_page_v2"
                 )
-            except Exception:
-                # Fallback: keep legacy index if copy_id migration hasn't run
-                await self._ensure_index_with_spec_check(
-                    canvas_pages,
-                    [("user_id", 1), ("book_type", 1), ("page_number", 1)],
-                    unique=True,
-                    name="uniq_canvas_page"
+            except Exception as exc:
+                # Never recreate the legacy three-field unique index: it makes
+                # two copy sets collide and is the direct cause of HTTP 409s.
+                logger.error(
+                    "Copy-aware canvas index setup failed on %s; run the "
+                    "copy-set migration before accepting canvas writes: %s",
+                    db_name,
+                    exc,
                 )
 
             # copy_sets collection
@@ -493,6 +509,13 @@ class DatabaseManager:
                 copy_sets,
                 [("user_id", 1), ("is_archived", 1), ("created_at", 1)],
                 name="idx_copy_sets_user"
+            )
+            await self._ensure_index_with_spec_check(
+                copy_sets,
+                [("user_id", 1), ("purpose", 1)],
+                unique=True,
+                partial_filter_expression={"purpose": {"$type": "string"}},
+                name="uniq_copy_sets_user_purpose",
             )
 
             # note_classifications: target index includes copy_id

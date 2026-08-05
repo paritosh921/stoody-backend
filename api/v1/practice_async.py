@@ -1722,13 +1722,13 @@ class UploadedDocumentFile(BaseModel):
 
 class QuestionPageRefsModel(BaseModel):
     """Per-question page mapping from the Stoody Pen QuestionSession."""
-    activePages: Optional[List[int]] = None        # Physical notebook page numbers
+    activePages: Optional[List[int]] = Field(default=None, max_length=50)  # Physical pages
     bookType: Optional[str] = None                 # e.g. "LS", "MS"
     copyId: Optional[str] = None                   # Copy set ID
     practiceSessionId: Optional[str] = None        # Client practice session ownership key
     questionId: Optional[str] = None               # Question ownership key
-    virtualPages: Optional[List[Dict[str, Any]]] = None  # Per-virtual-page metadata
-    timeIntervals: Optional[List[Dict[str, Any]]] = None  # [{startTs, endTs}]
+    virtualPages: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=50)
+    timeIntervals: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=50)
 
 
 class EvaluateRequest(BaseModel):

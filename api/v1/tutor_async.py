@@ -170,6 +170,70 @@ def _filter_strokes_by_practice_identity(
     return filtered
 
 
+def _question_page_identity_clauses(
+    *,
+    active_pages: Any,
+    book_type: Any,
+    virtual_pages: Any,
+) -> List[Dict[str, Any]]:
+    """Return copy-page identities without collapsing mixed notebook types.
+
+    Mobile can route the same physical page number in different book types.
+    ``virtual_pages`` is authoritative when present; the legacy top-level
+    ``active_pages`` + ``book_type`` pair remains supported for older web
+    attempts.
+    """
+    clauses: List[Dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    max_page_refs = 50
+
+    if isinstance(virtual_pages, list):
+        for page in virtual_pages:
+            if not isinstance(page, dict):
+                continue
+            raw_number = _first_present(
+                page, "physicalPageNo", "physical_page_no"
+            )
+            raw_book_type = _first_present(page, "bookType", "book_type")
+            try:
+                page_number = int(raw_number)
+            except (TypeError, ValueError):
+                continue
+            normalized_book_type = str(raw_book_type or "").strip().upper()
+            if not normalized_book_type:
+                continue
+            identity = (normalized_book_type, page_number)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            clauses.append(
+                {"book_type": normalized_book_type, "page_number": page_number}
+            )
+            if len(clauses) >= max_page_refs:
+                break
+
+    if clauses:
+        return clauses
+
+    normalized_book_type = str(book_type or "LS").strip().upper() or "LS"
+    if isinstance(active_pages, list):
+        for raw_number in active_pages:
+            try:
+                page_number = int(raw_number)
+            except (TypeError, ValueError):
+                continue
+            identity = (normalized_book_type, page_number)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            clauses.append(
+                {"book_type": normalized_book_type, "page_number": page_number}
+            )
+            if len(clauses) >= max_page_refs:
+                break
+    return clauses
+
+
 async def _revoke_tutor_sessions(tutor: Dict[str, Any], auth_manager: Optional[AuthManager]) -> None:
     user_id = str(tutor.get("_id") or tutor.get("id") or tutor.get("tutor_id") or "")
     if not user_id or auth_manager is None:
@@ -2165,12 +2229,17 @@ async def get_student_document_attempts(
                     qpr.get("time_intervals") or qpr.get("timeIntervals") or []
                 )
 
-                if active_pages:
+                page_identity_clauses = _question_page_identity_clauses(
+                    active_pages=active_pages,
+                    book_type=book_type,
+                    virtual_pages=virtual_pages,
+                )
+
+                if page_identity_clauses:
                     try:
                         page_query: Dict[str, Any] = {
                             "user_id": {"$in": student_user_ids},
-                            "page_number": {"$in": active_pages},
-                            "book_type": book_type.upper(),
+                            "$or": page_identity_clauses,
                         }
                         # Only filter by copy_id if it's a real ID
                         # (not "default" which is a frontend placeholder)
@@ -2178,9 +2247,11 @@ async def get_student_document_attempts(
                             page_query["copy_id"] = copy_id_ref
 
                         cursor = canvas_col.find(page_query).sort(
-                            "page_number", 1
+                            [("book_type", 1), ("page_number", 1)]
                         )
-                        raw_pages = await cursor.to_list(length=20)
+                        raw_pages = await cursor.to_list(
+                            length=min(50, max(20, len(page_identity_clauses)))
+                        )
 
                         for pg in raw_pages:
                             raw_strokes = pg.get("strokes") or []
