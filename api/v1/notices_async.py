@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 from bson import ObjectId
 
-from fastapi import APIRouter, Request, HTTPException, Depends, status, Query, Body
+from fastapi import APIRouter, Request, HTTPException, Depends, Query
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from pydantic import BaseModel, Field
@@ -30,12 +30,20 @@ limiter = Limiter(key_func=get_remote_address)
 # Request models
 # ---------------------------------------------------------------------------
 
+class ClassAudiencePair(BaseModel):
+    grade: str = Field(..., min_length=1)
+    section: str = ""
+
+
 class AudienceSpec(BaseModel):
     type: str = Field(..., description="individual | class | school")
     recipient_type: str = Field("student", description="student | tutor | all")
     recipient_ids: Optional[List[str]] = None
     grades: Optional[List[str]] = None
     sections: Optional[List[str]] = None
+    # Exact pairs avoid the grades x sections cross-product produced by the
+    # legacy arrays when a teacher selects, for example, 6-A and 7-B.
+    class_pairs: Optional[List[ClassAudiencePair]] = None
 
 
 class CreateNoticeRequest(BaseModel):
@@ -70,8 +78,21 @@ async def _resolve_recipients(
         if audience.recipient_type == "student":
             # Validate tutor scope
             if user_type == "tutor":
-                allowed = await _get_tutor_student_ids(db, current_user)
-                student_ids = [sid for sid in ids if sid in allowed]
+                students = await _get_tutor_students(db, current_user)
+                canonical_by_alias: Dict[str, str] = {}
+                for student in students:
+                    canonical = str(student.get("_id") or "")
+                    if not canonical:
+                        continue
+                    canonical_by_alias[canonical] = canonical
+                    business_id = str(student.get("student_id") or "")
+                    if business_id:
+                        canonical_by_alias[business_id] = canonical
+                student_ids = [
+                    canonical_by_alias[sid]
+                    for sid in ids
+                    if sid in canonical_by_alias
+                ]
             else:
                 student_ids = ids
         elif audience.recipient_type == "tutor":
@@ -85,27 +106,60 @@ async def _resolve_recipients(
             student_ids = ids
 
     elif audience.type == "class":
-        grades = audience.grades or []
-        sections = audience.sections or []
-        if not grades:
-            raise HTTPException(400, "grades required for class targeting")
+        exact_pairs = [
+            (pair.grade.strip(), pair.section.strip())
+            for pair in (audience.class_pairs or [])
+            if pair.grade.strip()
+        ]
+        grades = [grade for grade in (audience.grades or []) if grade]
+        sections = [section for section in (audience.sections or []) if section]
+        if not exact_pairs and not grades:
+            raise HTTPException(400, "class_pairs or grades required for class targeting")
+        requested_pairs = exact_pairs or [
+            (grade, section)
+            for grade in grades
+            for section in (sections or [""])
+        ]
 
         # If tutor, verify they teach these grades/sections
         if user_type == "tutor":
             allowed_classes = await _get_tutor_classes(db, current_user)
-            for g in grades:
-                for s in (sections or [""]):
-                    if (g, s) not in allowed_classes and (g, "") not in allowed_classes:
-                        raise HTTPException(
-                            403,
-                            f"You don't teach class {g}{'-' + s if s else ''}"
-                        )
+            for g, s in requested_pairs:
+                if (g, s) not in allowed_classes and (g, "") not in allowed_classes:
+                    raise HTTPException(
+                        403,
+                        f"You don't teach class {g}{'-' + s if s else ''}",
+                    )
 
         # Resolve students in these classes
         if audience.recipient_type in ("student", "all"):
-            filt: Dict[str, Any] = {"grade": {"$in": grades}}
-            if sections:
-                filt["section"] = {"$in": sections}
+            if exact_pairs:
+                pair_filters: List[Dict[str, Any]] = []
+                for grade, section in exact_pairs:
+                    conditions: List[Dict[str, Any]] = [
+                        {"$or": [{"grade": grade}, {"standard": grade}]}
+                    ]
+                    if section:
+                        conditions.append({"section": section})
+                    pair_filters.append(
+                        conditions[0]
+                        if len(conditions) == 1
+                        else {"$and": conditions}
+                    )
+                filt = (
+                    pair_filters[0]
+                    if len(pair_filters) == 1
+                    else {"$or": pair_filters}
+                )
+            else:
+                filt = {
+                    "$or": [
+                        {"grade": {"$in": grades}},
+                        {"standard": {"$in": grades}},
+                    ]
+                }
+                if sections:
+                    filt = {"$and": [filt, {"section": {"$in": sections}}]}
             students = await db.mongo_find("students", filt, projection={"_id": 1})
             student_ids = [str(s["_id"]) for s in students]
 
@@ -113,13 +167,41 @@ async def _resolve_recipients(
         if audience.recipient_type in ("tutor", "all"):
             if user_type == "tutor":
                 raise HTTPException(400, "Teachers cannot send notices to other teachers")
-            tutors = await db.mongo_find("tutors", {}, projection={"_id": 1, "teaching_assignments": 1})
-            for t in tutors:
-                for ta in (t.get("teaching_assignments") or []):
-                    if ta.get("standard") in grades:
-                        if not sections or any(s in (ta.get("sections") or []) for s in sections):
-                            tutor_ids.append(str(t["_id"]))
-                            break
+            tutors = await db.mongo_find(
+                "tutors",
+                {},
+                projection={
+                    "_id": 1,
+                    "teaching_assignments": 1,
+                    "class_teacher_of": 1,
+                    "standards": 1,
+                    "sections": 1,
+                },
+            )
+            for tutor in tutors:
+                tutor_classes = set()
+                for assignment in (tutor.get("teaching_assignments") or []):
+                    grade = str(assignment.get("standard") or "")
+                    for section in (assignment.get("sections") or [""]):
+                        if grade:
+                            tutor_classes.add((grade, str(section or "")))
+                class_teacher = tutor.get("class_teacher_of") or {}
+                if class_teacher.get("standard"):
+                    tutor_classes.add(
+                        (
+                            str(class_teacher["standard"]),
+                            str(class_teacher.get("section") or ""),
+                        )
+                    )
+                if not tutor_classes:
+                    for grade in (tutor.get("standards") or []):
+                        for section in (tutor.get("sections") or [""]):
+                            tutor_classes.add((str(grade), str(section or "")))
+                if any(
+                    pair in tutor_classes or (pair[0], "") in tutor_classes
+                    for pair in requested_pairs
+                ):
+                    tutor_ids.append(str(tutor["_id"]))
 
     elif audience.type == "school":
         if user_type == "tutor":
@@ -142,39 +224,64 @@ async def _resolve_recipients(
     return student_ids, tutor_ids
 
 
-async def _get_tutor_student_ids(db: DatabaseManager, current_user: Dict[str, Any]) -> set:
-    """Get the set of student IDs a tutor is allowed to target."""
-    user_id = current_user.get("user_id") or current_user.get("id")
-    tutor_doc = await db.mongo_find_one("tutors", {"_id": ObjectId(user_id)})
+async def _get_current_tutor(
+    db: DatabaseManager, current_user: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Resolve current and legacy tutor token identities without unsafe ObjectId casts."""
+
+    user_id = str(current_user.get("user_id") or current_user.get("id") or "")
+    tutor_id = str(current_user.get("tutor_id") or "")
+    clauses: List[Dict[str, Any]] = []
+    if ObjectId.is_valid(user_id):
+        clauses.append({"_id": ObjectId(user_id)})
+    if tutor_id:
+        clauses.append({"tutor_id": tutor_id})
+    if user_id:
+        clauses.append({"tutor_id": user_id})
+    if not clauses:
+        return None
+    return await db.mongo_find_one(
+        "tutors", clauses[0] if len(clauses) == 1 else {"$or": clauses}
+    )
+
+
+async def _get_tutor_students(
+    db: DatabaseManager, current_user: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Return the same complete tutor-visible roster used by monitoring."""
+
+    from utils.tutor_scoping import get_tutor_scoped_students
+
+    tutor_doc = await _get_current_tutor(db, current_user)
     if not tutor_doc:
-        return set()
-
-    allowed = set()
-
-    # Directly assigned students
-    for sid in (tutor_doc.get("assigned_student_ids") or []):
-        allowed.add(sid)
-
-    # Students matching teaching assignments (grade + section)
-    for ta in (tutor_doc.get("teaching_assignments") or []):
-        grade = ta.get("standard")
-        sections = ta.get("sections") or []
-        if not grade:
-            continue
-        filt: Dict[str, Any] = {"grade": grade}
-        if sections:
-            filt["section"] = {"$in": sections}
-        students = await db.mongo_find("students", filt, projection={"_id": 1})
-        for s in students:
-            allowed.add(str(s["_id"]))
-
-    return allowed
+        return []
+    admin_id = tutor_doc.get("created_by") or current_user.get("admin_id")
+    try:
+        admin_oid = admin_id if isinstance(admin_id, ObjectId) else ObjectId(str(admin_id))
+    except Exception:
+        admin_oid = None
+    if admin_oid is None:
+        return []
+    return await get_tutor_scoped_students(
+        tutor_id=str(tutor_doc.get("tutor_id") or current_user.get("tutor_id") or ""),
+        admin_oid=admin_oid,
+        db=db,
+        projection={
+            "_id": 1,
+            "name": 1,
+            "full_name": 1,
+            "student_id": 1,
+            "grade": 1,
+            "standard": 1,
+            "section": 1,
+        },
+        tutor_doc=tutor_doc,
+    )
 
 
 async def _get_tutor_classes(db: DatabaseManager, current_user: Dict[str, Any]) -> set:
     """Get set of (grade, section) tuples the tutor teaches."""
-    user_id = current_user.get("user_id") or current_user.get("id")
-    tutor_doc = await db.mongo_find_one("tutors", {"_id": ObjectId(user_id)})
+    tutor_doc = await _get_current_tutor(db, current_user)
     if not tutor_doc:
         return set()
 
@@ -183,6 +290,15 @@ async def _get_tutor_classes(db: DatabaseManager, current_user: Dict[str, Any]) 
         grade = ta.get("standard", "")
         for sec in (ta.get("sections") or [""]):
             classes.add((grade, sec))
+    class_teacher = tutor_doc.get("class_teacher_of") or {}
+    if class_teacher.get("standard"):
+        classes.add(
+            (class_teacher["standard"], class_teacher.get("section") or "")
+        )
+    if not classes:
+        for grade in (tutor_doc.get("standards") or []):
+            for section in (tutor_doc.get("sections") or [""]):
+                classes.add((grade, section))
     return classes
 
 
@@ -219,7 +335,7 @@ async def _resolve_sender_name(
 
     if user_type == "tutor":
         try:
-            tutor_doc = await db.mongo_find_one("tutors", {"_id": ObjectId(user_id)})
+            tutor_doc = await _get_current_tutor(db, current_user)
             if tutor_doc:
                 name = tutor_doc.get("name") or tutor_doc.get("full_name") or ""
                 if name:
@@ -299,6 +415,9 @@ async def create_notice(
             "recipient_ids": payload.audience.recipient_ids,
             "grades": payload.audience.grades,
             "sections": payload.audience.sections,
+            "class_pairs": [
+                pair.model_dump() for pair in (payload.audience.class_pairs or [])
+            ],
         },
         "audience_label": audience_label,
         "resolved_recipients": all_recipients,
@@ -380,6 +499,12 @@ async def _build_audience_label(
         return "Entire School — " + ", ".join(parts) if parts else "Entire School"
 
     if audience.type == "class":
+        if audience.class_pairs:
+            class_str = ", ".join(
+                f"Class {pair.grade}" + (f"-{pair.section}" if pair.section else "")
+                for pair in audience.class_pairs
+            )
+            return class_str + f" ({n_students + n_tutors} recipients)"
         grades = audience.grades or []
         sections = audience.sections or []
         class_str = ", ".join(
@@ -606,22 +731,14 @@ async def get_my_students(
     """Return list of students the current tutor can send notices to."""
     user_type = current_user.get("user_type", "")
     if user_type == "tutor":
-        allowed_ids = await _get_tutor_student_ids(db, current_user)
-        if not allowed_ids:
-            return {"students": []}
-        # Fetch names
-        students = await db.mongo_find(
-            "students",
-            {"_id": {"$in": [ObjectId(sid) for sid in allowed_ids if ObjectId.is_valid(sid)]}},
-            projection={"_id": 1, "name": 1, "student_id": 1, "grade": 1, "section": 1},
-        )
+        students = await _get_tutor_students(db, current_user)
         return {
             "students": [
                 {
                     "id": str(s["_id"]),
-                    "name": s.get("name", ""),
+                    "name": s.get("name") or s.get("full_name", ""),
                     "student_id": s.get("student_id", ""),
-                    "grade": s.get("grade", ""),
+                    "grade": s.get("grade") or s.get("standard", ""),
                     "section": s.get("section", ""),
                 }
                 for s in students

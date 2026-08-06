@@ -21,6 +21,7 @@ from core.permissions import has_permission
 from core.auth import AuthManager
 from core.token_blacklist import revoke_user_session
 from api.v1.auth_async import get_auth_manager, get_current_user, get_database
+from services.exam_analytics import PublishedExamAttempt, load_published_exam_attempts
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -1021,6 +1022,45 @@ async def _get_tutor_visible_students(
     )
 
 
+async def _get_published_exam_attempts(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+    students: List[Dict[str, Any]],
+) -> List[PublishedExamAttempt]:
+    """Resolve the request tenant and apply the student-result publication contract."""
+
+    tenant_db = await db.get_context_db()
+    if tenant_db is None and current_user.get("db_name"):
+        tenant_db = await db.get_tenant_db(str(current_user["db_name"]))
+    if tenant_db is None:
+        raise HTTPException(status_code=503, detail="Tenant database not available")
+    return await load_published_exam_attempts(tenant_db, students)
+
+
+def _combined_average(
+    legacy_count: int,
+    legacy_average: Any,
+    exam_attempts: List[PublishedExamAttempt],
+) -> float:
+    total_count = legacy_count + len(exam_attempts)
+    if total_count <= 0:
+        return 0.0
+    legacy_sum = float(legacy_average or 0.0) * legacy_count
+    exam_sum = sum(attempt.percentage for attempt in exam_attempts)
+    return round((legacy_sum + exam_sum) / total_count, 1)
+
+
+def _attempt_date(attempt: PublishedExamAttempt) -> Optional[str]:
+    return attempt.published_at.date().isoformat() if attempt.published_at else None
+
+
+def _attempt_week(attempt: PublishedExamAttempt) -> Optional[str]:
+    if not attempt.published_at:
+        return None
+    year, week, _ = attempt.published_at.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
 @router.get("/tutors/analytics/overview")
 @limiter.limit("15/minute")
 async def get_tutor_analytics_overview(
@@ -1101,6 +1141,12 @@ async def get_tutor_analytics_overview(
         thirty_days_ago = now - timedelta(days=30)
         seven_days_ago = now - timedelta(days=7)
 
+        # ExamPen is a separate assessment pipeline from test-series attempts.
+        # Only published, integrity-checked results are admitted here.
+        exam_attempts = await _get_published_exam_attempts(
+            current_user, db, students
+        )
+
         # --- Active students (last_login within 7 days) ---
         active_students = sum(
             1
@@ -1169,8 +1215,13 @@ async def get_tutor_analytics_overview(
             else {"total_tests": 0, "avg_score": 0.0}
         )
 
-        total_tests = test_summary["total_tests"]
-        overall_test_avg = round(test_summary["avg_score"] or 0.0, 1)
+        legacy_test_count = int(test_summary["total_tests"] or 0)
+        total_tests = legacy_test_count + len(exam_attempts)
+        overall_test_avg = _combined_average(
+            legacy_test_count,
+            test_summary.get("avg_score"),
+            exam_attempts,
+        )
 
         # ------------------------------------------------------------------
         # Subject performance (filtered to subjects the teacher teaches)
@@ -1211,31 +1262,89 @@ async def get_tutor_analytics_overview(
                     "_id": "$subject",
                     "test_attempts": {"$sum": 1},
                     "avg_score": {"$avg": "$percentage"},
+                    "students": {"$addToSet": "$student_id"},
                 }
             },
         ]
         subject_tests = await db.mongo_aggregate(
             "student_test_attempts", subject_test_pipeline
         )
-        subject_test_map = {st["_id"]: st for st in subject_tests if st.get("_id")}
+        subject_rows: Dict[str, Dict[str, Any]] = {}
+        for sp in subject_practice:
+            subject = str(sp.get("_id") or "").strip()
+            if not subject:
+                continue
+            attempts = int(sp.get("practice_attempts") or 0)
+            correct = int(sp.get("correct") or 0)
+            subject_rows[subject] = {
+                "subject": subject,
+                "practice_attempts": attempts,
+                "practice_accuracy": round(
+                    (correct / attempts * 100) if attempts else 0.0, 1
+                ),
+                "test_attempts": 0,
+                "test_score_sum": 0.0,
+                "students": set(sp.get("students") or []),
+            }
+
+        for test_info in subject_tests:
+            subject = str(test_info.get("_id") or "").strip()
+            if not subject:
+                continue
+            row = subject_rows.setdefault(
+                subject,
+                {
+                    "subject": subject,
+                    "practice_attempts": 0,
+                    "practice_accuracy": 0.0,
+                    "test_attempts": 0,
+                    "test_score_sum": 0.0,
+                    "students": set(),
+                },
+            )
+            count = int(test_info.get("test_attempts") or 0)
+            row["test_attempts"] += count
+            row["test_score_sum"] += float(test_info.get("avg_score") or 0.0) * count
+            row["students"].update(test_info.get("students") or [])
+
+        for attempt in exam_attempts:
+            subject = attempt.subject.strip()
+            if not subject:
+                continue
+            if tutor_subjects and subject not in tutor_subjects:
+                continue
+            row = subject_rows.setdefault(
+                subject,
+                {
+                    "subject": subject,
+                    "practice_attempts": 0,
+                    "practice_accuracy": 0.0,
+                    "test_attempts": 0,
+                    "test_score_sum": 0.0,
+                    "students": set(),
+                },
+            )
+            row["test_attempts"] += 1
+            row["test_score_sum"] += attempt.percentage
+            row["students"].add(attempt.student_key)
 
         subject_performance = []
-        for sp in subject_practice:
-            subj = sp.get("_id")
-            if not subj:
-                continue
-            attempts = sp["practice_attempts"]
-            correct = sp["correct"]
-            accuracy = round((correct / attempts * 100) if attempts > 0 else 0.0, 1)
-            test_info = subject_test_map.get(subj, {})
+        for subject in sorted(subject_rows):
+            row = subject_rows[subject]
+            test_attempts = int(row["test_attempts"])
             subject_performance.append(
                 {
-                    "subject": subj,
-                    "practice_attempts": attempts,
-                    "practice_accuracy": accuracy,
-                    "test_attempts": test_info.get("test_attempts", 0),
-                    "test_avg_score": round(test_info.get("avg_score", 0) or 0, 1),
-                    "student_count": len(sp.get("students", [])),
+                    "subject": subject,
+                    "practice_attempts": row["practice_attempts"],
+                    "practice_accuracy": row["practice_accuracy"],
+                    "test_attempts": test_attempts,
+                    "test_avg_score": round(
+                        row["test_score_sum"] / test_attempts
+                        if test_attempts
+                        else 0.0,
+                        1,
+                    ),
+                    "student_count": len(row["students"]),
                 }
             )
 
@@ -1280,26 +1389,64 @@ async def get_tutor_analytics_overview(
                         "$dateToString": {"format": "%Y-%m-%d", "date": "$submitted_at"}
                     },
                     "test_submissions": {"$sum": 1},
+                    "active_students": {"$addToSet": "$student_id"},
                 }
             },
         ]
         daily_tests = await db.mongo_aggregate(
             "student_test_attempts", daily_test_pipeline
         )
-        daily_test_map = {dt["_id"]: dt["test_submissions"] for dt in daily_tests}
-
-        daily_activity = []
+        daily_rows: Dict[str, Dict[str, Any]] = {}
         for dp in daily_practice:
             date_str = dp["_id"]
-            daily_activity.append(
+            daily_rows[date_str] = {
+                "date": date_str,
+                "practice_attempts": dp["practice_attempts"],
+                "practice_correct": dp["practice_correct"],
+                "test_submissions": 0,
+                "students": set(dp.get("active_students") or []),
+            }
+        for daily_test in daily_tests:
+            date_str = daily_test["_id"]
+            row = daily_rows.setdefault(
+                date_str,
                 {
                     "date": date_str,
-                    "practice_attempts": dp["practice_attempts"],
-                    "practice_correct": dp["practice_correct"],
-                    "test_submissions": daily_test_map.get(date_str, 0),
-                    "active_students": len(dp.get("active_students", [])),
-                }
+                    "practice_attempts": 0,
+                    "practice_correct": 0,
+                    "test_submissions": 0,
+                    "students": set(),
+                },
             )
+            row["test_submissions"] += int(daily_test.get("test_submissions") or 0)
+            row["students"].update(daily_test.get("active_students") or [])
+        for attempt in exam_attempts:
+            date_str = _attempt_date(attempt)
+            if not date_str or date_str < thirty_days_ago.date().isoformat():
+                continue
+            row = daily_rows.setdefault(
+                date_str,
+                {
+                    "date": date_str,
+                    "practice_attempts": 0,
+                    "practice_correct": 0,
+                    "test_submissions": 0,
+                    "students": set(),
+                },
+            )
+            row["test_submissions"] += 1
+            row["students"].add(attempt.student_key)
+
+        daily_activity = [
+            {
+                "date": date_str,
+                "practice_attempts": row["practice_attempts"],
+                "practice_correct": row["practice_correct"],
+                "test_submissions": row["test_submissions"],
+                "active_students": len(row["students"]),
+            }
+            for date_str, row in sorted(daily_rows.items())
+        ]
 
         # ------------------------------------------------------------------
         # Per-student combined accuracy for top / needs-attention
@@ -1335,6 +1482,9 @@ async def get_tutor_analytics_overview(
             "student_test_attempts", student_test_pipeline
         )
         student_test_stats_map = {st["_id"]: st for st in student_test_stats}
+        exam_attempts_by_student: Dict[str, List[PublishedExamAttempt]] = {}
+        for attempt in exam_attempts:
+            exam_attempts_by_student.setdefault(attempt.student_key, []).append(attempt)
 
         # Build combined list
         combined_stats = []
@@ -1343,9 +1493,15 @@ async def get_tutor_analytics_overview(
             tstats = student_test_stats_map.get(sid_str, {})
             p_total = pstats.get("total", 0)
             p_correct = pstats.get("correct", 0)
-            t_avg = tstats.get("avg_score", 0) or 0
+            legacy_test_count = int(tstats.get("test_count") or 0)
+            student_exam_attempts = exam_attempts_by_student.get(sid_str, [])
+            t_avg = _combined_average(
+                legacy_test_count,
+                tstats.get("avg_score"),
+                student_exam_attempts,
+            )
             p_acc = round((p_correct / p_total * 100) if p_total > 0 else 0.0, 1)
-            total_attempts = p_total + tstats.get("test_count", 0)
+            total_attempts = p_total + legacy_test_count + len(student_exam_attempts)
             combined_stats.append(
                 {
                     "student_id": sdata.get("student_id"),
@@ -1418,8 +1574,6 @@ async def get_tutor_student_analytics(
     MongoDB ObjectId.
     """
     try:
-        from bson import ObjectId
-
         # ----- Verify student is visible to this tutor -----
         visible_students = await _get_tutor_visible_students(current_user, db)
         student = None
@@ -1435,6 +1589,9 @@ async def get_tutor_student_analytics(
             )
 
         oid_str = str(student["_id"])
+        exam_attempts = await _get_published_exam_attempts(
+            current_user, db, [student]
+        )
 
         # ----- Student info -----
         student_info = {
@@ -1510,12 +1667,27 @@ async def get_tutor_student_analytics(
             if test_agg
             else {"tests_taken": 0, "avg_score": 0, "best_score": 0, "worst_score": 0}
         )
+        legacy_test_count = int(ts["tests_taken"] or 0)
+        assessment_scores = [attempt.percentage for attempt in exam_attempts]
+        if legacy_test_count:
+            # Aggregate endpoints expose only the legacy average/min/max.  The
+            # weighted mean remains exact; extrema remain exact as well.
+            legacy_average = float(ts["avg_score"] or 0.0)
+            combined_average = _combined_average(
+                legacy_test_count, legacy_average, exam_attempts
+            )
+            best_candidates = [float(ts["best_score"] or 0.0), *assessment_scores]
+            worst_candidates = [float(ts["worst_score"] or 0.0), *assessment_scores]
+        else:
+            combined_average = _combined_average(0, 0.0, exam_attempts)
+            best_candidates = assessment_scores
+            worst_candidates = assessment_scores
         test_summary = {
-            "tests_taken": ts["tests_taken"],
-            "avg_score": round(ts["avg_score"] or 0, 1),
-            "best_score": round(ts["best_score"] or 0, 1),
-            "worst_score": round(ts["worst_score"] or 0, 1),
-            "avg_percentage": round(ts["avg_score"] or 0, 1),
+            "tests_taken": legacy_test_count + len(exam_attempts),
+            "avg_score": combined_average,
+            "best_score": round(max(best_candidates), 1) if best_candidates else 0.0,
+            "worst_score": round(min(worst_candidates), 1) if worst_candidates else 0.0,
+            "avg_percentage": combined_average,
         }
 
         # ----- Subject breakdown -----
@@ -1549,9 +1721,7 @@ async def get_tutor_student_analytics(
         subject_tests = await db.mongo_aggregate(
             "student_test_attempts", subject_test_pipeline
         )
-        subject_test_map = {st["_id"]: st for st in subject_tests if st.get("_id")}
-
-        subject_breakdown = []
+        subject_rows: Dict[str, Dict[str, Any]] = {}
         for sp in subject_practice:
             subj = sp.get("_id")
             if not subj:
@@ -1559,19 +1729,69 @@ async def get_tutor_student_analytics(
             attempts = sp["practice_attempts"]
             correct = sp["correct"]
             total_time = sp["total_time"]
-            test_info = subject_test_map.get(subj, {})
+            subject_rows[str(subj)] = {
+                "subject": subj,
+                "practice_attempts": attempts,
+                "practice_accuracy": round(
+                    (correct / attempts * 100) if attempts > 0 else 0.0, 1
+                ),
+                "test_count": 0,
+                "test_score_sum": 0.0,
+                "avg_time": round(
+                    (total_time / attempts) if attempts > 0 else 0.0, 1
+                ),
+            }
+        for test_info in subject_tests:
+            subject = str(test_info.get("_id") or "").strip()
+            if not subject:
+                continue
+            row = subject_rows.setdefault(
+                subject,
+                {
+                    "subject": subject,
+                    "practice_attempts": 0,
+                    "practice_accuracy": 0.0,
+                    "test_count": 0,
+                    "test_score_sum": 0.0,
+                    "avg_time": 0.0,
+                },
+            )
+            count = int(test_info.get("test_count") or 0)
+            row["test_count"] += count
+            row["test_score_sum"] += float(test_info.get("avg_score") or 0.0) * count
+        for attempt in exam_attempts:
+            subject = attempt.subject.strip()
+            if not subject:
+                continue
+            row = subject_rows.setdefault(
+                subject,
+                {
+                    "subject": subject,
+                    "practice_attempts": 0,
+                    "practice_accuracy": 0.0,
+                    "test_count": 0,
+                    "test_score_sum": 0.0,
+                    "avg_time": 0.0,
+                },
+            )
+            row["test_count"] += 1
+            row["test_score_sum"] += attempt.percentage
+
+        subject_breakdown = []
+        for subject in sorted(subject_rows):
+            row = subject_rows[subject]
+            test_count = int(row["test_count"])
             subject_breakdown.append(
                 {
-                    "subject": subj,
-                    "practice_attempts": attempts,
-                    "practice_accuracy": round(
-                        (correct / attempts * 100) if attempts > 0 else 0.0, 1
+                    "subject": row["subject"],
+                    "practice_attempts": row["practice_attempts"],
+                    "practice_accuracy": row["practice_accuracy"],
+                    "test_count": test_count,
+                    "test_avg_score": round(
+                        row["test_score_sum"] / test_count if test_count else 0.0,
+                        1,
                     ),
-                    "test_count": test_info.get("test_count", 0),
-                    "test_avg_score": round(test_info.get("avg_score", 0) or 0, 1),
-                    "avg_time": round(
-                        (total_time / attempts) if attempts > 0 else 0.0, 1
-                    ),
+                    "avg_time": row["avg_time"],
                 }
             )
 
@@ -1623,27 +1843,78 @@ async def get_tutor_student_analytics(
         weekly_tests = await db.mongo_aggregate(
             "student_test_attempts", weekly_test_pipeline
         )
-        weekly_test_map = {wt["_id"]: wt for wt in weekly_tests}
-
-        weekly_trend = []
+        weekly_rows: Dict[str, Dict[str, Any]] = {}
         for wp in weekly_practice:
             week_key = wp["_id"]
             attempts = wp["practice_attempts"]
             correct = wp["practice_correct"]
-            wt_info = weekly_test_map.get(week_key, {})
+            weekly_rows[week_key] = {
+                "week": week_key,
+                "week_start": wp["week_start"].strftime("%Y-%m-%d")
+                if wp.get("week_start")
+                else None,
+                "practice_attempts": attempts,
+                "practice_correct": correct,
+                "accuracy": round(
+                    (correct / attempts * 100) if attempts > 0 else 0.0, 1
+                ),
+                "tests_taken": 0,
+                "test_score_sum": 0.0,
+            }
+        for weekly_test in weekly_tests:
+            week_key = weekly_test["_id"]
+            row = weekly_rows.setdefault(
+                week_key,
+                {
+                    "week": week_key,
+                    "week_start": None,
+                    "practice_attempts": 0,
+                    "practice_correct": 0,
+                    "accuracy": 0.0,
+                    "tests_taken": 0,
+                    "test_score_sum": 0.0,
+                },
+            )
+            count = int(weekly_test.get("tests_taken") or 0)
+            row["tests_taken"] += count
+            row["test_score_sum"] += float(weekly_test.get("avg_score") or 0.0) * count
+        for attempt in exam_attempts:
+            week_key = _attempt_week(attempt)
+            if not week_key or (
+                attempt.published_at
+                and attempt.published_at.date() < eight_weeks_ago.date()
+            ):
+                continue
+            row = weekly_rows.setdefault(
+                week_key,
+                {
+                    "week": week_key,
+                    "week_start": None,
+                    "practice_attempts": 0,
+                    "practice_correct": 0,
+                    "accuracy": 0.0,
+                    "tests_taken": 0,
+                    "test_score_sum": 0.0,
+                },
+            )
+            row["tests_taken"] += 1
+            row["test_score_sum"] += attempt.percentage
+
+        weekly_trend = []
+        for week_key, row in sorted(weekly_rows.items()):
+            tests_taken = int(row["tests_taken"])
             weekly_trend.append(
                 {
                     "week": week_key,
-                    "week_start": wp["week_start"].strftime("%Y-%m-%d")
-                    if wp.get("week_start")
-                    else None,
-                    "practice_attempts": attempts,
-                    "practice_correct": correct,
-                    "accuracy": round(
-                        (correct / attempts * 100) if attempts > 0 else 0.0, 1
+                    "week_start": row["week_start"],
+                    "practice_attempts": row["practice_attempts"],
+                    "practice_correct": row["practice_correct"],
+                    "accuracy": row["accuracy"],
+                    "tests_taken": tests_taken,
+                    "test_avg_score": round(
+                        row["test_score_sum"] / tests_taken if tests_taken else 0.0,
+                        1,
                     ),
-                    "tests_taken": wt_info.get("tests_taken", 0),
-                    "test_avg_score": round(wt_info.get("avg_score", 0) or 0, 1),
                 }
             )
 
