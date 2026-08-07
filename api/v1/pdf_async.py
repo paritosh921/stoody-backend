@@ -10270,6 +10270,8 @@ async def generate_document_solutions(
     """Generate objective solutions or teacher-reviewable PCR answer drafts."""
     started_at = datetime.utcnow()
     is_b2c = is_b2c_admin(current_user)
+    is_pcr_authoring = False
+    package_version = None
     try:
         if not generation_request.confirmQuestionsReviewed:
             raise HTTPException(
@@ -10353,7 +10355,9 @@ async def generate_document_solutions(
                 str(question.get("id") or ""),
             )
 
-        sorted_questions = sorted(questions, key=_question_sort_key)
+        all_sorted_questions = sorted(questions, key=_question_sort_key)
+        sorted_questions = list(all_sorted_questions)
+        package_version = "pcr-ai-grading-package-v1" if is_pcr_authoring else None
 
         status_update = {
             "answer_solution_mode": "auto",
@@ -10361,30 +10365,50 @@ async def generate_document_solutions(
             "generated_solutions_started_at": started_at,
             "generated_solutions_error": None,
         }
+        if is_pcr_authoring:
+            status_update.update(
+                {
+                    "ai_grading_package_status": "processing",
+                    "ai_grading_package_version": package_version,
+                    "ai_grading_package_started_at": started_at,
+                    "ai_grading_package_error": None,
+                }
+            )
         if is_b2c:
             await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": status_update})
         else:
             await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": status_update})
 
-        if not generation_request.replaceExisting:
-            if is_b2c:
-                existing_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
-            else:
-                existing_mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
-            existing_question_ids = {
-                str(mapping.get("question_id") or "")
-                for mapping in existing_mappings
-                if mapping.get("answer_text")
-            }
-            sorted_questions = [
-                question
-                for question in sorted_questions
-                if str(question.get("id") or "") not in existing_question_ids
-            ]
+        if is_b2c:
+            existing_mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+        else:
+            existing_mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+        existing_mapping_by_question = {
+            str(mapping.get("question_id") or mapping.get("question_region_id") or ""): mapping
+            for mapping in existing_mappings
+        }
+
+        def _can_replace_generated_mapping(question_id: str) -> bool:
+            existing = existing_mapping_by_question.get(question_id)
+            if not existing or not str(existing.get("answer_text") or "").strip():
+                return True
+            return bool(
+                generation_request.replaceExisting
+                and str(existing.get("source") or "").strip().lower() == "ai_generated"
+            )
+
+        sorted_questions = [
+            question
+            for question in sorted_questions
+            if _can_replace_generated_mapping(str(question.get("id") or ""))
+        ]
 
         generated = 0
         manual_review = 0
         failed = 0
+        generated_marking_plans = 0
+        preserved_teacher_content = 0
+        marking_plan_failed = 0
         batch_size = max(1, min(20, int(generation_request.batchSize or 8)))
         for offset in range(0, len(sorted_questions), batch_size):
             batch = sorted_questions[offset:offset + batch_size]
@@ -10475,7 +10499,106 @@ async def generate_document_solutions(
                     await db.b2c_update_one("answer_question_mappings", query, {"$set": mapping}, upsert=True)
                 else:
                     await db.mongo_update_one("answer_question_mappings", query, {"$set": mapping}, upsert=True)
+                existing_mapping_by_question[question_id] = mapping
                 generated += 1
+
+        if is_pcr_authoring:
+            for question in all_sorted_questions:
+                question_id = str(question.get("id") or "")
+                existing_plan_source = str(question.get("marking_plan_source") or "").strip().lower()
+                existing_criteria = question.get("marking_criteria") or []
+                existing_reference = str(question.get("reference_solution") or "").strip()
+                has_existing_reference = bool(existing_reference)
+                has_existing_criteria = bool(existing_criteria)
+                has_existing_plan = bool(has_existing_reference and has_existing_criteria)
+                may_replace_plan = bool(
+                    generation_request.replaceExisting
+                    and existing_plan_source == "ai_generated"
+                )
+                has_teacher_owned_plan_content = bool(
+                    existing_plan_source != "ai_generated"
+                    and (has_existing_reference or has_existing_criteria)
+                )
+                if has_existing_plan and not may_replace_plan:
+                    preserved_teacher_content += 1
+                    continue
+
+                mapping = existing_mapping_by_question.get(question_id) or {}
+                mapped_solution = str(mapping.get("answer_text") or existing_reference).strip()
+                if not mapped_solution:
+                    marking_plan_failed += 1
+                    continue
+
+                try:
+                    plan_context = _build_ai_gateway_context(
+                        current_user=current_user,
+                        db=db,
+                        document_id=document_id,
+                        region_id=question_id,
+                        region_scope="generated_pcr_marking_plan",
+                        is_b2c=is_b2c,
+                    )
+                    plan_draft = await generate_pcr_marking_plan_draft(
+                        document=document,
+                        question=question,
+                        mapped_solution=mapped_solution,
+                        gateway_context=plan_context,
+                    )
+                    generated_reference = str(
+                        plan_draft.get("reference_solution") or mapped_solution
+                    ).strip()
+                    generated_criteria = plan_draft.get("marking_criteria") or []
+                    reference_solution = (
+                        existing_reference
+                        if has_existing_reference and not may_replace_plan
+                        else generated_reference
+                    )
+                    marking_criteria = (
+                        existing_criteria
+                        if has_existing_criteria and not may_replace_plan
+                        else generated_criteria
+                    )
+                    if not reference_solution or not marking_criteria:
+                        marking_plan_failed += 1
+                        continue
+
+                    if has_teacher_owned_plan_content:
+                        preserved_teacher_content += 1
+
+                    question_update = {
+                        "reference_solution": reference_solution,
+                        "marking_criteria": marking_criteria,
+                        "method_policy": (
+                            question.get("method_policy")
+                            if question.get("method_policy") and not may_replace_plan
+                            else plan_draft.get("method_policy") or {}
+                        ),
+                        "marking_plan_source": (
+                            "teacher_and_ai"
+                            if has_teacher_owned_plan_content
+                            else "ai_generated"
+                        ),
+                        "marking_plan_review_status": "needs_review",
+                        "marking_plan_generation_contract": package_version,
+                        "marking_plan_generator_provider": plan_draft.get("provider"),
+                        "marking_plan_generator_model": plan_draft.get("model"),
+                        "marking_plan_generated_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }
+                    question_query = {"document_id": document_id, "id": question_id}
+                    if is_b2c:
+                        await db.b2c_update_one("questions", question_query, {"$set": question_update})
+                    else:
+                        await db.mongo_update_one("questions", question_query, {"$set": question_update})
+                    generated_marking_plans += 1
+                except Exception as plan_error:
+                    marking_plan_failed += 1
+                    logger.warning(
+                        "PCR marking-plan generation failed for document=%s question=%s: %s",
+                        document_id,
+                        question_id,
+                        plan_error,
+                    )
 
         completed_update = {
             "answer_solution_mode": "auto",
@@ -10485,6 +10608,24 @@ async def generate_document_solutions(
             "generated_solutions_manual_review_count": manual_review,
             "generated_solutions_failed_count": failed,
         }
+        package_status = None
+        if is_pcr_authoring:
+            package_status = (
+                "ready_for_review"
+                if failed == 0 and marking_plan_failed == 0
+                else "partial"
+            )
+            completed_update.update(
+                {
+                    "ai_grading_package_status": package_status,
+                    "ai_grading_package_version": package_version,
+                    "ai_grading_package_completed_at": datetime.utcnow(),
+                    "ai_grading_package_error": None,
+                    "generated_marking_plan_count": generated_marking_plans,
+                    "preserved_marking_plan_count": preserved_teacher_content,
+                    "generated_marking_plan_failed_count": marking_plan_failed,
+                }
+            )
         if is_b2c:
             await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": completed_update})
         else:
@@ -10498,11 +10639,16 @@ async def generate_document_solutions(
         return {
             "success": True,
             "documentId": document_id,
-            "processedQuestions": len(sorted_questions),
+            "processedQuestions": len(all_sorted_questions),
             "generated": generated,
             "manualReviewRequired": manual_review,
             "failed": failed,
             "batchSize": batch_size,
+            "generatedMarkingPlans": generated_marking_plans,
+            "preservedTeacherContent": preserved_teacher_content,
+            "markingPlanFailed": marking_plan_failed,
+            "packageStatus": package_status,
+            "packageVersion": package_version,
         }
 
     except HTTPException:
@@ -10512,6 +10658,14 @@ async def generate_document_solutions(
             "generated_solutions_status": "error",
             "generated_solutions_error": str(e),
         }
+        if is_pcr_authoring:
+            error_update.update(
+                {
+                    "ai_grading_package_status": "error",
+                    "ai_grading_package_version": package_version,
+                    "ai_grading_package_error": str(e),
+                }
+            )
         if is_b2c:
             await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": error_update})
         else:
