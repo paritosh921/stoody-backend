@@ -10427,8 +10427,14 @@ async def generate_document_solutions(
         preserved_teacher_content = 0
         marking_plan_failed = 0
         batch_size = max(1, min(20, int(generation_request.batchSize or 8)))
-        for offset in range(0, len(sorted_questions), batch_size):
-            batch = sorted_questions[offset:offset + batch_size]
+        # PCR authoring is handled below as one canonical operation per
+        # question: generate the reference answer and its locked marking plan
+        # together. Running the older reference-answer-only batch first makes
+        # answer-key-free papers pay for duplicate LLM work and can abort the
+        # request before the marking plan is created.
+        solution_generation_questions = [] if is_pcr_authoring else sorted_questions
+        for offset in range(0, len(solution_generation_questions), batch_size):
+            batch = solution_generation_questions[offset:offset + batch_size]
             gateway_context = _build_ai_gateway_context(
                 current_user=current_user,
                 db=db,
