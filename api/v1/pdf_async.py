@@ -3085,7 +3085,7 @@ async def generate_pcr_marking_plan_draft(
     *,
     document: Dict[str, Any],
     question: Dict[str, Any],
-    mapped_solution: str,
+    mapped_solution: Optional[str],
     gateway_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Ask the configured model for a *draft* criterion rubric.
@@ -3107,8 +3107,26 @@ async def generate_pcr_marking_plan_draft(
         raise ValueError("The question text is empty")
     if question_marks <= 0:
         raise ValueError("Set question marks before drafting marking criteria")
-    if not mapped_solution.strip():
-        raise ValueError("The mapped solution is empty")
+
+    mapped_solution_text = str(mapped_solution or "").strip()
+    has_teacher_solution = bool(mapped_solution_text)
+    source_instruction = (
+        "Use the supplied teacher-uploaded worked solution as the authoritative reference answer."
+        if has_teacher_solution
+        else (
+            "No teacher answer key was uploaded. Solve the question yourself at the stated subject, "
+            "board or course, class or standard, and difficulty level. Produce a concise reference "
+            "answer before deriving the marking criteria."
+        )
+    )
+    solution_section = (
+        f"--- MAPPED TEACHER SOLUTION ---\n{mapped_solution_text[:16000]}"
+        if has_teacher_solution
+        else (
+            "--- MAPPED TEACHER SOLUTION ---\n"
+            "Not provided. Generate the reference answer from the question."
+        )
+    )
 
     policy_module = _pcr_marking_policy_module()
     policy = policy_module.normalize_marking_policy(
@@ -3136,11 +3154,11 @@ async def generate_pcr_marking_plan_draft(
     prompt = (
         "You are assisting a teacher to author a subjective-exam marking plan.\n"
         "This is a DRAFT only. Do not award a student score.\n\n"
-        "Use only the supplied question and teacher-uploaded worked solution.\n"
+        f"{source_instruction}\n"
         "Treat the teacher's marking guidance as authoritative. Use the document subject, board or course, class or standard, difficulty, and question wording to infer the expected level and response type.\n"
         "For mathematics and science, reward correct results, valid reasoning, method steps, units, diagrams, and error-carried-forward only where they are relevant to the available marks. Accept equivalent valid methods unless the teacher or question requires a named method.\n"
         "For languages, humanities, essays, speeches, paragraphs, and other open responses, assess meaning rather than exact wording. Build criteria appropriate to the task, such as relevance and accuracy of ideas, organization, reasoning, evidence, language control, style, format, or creativity. Do not require the teacher answer's exact phrasing.\n"
-        "Create clear, independently assessable criterion rows using only requirements actually supported by the uploaded solution. "
+        "Create clear, independently assessable criterion rows using requirements supported by the teacher solution when supplied, otherwise by the generated reference answer. "
         "Do not automatically require method, intermediate work, and a final answer when the source or mark value does not require all three. "
         "Never make a criterion stricter than the teacher solution, and do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
         "Infer the method policy from the QUESTION wording and the marks actually allocated, not from the teacher's chosen worked route. Use any_valid_method by default. "
@@ -3152,7 +3170,7 @@ async def generate_pcr_marking_plan_draft(
         "For procedural mathematics and science, prefer independently assessable one-mark rows when the work genuinely contains distinct achievements. "
         "For open-ended language or humanities responses, use a small set of meaningful criteria and allow a criterion to carry multiple marks so teachers can award proportional credit. "
         "Do not split a holistic writing quality into artificial one-mark rows merely to satisfy a template.\n"
-        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the uploaded solution's own method and conclusion plus clearly equivalent valid alternatives. "
+        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the reference solution's method and conclusion plus clearly equivalent valid alternatives. "
         "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
         "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
@@ -3170,8 +3188,7 @@ async def generate_pcr_marking_plan_draft(
         f"Question marks: {question_marks:g}\n"
         "--- QUESTION ---\n"
         f"{question_text[:12000]}\n\n"
-        "--- MAPPED TEACHER SOLUTION ---\n"
-        f"{mapped_solution[:16000]}"
+        f"{solution_section}"
     )
 
     async def _raw_call():
@@ -10525,9 +10542,6 @@ async def generate_document_solutions(
 
                 mapping = existing_mapping_by_question.get(question_id) or {}
                 mapped_solution = str(mapping.get("answer_text") or existing_reference).strip()
-                if not mapped_solution:
-                    marking_plan_failed += 1
-                    continue
 
                 try:
                     plan_context = _build_ai_gateway_context(
@@ -10612,7 +10626,7 @@ async def generate_document_solutions(
         if is_pcr_authoring:
             package_status = (
                 "ready_for_review"
-                if failed == 0 and marking_plan_failed == 0
+                if marking_plan_failed == 0
                 else "partial"
             )
             completed_update.update(
