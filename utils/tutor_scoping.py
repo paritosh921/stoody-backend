@@ -12,6 +12,7 @@ Every query includes an admin_id filter for multi-tenant data isolation.
 
 from typing import Dict, Any, Optional, List
 import logging
+import re
 
 _logger = logging.getLogger(__name__)
 
@@ -247,6 +248,225 @@ def _normalise_scope_value(value: Any, *, standard: bool = False) -> str:
     return normalised
 
 
+def _identifier_values(value: Any) -> List[Any]:
+    """Return string/ObjectId variants used by legacy tenant records."""
+    if value is None or value == "":
+        return []
+
+    values: List[Any] = [value]
+    value_as_text = str(value)
+    if value_as_text != value:
+        values.append(value_as_text)
+
+    try:
+        from bson import ObjectId
+
+        object_id = ObjectId(value_as_text)
+        if object_id not in values:
+            values.append(object_id)
+    except Exception:
+        pass
+    return values
+
+
+async def get_tutor_document_access_context(
+    current_user: Dict[str, Any],
+    db: Any,
+) -> Optional[Dict[str, Any]]:
+    """Resolve the canonical tutor and tenant identities for paper access.
+
+    The persisted tutor record is authoritative for the tenant. Session claims
+    are used only as a fallback for older tutor records. Returning ``None`` is
+    intentionally fail-closed: callers must not interpret missing tutor scope
+    as institute-wide access.
+    """
+    tutor_id = (
+        current_user.get("tutor_id")
+        or current_user.get("teacher_id")
+    )
+    if not tutor_id:
+        return None
+
+    tutor_id = str(tutor_id)
+    tutor_doc = await db.mongo_find_one("tutors", {"tutor_id": tutor_id})
+    if not tutor_doc:
+        return None
+
+    admin_id = (
+        tutor_doc.get("created_by")
+        or tutor_doc.get("admin_id")
+        or current_user.get("admin_id")
+        or current_user.get("tenant_id")
+    )
+    admin_match_values = _identifier_values(admin_id)
+    if not admin_match_values:
+        return None
+
+    actor_ids = {
+        str(value)
+        for value in (
+            tutor_id,
+            current_user.get("tutor_id"),
+            current_user.get("teacher_id"),
+            current_user.get("user_id"),
+            current_user.get("id"),
+            tutor_doc.get("_id"),
+        )
+        if value
+    }
+    return {
+        "tutor_id": tutor_id,
+        "tutor_doc": tutor_doc,
+        "actor_ids": sorted(actor_ids),
+        "admin_ids": {str(value) for value in admin_match_values},
+        "admin_match_values": admin_match_values,
+    }
+
+
+def _scope_regex(value: Any, *, standard: bool = False) -> Dict[str, Any]:
+    normalised = _normalise_scope_value(value, standard=standard)
+    tokens = [re.escape(token) for token in normalised.split() if token]
+    token_pattern = r"\s+".join(tokens)
+    if standard:
+        token_pattern = rf"(?:(?:class|grade|standard)\s*)?{token_pattern}"
+    return {"$regex": rf"^\s*{token_pattern}\s*$", "$options": "i"}
+
+
+def _assignment_document_query(
+    *,
+    standard: Any,
+    sections: Any = None,
+    subjects: Any = None,
+) -> Optional[Dict[str, Any]]:
+    if not _normalise_scope_value(standard, standard=True):
+        return None
+
+    conditions: List[Dict[str, Any]] = [
+        {
+            "$or": [
+                {"standard": _scope_regex(standard, standard=True)},
+                {"grade": _scope_regex(standard, standard=True)},
+            ]
+        }
+    ]
+
+    subject_values = [
+        value
+        for value in _subject_values(subjects)
+        if _normalise_scope_value(value)
+    ]
+    if subject_values:
+        conditions.append(
+            {
+                "$or": [
+                    {"subject": _scope_regex(value)}
+                    for value in subject_values
+                ]
+            }
+        )
+
+    section_values = [
+        value
+        for value in _subject_values(sections)
+        if _normalise_scope_value(value)
+    ]
+    if section_values:
+        conditions.append(
+            {
+                "$or": [
+                    {"section": _scope_regex(value)}
+                    for value in section_values
+                ]
+                + [
+                    {"section": None},
+                    {"section": {"$regex": r"^\s*$"}},
+                    {"section": {"$exists": False}},
+                ]
+            }
+        )
+    return _combine_conditions(conditions)
+
+
+def build_tutor_document_candidate_filter(
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a database-side superset of the canonical paper access rule.
+
+    Callers must still run ``tutor_can_access_document`` as the final policy
+    check. This query keeps pagination and large school document collections
+    bounded without weakening the shared authorization decision.
+    """
+    tutor_doc = context["tutor_doc"]
+    actor_values: List[Any] = []
+    for actor_id in context.get("actor_ids") or []:
+        for value in _identifier_values(actor_id):
+            if value not in actor_values:
+                actor_values.append(value)
+
+    explicit_conditions: List[Dict[str, Any]] = [
+        {"teacher_ids": {"$in": actor_values}},
+    ]
+    for owner_field in ("uploaded_by", "created_by", "created_by_tutor_id"):
+        explicit_conditions.append({owner_field: {"$in": actor_values}})
+
+    assignment_conditions: List[Dict[str, Any]] = []
+    assignment_with_class = False
+    for assignment in tutor_doc.get("teaching_assignments") or []:
+        standard = assignment.get("standard") or assignment.get("grade")
+        if not standard:
+            continue
+        assignment_with_class = True
+        subjects = _subject_values(assignment.get("subject")) + _subject_values(
+            assignment.get("subjects")
+        )
+        condition = _assignment_document_query(
+            standard=standard,
+            sections=assignment.get("sections") or assignment.get("section"),
+            subjects=subjects,
+        )
+        if condition:
+            assignment_conditions.append(condition)
+
+    if not assignment_with_class:
+        class_teacher_of = tutor_doc.get("class_teacher_of") or {}
+        condition = _assignment_document_query(
+            standard=(
+                class_teacher_of.get("standard")
+                or class_teacher_of.get("grade")
+            ),
+            sections=class_teacher_of.get("section"),
+        )
+        if condition:
+            assignment_conditions.append(condition)
+
+    if not assignment_with_class and not assignment_conditions:
+        for standard in tutor_doc.get("standards") or []:
+            condition = _assignment_document_query(
+                standard=standard,
+                sections=tutor_doc.get("sections"),
+                subjects=tutor_doc.get("subjects"),
+            )
+            if condition:
+                assignment_conditions.append(condition)
+
+    if assignment_conditions:
+        explicit_conditions.append(
+            {
+                "$and": [
+                    {
+                        "$or": [
+                            {"teacher_ids": []},
+                            {"teacher_ids": None},
+                            {"teacher_ids": {"$exists": False}},
+                        ]
+                    },
+                    {"$or": assignment_conditions},
+                ]
+            }
+        )
+    return {"$or": explicit_conditions}
+
+
 def _document_matches_assignment(
     document: Dict[str, Any],
     *,
@@ -299,6 +519,7 @@ def tutor_can_access_document(
     *,
     tutor_id: str,
     actor_ids: Optional[List[str]] = None,
+    admin_ids: Optional[Any] = None,
 ) -> bool:
     """Return whether a tutor may use a finalized paper.
 
@@ -308,6 +529,18 @@ def tutor_can_access_document(
       3. Unassigned institute papers are visible only through a matching
          class/subject/section teaching assignment.
     """
+    if admin_ids is not None:
+        allowed_admin_ids = {
+            str(value) for value in admin_ids if value is not None and value != ""
+        }
+        document_admin_id = document.get("admin_id")
+        if (
+            not allowed_admin_ids
+            or document_admin_id is None
+            or str(document_admin_id) not in allowed_admin_ids
+        ):
+            return False
+
     identities = {
         str(value)
         for value in ([tutor_id] + list(actor_ids or []))
@@ -371,3 +604,30 @@ def tutor_can_access_document(
         ):
             return True
     return False
+
+
+def student_matches_document_scope(
+    student: Dict[str, Any],
+    document: Dict[str, Any],
+) -> bool:
+    """Return whether a student belongs to the paper's class/section roster.
+
+    Papers without a class are not silently treated as school-wide. A missing
+    paper section means class-wide; a present section must match exactly after
+    stable whitespace/case normalization.
+    """
+    document_standard = _normalise_scope_value(
+        document.get("standard") or document.get("grade"),
+        standard=True,
+    )
+    student_standard = _normalise_scope_value(
+        student.get("grade") or student.get("standard"),
+        standard=True,
+    )
+    if not document_standard or student_standard != document_standard:
+        return False
+
+    document_section = _normalise_scope_value(document.get("section"))
+    if not document_section:
+        return True
+    return document_section == _normalise_scope_value(student.get("section"))

@@ -59,6 +59,10 @@ class StudentCopyStatus(BaseModel):
 class StudentCopyExamOption(BaseModel):
     exam_id: str
     title: str
+    paper_title: Optional[str] = None
+    subject: Optional[str] = None
+    code: Optional[str] = None
+    question_paper_available: bool = False
     lifecycle_state: str
     max_pages: int = Field(ge=1, le=50)
     can_submit: bool
@@ -914,6 +918,10 @@ async def list_answer_copy_options(
             "student_self_submission_enabled": 1,
             "exam_type": 1,
             "capture_mode": 1,
+            "prepared_document_id": 1,
+            "subject": 1,
+            "code": 1,
+            "exam_code": 1,
             "roster": 1,
             "absent_student_ids": 1,
         },
@@ -1019,6 +1027,10 @@ async def list_answer_copy_options(
             StudentCopyExamOption(
                 exam_id=exam_id,
                 title=str(exam.get("title") or "PCR exam"),
+                paper_title=str(exam.get("paper_title") or exam.get("title") or "PCR paper"),
+                subject=exam.get("subject"),
+                code=exam.get("code") or exam.get("exam_code"),
+                question_paper_available=bool(exam.get("prepared_document_id")),
                 lifecycle_state=str(exam.get("lifecycle_state") or "draft"),
                 max_pages=int(exam.get("student_submission_max_pages") or 20),
                 can_submit=can_submit,
@@ -1059,6 +1071,138 @@ async def get_answer_copy_status(
         submitted_at=_fmt(attempt.get("created_at")),
         processing_status=None,
         publication_status=None,
+    )
+
+
+async def _read_student_download_asset(storage_path: str) -> bytes:
+    """Read a server-owned private asset without exposing its storage location."""
+    import inspect
+    from pathlib import Path
+
+    value = str(storage_path or "").strip()
+    if not value:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    if value.startswith("s3://"):
+        from utils.s3_storage import download_file
+
+        payload = download_file(value)
+        if inspect.isawaitable(payload):
+            payload = await payload
+        if isinstance(payload, bytes):
+            return payload
+        if hasattr(payload, "read"):
+            content = payload.read()
+            if inspect.isawaitable(content):
+                content = await content
+            if isinstance(content, bytes):
+                return content
+        if isinstance(payload, str):
+            downloaded_path = Path(payload)
+            if downloaded_path.is_file():
+                return downloaded_path.read_bytes()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    local_path = Path(value)
+    if not local_path.is_absolute():
+        local_path = Path(__file__).resolve().parents[2] / local_path
+    if not local_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+    return local_path.read_bytes()
+
+
+@router.get(
+    "/exams/{exam_id}/question-paper/download",
+    summary="Download the authenticated student's question paper",
+)
+async def download_question_paper(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_student),
+    db: DatabaseManager = Depends(get_database),
+):
+    from fastapi.responses import Response
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    student_ids = await _get_student_identity_ids(tenant_db, current_user)
+    exam = await _get_student_exam_or_404(
+        tenant_db,
+        exam_id=exam_id,
+        student_id=student_ids[0],
+    )
+    prepared_document_id = str(exam.get("prepared_document_id") or "").strip()
+    if not prepared_document_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question paper not found")
+    document = await tenant_db["documents"].find_one(
+        {"document_id": prepared_document_id},
+        projection={
+            "_id": 0,
+            "file_path": 1,
+            "storage_path": 1,
+            "source_storage_path": 1,
+        },
+    )
+    storage_path = str(
+        (document or {}).get("file_path")
+        or (document or {}).get("storage_path")
+        or (document or {}).get("source_storage_path")
+        or ""
+    )
+    content = await _read_student_download_asset(storage_path)
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{exam_id}-question-paper.pdf"'},
+    )
+
+
+@router.get(
+    "/exams/{exam_id}/answer-copy/download",
+    summary="Download the authenticated student's submitted answer copy",
+)
+async def download_answer_copy(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_student),
+    db: DatabaseManager = Depends(get_database),
+):
+    import io
+    import zipfile
+    from fastapi.responses import Response
+
+    tenant_db = await _get_tenant_db(db, current_user)
+    student_ids = await _get_student_identity_ids(tenant_db, current_user)
+    student_id = student_ids[0]
+    await _get_student_exam_or_404(tenant_db, exam_id=exam_id, student_id=student_id)
+    attempt = await _get_copy_attempt_state(tenant_db, exam_id=exam_id, student_id=student_id)
+    if not attempt:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer copy not found")
+
+    original_asset = attempt.get("original_asset") or {}
+    original_path = str(original_asset.get("storage_path") or "").strip()
+    if original_path:
+        content = await _read_student_download_asset(original_path)
+        is_pdf = str(original_asset.get("content_type") or "").lower() == "application/pdf"
+        suffix = "pdf" if is_pdf else "bin"
+        media_type = "application/pdf" if is_pdf else "application/octet-stream"
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{exam_id}-answer-copy.{suffix}"'},
+        )
+
+    pages = [page for page in (attempt.get("pages") or []) if page.get("storage_path")]
+    if not pages:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer copy not found")
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for index, page in enumerate(pages, start=1):
+            page_content = await _read_student_download_asset(str(page.get("storage_path") or ""))
+            content_type = str(page.get("content_type") or "").lower()
+            extension = "png" if "png" in content_type else "jpg"
+            bundle.writestr(f"page-{index}.{extension}", page_content)
+    return Response(
+        content=archive.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{exam_id}-answer-copy.zip"'},
     )
 
 

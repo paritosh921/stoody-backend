@@ -73,6 +73,10 @@ class StudentExamItem(BaseModel):
 
     exam_id: str
     title: str
+    paper_title: Optional[str] = None
+    subject: Optional[str] = None
+    code: Optional[str] = None
+    question_paper_available: bool = False
     exam_type: Optional[str] = None
     total_score: float = 0.0
     max_score: float = 0.0
@@ -515,6 +519,9 @@ async def list_student_exams(
                 "title": 1,
                 "exam_type": 1,
                 "prepared_document_id": 1,
+                "subject": 1,
+                "code": 1,
+                "exam_code": 1,
             },
         ).to_list(length=5000)
         exam_document_map = {
@@ -528,7 +535,16 @@ async def list_student_exams(
         prepared_documents = (
             await tenant_db["documents"].find(
                 {"document_id": {"$in": prepared_ids}},
-                {"_id": 0, "document_id": 1, "title": 1, "exam_mode": 1},
+                {
+                    "_id": 0,
+                    "document_id": 1,
+                    "title": 1,
+                    "exam_mode": 1,
+                    "subject": 1,
+                    "code": 1,
+                    "exam_code": 1,
+                    "file_path": 1,
+                },
             ).to_list(length=5000)
             if prepared_ids
             else []
@@ -583,6 +599,15 @@ async def list_student_exams(
                 StudentExamItem(
                     exam_id=eid,
                     title=title,
+                    paper_title=prepared_document.get("title") or title,
+                    subject=exam_document.get("subject") or prepared_document.get("subject"),
+                    code=(
+                        exam_document.get("code")
+                        or exam_document.get("exam_code")
+                        or prepared_document.get("code")
+                        or prepared_document.get("exam_code")
+                    ),
+                    question_paper_available=bool(prepared_document.get("file_path")),
                     exam_type=exam_type,
                     total_score=combined_total,
                     max_score=combined_max,

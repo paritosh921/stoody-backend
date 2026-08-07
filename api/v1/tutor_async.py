@@ -22,6 +22,12 @@ from core.auth import AuthManager
 from core.token_blacklist import revoke_user_session
 from api.v1.auth_async import get_auth_manager, get_current_user, get_database
 from services.exam_analytics import PublishedExamAttempt, load_published_exam_attempts
+from utils.tutor_scoping import (
+    build_tutor_document_candidate_filter,
+    get_tutor_document_access_context,
+    student_matches_document_scope,
+    tutor_can_access_document,
+)
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -1022,6 +1028,71 @@ async def _get_tutor_visible_students(
     )
 
 
+async def _require_tutor_document_context(
+    current_user: Dict[str, Any],
+    db: DatabaseManager,
+) -> Dict[str, Any]:
+    """Resolve paper access scope or fail closed for an invalid tutor session."""
+    context = await get_tutor_document_access_context(current_user, db)
+    if not context:
+        raise HTTPException(
+            status_code=403,
+            detail="Tutor teaching scope is unavailable",
+        )
+    return context
+
+
+def _document_visible_in_context(
+    document: Dict[str, Any],
+    context: Dict[str, Any],
+) -> bool:
+    return tutor_can_access_document(
+        context["tutor_doc"],
+        document,
+        tutor_id=context["tutor_id"],
+        actor_ids=context["actor_ids"],
+        admin_ids=context["admin_ids"],
+    )
+
+
+def _students_for_document(
+    students: List[Dict[str, Any]],
+    document: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    return [
+        student
+        for student in students
+        if student_matches_document_scope(student, document)
+    ]
+
+
+def _document_student_match(
+    documents: List[Dict[str, Any]],
+    students: List[Dict[str, Any]],
+) -> tuple[Dict[str, List[str]], List[Dict[str, Any]]]:
+    """Build per-paper student rosters and one bounded aggregation matcher."""
+    student_ids_by_document: Dict[str, List[str]] = {}
+    clauses: List[Dict[str, Any]] = []
+    for document in documents:
+        document_id = document.get("document_id") or str(document.get("_id", ""))
+        if not document_id:
+            continue
+        student_ids = [
+            str(student.get("_id"))
+            for student in _students_for_document(students, document)
+            if student.get("_id") is not None
+        ]
+        student_ids_by_document[document_id] = student_ids
+        if student_ids:
+            clauses.append(
+                {
+                    "document_id": document_id,
+                    "student_id": {"$in": student_ids},
+                }
+            )
+    return student_ids_by_document, clauses
+
+
 async def _get_published_exam_attempts(
     current_user: Dict[str, Any],
     db: DatabaseManager,
@@ -2013,8 +2084,6 @@ async def get_student_document_analytics(
     "Assignments & Papers" sub-tab.
     """
     try:
-        from bson import ObjectId
-
         # ----- Verify student is visible to this tutor -----
         visible_students = await _get_tutor_visible_students(current_user, db)
         target_student = None
@@ -2032,33 +2101,29 @@ async def get_student_document_analytics(
         oid_str = str(target_student["_id"])
 
         # ----- Build document filter (same scoping as /analytics/documents) -----
-        tutor_id = current_user.get("tutor_id")
-        admin_id = current_user.get("admin_id")
-
-        try:
-            admin_oid = ObjectId(admin_id)
-            admin_matches = [admin_oid, str(admin_id)]
-        except Exception:
-            admin_matches = [admin_id]
+        document_context = await _require_tutor_document_context(current_user, db)
 
         doc_filter: Dict[str, Any] = {
             "$and": [
-                {"admin_id": {"$in": admin_matches}},
-                {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
                 {
-                    "$or": [
-                        {"teacher_ids": {"$in": [tutor_id]}},
-                        {"teacher_ids": []},
-                        {"teacher_ids": None},
-                        {"teacher_ids": {"$exists": False}},
-                    ]
+                    "admin_id": {
+                        "$in": document_context["admin_match_values"]
+                    }
                 },
+                {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
+                build_tutor_document_candidate_filter(document_context),
             ]
         }
 
         documents = await db.mongo_find(
             "documents", doc_filter, sort=[("uploaded_at", -1)]
         )
+        documents = [
+            document
+            for document in documents
+            if _document_visible_in_context(document, document_context)
+            and student_matches_document_scope(target_student, document)
+        ]
 
         if not documents:
             return {
@@ -2297,18 +2362,44 @@ async def get_tutor_attempt_detail(
         # Verify the student belongs to this tutor's visible students
         visible_students = await _get_tutor_visible_students(current_user, db)
         attempt_student_id = attempt.get("student_id", "")
-        student_visible = False
+        target_student = None
         for s in visible_students:
             sid = str(s.get("_id", ""))
             if sid == attempt_student_id or s.get("student_id") == attempt_student_id:
-                student_visible = True
+                target_student = s
                 break
 
-        if not student_visible:
+        if not target_student:
             raise HTTPException(
                 status_code=403,
                 detail="You do not have access to this student's data",
             )
+
+        document_id = str(attempt.get("document_id") or "").strip()
+        if document_id:
+            document_context = await _require_tutor_document_context(current_user, db)
+            document = await db.mongo_find_one(
+                "documents",
+                {
+                    "$and": [
+                        {"document_id": document_id},
+                        {
+                            "admin_id": {
+                                "$in": document_context["admin_match_values"]
+                            }
+                        },
+                    ]
+                },
+            )
+            if (
+                not document
+                or not _document_visible_in_context(document, document_context)
+                or not student_matches_document_scope(target_student, document)
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="You do not have access to this document attempt",
+                )
 
         # Convert submission image storage paths to presigned URLs
         image_urls: list = []
@@ -2383,6 +2474,30 @@ async def get_student_document_attempts(
             raise HTTPException(
                 status_code=403,
                 detail="You do not have access to this student's data",
+            )
+
+        document_context = await _require_tutor_document_context(current_user, db)
+        document = await db.mongo_find_one(
+            "documents",
+            {
+                "$and": [
+                    {"document_id": document_id},
+                    {
+                        "admin_id": {
+                            "$in": document_context["admin_match_values"]
+                        }
+                    },
+                ]
+            },
+        )
+        if (
+            not document
+            or not _document_visible_in_context(document, document_context)
+            or not student_matches_document_scope(target_student, document)
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found or not accessible by this tutor",
             )
 
         oid_str = str(target_student["_id"])
@@ -2621,30 +2736,17 @@ async def get_tutor_document_analytics(
     with aggregated attempt stats per document.
     """
     try:
-        from bson import ObjectId
-
-        tutor_id = current_user.get("tutor_id")
-        admin_id = current_user.get("admin_id")
-
-        # ----- Build document filter with tutor scoping -----
-        try:
-            admin_oid = ObjectId(admin_id)
-            admin_matches = [admin_oid, str(admin_id)]
-        except Exception:
-            admin_matches = [admin_id]
+        document_context = await _require_tutor_document_context(current_user, db)
 
         doc_filter: Dict[str, Any] = {
             "$and": [
-                {"admin_id": {"$in": admin_matches}},
-                {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
                 {
-                    "$or": [
-                        {"teacher_ids": {"$in": [tutor_id]}},
-                        {"teacher_ids": []},
-                        {"teacher_ids": None},
-                        {"teacher_ids": {"$exists": False}},
-                    ]
+                    "admin_id": {
+                        "$in": document_context["admin_match_values"]
+                    }
                 },
+                {"document_type": {"$in": ["Practice Sets", "Test Series"]}},
+                build_tutor_document_candidate_filter(document_context),
             ]
         }
 
@@ -2660,29 +2762,30 @@ async def get_tutor_document_analytics(
         documents = await db.mongo_find(
             "documents", doc_filter, sort=[("uploaded_at", -1)]
         )
+        documents = [
+            document
+            for document in documents
+            if _document_visible_in_context(document, document_context)
+        ]
 
         if not documents:
             return {"success": True, "data": {"documents": [], "total": 0}}
 
         # ----- Get visible students -----
         visible_students = await _get_tutor_visible_students(current_user, db)
-        visible_student_ids = [str(s["_id"]) for s in visible_students]
-        total_visible_students = len(visible_student_ids)
-
-        # Collect all document_ids
-        doc_ids = []
-        for d in documents:
-            did = d.get("document_id") or str(d.get("_id", ""))
-            if did:
-                doc_ids.append(did)
+        student_ids_by_document, document_student_clauses = _document_student_match(
+            documents,
+            visible_students,
+        )
 
         # ----- Aggregate practice_attempts per document -----
         practice_pipeline = [
             {
-                "$match": {
-                    "document_id": {"$in": doc_ids},
-                    "student_id": {"$in": visible_student_ids},
-                }
+                "$match": (
+                    {"$or": document_student_clauses}
+                    if document_student_clauses
+                    else {"_id": {"$exists": False}}
+                )
             },
             {
                 "$group": {
@@ -2704,10 +2807,11 @@ async def get_tutor_document_analytics(
         # ----- Aggregate student_test_attempts per document -----
         test_pipeline = [
             {
-                "$match": {
-                    "document_id": {"$in": doc_ids},
-                    "student_id": {"$in": visible_student_ids},
-                }
+                "$match": (
+                    {"$or": document_student_clauses}
+                    if document_student_clauses
+                    else {"_id": {"$exists": False}}
+                )
             },
             {
                 "$group": {
@@ -2732,6 +2836,7 @@ async def get_tutor_document_analytics(
                 continue
 
             dtype = doc.get("document_type", "")
+            total_visible_students = len(student_ids_by_document.get(did, []))
             doc_entry: Dict[str, Any] = {
                 "document_id": did,
                 "title": doc.get("title", ""),
@@ -2835,34 +2940,22 @@ async def get_tutor_document_detail_analytics(
     and per-question breakdown for a single document.
     """
     try:
-        from bson import ObjectId
-
-        tutor_id = current_user.get("tutor_id")
-        admin_id = current_user.get("admin_id")
-
-        try:
-            admin_oid = ObjectId(admin_id)
-            admin_matches = [admin_oid, str(admin_id)]
-        except Exception:
-            admin_matches = [admin_id]
+        document_context = await _require_tutor_document_context(current_user, db)
 
         # ----- Fetch and verify document access -----
         doc_filter: Dict[str, Any] = {
             "$and": [
                 {"document_id": document_id},
-                {"admin_id": {"$in": admin_matches}},
                 {
-                    "$or": [
-                        {"teacher_ids": {"$in": [tutor_id]}},
-                        {"teacher_ids": []},
-                        {"teacher_ids": None},
-                        {"teacher_ids": {"$exists": False}},
-                    ]
+                    "admin_id": {
+                        "$in": document_context["admin_match_values"]
+                    }
                 },
+                build_tutor_document_candidate_filter(document_context),
             ]
         }
         doc = await db.mongo_find_one("documents", doc_filter)
-        if not doc:
+        if not doc or not _document_visible_in_context(doc, document_context):
             raise HTTPException(
                 status_code=404,
                 detail="Document not found or not accessible by this tutor",
@@ -2877,6 +2970,7 @@ async def get_tutor_document_detail_analytics(
 
         # ----- Get visible students -----
         visible_students = await _get_tutor_visible_students(current_user, db)
+        visible_students = _students_for_document(visible_students, doc)
         visible_student_ids = [str(s["_id"]) for s in visible_students]
         total_visible_students = len(visible_student_ids)
 

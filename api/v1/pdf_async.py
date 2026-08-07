@@ -38,6 +38,11 @@ from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS, settings
 from utils.path_utils import get_relative_path, get_absolute_path
 from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url, download_file
+from utils.tutor_scoping import (
+    build_tutor_document_candidate_filter,
+    get_tutor_document_access_context,
+    tutor_can_access_document,
+)
 from services.ai_gateway_service import (
     AIGatewayService,
     AIUsageLimitExceeded,
@@ -6363,6 +6368,7 @@ async def get_documents(
         # Build base filter scoped by tenant (admin) and role
         user_type = current_user.get("user_type")
         filter_query: Dict[str, Any] = {}
+        tutor_document_context: Optional[Dict[str, Any]] = None
         
         if is_b2c:
             # B2C admin sees all documents in B2C database (no admin_id filter)
@@ -6373,28 +6379,27 @@ async def get_documents(
             except Exception:
                 pass
         else:
-            # Tutor: filter by their admin_id and (optionally) by teacher mapping
-            admin_id = current_user.get("admin_id")
-            if admin_id:
-                try:
-                    filter_query["admin_id"] = BsonObjectId(admin_id)
-                except Exception:
-                    pass
+            tutor_document_context = await get_tutor_document_access_context(
+                current_user,
+                db,
+            )
+            if not tutor_document_context:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Tutor teaching scope is unavailable",
+                )
+            filter_query["admin_id"] = {
+                "$in": tutor_document_context["admin_match_values"]
+            }
         if document_type:
             filter_query["document_type"] = document_type
-
-        # For tutors, only show docs mapped to them or open to all (no teacher restriction)
-        if user_type == "tutor":
-            tutor_id = current_user.get("tutor_id")
+        if tutor_document_context:
             filter_query = {
                 "$and": [
                     filter_query,
-                    {"$or": [
-                        {"teacher_ids": {"$in": [tutor_id]}},
-                        {"teacher_ids": []},
-                        {"teacher_ids": None},
-                        {"teacher_ids": {"$exists": False}}
-                    ]}
+                    build_tutor_document_candidate_filter(
+                        tutor_document_context
+                    ),
                 ]
             }
 
@@ -6410,6 +6415,37 @@ async def get_documents(
                 limit=limit,
                 sort=[("uploaded_at", -1)]
             )
+        elif user_type == "tutor":
+            # Tutor access depends on class/subject/section assignments and
+            # explicit ownership, so authorization must happen before paging.
+            # This prevents an out-of-scope paper from leaking through one page
+            # and keeps the response total consistent with the visible records.
+            total = await db.mongo_count("documents", filter_query)
+            skip = (page - 1) * limit
+            candidates = await db.mongo_find(
+                "documents",
+                filter_query,
+                skip=skip,
+                limit=limit,
+                sort=[("uploaded_at", -1)],
+            )
+            if tutor_document_context is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Tutor teaching scope is unavailable",
+                )
+            scoped_documents = [
+                document
+                for document in candidates
+                if tutor_can_access_document(
+                    tutor_document_context["tutor_doc"],
+                    document,
+                    tutor_id=tutor_document_context["tutor_id"],
+                    actor_ids=tutor_document_context["actor_ids"],
+                    admin_ids=tutor_document_context["admin_ids"],
+                )
+            ]
+            documents = scoped_documents
         else:
             # Regular admin/tutor - query tenant database
             total = len(await db.mongo_find("documents", filter_query))
@@ -7522,6 +7558,26 @@ async def update_document_metadata(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {document_id} not found"
             )
+
+        if current_user.get("user_type") == "tutor":
+            tutor_document_context = await get_tutor_document_access_context(
+                current_user,
+                db,
+            )
+            if (
+                not tutor_document_context
+                or not tutor_can_access_document(
+                    tutor_document_context["tutor_doc"],
+                    existing_doc,
+                    tutor_id=tutor_document_context["tutor_id"],
+                    actor_ids=tutor_document_context["actor_ids"],
+                    admin_ids=tutor_document_context["admin_ids"],
+                )
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Document is outside this tutor's teaching scope",
+                )
 
         # Finalization freezes the paper itself, not its operational
         # availability.  Admins must still be able to activate/deactivate an
