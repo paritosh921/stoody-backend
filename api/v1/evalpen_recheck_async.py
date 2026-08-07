@@ -442,6 +442,7 @@ async def resolve_recheck_request(
                     new_score=float(body.updated_score),
                     reason=f"Recheck {request_id}: {body.teacher_response.strip()}",
                     amend_published=True,
+                    recheck_request_id=request_id,
                 ),
                 current_user=current_user,
                 db=db,

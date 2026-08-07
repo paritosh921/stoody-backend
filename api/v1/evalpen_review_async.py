@@ -101,6 +101,15 @@ class ScoreOverrideRequest(BaseModel):
             "The corrected result remains published and receives a new audited snapshot."
         ),
     )
+    recheck_request_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description=(
+            "Internal recheck transaction identifier. It authorizes a total-score "
+            "amendment only while that request is locked by the resolving teacher."
+        ),
+    )
 
     @field_validator("reason")
     @classmethod
@@ -2790,14 +2799,30 @@ async def override_evaluation_score(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Evaluation {evaluation_id} not found",
             )
-        if isinstance(existing.get("criterion_marks"), list) and existing.get("criterion_marks"):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "This evaluation uses a locked criterion rubric. "
-                    "Adjust its individual criterion marks instead of overriding the total."
-                ),
-            )
+
+        actor_id = str(current_user.get("user_id") or "unknown")
+        criterion_marks = existing.get("criterion_marks")
+        verified_recheck: Optional[Dict[str, Any]] = None
+        if isinstance(criterion_marks, list) and criterion_marks:
+            recheck_request_id = str(body.recheck_request_id or "").strip()
+            if recheck_request_id:
+                verified_recheck = await tenant_db["evalpen_recheck_requests"].find_one(
+                    {
+                        "request_id": recheck_request_id,
+                        "evaluation_id": evaluation_id,
+                        "status": "under_review",
+                        "assigned_to": actor_id,
+                        "resolution_lock": {"$exists": True, "$ne": ""},
+                    }
+                )
+            if verified_recheck is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "This evaluation uses a locked criterion rubric. Adjust its individual "
+                        "criterion marks, or resolve an active student recheck request."
+                    ),
+                )
 
         # Tutor scoping and publication freeze are resolved through the
         # response's canonical submission, even when the evaluation already
@@ -2882,7 +2907,6 @@ async def override_evaluation_score(
                 ),
             )
 
-        actor_id = current_user.get("user_id", "unknown")
         old_score = existing.get("total_score", 0.0)
 
         # Perform the atomic score override with audit trail
@@ -2900,24 +2924,41 @@ async def override_evaluation_score(
             )
 
         teacher_reviewed_at = datetime.now(timezone.utc)
+        teacher_review_fields: Dict[str, Any] = {
+            "manual_review_required": False,
+            "manual_review_reason": None,
+            "flags": _resolve_review_flags(
+                existing.get("flags"),
+                actor_id=actor_id,
+                resolved_at=teacher_reviewed_at,
+                reason=body.reason,
+            ),
+            "teacher_review_status": "approved",
+            "teacher_reviewed": True,
+            "teacher_reviewed_by": actor_id,
+            "teacher_reviewed_at": teacher_reviewed_at,
+            "updated_at": teacher_reviewed_at,
+        }
+        if verified_recheck is not None:
+            rubric_total = round(
+                sum(float(row.get("awarded_marks") or 0.0) for row in criterion_marks),
+                4,
+            )
+            teacher_review_fields["teacher_total_override"] = {
+                "source": "student_recheck",
+                "request_id": str(verified_recheck.get("request_id") or body.recheck_request_id),
+                "previous_score": float(old_score),
+                "rubric_total": rubric_total,
+                "new_score": float(body.new_score),
+                "delta": round(float(body.new_score) - float(old_score), 4),
+                "reason": body.reason,
+                "actor_id": actor_id,
+                "recorded_at": teacher_reviewed_at,
+            }
         await tenant_db["evalpen_evaluations"].update_one(
             {"evaluation_id": evaluation_id},
             {
-                "$set": {
-                    "manual_review_required": False,
-                    "manual_review_reason": None,
-                    "flags": _resolve_review_flags(
-                        existing.get("flags"),
-                        actor_id=str(actor_id),
-                        resolved_at=teacher_reviewed_at,
-                        reason=body.reason,
-                    ),
-                    "teacher_review_status": "approved",
-                    "teacher_reviewed": True,
-                    "teacher_reviewed_by": actor_id,
-                    "teacher_reviewed_at": teacher_reviewed_at,
-                    "updated_at": teacher_reviewed_at,
-                }
+                "$set": teacher_review_fields,
             },
         )
         if _resp_doc:
