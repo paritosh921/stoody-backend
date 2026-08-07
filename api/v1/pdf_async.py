@@ -2844,6 +2844,114 @@ async def generate_worked_solution_batch(
     }
 
 
+async def generate_pcr_reference_answer_batch(
+    *,
+    questions: List[Dict[str, Any]],
+    document: Dict[str, Any],
+    gateway_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Generate teacher-reviewable reference-answer drafts for PCR questions.
+
+    PCR answer generation is authoring assistance, not an answer key. Drafts
+    are based only on the question catalog and document metadata, and remain
+    unapproved until a teacher reviews them before paper finalization.
+    """
+    import json as _json
+    from openai import AsyncOpenAI
+
+    if GROQ_API_KEY:
+        client = AsyncOpenAI(
+            api_key=GROQ_API_KEY,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        extract_model = GROQ_MODEL
+        provider_name = "Groq"
+    else:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise Exception("Neither GROQ_API_KEY nor OPENAI_API_KEY configured - cannot generate PCR answer drafts")
+        client = AsyncOpenAI(api_key=openai_key)
+        extract_model = OCR_FALLBACK_MODEL
+        provider_name = "OpenAI"
+
+    question_payload = [
+        {
+            "question_id": str(question.get("id") or ""),
+            "question_text": question.get("text") or question.get("question_text") or "",
+            "question_type": question.get("question_type") or document.get("question_type") or "subjective",
+            "marks": question.get("marks") or question.get("points") or question.get("max_marks"),
+            "teacher_notes": question.get("teacher_notes") or question.get("marking_guidance") or "",
+        }
+        for question in questions
+    ]
+
+    prompt = (
+        "You are drafting reference answers for a teacher who will review a PCR paper before AI marking.\n"
+        "Use only the approved question catalog and document metadata. Never infer an answer from student work.\n\n"
+        "For every question:\n"
+        "- Produce a correct, concise model answer appropriate to the subject, class, board, and available marks.\n"
+        "- For mathematics and science, show essential reasoning, formulae, units, the final answer, and valid alternative methods where relevant.\n"
+        "- For language, humanities, essays, speeches, and other open responses, provide an exemplar plus evaluation guidance covering meaning, structure, evidence, language, and acceptable variation. Do not require phrase matching.\n"
+        "- If a diagram, ambiguous OCR, missing context, or underspecified question prevents a reliable answer, set manual_review_required true and explain the limitation instead of inventing facts.\n"
+        "- Do not assign marks or criterion IDs. A separate teacher-reviewed marking-plan draft will be derived from this answer.\n"
+        "- Preserve mathematical notation in markdown-compatible LaTeX.\n\n"
+        "Return ONLY valid JSON, with no markdown fences:\n"
+        '{"solutions": ['
+        '{"question_id": "id", "answer_text": "reference answer draft", "confidence": 0.0, '
+        '"manual_review_required": true, "answer_kind": "worked|exemplar|guidance", "notes": "review notes"}'
+        "]}\n\n"
+        f"Document: {document.get('title') or document.get('document_id')}\n"
+        f"Subject: {document.get('subject') or 'General'}\n"
+        f"Class: {document.get('class_name') or document.get('class') or document.get('grade') or 'Not specified'}\n"
+        f"Board: {document.get('board') or document.get('curriculum') or 'Not specified'}\n"
+        "--- QUESTION CATALOG ---\n"
+        f"{_json.dumps(question_payload, ensure_ascii=False, default=str)}"
+    )
+
+    async def _raw_call():
+        return await client.chat.completions.create(
+            model=extract_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=16384,
+        )
+
+    if gateway_context:
+        gateway = AIGatewayService(
+            gateway_context.get("db"),
+            is_b2c=bool(gateway_context.get("is_b2c")),
+        )
+        response = await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=None,
+            region_scope="generated_pcr_reference_answer_batch",
+            stage="pcr_reference_answer_generation_batch",
+            provider=provider_name.lower(),
+            model=extract_model,
+            input_kind="text",
+            estimated_input_tokens=estimate_text_tokens(prompt),
+            estimated_output_tokens=4096,
+            max_output_tokens=16384,
+            input_units={"questions": len(question_payload)},
+            call_fn=_raw_call,
+        )
+    else:
+        response = await _raw_call()
+
+    raw_response = (response.choices[0].message.content or "").strip()
+    if raw_response.startswith("```"):
+        raw_response = raw_response.split("\n", 1)[-1]
+        if raw_response.endswith("```"):
+            raw_response = raw_response[:-3].strip()
+    data = _json.loads(raw_response)
+    return {
+        "solutions": data.get("solutions", []),
+        "provider": provider_name.lower(),
+        "model": extract_model,
+    }
+
+
 def _parse_pcr_marking_plan_draft(
     raw_response: str,
     *,
@@ -4150,10 +4258,12 @@ async def upload_pdf(
                 detail="Upload mode requires an answer sheet PDF",
             )
         if answer_solution_mode == "auto":
-            if document_type != "Test Series" or exam_mode or effective_document_question_type != "mcq":
+            is_pcr_authoring = str(exam_mode or "").strip().lower() == "pcr"
+            is_online_objective = not exam_mode and effective_document_question_type == "mcq"
+            if document_type != "Test Series" or not (is_pcr_authoring or is_online_objective):
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Auto-generated solutions are only allowed for online objective Test Series documents",
+                    detail="AI answer generation is available for PCR authoring and online objective Test Series documents",
                 )
 
         # Validate title length
@@ -10157,7 +10267,7 @@ async def generate_document_solutions(
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ):
-    """Generate worked explanations from extracted MCQ question data."""
+    """Generate objective solutions or teacher-reviewable PCR answer drafts."""
     started_at = datetime.utcnow()
     is_b2c = is_b2c_admin(current_user)
     try:
@@ -10190,15 +10300,14 @@ async def generate_document_solutions(
                 if tutor_admin_id != document_admin_id_str and not _DEBUG_MODE:
                     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
 
-        if document.get("document_type") != "Test Series" or document.get("exam_mode"):
+        exam_mode = str(document.get("exam_mode") or "").strip().lower()
+        question_type = str(document.get("question_type") or "mcq").strip().lower()
+        is_pcr_authoring = exam_mode == "pcr"
+        is_online_objective = not exam_mode and question_type == "mcq"
+        if document.get("document_type") != "Test Series" or not (is_pcr_authoring or is_online_objective):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Auto-generated solutions are only available for online Test Series documents.",
-            )
-        if str(document.get("question_type") or "mcq").lower() != "mcq":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Auto-generated solutions require objective questions.",
+                detail="AI answer generation is available for PCR authoring and online objective Test Series documents.",
             )
         if document.get("ocr_status") != "completed":
             raise HTTPException(
@@ -10217,16 +10326,17 @@ async def generate_document_solutions(
                 detail="No extracted questions found. Run question paper OCR first.",
             )
 
-        missing_correct = [
-            str(question.get("id") or index + 1)
-            for index, question in enumerate(questions)
-            if not _normalise_correct_answer_label(question.get("correct_answer"))
-        ]
-        if missing_correct:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"All questions must have a correct answer before generating solutions. Missing: {', '.join(missing_correct[:10])}",
-            )
+        if is_online_objective:
+            missing_correct = [
+                str(question.get("id") or index + 1)
+                for index, question in enumerate(questions)
+                if not _normalise_correct_answer_label(question.get("correct_answer"))
+            ]
+            if missing_correct:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"All objective questions must have a correct answer before generating solutions. Missing: {', '.join(missing_correct[:10])}",
+                )
 
         def _question_sort_key(question: Dict[str, Any]) -> tuple:
             region = question.get("region_metadata") or {}
@@ -10278,17 +10388,29 @@ async def generate_document_solutions(
         batch_size = max(1, min(20, int(generation_request.batchSize or 8)))
         for offset in range(0, len(sorted_questions), batch_size):
             batch = sorted_questions[offset:offset + batch_size]
-            batch_result = await generate_worked_solution_batch(
-                questions=batch,
-                document=document,
-                gateway_context=_build_ai_gateway_context(
-                    current_user=current_user,
-                    db=db,
-                    document_id=document_id,
-                    region_scope="generated_solution_batch",
-                    is_b2c=is_b2c,
+            gateway_context = _build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_scope=(
+                    "generated_pcr_reference_answer_batch"
+                    if is_pcr_authoring
+                    else "generated_solution_batch"
                 ),
+                is_b2c=is_b2c,
             )
+            if is_pcr_authoring:
+                batch_result = await generate_pcr_reference_answer_batch(
+                    questions=batch,
+                    document=document,
+                    gateway_context=gateway_context,
+                )
+            else:
+                batch_result = await generate_worked_solution_batch(
+                    questions=batch,
+                    document=document,
+                    gateway_context=gateway_context,
+                )
             solutions_by_id = {
                 str(solution.get("question_id") or ""): solution
                 for solution in batch_result.get("solutions", [])
@@ -10308,7 +10430,11 @@ async def generate_document_solutions(
                     confidence = float(confidence)
                 except (TypeError, ValueError):
                     confidence = 0.5
-                review_required = bool(solution.get("manual_review_required")) or not bool(solution.get("correct_option_verified"))
+                review_required = (
+                    True
+                    if is_pcr_authoring
+                    else bool(solution.get("manual_review_required")) or not bool(solution.get("correct_option_verified"))
+                )
                 if review_required:
                     manual_review += 1
                 mapping = {
@@ -10318,12 +10444,26 @@ async def generate_document_solutions(
                     "question_id": question_id,
                     "answer_region_id": f"generated:{question_id}",
                     "answer_text": answer_text,
-                    "mapping_strategy": "ai_generated_solution",
+                    "mapping_strategy": (
+                        "ai_generated_pcr_reference_draft"
+                        if is_pcr_authoring
+                        else "ai_generated_solution"
+                    ),
                     "confidence": max(0.0, min(1.0, confidence)),
                     "manual_review_required": review_required,
                     "review_status": "needs_review" if review_required else "accepted",
                     "source": "ai_generated",
-                    "correct_option_verified": bool(solution.get("correct_option_verified")),
+                    "generation_contract": (
+                        "pcr_reference_answer_draft_v1"
+                        if is_pcr_authoring
+                        else "objective_worked_solution_v1"
+                    ),
+                    "answer_kind": solution.get("answer_kind") or ("draft" if is_pcr_authoring else "worked"),
+                    "correct_option_verified": (
+                        None
+                        if is_pcr_authoring
+                        else bool(solution.get("correct_option_verified"))
+                    ),
                     "generation_notes": solution.get("notes") or "",
                     "generator_provider": batch_result.get("provider"),
                     "generator_model": batch_result.get("model"),
