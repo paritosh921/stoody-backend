@@ -946,7 +946,14 @@ async def get_exam_queue(
             scoped_ids,
         )
 
-        sub_query: Dict[str, Any] = {"exam_id": exam_id}
+        # This endpoint is an actionable work queue. A published submission is
+        # a terminal result record, including when its score is amended after a
+        # recheck, and must not re-enter a work bucket because an underlying
+        # evaluation still contains diagnostic or readiness warnings.
+        sub_query: Dict[str, Any] = {
+            "exam_id": exam_id,
+            "publication_status": {"$ne": "published"},
+        }
         if scoped_ids is not None:
             sub_query["student_id"] = {"$in": scoped_ids}
 
@@ -1055,7 +1062,11 @@ async def get_exam_queue(
         for sub in submissions:
             sub_id = str(sub.get("submission_id") or "")
             student_id = str(sub.get("student_id") or "")
-            pub_status = sub.get("publication_status")
+            pub_status = str(sub.get("publication_status") or "").lower()
+            # Defensive guard for database adapters or legacy records that do
+            # not apply the query predicate consistently.
+            if pub_status == "published":
+                continue
             sub_responses = responses_by_sub.get(sub_id, [])
             response_count = len(sub_responses)
             page_count = max(
