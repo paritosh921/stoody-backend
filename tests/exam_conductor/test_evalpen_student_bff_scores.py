@@ -198,3 +198,119 @@ def test_student_score_transport_preserves_objective_negative_marks():
     from api.v1.evalpen_student_bff_async import _safe_score
 
     assert _safe_score(-1) == -1.0
+
+
+def test_student_exam_recheck_summary_only_settles_explicitly_resolved_requests():
+    from api.v1.evalpen_student_bff_async import _summarize_rechecks_by_exam
+
+    total_counts, open_counts = _summarize_rechecks_by_exam(
+        [
+            {"exam_id": "EXAM-OPEN", "status": "open"},
+            {"exam_id": "EXAM-OPEN", "status": "resolved_no_change"},
+            {"exam_id": "EXAM-CLAIMED", "status": "under_review"},
+            {"exam_id": "EXAM-SETTLED", "status": "resolved_score_updated"},
+            {"exam_id": "EXAM-LEGACY"},
+            {"exam_id": "EXAM-UNKNOWN", "status": "unexpected_legacy_state"},
+            {"status": "open"},
+        ]
+    )
+
+    assert total_counts == {
+        "EXAM-OPEN": 2,
+        "EXAM-CLAIMED": 1,
+        "EXAM-SETTLED": 1,
+        "EXAM-LEGACY": 1,
+        "EXAM-UNKNOWN": 1,
+    }
+    assert open_counts == {
+        "EXAM-OPEN": 1,
+        "EXAM-CLAIMED": 1,
+        "EXAM-LEGACY": 1,
+        "EXAM-UNKNOWN": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_student_exam_list_reports_under_review_until_requests_are_resolved():
+    from api.v1.evalpen_student_bff_async import list_student_exams
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_many(
+        [
+            {
+                "submission_id": f"SUB-{suffix}",
+                "exam_id": f"EXAM-{suffix}",
+                "student_id": "STU-1",
+                "publication_status": "published",
+            }
+            for suffix in ("OPEN", "SETTLED", "NONE")
+        ]
+    )
+    await db["exampen_exams"].insert_many(
+        [
+            {
+                "exam_id": f"EXAM-{suffix}",
+                "title": f"Exam {suffix.title()}",
+                "exam_type": "dcr",
+            }
+            for suffix in ("OPEN", "SETTLED", "NONE")
+        ]
+    )
+    await db["exampen_dcr_results"].insert_many(
+        [
+            {
+                "exam_id": f"EXAM-{suffix}",
+                "student_id": "STU-1",
+                "score": 8,
+                "max_score": 10,
+            }
+            for suffix in ("OPEN", "SETTLED", "NONE")
+        ]
+    )
+    await db["evalpen_recheck_requests"].insert_many(
+        [
+            {
+                "request_id": "REQUEST-OPEN",
+                "exam_id": "EXAM-OPEN",
+                "submission_id": "SUB-OPEN",
+                "student_id": "STU-1",
+                "status": "open",
+            },
+            {
+                "request_id": "REQUEST-SETTLED",
+                "exam_id": "EXAM-SETTLED",
+                "submission_id": "SUB-SETTLED",
+                "student_id": "STU-1",
+                "status": "resolved_no_change",
+            },
+            {
+                "request_id": "REQUEST-OLD-ATTEMPT",
+                "exam_id": "EXAM-NONE",
+                "submission_id": "SUB-OLD-ATTEMPT",
+                "student_id": "STU-1",
+                "status": "open",
+            },
+        ]
+    )
+
+    with (
+        patch(
+            "api.v1.evalpen_student_bff_async._get_tenant_db",
+            return_value=db,
+        ),
+        patch(
+            "api.v1.evalpen_student_bff_async._get_student_identity_ids",
+            return_value=["STU-1"],
+        ),
+    ):
+        result = await list_student_exams(current_user=_student_user(), db=None)
+
+    by_exam_id = {item.exam_id: item for item in result.items}
+    assert by_exam_id["EXAM-OPEN"].result_status == "under_review"
+    assert by_exam_id["EXAM-OPEN"].open_recheck_count == 1
+    assert by_exam_id["EXAM-OPEN"].recheck_count == 1
+    assert by_exam_id["EXAM-SETTLED"].result_status == "published"
+    assert by_exam_id["EXAM-SETTLED"].open_recheck_count == 0
+    assert by_exam_id["EXAM-SETTLED"].recheck_count == 1
+    assert by_exam_id["EXAM-NONE"].result_status == "published"
+    assert by_exam_id["EXAM-NONE"].open_recheck_count == 0

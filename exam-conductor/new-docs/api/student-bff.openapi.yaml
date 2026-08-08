@@ -54,7 +54,7 @@ components:
   schemas:
     StudentExamCard:
       type: object
-      required: [exam_id, title, exam_type]
+      required: [exam_id, title, exam_type, result_status, recheck_count, open_recheck_count]
       properties:
         exam_id:
           type: string
@@ -63,3 +63,15 @@ components:
         exam_type:
           type: string
           enum: [dcr, pcr]
+        result_status:
+          type: string
+          enum: [published, under_review]
+          description: Under review while any student recheck request is unresolved.
+        recheck_count:
+          type: integer
+          minimum: 0
+          description: Total recheck requests, including resolved history.
+        open_recheck_count:
+          type: integer
+          minimum: 0
+          description: Requests that have not reached an explicit resolved state.

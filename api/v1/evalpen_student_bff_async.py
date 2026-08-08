@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Literal, Mapping, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -81,8 +81,10 @@ class StudentExamItem(BaseModel):
     total_score: float = 0.0
     max_score: float = 0.0
     published_at: Optional[str] = None
+    result_status: Literal["published", "under_review"] = "published"
     recheck_available: bool = True
     recheck_count: int = 0
+    open_recheck_count: int = 0
     conversation_count: int = 0
 
 
@@ -282,6 +284,37 @@ def _safe_question_number(value: Any) -> Optional[int]:
         return number if number > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+_RESOLVED_RECHECK_STATUSES = {
+    "resolved_no_change",
+    "resolved_score_updated",
+    "resolved_explained",
+}
+
+
+def _summarize_rechecks_by_exam(
+    documents: List[Mapping[str, Any]],
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Return total and unresolved request counts keyed by exam.
+
+    The exam list is the student's workflow surface, so a request remains
+    under review until it reaches an explicit terminal state. Missing or
+    unfamiliar legacy statuses are deliberately treated as unresolved rather
+    than incorrectly presenting the result as settled.
+    """
+
+    total_counts: Dict[str, int] = {}
+    open_counts: Dict[str, int] = {}
+    for document in documents:
+        exam_id = str(document.get("exam_id") or "").strip()
+        if not exam_id:
+            continue
+        total_counts[exam_id] = total_counts.get(exam_id, 0) + 1
+        request_status = str(document.get("status") or "open").strip().lower()
+        if request_status not in _RESOLVED_RECHECK_STATUSES:
+            open_counts[exam_id] = open_counts.get(exam_id, 0) + 1
+    return total_counts, open_counts
 
 
 def _student_safe_text(value: Any, *, limit: int = 1600) -> Optional[str]:
@@ -555,14 +588,13 @@ async def list_student_exams(
         recheck_documents = await tenant_db["evalpen_recheck_requests"].find(
             {
                 "exam_id": {"$in": exam_ids},
-                "student_id": {"$in": student_ids},
+                "submission_id": {"$in": sub_ids},
             },
-            {"_id": 0, "exam_id": 1},
+            {"_id": 0, "exam_id": 1, "status": 1},
         ).to_list(length=5000)
-        recheck_counts: Dict[str, int] = {}
-        for item in recheck_documents:
-            recheck_exam_id = str(item.get("exam_id") or "")
-            recheck_counts[recheck_exam_id] = recheck_counts.get(recheck_exam_id, 0) + 1
+        recheck_counts, open_recheck_counts = _summarize_rechecks_by_exam(
+            recheck_documents
+        )
 
         # ----- Build response items -----
         items: List[StudentExamItem] = []
@@ -573,6 +605,7 @@ async def list_student_exams(
             dcr = dcr_scores.get(eid, {"total_score": 0.0, "max_score": 0.0})
             combined_total = pcr["total_score"] + dcr["total_score"]
             combined_max = pcr["max_score"] + dcr["max_score"]
+            open_recheck_count = open_recheck_counts.get(eid, 0)
 
             title_info = title_map.get(eid, {})
             exam_document = exam_document_map.get(eid, {})
@@ -612,8 +645,12 @@ async def list_student_exams(
                     total_score=combined_total,
                     max_score=combined_max,
                     published_at=published_at,
+                    result_status=(
+                        "under_review" if open_recheck_count > 0 else "published"
+                    ),
                     recheck_available=True,
                     recheck_count=recheck_counts.get(eid, 0),
+                    open_recheck_count=open_recheck_count,
                     conversation_count=0,
                 )
             )
