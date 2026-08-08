@@ -29,6 +29,7 @@ Hard constraints:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -49,6 +50,9 @@ from services.exampen_submission_readiness import (
 from services.evalpen_flag_utils import is_flag_resolved
 
 logger = logging.getLogger(__name__)
+
+_CLASS_PREFIX_RE = re.compile(r"^(?:class|grade|standard)\s*[-:]?\s*", re.IGNORECASE)
+_SECTION_PREFIX_RE = re.compile(r"^section\s*[-:]?\s*", re.IGNORECASE)
 
 router = APIRouter()
 
@@ -87,6 +91,12 @@ class ExamSummaryItem(BaseModel):
     blocked_count: int = 0
     published_count: int = 0
     open_recheck_count: int = 0
+    pending_count: int = 0
+    needs_review_count: int = 0
+    ready_to_publish_count: int = 0
+    workflow_status: str = "prepared"
+    class_name: Optional[str] = None
+    section_name: Optional[str] = None
     class_label: Optional[str] = None
     # Prepared-exam fields (from finalized documents)
     status: str = "active"  # "prepared" | "active"
@@ -100,6 +110,41 @@ class ExamListResponse(BaseModel):
     """Response for GET /exams."""
 
     items: List[ExamSummaryItem] = Field(default_factory=list)
+
+
+def _derive_exam_workflow_status(item: ExamSummaryItem) -> str:
+    """Return the single teacher-facing status for an exam card.
+
+    The order is intentional: an open student request is always visible as
+    under review, and actionable failures take precedence over routine work.
+    Published submissions are terminal and do not re-enter a work state.
+    """
+    if item.status == "prepared":
+        return "prepared"
+    if item.open_recheck_count > 0 or item.needs_review_count > 0:
+        return "under_review"
+    if item.blocked_count > 0:
+        return "needs_attention"
+    if item.pending_count > 0:
+        return "checking"
+    if item.ready_to_publish_count > 0:
+        return "ready_to_publish"
+    if item.total_students > 0 and item.published_count >= item.total_students:
+        return "published"
+
+    lifecycle = str(item.lifecycle_state or "").strip().lower()
+    if lifecycle == "armed":
+        return "scheduled"
+    if lifecycle in {"in_progress", "uploading"}:
+        return "collecting"
+    return "awaiting_submissions"
+
+
+def _normalize_class_or_section(value: Any, *, section: bool = False) -> str:
+    """Keep column values concise when older records include their own label."""
+    normalized = str(value or "").strip()
+    prefix = _SECTION_PREFIX_RE if section else _CLASS_PREFIX_RE
+    return prefix.sub("", normalized).strip()
 
 
 class QueueItem(BaseModel):
@@ -236,6 +281,21 @@ def _visible_exam_query_for_user(
             "prepared_document_id": {"$in": visible_prepared_document_ids}
         })
     return {"$or": visibility}
+
+
+def _has_full_exam_access(
+    current_user: Dict[str, Any],
+    exam_doc: Optional[Dict[str, Any]],
+) -> bool:
+    """Whether the actor owns/teaches the exam and may see its full roster."""
+    if _is_tutor_admin_role(current_user):
+        return True
+    tutor_id = _current_tutor_id(current_user)
+    return bool(
+        exam_doc
+        and tutor_id is not None
+        and _is_exam_visible_to_tutor(exam_doc, tutor_id)
+    )
 
 
 async def _require_exam_visible_or_legacy_student_scope(
@@ -482,6 +542,12 @@ async def list_exams(
                 "created_by_tutor_id": 1,
                 "teacher_ids": 1,
                 "created_at": 1,
+                "standard": 1,
+                "grade": 1,
+                "class_name": 1,
+                "section": 1,
+                "section_name": 1,
+                "roster": 1,
             },
         ).to_list(length=5000)
         active_exam_map: Dict[str, Dict[str, Any]] = {
@@ -519,7 +585,10 @@ async def list_exams(
                 {
                     "document_id": 1,
                     "standard": 1,
+                    "grade": 1,
+                    "class_name": 1,
                     "section": 1,
+                    "section_name": 1,
                 },
             ).to_list(length=5000)
             if overview_document_ids
@@ -539,6 +608,9 @@ async def list_exams(
             evaluated_count: int = 0,
             blocked_count: int = 0,
             published_count: int = 0,
+            pending_count: int = 0,
+            needs_review_count: int = 0,
+            ready_to_publish_count: int = 0,
             title_override: Optional[str] = None,
             exam_type_override: Optional[str] = None,
         ) -> ExamSummaryItem:
@@ -565,6 +637,9 @@ async def list_exams(
                 evaluated_count=evaluated_count,
                 blocked_count=blocked_count,
                 published_count=published_count,
+                pending_count=pending_count,
+                needs_review_count=needs_review_count,
+                ready_to_publish_count=ready_to_publish_count,
                 status="active",
                 exam_mode=prepared_meta.get("exam_mode") or exam_doc.get("exam_type"),
                 created_at=(
@@ -581,10 +656,10 @@ async def list_exams(
                 ),
             )
 
-        async def _attach_open_recheck_counts(
+        async def _attach_exam_metadata_and_status(
             exam_items: List[ExamSummaryItem],
         ) -> List[ExamSummaryItem]:
-            """Attach actionable request counts without changing exam visibility."""
+            """Attach class, section, requests, and the canonical list status."""
             for item in exam_items:
                 exam_doc = active_exam_map.get(item.exam_id, {})
                 prepared_document_id = str(
@@ -593,12 +668,25 @@ async def list_exams(
                     or (item.exam_id if item.status == "prepared" else "")
                 ).strip()
                 source_document = overview_document_meta.get(prepared_document_id, {})
-                standard = str(
-                    source_document.get("standard") or exam_doc.get("standard") or ""
-                ).strip()
-                section = str(
-                    source_document.get("section") or exam_doc.get("section") or ""
-                ).strip()
+                standard = _normalize_class_or_section(
+                    source_document.get("standard")
+                    or source_document.get("grade")
+                    or source_document.get("class_name")
+                    or exam_doc.get("standard")
+                    or exam_doc.get("grade")
+                    or exam_doc.get("class_name")
+                    or "",
+                )
+                section = _normalize_class_or_section(
+                    source_document.get("section")
+                    or source_document.get("section_name")
+                    or exam_doc.get("section")
+                    or exam_doc.get("section_name")
+                    or "",
+                    section=True,
+                )
+                item.class_name = standard or None
+                item.section_name = section or None
                 if standard and section:
                     item.class_label = f"Class {standard} - Section {section}"
                 elif standard:
@@ -609,35 +697,41 @@ async def list_exams(
             visible_exam_ids = [
                 item.exam_id for item in exam_items if item.status == "active"
             ]
-            if not visible_exam_ids:
-                return exam_items
+            count_by_exam: Dict[str, int] = {}
+            if visible_exam_ids:
+                match: Dict[str, Any] = {
+                    "exam_id": {"$in": visible_exam_ids},
+                    "status": {"$in": ["open", "under_review"]},
+                }
+                if scoped_ids is not None:
+                    match["student_id"] = {"$in": scoped_ids}
 
-            match: Dict[str, Any] = {
-                "exam_id": {"$in": visible_exam_ids},
-                "status": {"$in": ["open", "under_review"]},
-            }
-            if scoped_ids is not None:
-                match["student_id"] = {"$in": scoped_ids}
-
-            count_docs = await tenant_db["evalpen_recheck_requests"].aggregate([
-                {"$match": match},
-                {"$group": {"_id": "$exam_id", "count": {"$sum": 1}}},
-            ]).to_list(length=5000)
-            count_by_exam = {
-                str(doc["_id"]): int(doc.get("count", 0))
-                for doc in count_docs
-                if doc.get("_id")
-            }
+                count_docs = await tenant_db["evalpen_recheck_requests"].aggregate([
+                    {"$match": match},
+                    {"$group": {"_id": "$exam_id", "count": {"$sum": 1}}},
+                ]).to_list(length=5000)
+                count_by_exam = {
+                    str(doc["_id"]): int(doc.get("count", 0))
+                    for doc in count_docs
+                    if doc.get("_id")
+                }
             for item in exam_items:
                 item.open_recheck_count = count_by_exam.get(item.exam_id, 0)
+                item.workflow_status = _derive_exam_workflow_status(item)
             return exam_items
 
         # ----- Fetch submissions (tutor-scoped) -----
         sub_query: Dict[str, Any] = {}
         if scoped_ids is not None:
-            visible_exam_ids = list(active_exam_map.keys())
-            sub_query["exam_id"] = {"$in": visible_exam_ids}
-            sub_query["student_id"] = {"$in": scoped_ids}
+            fully_visible_exam_ids = [
+                exam_id
+                for exam_id, exam_doc in active_exam_map.items()
+                if _has_full_exam_access(current_user, exam_doc)
+            ]
+            sub_query["$or"] = [
+                {"exam_id": {"$in": fully_visible_exam_ids}},
+                {"student_id": {"$in": scoped_ids}},
+            ]
 
         submissions_cursor = tenant_db["evalpen_submissions"].find(
             sub_query,
@@ -676,7 +770,7 @@ async def list_exams(
                 reverse=True,
             )
             return ExamListResponse(
-                items=await _attach_open_recheck_counts(items),
+                items=await _attach_exam_metadata_and_status(items),
             )
 
         # ----- Group submissions by exam_id -----
@@ -687,13 +781,20 @@ async def list_exams(
             if eid:
                 exams_map.setdefault(eid, []).append(sub)
 
-        # ----- Collect all submission_ids for batch response lookup -----
-        all_sub_ids = [s.get("submission_id", "") for s in submissions]
+        # Published submissions are terminal; only active work needs the
+        # readiness/response joins used to derive the dashboard status.
+        workflow_sub_ids = [
+            str(submission.get("submission_id") or "")
+            for submission in submissions
+            if str(submission.get("publication_status") or "").lower()
+            != "published"
+            and str(submission.get("submission_id") or "")
+        ]
 
         # ----- Fetch all responses for these submissions -----
         resp_cursor = tenant_db["evalpen_detected_responses"].find(
             {
-                "submission_id": {"$in": all_sub_ids},
+                "submission_id": {"$in": workflow_sub_ids},
                 "eval_status": {"$ne": "superseded"},
                 "superseded_at": {"$exists": False},
             },
@@ -711,6 +812,30 @@ async def list_exams(
         for resp in all_responses:
             sid = resp.get("submission_id", "")
             responses_by_sub.setdefault(sid, []).append(resp)
+
+        # Read the latest durable processing state and readiness once for all
+        # submissions. This keeps the list status aligned with the queue/roster
+        # contracts without issuing one query per exam or student.
+        jobs_by_sub: Dict[str, Dict[str, Any]] = {}
+        if workflow_sub_ids:
+            jobs_cursor = tenant_db["exampen_processing_jobs"].find(
+                {"submission_id": {"$in": workflow_sub_ids}},
+                {
+                    "submission_id": 1,
+                    "status": 1,
+                    "updated_at": 1,
+                },
+            ).sort("updated_at", -1)
+            for job in await jobs_cursor.to_list(length=5000):
+                submission_id = str(job.get("submission_id") or "")
+                if submission_id and submission_id not in jobs_by_sub:
+                    jobs_by_sub[submission_id] = job
+
+        readiness_by_submission = (
+            await assess_submissions_readiness(tenant_db, workflow_sub_ids)
+            if workflow_sub_ids
+            else {}
+        )
 
         # ----- Resolve exam titles from evalpen_questions -----
         exam_ids = list(exams_map.keys())
@@ -764,6 +889,9 @@ async def list_exams(
             evaluated = 0
             blocked = 0
             published = 0
+            pending = 0
+            needs_review = 0
+            ready_to_publish = 0
             exam_has_dcr = exam_id in exams_with_dcr
             dcr_students = dcr_students_by_exam.get(exam_id, set())
 
@@ -776,25 +904,34 @@ async def list_exams(
                 # Publication check
                 if sub.get("publication_status") == "published":
                     published += 1
+                    evaluated += 1
+                    continue
 
                 # Get responses for this submission
                 sub_responses = responses_by_sub.get(sub_id, [])
 
-                # Check if ALL PCR responses are evaluated (none pending)
-                pcr_all_evaluated = sub_responses and all(
-                    r.get("eval_status", "pending") != "pending"
-                    for r in sub_responses
-                )
+                pcr_question_count = session_question_counts.get(exam_id, 0)
+                if pcr_question_count > 0:
+                    readiness = readiness_by_submission.get(
+                        sub_id,
+                        {"ready": False, "blockers": [{"code": "readiness_missing"}]},
+                    )
+                    pcr_ready = bool(readiness.get("ready"))
+                elif exam_has_dcr:
+                    readiness = {"ready": True, "blockers": []}
+                    pcr_ready = True
+                else:
+                    readiness = {
+                        "ready": False,
+                        "blockers": [{"code": "paper_catalog_missing"}],
+                    }
+                    pcr_ready = False
 
-                # A student is "fully evaluated" only if:
-                # 1. All PCR responses are evaluated, AND
-                # 2. DCR results exist (if exam has DCR questions)
                 dcr_complete = (
                     not exam_has_dcr
                     or student_id in dcr_students
                 )
-                if pcr_all_evaluated and dcr_complete:
-                    evaluated += 1
+                all_evaluated = pcr_ready and dcr_complete
 
                 # Check for any unresolved blocking flags
                 has_unresolved_blocking = False
@@ -809,8 +946,47 @@ async def list_exams(
                             break
                     if has_unresolved_blocking:
                         break
-                if has_unresolved_blocking:
+                blocker_codes = {
+                    str(blocker.get("code") or "")
+                    for blocker in (readiness.get("blockers") or [])
+                    if str(blocker.get("code") or "")
+                }
+                review_codes = {
+                    str(note.get("code") or "")
+                    for note in (readiness.get("review_notes") or [])
+                    if str(note.get("code") or "")
+                    == "document_coverage_requires_review"
+                }
+                reviewable_codes = {
+                    "document_coverage_requires_review",
+                    "response_assignment_requires_review",
+                    "evaluation_requires_review",
+                }
+                action_codes = blocker_codes | review_codes
+                needs_teacher_review = bool(action_codes) and action_codes.issubset(
+                    reviewable_codes
+                )
+                processing_status = str(
+                    (jobs_by_sub.get(sub_id) or {}).get("status") or ""
+                ).lower()
+                job_needs_attention = processing_status in {
+                    "failed",
+                    "retryable_error",
+                    "enqueue_failed",
+                }
+
+                if needs_teacher_review and not has_unresolved_blocking and not job_needs_attention:
+                    needs_review += 1
+                elif has_unresolved_blocking or job_needs_attention or (
+                    not pcr_ready
+                    and processing_status not in {"", "queued", "processing"}
+                ):
                     blocked += 1
+                elif not all_evaluated:
+                    pending += 1
+                else:
+                    ready_to_publish += 1
+                    evaluated += 1
 
             # Resolve title
             title_info = title_map.get(exam_id, {})
@@ -840,6 +1016,9 @@ async def list_exams(
                         evaluated_count=evaluated,
                         blocked_count=blocked,
                         published_count=published,
+                        pending_count=pending,
+                        needs_review_count=needs_review,
+                        ready_to_publish_count=ready_to_publish,
                         title_override=title,
                         exam_type_override=exam_type,
                     )
@@ -854,6 +1033,9 @@ async def list_exams(
                         evaluated_count=evaluated,
                         blocked_count=blocked,
                         published_count=published,
+                        pending_count=pending,
+                        needs_review_count=needs_review,
+                        ready_to_publish_count=ready_to_publish,
                         status="active",
                         question_count=session_question_counts.get(exam_id, 0),
                     )
@@ -892,7 +1074,7 @@ async def list_exams(
         )
 
         return ExamListResponse(
-            items=await _attach_open_recheck_counts(items),
+            items=await _attach_exam_metadata_and_status(items),
         )
 
     except HTTPException:
@@ -939,11 +1121,19 @@ async def get_exam_queue(
 
     try:
         # ----- Fetch submissions for this exam (tutor-scoped) -----
-        has_visible_exam_doc = await _require_exam_visible_or_legacy_student_scope(
+        await _require_exam_visible_or_legacy_student_scope(
             tenant_db,
             exam_id,
             current_user,
             scoped_ids,
+        )
+        exam_doc = await tenant_db["exampen_exams"].find_one(
+            {"exam_id": exam_id},
+            {
+                "exam_id": 1,
+                "created_by_tutor_id": 1,
+                "teacher_ids": 1,
+            },
         )
 
         # This endpoint is an actionable work queue. A published submission is
@@ -954,7 +1144,7 @@ async def get_exam_queue(
             "exam_id": exam_id,
             "publication_status": {"$ne": "published"},
         }
-        if scoped_ids is not None:
+        if scoped_ids is not None and not _has_full_exam_access(current_user, exam_doc):
             sub_query["student_id"] = {"$in": scoped_ids}
 
         submissions_cursor = tenant_db["evalpen_submissions"].find(
@@ -1121,20 +1311,27 @@ async def get_exam_queue(
                 for item in (readiness.get("blockers") or [])
                 if str(item.get("code") or "")
             }
+            review_codes = {
+                str(item.get("code") or "")
+                for item in (readiness.get("review_notes") or [])
+                if str(item.get("code") or "")
+                == "document_coverage_requires_review"
+            }
             reviewable_codes = {
                 "document_coverage_requires_review",
                 "response_assignment_requires_review",
                 "evaluation_requires_review",
             }
-            needs_teacher_review = bool(blocker_codes) and blocker_codes.issubset(
+            action_codes = blocker_codes | review_codes
+            needs_teacher_review = bool(action_codes) and action_codes.issubset(
                 reviewable_codes
             )
             review_kind: Optional[str] = None
-            if blocker_codes == {"document_coverage_requires_review"}:
+            if action_codes == {"document_coverage_requires_review"}:
                 review_kind = "document_coverage"
-            elif "response_assignment_requires_review" in blocker_codes:
+            elif "response_assignment_requires_review" in action_codes:
                 review_kind = "response_assignment"
-            elif "evaluation_requires_review" in blocker_codes:
+            elif "evaluation_requires_review" in action_codes:
                 review_kind = "evaluation"
 
             # Determine blocking status

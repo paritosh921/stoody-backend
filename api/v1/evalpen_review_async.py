@@ -45,6 +45,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from api.v1.exam_orch_async import (
+    _current_tutor_id,
+    _is_exam_visible_to_tutor,
+    _is_tutor_admin_role,
+)
 from services.answer_mapping_contract import normalize_answer_label
 from services.evalpen_flag_utils import is_flag_resolved, resolve_flag
 from services.objective_scoring_service import is_integer_question
@@ -54,6 +59,21 @@ from utils.s3_storage import PrivateObjectStorageError, create_private_download_
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _has_full_exam_access(
+    current_user: Dict[str, Any],
+    exam_doc: Optional[Dict[str, Any]],
+) -> bool:
+    """Whether the actor owns/teaches an exam and may see its full roster."""
+    if _is_tutor_admin_role(current_user):
+        return True
+    tutor_id = _current_tutor_id(current_user)
+    return bool(
+        exam_doc
+        and tutor_id is not None
+        and _is_exam_visible_to_tutor(exam_doc, tutor_id)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1655,7 @@ class CollectionRosterItemAPI(BaseModel):
     status: str = "expected"
     source: Optional[str] = None
     last_activity: Optional[str] = None
+    open_recheck_count: int = 0
 
 
 class ExamRosterAPI(BaseModel):
@@ -1678,13 +1699,14 @@ async def get_exam_roster(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Exam {exam_id} not found",
         )
+    has_full_exam_access = _has_full_exam_access(current_user, exam)
 
     roster_ids = [
         str(student_id).strip()
         for student_id in (exam.get("roster") or [])
         if str(student_id).strip()
     ]
-    if scoped_ids is not None:
+    if scoped_ids is not None and not has_full_exam_access:
         allowed = {str(item) for item in scoped_ids}
         roster_ids = [student_id for student_id in roster_ids if student_id in allowed]
 
@@ -1724,7 +1746,7 @@ async def get_exam_roster(
             "created_at": 1,
         },
     ).to_list(length=5000)
-    if scoped_ids is not None:
+    if scoped_ids is not None and not has_full_exam_access:
         allowed = {str(item) for item in scoped_ids}
         submissions = [
             doc
@@ -1745,6 +1767,24 @@ async def get_exam_roster(
         str(job.get("submission_id") or ""): job
         for job in jobs
         if job.get("submission_id")
+    }
+
+    recheck_match: Dict[str, Any] = {
+        "exam_id": exam_id,
+        "status": {"$in": ["open", "under_review"]},
+    }
+    if scoped_ids is not None and not has_full_exam_access:
+        recheck_match["student_id"] = {"$in": list(scoped_ids)}
+    recheck_rows = await tenant_db["evalpen_recheck_requests"].aggregate(
+        [
+            {"$match": recheck_match},
+            {"$group": {"_id": "$student_id", "count": {"$sum": 1}}},
+        ]
+    ).to_list(length=5000)
+    open_rechecks_by_student = {
+        str(row.get("_id") or ""): int(row.get("count") or 0)
+        for row in recheck_rows
+        if str(row.get("_id") or "")
     }
 
     # Prefer the latest submission per student.
@@ -1834,6 +1874,7 @@ async def get_exam_roster(
         publication = str((submission or {}).get("publication_status") or "").lower()
         job_status = str((job or {}).get("status") or "").lower()
         review_state = str((submission or {}).get("review_state") or "").lower()
+        open_recheck_count = open_rechecks_by_student.get(student_id, 0)
         readiness_ready = bool(
             (readiness_by_submission.get(submission_id or "") or {}).get("ready")
         )
@@ -1843,6 +1884,13 @@ async def get_exam_roster(
 
         if not submission_id:
             status_value = "expected"
+        elif open_recheck_count > 0:
+            status_value = "review"
+            total_needs_review += 1
+            total_submitted += 1
+            if publication == "published":
+                total_published += 1
+                total_ready += 1
         elif publication == "published":
             status_value = "published"
             total_published += 1
@@ -1904,6 +1952,7 @@ async def get_exam_roster(
                 status=status_value,
                 source=source if source in {"pen", "camera", "mixed"} else None,
                 last_activity=last_activity,
+                open_recheck_count=open_recheck_count,
             )
         )
 
@@ -2510,6 +2559,17 @@ async def get_exam_results(
     """
     tenant_db = await _get_tenant_db(db, current_user)
     scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+    exam_doc = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {
+            "exam_id": 1,
+            "created_by_tutor_id": 1,
+            "teacher_ids": 1,
+        },
+    )
+    result_scoped_ids = (
+        None if _has_full_exam_access(current_user, exam_doc) else scoped_ids
+    )
 
     try:
         from api.v1._exampen_imports import load_exampen
@@ -2543,8 +2603,8 @@ async def get_exam_results(
 
             # Find submissions for this exam (tutor-scoped)
             sub_query: Dict[str, Any] = {"exam_id": exam_id}
-            if scoped_ids is not None:
-                sub_query["student_id"] = {"$in": scoped_ids}
+            if result_scoped_ids is not None:
+                sub_query["student_id"] = {"$in": result_scoped_ids}
 
             submissions_cursor = tenant_db["evalpen_submissions"].find(
                 sub_query,
@@ -2677,8 +2737,8 @@ async def get_exam_results(
         if dcr_available:
             # Find distinct students with DCR results for this exam (tutor-scoped)
             dcr_query: Dict[str, Any] = {"exam_id": exam_id}
-            if scoped_ids is not None:
-                dcr_query["student_id"] = {"$in": scoped_ids}
+            if result_scoped_ids is not None:
+                dcr_query["student_id"] = {"$in": result_scoped_ids}
 
             dcr_cursor = tenant_db["exampen_dcr_results"].find(
                 dcr_query,

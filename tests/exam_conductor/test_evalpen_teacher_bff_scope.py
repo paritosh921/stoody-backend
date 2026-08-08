@@ -126,6 +126,128 @@ async def test_teacher_bff_counts_hub_submission_by_visible_exam_not_student_sco
     assert items["EXAM-1"].total_students == 1
     assert items["EXAM-1"].evaluated_count == 1
     assert items["EXAM-1"].blocked_count == 0
+    assert items["EXAM-1"].pending_count == 0
+    assert items["EXAM-1"].ready_to_publish_count == 1
+    assert items["EXAM-1"].workflow_status == "ready_to_publish"
+
+
+@pytest.mark.asyncio
+async def test_teacher_bff_list_exposes_class_section_and_prioritizes_student_requests():
+    from api.v1.evalpen_teacher_bff_async import list_exams
+
+    db = _fresh_db()
+    await db["documents"].insert_one(
+        {
+            "document_id": "DOC-1",
+            "title": "Term exam",
+            "exam_finalized": True,
+            "exam_mode": "pcr",
+            "standard": "Class 11",
+            "section": "Section A",
+        }
+    )
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-REQUEST",
+            "title": "Term exam",
+            "exam_type": "pcr",
+            "lifecycle_state": "collection_closed",
+            "prepared_document_id": "DOC-1",
+            "created_by_tutor_id": "TUT-1",
+            "teacher_ids": ["TUT-1"],
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-REQUEST",
+            "exam_id": "EXAM-REQUEST",
+            "student_id": "student-1",
+            "publication_status": "published",
+        }
+    )
+    await db["evalpen_recheck_requests"].insert_one(
+        {
+            "request_id": "REQ-1",
+            "exam_id": "EXAM-REQUEST",
+            "student_id": "student-1",
+            "status": "open",
+        }
+    )
+
+    admin_user = {
+        "user_id": "admin-1",
+        "user_type": "admin",
+        "db_name": "skb_test",
+    }
+    with patch(
+        "api.v1.evalpen_teacher_bff_async._get_tenant_db",
+        return_value=db,
+    ):
+        result = await list_exams(current_user=admin_user, db=None)
+
+    item = next(row for row in result.items if row.exam_id == "EXAM-REQUEST")
+    assert item.class_name == "11"
+    assert item.section_name == "A"
+    assert item.class_label == "Class 11 - Section A"
+    assert item.published_count == 1
+    assert item.open_recheck_count == 1
+    assert item.workflow_status == "under_review"
+
+
+@pytest.mark.asyncio
+async def test_exam_roster_shows_full_owned_exam_not_only_generic_student_scope():
+    from api.v1.evalpen_review_async import get_exam_roster
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-ROSTER",
+            "created_by_tutor_id": "TUT-1",
+            "teacher_ids": ["TUT-1"],
+            "roster": ["student-a", "student-b"],
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-ROSTER-A",
+            "exam_id": "EXAM-ROSTER",
+            "student_id": "student-a",
+            "publication_status": "published",
+        }
+    )
+    await db["evalpen_recheck_requests"].insert_one(
+        {
+            "request_id": "REQ-ROSTER-A",
+            "exam_id": "EXAM-ROSTER",
+            "student_id": "student-a",
+            "status": "under_review",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "different-student-id"}],
+        ),
+    ):
+        result = await get_exam_roster(
+            exam_id="EXAM-ROSTER",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert result.total_expected == 2
+    assert [row.student_id for row in result.expected_students] == [
+        "student-a",
+        "student-b",
+    ]
+    first_student = result.expected_students[0]
+    assert first_student.status == "review"
+    assert first_student.open_recheck_count == 1
+    assert result.total_submitted == 1
+    assert result.total_published == 1
+    assert result.total_needs_review == 1
 
 
 @pytest.mark.asyncio
