@@ -77,6 +77,62 @@ async def test_student_submission_options_only_show_enabled_rostered_pcr_session
 
 
 @pytest.mark.asyncio
+async def test_student_submission_options_resolve_canonical_prepared_paper_metadata():
+    """Legacy sessions must remain discoverable through their finalized paper."""
+    from api.v1.evalpen_student_submission_async import list_answer_copy_options
+
+    db = _fresh_db()
+    created_at = datetime(2026, 8, 9, 16, 38, tzinfo=timezone.utc)
+    updated_at = created_at + timedelta(minutes=2)
+    await db["documents"].insert_one(
+        {
+            "document_id": "Phy1",
+            "title": "Phy 1",
+            "subject": "Mathematics",
+            "content_category_id": "weekly-1",
+            "content_category_name": "Weekly 1",
+            "file_path": "uploads/phy1.pdf",
+            "exam_finalized_at": created_at,
+        }
+    )
+    await _seed_self_submission_exam(
+        db,
+        exam_id="PHY1-SESSION",
+        title="Phy 1 session",
+        prepared_document_id="Phy1",
+        # Sessions created before the metadata contract was introduced do not
+        # have these fields.  The prepared document is their source of truth.
+        subject=None,
+        code=None,
+        content_category_id="stale-category",
+        content_category_name="Stale category",
+        created_at=created_at,
+        updated_at=updated_at,
+    )
+
+    with patch(
+        "api.v1.evalpen_student_submission_async._get_tenant_db",
+        return_value=db,
+    ):
+        result = await list_answer_copy_options(current_user=_student_user(), db=None)
+
+    assert len(result.items) == 1
+    option = result.items[0]
+    assert option.exam_id == "PHY1-SESSION"
+    assert option.title == "Phy 1 session"
+    assert option.paper_title == "Phy 1"
+    assert option.subject == "Mathematics"
+    assert option.code == "Phy1"
+    assert option.content_category_id == "weekly-1"
+    assert option.content_category_name == "Weekly 1"
+    assert option.question_paper_available is True
+    assert option.answer_copy_available is False
+    assert option.created_at == created_at.isoformat()
+    assert option.updated_at == updated_at.isoformat()
+    assert option.can_submit is True
+
+
+@pytest.mark.asyncio
 async def test_student_submission_options_resolve_student_db_roster_id_for_existing_login_session():
     """A token's account id must resolve to the Student DB id used by rosters."""
     from api.v1.evalpen_student_submission_async import list_answer_copy_options

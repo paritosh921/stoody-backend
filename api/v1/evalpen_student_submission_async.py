@@ -66,6 +66,8 @@ class StudentCopyExamOption(BaseModel):
     code: Optional[str] = None
     question_paper_available: bool = False
     answer_copy_available: bool = False
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     lifecycle_state: str
     max_pages: int = Field(ge=1, le=50)
     can_submit: bool
@@ -401,6 +403,11 @@ async def _mark_attempt_upload_failed(
 
 
 def _fmt(value: Any) -> Optional[str]:
+    if isinstance(value, datetime) and value.tzinfo is None:
+        # PyMongo returns BSON UTC datetimes as naive values unless tz-aware
+        # decoding is enabled.  Never send a timezone-ambiguous timestamp to
+        # the browser, where it would otherwise be interpreted as local time.
+        value = value.replace(tzinfo=timezone.utc)
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value) if value is not None else None
@@ -916,6 +923,7 @@ async def list_answer_copy_options(
         projection={
             "exam_id": 1,
             "title": 1,
+            "paper_title": 1,
             "lifecycle_state": 1,
             "student_submission_max_pages": 1,
             "student_self_submission_enabled": 1,
@@ -929,6 +937,8 @@ async def list_answer_copy_options(
             "exam_code": 1,
             "roster": 1,
             "absent_student_ids": 1,
+            "created_at": 1,
+            "updated_at": 1,
         },
     ).sort("created_at", -1)
     exams = await cursor.to_list(length=100)
@@ -943,11 +953,18 @@ async def list_answer_copy_options(
             {"document_id": {"$in": prepared_ids}},
             projection={
                 "document_id": 1,
+                "title": 1,
+                "subject": 1,
+                "code": 1,
+                "exam_code": 1,
                 "content_category_id": 1,
                 "content_category_name": 1,
                 "file_path": 1,
                 "storage_path": 1,
                 "source_storage_path": 1,
+                "uploaded_at": 1,
+                "updated_at": 1,
+                "exam_finalized_at": 1,
             },
         ).to_list(length=max(1, len(prepared_ids)))
         if prepared_ids
@@ -1079,18 +1096,41 @@ async def list_answer_copy_options(
         items.append(
             StudentCopyExamOption(
                 exam_id=exam_id,
-                title=str(exam.get("title") or "PCR exam"),
-                paper_title=str(exam.get("paper_title") or exam.get("title") or "PCR paper"),
-                subject=exam.get("subject"),
+                # The finalized prepared document is the canonical paper
+                # metadata.  The conducted-session record owns runtime state,
+                # but older sessions did not snapshot subject/category/code.
+                # Resolve display and filtering fields from the paper first so
+                # students see the same metadata configured by the institute.
+                title=str(
+                    exam.get("title")
+                    or prepared_document.get("title")
+                    or "PCR exam"
+                ),
+                paper_title=str(
+                    prepared_document.get("title")
+                    or exam.get("paper_title")
+                    or exam.get("title")
+                    or "PCR paper"
+                ),
+                subject=(
+                    prepared_document.get("subject")
+                    or exam.get("subject")
+                ),
                 content_category_id=(
-                    exam.get("content_category_id")
-                    or prepared_document.get("content_category_id")
+                    prepared_document.get("content_category_id")
+                    or exam.get("content_category_id")
                 ),
                 content_category_name=(
-                    exam.get("content_category_name")
-                    or prepared_document.get("content_category_name")
+                    prepared_document.get("content_category_name")
+                    or exam.get("content_category_name")
                 ),
-                code=exam.get("code") or exam.get("exam_code"),
+                code=(
+                    prepared_document.get("code")
+                    or prepared_document.get("exam_code")
+                    or prepared_document.get("document_id")
+                    or exam.get("code")
+                    or exam.get("exam_code")
+                ),
                 question_paper_available=bool(
                     prepared_document.get("file_path")
                     or prepared_document.get("storage_path")
@@ -1099,6 +1139,18 @@ async def list_answer_copy_options(
                 answer_copy_available=(
                     str(submission.submission_id or "")
                     in answer_copy_submission_ids
+                ),
+                created_at=_fmt(
+                    exam.get("created_at")
+                    or prepared_document.get("exam_finalized_at")
+                    or prepared_document.get("uploaded_at")
+                ),
+                updated_at=_fmt(
+                    exam.get("updated_at")
+                    or exam.get("created_at")
+                    or prepared_document.get("updated_at")
+                    or prepared_document.get("exam_finalized_at")
+                    or prepared_document.get("uploaded_at")
                 ),
                 lifecycle_state=str(exam.get("lifecycle_state") or "draft"),
                 max_pages=int(exam.get("student_submission_max_pages") or 20),
