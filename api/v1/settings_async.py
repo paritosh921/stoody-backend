@@ -15,6 +15,7 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.school_settings_format import clean_class_sections, clean_class_values, validate_class_values
+from core.content_categories import normalize_content_categories
 from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
@@ -57,6 +58,13 @@ class SmartboardConfig(BaseModel):
     hub_mode_policy: Optional[str] = None
 
 
+class ContentCategoryConfig(BaseModel):
+    """School-defined label used to classify content and assessment papers."""
+    id: str
+    name: str
+    active: bool = True
+
+
 class SchoolSettingsRequest(BaseModel):
     """Request model for updating school settings"""
     school_info: Optional[SchoolInfo] = None
@@ -66,6 +74,10 @@ class SchoolSettingsRequest(BaseModel):
     subjects: Optional[List[str]] = Field(None, description="List of subject names")
     plan_types: Optional[List[str]] = Field(None, description="List of plan types (e.g., CBSE, JEE)")
     streams: Optional[List[str]] = Field(None, description="List of streams (e.g., Science, Arts)")
+    content_categories: Optional[List[ContentCategoryConfig]] = Field(
+        None,
+        description="Institution-defined content and assessment categories",
+    )
     smartboard: Optional[SmartboardConfig] = None
 
 
@@ -79,6 +91,7 @@ class SchoolSettingsResponse(BaseModel):
     subjects: List[str]
     plan_types: List[str]
     streams: List[str]
+    content_categories: List[ContentCategoryConfig]
     smartboard: Optional[SmartboardConfig] = None
     updated_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -100,6 +113,7 @@ DEFAULT_SETTINGS = {
     "subjects": [],
     "plan_types": [],
     "streams": [],
+    "content_categories": [],
     "smartboard": {
         "enabled": False,
         "allow_cloud_features": False,
@@ -210,6 +224,10 @@ async def get_school_settings(
             "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
             "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
             "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"]),
+            "content_categories": normalize_content_categories(
+                settings_doc.get("content_categories", DEFAULT_SETTINGS["content_categories"]),
+                strict=False,
+            ),
             "smartboard": settings_doc.get("smartboard", DEFAULT_SETTINGS["smartboard"]),
             "created_at": settings_doc.get("created_at"),
             "updated_at": settings_doc.get("updated_at")
@@ -325,6 +343,21 @@ async def update_school_settings(
         update_doc["plan_types"] = settings_data.plan_types if settings_data.plan_types is not None else (existing_settings.get("plan_types", DEFAULT_SETTINGS["plan_types"]) if existing_settings else DEFAULT_SETTINGS["plan_types"])
         update_doc["streams"] = settings_data.streams if settings_data.streams is not None else (existing_settings.get("streams", DEFAULT_SETTINGS["streams"]) if existing_settings else DEFAULT_SETTINGS["streams"])
 
+        existing_content_categories = normalize_content_categories(
+            existing_settings.get("content_categories", DEFAULT_SETTINGS["content_categories"])
+            if existing_settings
+            else DEFAULT_SETTINGS["content_categories"],
+            strict=False,
+        )
+        try:
+            update_doc["content_categories"] = (
+                normalize_content_categories(settings_data.content_categories, strict=True)
+                if settings_data.content_categories is not None
+                else existing_content_categories
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
         # Update smartboard config if provided
         if settings_data.smartboard is not None:
             update_doc["smartboard"] = settings_data.smartboard.dict()
@@ -338,6 +371,18 @@ async def update_school_settings(
             {"$set": update_doc},
             upsert=True,
         )
+
+        # Category IDs are stable references. Keep the denormalized display
+        # label on existing documents synchronized when an admin renames one.
+        old_names = {item["id"]: item["name"] for item in existing_content_categories}
+        for category in update_doc["content_categories"]:
+            if old_names.get(category["id"]) == category["name"]:
+                continue
+            await db.mongo_update_many(
+                "documents",
+                {"content_category_id": category["id"]},
+                {"$set": {"content_category_name": category["name"]}},
+            )
         
         # Invalidate cache
         cache_key = f"school_settings:v2:{admin_id}"
@@ -354,6 +399,7 @@ async def update_school_settings(
             "subjects": update_doc["subjects"],
             "plan_types": update_doc["plan_types"],
             "streams": update_doc["streams"],
+            "content_categories": update_doc["content_categories"],
             "smartboard": update_doc.get("smartboard", DEFAULT_SETTINGS["smartboard"]),
             "created_at": update_doc["created_at"],
             "updated_at": update_doc["updated_at"]
@@ -516,7 +562,8 @@ async def get_public_school_settings(
                 "class_sections": DEFAULT_SETTINGS["class_sections"],
                 "subjects": DEFAULT_SETTINGS["subjects"],
                 "plan_types": DEFAULT_SETTINGS["plan_types"],
-                "streams": DEFAULT_SETTINGS["streams"]
+                "streams": DEFAULT_SETTINGS["streams"],
+                "content_categories": DEFAULT_SETTINGS["content_categories"],
             }
         else:
             school_info = settings_doc.get("school_info", {})
@@ -534,7 +581,11 @@ async def get_public_school_settings(
                 ),
                 "subjects": settings_doc.get("subjects", DEFAULT_SETTINGS["subjects"]),
                 "plan_types": settings_doc.get("plan_types", DEFAULT_SETTINGS["plan_types"]),
-                "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"])
+                "streams": settings_doc.get("streams", DEFAULT_SETTINGS["streams"]),
+                "content_categories": normalize_content_categories(
+                    settings_doc.get("content_categories", DEFAULT_SETTINGS["content_categories"]),
+                    strict=False,
+                ),
             }
         
         # Cache for 10 minutes
