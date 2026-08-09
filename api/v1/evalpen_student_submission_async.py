@@ -65,6 +65,7 @@ class StudentCopyExamOption(BaseModel):
     content_category_name: Optional[str] = None
     code: Optional[str] = None
     question_paper_available: bool = False
+    answer_copy_available: bool = False
     lifecycle_state: str
     max_pages: int = Field(ge=1, le=50)
     can_submit: bool
@@ -944,6 +945,9 @@ async def list_answer_copy_options(
                 "document_id": 1,
                 "content_category_id": 1,
                 "content_category_name": 1,
+                "file_path": 1,
+                "storage_path": 1,
+                "source_storage_path": 1,
             },
         ).to_list(length=max(1, len(prepared_ids)))
         if prepared_ids
@@ -986,6 +990,24 @@ async def list_answer_copy_options(
         for item in submissions
         if item.get("submission_id")
     ]
+    answer_pages = (
+        await tenant_db["evalpen_answer_pages"]
+        .find(
+            {
+                "submission_id": {"$in": submission_ids},
+                "raw_image_ref": {"$nin": [None, ""]},
+            },
+            projection={"submission_id": 1},
+        )
+        .to_list(length=max(1, len(submission_ids) * 50))
+        if submission_ids
+        else []
+    )
+    answer_copy_submission_ids = {
+        str(page.get("submission_id") or "")
+        for page in answer_pages
+        if page.get("submission_id")
+    }
     jobs = (
         await tenant_db[PROCESSING_JOBS_COLLECTION]
         .find(
@@ -1069,7 +1091,15 @@ async def list_answer_copy_options(
                     or prepared_document.get("content_category_name")
                 ),
                 code=exam.get("code") or exam.get("exam_code"),
-                question_paper_available=bool(exam.get("prepared_document_id")),
+                question_paper_available=bool(
+                    prepared_document.get("file_path")
+                    or prepared_document.get("storage_path")
+                    or prepared_document.get("source_storage_path")
+                ),
+                answer_copy_available=(
+                    str(submission.submission_id or "")
+                    in answer_copy_submission_ids
+                ),
                 lifecycle_state=str(exam.get("lifecycle_state") or "draft"),
                 max_pages=int(exam.get("student_submission_max_pages") or 20),
                 can_submit=can_submit,
@@ -1211,11 +1241,26 @@ async def download_answer_copy(
     student_ids = await _get_student_identity_ids(tenant_db, current_user)
     student_id = student_ids[0]
     await _get_student_exam_or_404(tenant_db, exam_id=exam_id, student_id=student_id)
-    attempt = await _get_copy_attempt_state(tenant_db, exam_id=exam_id, student_id=student_id)
-    if not attempt:
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"exam_id": exam_id, "student_id": {"$in": student_ids}},
+        projection={"_id": 0, "submission_id": 1},
+    )
+    submission_id = str((submission or {}).get("submission_id") or "")
+    if not submission_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer copy not found")
 
-    original_asset = attempt.get("original_asset") or {}
+    # Preserve the original PDF when the authenticated student uploaded one.
+    # Staff uploads have no student reservation, so canonical answer pages below
+    # remain the source of truth for both submission channels.
+    attempt = await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION].find_one(
+        {
+            "exam_id": exam_id,
+            "student_id": {"$in": student_ids},
+            "submission_id": submission_id,
+        },
+        projection={"_id": 0, "original_asset": 1},
+    )
+    original_asset = (attempt or {}).get("original_asset") or {}
     original_path = str(original_asset.get("storage_path") or "").strip()
     if original_path:
         content = await _read_student_download_asset(original_path)
@@ -1228,13 +1273,38 @@ async def download_answer_copy(
             headers={"Content-Disposition": f'attachment; filename="{exam_id}-answer-copy.{suffix}"'},
         )
 
-    pages = [page for page in (attempt.get("pages") or []) if page.get("storage_path")]
+    pages = await tenant_db["evalpen_answer_pages"].find(
+        {
+            "submission_id": submission_id,
+            "student_id": {"$in": student_ids},
+            "raw_image_ref": {"$nin": [None, ""]},
+        },
+        projection={
+            "_id": 0,
+            "page_number": 1,
+            "raw_image_ref": 1,
+            "content_type": 1,
+            "original_filename": 1,
+        },
+    ).sort("page_number", 1).to_list(length=50)
     if not pages:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer copy not found")
+
+    if len(pages) == 1:
+        page = pages[0]
+        content = await _read_student_download_asset(str(page.get("raw_image_ref") or ""))
+        content_type = str(page.get("content_type") or "image/jpeg").lower()
+        extension = "png" if "png" in content_type else "jpg"
+        return Response(
+            content=content,
+            media_type=content_type if content_type.startswith("image/") else "application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{exam_id}-answer-copy.{extension}"'},
+        )
+
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for index, page in enumerate(pages, start=1):
-            page_content = await _read_student_download_asset(str(page.get("storage_path") or ""))
+            page_content = await _read_student_download_asset(str(page.get("raw_image_ref") or ""))
             content_type = str(page.get("content_type") or "").lower()
             extension = "png" if "png" in content_type else "jpg"
             bundle.writestr(f"page-{index}.{extension}", page_content)

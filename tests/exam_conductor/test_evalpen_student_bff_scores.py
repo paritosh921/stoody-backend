@@ -267,6 +267,15 @@ async def test_student_exam_list_reports_under_review_until_requests_are_resolve
             for suffix in ("OPEN", "SETTLED", "NONE")
         ]
     )
+    await db["evalpen_answer_pages"].insert_one(
+        {
+            "submission_id": "SUB-OPEN",
+            "exam_id": "EXAM-OPEN",
+            "student_id": "STU-1",
+            "page_number": 1,
+            "raw_image_ref": "s3://private/exam-open/page-1.png",
+        }
+    )
     await db["evalpen_recheck_requests"].insert_many(
         [
             {
@@ -309,8 +318,10 @@ async def test_student_exam_list_reports_under_review_until_requests_are_resolve
     assert by_exam_id["EXAM-OPEN"].result_status == "under_review"
     assert by_exam_id["EXAM-OPEN"].open_recheck_count == 1
     assert by_exam_id["EXAM-OPEN"].recheck_count == 1
+    assert by_exam_id["EXAM-OPEN"].answer_copy_available is True
     assert by_exam_id["EXAM-SETTLED"].result_status == "published"
     assert by_exam_id["EXAM-SETTLED"].open_recheck_count == 0
     assert by_exam_id["EXAM-SETTLED"].recheck_count == 1
     assert by_exam_id["EXAM-NONE"].result_status == "published"
     assert by_exam_id["EXAM-NONE"].open_recheck_count == 0
+    assert by_exam_id["EXAM-NONE"].answer_copy_available is False

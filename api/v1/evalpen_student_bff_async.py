@@ -79,6 +79,7 @@ class StudentExamItem(BaseModel):
     content_category_name: Optional[str] = None
     code: Optional[str] = None
     question_paper_available: bool = False
+    answer_copy_available: bool = False
     exam_type: Optional[str] = None
     total_score: float = 0.0
     max_score: float = 0.0
@@ -581,6 +582,8 @@ async def list_student_exams(
                     "code": 1,
                     "exam_code": 1,
                     "file_path": 1,
+                    "storage_path": 1,
+                    "source_storage_path": 1,
                     "content_category_id": 1,
                     "content_category_name": 1,
                 },
@@ -601,6 +604,18 @@ async def list_student_exams(
         recheck_counts, open_recheck_counts = _summarize_rechecks_by_exam(
             recheck_documents
         )
+        answer_page_documents = await tenant_db["evalpen_answer_pages"].find(
+            {
+                "submission_id": {"$in": sub_ids},
+                "raw_image_ref": {"$nin": [None, ""]},
+            },
+            {"_id": 0, "submission_id": 1},
+        ).to_list(length=5000)
+        answer_copy_submission_ids = {
+            str(page.get("submission_id") or "")
+            for page in answer_page_documents
+            if page.get("submission_id")
+        }
 
         # ----- Build response items -----
         items: List[StudentExamItem] = []
@@ -654,7 +669,15 @@ async def list_student_exams(
                         or prepared_document.get("code")
                         or prepared_document.get("exam_code")
                     ),
-                    question_paper_available=bool(prepared_document.get("file_path")),
+                    question_paper_available=bool(
+                        prepared_document.get("file_path")
+                        or prepared_document.get("storage_path")
+                        or prepared_document.get("source_storage_path")
+                    ),
+                    answer_copy_available=(
+                        str(sub_info.get("submission_id") or "")
+                        in answer_copy_submission_ids
+                    ),
                     exam_type=exam_type,
                     total_score=combined_total,
                     max_score=combined_max,

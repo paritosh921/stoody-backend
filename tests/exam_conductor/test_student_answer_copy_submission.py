@@ -298,6 +298,15 @@ async def test_existing_final_submission_blocks_another_student_copy():
             "segmentation_status": "pending",
         }
     )
+    await db["evalpen_answer_pages"].insert_one(
+        {
+            "submission_id": "already-submitted",
+            "exam_id": "PCR-SELF-1",
+            "student_id": "student-1",
+            "page_number": 1,
+            "raw_image_ref": "/private/already-submitted-page.jpg",
+        }
+    )
 
     with patch(
         "api.v1.evalpen_student_submission_async._get_tenant_db",
@@ -316,7 +325,49 @@ async def test_existing_final_submission_blocks_another_student_copy():
 
     assert options.items[0].can_submit is False
     assert options.items[0].submission.submission_id == "already-submitted"
+    assert options.items[0].answer_copy_available is True
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_answer_copy_download_reads_canonical_pages_uploaded_by_staff(tmp_path):
+    from api.v1.evalpen_student_submission_async import download_answer_copy
+
+    db = _fresh_db()
+    await _seed_self_submission_exam(db, student_self_submission_enabled=False)
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "staff-submission-1",
+            "exam_id": "PCR-SELF-1",
+            "student_id": "student-1",
+        }
+    )
+    page_path = tmp_path / "staff-answer-page.png"
+    page_path.write_bytes(b"canonical-staff-answer-page")
+    await db["evalpen_answer_pages"].insert_one(
+        {
+            "submission_id": "staff-submission-1",
+            "exam_id": "PCR-SELF-1",
+            "student_id": "student-1",
+            "page_number": 1,
+            "raw_image_ref": str(page_path),
+            "content_type": "image/png",
+        }
+    )
+
+    with patch(
+        "api.v1.evalpen_student_submission_async._get_tenant_db",
+        return_value=db,
+    ):
+        response = await download_answer_copy(
+            exam_id="PCR-SELF-1",
+            current_user=_student_user(),
+            db=None,
+        )
+
+    assert response.body == b"canonical-staff-answer-page"
+    assert response.media_type == "image/png"
+    assert "PCR-SELF-1-answer-copy.png" in response.headers["content-disposition"]
 
 
 @pytest.mark.asyncio
