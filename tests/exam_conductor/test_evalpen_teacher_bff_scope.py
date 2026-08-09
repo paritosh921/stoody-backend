@@ -323,6 +323,63 @@ async def test_teacher_bff_queue_separates_review_from_technical_failure():
 
 
 @pytest.mark.asyncio
+async def test_teacher_bff_approved_submission_with_advisory_is_ready_to_publish():
+    """An approved ready state must outrank a non-blocking coverage advisory."""
+    from api.v1.evalpen_teacher_bff_async import get_exam_queue, list_exams
+
+    db = _fresh_db()
+    await _seed_visible_exam_with_hub_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-1"},
+        {
+            "$set": {
+                "review_state": "ready",
+                "publication_status": "ready",
+                "document_review": {
+                    "status": "pending_review",
+                    "required": True,
+                    "confidence": 0.93,
+                    "warnings": ["Confirm four unassigned visible regions."],
+                    "grading_run_id": "DOCGR-approved",
+                },
+            }
+        },
+    )
+    await db["evalpen_evaluations"].update_many(
+        {"response_id": {"$in": ["RESP-1", "RESP-2"]}},
+        {
+            "$set": {
+                "teacher_reviewed": True,
+                "teacher_review_status": "approved",
+            }
+        },
+    )
+
+    with (
+        patch("api.v1.evalpen_teacher_bff_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_teacher_bff_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "lavyansh"}],
+        ),
+    ):
+        queue = await get_exam_queue(
+            exam_id="EXAM-1",
+            current_user=_tutor_user(),
+            db=None,
+        )
+        exams = await list_exams(current_user=_tutor_user(), db=None)
+
+    assert queue.blocked == []
+    assert queue.needs_review == []
+    assert len(queue.ready_to_publish) == 1
+    assert queue.ready_to_publish[0].submission_id == "SUB-1"
+    exam = next(item for item in exams.items if item.exam_id == "EXAM-1")
+    assert exam.needs_review_count == 0
+    assert exam.ready_to_publish_count == 1
+    assert exam.workflow_status == "ready_to_publish"
+
+
+@pytest.mark.asyncio
 async def test_teacher_bff_queue_treats_scored_manual_review_as_ready_to_publish():
     from api.v1.evalpen_teacher_bff_async import get_exam_queue
 
