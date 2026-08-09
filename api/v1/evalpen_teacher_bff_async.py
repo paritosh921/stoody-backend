@@ -98,6 +98,8 @@ class ExamSummaryItem(BaseModel):
     class_name: Optional[str] = None
     section_name: Optional[str] = None
     class_label: Optional[str] = None
+    content_category_id: Optional[str] = None
+    content_category_name: Optional[str] = None
     # Prepared-exam fields (from finalized documents)
     status: str = "active"  # "prepared" | "active"
     exam_mode: Optional[str] = None  # "dcr" | "pcr" | None
@@ -454,6 +456,8 @@ async def list_exams(
                 "grade": 1,
                 "subject": 1,
                 "section": 1,
+                "content_category_id": 1,
+                "content_category_name": 1,
             },
         )
         finalized_docs = await doc_cursor.to_list(length=5000)
@@ -495,6 +499,8 @@ async def list_exams(
                         else None
                     ),
                     "question_count": live_q_counts.get(doc_id, 0),
+                    "content_category_id": fdoc.get("content_category_id"),
+                    "content_category_name": fdoc.get("content_category_name"),
                 }
                 prepared_items.append(
                     ExamSummaryItem(
@@ -521,6 +527,8 @@ async def list_exams(
                             else None
                         ),
                         question_count=live_q_counts.get(doc_id, 0),
+                        content_category_id=fdoc.get("content_category_id"),
+                        content_category_name=fdoc.get("content_category_name"),
                     )
                 )
 
@@ -642,6 +650,14 @@ async def list_exams(
                 ready_to_publish_count=ready_to_publish_count,
                 status="active",
                 exam_mode=prepared_meta.get("exam_mode") or exam_doc.get("exam_type"),
+                content_category_id=(
+                    prepared_meta.get("content_category_id")
+                    or exam_doc.get("content_category_id")
+                ),
+                content_category_name=(
+                    prepared_meta.get("content_category_name")
+                    or exam_doc.get("content_category_name")
+                ),
                 created_at=(
                     exam_doc["created_at"].isoformat()
                     if hasattr(exam_doc.get("created_at"), "isoformat")

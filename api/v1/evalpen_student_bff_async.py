@@ -75,6 +75,8 @@ class StudentExamItem(BaseModel):
     title: str
     paper_title: Optional[str] = None
     subject: Optional[str] = None
+    content_category_id: Optional[str] = None
+    content_category_name: Optional[str] = None
     code: Optional[str] = None
     question_paper_available: bool = False
     exam_type: Optional[str] = None
@@ -553,6 +555,8 @@ async def list_student_exams(
                 "exam_type": 1,
                 "prepared_document_id": 1,
                 "subject": 1,
+                "content_category_id": 1,
+                "content_category_name": 1,
                 "code": 1,
                 "exam_code": 1,
             },
@@ -577,6 +581,8 @@ async def list_student_exams(
                     "code": 1,
                     "exam_code": 1,
                     "file_path": 1,
+                    "content_category_id": 1,
+                    "content_category_name": 1,
                 },
             ).to_list(length=5000)
             if prepared_ids
@@ -634,6 +640,14 @@ async def list_student_exams(
                     title=title,
                     paper_title=prepared_document.get("title") or title,
                     subject=exam_document.get("subject") or prepared_document.get("subject"),
+                    content_category_id=(
+                        prepared_document.get("content_category_id")
+                        or exam_document.get("content_category_id")
+                    ),
+                    content_category_name=(
+                        prepared_document.get("content_category_name")
+                        or exam_document.get("content_category_name")
+                    ),
                     code=(
                         exam_document.get("code")
                         or exam_document.get("exam_code")

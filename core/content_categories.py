@@ -89,3 +89,17 @@ def find_content_category(
         return category
     raise ValueError("The selected content category is not configured for this school")
 
+
+def ensure_content_category_ids_preserved(
+    existing: Iterable[Dict[str, Any]],
+    updated: Iterable[Dict[str, Any]],
+) -> None:
+    """Protect document references by requiring removal to use archival."""
+    existing_ids = {str(category.get("id") or "") for category in existing}
+    updated_ids = {str(category.get("id") or "") for category in updated}
+    removed_ids = sorted(category_id for category_id in existing_ids - updated_ids if category_id)
+    if removed_ids:
+        raise ValueError(
+            "Existing content categories cannot be deleted or have their IDs changed; "
+            "archive them instead"
+        )

@@ -3953,6 +3953,8 @@ class DocumentMetadata(BaseModel):
     course_plan: Optional[str] = None
     standard: Optional[str] = None
     section: Optional[str] = None  # Section A-F for filtering
+    content_category_id: Optional[str] = None
+    content_category_name: Optional[str] = None
     teacher_ids: Optional[List[str]] = None  # Array of teacher IDs for filtering
     file_path: str
     filename: str
@@ -4127,6 +4129,55 @@ def _can_upload_answer_sheet(document_type: Any, exam_mode: Optional[str]) -> bo
     return document_type == "Test Series" and normalized_exam_mode in {"", "pcr"}
 
 
+async def _resolve_content_category_for_actor(
+    db: DatabaseManager,
+    current_user: Dict[str, Any],
+    category_id: Optional[str],
+    *,
+    require_active: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a category against the actor's institution settings."""
+    from core.content_categories import find_content_category, normalize_content_categories
+
+    normalized_id = str(category_id or "").strip().lower()
+    if not normalized_id:
+        return None
+
+    admin_id = (
+        current_user.get("admin_id")
+        if current_user.get("user_type") == "tutor"
+        else current_user.get("user_id") or current_user.get("sub")
+    )
+    if not admin_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid user session")
+
+    if is_b2c_admin(current_user):
+        settings_doc = await db.b2c_find_one("school_settings", {"admin_id": str(admin_id)})
+    else:
+        settings_doc = await db.mongo_find_one("school_settings", {"admin_id": str(admin_id)})
+        if settings_doc is None:
+            try:
+                settings_doc = await db.mongo_find_one(
+                    "school_settings",
+                    {"admin_id": BsonObjectId(str(admin_id))},
+                )
+            except Exception:
+                settings_doc = None
+
+    categories = normalize_content_categories(
+        (settings_doc or {}).get("content_categories", []),
+        strict=False,
+    )
+    try:
+        return find_content_category(
+            categories,
+            normalized_id,
+            require_active=require_active,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
 @router.post("/upload")
 @limiter.limit("10/minute")
 async def upload_pdf(
@@ -4142,6 +4193,7 @@ async def upload_pdf(
     course_plan: Optional[str] = Form("CBSE"),
     standard: Optional[str] = Form("11"),
     section: Optional[str] = Form(None),  # Section A-F for filtering
+    content_category_id: Optional[str] = Form(None),
     teacher_ids: Optional[str] = Form(None),  # Comma-separated teacher IDs for filtering
     total_points: Optional[float] = Form(None),
     total_minutes: Optional[int] = Form(None),
@@ -4199,6 +4251,12 @@ async def upload_pdf(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid document type. Allowed: {', '.join(allowed_types)}"
             )
+
+        content_category = await _resolve_content_category_for_actor(
+            db,
+            current_user,
+            content_category_id,
+        )
 
         exam_mode = (exam_mode or "").strip().lower() or None
         question_type = (question_type or "").strip().lower() or None
@@ -4489,6 +4547,8 @@ async def upload_pdf(
             "course_plan": course_plan or "CBSE",
             "standard": standard or "11",
             "section": section,  # Section A-F for filtering
+            "content_category_id": content_category["id"] if content_category else None,
+            "content_category_name": content_category["name"] if content_category else None,
             "teacher_ids": teacher_ids_list,  # Array of teacher IDs for filtering
             "file_path": relative_path,
             "filename": clean_document_upload.original_filename,
@@ -6631,6 +6691,8 @@ async def get_documents(
                 course_plan=doc.get("course_plan"),
                 standard=doc.get("standard"),
                 section=doc.get("section"),
+                content_category_id=doc.get("content_category_id"),
+                content_category_name=doc.get("content_category_name"),
                 teacher_ids=doc.get("teacher_ids"),
                 file_path="",
                 filename=doc["filename"],
@@ -7290,6 +7352,8 @@ async def get_student_available_options(
                 difficulty=doc["difficulty"],
                 course_plan=doc.get("course_plan"),
                 standard=doc.get("standard"),
+                content_category_id=doc.get("content_category_id"),
+                content_category_name=doc.get("content_category_name"),
                 file_path="",
                 filename=doc["filename"],
                 uploaded_by=doc["uploaded_by"],
@@ -7709,7 +7773,7 @@ async def update_document_metadata(
         # Finalization freezes the paper itself, not its operational
         # availability.  Admins must still be able to activate/deactivate an
         # approved paper for students without changing its immutable content.
-        finalized_metadata_fields = set(metadata) - {"is_active"}
+        finalized_metadata_fields = set(metadata) - {"is_active", "content_category_id"}
         if existing_doc.get("exam_finalized") and finalized_metadata_fields:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -7729,6 +7793,19 @@ async def update_document_metadata(
                 value = str(metadata[field]).strip()
                 if value:  # Only update if non-empty
                     update_data[field] = value
+
+        if "content_category_id" in metadata:
+            content_category = await _resolve_content_category_for_actor(
+                db,
+                current_user,
+                metadata.get("content_category_id"),
+            )
+            update_data["content_category_id"] = (
+                content_category["id"] if content_category else None
+            )
+            update_data["content_category_name"] = (
+                content_category["name"] if content_category else None
+            )
 
         # Instructions field (allow clearing with empty string)
         if "instructions" in metadata:
@@ -8044,9 +8121,23 @@ async def duplicate_document(
         new_doc["document_id"] = new_document_id
         new_doc["uploaded_at"] = datetime.utcnow().isoformat()
 
+        if "content_category_id" in metadata:
+            content_category = await _resolve_content_category_for_actor(
+                db,
+                current_user,
+                metadata.get("content_category_id"),
+            )
+            new_doc["content_category_id"] = (
+                content_category["id"] if content_category else None
+            )
+            new_doc["content_category_name"] = (
+                content_category["name"] if content_category else None
+            )
+
         # Update metadata fields from request
         update_fields = ["title", "subject", "course_plan", "standard", "section",
-                        "difficulty", "document_type", "question_type", "teacher_ids", "total_minutes"]
+                        "difficulty", "document_type", "question_type", "teacher_ids",
+                        "total_minutes"]
         for field in update_fields:
             if field in metadata and metadata[field] is not None:
                 new_doc[field] = metadata[field]

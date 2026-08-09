@@ -15,7 +15,10 @@ from slowapi.util import get_remote_address
 from core.database import DatabaseManager
 from core.cache import CacheManager
 from core.school_settings_format import clean_class_sections, clean_class_values, validate_class_values
-from core.content_categories import normalize_content_categories
+from core.content_categories import (
+    ensure_content_category_ids_preserved,
+    normalize_content_categories,
+)
 from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user
 from config_async import settings, MONGODB_URL, DISABLE_MONGODB
@@ -91,7 +94,7 @@ class SchoolSettingsResponse(BaseModel):
     subjects: List[str]
     plan_types: List[str]
     streams: List[str]
-    content_categories: List[ContentCategoryConfig]
+    content_categories: List[ContentCategoryConfig] = Field(default_factory=list)
     smartboard: Optional[SmartboardConfig] = None
     updated_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -355,6 +358,11 @@ async def update_school_settings(
                 if settings_data.content_categories is not None
                 else existing_content_categories
             )
+            if settings_data.content_categories is not None:
+                ensure_content_category_ids_preserved(
+                    existing_content_categories,
+                    update_doc["content_categories"],
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 

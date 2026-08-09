@@ -61,6 +61,8 @@ class StudentCopyExamOption(BaseModel):
     title: str
     paper_title: Optional[str] = None
     subject: Optional[str] = None
+    content_category_id: Optional[str] = None
+    content_category_name: Optional[str] = None
     code: Optional[str] = None
     question_paper_available: bool = False
     lifecycle_state: str
@@ -920,6 +922,8 @@ async def list_answer_copy_options(
             "capture_mode": 1,
             "prepared_document_id": 1,
             "subject": 1,
+            "content_category_id": 1,
+            "content_category_name": 1,
             "code": 1,
             "exam_code": 1,
             "roster": 1,
@@ -927,6 +931,29 @@ async def list_answer_copy_options(
         },
     ).sort("created_at", -1)
     exams = await cursor.to_list(length=100)
+
+    prepared_ids = [
+        str(exam.get("prepared_document_id") or "")
+        for exam in exams
+        if exam.get("prepared_document_id")
+    ]
+    prepared_documents = (
+        await tenant_db["documents"].find(
+            {"document_id": {"$in": prepared_ids}},
+            projection={
+                "document_id": 1,
+                "content_category_id": 1,
+                "content_category_name": 1,
+            },
+        ).to_list(length=max(1, len(prepared_ids)))
+        if prepared_ids
+        else []
+    )
+    prepared_document_map = {
+        str(document.get("document_id") or ""): document
+        for document in prepared_documents
+        if document.get("document_id")
+    }
 
     # Fetch status data in fixed-size batches. The previous implementation ran
     # two extra Mongo queries for every exam, so the 5-second student poll could
@@ -1001,6 +1028,10 @@ async def list_answer_copy_options(
     items: List[StudentCopyExamOption] = []
     for exam in exams:
         exam_id = str(exam.get("exam_id") or "")
+        prepared_document = prepared_document_map.get(
+            str(exam.get("prepared_document_id") or ""),
+            {},
+        )
         can_submit, unavailable_reason = _student_upload_availability(exam, student_id)
         submission_record = submission_by_exam.get(exam_id)
         submission_id = str((submission_record or {}).get("submission_id") or "")
@@ -1029,6 +1060,14 @@ async def list_answer_copy_options(
                 title=str(exam.get("title") or "PCR exam"),
                 paper_title=str(exam.get("paper_title") or exam.get("title") or "PCR paper"),
                 subject=exam.get("subject"),
+                content_category_id=(
+                    exam.get("content_category_id")
+                    or prepared_document.get("content_category_id")
+                ),
+                content_category_name=(
+                    exam.get("content_category_name")
+                    or prepared_document.get("content_category_name")
+                ),
                 code=exam.get("code") or exam.get("exam_code"),
                 question_paper_available=bool(exam.get("prepared_document_id")),
                 lifecycle_state=str(exam.get("lifecycle_state") or "draft"),
