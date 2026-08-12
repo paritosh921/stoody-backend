@@ -126,6 +126,15 @@ class CreditPolicyEnvelope(BaseModel):
         extra = "forbid"
 
 
+class ActivateV2PolicyResponse(BaseModel):
+    success: StrictBool = True
+    activated: StrictBool
+    data: CreditPolicyResponse
+
+    class Config:
+        extra = "forbid"
+
+
 class CreditSummaryResponse(BaseModel):
     success: StrictBool = True
     data: Dict[str, Any]
@@ -369,13 +378,45 @@ async def update_credit_policy(
 ):
     tenant_db = await _tenant_db(db, current_user)
     changes = _as_dict(payload)
-    policy = await student_credits.update_credit_policy(
-        tenant_db,
-        changes,
-        admin_id=str(current_user.get("user_id", "")),
-    )
+    try:
+        policy = await student_credits.update_credit_policy(
+            tenant_db,
+            changes,
+            admin_id=str(current_user.get("user_id", "")),
+            db_name=str(current_user.get("db_name", "")).strip(),
+        )
+    except student_credits.CreditPolicyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except student_credits.CreditPolicyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return CreditPolicyEnvelope(
         success=True,
+        data=CreditPolicyResponse(**await _policy_dict_to_response(policy)),
+    )
+
+
+@router.post("/policy/activate-v2", response_model=ActivateV2PolicyResponse)
+@limiter.limit("20/minute")
+async def activate_v2_credit_policy(
+    request: Request,
+    current_user: Dict[str, Any] = Depends(require_admin),
+    db: DatabaseManager = Depends(get_database),
+):
+    tenant_db = await _tenant_db(db, current_user)
+    db_name = str(current_user.get("db_name") or "").strip()
+    try:
+        policy, activated = await student_credits.activate_v2_credit_policy(
+            tenant_db,
+            admin_id=str(current_user.get("user_id", "")),
+            db_name=db_name,
+        )
+    except student_credits.CreditPolicyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except student_credits.CreditPolicyValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return ActivateV2PolicyResponse(
+        success=True,
+        activated=bool(activated),
         data=CreditPolicyResponse(**await _policy_dict_to_response(policy)),
     )
 

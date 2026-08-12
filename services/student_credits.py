@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,13 +37,17 @@ SOURCE_STROKE = "stroke_page"
 SOURCE_PHOTO = "notebook_photo"
 TERMINAL_JOB_STATES = {"completed", "failed"}
 RECONCILIATION_MAX_DISPATCHES = 200
+POLICY_TRANSITION_LOCK_SECONDS = 60
+MISSING_COMPLETION_LOOKUPS = 6
+POLICY_LOCK_KEY_PREFIX = "credit-policy-transition"
+MISSING_COMPLETION_FAILURE_REASON = "source completion evidence could not be loaded"
 
 DEFAULT_TIERS = [
     {"id": "seed", "name": "Seed", "min_credits": 0, "accent": "#22A06B", "icon": "sprout"},
     {"id": "scribe", "name": "Scribe", "min_credits": 100, "accent": "#2563EB", "icon": "pen-tool"},
-    {"id": "pathfinder", "name": "Pathfinder", "min_credits": 300, "accent": "#7C3AED", "icon": "compass"},
-    {"id": "beacon", "name": "Beacon", "min_credits": 700, "accent": "#D97706", "icon": "lamp"},
-    {"id": "luminary", "name": "Luminary", "min_credits": 1500, "accent": "#DB2777", "icon": "sparkles"},
+    {"id": "pathfinder", "name": "Pathfinder", "min_credits": 500, "accent": "#7C3AED", "icon": "compass"},
+    {"id": "beacon", "name": "Beacon", "min_credits": 1500, "accent": "#D97706", "icon": "lamp"},
+    {"id": "luminary", "name": "Luminary", "min_credits": 4000, "accent": "#DB2777", "icon": "sparkles"},
 ]
 
 DEFAULT_POLICY: Dict[str, Any] = {
@@ -68,15 +73,33 @@ DEFAULT_POLICY: Dict[str, Any] = {
     "max_overexposure_ratio": 0.70,
     "max_edge_clipping_ratio": 0.20,
     "stroke_mm_per_credit_unit": 250.0,
-    "stroke_credits_per_unit": 4,
-    "image_credits_per_page": 2,
-    "max_stroke_credits_per_page": 40,
-    "max_image_credits_per_submission": 20,
-    "daily_credit_cap": 200,
+    "stroke_credits_per_unit": 1,
+    "image_credits_per_page": 1,
+    "max_stroke_credits_per_page": 5,
+    "max_image_credits_per_submission": 10,
+    "daily_credit_cap": 100,
     "max_attempts": 5,
     "lease_seconds": 300,
     "tiers": DEFAULT_TIERS,
 }
+
+V2_AWARD_POLICY: Dict[str, Any] = {
+    "stroke_mm_per_credit_unit": 250.0,
+    "stroke_credits_per_unit": 1,
+    "image_credits_per_page": 1,
+    "max_stroke_credits_per_page": 5,
+    "max_image_credits_per_submission": 10,
+    "daily_credit_cap": 100,
+    "tiers": DEFAULT_TIERS,
+}
+
+
+class CreditPolicyValidationError(ValueError):
+    """Raised when a credit-policy payload violates semantic invariants."""
+
+
+class CreditPolicyConflictError(RuntimeError):
+    """Raised when a policy transition cannot proceed safely."""
 
 
 def utc_now() -> datetime:
@@ -98,6 +121,7 @@ def _latest_time(*values: Any) -> Optional[datetime]:
         if latest is None or value > latest:
             latest = value
     return latest
+
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
@@ -123,6 +147,145 @@ def _normalise_policy(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         key=lambda item: int(item.get("min_credits") or 0),
     )
     return policy
+
+
+def _normalise_number(value: Any, *, field: str, cast_float: bool = False) -> float | int:
+    try:
+        return float(value) if cast_float else int(value)
+    except Exception as exc:
+        raise CreditPolicyValidationError(f"{field} must be numeric") from exc
+
+
+def _normalise_tier(tier: Any) -> Dict[str, Any]:
+    if not isinstance(tier, dict):
+        raise CreditPolicyValidationError("tier entry must be an object")
+
+    tier_id = _clean_text(tier.get("id"))
+    name = _clean_text(tier.get("name"))
+    icon = _clean_text(tier.get("icon"))
+    accent = _clean_text(tier.get("accent"))
+    min_credits = _normalise_number(tier.get("min_credits"), field="min_credits")
+
+    if not tier_id or not name:
+        raise CreditPolicyValidationError("tier id and name must be non-empty")
+    if not icon or not accent:
+        raise CreditPolicyValidationError("tier icon and accent are required")
+    if min_credits < 0:
+        raise CreditPolicyValidationError("tier minimum credits must be non-negative")
+    return {"id": tier_id, "name": name, "min_credits": min_credits, "accent": accent, "icon": icon}
+
+
+def _validate_policy_semantics(policy: Dict[str, Any]) -> None:
+    tiers_value = policy.get("tiers")
+    if not isinstance(tiers_value, list) or not tiers_value:
+        raise CreditPolicyValidationError("tiers must be a non-empty list")
+
+    tiers = [_normalise_tier(tier) for tier in tiers_value]
+    ordered = sorted(tiers, key=lambda item: int(item["min_credits"]))
+    if ordered[0]["min_credits"] != 0:
+        raise CreditPolicyValidationError("first tier minimum credits must be 0")
+
+    ids = [item["id"].casefold() for item in ordered]
+    names = [item["name"].casefold() for item in ordered]
+    if len(set(ids)) != len(ids):
+        raise CreditPolicyValidationError("duplicate tier identifiers are not allowed")
+    if len(set(names)) != len(names):
+        raise CreditPolicyValidationError("duplicate tier names are not allowed")
+
+    for current, next_item in zip(ordered, ordered[1:]):
+        if int(next_item["min_credits"]) <= int(current["min_credits"]):
+            raise CreditPolicyValidationError("tier minimum credits must be strictly increasing")
+
+    if float(policy["min_written_coverage"]) > float(policy["max_written_coverage"]):
+        raise CreditPolicyValidationError("min_written_coverage must be <= max_written_coverage")
+    if float(policy["min_ink_density"]) > float(policy["max_ink_density"]):
+        raise CreditPolicyValidationError("min_ink_density must be <= max_ink_density")
+
+    stroke_credits_per_unit = _normalise_number(policy["stroke_credits_per_unit"], field="stroke_credits_per_unit")
+    max_stroke_credits_per_page = _normalise_number(
+        policy["max_stroke_credits_per_page"], field="max_stroke_credits_per_page"
+    )
+    image_credits_per_page = _normalise_number(policy["image_credits_per_page"], field="image_credits_per_page")
+    max_image_credits_per_submission = _normalise_number(
+        policy["max_image_credits_per_submission"], field="max_image_credits_per_submission"
+    )
+    if stroke_credits_per_unit > max_stroke_credits_per_page:
+        raise CreditPolicyValidationError("stroke_credits_per_unit must be <= max_stroke_credits_per_page")
+    if image_credits_per_page > max_image_credits_per_submission:
+        raise CreditPolicyValidationError("image_credits_per_page must be <= max_image_credits_per_submission")
+
+
+def _validate_tier_input_order(tiers: Any) -> None:
+    if not isinstance(tiers, list) or not tiers:
+        raise CreditPolicyValidationError("tiers must be a non-empty list")
+    minimums = [int(_normalise_tier(tier)["min_credits"]) for tier in tiers]
+    if any(next_value <= current for current, next_value in zip(minimums, minimums[1:])):
+        raise CreditPolicyValidationError("tier minimum credits must be supplied in strictly increasing order")
+
+
+def _is_v2_preset(policy: Dict[str, Any]) -> bool:
+    snapshot = _normalise_policy(policy)
+    return all(snapshot.get(key) == value for key, value in V2_AWARD_POLICY.items())
+
+
+def _policy_transition_lock_key(db_name: str) -> str:
+    return f"{POLICY_LOCK_KEY_PREFIX}:{db_name}"
+
+
+def _missing_completion_reason() -> str:
+    return MISSING_COMPLETION_FAILURE_REASON
+
+
+async def _acquire_named_lock(db: Any, lock_key: str, token: str, *, lease_seconds: int) -> bool:
+    now = utc_now()
+    expires = now + timedelta(seconds=max(1, int(lease_seconds)))
+    try:
+        locked = await db[LOCK_COLLECTION].find_one_and_update(
+            {
+                "_id": lock_key,
+                "$or": [
+                    {"lease_expires_at": {"$lte": now}},
+                    {"lease_expires_at": None},
+                    {"lease_expires_at": {"$exists": False}},
+                    {"lease_token": token},
+                ],
+            },
+            {"$set": {"lease_token": token, "lease_expires_at": expires, "updated_at": now}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(locked and locked.get("lease_token") == token)
+    except DuplicateKeyError:
+        return False
+
+
+async def _release_named_lock(db: Any, lock_key: str, token: str) -> None:
+    await db[LOCK_COLLECTION].update_one(
+        {"_id": lock_key, "lease_token": token},
+        {"$set": {"lease_token": None, "lease_expires_at": utc_now(), "updated_at": utc_now()}},
+    )
+
+
+def _policy_transition_lock_token() -> str:
+    return f"policy-transition:{uuid.uuid4().hex}"
+
+
+async def _student_has_positive_daily_credit_over_cap(
+    db: Any,
+    *,
+    cap: int,
+) -> bool:
+    now = utc_now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = await db[LEDGER_COLLECTION].aggregate(
+        [
+            {"$match": {"created_at": {"$gte": start}, "delta": {"$gt": 0}}},
+            {"$group": {"_id": "$student_record_id", "total": {"$sum": "$delta"}}},
+            {"$match": {"total": {"$gt": cap}}},
+            {"$limit": 1},
+        ]
+    ).to_list(length=1)
+    return bool(rows)
 
 
 async def ensure_credit_indexes(db: Any) -> None:
@@ -160,10 +323,12 @@ async def ensure_credit_indexes(db: Any) -> None:
 
 
 async def get_credit_policy(db: Any, *, admin_id: str = "") -> Dict[str, Any]:
+    """Return the active policy without creating durable state on read paths."""
     await ensure_credit_indexes(db)
     existing = await db[POLICY_COLLECTION].find_one({"_id": "current"})
     if existing:
         result = _normalise_policy(existing)
+        _validate_policy_semantics(result)
         result.update(
             {
                 "version": int(existing.get("version") or 1),
@@ -172,6 +337,19 @@ async def get_credit_policy(db: Any, *, admin_id: str = "") -> Dict[str, Any]:
             }
         )
         return result
+
+    return _normalise_policy(DEFAULT_POLICY) | {
+        "version": 1,
+        "earning_started_at": None,
+        "updated_at": None,
+    }
+
+
+async def initialize_credit_policy(db: Any, *, admin_id: str = "") -> Dict[str, Any]:
+    """Create the tenant policy at an explicit write boundary if it is absent."""
+    existing = await db[POLICY_COLLECTION].find_one({"_id": "current"})
+    if existing:
+        return await get_credit_policy(db, admin_id=admin_id)
 
     now = utc_now()
     document = {
@@ -194,27 +372,134 @@ async def get_credit_policy(db: Any, *, admin_id: str = "") -> Dict[str, Any]:
     }
 
 
-async def update_credit_policy(db: Any, changes: Dict[str, Any], *, admin_id: str) -> Dict[str, Any]:
-    current = await get_credit_policy(db, admin_id=admin_id)
-    clean = {key: value for key, value in changes.items() if key in DEFAULT_POLICY and value is not None}
-    next_policy = _normalise_policy(current | clean)
-    now = utc_now()
-    update_fields = {key: next_policy[key] for key in DEFAULT_POLICY}
-    updated = await db[POLICY_COLLECTION].find_one_and_update(
-        {"_id": "current"},
-        {
-            "$set": {**update_fields, "admin_id": admin_id, "updated_at": now},
-            "$inc": {"version": 1},
-            "$setOnInsert": {"created_at": now, "earning_started_at": now},
-        },
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+async def update_credit_policy(
+    db: Any,
+    changes: Dict[str, Any],
+    *,
+    admin_id: str,
+    db_name: str = "",
+) -> Dict[str, Any]:
+    lock_key = _policy_transition_lock_key(_clean_text(db_name) or str(admin_id))
+    lock_token = _policy_transition_lock_token()
+    for _ in range(8):
+        if await _acquire_named_lock(db, lock_key, lock_token, lease_seconds=POLICY_TRANSITION_LOCK_SECONDS):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise CreditPolicyConflictError("policy transition lock is busy")
+    try:
+        current = await initialize_credit_policy(db, admin_id=admin_id)
+        clean = {key: value for key, value in changes.items() if key in DEFAULT_POLICY and value is not None}
+        if "tiers" in clean:
+            _validate_tier_input_order(clean["tiers"])
+        next_policy = _normalise_policy(current | clean)
+        _validate_policy_semantics(next_policy)
+        now = utc_now()
+        update_fields = {key: next_policy[key] for key in DEFAULT_POLICY}
+        updated = await db[POLICY_COLLECTION].find_one_and_update(
+            {"_id": "current"},
+            {
+                "$set": {**update_fields, "admin_id": admin_id, "updated_at": now},
+                "$inc": {"version": 1},
+                "$setOnInsert": {"created_at": now, "earning_started_at": now},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    finally:
+        await _release_named_lock(db, lock_key, lock_token)
     return _normalise_policy(updated) | {
         "version": int(updated.get("version") or 1),
         "earning_started_at": updated.get("earning_started_at"),
         "updated_at": updated.get("updated_at"),
     }
+
+
+async def activate_v2_credit_policy(db: Any, *, admin_id: str, db_name: str) -> Tuple[Dict[str, Any], bool]:
+    lock_key = _policy_transition_lock_key(db_name)
+    lock_token = _policy_transition_lock_token()
+    if not await _acquire_named_lock(db, lock_key, lock_token, lease_seconds=POLICY_TRANSITION_LOCK_SECONDS):
+        raise CreditPolicyConflictError("policy transition lock is busy")
+
+    try:
+        await ensure_credit_indexes(db)
+        policy = await initialize_credit_policy(db, admin_id=admin_id)
+        if _is_v2_preset(policy):
+            return policy, False
+
+        non_terminal = await db[JOB_COLLECTION].count_documents(
+            {"status": {"$in": ["pending", "processing", "retry"]}}
+        )
+        if non_terminal:
+            raise CreditPolicyConflictError("cannot activate v2 while credit jobs are not terminal")
+
+        if await _student_has_positive_daily_credit_over_cap(db, cap=int(V2_AWARD_POLICY["daily_credit_cap"])):
+            raise CreditPolicyConflictError("cannot activate v2 while a student exceeded daily credit cap today")
+
+        activated_policy = _normalise_policy(policy | V2_AWARD_POLICY)
+        _validate_policy_semantics(activated_policy)
+        update_payload = {key: activated_policy[key] for key in DEFAULT_POLICY}
+        now = utc_now()
+        updated = await db[POLICY_COLLECTION].find_one_and_update(
+            {"_id": "current"},
+            {
+                "$set": {**update_payload, "admin_id": admin_id, "updated_at": now},
+                "$inc": {"version": 1},
+                "$setOnInsert": {"created_at": now, "earning_started_at": now},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return _normalise_policy(updated) | {
+            "version": int(updated.get("version") or 1),
+            "earning_started_at": updated.get("earning_started_at"),
+            "updated_at": updated.get("updated_at"),
+        }, True
+    finally:
+        await _release_named_lock(db, lock_key, lock_token)
+
+
+async def _acquire_missing_completion_lookup_slot(
+    db: Any,
+    job_id: str,
+) -> int:
+    row = await db[JOB_COLLECTION].find_one_and_update(
+        {"job_id": job_id, "status": {"$in": ["pending", "retry"]}},
+        {"$inc": {"missing_completion_lookups": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not row:
+        return 0
+    return int(row.get("missing_completion_lookups") or 0)
+
+
+async def _finalize_missing_completion_failure(
+    db: Any,
+    *,
+    job_id: str,
+    missing_completion_lookups: int,
+    now: datetime,
+) -> None:
+    await db[JOB_COLLECTION].update_one(
+        {
+            "job_id": job_id,
+            "status": {"$in": ["pending", "retry"]},
+            "missing_completion_lookups": {"$gte": MISSING_COMPLETION_LOOKUPS},
+        },
+        {
+            "$set": {
+                "status": "failed",
+                "decision": "missing_completion",
+                "award_delta": 0,
+                "completed_at": now,
+                "updated_at": now,
+                "missing_completion_lookups": int(missing_completion_lookups),
+                "last_error": _missing_completion_reason(),
+                "lease_token": None,
+                "lease_expires_at": None,
+            }
+        },
+    )
 
 
 async def resolve_student_record(db: Any, identity: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -313,43 +598,56 @@ async def enqueue_credit_job(
     source_completed_at: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Idempotently create a durable job after the primary write succeeds."""
-    policy = await get_credit_policy(db, admin_id=admin_id)
-    completed_at = _as_utc(source_completed_at)
-    cutoff = _as_utc(policy.get("earning_started_at"))
-    if not policy.get("enabled", True) or (cutoff is not None and completed_at is not None and completed_at < cutoff):
-        return None
-
     now = utc_now()
-    identity = student_identity(student)
-    document = {
-        "job_id": f"credit-{uuid.uuid4().hex}",
-        "db_name": db_name,
-        "admin_id": admin_id,
-        **identity,
-        "source_type": source_type,
-        "source_id": source_id,
-        "source_version": str(source_version),
-        "group_key": group_key,
-        "source_ref": dict(source_ref),
-        "source_completed_at": completed_at,
-        "policy_version": int(policy.get("version") or 1),
-        "policy_snapshot": {key: policy.get(key) for key in DEFAULT_POLICY},
-        "status": "pending",
-        "attempts": 0,
-        "next_attempt_at": now,
-        "lease_token": None,
-        "lease_expires_at": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db[JOB_COLLECTION].update_one(
-        {"source_type": source_type, "source_id": source_id, "source_version": str(source_version)},
-        {"$setOnInsert": document},
-        upsert=True,
-    )
-    return await db[JOB_COLLECTION].find_one(
-        {"source_type": source_type, "source_id": source_id, "source_version": str(source_version)}
-    )
+    source_completed = _as_utc(source_completed_at)
+    lock_key = _policy_transition_lock_key(db_name)
+    lock_token = _policy_transition_lock_token()
+
+    for _ in range(10):
+        if await _acquire_named_lock(db, lock_key, lock_token, lease_seconds=POLICY_TRANSITION_LOCK_SECONDS):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise CreditPolicyConflictError("policy transition lock is busy")
+
+    try:
+        policy = await initialize_credit_policy(db, admin_id=admin_id)
+        cutoff = _as_utc(policy.get("earning_started_at"))
+        if not policy.get("enabled", True) or (
+            cutoff is not None and source_completed is not None and source_completed < cutoff
+        ):
+            return None
+
+        document = {
+            "job_id": f"credit-{uuid.uuid4().hex}",
+            "db_name": db_name,
+            "admin_id": admin_id,
+            **student_identity(student),
+            "source_type": source_type,
+            "source_id": source_id,
+            "source_version": str(source_version),
+            "group_key": group_key,
+            "source_ref": dict(source_ref),
+            "source_completed_at": source_completed,
+            "policy_version": int(policy.get("version") or 1),
+            "policy_snapshot": {key: policy.get(key) for key in DEFAULT_POLICY},
+            "status": "pending",
+            "attempts": 0,
+            "next_attempt_at": now,
+            "lease_token": None,
+            "lease_expires_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        source_key = {
+            "source_type": source_type,
+            "source_id": source_id,
+            "source_version": str(source_version),
+        }
+        await db[JOB_COLLECTION].update_one(source_key, {"$setOnInsert": document}, upsert=True)
+        return await db[JOB_COLLECTION].find_one(source_key)
+    finally:
+        await _release_named_lock(db, lock_key, lock_token)
 
 
 def _eligible_strokes(page: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1409,6 +1707,24 @@ async def reconcile_credit_jobs(db: Any, *, db_name: str, dispatch: bool = True)
                     await db[JOB_COLLECTION].update_one({"job_id": row["job_id"]}, {"$set": {"source_completed_at": completion}})
 
             if completion is None:
+                lookup_count = await _acquire_missing_completion_lookup_slot(
+                    db,
+                    row["job_id"],
+                )
+                if lookup_count == 0:
+                    continue
+                if lookup_count >= MISSING_COMPLETION_LOOKUPS:
+                    await _finalize_missing_completion_failure(
+                        db,
+                        job_id=row["job_id"],
+                        missing_completion_lookups=lookup_count,
+                        now=now,
+                    )
+                    continue
+                await db[JOB_COLLECTION].update_one(
+                    {"job_id": row["job_id"]},
+                    {"$set": {"missing_completion_lookups": lookup_count, "next_attempt_at": now, "updated_at": now}},
+                )
                 continue
 
             if cutoff_dt is not None and completion < cutoff_dt:
@@ -1490,6 +1806,8 @@ async def get_student_credit_summary(db: Any, student: Dict[str, Any], *, recent
     return {
         "total_credits": total,
         "tier": tier_for_credits(total, policy["tiers"]),
+        "policy_version": int(policy.get("version") or 1),
+        "tiers": list(policy.get("tiers") or []),
         "stats": {"accepted": counts.get("accepted", 0), "rejected": counts.get("rejected", 0), "pending": pending},
         "by_source": {row["_id"]: {"credits": int(row.get("credits") or 0), "entries": int(row.get("entries") or 0)} for row in ledger_rows},
         "recent": recent,
