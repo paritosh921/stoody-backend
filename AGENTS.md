@@ -1,5 +1,11 @@
 # Backend - Stoody AI Learning Platform
 
+## TLA+-guided refactors
+
+When the user invokes `tla-plus-implementation` for work in this repository, read `docs/formal/constraint-index.md` before creating the task-specific Phase 0 artifacts. Re-verify every selected evidence anchor in the current checkout, cite the relevant `BE-*` IDs in `system-context.md`/`boundary-decisions.md`, and treat material drift or uncertainty as `UNKNOWN` until resolved.
+
+The catalog is discovery input, not a universal specification or a substitute for the skill's required `requirements.md`, `system-context.md`, `boundary-decisions.md`, PlusCal/TLA+, TLC run, and gates. Do not run the formal workflow for ordinary stateless work unless the user or skill trigger requires it.
+
 ## Overview
 
 Async Python backend for an educational platform (Stoody) with AI-powered learning features, multi-tenancy, and real-time capabilities. Deployed on **AWS EC2** with Nginx + Supervisor.

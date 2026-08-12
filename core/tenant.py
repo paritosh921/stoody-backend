@@ -50,6 +50,11 @@ TENANT_SCOPED_COLLECTIONS: Set[str] = {
     "academic_calendar",    # Holidays, exams, events
     "pre_reads",            # Pre-read material for periods
     "notices",              # Admin/teacher notices to students/staff
+    "student_credit_jobs",
+    "student_credit_judgments",
+    "student_credit_ledger",
+    "student_credit_locks",
+    "student_credit_policies",
 }
 
 # Collections that are global (not tenant-scoped)

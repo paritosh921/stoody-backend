@@ -32,6 +32,7 @@ class CallerID(str, enum.Enum):
     PCR_PRACTICE = "pcr_practice"
     DCR_AI = "dcr_ai"
     DCR_DEVANAGARI = "dcr_devanagari"
+    CREDITS_QUALITY_JUDGE = "credits_quality_judge"
 
 
 ALLOWED_CALLER_IDS: frozenset[str] = frozenset(c.value for c in CallerID)

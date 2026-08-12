@@ -122,6 +122,7 @@ Only registered callers may invoke the gate. Any unregistered `caller_id` is rej
 | `pcr_practice` | PCR | Stateless live practice evaluation |
 | `dcr_ai` | DCR | Vision OCR recognition of rendered stroke images |
 | `dcr_devanagari` | DCR | Future LLM-assisted Devanagari recognition |
+| `credits_quality_judge` | Credits | Decide whether a rendered canonical stroke page or uploaded notebook page contains useful, legible writing rather than blank, random, or scribbled content |
 
 New callers must be added here before implementation.
 
