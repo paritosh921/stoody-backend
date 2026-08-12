@@ -358,6 +358,71 @@ class DatabaseManager:
                 name="uniq_tutors_tutor_id"
             )
 
+            # Student contribution credits collections (append-only ledger + async jobs).
+            student_credit_policies = db["student_credit_policies"]
+            await self._ensure_index_with_spec_check(
+                student_credit_policies,
+                [("_id", 1)],
+                unique=True,
+                name="uniq_student_credit_policy",
+            )
+
+            student_credit_jobs = db["student_credit_jobs"]
+            await self._ensure_index_with_spec_check(
+                student_credit_jobs,
+                [("source_type", 1), ("source_id", 1), ("source_version", 1)],
+                unique=True,
+                name="uniq_credit_source_version",
+            )
+            await self._ensure_index_with_spec_check(
+                student_credit_jobs,
+                [("status", 1), ("next_attempt_at", 1), ("lease_expires_at", 1)],
+                name="idx_credit_job_dispatch",
+            )
+            await self._ensure_index_with_spec_check(
+                student_credit_jobs,
+                [("status", 1), ("updated_at", -1)],
+                name="idx_credit_job_status_updated",
+            )
+
+            student_credit_judgments = db["student_credit_judgments"]
+            await self._ensure_index_with_spec_check(
+                student_credit_judgments,
+                [("source_type", 1), ("source_id", 1), ("source_version", 1)],
+                unique=True,
+                name="uniq_credit_judgment_source",
+            )
+            await self._ensure_index_with_spec_check(
+                student_credit_judgments,
+                [("student_record_id", 1), ("decided_at", -1)],
+                name="idx_credit_judgment_student",
+            )
+
+            student_credit_ledger = db["student_credit_ledger"]
+            await self._ensure_index_with_spec_check(
+                student_credit_ledger,
+                [("judgment_key", 1)],
+                unique=True,
+                name="uniq_credit_ledger_judgment",
+            )
+            await self._ensure_index_with_spec_check(
+                student_credit_ledger,
+                [("student_record_id", 1), ("created_at", -1)],
+                name="idx_credit_ledger_student",
+            )
+            await self._ensure_index_with_spec_check(
+                student_credit_ledger,
+                [("group_key", 1), ("created_at", 1)],
+                name="idx_credit_ledger_group",
+            )
+
+            student_credit_locks = db["student_credit_locks"]
+            await self._ensure_index_with_spec_check(
+                student_credit_locks,
+                [("lease_expires_at", 1)],
+                name="idx_credit_lock_expiry",
+            )
+
             # Note classification lookup indexes. The legacy unique page index
             # omitted ``copy_id`` and is incompatible with multiple copies of
             # the same notebook page. Do not recreate it here: the copy-aware

@@ -58,6 +58,10 @@ app.conf.beat_schedule = {
         "task": "celery_app.reconcile_exampen_processing_jobs",
         "schedule": 60.0,
     },
+    "student-credit-reconciler": {
+        "task": "celery_app.reconcile_student_credit_jobs",
+        "schedule": 60.0,
+    },
 }
 
 
@@ -211,3 +215,79 @@ def process_exampen_pcr_submission(
         # is the single retry authority and the periodic reconciler redelivers it.
         logger.exception("PCR worker infrastructure failed before job state was recorded")
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+
+
+@app.task(name="celery_app.process_student_credit_job", bind=True, max_retries=3)
+def process_student_credit_job(self, db_name: str, job_id: str) -> dict:
+    """Evaluate one student-credit job through the async judge/ledger pipeline."""
+    from core.database import DatabaseManager
+    from services.student_credits import process_credit_job
+
+    execution_token = f"celery:{self.request.id}"
+
+    async def _run() -> dict:
+        db_mgr = DatabaseManager()
+        await db_mgr.initialize()
+        tenant_db = await db_mgr.get_tenant_db(db_name)
+        if tenant_db is None:
+            raise RuntimeError(f"Tenant database {db_name} is not available")
+        return await process_credit_job(tenant_db, job_id=job_id, execution_token=execution_token)
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Student credit job dispatch failed for %s", job_id)
+        raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+
+
+@app.task(name="celery_app.reconcile_student_credit_jobs", bind=True, max_retries=2)
+def reconcile_student_credit_jobs(self) -> dict:
+    """Replay stale student credit jobs and dispatch due work for all active tenants."""
+    from core.database import DatabaseManager
+
+    async def _run() -> dict:
+        db_mgr = DatabaseManager()
+        await db_mgr.initialize()
+        master_db = await db_mgr.get_master_db()
+        cursor = master_db["tenants"].find(
+            {"status": "active"},
+            {"db_name": 1, "_id": 0},
+        )
+        tenants = await cursor.to_list(length=1000)
+        results: dict = {
+            "tenants_processed": 0,
+            "dispatched": 0,
+            "repaired": 0,
+            "stale_recovered": 0,
+            "errors": [],
+        }
+
+        from services.student_credits import reconcile_credit_jobs
+
+        for tenant in tenants:
+            db_name = tenant.get("db_name")
+            if not db_name:
+                continue
+            try:
+                tenant_db = await db_mgr.get_tenant_db(db_name)
+                if tenant_db is None:
+                    continue
+                reconciled = await reconcile_credit_jobs(
+                    tenant_db,
+                    db_name=db_name,
+                    dispatch=True,
+                )
+                results["tenants_processed"] += 1
+                results["dispatched"] += int(reconciled.get("dispatched") or 0)
+                results["repaired"] += int(reconciled.get("repaired") or 0)
+                results["stale_recovered"] += int(reconciled.get("stale_recovered") or 0)
+            except Exception as exc:
+                logger.exception("Student credit job reconciliation failed for tenant %s", db_name)
+                results["errors"].append({"tenant": db_name, "error": str(exc)})
+        return results
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Student credit reconciliation task failed")
+        raise self.retry(exc=exc, countdown=60)

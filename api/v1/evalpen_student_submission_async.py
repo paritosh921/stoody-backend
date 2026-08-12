@@ -28,6 +28,7 @@ from api.v1.evalpen_student_bff_async import _get_student_identity_ids, require_
 from core.database import DatabaseManager
 from core.upload_security.service import CleanUpload, secure_upload, secure_upload_many
 from core.upload_security.storage import PrivateUploadStorage, safe_storage_segment
+from services import student_credits
 from utils.s3_storage import (
     PrivateObjectStorageError,
     delete_private_object,
@@ -274,6 +275,7 @@ async def _reserve_student_copy_attempt(
     exam_id: str,
     student_id: str,
     admin_id: str,
+    submission_channel: str = "student_web",
 ) -> str:
     """Atomically reserve the student's single final-copy upload slot.
 
@@ -292,7 +294,7 @@ async def _reserve_student_copy_attempt(
                 "student_id": student_id,
                 "admin_id": admin_id,
                 "submitted_by": student_id,
-                "submission_channel": "student_web",
+                "submission_channel": str(submission_channel or "student_web").strip() or "student_web",
                 "status": "receiving",
                 "lease_expires_at": lease_expires_at,
                 "upload_attempt_count": 1,
@@ -340,6 +342,7 @@ async def _reserve_student_copy_attempt(
             {
                 "$set": {
                     "status": "receiving",
+                    "submission_channel": str(submission_channel or "student_web").strip() or "student_web",
                     "updated_at": now,
                     "lease_expires_at": lease_expires_at,
                     "last_error": None,
@@ -582,6 +585,63 @@ async def _queue_pcr_processing(
         submission_id=submission_id,
         student_id=student_id,
     )
+
+
+async def _try_enqueue_student_copy_credit(
+    tenant_db: Any,
+    *,
+    current_user: Dict[str, Any],
+    exam_id: str,
+    submission_id: str,
+    submission_channel: str = "student_web",
+) -> None:
+    try:
+        if str(current_user.get("user_type") or "") != "student":
+            return
+
+        student = await student_credits.resolve_student_record(tenant_db, current_user)
+        if not student:
+            return
+
+        db_name = str(current_user.get("db_name") or "").strip()
+        if not db_name:
+            return
+
+        submission = await tenant_db["evalpen_submissions"].find_one(
+            {"submission_id": submission_id, "exam_id": exam_id},
+            {"_id": 0, "student_id": 1, "admin_id": 1},
+        )
+        if not submission:
+            return
+
+        resolved_channel = str(
+            submission_channel or submission.get("submission_channel") or "student_web"
+        ).strip()
+        if not resolved_channel:
+            resolved_channel = "student_web"
+
+        source_ref = {
+            "submission_id": submission_id,
+            "submission_channel": resolved_channel,
+            "student_id": submission.get("student_id"),
+        }
+        source_id = f"photo:{submission_id}"
+        source_version = "1"
+        group_key = f"photo:{student.get('student_id') or student.get('_id')}:{submission_id}"
+
+        await student_credits.enqueue_credit_job(
+            tenant_db,
+            db_name=db_name,
+            admin_id=str(student.get("admin_id") or ""),
+            student=student,
+            source_type=student_credits.SOURCE_PHOTO,
+            source_id=source_id,
+            source_version=source_version,
+            group_key=group_key,
+            source_ref=source_ref,
+        )
+    except Exception as exc:
+        logger.warning("Student answer-copy credit enqueue failed (non-blocking): %s", exc)
 
 
 def _render_pdf_pages_sync(pdf_bytes: bytes, *, max_pages: int) -> List[tuple[bytes, int, int]]:
@@ -1380,6 +1440,7 @@ async def download_answer_copy(
 )
 async def submit_answer_copy(
     exam_id: str,
+    request: Request = None,
     pages: List[UploadFile] = File(default=[]),
     answer_pdf: Optional[UploadFile] = File(default=None),
     confirm_submission: bool = Form(False),
@@ -1397,6 +1458,9 @@ async def submit_answer_copy(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Confirm that all answer pages are included before submitting",
         )
+    request_headers = request.headers if request is not None else {}
+    app_source = str(request_headers.get("X-App-Source") or request_headers.get("x-app-source") or "").strip().lower()
+    submission_channel = "student_mobile" if app_source == "stoody-mobile" else "student_web"
 
     tenant_db = await _get_tenant_db(db, current_user)
     student_ids = await _get_student_identity_ids(tenant_db, current_user)
@@ -1451,6 +1515,7 @@ async def submit_answer_copy(
         exam_id=exam_id,
         student_id=student_id,
         admin_id=admin_id,
+        submission_channel=submission_channel,
     )
 
     released_local_paths: List[str] = []
@@ -1501,7 +1566,7 @@ async def submit_answer_copy(
         "student_id": student_id,
         "admin_id": admin_id,
         "submitted_by": student_id,
-        "submission_channel": "student_web",
+        "submission_channel": submission_channel,
         "source_format": source_format,
         "storage_backend": "s3",
         "storage_handoff_status": "complete",
@@ -1564,6 +1629,7 @@ async def submit_answer_copy(
             exam_id=exam_id,
             student_id=student_id,
             admin_id=admin_id,
+            source="student_web",
             pages=[
                 {
                     "page_number": page["page_number"],
@@ -1658,6 +1724,15 @@ async def submit_answer_copy(
     except Exception as exc:  # durable ingest succeeds even if the queue is briefly unavailable
         logger.exception("Could not queue PCR processing for student copy %s", result.submission_id)
         processing_job = {"status": "enqueue_failed", "last_error": str(exc)[:500]}
+    else:
+        if str(processing_job.get("status") or "").strip().lower() not in {"enqueue_failed", "failed"}:
+            await _try_enqueue_student_copy_credit(
+                tenant_db,
+                current_user=current_user,
+                exam_id=exam_id,
+                submission_id=result.submission_id,
+                submission_channel=submission_channel,
+            )
 
     await upload_collection.update_one(
         {"attempt_id": attempt_id},

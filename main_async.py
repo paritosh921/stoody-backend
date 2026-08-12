@@ -126,6 +126,13 @@ from api.v1.push_async import router as push_router
 from api.v1.notices_async import router as notices_router
 from api.v1.mcq_async import router as mcq_router
 from api.v1.tutor_async import router as tutor_router
+try:
+    from api.v1.credits_async import router as credits_router
+    _credits_available = True
+except Exception as e:
+    credits_router = None
+    _credits_available = False
+    logging.warning(f"Credits routes disabled: {str(e)}")
 
 # Diagram generation pipeline routes (Kimi 2.5 + Gemini Nano Banana)
 try:
@@ -1096,6 +1103,14 @@ app.include_router(
     prefix=f"{API_V1_PREFIX}/mcq",
     tags=["MCQ"]
 )
+
+if _credits_available and credits_router:
+    app.include_router(
+        credits_router,
+        prefix=f"{API_V1_PREFIX}/credits",
+        tags=["Student Credits"]
+    )
+    logger.info("✅ Student Credits routes enabled")
 
 # Tutor routes (admin can manage tutors; tutors can view their own students)
 app.include_router(

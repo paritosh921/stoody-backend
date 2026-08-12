@@ -22,6 +22,7 @@ from core.database import DatabaseManager
 from core.permissions import has_permission
 from core.pen_tokens import decode_pen_token
 from core.user_identity import canonical_canvas_user_id
+from services import student_credits
 
 logger = logging.getLogger(__name__)
 
@@ -426,6 +427,95 @@ def _resolve_canvas_user_ids(current_user: Dict[str, Any]) -> List[Any]:
 _canonical_canvas_user_id = canonical_canvas_user_id  # back-compat alias
 
 
+def _is_canvas_student_credit_source(
+    user_type: str,
+    page: Dict[str, Any],
+) -> bool:
+    if user_type != "student":
+        return False
+    source = str(page.get("source") or "").strip().lower()
+    if source in {"", "camera", "touch", "tutor", "teacher"}:
+        return False
+
+    pen_mac = str(page.get("pen_mac") or "").strip()
+    if not pen_mac or pen_mac.lower() == "canvas":
+        return False
+
+    for stroke in page.get("strokes") or []:
+        if not isinstance(stroke, dict):
+            continue
+        if str(stroke.get("processingVersion") or "").strip() != CANONICAL_STROKE_PROCESSING_VERSION:
+            continue
+        if str(stroke.get("sourceMode") or "").strip() not in {"live", "offlineReplay"}:
+            continue
+        return True
+    return False
+
+
+def _page_to_credit_source_ref(page: Dict[str, Any], source_version: str) -> Dict[str, Any]:
+    source_mode = None
+    canonical_stroke_count = 0
+    for stroke in page.get("strokes") or []:
+        if not isinstance(stroke, dict):
+            continue
+        if str(stroke.get("processingVersion") or "").strip() != CANONICAL_STROKE_PROCESSING_VERSION:
+            continue
+        if str(stroke.get("sourceMode") or "").strip() not in {"live", "offlineReplay"}:
+            continue
+        if source_mode is None:
+            source_mode = str(stroke.get("sourceMode")).strip()
+        canonical_stroke_count += 1
+
+    return {
+        "user_id": page.get("user_id"),
+        "copy_id": page.get("copy_id"),
+        "book_type": page.get("book_type"),
+        "page_number": int(page.get("page_number") or 0),
+        "source_version": str(source_version),
+        "source": page.get("source"),
+        "pen_mac": page.get("pen_mac"),
+        "source_mode": source_mode,
+        "canonical_stroke_count": canonical_stroke_count,
+    }
+
+
+async def _try_enqueue_canvas_credit(
+    tenant_db: Any,
+    *,
+    current_user: Dict[str, Any],
+    page_doc: Dict[str, Any],
+) -> None:
+    user_type = str(current_user.get("user_type") or "")
+    if not _is_canvas_student_credit_source(user_type=user_type, page=page_doc):
+        return
+
+    try:
+        db_name = str(current_user.get("db_name") or "").strip()
+        if not db_name:
+            logger.warning("Cannot enqueue canvas credit job: tenant context missing")
+            return
+
+        student = await student_credits.resolve_student_record(tenant_db, current_user)
+        if not student:
+            return
+
+        source_id, source_version, group_key = student_credits.stroke_source_descriptor(page_doc)
+        source_ref = _page_to_credit_source_ref(page_doc, source_version=source_version)
+        await student_credits.enqueue_credit_job(
+            tenant_db,
+            db_name=db_name,
+            admin_id=str(student.get("admin_id") or current_user.get("admin_id") or ""),
+            student=student,
+            source_type=student_credits.SOURCE_STROKE,
+            source_id=source_id,
+            source_version=source_version,
+            group_key=group_key,
+            source_ref=source_ref,
+        )
+    except Exception as exc:
+        logger.warning("Canvas credit enqueue failed (non-blocking): %s", exc)
+
+
 def _extract_duplicate_index_details(exc: Exception) -> tuple[Optional[str], Optional[dict]]:
     """Return duplicate-index name and key values without leaking the full failed op."""
     if isinstance(exc, DuplicateKeyError):
@@ -764,6 +854,7 @@ async def upsert_canvas_page(
     user_id = _canonical_canvas_user_id(current_user)
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
+    tenant_db = collection.database
     classification_collection = collection.database["note_classifications"]
     user_ids = _resolve_canvas_user_ids(current_user)
 
@@ -778,6 +869,7 @@ async def upsert_canvas_page(
         "page_number": page.page_number,
     }
     existing = await collection.find_one(page_filter)
+    should_enqueue_credit = False
 
     if existing is None:
         doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
@@ -791,6 +883,7 @@ async def upsert_canvas_page(
             result = await collection.replace_one(upsert_filt, doc, upsert=True)
         except DuplicateKeyError as exc:
             _raise_sanitized_canvas_write_error(exc)
+        should_enqueue_credit = True
     else:
         doc, added_count = _build_merged_page_doc(
             existing_doc=existing,
@@ -822,6 +915,7 @@ async def upsert_canvas_page(
             result = await collection.replace_one({"_id": existing["_id"]}, doc)
         except DuplicateKeyError as exc:
             _raise_sanitized_canvas_write_error(exc)
+        should_enqueue_credit = True
 
     await _upsert_notes_canvas_classification(
         classification_collection,
@@ -831,6 +925,12 @@ async def upsert_canvas_page(
         now=now,
         copy_id=copy_id,
     )
+    if should_enqueue_credit:
+        await _try_enqueue_canvas_credit(
+            tenant_db,
+            current_user=current_user,
+            page_doc=doc,
+        )
 
     return {
         "success": True,
@@ -850,6 +950,7 @@ async def batch_upsert_canvas_pages(
     user_id = _canonical_canvas_user_id(current_user)
     admin_id = current_user.get("admin_id")
     collection = await _get_canvas_collection(current_user, db)
+    tenant_db = collection.database
     classification_collection = collection.database["note_classifications"]
     user_ids = _resolve_canvas_user_ids(current_user)
 
@@ -898,6 +999,7 @@ async def batch_upsert_canvas_pages(
 
     ops = []
     changed_pages: List[tuple[CanvasPageUpsert, str]] = []  # (page, resolved_copy_id)
+    credit_pages: List[Dict[str, Any]] = []
     for page in body.pages:
         copy_id = page.copy_id or batch_copy_id
         key = (copy_id, page.book_type.upper(), page.page_number)
@@ -912,6 +1014,7 @@ async def batch_upsert_canvas_pages(
             }
             ops.append(ReplaceOne(filt, doc, upsert=True))
             changed_pages.append((page, copy_id))
+            credit_pages.append(doc)
         else:
             doc, added_count = _build_merged_page_doc(
                 existing_doc=existing,
@@ -930,6 +1033,7 @@ async def batch_upsert_canvas_pages(
                 continue
             ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
             changed_pages.append((page, copy_id))
+            credit_pages.append(doc)
 
     if ops:
         try:
@@ -944,6 +1048,12 @@ async def batch_upsert_canvas_pages(
                 page=page,
                 now=now,
                 copy_id=page_copy_id,
+            )
+        for page_doc in credit_pages:
+            await _try_enqueue_canvas_credit(
+                tenant_db,
+                current_user=current_user,
+                page_doc=page_doc,
             )
         return {
             "success": True,
