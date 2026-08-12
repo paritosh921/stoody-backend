@@ -33,8 +33,13 @@ import copy
 from typing import Any, Dict, List, Optional
 
 from services.answer_mapping_contract import normalize_answer_label
+from services.question_marking_contract import normalize_question_penalty
 
-from .marking_policy import normalize_marking_criteria, normalize_method_policy
+from .marking_policy import (
+    normalize_assessment_units,
+    normalize_marking_criteria,
+    normalize_method_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,15 +366,11 @@ def adapt_question_to_pcr(
     correct_answer = normalize_answer_label(
         question_doc.get("correct_answer") or question_doc.get("correctAnswer")
     )
-    try:
-        penalty_marks = float(
-            question_doc.get(
-                "penalty",
-                question_doc.get("penalty_marks", 1),
-            )
-        )
-    except (TypeError, ValueError):
-        penalty_marks = 1.0
+    penalty_marks = normalize_question_penalty(
+        question_doc.get("penalty", question_doc.get("penalty_marks")),
+        question_type=question_type,
+        document_question_type=question_doc.get("document_question_type"),
+    )
 
     raw_criteria = question_doc.get("marking_criteria")
     if raw_criteria is None and isinstance(question_doc.get("metadata"), dict):
@@ -388,6 +389,17 @@ def adapt_question_to_pcr(
         method_policy = normalize_method_policy(raw_method_policy)
     except ValueError:
         method_policy = normalize_method_policy(None)
+
+    raw_assessment_units = question_doc.get("assessment_units")
+    if raw_assessment_units is None and isinstance(question_doc.get("metadata"), dict):
+        raw_assessment_units = question_doc["metadata"].get("assessment_units")
+    try:
+        assessment_units = normalize_assessment_units(
+            raw_assessment_units,
+            assign_missing_ids=False,
+        )
+    except ValueError:
+        assessment_units = []
 
     # Expected word range heuristic based on complexity
     expected_word_range: Optional[Dict[str, int]] = None
@@ -434,7 +446,7 @@ def adapt_question_to_pcr(
         ),
         "options": copy.deepcopy(objective_options),
         "correct_answer": correct_answer or None,
-        "penalty_marks": max(0.0, penalty_marks),
+        "penalty_marks": penalty_marks,
         "complexity": complexity,
         "eval_template": eval_template,
         "max_marks": max_marks,
@@ -442,6 +454,7 @@ def adapt_question_to_pcr(
         "reference_solution": reference_solution or None,
         "rubric": rubric,
         "marking_criteria": copy.deepcopy(marking_criteria),
+        "assessment_units": copy.deepcopy(assessment_units),
         "method_policy": copy.deepcopy(method_policy),
         "marking_policy": copy.deepcopy(question_doc.get("marking_policy"))
         if isinstance(question_doc.get("marking_policy"), dict)

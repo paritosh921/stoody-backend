@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import math
 import re
+import hashlib
 from copy import deepcopy
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
 POLICY_VERSION = "criterion-rubric-v2"
 METHOD_POLICY_VERSION = "method-policy-v1"
+ASSESSMENT_UNIT_VERSION = "assessment-unit-v1"
 STRUCTURED_RUBRIC_MODE = "criterion_rubric_v1"
 LEGACY_AI_MODE = "legacy_ai_v1"
 MAX_AI_TEMPERATURE = 0.20
@@ -30,6 +32,10 @@ METHOD_POLICY_MODES = {
     SPECIFIED_METHOD_REQUIRED,
     NO_METHOD_REQUIRED,
 }
+
+POINT_BASED_SCORING = "point_based"
+HOLISTIC_BANDED_SCORING = "holistic_banded"
+SCORING_MODELS = {POINT_BASED_SCORING, HOLISTIC_BANDED_SCORING}
 
 
 # These are marking standards, not model-temperature aliases.  Temperature is
@@ -63,6 +69,25 @@ STRICTNESS_PROFILES: Dict[str, str] = {
 
 _CRITERION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MARK_TOLERANCE = 0.01
+
+
+def normalize_scoring_model(value: Any) -> str:
+    """Canonicalise how marks are divided inside one assessable response."""
+
+    raw = str(value or POINT_BASED_SCORING).strip().lower().replace("-", "_")
+    aliases = {
+        "atomic": POINT_BASED_SCORING,
+        "analytical": POINT_BASED_SCORING,
+        "criterion": POINT_BASED_SCORING,
+        "criteria": POINT_BASED_SCORING,
+        "holistic": HOLISTIC_BANDED_SCORING,
+        "banded": HOLISTIC_BANDED_SCORING,
+        "range": HOLISTIC_BANDED_SCORING,
+    }
+    model = aliases.get(raw, raw)
+    if model not in SCORING_MODELS:
+        raise ValueError("Scoring model must be point_based or holistic_banded")
+    return model
 
 
 def default_structured_marking_policy() -> Dict[str, Any]:
@@ -384,6 +409,223 @@ def validate_marking_criteria(
     return errors
 
 
+def normalize_assessment_units(
+    value: Any,
+    *,
+    assign_missing_ids: bool = True,
+) -> List[Dict[str, Any]]:
+    """Return canonical leaf-level scoring units for one displayed question.
+
+    A printed question may contain several separately answered and marked
+    subparts.  Keeping those leaves explicit prevents one broad rubric row from
+    hiding which subpart earned or lost marks while preserving the parent
+    question's display identity and total.
+    """
+
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Assessment units must be valid JSON") from exc
+    if not isinstance(value, list):
+        raise ValueError("Assessment units must be a list")
+
+    units: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for position, item in enumerate(value, start=1):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Assessment unit {position} must be an object")
+        unit_id = str(item.get("unit_id") or item.get("id") or "").strip()
+        if not unit_id and assign_missing_ids:
+            unit_id = f"unit_{position}"
+        if unit_id and not _CRITERION_ID_RE.fullmatch(unit_id):
+            raise ValueError(
+                f"Assessment unit {position} has an invalid id; use letters, numbers, _ or -"
+            )
+        if unit_id in seen_ids:
+            raise ValueError(f"Assessment unit ids must be unique ({unit_id})")
+        if unit_id:
+            seen_ids.add(unit_id)
+
+        label = str(item.get("label") or item.get("question_label") or "").strip()
+        prompt = str(
+            item.get("prompt")
+            or item.get("question_text")
+            or item.get("text")
+            or ""
+        ).strip()
+        reference_solution = str(
+            item.get("reference_solution")
+            or item.get("answer")
+            or item.get("solution")
+            or ""
+        ).strip()
+        if len(label) > 160:
+            raise ValueError(f"Assessment unit {position} label is too long")
+        if len(prompt) > 12000:
+            raise ValueError(f"Assessment unit {position} prompt is too long")
+        if len(reference_solution) > 24000:
+            raise ValueError(f"Assessment unit {position} reference solution is too long")
+
+        raw_marks = item.get("max_marks", item.get("marks", item.get("points", 0)))
+        try:
+            max_marks = float(raw_marks or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if not math.isfinite(max_marks):
+            raise ValueError(f"Assessment unit {position} has an invalid mark value")
+
+        figure_refs = item.get("figure_refs") or item.get("image_refs") or []
+        if not isinstance(figure_refs, list):
+            raise ValueError(f"Assessment unit {position} figure_refs must be a list")
+        normalized_refs = []
+        for ref in figure_refs[:20]:
+            value_text = str(ref or "").strip()
+            if value_text and value_text not in normalized_refs:
+                normalized_refs.append(value_text[:200])
+
+        units.append(
+            {
+                "version": ASSESSMENT_UNIT_VERSION,
+                "unit_id": unit_id,
+                "label": label or f"Part {position}",
+                "prompt": prompt,
+                "max_marks": round(max_marks, 2),
+                "scoring_model": normalize_scoring_model(item.get("scoring_model")),
+                "reference_solution": reference_solution,
+                "marking_criteria": normalize_marking_criteria(
+                    item.get("marking_criteria", item.get("criteria", [])),
+                    assign_missing_ids=assign_missing_ids,
+                ),
+                "method_policy": normalize_method_policy(item.get("method_policy")),
+                "figure_refs": normalized_refs,
+            }
+        )
+    return units
+
+
+def validate_assessment_units(
+    units: Iterable[Mapping[str, Any]],
+    question_max_marks: Any,
+    *,
+    require_reference_solution: bool = False,
+) -> List[str]:
+    """Validate the complete marks ledger below one displayed question."""
+
+    normalized = normalize_assessment_units(list(units), assign_missing_ids=False)
+    if not normalized:
+        return ["add at least one assessment unit"]
+    try:
+        question_marks = float(question_max_marks)
+    except (TypeError, ValueError):
+        question_marks = 0.0
+    if not math.isfinite(question_marks) or question_marks <= 0:
+        return ["assign question marks greater than zero before setting assessment units"]
+
+    errors: List[str] = []
+    unit_total = 0.0
+    seen_ids: set[str] = set()
+    for position, unit in enumerate(normalized, start=1):
+        unit_id = str(unit.get("unit_id") or "").strip()
+        label = str(unit.get("label") or f"Part {position}").strip()
+        if not unit_id:
+            errors.append(f"assessment unit {position}: missing unit id")
+        elif unit_id in seen_ids:
+            errors.append(f"assessment unit {position}: duplicate unit id {unit_id}")
+        seen_ids.add(unit_id)
+        if not str(unit.get("prompt") or "").strip():
+            errors.append(f"assessment unit {label}: missing prompt")
+        marks = float(unit.get("max_marks") or 0)
+        if marks <= 0:
+            errors.append(f"assessment unit {label}: assign marks greater than zero")
+        unit_total += marks
+        if require_reference_solution and not str(unit.get("reference_solution") or "").strip():
+            errors.append(f"assessment unit {label}: add a reference solution")
+        criterion_errors = validate_marking_criteria(
+            unit.get("marking_criteria") or [],
+            marks,
+            require_atomic=(unit.get("scoring_model") == POINT_BASED_SCORING),
+        )
+        errors.extend(f"assessment unit {label}: {error}" for error in criterion_errors)
+
+    if abs(unit_total - question_marks) > _MARK_TOLERANCE:
+        errors.append(
+            f"assessment unit marks total {unit_total:g}, but this question is worth {question_marks:g}"
+        )
+    return errors
+
+
+def _flattened_criterion_id(unit_id: str, criterion_id: str, used: set[str]) -> str:
+    raw = f"{unit_id}__{criterion_id}"
+    if len(raw) > 64:
+        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+        raw = f"{raw[:53]}_{suffix}"
+    candidate = raw
+    counter = 2
+    while candidate in used:
+        suffix = f"_{counter}"
+        candidate = f"{raw[:64-len(suffix)]}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def flatten_assessment_unit_criteria(value: Any) -> List[Dict[str, Any]]:
+    """Flatten child criteria for existing question-level grading consumers."""
+
+    units = normalize_assessment_units(value, assign_missing_ids=False)
+    flattened: List[Dict[str, Any]] = []
+    used_ids: set[str] = set()
+    single_unit = len(units) == 1
+    for unit in units:
+        label = str(unit.get("label") or "").strip()
+        for criterion in unit.get("marking_criteria") or []:
+            description = str(criterion.get("description") or "").strip()
+            evidence = str(criterion.get("acceptable_evidence") or "").strip()
+            flattened.append(
+                {
+                    "criterion_id": (
+                        str(criterion.get("criterion_id") or "criterion")
+                        if single_unit
+                        else _flattened_criterion_id(
+                            str(unit.get("unit_id") or "unit"),
+                            str(criterion.get("criterion_id") or "criterion"),
+                            used_ids,
+                        )
+                    ),
+                    "description": (
+                        description
+                        if single_unit
+                        else (f"[{label}] {description}" if label else description)
+                    ),
+                    "max_marks": float(criterion.get("max_marks") or 0),
+                    "acceptable_evidence": (
+                        evidence
+                        if single_unit
+                        else (f"[{label}] {evidence}" if label and evidence else evidence)
+                    ),
+                    "assessment_unit_id": unit.get("unit_id"),
+                    "assessment_unit_label": label,
+                    "scoring_model": unit.get("scoring_model"),
+                }
+            )
+    return flattened
+
+
+def compose_assessment_unit_reference_solution(value: Any) -> str:
+    units = normalize_assessment_units(value, assign_missing_ids=False)
+    if len(units) == 1:
+        return str(units[0].get("reference_solution") or "").strip()
+    sections = []
+    for unit in units:
+        solution = str(unit.get("reference_solution") or "").strip()
+        if solution:
+            sections.append(f"{unit.get('label')}: {solution}")
+    return "\n\n".join(sections)
+
+
 def snapshot_criteria(value: Any) -> List[Dict[str, Any]]:
     """Make an immutable copy of criteria after finalisation validation."""
 
@@ -394,3 +636,9 @@ def snapshot_method_policy(value: Any) -> Dict[str, Any]:
     """Make an immutable copy of a validated question method policy."""
 
     return deepcopy(normalize_method_policy(value))
+
+
+def snapshot_assessment_units(value: Any) -> List[Dict[str, Any]]:
+    """Freeze validated assessment units into an immutable paper snapshot."""
+
+    return deepcopy(normalize_assessment_units(value, assign_missing_ids=False))

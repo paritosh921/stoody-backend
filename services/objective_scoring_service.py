@@ -12,6 +12,7 @@ import math
 from typing import Any, Dict
 
 from services.answer_mapping_contract import normalize_answer_label
+from services.question_marking_contract import normalize_question_penalty
 
 
 class ObjectiveScoringContractError(ValueError):
@@ -40,7 +41,11 @@ def objective_penalty(question: Dict[str, Any]) -> float:
     value = question.get("penalty")
     if value in (None, ""):
         value = question.get("penalty_marks")
-    return round(max(0.0, _finite_number(value, default=1.0)), 2)
+    return normalize_question_penalty(
+        value,
+        question_type=question.get("question_type") or question.get("grading_mode") or "objective",
+        document_question_type=question.get("document_question_type"),
+    )
 
 
 def _is_numeric_answer(value: Any) -> bool:

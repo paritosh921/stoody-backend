@@ -58,10 +58,13 @@ from ..domain.content_classifier import compute_scoreable_marks
 from ..domain.response_models import ContentType, FlagSeverity, FlagType
 from ..marking_policy import (
     STRUCTURED_RUBRIC_MODE,
+    flatten_assessment_unit_criteria,
+    normalize_assessment_units,
     normalize_marking_criteria,
     normalize_marking_policy,
     strictness_instruction,
     validate_marking_criteria,
+    validate_assessment_units,
 )
 
 from .solution_cache import CacheLookupResult, SolutionCache
@@ -1330,7 +1333,37 @@ class EvalCore:
             marking_criteria = []
 
         if uses_structured_rubric:
-            criterion_errors = validate_marking_criteria(marking_criteria, max_marks)
+            assessment_units_invalid = False
+            try:
+                assessment_units = normalize_assessment_units(
+                    question_doc.get("assessment_units"),
+                    assign_missing_ids=False,
+                )
+            except (TypeError, ValueError):
+                assessment_units = []
+                assessment_units_invalid = True
+            criterion_errors = (
+                ["assessment-unit metadata is invalid"]
+                if assessment_units_invalid
+                else (
+                    validate_assessment_units(
+                        assessment_units,
+                        max_marks,
+                        require_reference_solution=True,
+                    )
+                    if assessment_units
+                    else validate_marking_criteria(marking_criteria, max_marks)
+                )
+            )
+            if assessment_units and not criterion_errors:
+                projected_criteria = normalize_marking_criteria(
+                    flatten_assessment_unit_criteria(assessment_units),
+                    assign_missing_ids=False,
+                )
+                if projected_criteria != marking_criteria:
+                    criterion_errors.append(
+                        "assessment-unit criteria projection is out of sync"
+                    )
             if criterion_errors:
                 message = "Locked marking rubric is invalid: " + "; ".join(criterion_errors)
                 logger.error("Question %s cannot be automatically marked: %s", question_id, message)

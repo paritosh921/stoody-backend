@@ -92,7 +92,7 @@ def test_subjective_activation_requires_uploaded_worked_solution_mapping():
 def test_key_only_pcr_draft_does_not_invent_a_worked_method():
     draft = _build_answer_key_pcr_marking_plan_draft(
         document={"pcr_marking_policy": {"mode": "criterion_rubric_v1"}},
-        question={"id": "q-1", "points": 4},
+        question={"id": "q-1", "text": "State the correct distance.", "points": 4},
         mapping={
             "answer_kind": "answer_key",
             "correct_answer_candidate": "B",
@@ -103,14 +103,14 @@ def test_key_only_pcr_draft_does_not_invent_a_worked_method():
     assert draft["reference_solution"] == "B. 420 m"
     assert draft["provider"] == "deterministic"
     assert draft["method_policy"]["mode"] == "no_method_required"
-    assert draft["marking_criteria"] == [
-        {
-            "criterion_id": "correct_answer",
-            "description": "Gives the correct answer: B - 420 m.",
-            "max_marks": 4.0,
-            "acceptable_evidence": (
-                "Accept B. 420 m, the equivalent option label B, or an equivalent "
-                "response with the same result."
-            ),
-        }
-    ]
+    assert len(draft["assessment_units"]) == 1
+    assert draft["assessment_units"][0]["reference_solution"] == "B. 420 m"
+    criterion = draft["marking_criteria"][0]
+    assert criterion["criterion_id"] == "correct_answer"
+    assert criterion["description"] == "Gives the correct answer: B - 420 m."
+    assert criterion["max_marks"] == 4.0
+    assert criterion["acceptable_evidence"] == (
+        "Accept B. 420 m, the equivalent option label B, or an equivalent "
+        "response with the same result."
+    )
+    assert criterion["assessment_unit_id"] == "unit_1"

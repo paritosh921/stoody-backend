@@ -29,6 +29,10 @@ from pymongo.errors import DuplicateKeyError
 from config_async import settings
 from core.upload_security.storage import safe_storage_segment
 from services.answer_mapping_contract import normalize_answer_label
+from services.question_marking_contract import (
+    normalize_question_penalty,
+    parse_question_penalty,
+)
 from utils.s3_storage import (
     PrivateObjectStorageError,
     download_file,
@@ -442,7 +446,30 @@ def _question_marking_criteria(question: Dict[str, Any]) -> List[Dict[str, Any]]
     if isinstance(raw_value, str) and not raw_value.lstrip().startswith("["):
         return []
     try:
-        return _marking_policy_module().normalize_marking_criteria(raw_value)
+        return _marking_policy_module().normalize_marking_criteria(
+            raw_value,
+            assign_missing_ids=False,
+        )
+    except ValueError:
+        return []
+
+
+def _raw_question_assessment_units(question: Dict[str, Any]) -> Any:
+    raw_value = question.get("assessment_units")
+    if raw_value is None and isinstance(question.get("metadata"), dict):
+        raw_value = question["metadata"].get("assessment_units")
+    return raw_value
+
+
+def _question_assessment_units(question: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_value = _raw_question_assessment_units(question)
+    if raw_value is None:
+        return []
+    try:
+        return _marking_policy_module().normalize_assessment_units(
+            raw_value,
+            assign_missing_ids=False,
+        )
     except ValueError:
         return []
 
@@ -583,6 +610,7 @@ def _content_hash(
                 "rubric": _question_rubric(question),
                 "reference_solution": _question_reference_solution(question),
                 "marking_criteria": _question_marking_criteria(question),
+                "assessment_units": _question_assessment_units(question),
                 "options": copy.deepcopy(question.get("options") or []),
                 "enhanced_options": copy.deepcopy(
                     question.get("enhanced_options") or []
@@ -591,9 +619,10 @@ def _content_hash(
                     question.get("correct_answer")
                     or question.get("correctAnswer")
                 ),
-                "penalty_marks": question.get(
-                    "penalty",
-                    question.get("penalty_marks"),
+                "penalty_marks": normalize_question_penalty(
+                    question.get("penalty", question.get("penalty_marks")),
+                    question_type=question.get("question_type"),
+                    document_question_type=document.get("question_type"),
                 ),
                 "expects_diagram": bool(question.get("has_diagram") or question.get("expects_diagram")),
             }
@@ -1053,13 +1082,12 @@ def validate_pcr_questions(
                 errors.append(
                     f"Q {label}: correct answer {correct_answer} is not one of the saved options"
                 )
-            raw_penalty = question.get("penalty", question.get("penalty_marks", 1))
             try:
-                penalty = float(raw_penalty)
-            except (TypeError, ValueError):
-                penalty = -1
-            if penalty < 0:
-                errors.append(f"Q {label}: negative marking must be zero or greater")
+                parse_question_penalty(
+                    question.get("penalty", question.get("penalty_marks")),
+                )
+            except ValueError as exc:
+                errors.append(f"Q {label}: invalid negative marking: {exc}")
             # Objective PCR does not need an AI rubric. The camera grader only
             # transcribes a selected option; the server applies the frozen key.
             continue
@@ -1077,6 +1105,31 @@ def validate_pcr_questions(
                 f"Q {label}: add an approved reference solution or marking rubric"
             )
         if uses_structured_criteria:
+            raw_assessment_units = _raw_question_assessment_units(question)
+            try:
+                assessment_units = policy_module.normalize_assessment_units(
+                    raw_assessment_units,
+                    assign_missing_ids=False,
+                )
+            except ValueError as exc:
+                errors.append(f"Q {label}: invalid assessment units: {exc}")
+                continue
+            if assessment_units:
+                unit_errors = policy_module.validate_assessment_units(
+                    assessment_units,
+                    _question_marks(question),
+                    require_reference_solution=True,
+                )
+                errors.extend(f"Q {label}: {error}" for error in unit_errors)
+                projected_criteria = policy_module.flatten_assessment_unit_criteria(
+                    assessment_units
+                )
+                saved_criteria = _question_marking_criteria(question)
+                if policy_module.snapshot_criteria(projected_criteria) != policy_module.snapshot_criteria(saved_criteria):
+                    errors.append(
+                        f"Q {label}: assessment-unit criteria projection is out of sync; save or regenerate the marking plan"
+                    )
+                continue
             try:
                 method_policy = _question_method_policy(question)
             except ValueError as exc:
@@ -1169,6 +1222,11 @@ async def create_paper_snapshot(
         # anonymous question after _id is removed.
         if source_question_id and not clean_question.get("id") and not clean_question.get("question_id"):
             clean_question["id"] = source_question_id
+        clean_question["penalty"] = normalize_question_penalty(
+            clean_question.get("penalty", clean_question.get("penalty_marks")),
+            question_type=clean_question.get("question_type"),
+            document_question_type=document.get("question_type"),
+        )
         if policy_module.is_structured_rubric_policy(marking_policy):
             # Snapshot exactly the validated criterion rows.  This prevents a
             # later authoring edit from changing a conducted sitting.
@@ -1178,6 +1236,11 @@ async def create_paper_snapshot(
             clean_question["method_policy"] = policy_module.snapshot_method_policy(
                 _question_method_policy(clean_question)
             )
+            assessment_units = _question_assessment_units(clean_question)
+            if assessment_units:
+                clean_question["assessment_units"] = (
+                    policy_module.snapshot_assessment_units(assessment_units)
+                )
         question_docs.append(
             {
                 "paper_version_id": paper_version_id,
@@ -1429,6 +1492,7 @@ async def snapshot_paper_to_session(
             pcr_doc["marking_policy"] = copy.deepcopy(marking_policy)
             pcr_doc["marking_criteria"] = _question_marking_criteria(raw_question)
             pcr_doc["method_policy"] = _question_method_policy(raw_question)
+            pcr_doc["assessment_units"] = _question_assessment_units(raw_question)
             if policy_module.is_structured_rubric_policy(marking_policy):
                 pcr_doc["evaluation_mode"] = policy_module.STRUCTURED_RUBRIC_MODE
             pcr_doc["question_text"] = _question_text(raw_question)

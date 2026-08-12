@@ -39,10 +39,13 @@ from ..marking_policy import (
     NO_METHOD_REQUIRED,
     SPECIFIED_METHOD_REQUIRED,
     method_policy_instruction,
+    flatten_assessment_unit_criteria,
+    normalize_assessment_units,
     normalize_marking_criteria,
     normalize_marking_policy,
     normalize_method_policy,
     strictness_instruction,
+    validate_assessment_units,
 )
 from ..storage.evaluation_repo import EvaluationRepository
 from ..storage.response_repo import DetectedResponseRepository
@@ -3860,6 +3863,16 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
     policy = _question_marking_policy(question)
     method_policy = _question_method_policy(question)
     objective = _is_objective_question(question)
+    assessment_units: List[Dict[str, Any]] = []
+    assessment_units_invalid = False
+    if not objective:
+        try:
+            assessment_units = normalize_assessment_units(
+                question.get("assessment_units"),
+                assign_missing_ids=False,
+            )
+        except (TypeError, ValueError):
+            assessment_units_invalid = True
     return {
         "question_number": _positive_int(question.get("question_number")),
         "question_id": str(question.get("question_id") or ""),
@@ -3872,6 +3885,8 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
             "" if objective else _reference_solution(question)[:5000]
         ),
         "marking_criteria": [] if objective else _criteria(question),
+        "assessment_units": assessment_units,
+        "assessment_units_invalid": assessment_units_invalid,
         "marking_policy": policy,
         "method_policy": method_policy,
         "method_standard": method_policy_instruction(method_policy),
@@ -3929,6 +3944,28 @@ def _validate_question_catalog(questions: List[Dict[str, Any]]) -> List[str]:
         if max_marks <= 0:
             errors.append(f"Q{number} has no positive maximum mark")
         criteria = _criteria(question)
+        assessment_units = _assessment_units(question)
+        if bool(question.get("assessment_units_invalid")):
+            errors.append(f"Q{number} has invalid assessment-unit metadata")
+        if assessment_units:
+            unit_errors = validate_assessment_units(
+                assessment_units,
+                max_marks,
+                require_reference_solution=True,
+            )
+            errors.extend(f"Q{number} {error}" for error in unit_errors)
+            projected_criteria = normalize_marking_criteria(
+                flatten_assessment_unit_criteria(assessment_units),
+                assign_missing_ids=False,
+            )
+            saved_criteria = normalize_marking_criteria(
+                criteria,
+                assign_missing_ids=False,
+            )
+            if projected_criteria != saved_criteria:
+                errors.append(
+                    f"Q{number} assessment-unit criteria projection is out of sync"
+                )
         criterion_ids = [item["criterion_id"] for item in criteria]
         if len(criterion_ids) != len(set(criterion_ids)):
             errors.append(f"Q{number} has duplicate locked criterion IDs")
@@ -3985,6 +4022,16 @@ def _criteria(question: Dict[str, Any]) -> List[Dict[str, Any]]:
             }
         )
     return criteria
+
+
+def _assessment_units(question: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        return normalize_assessment_units(
+            question.get("assessment_units"),
+            assign_missing_ids=False,
+        )
+    except (TypeError, ValueError):
+        return []
 
 
 def _semantic_grade_defects(

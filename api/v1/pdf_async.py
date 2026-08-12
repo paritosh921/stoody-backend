@@ -9,6 +9,8 @@ import asyncio
 import uuid
 import os
 import json
+import re
+import io
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -64,6 +66,11 @@ from services.extraction_validator import ExtractionValidator
 from services.full_document_extraction_validator import FullDocumentExtractionValidator
 from services.layout_preflight_service import LayoutPreflightService
 from services.option_layout_normalizer import OptionLayoutNormalizer
+from services.question_marking_contract import (
+    normalize_question_penalty,
+    parse_question_penalty,
+    supports_negative_marking,
+)
 from services.region_crop_service import RegionCropService
 from services.tally_question_map_service import build_tally_question_map
 
@@ -89,6 +96,16 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
 # and as primary for GPT Vision OCR fallback
 OCR_FALLBACK_MODEL = os.getenv("OCR_FALLBACK_MODEL", "gpt-5-mini")
 ANSWER_MAPPING_VISION_MODEL = os.getenv("ANSWER_MAPPING_VISION_MODEL", "gpt-5.4-mini")
+PCR_AUTHORING_VISION_MODEL = os.getenv(
+    "PCR_AUTHORING_VISION_MODEL",
+    ANSWER_MAPPING_VISION_MODEL,
+)
+
+_PCR_AUTHORING_VISUAL_HINT_RE = re.compile(
+    r"(?:!\[|<img\b|\b(?:diagram|figure|graph|chart|map|image|illustration)\b|"
+    r"\bshown\s+(?:above|below)\b|\bfollowing\s+(?:diagram|figure|graph|image)\b)",
+    re.IGNORECASE,
+)
 
 # IMPORTANT: Grade/Standard matching uses EXACT string matching
 # Both student.grade and document.standard should come from the same admin settings
@@ -119,7 +136,7 @@ class ExtractedQuestion(BaseModel):
     images: List[Dict[str, Any]] = []
     metadata: Dict[str, Any] = {}
     points: Optional[float] = 4.0  # Default 4 points for Test Series (JEE style)
-    penalty: Optional[float] = 1.0  # Default 1 penalty (JEE style)
+    penalty: Optional[float] = None  # Resolved from objective/subjective scoring semantics
 
 class PDFProcessingResult(BaseModel):
     job_id: str
@@ -176,7 +193,7 @@ class Question(BaseModel):
     correct_answer: Optional[str] = None
     metadata: Dict[str, Any] = {}
     points: Optional[float] = 4.0
-    penalty: Optional[float] = 1.0
+    penalty: Optional[float] = None
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Dependency to require admin access (regular or B2C)"""
@@ -253,6 +270,25 @@ def _is_reviewed_pcr_answer_mapping(mapping: Dict[str, Any]) -> bool:
             ).strip()
         )
     )
+
+
+def _pcr_marking_plan_source(
+    question: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+) -> tuple[str, str]:
+    """Resolve the explicit authoring source without requiring a mapping row."""
+
+    mapped_solution = str(
+        (mapping or {}).get("final_answer_text")
+        or (mapping or {}).get("answer_text")
+        or ""
+    ).strip()
+    if mapped_solution:
+        return mapped_solution, "accepted_mapping"
+    direct_reference = str(question.get("reference_solution") or "").strip()
+    if direct_reference:
+        return direct_reference, "saved_reference_solution"
+    return "", "ai_generated_from_question"
 
 
 async def _materialize_pcr_marking_plan(
@@ -2844,6 +2880,96 @@ async def generate_worked_solution_batch(
     }
 
 
+async def _refresh_pcr_authoring_package_status(
+    *,
+    db: DatabaseManager,
+    document: Dict[str, Any],
+    is_b2c: bool,
+) -> None:
+    """Recompute PCR package state after one question's marking plan changes."""
+
+    if str(document.get("exam_mode") or "").strip().lower() != "pcr":
+        return
+    document_id = str(document.get("document_id") or "").strip()
+    if not document_id:
+        return
+    questions = (
+        await db.b2c_find("questions", {"document_id": document_id})
+        if is_b2c
+        else await db.mongo_find("questions", {"document_id": document_id})
+    )
+    subjective_questions = [
+        question
+        for question in questions
+        if not _is_objective_question_type(
+            question.get("question_type") or document.get("question_type")
+        )
+    ]
+    if not subjective_questions:
+        return
+
+    from services.exampen_paper_service import validate_pcr_questions
+
+    marking_policy = _pcr_marking_policy_module().normalize_marking_policy(
+        document.get("pcr_marking_policy"),
+        default_structured=True,
+    )
+    ready_count = 0
+    failures: List[Dict[str, str]] = []
+    for question in subjective_questions:
+        errors = validate_pcr_questions([question], marking_policy=marking_policy)
+        if not errors:
+            ready_count += 1
+            continue
+        failures.append(
+            {
+                "questionId": str(question.get("id") or question.get("question_id") or ""),
+                "questionLabel": str(
+                    question.get("question_number")
+                    or question.get("extraction_order")
+                    or question.get("id")
+                    or ""
+                ),
+                "error": str(errors[0])[:1000],
+            }
+        )
+
+    total = len(subjective_questions)
+    all_ready = ready_count == total
+    status_update = {
+        "generated_solutions_status": (
+            "completed" if all_ready else ("partial" if ready_count else "not_generated")
+        ),
+        "generated_solutions_count": ready_count,
+        "generated_solutions_failed_count": len(failures),
+        "generated_solutions_completed_at": datetime.utcnow() if all_ready else None,
+        "generated_marking_plan_count": ready_count,
+        "generated_marking_plan_failed_count": len(failures),
+        "generated_marking_plan_failures": failures[:100],
+        "ai_grading_package_status": "ready_for_review" if all_ready else "partial",
+        "ai_grading_package_error": None if all_ready else failures[0]["error"],
+        "ai_grading_package_completed_at": datetime.utcnow() if all_ready else None,
+        "ai_grading_package_updated_at": datetime.utcnow(),
+    }
+    if is_b2c:
+        await db.b2c_update_one(
+            "documents",
+            {"document_id": document_id},
+            {"$set": status_update},
+        )
+    else:
+        await db.mongo_update_one(
+            "documents",
+            {"document_id": document_id},
+            {"$set": status_update},
+        )
+    await refresh_answer_solution_coverage(
+        db=db,
+        is_b2c=is_b2c,
+        document_id=document_id,
+    )
+
+
 async def generate_pcr_reference_answer_batch(
     *,
     questions: List[Dict[str, Any]],
@@ -2952,10 +3078,34 @@ async def generate_pcr_reference_answer_batch(
     }
 
 
+_PCR_MARKS_MULTIPLIER_RE = re.compile(
+    r"(?P<count>\d{1,2})\s*[x×]\s*(?P<each>\d+(?:\.\d+)?)\s*=\s*(?P<total>\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _expected_pcr_assessment_unit_count(question_text: str, question_marks: float) -> Optional[int]:
+    """Read an explicit N x marks ledger without guessing from answer labels."""
+
+    for match in _PCR_MARKS_MULTIPLIER_RE.finditer(str(question_text or "")):
+        count = int(match.group("count"))
+        each = float(match.group("each"))
+        declared_total = float(match.group("total"))
+        if (
+            1 < count <= 30
+            and abs(count * each - declared_total) <= 0.01
+            and abs(declared_total - float(question_marks or 0)) <= 0.01
+        ):
+            return count
+    return None
+
+
 def _parse_pcr_marking_plan_draft(
     raw_response: str,
     *,
     question_marks: float,
+    question_text: str = "",
+    available_figure_labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Parse and validate a non-persistent, teacher-reviewable rubric draft.
 
@@ -2976,35 +3126,97 @@ def _parse_pcr_marking_plan_draft(
     if not isinstance(payload, dict):
         raise ValueError("The AI returned an invalid marking-plan draft")
 
-    raw_criteria = payload.get("marking_criteria", payload.get("criteria", []))
     policy_module = _pcr_marking_policy_module()
+    raw_units = payload.get("assessment_units", payload.get("subquestions"))
     try:
-        criteria = policy_module.normalize_marking_criteria(raw_criteria, assign_missing_ids=True)
+        if raw_units is not None:
+            assessment_units = policy_module.normalize_assessment_units(
+                raw_units,
+                assign_missing_ids=True,
+            )
+        else:
+            # Backward-compatible one-unit response. Compound questions with an
+            # explicit marks formula are rejected below so they cannot silently
+            # collapse several assessable parts into one broad row.
+            raw_criteria = payload.get("marking_criteria", payload.get("criteria", []))
+            criteria = policy_module.normalize_marking_criteria(
+                raw_criteria,
+                assign_missing_ids=True,
+            )
+            reference_solution = str(
+                payload.get("reference_solution")
+                or payload.get("teacher_reference_solution")
+                or ""
+            ).strip()
+            method_policy = policy_module.normalize_method_policy(
+                payload.get("method_policy")
+            )
+            assessment_units = policy_module.normalize_assessment_units(
+                [
+                    {
+                        "unit_id": "unit_1",
+                        "label": "Whole question",
+                        "prompt": question_text or "Whole question",
+                        "max_marks": question_marks,
+                        "scoring_model": (
+                            policy_module.HOLISTIC_BANDED_SCORING
+                            if any(float(item.get("max_marks") or 0) > 1.0 for item in criteria)
+                            else policy_module.POINT_BASED_SCORING
+                        ),
+                        "reference_solution": reference_solution,
+                        "marking_criteria": criteria,
+                        "method_policy": method_policy,
+                    }
+                ],
+                assign_missing_ids=True,
+            )
     except ValueError as exc:
-        raise ValueError(f"The AI returned invalid criterion rows: {exc}") from exc
+        raise ValueError(f"The AI returned invalid assessment units: {exc}") from exc
 
-    reference_solution = str(
-        payload.get("reference_solution") or payload.get("teacher_reference_solution") or ""
-    ).strip()
-    try:
-        method_policy = policy_module.normalize_method_policy(
-            payload.get("method_policy")
-        )
-    except ValueError as exc:
-        raise ValueError(f"The AI returned an invalid method policy: {exc}") from exc
-    errors = policy_module.validate_marking_criteria(
-        criteria,
+    errors = policy_module.validate_assessment_units(
+        assessment_units,
         question_marks,
-        require_atomic=(
-            method_policy.get("mode") != policy_module.NO_METHOD_REQUIRED
-        ),
+        require_reference_solution=True,
     )
+    expected_unit_count = _expected_pcr_assessment_unit_count(
+        question_text,
+        question_marks,
+    )
+    if expected_unit_count and len(assessment_units) != expected_unit_count:
+        errors.append(
+            f"the question declares {expected_unit_count} separately marked parts, "
+            f"but the draft contains {len(assessment_units)} assessment units"
+        )
+    if available_figure_labels is not None:
+        allowed_figure_labels = {
+            str(label or "").strip().casefold(): str(label or "").strip()
+            for label in available_figure_labels
+            if str(label or "").strip()
+        }
+        for unit in assessment_units:
+            for figure_ref in unit.get("figure_refs") or []:
+                if str(figure_ref or "").strip().casefold() not in allowed_figure_labels:
+                    errors.append(
+                        f"assessment unit {unit.get('label')}: figure reference "
+                        f"{figure_ref!r} does not match an attached visual label"
+                    )
     if errors:
         raise ValueError("The AI draft needs regeneration: " + "; ".join(errors[:3]))
+    reference_solution = policy_module.compose_assessment_unit_reference_solution(
+        assessment_units
+    )
+    criteria = policy_module.flatten_assessment_unit_criteria(assessment_units)
+    method_policies = [unit.get("method_policy") for unit in assessment_units]
+    method_policy = (
+        method_policies[0]
+        if method_policies and all(item == method_policies[0] for item in method_policies)
+        else policy_module.default_method_policy()
+    )
     return {
         "reference_solution": reference_solution,
         "marking_criteria": criteria,
         "method_policy": method_policy,
+        "assessment_units": assessment_units,
     }
 
 
@@ -3045,20 +3257,6 @@ def _build_answer_key_pcr_marking_plan_draft(
         f"{f' {label}' if label else ''}, or an equivalent response with the same result."
     )
     policy_module = _pcr_marking_policy_module()
-    criteria = policy_module.normalize_marking_criteria(
-        [
-            {
-                "criterion_id": "correct_answer",
-                "description": description,
-                "max_marks": question_marks,
-                "acceptable_evidence": acceptable_evidence,
-            }
-        ],
-        assign_missing_ids=False,
-    )
-    errors = policy_module.validate_marking_criteria(criteria, question_marks)
-    if errors:
-        raise ValueError("Could not build the answer-key marking plan: " + "; ".join(errors))
     method_policy = policy_module.normalize_method_policy(
         {
             "mode": "no_method_required",
@@ -3066,14 +3264,47 @@ def _build_answer_key_pcr_marking_plan_draft(
             "allow_error_carried_forward": False,
         }
     )
+    assessment_units = policy_module.normalize_assessment_units(
+        [
+            {
+                "unit_id": "unit_1",
+                "label": "Whole question",
+                "prompt": str(question.get("question_text") or question.get("text") or "").strip(),
+                "max_marks": question_marks,
+                "scoring_model": policy_module.HOLISTIC_BANDED_SCORING,
+                "reference_solution": mapped_answer,
+                "marking_criteria": [
+                    {
+                        "criterion_id": "correct_answer",
+                        "description": description,
+                        "max_marks": question_marks,
+                        "acceptable_evidence": acceptable_evidence,
+                    }
+                ],
+                "method_policy": method_policy,
+            }
+        ],
+        assign_missing_ids=False,
+    )
+    errors = policy_module.validate_assessment_units(
+        assessment_units,
+        question_marks,
+        require_reference_solution=True,
+    )
+    if errors:
+        raise ValueError("Could not build the answer-key marking plan: " + "; ".join(errors))
+    criteria = policy_module.flatten_assessment_unit_criteria(assessment_units)
     authoring_policy = policy_module.normalize_marking_policy(
         document.get("pcr_marking_policy"),
         default_structured=True,
     )
     return {
-        "reference_solution": mapped_answer,
+        "reference_solution": policy_module.compose_assessment_unit_reference_solution(
+            assessment_units
+        ),
         "marking_criteria": criteria,
         "method_policy": method_policy,
+        "assessment_units": assessment_units,
         "provider": "deterministic",
         "model": "answer-key-v1",
         "strictness": authoring_policy.get("strictness") or "balanced",
@@ -3081,11 +3312,337 @@ def _build_answer_key_pcr_marking_plan_draft(
     }
 
 
+def _authoring_image_bytes_data_uri(data: bytes, content_type: str = "image/png") -> str:
+    """Validate and bound one raster before including it in an AI request."""
+
+    if not data:
+        raise ValueError("A PCR authoring image is empty")
+    if len(data) > 12 * 1024 * 1024:
+        raise ValueError("A PCR authoring image exceeds the 12 MB input limit")
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(data)) as opened:
+            width, height = opened.size
+            if not width or not height or width * height > 40_000_000:
+                raise ValueError("A PCR authoring image has unsafe dimensions")
+            opened.verify()
+        with Image.open(io.BytesIO(data)) as opened:
+            width, height = opened.size
+            if not width or not height or width * height > 40_000_000:
+                raise ValueError("A PCR authoring image has unsafe dimensions")
+            image = ImageOps.exif_transpose(opened)
+            image.load()
+            width, height = image.size
+            if max(width, height) > 2200:
+                image.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+
+            has_alpha = image.mode in {"RGBA", "LA"} or (
+                image.mode == "P" and "transparency" in image.info
+            )
+            if has_alpha:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                image = background
+
+            original_type = _authoring_image_media_type(data, content_type)
+            use_jpeg = original_type in {"image/jpeg", "image/webp"} or len(data) > 4 * 1024 * 1024
+            output = io.BytesIO()
+            if use_jpeg:
+                image.convert("RGB").save(output, format="JPEG", quality=88, optimize=True)
+                output_type = "image/jpeg"
+            else:
+                image.save(output, format="PNG", optimize=False, compress_level=6)
+                output_type = "image/png"
+            normalized = output.getvalue()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("A PCR authoring image is unreadable or is not a supported raster image") from exc
+
+    if len(normalized) > 8 * 1024 * 1024:
+        raise ValueError("A PCR authoring image is still too large after resizing")
+    return f"data:{output_type};base64,{base64.b64encode(normalized).decode('ascii')}"
+
+
+def _authoring_image_data_uri(value: Any, content_type: str = "image/png") -> Optional[str]:
+    """Normalize one trusted stored image value for a multimodal model call."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    safe_type = str(content_type or "image/png").strip().lower()
+    payload = raw
+    if raw.startswith("data:image/") and "," in raw:
+        header, payload = raw.split(",", 1)
+        if ";base64" not in header.lower():
+            raise ValueError("PCR authoring image data must use base64 encoding")
+        safe_type = header[5:].split(";", 1)[0].strip().lower()
+    elif raw.startswith("data:"):
+        raise ValueError("PCR authoring accepts image attachments only")
+    try:
+        data = base64.b64decode("".join(payload.split()), validate=True)
+    except Exception as exc:
+        raise ValueError("A PCR authoring image has invalid base64 data") from exc
+    return _authoring_image_bytes_data_uri(data, safe_type)
+
+
+def _authoring_image_media_type(data: bytes, hint: Optional[str] = None) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    candidate = str(hint or "").strip().lower()
+    return candidate if candidate.startswith("image/") else "image/png"
+
+
+async def _read_authoring_storage_bytes(storage_path: Any) -> Optional[bytes]:
+    raw_path = str(storage_path or "").strip()
+    if not raw_path:
+        return None
+    resolved_path = raw_path
+    if not raw_path.startswith("s3://") and not Path(raw_path).is_absolute():
+        resolved_path = get_absolute_path(raw_path)
+    try:
+        return await asyncio.wait_for(download_file(str(resolved_path)), timeout=20.0)
+    except asyncio.TimeoutError as exc:
+        raise ValueError("Timed out while loading PCR authoring visual evidence") from exc
+
+
+async def _resolve_authoring_image_ref(
+    ref: Any,
+    *,
+    gateway_context: Dict[str, Any],
+) -> Optional[str]:
+    """Resolve a question/solution image without fetching arbitrary remote URLs."""
+
+    if isinstance(ref, str):
+        raw_ref = ref.strip()
+        if raw_ref.startswith("data:image/") or len(raw_ref) > 512:
+            return await asyncio.to_thread(_authoring_image_data_uri, raw_ref)
+        ref = {"id": raw_ref}
+    if not isinstance(ref, dict):
+        return None
+
+    content_type = str(ref.get("content_type") or ref.get("mime_type") or "image/png")
+    for key in ("base64Data", "base64_data", "image_base64", "image_b64"):
+        if ref.get(key):
+            return await asyncio.to_thread(
+                _authoring_image_data_uri,
+                ref.get(key),
+                content_type,
+            )
+    if str(ref.get("type") or "").strip().lower() == "image" and ref.get("content"):
+        return await asyncio.to_thread(
+            _authoring_image_data_uri,
+            ref.get("content"),
+            content_type,
+        )
+
+    image_id = str(ref.get("image_id") or ref.get("id") or "").strip()
+    db_manager = gateway_context.get("db")
+    image_doc: Optional[Dict[str, Any]] = None
+    if image_id and db_manager is not None:
+        image_doc = (
+            await db_manager.b2c_find_one("images", {"_id": image_id})
+            if gateway_context.get("is_b2c")
+            else await db_manager.mongo_find_one("images", {"_id": image_id})
+        )
+    if image_doc:
+        image_content_type = str(image_doc.get("content_type") or content_type)
+        for key in ("base64Data", "base64_data", "image_base64", "image_b64"):
+            if image_doc.get(key):
+                return await asyncio.to_thread(
+                    _authoring_image_data_uri,
+                    image_doc.get(key),
+                    image_content_type,
+                )
+        stored = image_doc.get("file_path") or image_doc.get("storage_path")
+        data = await _read_authoring_storage_bytes(stored)
+        if data:
+            return await asyncio.to_thread(
+                _authoring_image_bytes_data_uri,
+                data,
+                image_content_type,
+            )
+
+    stored = ref.get("storage_path") or ref.get("file_path") or ref.get("path")
+    data = await _read_authoring_storage_bytes(stored)
+    if data:
+        return await asyncio.to_thread(
+            _authoring_image_bytes_data_uri,
+            data,
+            content_type,
+        )
+    return None
+
+
+def _question_visual_refs(question: Dict[str, Any]) -> List[tuple[str, Any]]:
+    refs: List[tuple[str, Any]] = []
+    for index, figure in enumerate(question.get("question_figures") or [], start=1):
+        if isinstance(figure, (dict, str)):
+            refs.append((f"Question figure {index}", figure))
+    for index, option in enumerate(question.get("enhanced_options") or [], start=1):
+        if isinstance(option, dict) and str(option.get("type") or "").lower() == "image":
+            label = str(option.get("label") or index)
+            refs.append((f"Question option {label}", option))
+    for index, image in enumerate(question.get("images") or [], start=1):
+        if isinstance(image, (dict, str)):
+            refs.append((f"Question image {index}", image))
+    return refs
+
+
+def _question_requires_visual_authoring(question: Dict[str, Any]) -> bool:
+    if _question_visual_refs(question):
+        return True
+    text = str(question.get("question_text") or question.get("text") or "")
+    return bool(_PCR_AUTHORING_VISUAL_HINT_RE.search(text))
+
+
+def _question_source_page_number(question: Dict[str, Any]) -> int:
+    try:
+        explicit = int(question.get("page_number") or 0)
+    except (TypeError, ValueError):
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    metadata = question.get("metadata") if isinstance(question.get("metadata"), dict) else {}
+    try:
+        # OCR metadata stores zero-based page indexes.
+        return int(metadata.get("page")) + 1
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _render_question_source_page(
+    *,
+    document: Dict[str, Any],
+    question: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """Render the canonical paper page when extracted image refs are incomplete."""
+
+    page_number = _question_source_page_number(question)
+    if page_number <= 0:
+        return None
+    pdf_bytes = await _read_authoring_storage_bytes(document.get("file_path"))
+    if not pdf_bytes:
+        return None
+
+    def _render() -> Optional[bytes]:
+        import fitz
+
+        pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if page_number > len(pdf):
+                return None
+            page = pdf[page_number - 1]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+            return pixmap.tobytes("png")
+        finally:
+            pdf.close()
+
+    try:
+        rendered = await asyncio.wait_for(asyncio.to_thread(_render), timeout=20.0)
+    except asyncio.TimeoutError as exc:
+        raise ValueError("Timed out while rendering the PCR question-paper page") from exc
+    if not rendered:
+        return None
+    return {
+        "label": f"Canonical question-paper page {page_number}",
+        "data_uri": f"data:image/png;base64,{base64.b64encode(rendered).decode('ascii')}",
+    }
+
+
+async def _build_pcr_authoring_visual_context(
+    *,
+    document: Dict[str, Any],
+    question: Dict[str, Any],
+    solution_images: Optional[List[Dict[str, Any]]],
+    gateway_context: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Load complete visual evidence or fail closed for a visual question."""
+
+    refs = _question_visual_refs(question)
+    solution_refs = [
+        (f"Teacher solution image {index}", image)
+        for index, image in enumerate(solution_images or [], start=1)
+        if isinstance(image, dict)
+    ]
+    resolved: List[Dict[str, str]] = []
+    unresolved_question_refs = 0
+    unresolved_solution_refs = 0
+    resolved_question_refs = 0
+    seen: set[str] = set()
+    for label, ref in [*refs, *solution_refs]:
+        try:
+            data_uri = await _resolve_authoring_image_ref(ref, gateway_context=gateway_context)
+        except Exception as exc:
+            logger.warning("Could not resolve PCR authoring image %s: %s", label, exc)
+            data_uri = None
+        if not data_uri:
+            if label.startswith("Teacher solution"):
+                unresolved_solution_refs += 1
+            else:
+                unresolved_question_refs += 1
+            continue
+        fingerprint = data_uri[-160:]
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        resolved.append({"label": label, "data_uri": data_uri})
+        if not label.startswith("Teacher solution"):
+            resolved_question_refs += 1
+
+    visual_question = _question_requires_visual_authoring(question)
+    if visual_question and (unresolved_question_refs or not resolved_question_refs):
+        page_render = await _render_question_source_page(document=document, question=question)
+        if page_render:
+            resolved.append(page_render)
+            resolved_question_refs += 1
+            unresolved_question_refs = 0
+
+    if unresolved_solution_refs:
+        raise ValueError(
+            "A teacher-solution image could not be loaded. Restore the image or enter its content as text before generating step marking."
+        )
+    if visual_question and not resolved_question_refs:
+        raise ValueError(
+            "This question depends on an image, but no readable visual evidence is available. Restore/crop the question image before generating step marking."
+        )
+    if unresolved_question_refs:
+        raise ValueError(
+            "One or more question images could not be loaded. Restore/crop them before generating step marking."
+        )
+    if len(resolved) > 12:
+        raise ValueError(
+            "This question has more than 12 visual attachments. Combine or remove duplicate images before generating step marking."
+        )
+    if sum(len(item["data_uri"]) for item in resolved) > 32 * 1024 * 1024:
+        raise ValueError(
+            "The visual evidence for this question is too large. Crop the images more tightly before generating step marking."
+        )
+    return resolved
+
+
+def _pcr_authoring_timeout_seconds() -> float:
+    try:
+        return max(15.0, min(240.0, float(os.getenv("PCR_AUTHORING_TIMEOUT_SECONDS", "90"))))
+    except (TypeError, ValueError):
+        return 90.0
+
+
 async def generate_pcr_marking_plan_draft(
     *,
     document: Dict[str, Any],
     question: Dict[str, Any],
     mapped_solution: Optional[str],
+    solution_images: Optional[List[Dict[str, Any]]] = None,
+    solution_image_notes: Optional[str] = None,
     gateway_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Ask the configured model for a *draft* criterion rubric.
@@ -3109,6 +3666,16 @@ async def generate_pcr_marking_plan_draft(
         raise ValueError("Set question marks before drafting marking criteria")
 
     mapped_solution_text = str(mapped_solution or "").strip()
+    visual_context = await _build_pcr_authoring_visual_context(
+        document=document,
+        question=question,
+        solution_images=solution_images,
+        gateway_context=gateway_context,
+    )
+    expected_unit_count = _expected_pcr_assessment_unit_count(
+        question_text,
+        question_marks,
+    )
     has_teacher_solution = bool(mapped_solution_text)
     source_instruction = (
         "Use the supplied teacher-uploaded worked solution as the authoritative reference answer."
@@ -3135,8 +3702,18 @@ async def generate_pcr_marking_plan_draft(
     )
     strictness = str(policy.get("strictness") or "balanced")
     temperature = 0.0
+    max_output_tokens = 8192 if expected_unit_count and expected_unit_count >= 4 else 4096
 
-    if GROQ_API_KEY:
+    if visual_context:
+        openai_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required to generate marking criteria for image-based PCR questions"
+            )
+        client = AsyncOpenAI(api_key=openai_key)
+        model = PCR_AUTHORING_VISION_MODEL
+        provider = "openai"
+    elif GROQ_API_KEY:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
@@ -3158,7 +3735,15 @@ async def generate_pcr_marking_plan_draft(
         "Treat the teacher's marking guidance as authoritative. Use the document subject, board or course, class or standard, difficulty, and question wording to infer the expected level and response type.\n"
         "For mathematics and science, reward correct results, valid reasoning, method steps, units, diagrams, and error-carried-forward only where they are relevant to the available marks. Accept equivalent valid methods unless the teacher or question requires a named method.\n"
         "For languages, humanities, essays, speeches, paragraphs, and other open responses, assess meaning rather than exact wording. Build criteria appropriate to the task, such as relevance and accuracy of ideas, organization, reasoning, evidence, language control, style, format, or creativity. Do not require the teacher answer's exact phrasing.\n"
-        "Create clear, independently assessable criterion rows using requirements supported by the teacher solution when supplied, otherwise by the generated reference answer. "
+        "First decompose the printed question into leaf ASSESSMENT UNITS: each unit must be something a student answers and receives its own stated marks for. Preserve printed labels such as 4(a)(i), 4(b), etc. Keep one unit only when the printed question is genuinely one assessable response. "
+        + (
+            f"The printed marks formula declares exactly {expected_unit_count} separately marked units; return exactly {expected_unit_count} assessment_units. "
+            if expected_unit_count
+            else "Infer the smallest defensible set of separately marked leaf units from the wording and mark allocation. "
+        )
+        + "The assessment-unit marks MUST sum exactly to the displayed question marks. Assign a visual only to the unit that actually depends on it; refer to attached visuals using their supplied labels in figure_refs. "
+        "For every unit, choose scoring_model=point_based for independently countable facts, steps, labels, results, or listed items; each point_based criterion must be worth at most 1 mark. Choose scoring_model=holistic_banded only for an indivisible quality range such as essay organization, language quality, creativity, or an integrated explanation; multi-mark criteria are allowed only there. "
+        "Create clear criterion rows using requirements supported by the teacher solution when supplied, otherwise by the generated reference answer. "
         "Do not automatically require method, intermediate work, and a final answer when the source or mark value does not require all three. "
         "Never make a criterion stricter than the teacher solution, and do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
         "Infer the method policy from the QUESTION wording and the marks actually allocated, not from the teacher's chosen worked route. Use any_valid_method by default. "
@@ -3166,7 +3751,7 @@ async def generate_pcr_marking_plan_draft(
         "A question that merely names an operation, calculation route, or tool is not enough when the completed result independently proves the awarded criteria. "
         "When specified_method_required is justified, copy the requirement into required_method and include explicit method-mark criteria. "
         "Use no_method_required when a result alone earns the available marks. Enable error-carried-forward unless the question or scheme clearly forbids it.\n"
-        f"The question is worth exactly {question_marks:g} marks. The sum of all criterion max_marks MUST be exactly {question_marks:g}.\n"
+        f"The displayed question is worth exactly {question_marks:g} marks. For every unit, criterion max_marks must sum to that unit's max_marks; all unit max_marks must sum to {question_marks:g}.\n"
         "For procedural mathematics and science, prefer independently assessable one-mark rows when the work genuinely contains distinct achievements. "
         "For open-ended language or humanities responses, use a small set of meaningful criteria and allow a criterion to carry multiple marks so teachers can award proportional credit. "
         "Do not split a holistic writing quality into artificial one-mark rows merely to satisfy a template.\n"
@@ -3174,10 +3759,10 @@ async def generate_pcr_marking_plan_draft(
         "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
         "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
-        '{"reference_solution":"teacher-ready cleaned solution", "method_policy":'
-        '{"mode":"any_valid_method","required_method":null,"allow_error_carried_forward":true}, "marking_criteria":['
-        '{"criterion_id":"criterion_1","description":"...","max_marks":1,"acceptable_evidence":"..."}'
-        "]}\n\n"
+        '{"assessment_units":[{"unit_id":"unit_1","label":"4(a)(i)","prompt":"leaf question text",'
+        '"max_marks":2,"scoring_model":"point_based","figure_refs":[],"reference_solution":"teacher-ready answer for this leaf",'
+        '"method_policy":{"mode":"any_valid_method","required_method":null,"allow_error_carried_forward":true},'
+        '"marking_criteria":[{"criterion_id":"criterion_1","description":"...","max_marks":1,"acceptable_evidence":"..."}]}]}\n\n'
         f"Document: {document.get('title') or document.get('document_id') or ''}\n"
         f"Subject: {question.get('subject') or document.get('subject') or 'General'}\n"
         f"Board/course: {document.get('course_plan') or document.get('board') or document.get('curriculum') or 'Not specified'}\n"
@@ -3186,17 +3771,41 @@ async def generate_pcr_marking_plan_draft(
         f"Teacher marking guidance: {question.get('rubric') or question.get('marking_guidance') or 'No additional guidance'}\n"
         f"Paper instructions: {document.get('instructions') or 'No additional instructions'}\n"
         f"Question marks: {question_marks:g}\n"
+        f"Available visual labels: {', '.join(item['label'] for item in visual_context) or 'None'}\n"
         "--- QUESTION ---\n"
         f"{question_text[:12000]}\n\n"
-        f"{solution_section}"
+        f"{solution_section}\n"
+        f"Teacher solution image notes: {str(solution_image_notes or '').strip() or 'None'}\n"
+        + (
+            "The attached images are authoritative visual parts of this exact question or teacher solution. "
+            "Read them directly; do not rely on OCR placeholders and do not borrow content from neighbouring questions."
+            if visual_context
+            else "No visual evidence is attached because this question is fully represented by text."
+        )
     )
 
+    message_content: Any = prompt
+    if visual_context:
+        content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for visual in visual_context:
+            content_parts.append({"type": "text", "text": visual["label"]})
+            content_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": visual["data_uri"], "detail": "high"},
+                }
+            )
+        message_content = content_parts
+
     async def _raw_call():
-        return await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=temperature,
-            max_completion_tokens=4096,
+        return await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": message_content}],
+                temperature=temperature,
+                max_completion_tokens=max_output_tokens,
+            ),
+            timeout=_pcr_authoring_timeout_seconds(),
         )
 
     gateway = AIGatewayService(
@@ -3212,15 +3821,111 @@ async def generate_pcr_marking_plan_draft(
         stage="pcr_marking_plan_draft",
         provider=provider,
         model=model,
-        input_kind="text",
-        estimated_input_tokens=estimate_text_tokens(prompt),
-        estimated_output_tokens=1200,
-        max_output_tokens=4096,
-        input_units={"questions": 1, "marks": question_marks},
+        input_kind="multimodal" if visual_context else "text",
+        estimated_input_tokens=(
+            estimate_text_tokens(prompt)
+            + (
+                estimate_ocr_tokens(
+                    image_bytes=sum(len(item["data_uri"]) * 3 // 4 for item in visual_context),
+                    page_count=len(visual_context),
+                )
+                if visual_context
+                else 0
+            )
+        ),
+        estimated_output_tokens=2400 if max_output_tokens > 4096 else 1200,
+        max_output_tokens=max_output_tokens,
+        input_units={
+            "questions": 1,
+            "marks": question_marks,
+            "images": len(visual_context),
+            "page_count": len(visual_context),
+        },
         call_fn=_raw_call,
     )
     raw_response = str(response.choices[0].message.content or "")
-    draft = _parse_pcr_marking_plan_draft(raw_response, question_marks=question_marks)
+    repair_attempted = False
+    try:
+        draft = _parse_pcr_marking_plan_draft(
+            raw_response,
+            question_marks=question_marks,
+            question_text=question_text,
+            available_figure_labels=[item["label"] for item in visual_context],
+        )
+    except ValueError as initial_error:
+        repair_attempted = True
+        repair_prompt = (
+            "Repair this PCR authoring JSON. Return the complete corrected JSON only.\n"
+            "Do not change the displayed question total, teacher solution facts, or visual interpretation. "
+            "Correct the assessment-unit hierarchy and marks ledger according to the validation error. "
+            "Point-based criteria may be worth at most 1 mark; holistic_banded may be multi-mark only for genuinely indivisible response quality.\n\n"
+            f"VALIDATION ERROR:\n{initial_error}\n\n"
+            f"QUESTION MARKS: {question_marks:g}\n"
+            f"EXPECTED UNIT COUNT: {expected_unit_count or 'infer from printed parts'}\n"
+            f"QUESTION:\n{question_text[:12000]}\n\n"
+            f"{solution_section}\n\n"
+            f"INVALID JSON:\n{raw_response[:24000]}"
+        )
+        repair_content: Any = repair_prompt
+        if visual_context:
+            repair_parts: List[Dict[str, Any]] = [
+                {"type": "text", "text": repair_prompt}
+            ]
+            for visual in visual_context:
+                repair_parts.append({"type": "text", "text": visual["label"]})
+                repair_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": visual["data_uri"], "detail": "high"},
+                    }
+                )
+            repair_content = repair_parts
+
+        async def _repair_call():
+            return await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": repair_content}],
+                    temperature=temperature,
+                    max_completion_tokens=max_output_tokens,
+                ),
+                timeout=_pcr_authoring_timeout_seconds(),
+            )
+
+        repair_response = await gateway.call(
+            user_id=str(gateway_context.get("user_id") or "unknown"),
+            tenant_id=gateway_context.get("tenant_id"),
+            document_id=gateway_context.get("document_id"),
+            region_id=gateway_context.get("region_id"),
+            region_scope="pcr_marking_plan_repair",
+            stage="pcr_marking_plan_repair",
+            provider=provider,
+            model=model,
+            input_kind="multimodal" if visual_context else "text",
+            estimated_input_tokens=estimate_text_tokens(repair_prompt),
+            estimated_output_tokens=2400 if max_output_tokens > 4096 else 1200,
+            max_output_tokens=max_output_tokens,
+            input_units={
+                "questions": 1,
+                "marks": question_marks,
+                "images": len(visual_context),
+                "page_count": len(visual_context),
+                "repair_attempt": 1,
+            },
+            call_fn=_repair_call,
+        )
+        repaired_raw_response = str(repair_response.choices[0].message.content or "")
+        try:
+            draft = _parse_pcr_marking_plan_draft(
+                repaired_raw_response,
+                question_marks=question_marks,
+                question_text=question_text,
+                available_figure_labels=[item["label"] for item in visual_context],
+            )
+        except ValueError as repair_error:
+            raise ValueError(
+                f"The AI marking plan remained invalid after one repair attempt: {repair_error}"
+            ) from repair_error
     if not draft["reference_solution"]:
         draft["reference_solution"] = mapped_solution.strip()
     draft.update(
@@ -3229,6 +3934,9 @@ async def generate_pcr_marking_plan_draft(
             "model": model,
             "strictness": strictness,
             "temperature": temperature,
+            "repair_attempted": repair_attempted,
+            "visual_evidence_count": len(visual_context),
+            "visual_evidence_labels": [item["label"] for item in visual_context],
         }
     )
     return draft
@@ -3743,7 +4451,11 @@ async def run_document_ocr_pipeline(
                     "is_image_based_mcq": question.metadata.get("is_image_based_mcq", False),
                     "metadata": question.metadata,
                     "points": question.points if hasattr(question, 'points') else 1.0,
-                    "penalty": question.penalty if hasattr(question, 'penalty') else 0.0,
+                    "penalty": normalize_question_penalty(
+                        question.penalty if hasattr(question, "penalty") else None,
+                        question_type=_default_extracted_question_type(document),
+                        document_question_type=document.get("question_type"),
+                    ),
                     "created_by": current_user.get("user_id"),
                     "created_at": datetime.utcnow()
                 }
@@ -3780,7 +4492,11 @@ async def run_document_ocr_pipeline(
                     "correct_answer": question.correct_answer,
                     "metadata": question.metadata,
                     "points": question.points if hasattr(question, 'points') else 1.0,
-                    "penalty": question.penalty if hasattr(question, 'penalty') else 0.0,
+                    "penalty": normalize_question_penalty(
+                        question.penalty if hasattr(question, "penalty") else None,
+                        question_type=_default_extracted_question_type(document),
+                        document_question_type=document.get("question_type"),
+                    ),
                     "created_by": current_user.get("user_id"),
                     "created_at": datetime.utcnow()
                 }
@@ -4847,13 +5563,18 @@ async def draft_pcr_marking_plan(
         ):
             mapping = effective_mapping
     else:
-        mapping = effective_mapping
-    if mapping is None:
+        mapping = (
+            effective_mapping
+            if effective_mapping is not None
+            and _is_reviewed_pcr_answer_mapping(effective_mapping)
+            else None
+        )
+    if mapping_id and mapping is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="No mapped teacher answer is available for this question",
+            detail="The selected teacher answer mapping no longer exists",
         )
-    if not _is_reviewed_pcr_answer_mapping(mapping):
+    if mapping is not None and not _is_reviewed_pcr_answer_mapping(mapping):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -4861,19 +5582,33 @@ async def draft_pcr_marking_plan(
                 "as a PCR marking-plan source"
             ),
         )
-    mapped_solution = str(
-        mapping.get("final_answer_text") or mapping.get("answer_text") or ""
-    ).strip()
-    if not mapped_solution:
+    direct_reference_solution = str(question.get("reference_solution") or "").strip()
+    mapped_solution, source_kind = _pcr_marking_plan_source(question, mapping)
+    uploaded_answer_source = bool(
+        document.get("answer_sheet_path")
+        or str(document.get("answer_solution_mode") or "").strip().lower() == "upload"
+    )
+    if mapping is None and not direct_reference_solution and uploaded_answer_source:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The selected mapped answer has no usable answer text",
+            detail=(
+                "Review and accept the uploaded teacher answer before generating its marking plan"
+                if effective_mapping is not None
+                else "Map or enter the uploaded teacher answer before generating its marking plan"
+            ),
         )
 
     try:
         if (
-            str(mapping.get("answer_kind") or "").lower() == "answer_key"
-            or str(mapping.get("mapping_strategy") or "").lower() == "answer_key"
+            mapping is not None
+            and (
+                str(mapping.get("answer_kind") or "").lower() == "answer_key"
+                or str(mapping.get("mapping_strategy") or "").lower() == "answer_key"
+            )
+            and _expected_pcr_assessment_unit_count(
+                str(question.get("question_text") or question.get("text") or ""),
+                float(question.get("points") or question.get("max_marks") or 0),
+            ) is None
         ):
             draft = _build_answer_key_pcr_marking_plan_draft(
                 document=document,
@@ -4885,6 +5620,8 @@ async def draft_pcr_marking_plan(
                 document=document,
                 question=question,
                 mapped_solution=mapped_solution,
+                solution_images=(mapping or {}).get("solution_images") or [],
+                solution_image_notes=(mapping or {}).get("solution_image_notes") or "",
                 gateway_context=_build_ai_gateway_context(
                     current_user=current_user,
                     db=db,
@@ -4894,6 +5631,11 @@ async def draft_pcr_marking_plan(
                     is_b2c=is_b2c,
                 ),
             )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="AI marking-plan generation timed out. Retry this question; no partial marking plan was saved.",
+        ) from exc
     except (ImportError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -4911,10 +5653,11 @@ async def draft_pcr_marking_plan(
     return {
         "document_id": document_id,
         "question_id": question_id,
-        "source_mapping": _serialize_answer_mapping(mapping),
+        "source_mapping": _serialize_answer_mapping(mapping) if mapping is not None else None,
+        "source_kind": source_kind,
         "draft": draft,
         "requires_teacher_review": True,
-        "message": "Draft created from the mapped answer. Review and save it before finalizing the paper.",
+        "message": "Draft created. Review and save it before finalizing the paper.",
     }
 
 
@@ -8387,6 +9130,14 @@ async def get_document_questions(
             # Map backend field names to frontend expected names
             if "text" in question_dict:
                 question_dict["question_text"] = question_dict["text"]
+            # Negative marking is an objective-scoring contract. Normalize
+            # legacy subjective records at the API boundary so every client
+            # sees the same zero-penalty semantics before a data migration.
+            question_dict["penalty"] = normalize_question_penalty(
+                question_dict.get("penalty", question_dict.get("penalty_marks")),
+                question_type=question_dict.get("question_type"),
+                document_question_type=document.get("question_type"),
+            )
 
             # === ENHANCED: Load base64 image data for question_figures ===
             enriched_figures = []
@@ -8638,11 +9389,14 @@ async def create_question(
     course_plan: str = Form(...),
     standard: str = Form(...),
     question_type: str = Form(default="mcq"),  # mcq or integer
+    points: float = Form(default=4.0, ge=0.0),
+    penalty: Optional[float] = Form(default=None, ge=0.0, le=50.0),
     evaluation_mode: str = Form(default="auto"),
     reference_solution: Optional[str] = Form(None),
     rubric: Optional[str] = Form(None),
     marking_criteria: Optional[str] = Form(None),
     method_policy: Optional[str] = Form(None),
+    assessment_units: Optional[str] = Form(None),
     document_id: Optional[str] = Form(None),
     options_data: str = Form(default="[]"),  # JSON string of options metadata (optional for integer type)
     question_image: Optional[UploadFile] = File(None),
@@ -8682,6 +9436,16 @@ async def create_question(
             policy_module = _pcr_marking_policy_module()
             normalized_marking_criteria = policy_module.normalize_marking_criteria(marking_criteria)
             normalized_method_policy = policy_module.normalize_method_policy(method_policy)
+            normalized_assessment_units = policy_module.normalize_assessment_units(
+                assessment_units,
+            )
+            if normalized_assessment_units:
+                normalized_marking_criteria = policy_module.flatten_assessment_unit_criteria(
+                    normalized_assessment_units
+                )
+                reference_solution = policy_module.compose_assessment_unit_reference_solution(
+                    normalized_assessment_units
+                )
         except (ImportError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -8731,6 +9495,13 @@ async def create_question(
             "rubric": (rubric or "").strip() or None,
             "marking_criteria": normalized_marking_criteria,
             "method_policy": normalized_method_policy,
+            "assessment_units": normalized_assessment_units,
+            "points": float(points),
+            "penalty": normalize_question_penalty(
+                penalty,
+                question_type=question_type,
+                document_question_type=(_doc or {}).get("question_type") if document_id else None,
+            ),
             "subject": subject,
             "difficulty": difficulty,
             "document_type": document_type,
@@ -8881,6 +9652,7 @@ async def update_question(
             )
 
         # Block edits if parent document is finalized for exam
+        _parent_doc = None
         _q_doc_id = existing_question.get("document_id")
         if _q_doc_id:
             _parent_doc = await (db.b2c_find_one("documents", {"document_id": _q_doc_id}) if is_b2c
@@ -8890,8 +9662,10 @@ async def update_question(
 
         # Update fields
         update_data = {}
+        submitted_assessment_units = None
         if "text" in question_data:
             update_data["text"] = question_data["text"]
+            update_data["question_text"] = question_data["text"]
         if "options" in question_data:
             update_data["options"] = question_data["options"]
         if "correct_answer" in question_data:
@@ -8917,6 +9691,63 @@ async def update_question(
                 update_data["method_policy"] = _pcr_marking_policy_module().normalize_method_policy(
                     question_data["method_policy"]
                 )
+            except (ImportError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+        if "assessment_units" in question_data:
+            try:
+                policy_module = _pcr_marking_policy_module()
+                normalized_units = policy_module.normalize_assessment_units(
+                    question_data["assessment_units"]
+                )
+                submitted_assessment_units = normalized_units
+                update_data["assessment_units"] = normalized_units
+                if normalized_units:
+                    # Assessment units are the authoring authority. Keep the
+                    # existing top-level fields as a compatibility projection
+                    # for current graders and legacy paper views.
+                    update_data["marking_criteria"] = (
+                        policy_module.flatten_assessment_unit_criteria(normalized_units)
+                    )
+                    update_data["reference_solution"] = (
+                        policy_module.compose_assessment_unit_reference_solution(normalized_units)
+                        or None
+                    )
+                    unit_policies = [item.get("method_policy") for item in normalized_units]
+                    if unit_policies and all(item == unit_policies[0] for item in unit_policies):
+                        update_data["method_policy"] = unit_policies[0]
+                    else:
+                        update_data["method_policy"] = policy_module.default_method_policy()
+                    effective_marks = question_data.get(
+                        "points",
+                        existing_question.get("points", existing_question.get("max_marks", 0)),
+                    )
+                    unit_errors = policy_module.validate_assessment_units(
+                        normalized_units,
+                        effective_marks,
+                        require_reference_solution=True,
+                    )
+                    if unit_errors:
+                        update_data["marking_plan_generation_status"] = "not_generated"
+                        update_data["marking_plan_generation_error"] = (
+                            "Assessment units need review: " + "; ".join(unit_errors[:3])
+                        )[:1000]
+                    else:
+                        update_data["marking_plan_generation_status"] = "completed"
+                        update_data["marking_plan_generation_error"] = None
+                        update_data["marking_plan_generation_contract"] = (
+                            "pcr-assessment-units-v1"
+                        )
+                elif existing_question.get("assessment_units"):
+                    update_data["marking_criteria"] = []
+                    update_data["reference_solution"] = None
+                    update_data["method_policy"] = policy_module.default_method_policy()
+                    update_data["marking_plan_generation_status"] = "not_generated"
+                    update_data["marking_plan_generation_error"] = (
+                        "Assessment units were removed; prepare and review a new marking plan"
+                    )
             except (ImportError, ValueError) as exc:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -9010,14 +9841,26 @@ async def update_question(
         if "points" in question_data:
             update_data["points"] = question_data["points"]
         if "penalty" in question_data:
-            # Validate penalty max 50
-            penalty = question_data["penalty"]
-            if penalty > 50:
+            raw_penalty = question_data["penalty"]
+            try:
+                validated_penalty = parse_question_penalty(
+                    raw_penalty,
+                    allow_missing=False,
+                )
+            except ValueError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Penalty cannot exceed 50 points"
-                )
-            update_data["penalty"] = penalty
+                    detail=str(exc),
+                ) from exc
+            update_data["penalty"] = normalize_question_penalty(
+                validated_penalty,
+                question_type=(
+                    question_data.get("question_type")
+                    or question_data.get("questionType")
+                    or existing_question.get("question_type")
+                ),
+                document_question_type=(_parent_doc or {}).get("question_type"),
+            )
         
         # Support question_type (mcq or integer) - accept both snake_case and camelCase
         question_type = question_data.get("question_type") or question_data.get("questionType")
@@ -9030,6 +9873,86 @@ async def update_question(
                     detail="DCR exam documents only allow Objective questions",
                 )
             update_data["question_type"] = question_type
+            if not supports_negative_marking(
+                question_type,
+                document_question_type=(_parent_doc or {}).get("question_type"),
+            ):
+                update_data["penalty"] = 0.0
+
+        structural_changed = False
+        if "text" in question_data:
+            current_text = str(
+                existing_question.get("question_text")
+                or existing_question.get("text")
+                or ""
+            ).strip()
+            structural_changed = str(question_data.get("text") or "").strip() != current_text
+        if "points" in question_data:
+            try:
+                structural_changed = structural_changed or abs(
+                    float(question_data.get("points") or 0)
+                    - float(existing_question.get("points") or existing_question.get("max_marks") or 0)
+                ) > 0.01
+            except (TypeError, ValueError):
+                structural_changed = True
+        incoming_question_type = question_data.get("question_type") or question_data.get("questionType")
+        if incoming_question_type is not None:
+            structural_changed = structural_changed or (
+                str(incoming_question_type or "").strip().lower()
+                != str(existing_question.get("question_type") or "").strip().lower()
+            )
+        if "question_figures" in question_data:
+            def _figure_identity(items: Any) -> List[str]:
+                if not isinstance(items, list):
+                    return []
+                return [
+                    str(
+                        item.get("id")
+                        or item.get("storage_path")
+                        or item.get("path")
+                        or item.get("url")
+                        or item.get("filename")
+                        or ""
+                    ).strip()
+                    for item in items
+                    if isinstance(item, dict)
+                ]
+
+            structural_changed = structural_changed or (
+                _figure_identity(question_data.get("question_figures"))
+                != _figure_identity(existing_question.get("question_figures"))
+            )
+        assessment_units_unchanged = submitted_assessment_units is None
+        if submitted_assessment_units is not None:
+            try:
+                assessment_units_unchanged = (
+                    _pcr_marking_policy_module().snapshot_assessment_units(
+                        submitted_assessment_units
+                    )
+                    == _pcr_marking_policy_module().snapshot_assessment_units(
+                        existing_question.get("assessment_units") or []
+                    )
+                )
+            except ValueError:
+                assessment_units_unchanged = False
+        if (
+            existing_question.get("assessment_units")
+            and structural_changed
+            and assessment_units_unchanged
+        ):
+            # Never leave a previously approved child marks ledger attached to
+            # question text, marks, or visuals that have since changed.
+            update_data.update(
+                {
+                    "assessment_units": [],
+                    "marking_criteria": [],
+                    "reference_solution": None,
+                    "marking_plan_generation_status": "not_generated",
+                    "marking_plan_generation_error": (
+                        "Question structure changed; regenerate and review the assessment units"
+                    ),
+                }
+            )
 
         # Add updated timestamp
         update_data["updated_at"] = datetime.utcnow()
@@ -9095,6 +10018,20 @@ async def update_question(
                         )
                     logger.info(f"Updated document {document_id} total_points to {total_points}")
 
+        if "assessment_units" in update_data and _parent_doc:
+            try:
+                await _refresh_pcr_authoring_package_status(
+                    db=db,
+                    document=_parent_doc,
+                    is_b2c=is_b2c,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Question %s was saved, but PCR package status refresh failed: %s",
+                    question_id,
+                    exc,
+                )
+
         return {
             "message": "Question updated successfully",
             "question_id": question_id
@@ -9129,29 +10066,62 @@ async def bulk_update_questions(
         if _parent_doc:
             _require_document_authoring_unlocked(_parent_doc)
 
-        # Build the $set update
+        # Build the shared fields. Penalty is normalized per question below
+        # because mixed papers may contain both objective and subjective rows.
         set_fields = {}
         if "points" in update_data:
             pts = update_data["points"]
             if not isinstance(pts, (int, float)) or pts < 0:
                 raise HTTPException(status_code=400, detail="points must be >= 0")
             set_fields["points"] = pts
+        requested_penalty = None
         if "penalty" in update_data:
             pen = update_data["penalty"]
-            if not isinstance(pen, (int, float)) or pen < 0:
-                raise HTTPException(status_code=400, detail="penalty must be >= 0")
-            set_fields["penalty"] = pen
+            try:
+                requested_penalty = parse_question_penalty(
+                    pen,
+                    allow_missing=False,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        if not set_fields:
+        if not set_fields and requested_penalty is None:
             raise HTTPException(status_code=400, detail="Provide at least one of: points, penalty")
 
         query = {"document_id": document_id}
-        if is_b2c:
-            # B2C has no update_many, loop through questions
-            all_qs = await db.b2c_find("questions", query)
+        all_qs = (
+            await db.b2c_find("questions", query)
+            if is_b2c
+            else await db.mongo_find("questions", query)
+        )
+        objective_penalty_updates = 0
+        subjective_penalty_resets = 0
+        if requested_penalty is not None or is_b2c:
             modified = 0
             for q in all_qs:
-                await db.b2c_update_one("questions", {"id": q["id"]}, {"$set": set_fields})
+                question_fields = dict(set_fields)
+                if requested_penalty is not None:
+                    objective = supports_negative_marking(
+                        q.get("question_type"),
+                        document_question_type=(_parent_doc or {}).get("question_type"),
+                    )
+                    question_fields["penalty"] = normalize_question_penalty(
+                        requested_penalty,
+                        question_type=q.get("question_type"),
+                        document_question_type=(_parent_doc or {}).get("question_type"),
+                    )
+                    if objective:
+                        objective_penalty_updates += 1
+                    elif float(q.get("penalty") or 0) != 0:
+                        subjective_penalty_resets += 1
+                if is_b2c:
+                    await db.b2c_update_one(
+                        "questions", {"id": q["id"]}, {"$set": question_fields}
+                    )
+                else:
+                    await db.mongo_update_one(
+                        "questions", {"id": q["id"]}, {"$set": question_fields}
+                    )
                 modified += 1
         else:
             result = await db.mongo_update_many("questions", query, {"$set": set_fields})
@@ -9173,7 +10143,12 @@ async def bulk_update_questions(
             "success": True,
             "message": f"Updated {modified} questions",
             "modified_count": modified,
-            "updated_fields": set_fields
+            "updated_fields": {
+                **set_fields,
+                **({"penalty": requested_penalty} if requested_penalty is not None else {}),
+            },
+            "objective_penalty_updated_count": objective_penalty_updates,
+            "subjective_penalty_reset_count": subjective_penalty_resets,
         }
     except HTTPException:
         raise
@@ -10517,6 +11492,7 @@ async def generate_document_solutions(
         generated_marking_plans = 0
         preserved_teacher_content = 0
         marking_plan_failed = 0
+        marking_plan_failures: List[Dict[str, str]] = []
         batch_size = max(1, min(20, int(generation_request.batchSize or 8)))
         # PCR authoring is handled below as one canonical operation per
         # question: generate the reference answer and its locked marking plan
@@ -10653,12 +11629,15 @@ async def generate_document_solutions(
                         document=document,
                         question=question,
                         mapped_solution=mapped_solution,
+                        solution_images=mapping.get("solution_images") or [],
+                        solution_image_notes=mapping.get("solution_image_notes") or "",
                         gateway_context=plan_context,
                     )
                     generated_reference = str(
                         plan_draft.get("reference_solution") or mapped_solution
                     ).strip()
                     generated_criteria = plan_draft.get("marking_criteria") or []
+                    generated_assessment_units = plan_draft.get("assessment_units") or []
                     reference_solution = (
                         existing_reference
                         if has_existing_reference and not may_replace_plan
@@ -10670,8 +11649,9 @@ async def generate_document_solutions(
                         else generated_criteria
                     )
                     if not reference_solution or not marking_criteria:
-                        marking_plan_failed += 1
-                        continue
+                        raise ValueError(
+                            "AI returned an incomplete marking plan. Retry this question; no partial plan was saved."
+                        )
 
                     if has_teacher_owned_plan_content:
                         preserved_teacher_content += 1
@@ -10684,16 +11664,23 @@ async def generate_document_solutions(
                             if question.get("method_policy") and not may_replace_plan
                             else plan_draft.get("method_policy") or {}
                         ),
+                        "assessment_units": (
+                            (question.get("assessment_units") or [])
+                            if has_existing_criteria and not may_replace_plan
+                            else generated_assessment_units
+                        ),
                         "marking_plan_source": (
                             "teacher_and_ai"
                             if has_teacher_owned_plan_content
                             else "ai_generated"
                         ),
                         "marking_plan_review_status": "needs_review",
-                        "marking_plan_generation_contract": package_version,
+                        "marking_plan_generation_contract": "pcr-assessment-units-v1",
                         "marking_plan_generator_provider": plan_draft.get("provider"),
                         "marking_plan_generator_model": plan_draft.get("model"),
                         "marking_plan_generated_at": datetime.utcnow(),
+                        "marking_plan_generation_status": "completed",
+                        "marking_plan_generation_error": None,
                         "updated_at": datetime.utcnow(),
                     }
                     question_query = {"document_id": document_id, "id": question_id}
@@ -10704,6 +11691,37 @@ async def generate_document_solutions(
                     generated_marking_plans += 1
                 except Exception as plan_error:
                     marking_plan_failed += 1
+                    failure_detail = str(plan_error).strip() or type(plan_error).__name__
+                    marking_plan_failures.append(
+                        {
+                            "questionId": question_id,
+                            "questionLabel": str(
+                                question.get("question_number")
+                                or question.get("extraction_order")
+                                or question_id
+                            ),
+                            "error": failure_detail[:1000],
+                        }
+                    )
+                    failure_update = {
+                        "marking_plan_generation_status": "error",
+                        "marking_plan_generation_error": failure_detail[:1000],
+                        "marking_plan_generation_failed_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow(),
+                    }
+                    question_query = {"document_id": document_id, "id": question_id}
+                    try:
+                        if is_b2c:
+                            await db.b2c_update_one("questions", question_query, {"$set": failure_update})
+                        else:
+                            await db.mongo_update_one("questions", question_query, {"$set": failure_update})
+                    except Exception as status_error:
+                        logger.warning(
+                            "Could not persist PCR marking-plan failure status for document=%s question=%s: %s",
+                            document_id,
+                            question_id,
+                            status_error,
+                        )
                     logger.warning(
                         "PCR marking-plan generation failed for document=%s question=%s: %s",
                         document_id,
@@ -10713,7 +11731,9 @@ async def generate_document_solutions(
 
         completed_update = {
             "answer_solution_mode": "auto",
-            "generated_solutions_status": "completed",
+            "generated_solutions_status": (
+                "partial" if is_pcr_authoring and marking_plan_failed else "completed"
+            ),
             "generated_solutions_completed_at": datetime.utcnow(),
             "generated_solutions_count": generated,
             "generated_solutions_manual_review_count": manual_review,
@@ -10735,6 +11755,7 @@ async def generate_document_solutions(
                     "generated_marking_plan_count": generated_marking_plans,
                     "preserved_marking_plan_count": preserved_teacher_content,
                     "generated_marking_plan_failed_count": marking_plan_failed,
+                    "generated_marking_plan_failures": marking_plan_failures[:100],
                 }
             )
         if is_b2c:
@@ -10758,10 +11779,29 @@ async def generate_document_solutions(
             "generatedMarkingPlans": generated_marking_plans,
             "preservedTeacherContent": preserved_teacher_content,
             "markingPlanFailed": marking_plan_failed,
+            "markingPlanFailures": marking_plan_failures,
             "packageStatus": package_status,
             "packageVersion": package_version,
         }
 
+    except asyncio.CancelledError:
+        cancelled_update = {
+            "generated_solutions_status": "error",
+            "generated_solutions_error": "PCR marking-plan generation was interrupted",
+        }
+        if is_pcr_authoring:
+            cancelled_update.update(
+                {
+                    "ai_grading_package_status": "error",
+                    "ai_grading_package_version": package_version,
+                    "ai_grading_package_error": "PCR marking-plan generation was interrupted",
+                }
+            )
+        if is_b2c:
+            await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": cancelled_update})
+        else:
+            await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": cancelled_update})
+        raise
     except HTTPException:
         raise
     except Exception as e:
@@ -11775,7 +12815,11 @@ async def process_regions_ocr(
                         "manual_review_required": bool(validation_result.get("manual_review_required")),
                     },
                     "points": parsed_question.points if parsed_question and parsed_question.points else 4.0,
-                    "penalty": parsed_question.penalty if parsed_question and parsed_question.penalty else 1.0,
+                    "penalty": normalize_question_penalty(
+                        parsed_question.penalty if parsed_question else None,
+                        question_type=_default_extracted_question_type(document),
+                        document_question_type=document.get("question_type"),
+                    ),
                     "created_by": current_user.get("user_id"),
                     "created_at": datetime.utcnow()
                 }
