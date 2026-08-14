@@ -219,6 +219,7 @@ async def test_student_copy_submission_derives_identity_and_queues_existing_pcr_
     assert upload_private.await_count == 1
     assert canonical_ingest.await_args.kwargs["student_id"] == "student-1"
     assert canonical_ingest.await_args.kwargs["admin_id"] == "admin-1"
+    assert canonical_ingest.await_args.kwargs["source"] == "camera"
     assert queue_processing.await_args.kwargs["student_id"] == "student-1"
 
     attempt = await db["exampen_student_copy_uploads"].find_one({"exam_id": "PCR-SELF-1"})
@@ -623,3 +624,73 @@ async def test_student_copy_uses_the_existing_canonical_pcr_ingest_records():
     assert submission["student_id"] == "student-1"
     assert submission["source"] == "camera"
     assert answer_page["raw_image_ref"] == "/private/student-answer-page-1.png"
+
+
+@pytest.mark.asyncio
+async def test_canonical_ingest_maps_student_web_channel_to_camera_source():
+    from api.v1.evalpen_student_submission_async import _canonical_ingest
+
+    db = _fresh_db()
+    result = await _canonical_ingest(
+        db,
+        exam_id="PCR-STUDENT-WEB-1",
+        student_id="rohan21",
+        admin_id="admin-1",
+        source="student_web",
+        pages=[
+            {
+                "page_number": 1,
+                "raw_strokes": None,
+                "raw_image_ref": "/private/rohan-answer-page-1.png",
+            }
+        ],
+    )
+
+    submission = await db["evalpen_submissions"].find_one({"submission_id": result.submission_id})
+    assert submission["source"] == "camera"
+    assert submission["student_id"] == "rohan21"
+
+
+@pytest.mark.asyncio
+async def test_ingest_failed_attempt_can_be_retried_and_is_visible_to_the_student():
+    from api.v1.evalpen_student_submission_async import (
+        _ensure_student_copy_indexes,
+        _reserve_student_copy_attempt,
+        list_answer_copy_options,
+    )
+
+    db = _fresh_db()
+    await _seed_self_submission_exam(db)
+    collection = db["exampen_student_copy_uploads"]
+    await _ensure_student_copy_indexes(collection)
+    await collection.insert_one(
+        {
+            "attempt_id": "attempt-ingest-failed",
+            "exam_id": "PCR-SELF-1",
+            "student_id": "student-1",
+            "status": "ingest_failed",
+            "page_count": 6,
+            "last_error": "'student_web' is not a valid ArtifactSource",
+        }
+    )
+
+    with patch(
+        "api.v1.evalpen_student_submission_async._get_tenant_db",
+        return_value=db,
+    ):
+        options = await list_answer_copy_options(current_user=_student_user(), db=None)
+
+    assert options.items[0].can_submit is True
+    assert options.items[0].submission.status == "ingest_failed"
+    assert options.items[0].answer_copy_available is False
+
+    retry_attempt = await _reserve_student_copy_attempt(
+        collection,
+        attempt_id="attempt-new-request",
+        exam_id="PCR-SELF-1",
+        student_id="student-1",
+        admin_id="admin-1",
+    )
+    assert retry_attempt == "attempt-ingest-failed"
+    reservation = await collection.find_one({"attempt_id": "attempt-ingest-failed"})
+    assert reservation["status"] == "receiving"

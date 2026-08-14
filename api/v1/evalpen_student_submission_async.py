@@ -323,9 +323,10 @@ async def _reserve_student_copy_attempt(
         existing,
         now=now,
     )
+    retryable_failed = existing_status in {"upload_failed", "ingest_failed"}
     if (
         existing
-        and (existing_status == "upload_failed" or stale_receiving)
+        and (retryable_failed or stale_receiving)
         and not existing.get("submission_id")
         and existing.get("attempt_id")
     ):
@@ -355,8 +356,6 @@ async def _reserve_student_copy_attempt(
 
     if existing and existing.get("submission_id"):
         detail = "A final answer copy has already been submitted for this exam"
-    elif existing and str(existing.get("status") or "") == "ingest_failed":
-        detail = "Your earlier copy needs teacher support before another final copy can be submitted"
     else:
         detail = "An answer-copy submission is already in progress. Please wait before trying again"
     raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -552,7 +551,12 @@ async def _canonical_ingest(
         "photographed_copy",
         "scan",
         "upload",
+        "student_web",
+        "student_mobile",
+        "student",
     }:
+        # PCR ingest only accepts ble_pen | camera. Student portal/app
+        # uploads are photographed or scanned copies of the same artifact.
         normalized_source = "camera"
 
     IngestService = load_exampen("ingest.service").IngestService
@@ -1151,8 +1155,22 @@ async def list_answer_copy_options(
                 can_submit = False
                 unavailable_reason = "Your answer copy is still being prepared. Please wait before trying again"
             elif attempt_status == "ingest_failed":
-                can_submit = False
-                unavailable_reason = "Your copy needs teacher support before another final copy can be submitted"
+                # No canonical submission was written, so the student may
+                # send another final copy. Surface the failed attempt so
+                # the library does not look like a successful submit.
+                can_submit = True
+                unavailable_reason = None
+                submission = StudentCopyStatus(
+                    status="ingest_failed",
+                    page_count=int((attempt or {}).get("page_count") or 0),
+                    submitted_at=_fmt(
+                        (attempt or {}).get("updated_at")
+                        or (attempt or {}).get("created_at")
+                    ),
+                )
+            elif attempt_status == "upload_failed":
+                can_submit = True
+                unavailable_reason = None
         items.append(
             StudentCopyExamOption(
                 exam_id=exam_id,
@@ -1629,7 +1647,7 @@ async def submit_answer_copy(
             exam_id=exam_id,
             student_id=student_id,
             admin_id=admin_id,
-            source="student_web",
+            source="camera",
             pages=[
                 {
                     "page_number": page["page_number"],

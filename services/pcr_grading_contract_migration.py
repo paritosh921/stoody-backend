@@ -11,10 +11,23 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from services.exampen_workflow import CAPABILITY_QUEUED_JOB_STATUS
 
-SOURCE_PROMPT_VERSION = "pcr-full-document-visual-v5"
-TARGET_PROMPT_VERSION = "pcr-full-document-visual-v6"
+
+V5_PROMPT_VERSION = "pcr-full-document-visual-v5"
+V6_PROMPT_VERSION = "pcr-full-document-visual-v6"
+V11_PROMPT_VERSION = "pcr-full-document-visual-v11"
+V12_PROMPT_VERSION = "pcr-full-document-visual-v12"
+# Backward-compatible exports used by the existing v5 migration CLI.
+SOURCE_PROMPT_VERSION = V5_PROMPT_VERSION
+TARGET_PROMPT_VERSION = V6_PROMPT_VERSION
 EVIDENCE_GRAPH_PAPER_VERSION = "canonical-full-document-visual-v2"
+PIPELINE_VERSION_BY_PROMPT = {
+    V5_PROMPT_VERSION: 2,
+    V6_PROMPT_VERSION: 2,
+    V11_PROMPT_VERSION: 3,
+    V12_PROMPT_VERSION: 3,
+}
 
 EXAMS_COLLECTION = "exampen_exams"
 SUBMISSIONS_COLLECTION = "evalpen_submissions"
@@ -23,7 +36,13 @@ GRADING_RUNS_COLLECTION = "evalpen_document_grading_runs"
 MIGRATIONS_COLLECTION = "exampen_grading_contract_migrations"
 PAPER_VERSIONS_COLLECTION = "exampen_paper_versions"
 
-ACTIVE_JOB_STATUSES = ("queued", "processing")
+ACTIVE_JOB_STATUSES = (
+    "queued",
+    "processing",
+    "retryable_error",
+    "enqueue_failed",
+    CAPABILITY_QUEUED_JOB_STATUS,
+)
 
 
 class GradingContractMigrationError(RuntimeError):
@@ -98,14 +117,16 @@ async def _validate_frozen_paper_version(
     return blockers
 
 
-async def inspect_v5_contracts(
+async def _inspect_contracts(
     tenant_db: Any,
     *,
     db_name: str,
+    source_prompt_version: str,
+    target_prompt_version: str,
     exam_id: str | None = None,
 ) -> list[dict[str, Any]]:
     query: dict[str, Any] = {
-        "pcr_grading_contract.prompt_version": SOURCE_PROMPT_VERSION,
+        "pcr_grading_contract.prompt_version": source_prompt_version,
     }
     if exam_id:
         query["exam_id"] = exam_id
@@ -160,8 +181,8 @@ async def inspect_v5_contracts(
                 "db_name": db_name,
                 "exam_id": current_exam_id,
                 "exam_name": exam.get("exam_name") or exam.get("title") or current_exam_id,
-                "source_prompt_version": SOURCE_PROMPT_VERSION,
-                "target_prompt_version": TARGET_PROMPT_VERSION,
+                "source_prompt_version": source_prompt_version,
+                "target_prompt_version": target_prompt_version,
                 "submission_count": submission_count,
                 "published_count": published_count,
                 "active_job_count": active_job_count,
@@ -173,12 +194,14 @@ async def inspect_v5_contracts(
     return plans
 
 
-async def migrate_v5_exam_to_v6(
+async def _migrate_exam_contract(
     tenant_db: Any,
     *,
     db_name: str,
     exam_id: str,
     requested_by: str,
+    source_prompt_version: str,
+    target_prompt_version: str,
 ) -> dict[str, Any]:
     """Migrate one complete unpublished cohort and queue exactly one new run per job."""
 
@@ -189,21 +212,27 @@ async def migrate_v5_exam_to_v6(
     contract = dict(exam.get("pcr_grading_contract") or {})
     current_version = str(contract.get("prompt_version") or "")
     migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
-    if current_version == TARGET_PROMPT_VERSION and migration_state.get("status") == "complete":
+    if current_version == target_prompt_version and migration_state.get("status") == "complete":
         return {
             "db_name": db_name,
             "exam_id": exam_id,
             "status": "already_migrated",
             "migration_id": migration_state.get("migration_id"),
         }
-    if current_version not in {SOURCE_PROMPT_VERSION, TARGET_PROMPT_VERSION}:
+    if current_version not in {source_prompt_version, target_prompt_version}:
         raise GradingContractMigrationError(
             f"Exam {exam_id} is locked to {current_version or 'no contract'}, not "
-            f"{SOURCE_PROMPT_VERSION}"
+            f"{source_prompt_version}"
         )
 
-    plans = await inspect_v5_contracts(tenant_db, db_name=db_name, exam_id=exam_id)
-    if current_version == SOURCE_PROMPT_VERSION:
+    plans = await _inspect_contracts(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        source_prompt_version=source_prompt_version,
+        target_prompt_version=target_prompt_version,
+    )
+    if current_version == source_prompt_version:
         if not plans:
             raise GradingContractMigrationError(
                 f"Exam {exam_id} no longer matches the expected source contract"
@@ -222,17 +251,37 @@ async def migrate_v5_exam_to_v6(
             )
 
     now = _utcnow()
-    migration_id = str(migration_state.get("migration_id") or f"PCR-MIG-{uuid4().hex}")
+    previous_migration_id = str(migration_state.get("migration_id") or "").strip()
+    migration_state_matches_pair = (
+        str(migration_state.get("source_prompt_version") or "")
+        == source_prompt_version
+        and str(migration_state.get("target_prompt_version") or "")
+        == target_prompt_version
+    )
+    migration_id = (
+        previous_migration_id
+        if migration_state_matches_pair and previous_migration_id
+        else f"PCR-MIG-{uuid4().hex}"
+    )
     audit = {
         "migration_id": migration_id,
         "db_name": db_name,
         "exam_id": exam_id,
-        "source_prompt_version": SOURCE_PROMPT_VERSION,
-        "target_prompt_version": TARGET_PROMPT_VERSION,
+        "source_prompt_version": source_prompt_version,
+        "target_prompt_version": target_prompt_version,
         "requested_by": requested_by,
-        "started_at": migration_state.get("started_at") or now,
+        "started_at": (
+            migration_state.get("started_at")
+            if migration_state_matches_pair and migration_state.get("started_at")
+            else now
+        ),
         "updated_at": now,
         "status": "applying",
+        **(
+            {"previous_migration_id": previous_migration_id}
+            if previous_migration_id and previous_migration_id != migration_id
+            else {}
+        ),
     }
     await tenant_db[MIGRATIONS_COLLECTION].update_one(
         {"migration_id": migration_id},
@@ -241,11 +290,11 @@ async def migrate_v5_exam_to_v6(
     )
 
     try:
-        if current_version == SOURCE_PROMPT_VERSION:
+        if current_version == source_prompt_version:
             migrated_contract = {
                 **contract,
-                "prompt_version": TARGET_PROMPT_VERSION,
-                "migrated_from": SOURCE_PROMPT_VERSION,
+                "prompt_version": target_prompt_version,
+                "migrated_from": source_prompt_version,
                 "migrated_at": now,
                 "migration_id": migration_id,
             }
@@ -254,15 +303,15 @@ async def migrate_v5_exam_to_v6(
                     "exam_id": exam_id,
                     "paper_version_id": exam.get("paper_version_id"),
                     "prepared_document_id": exam.get("prepared_document_id"),
-                    "pcr_grading_contract.prompt_version": SOURCE_PROMPT_VERSION,
+                    "pcr_grading_contract.prompt_version": source_prompt_version,
                 },
                 {
                     "$set": {
                         "pcr_grading_contract": migrated_contract,
                         "pcr_grading_contract_migration": {
                             "migration_id": migration_id,
-                            "source_prompt_version": SOURCE_PROMPT_VERSION,
-                            "target_prompt_version": TARGET_PROMPT_VERSION,
+                            "source_prompt_version": source_prompt_version,
+                            "target_prompt_version": target_prompt_version,
                             "requested_by": requested_by,
                             "started_at": now,
                             "status": "applying",
@@ -279,7 +328,7 @@ async def migrate_v5_exam_to_v6(
         superseded_runs = await tenant_db[GRADING_RUNS_COLLECTION].update_many(
             {
                 "exam_id": exam_id,
-                "prompt_version": SOURCE_PROMPT_VERSION,
+                "prompt_version": source_prompt_version,
                 "status": {"$ne": "superseded"},
             },
             {
@@ -299,11 +348,18 @@ async def migrate_v5_exam_to_v6(
             "reason": "grading_contract_migration",
             "migration_id": migration_id,
         }
+        target_pipeline_version = PIPELINE_VERSION_BY_PROMPT[target_prompt_version]
+        queued_status = (
+            CAPABILITY_QUEUED_JOB_STATUS
+            if target_pipeline_version >= 3
+            else "queued"
+        )
         queued_jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].update_many(
             {"exam_id": exam_id, "status": {"$nin": list(ACTIVE_JOB_STATUSES)}},
             {
                 "$set": {
-                    "status": "queued",
+                    "status": queued_status,
+                    "pipeline_version": target_pipeline_version,
                     "attempts": 0,
                     "queued_at": now,
                     "updated_at": now,
@@ -395,3 +451,73 @@ async def migrate_v5_exam_to_v6(
             },
         )
         raise
+
+
+async def inspect_v5_contracts(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect legacy v5 cohorts for the established v5-to-v6 migration."""
+
+    return await _inspect_contracts(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        source_prompt_version=V5_PROMPT_VERSION,
+        target_prompt_version=V6_PROMPT_VERSION,
+    )
+
+
+async def migrate_v5_exam_to_v6(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str,
+    requested_by: str,
+) -> dict[str, Any]:
+    return await _migrate_exam_contract(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        requested_by=requested_by,
+        source_prompt_version=V5_PROMPT_VERSION,
+        target_prompt_version=V6_PROMPT_VERSION,
+    )
+
+
+async def inspect_v11_contracts(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect cohorts that need the bounded whole-copy visual grader v12."""
+
+    return await _inspect_contracts(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        source_prompt_version=V11_PROMPT_VERSION,
+        target_prompt_version=V12_PROMPT_VERSION,
+    )
+
+
+async def migrate_v11_exam_to_v12(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str,
+    requested_by: str,
+) -> dict[str, Any]:
+    """Atomically migrate and requeue one complete unpublished v11 cohort."""
+
+    return await _migrate_exam_contract(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        requested_by=requested_by,
+        source_prompt_version=V11_PROMPT_VERSION,
+        target_prompt_version=V12_PROMPT_VERSION,
+    )

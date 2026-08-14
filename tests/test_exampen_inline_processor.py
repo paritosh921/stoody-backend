@@ -47,7 +47,7 @@ async def test_inline_processor_picks_up_durable_queued_job_from_active_tenant()
     ):
         assert db is tenant_db
         assert execution_token.startswith("inline:")
-        assert required_pipeline_version == 2
+        assert required_pipeline_version == 3
         called.append(job_id)
         return {"job_id": job_id, "status": "completed"}
 
@@ -90,7 +90,7 @@ async def test_inline_processor_does_not_schedule_same_job_twice_while_active():
         required_pipeline_version: int,
     ):
         assert execution_token.startswith("inline:")
-        assert required_pipeline_version == 2
+        assert required_pipeline_version == 3
         calls.append(job_id)
         started.set()
         await release.wait()
@@ -146,7 +146,7 @@ async def test_inline_processor_recovers_stalled_processing_job_and_retries_it()
         required_pipeline_version: int,
     ):
         assert execution_token.startswith("inline:")
-        assert required_pipeline_version == 2
+        assert required_pipeline_version == 3
         called.append(job_id)
         return {"job_id": job_id, "status": "completed"}
 
@@ -202,7 +202,7 @@ async def test_inline_processor_honors_durable_retry_schedule():
         required_pipeline_version: int,
     ):
         assert execution_token.startswith("inline:")
-        assert required_pipeline_version == 2
+        assert required_pipeline_version == 3
         called.append(job_id)
         return {"job_id": job_id, "status": "completed"}
 

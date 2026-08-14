@@ -277,6 +277,13 @@ async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping(
     class _FullDocError(RuntimeError):
         pass
 
+    class _ObjectiveGrader:
+        def __init__(self, _db, _gate):
+            pass
+
+        async def grade_submission(self, _submission_id: str):
+            return SimpleNamespace(handled=False)
+
     class _DocumentGrader:
         def __init__(self, _db, _gate):
             pass
@@ -290,6 +297,7 @@ async def test_visual_contract_cannot_silently_fall_back_to_ocr_mapping(
     def _load(name: str):
         if name == "pcr.services":
             return SimpleNamespace(
+                ObjectiveAnswerSheetGradingService=_ObjectiveGrader,
                 FullDocumentGradingService=_DocumentGrader,
                 FullDocumentGradingError=_FullDocError,
             )
@@ -341,6 +349,50 @@ async def test_worker_pipeline_contract_rejects_an_old_job_revision():
 
 
 @pytest.mark.asyncio
+async def test_v3_capability_queue_cannot_be_claimed_by_v2_worker():
+    from services.exampen_workflow import (
+        CAPABILITY_QUEUED_JOB_STATUS,
+        PROCESSING_JOBS_COLLECTION,
+        _claim_job,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-V3-FENCE",
+            "submission_id": "SUB-V3-FENCE",
+            "status": CAPABILITY_QUEUED_JOB_STATUS,
+            "pipeline_version": 3,
+            "attempts": 0,
+        }
+    )
+
+    stale_claim = await _claim_job(
+        db,
+        "pcr-job-V3-FENCE",
+        required_pipeline_version=2,
+    )
+
+    assert stale_claim is None
+    still_queued = await jobs.find_one({"job_id": "pcr-job-V3-FENCE"})
+    assert still_queued["status"] == CAPABILITY_QUEUED_JOB_STATUS
+    assert still_queued["attempts"] == 0
+
+    current_claim = await _claim_job(
+        db,
+        "pcr-job-V3-FENCE",
+        execution_token="v3-worker",
+        required_pipeline_version=3,
+    )
+
+    assert current_claim is not None
+    assert current_claim["status"] == "processing"
+    assert current_claim["lease_token"] == "v3-worker"
+    assert current_claim["attempts"] == 1
+
+
+@pytest.mark.asyncio
 async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatch):
     """A teacher retry must be a fresh, auditable mapping run, not a mutation race."""
     from services.exampen_workflow import (
@@ -384,15 +436,15 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
         reason="Run the full-document answer mapper again",
     )
 
-    assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1", 2)]
+    assert result["status"] == "queued_pipeline_v3"
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 3)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
     assert stored["segmentation"] == {}
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
-    assert stored["mapping_pipeline_version"] == "full-document-visual-v2"
+    assert stored["mapping_pipeline_version"] == "whole-copy-rubric-v3"
     assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
@@ -497,8 +549,8 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
         reason="Recover expired worker",
     )
 
-    assert result["status"] == "queued"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 2)]
+    assert result["status"] == "queued_pipeline_v3"
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 3)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored
@@ -647,7 +699,7 @@ async def test_concurrent_dispatch_reserves_job_once(monkeypatch):
         dispatch_processing_job(db, db_name="skb_test", job=dict(job)),
     )
 
-    assert task.calls == [("skb_test", "pcr-job-dispatch-once", 2)]
+    assert task.calls == [("skb_test", "pcr-job-dispatch-once", 3)]
 
 
 @pytest.mark.asyncio
@@ -694,11 +746,11 @@ async def test_reconciler_dispatches_only_due_retries(monkeypatch):
     result = await reconcile_processing_jobs(db, db_name="skb_test")
 
     assert result["pending"] == 1
-    assert task.calls == [("skb_test", "pcr-job-due", 2)]
+    assert task.calls == [("skb_test", "pcr-job-due", 3)]
     future = await jobs.find_one({"job_id": "pcr-job-future"})
     due = await jobs.find_one({"job_id": "pcr-job-due"})
     assert future["status"] == "retryable_error"
-    assert due["status"] == "queued"
+    assert due["status"] == "queued_pipeline_v3"
 
 
 @pytest.mark.asyncio
@@ -897,7 +949,7 @@ async def test_dispatch_without_redis_leaves_job_for_bounded_inline_processor(mo
         force=True,
     )
 
-    assert result["status"] == "queued"
+    assert result["status"] == "queued_pipeline_v3"
     assert "broker unavailable" in str(result.get("last_error") or "").lower()
 
 

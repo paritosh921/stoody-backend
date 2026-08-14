@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
+from services.exampen_workflow import public_processing_status
 from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
 
 logger = logging.getLogger(__name__)
@@ -453,7 +454,7 @@ def _processing_job_to_response(doc: Dict[str, Any]) -> ProcessingJobResponse:
         job_id=str(doc.get("job_id") or ""),
         submission_id=str(doc.get("submission_id") or ""),
         student_id=_fmt(doc.get("student_id")),
-        status=str(doc.get("status") or "queued"),
+        status=public_processing_status(doc.get("status") or "queued"),
         attempts=int(doc.get("attempts") or 0),
         last_error=_fmt(doc.get("last_error")),
         created_at=_fmt(doc.get("created_at")),

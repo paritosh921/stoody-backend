@@ -48,6 +48,7 @@ from services.exampen_submission_readiness import (
     readiness_message,
 )
 from services.evalpen_flag_utils import is_flag_resolved
+from services.exampen_workflow import public_processing_status
 
 logger = logging.getLogger(__name__)
 
@@ -1015,9 +1016,9 @@ async def list_exams(
                 needs_teacher_review = bool(action_codes) and action_codes.issubset(
                     reviewable_codes
                 )
-                processing_status = str(
+                processing_status = public_processing_status(
                     (jobs_by_sub.get(sub_id) or {}).get("status") or ""
-                ).lower()
+                )
                 job_needs_attention = processing_status in {
                     "failed",
                     "retryable_error",
@@ -1323,7 +1324,7 @@ async def get_exam_queue(
             submission_source = str(sub.get("source") or "") or None
             processing_job = jobs_by_sub.get(sub_id)
             processing_status = (
-                str(processing_job.get("status") or "")
+                public_processing_status(processing_job.get("status") or "")
                 if processing_job
                 else None
             )

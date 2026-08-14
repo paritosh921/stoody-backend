@@ -13,6 +13,8 @@ Hard constraint : C4 — All LLM calls through the gate.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -20,6 +22,24 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+def _structured_output_schema_name(json_schema: Dict[str, Any]) -> str:
+    """Return a provider-safe identity unique to the exact strict schema.
+
+    The Responses API may cache compiled structured-output grammars by name.
+    Reusing one constant name for grading, objective extraction, and successive
+    contract schemas can therefore apply a stale grammar to a new request.
+    A canonical schema digest makes the identity content-addressed.
+    """
+
+    encoded = json.dumps(
+        json_schema,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "exam_document_" + hashlib.sha256(encoded).hexdigest()[:24]
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +412,7 @@ async def _call_openai_responses(
         payload["text"] = {
             "format": {
                 "type": "json_schema",
-                "name": "exam_document_evidence_ledger",
+                "name": _structured_output_schema_name(json_schema),
                 "strict": True,
                 "schema": json_schema,
             }

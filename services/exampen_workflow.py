@@ -18,8 +18,14 @@ logger = logging.getLogger(__name__)
 
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
-DISPATCHABLE_JOB_STATUSES = {"queued", "retryable_error", "enqueue_failed"}
-CURRENT_PCR_PIPELINE_VERSION = 2
+CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v3"
+DISPATCHABLE_JOB_STATUSES = {
+    "queued",
+    "retryable_error",
+    "enqueue_failed",
+    CAPABILITY_QUEUED_JOB_STATUS,
+}
+CURRENT_PCR_PIPELINE_VERSION = 3
 FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
@@ -80,6 +86,34 @@ class ProcessingJobBusyError(RuntimeError):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _queued_status_for_pipeline(pipeline_version: Any) -> str:
+    """Keep new-contract work invisible to pre-v3 workers during rollout."""
+
+    try:
+        version = int(pipeline_version or 0)
+    except (TypeError, ValueError):
+        version = 0
+    return CAPABILITY_QUEUED_JOB_STATUS if version >= 3 else "queued"
+
+
+def _retryable_status_for_pipeline(pipeline_version: Any) -> str:
+    """Preserve legacy retry semantics while fencing v3 work from old workers."""
+
+    queued_status = _queued_status_for_pipeline(pipeline_version)
+    return (
+        CAPABILITY_QUEUED_JOB_STATUS
+        if queued_status == CAPABILITY_QUEUED_JOB_STATUS
+        else "retryable_error"
+    )
+
+
+def public_processing_status(status: Any) -> str:
+    """Expose capability-fenced queued work through the stable API status."""
+
+    normalized = str(status or "").strip().lower()
+    return "queued" if normalized == CAPABILITY_QUEUED_JOB_STATUS else normalized
 
 
 def _job_id(submission_id: str) -> str:
@@ -240,7 +274,9 @@ async def ensure_processing_job(
                 "db_name": db_name,
                 "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
                 "required_processing_path": required_processing_path,
-                "status": "queued",
+                "status": _queued_status_for_pipeline(
+                    CURRENT_PCR_PIPELINE_VERSION
+                ),
                 "attempts": 0,
                 "lease_generation": 0,
                 "created_at": now,
@@ -288,11 +324,14 @@ async def dispatch_processing_job(
         queue_filter["enqueue_attempted_at"] = {"$exists": False}
     else:
         queue_filter["enqueue_attempted_at"] = job["enqueue_attempted_at"]
+    capability_status = _queued_status_for_pipeline(
+        CURRENT_PCR_PIPELINE_VERSION
+    )
     queued = await jobs.update_one(
         queue_filter,
         {
             "$set": {
-                "status": "queued",
+                "status": capability_status,
                 "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
                 "required_processing_path": required_processing_path,
                 "db_name": db_name,
@@ -315,7 +354,7 @@ async def dispatch_processing_job(
         # configured concurrency limit and strand a ``processing`` lease when
         # the API reloads or exits.
         await jobs.update_one(
-            {"job_id": job_id, "status": "queued"},
+            {"job_id": job_id, "status": capability_status},
             {
                 "$set": {
                     "last_error": (
@@ -347,7 +386,7 @@ async def dispatch_processing_job(
             # If the worker claimed the job before the broker client raised,
             # preserve the worker state rather than overwriting it with an
             # enqueue error.
-            {"job_id": job_id, "status": "queued"},
+            {"job_id": job_id, "status": capability_status},
             {
                 "$set": {
                     "status": "enqueue_failed",
@@ -461,7 +500,9 @@ async def reprocess_processing_job(
         reset_filter,
         {
             "$set": {
-                "status": "queued",
+                "status": _queued_status_for_pipeline(
+                    CURRENT_PCR_PIPELINE_VERSION
+                ),
                 "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
                 "required_processing_path": required_processing_path,
                 "db_name": db_name,
@@ -471,7 +512,7 @@ async def reprocess_processing_job(
                 "reprocess_requested_at": now,
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": "full-document-rubric-v3",
+                "mapping_pipeline_version": "whole-copy-rubric-v3",
                 "attempts": 0,
                 "updated_at": now,
             },
@@ -558,20 +599,44 @@ async def recover_stale_processing_jobs(
             },
         },
     )
-    retry_result = await jobs.update_many(
+    retryable_attempt_predicate = {
+        "$or": [
+            {"attempts": {"$lt": PROCESSING_MAX_AUTOMATIC_ATTEMPTS}},
+            {"attempts": {"$exists": False}},
+        ]
+    }
+    current_retry_result = await jobs.update_many(
         {
             "$and": [
                 *stale_predicates,
-                {
-                    "$or": [
-                        {
-                            "attempts": {
-                                "$lt": PROCESSING_MAX_AUTOMATIC_ATTEMPTS
-                            }
-                        },
-                        {"attempts": {"$exists": False}},
-                    ]
-                },
+                retryable_attempt_predicate,
+                {"pipeline_version": {"$gte": 3}},
+            ]
+        },
+        {
+            "$set": {
+                "status": CAPABILITY_QUEUED_JOB_STATUS,
+                "last_error": (
+                    "Processing worker heartbeat stopped; queued for automatic recovery"
+                ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "next_retry_at": recovered_at
+                + timedelta(seconds=PROCESSING_RETRY_BASE_SECONDS),
+                "stale_worker_recovered_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
+        },
+    )
+    legacy_retry_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                retryable_attempt_predicate,
             ]
         },
         {
@@ -618,7 +683,8 @@ async def recover_stale_processing_jobs(
     )
     return int(
         exhausted_result.modified_count
-        + retry_result.modified_count
+        + current_retry_result.modified_count
+        + legacy_retry_result.modified_count
         + malformed_result.modified_count
     )
 
@@ -673,7 +739,11 @@ async def reconcile_processing_jobs(
             db_name=db_name,
             job=job,
         )
-        if updated.get("status") in {"queued", "processing"}:
+        if updated.get("status") in {
+            "queued",
+            CAPABILITY_QUEUED_JOB_STATUS,
+            "processing",
+        }:
             dispatched += 1
 
     return {
@@ -871,7 +941,7 @@ async def process_pcr_processing_job(
     # transcribes only student selections and never receives the answer key;
     # immutable server code applies positive/negative marking afterwards.
     # Subjective, integer-answer, and mixed papers explicitly decline this lane
-    # and continue through the full-document evidence graph unchanged.
+    # and continue through the bounded whole-copy visual grader unchanged.
     pcr_services = load_exampen("pcr.services")
     LLMGate = load_exampen("llm_gate").LLMGate
     visual_gate = LLMGate(tenant_db)
@@ -1469,11 +1539,19 @@ async def mark_processing_job_retryable_error(
         # Legacy callers have no ownership proof. They may update an idle job,
         # but must never fence out an active worker.
         query["status"] = {"$ne": "processing"}
+    job = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one(
+        query,
+        {"pipeline_version": 1},
+    )
+    if job is None:
+        return False
     result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
         query,
         {
             "$set": {
-                "status": "retryable_error",
+                "status": _retryable_status_for_pipeline(
+                    job.get("pipeline_version")
+                ),
                 "last_error": _short_error(error),
                 "updated_at": _now(),
             },
@@ -1547,7 +1625,9 @@ async def record_processing_job_failure(
         next_retry_at = now + timedelta(seconds=retry_delay)
         update = {
             "$set": {
-                "status": "retryable_error",
+                "status": _retryable_status_for_pipeline(
+                    job.get("pipeline_version")
+                ),
                 "last_error": error_text,
                 "failure_code": failure_code,
                 "next_retry_at": next_retry_at,
@@ -1559,7 +1639,7 @@ async def record_processing_job_failure(
                 "finished_at": "",
             },
         }
-        status = "retryable_error"
+        status = _retryable_status_for_pipeline(job.get("pipeline_version"))
 
     result = await jobs.update_one(query, update)
     return {

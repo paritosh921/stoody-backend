@@ -1,9 +1,10 @@
 """Submission-level visual grading for PCR answer copies.
 
 This is the primary camera/PDF path for papers where handwriting, diagrams,
-tables, and answer ownership cannot safely be reduced to OCR text first.  One
-GPT-5 Responses request receives the immutable question paper, the teacher's
-uploaded solution document (when present), and every canonical student page.
+tables, and answer ownership cannot safely be reduced to OCR text first. One
+whole-copy request receives the immutable question paper, teacher solution
+(when present), and every unaltered student page. At most one bounded recovery
+request rechecks only genuinely unresolved questions.
 
 Deterministic code does not decide what the handwriting means.  It validates
 the model's evidence ledger against immutable question IDs, page bounds, and
@@ -32,12 +33,10 @@ from services.objective_scoring_service import (
     ObjectiveScoringContractError,
     score_objective_response,
 )
+from services.page_orientation import detect_sideways_page
 
 from ..domain.response_models import ContentType
 from ..marking_policy import (
-    ANY_VALID_METHOD,
-    NO_METHOD_REQUIRED,
-    SPECIFIED_METHOD_REQUIRED,
     method_policy_instruction,
     flatten_assessment_unit_criteria,
     normalize_assessment_units,
@@ -50,28 +49,14 @@ from ..marking_policy import (
 from ..storage.evaluation_repo import EvaluationRepository
 from ..storage.response_repo import DetectedResponseRepository
 from .ocr_service import AssetIntegrityError, _resolve_image_base64
-from .visual_evidence_graph import (
-    EVIDENCE_GRAPH_VERSION,
-    PROMPT_VERSION as _EVIDENCE_GRAPH_PROMPT_VERSION,
-    evidence_mapping_schema,
-    grading_system_instructions,
-    mapping_system_instructions,
-    merge_mapping_and_grading,
-    question_grading_schema,
-    validate_mapping_payload,
-)
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_VERSION = "pcr-full-document-visual-v4"
-_SUPPORTED_PROMPT_VERSIONS = {_PROMPT_VERSION, _EVIDENCE_GRAPH_PROMPT_VERSION}
+_PROMPT_VERSION = "pcr-full-document-visual-v12"
+_SUPPORTED_PROMPT_VERSIONS = {_PROMPT_VERSION}
 _RUNS_COLLECTION = "evalpen_document_grading_runs"
 _PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 _CALLER_ID = "pcr_eval_core"
-_AUTO_ACCEPT_CONFIDENCE = 0.80
-_ABSENCE_CONFIDENCE = 0.85
-_CRITERION_AUTO_ACCEPT_CONFIDENCE = 0.85
-_CRITERION_MIN_SCORE_CONFIDENCE = 0.65
 _DEFAULT_REASONING_EFFORT = "medium"
 _MAX_PAGE_COUNT = 50
 _MAX_STATIC_PDF_BYTES = 45 * 1024 * 1024
@@ -100,58 +85,31 @@ class UnsupportedGradingContractError(FullDocumentGradingError):
     retryable = False
 
 
-class StructuredOutputContractError(FullDocumentGradingError):
-    """A strict model response was incomplete or violated its JSON contract.
-
-    A Responses API HTTP 200 does not mean a JSON-schema response completed.
-    Repeating an incomplete or malformed deterministic request burns budget
-    without creating a score, so this is terminal and auditable.
-    """
-
-    retryable = False
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        stage: str,
-        completion_status: str,
-        incomplete_reason: str,
-        raw: str,
-    ) -> None:
-        super().__init__(message)
-        self.structured_output_failure = {
-            "stage": stage,
-            "completion_status": completion_status,
-            "incomplete_reason": incomplete_reason,
-            # This is model output, not a copy of student pages. It is needed
-            # to diagnose a schema/provider regression without blind retries.
-            "raw_response": raw[:64_000],
-            "recorded_at": datetime.now(timezone.utc),
-        }
-
-
-class QuestionVisualGraderContractError(FullDocumentGradingError):
-    """Raised when a batch request is answered with the wrong question set."""
-
-    retryable = False
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        requested_numbers: Sequence[int],
-        returned_numbers: Sequence[int],
-    ) -> None:
-        super().__init__(message)
-        self.requested_numbers = list(requested_numbers)
-        self.returned_numbers = list(returned_numbers)
-
-
 class GradingRunIdentityError(FullDocumentGradingError):
     """Raised for a deterministic grading-run ownership or identity conflict."""
 
     retryable = False
+
+
+class StructuredGradingOutputError(FullDocumentGradingError):
+    """Terminal provider-output failure that must not burn an identical retry."""
+
+    retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        completion_status: str = "",
+        incomplete_reason: str = "",
+        max_output_tokens: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.structured_output_failure = {
+            "completion_status": completion_status or "unknown",
+            "incomplete_reason": incomplete_reason,
+            "max_output_tokens": max(0, int(max_output_tokens or 0)),
+        }
 
 
 @dataclass
@@ -210,14 +168,6 @@ class _ValidatedGrade:
     validation_errors: List[str] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class _StudentPageAsset:
-    page_number: int
-    original_bytes: bytes
-    global_bytes: bytes
-    global_media_type: str
-
-
 class FullDocumentGradingService:
     """Grade one immutable camera/PDF submission as a complete visual document."""
 
@@ -271,7 +221,6 @@ class FullDocumentGradingService:
             {"paper_version_id": exam.get("paper_version_id")}
         )
         canonical_visual_required = _paper_requires_canonical_visual(paper_version)
-        evidence_graph_required = _paper_requires_evidence_graph(paper_version)
         if not _feature_enabled():
             if canonical_visual_required:
                 raise FullDocumentGradingError(
@@ -285,11 +234,7 @@ class FullDocumentGradingService:
             )
         grading_contract = dict(exam.get("pcr_grading_contract") or {})
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
-        prompt_version = (
-            _EVIDENCE_GRAPH_PROMPT_VERSION
-            if evidence_graph_required
-            else _PROMPT_VERSION
-        )
+        prompt_version = _PROMPT_VERSION
         if contract_version and contract_version not in _SUPPORTED_PROMPT_VERSIONS:
             raise UnsupportedGradingContractError(
                 "This exam is locked to grading contract "
@@ -544,16 +489,9 @@ class FullDocumentGradingService:
                 raise FullDocumentGradingError(
                     "The submission grading run could not acquire generation ownership"
                 )
-            student_assets: Optional[List[_StudentPageAsset]] = None
-            if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
-                student_assets, student_image_bytes = await _student_page_assets(
-                    answer_pages
-                )
-                student_content = _student_content_from_assets(student_assets)
-            else:
-                student_content, student_image_bytes = await _student_copy_content(
-                    answer_pages
-                )
+            student_content, student_image_bytes = await _student_copy_content(
+                answer_pages
+            )
             if (
                 len(paper_bytes)
                 + len(solution_bytes or b"")
@@ -561,76 +499,74 @@ class FullDocumentGradingService:
                 > _MAX_REQUEST_PAYLOAD_BYTES
             ):
                 raise FullDocumentGradingError(
-                    "Paper, solution, and optimized student pages exceed the visual "
+                    "Paper, solution, and original student pages exceed the visual "
                     "request size limit"
                 )
+            primary_output_limit = _whole_copy_output_limit(len(questions))
+            gate_response: Any = None
             try:
-                if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION:
-                    raw_payload, raw_llm, usage = await self._run_evidence_graph(
-                        run_id=run_id,
-                        generation_lease_token=generation_lease_token,
-                        existing_run=await self._db[_RUNS_COLLECTION].find_one(
-                            {"run_id": run_id}
-                        ),
-                        submission_id=submission_id,
-                        exam_id=exam_id,
-                        questions=questions,
-                        answer_pages=answer_pages,
-                        student_assets=student_assets or [],
-                        paper_bytes=paper_bytes,
-                        solution_bytes=solution_bytes,
-                        student_content=student_content,
-                        document=document,
-                        model_id=model_id,
-                        temperature=temperature,
-                        reasoning_effort=reasoning_effort,
-                        paper_file_hash=paper_file_hash,
-                        solution_file_hash=solution_file_hash,
+                request_input = _build_responses_input(
+                    questions=questions,
+                    paper_bytes=paper_bytes,
+                    solution_bytes=solution_bytes,
+                    student_content=student_content,
+                    paper_filename=str(
+                        document.get("filename") or "question-paper.pdf"
+                    ),
+                    solution_filename=str(
+                        document.get("answer_sheet_filename")
+                        or "teacher-solution.pdf"
+                    ),
+                )
+                gate_response = await self._gate.call(
+                    model_id=model_id,
+                    prompt="",
+                    caller_id=_CALLER_ID,
+                    responses_input=request_input,
+                    json_schema=_whole_copy_schema(questions),
+                    prompt_cache_key=(
+                        "pcr-paper-"
+                        + _static_context_hash(
+                            exam,
+                            paper_hash=paper_file_hash,
+                            solution_hash=solution_file_hash,
+                            prompt_version=prompt_version,
+                        )[:32]
+                    ),
+                    reasoning_effort=reasoning_effort,
+                    temperature=temperature,
+                    max_output_tokens=primary_output_limit,
+                    metadata={
+                        "pcr_stage": "full_document_visual_grading",
+                        "prompt_version": prompt_version,
+                        "submission_id": submission_id,
+                        "exam_id": exam_id,
+                        "question_count": len(questions),
+                        "page_count": len(answer_pages),
+                        "run_id": run_id,
+                        "provider_call_number": 1,
+                        "provider_call_limit": 2,
+                    },
+                )
+                completion_failure = _response_completion_failure(gate_response)
+                if completion_failure:
+                    raise StructuredGradingOutputError(
+                        "The model exhausted its output budget before returning the "
+                        "complete grading ledger",
+                        completion_status=completion_failure["completion_status"],
+                        incomplete_reason=completion_failure["incomplete_reason"],
+                        max_output_tokens=primary_output_limit,
                     )
-                    gate_response = None
-                else:
-                    request_input = _build_responses_input(
-                        questions=questions,
-                        paper_bytes=paper_bytes,
-                        solution_bytes=solution_bytes,
-                        student_content=student_content,
-                        paper_filename=str(
-                            document.get("filename") or "question-paper.pdf"
+                raw_llm = str(getattr(gate_response, "content", "") or "")
+                raw_payload = _parse_json_object(raw_llm)
+                if raw_payload is None:
+                    raise StructuredGradingOutputError(
+                        "The model returned invalid structured grading JSON",
+                        completion_status=str(
+                            getattr(gate_response, "completion_status", "completed")
+                            or "completed"
                         ),
-                        solution_filename=str(
-                            document.get("answer_sheet_filename")
-                            or "teacher-solution.pdf"
-                        ),
-                    )
-                    gate_response = await self._gate.call(
-                        model_id=model_id,
-                        prompt="",
-                        caller_id=_CALLER_ID,
-                        responses_input=request_input,
-                        json_schema=_evidence_ledger_schema(),
-                        prompt_cache_key=(
-                            "pcr-paper-"
-                            + _static_context_hash(
-                                exam,
-                                paper_hash=paper_file_hash,
-                                solution_hash=solution_file_hash,
-                                prompt_version=prompt_version,
-                            )[:32]
-                        ),
-                        reasoning_effort=reasoning_effort,
-                        temperature=temperature,
-                        max_output_tokens=min(
-                            32_000, max(10_000, 1_400 * len(questions))
-                        ),
-                        metadata={
-                            "pcr_stage": "full_document_visual_grading",
-                            "prompt_version": prompt_version,
-                            "submission_id": submission_id,
-                            "exam_id": exam_id,
-                            "question_count": len(questions),
-                            "page_count": len(answer_pages),
-                            "run_id": run_id,
-                        },
+                        max_output_tokens=primary_output_limit,
                     )
             except Exception as exc:
                 failure_update: Dict[str, Any] = {
@@ -638,6 +574,11 @@ class FullDocumentGradingService:
                     "generation_error": str(exc)[:500],
                     "updated_at": datetime.now(timezone.utc),
                 }
+                if gate_response is not None:
+                    failure_update["token_usage"] = _usage_dict(
+                        gate_response,
+                        fallback_model=model_id,
+                    )
                 structured_failure = getattr(exc, "structured_output_failure", None)
                 if isinstance(structured_failure, dict):
                     failure_update["structured_output_failure"] = structured_failure
@@ -660,14 +601,24 @@ class FullDocumentGradingService:
                     f"Full-document model request failed: {str(exc)[:400]}"
                 ) from exc
 
-            if gate_response is not None:
-                raw_llm = str(getattr(gate_response, "content", "") or "")
-                raw_payload = _parse_json_object(raw_llm)
-                if raw_payload is None:
-                    raise FullDocumentGradingError(
-                        "Full-document model returned an invalid evidence ledger"
-                    )
-                usage = _usage_dict(gate_response, fallback_model=model_id)
+            usage = _usage_dict(gate_response, fallback_model=model_id)
+            raw_payload, raw_llm, usage = await _recover_unresolved_once(
+                gate=self._gate,
+                primary_payload=raw_payload,
+                primary_raw=raw_llm,
+                primary_usage=usage,
+                questions=questions,
+                answer_pages=answer_pages,
+                paper_bytes=paper_bytes,
+                solution_bytes=solution_bytes,
+                document=document,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+                submission_id=submission_id,
+                exam_id=exam_id,
+                run_id=run_id,
+            )
             try:
                 await _freeze_exam_grading_contract(
                     self._db,
@@ -781,535 +732,6 @@ class FullDocumentGradingService:
         )
         return result
 
-    async def _run_evidence_graph(
-        self,
-        *,
-        run_id: str,
-        generation_lease_token: str,
-        existing_run: Optional[Dict[str, Any]],
-        submission_id: str,
-        exam_id: str,
-        questions: List[Dict[str, Any]],
-        answer_pages: List[Dict[str, Any]],
-        student_assets: List[_StudentPageAsset],
-        paper_bytes: bytes,
-        solution_bytes: Optional[bytes],
-        student_content: List[Dict[str, Any]],
-        document: Dict[str, Any],
-        model_id: str,
-        temperature: float,
-        reasoning_effort: str,
-        paper_file_hash: str,
-        solution_file_hash: Optional[str],
-    ) -> tuple[Dict[str, Any], str, Dict[str, Any]]:
-        """Build a global evidence graph, then grade bounded visual crop batches.
-
-        The global request owns only question association and full-copy coverage.
-        Question scoring receives high-resolution crops from the mapper's immutable
-        regions. Intermediate results are checkpointed on the run so a provider
-        retry does not repurchase completed work.
-        """
-
-        if not student_assets:
-            raise FullDocumentGradingError(
-                "Evidence-graph grading requires canonical student page assets"
-            )
-        current_run = dict(existing_run or {})
-        static_content = _multistage_static_content(
-            questions=questions,
-            paper_bytes=paper_bytes,
-            solution_bytes=solution_bytes,
-            paper_filename=str(document.get("filename") or "question-paper.pdf"),
-            solution_filename=str(
-                document.get("answer_sheet_filename") or "teacher-solution.pdf"
-            ),
-        )
-        cache_key = (
-            "pcr-evidence-graph-"
-            + _static_context_hash(
-                {"paper_version_id": document.get("document_id")},
-                paper_hash=paper_file_hash,
-                solution_hash=solution_file_hash,
-                prompt_version=_EVIDENCE_GRAPH_PROMPT_VERSION,
-            )[:32]
-        )
-
-        mapping_payload = current_run.get("evidence_graph_mapping")
-        mapping_usage = dict(current_run.get("evidence_graph_mapping_usage") or {})
-        mapping_raw = str(current_run.get("evidence_graph_mapping_raw") or "")
-        resolved_model = str(current_run.get("model_used") or model_id)
-        if not isinstance(mapping_payload, dict):
-            mapping_input = [
-                {
-                    "role": "developer",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": _multistage_system_instructions(),
-                        }
-                    ],
-                },
-                {"role": "user", "content": static_content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": (
-                                "TASK: Build the complete student evidence graph. "
-                                "Do not grade any question."
-                            ),
-                        },
-                        *student_content,
-                    ],
-                },
-            ]
-            mapping_response = await self._gate.call(
-                model_id=resolved_model,
-                prompt="",
-                caller_id=_CALLER_ID,
-                responses_input=mapping_input,
-                json_schema=evidence_mapping_schema(
-                    [_catalog_question(question) for question in questions]
-                ),
-                prompt_cache_key=cache_key,
-                reasoning_effort=reasoning_effort,
-                temperature=temperature,
-                max_output_tokens=_mapping_output_token_budget(len(questions)),
-                metadata={
-                    "pcr_stage": "full_document_evidence_mapping",
-                    "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
-                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
-                    "submission_id": submission_id,
-                    "exam_id": exam_id,
-                    "question_count": len(questions),
-                    "page_count": len(answer_pages),
-                    "run_id": run_id,
-                },
-            )
-            mapping_raw = str(getattr(mapping_response, "content", "") or "")
-            mapping_payload = _require_structured_payload(
-                mapping_response,
-                raw=mapping_raw,
-                stage="Evidence mapper",
-            )
-            mapping_usage = _usage_dict(
-                mapping_response,
-                fallback_model=resolved_model,
-            )
-            resolved_model = str(mapping_usage.get("model") or resolved_model)
-            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
-                {
-                    "run_id": run_id,
-                    "generation_lease_token": generation_lease_token,
-                },
-                {
-                    "$set": {
-                        "evidence_graph_mapping": mapping_payload,
-                        "evidence_graph_mapping_raw": mapping_raw,
-                        "evidence_graph_mapping_usage": mapping_usage,
-                        "model_used": resolved_model,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                },
-            )
-            if checkpoint.matched_count != 1:
-                raise FullDocumentGradingError(
-                    "Submission grading ownership expired while saving evidence mapping"
-                )
-
-        mapping = validate_mapping_payload(
-            mapping_payload,
-            question_numbers=[
-                int(question.get("question_number") or index)
-                for index, question in enumerate(questions, start=1)
-            ],
-            page_count=len(answer_pages),
-            absence_confidence=_ABSENCE_CONFIDENCE,
-        )
-        saved_grades = dict(
-            current_run.get("evidence_graph_question_grades") or {}
-        )
-        saved_usages = dict(
-            current_run.get("evidence_graph_question_grade_usages") or {}
-        )
-        attempted_numbers = [
-            number
-            for number, item in mapping.questions.items()
-            if item.get("attempt_status") == "attempted"
-        ]
-        question_by_number = {
-            int(question.get("question_number") or index): question
-            for index, question in enumerate(questions, start=1)
-        }
-        missing_numbers = [
-            number for number in attempted_numbers if str(number) not in saved_grades
-        ]
-
-        def _unresolved_grade_for_output_budget(
-            question_number: int,
-            reason: str,
-            *,
-            confidence: float = 0.0,
-        ) -> Dict[str, Any]:
-            return {
-                "question_number": question_number,
-                "attempt_status": "unresolved",
-                "confidence": confidence,
-                "student_answer": "",
-                "content_type": ContentType.MIXED.value,
-                "evidence_regions": [],
-                "method_analysis": {
-                    **_not_applicable_method_analysis(),
-                    "method_classification": "unresolved",
-                    "method_validity": "unresolved",
-                    "method_requirement_satisfied": False,
-                    "confidence": confidence,
-                    "explanation": reason[:800],
-                    "error_carried_forward": "unresolved",
-                },
-                "criterion_marks": [],
-                "total_score": 0.0,
-                "overall_feedback": "No verified answer state exists for this question.",
-                "needs_review": True,
-                "review_reason": reason[:800],
-            }
-
-        async def _grade_question_subset(
-            batch_questions: List[Dict[str, Any]],
-            batch_numbers: List[int],
-            *,
-            batch_index: str,
-            budget_minimum: int = 4_000,
-        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-            grading_input, crop_bytes = _build_question_grading_input(
-                questions=batch_questions,
-                mappings=mapping.questions,
-                student_assets=student_assets,
-            )
-            if crop_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
-                raise FullDocumentGradingError(
-                    "Question-specific visual evidence exceeds the request size limit"
-                )
-            grading_response = await self._gate.call(
-                model_id=resolved_model,
-                prompt="",
-                caller_id=_CALLER_ID,
-                responses_input=grading_input,
-                json_schema=question_grading_schema(
-                    [_catalog_question(question) for question in batch_questions]
-                ),
-                prompt_cache_key=cache_key,
-                reasoning_effort=reasoning_effort,
-                temperature=temperature,
-                max_output_tokens=_question_output_token_budget(
-                    len(batch_questions),
-                    minimum_output_tokens=budget_minimum,
-                ),
-                metadata={
-                    "pcr_stage": "question_visual_grading",
-                    "prompt_version": _EVIDENCE_GRAPH_PROMPT_VERSION,
-                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
-                    "submission_id": submission_id,
-                    "exam_id": exam_id,
-                    "question_numbers": batch_numbers,
-                    "batch_index": batch_index,
-                    "run_id": run_id,
-                    "budget_minimum": budget_minimum,
-                },
-            )
-            grading_raw = str(getattr(grading_response, "content", "") or "")
-            grading_payload = _require_structured_payload(
-                grading_response,
-                raw=grading_raw,
-                stage="Question visual grader",
-            )
-            allowed = set(batch_numbers)
-            returned: Dict[str, Dict[str, Any]] = {}
-            unexpected_numbers: set[int] = set()
-            duplicate_numbers: set[int] = set()
-            observed_numbers: set[int] = set()
-            if (
-                grading_payload.get("evidence_graph_version")
-                != EVIDENCE_GRAPH_VERSION
-            ):
-                raise FullDocumentGradingError(
-                    "Question visual grader returned the wrong evidence contract"
-                )
-            raw_question_items = grading_payload.get("questions") or []
-            if isinstance(raw_question_items, Mapping):
-                normalized_question_items: List[Dict[str, Any]] = []
-                for raw_number, raw_item in raw_question_items.items():
-                    if not isinstance(raw_item, Mapping):
-                        continue
-                    normalized_item = dict(raw_item)
-                    normalized_item["question_number"] = _positive_int(raw_number)
-                    raw_criteria = normalized_item.get("criterion_marks")
-                    if isinstance(raw_criteria, Mapping):
-                        normalized_item["criterion_marks"] = [
-                            {"criterion_id": str(criterion_id), **dict(score)}
-                            for criterion_id, score in raw_criteria.items()
-                            if isinstance(score, Mapping)
-                        ]
-                    normalized_question_items.append(normalized_item)
-            else:
-                normalized_question_items = [
-                    dict(item)
-                    for item in raw_question_items
-                    if isinstance(item, Mapping)
-                ]
-            for item in normalized_question_items:
-                if not isinstance(item, dict):
-                    continue
-                number = _positive_int(item.get("question_number"))
-                if number is not None:
-                    observed_numbers.add(number)
-                if number not in allowed:
-                    if number is not None:
-                        unexpected_numbers.add(number)
-                    continue
-                if str(number) in returned:
-                    duplicate_numbers.add(number)
-                    continue
-                returned[str(number)] = dict(item)
-            if unexpected_numbers or duplicate_numbers:
-                logger.warning(
-                    "Question grader returned ignored IDs for batch %s: unexpected=%s "
-                    "duplicate=%s",
-                    batch_index,
-                    sorted(unexpected_numbers),
-                    sorted(duplicate_numbers),
-                )
-            batch_usage = _usage_dict(
-                grading_response,
-                fallback_model=resolved_model,
-            )
-            return returned, batch_usage
-
-        def _merge_usages(
-            *usages: Mapping[str, Any],
-        ) -> Dict[str, Any]:
-            merged: Dict[str, Any] = {}
-            for usage in usages:
-                for key, value in usage.items():
-                    if isinstance(value, (int, float)):
-                        merged[key] = int(merged.get(key, 0)) + int(value)
-                    elif key not in merged:
-                        merged[key] = value
-            return merged
-
-        async def _grade_question_subset_with_fallback(
-            batch_questions: List[Dict[str, Any]],
-            batch_numbers: List[int],
-            *,
-            batch_index: str,
-            budget_minimum: int = 4_000,
-            retry_available: bool = True,
-        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-            try:
-                returned, usage = await _grade_question_subset(
-                    batch_questions,
-                    batch_numbers,
-                    batch_index=batch_index,
-                    budget_minimum=budget_minimum,
-                )
-                semantic_failures: Dict[int, List[str]] = {}
-                for number in batch_numbers:
-                    item = returned.get(str(number))
-                    question = question_by_number.get(number)
-                    if not item or not question:
-                        continue
-                    defects = _semantic_grade_defects(question, item)
-                    if defects:
-                        semantic_failures[number] = defects
-                        returned.pop(str(number), None)
-                missing = [
-                    number for number in batch_numbers if str(number) not in returned
-                ]
-                if missing and retry_available:
-                    logger.warning(
-                        "Question grader omitted or incompletely graded %s from batch "
-                        "%s; retrying only those question IDs once. defects=%s",
-                        missing,
-                        batch_index,
-                        semantic_failures,
-                    )
-                    retry_questions = [
-                        question_by_number[number]
-                        for number in missing
-                        if number in question_by_number
-                    ]
-                    retry_returned, retry_usage = (
-                        await _grade_question_subset_with_fallback(
-                            retry_questions,
-                            missing,
-                            batch_index=f"{batch_index}.missing",
-                            budget_minimum=_fallback_question_output_tokens(
-                                budget_minimum
-                            ),
-                            retry_available=False,
-                        )
-                    )
-                    returned.update(retry_returned)
-                    usage = _merge_usages(usage, retry_usage)
-                still_missing = [
-                    number for number in batch_numbers if str(number) not in returned
-                ]
-                for number in still_missing:
-                    returned[str(number)] = _unresolved_grade_for_output_budget(
-                        number,
-                        "The question grader did not return a complete result aligned "
-                        "with the locked marking criteria after one targeted retry. "
-                        "Its evidence remains available for teacher review.",
-                    )
-                return returned, usage
-            except StructuredOutputContractError as exc:
-                if retry_available:
-                    logger.warning(
-                        "Question visual grader returned incomplete structured output "
-                        "for batch %s; retrying the same bounded batch once with a "
-                        "larger budget.",
-                        batch_index,
-                    )
-                    return await _grade_question_subset_with_fallback(
-                        batch_questions,
-                        batch_numbers,
-                        batch_index=f"{batch_index}.retry",
-                        budget_minimum=_fallback_question_output_tokens(
-                            budget_minimum
-                        ),
-                        retry_available=False,
-                    )
-                logger.warning(
-                    "Question grader could not produce structured output for batch %s "
-                    "after bounded retries; preserving review placeholders.",
-                    batch_index,
-                )
-                return (
-                    {
-                        str(number): _unresolved_grade_for_output_budget(
-                            number,
-                            "The question grader could not return a complete strict "
-                            "result after bounded retries. The mapped evidence remains "
-                            "available for teacher review.",
-                        )
-                        for number in batch_numbers
-                    },
-                    {},
-                )
-
-        batch_specs = list(
-            enumerate(
-                _question_batches(
-                    missing_numbers,
-                    mappings=mapping.questions,
-                ),
-                start=1,
-            )
-        )
-        try:
-            configured_concurrency = int(
-                os.getenv("PCR_VISUAL_BATCH_CONCURRENCY", "3") or 3
-            )
-        except (TypeError, ValueError):
-            configured_concurrency = 3
-        batch_semaphore = asyncio.Semaphore(
-            max(1, min(4, configured_concurrency))
-        )
-
-        async def _run_question_batch(
-            batch_index: int,
-            batch_numbers: List[int],
-        ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-            batch_questions = [
-                question_by_number[number]
-                for number in batch_numbers
-                if number in question_by_number
-            ]
-            async with batch_semaphore:
-                return await _grade_question_subset_with_fallback(
-                    batch_questions,
-                    batch_numbers,
-                    batch_index=str(batch_index),
-                )
-
-        batch_results = await asyncio.gather(
-            *[
-                _run_question_batch(batch_index, batch_numbers)
-                for batch_index, batch_numbers in batch_specs
-            ],
-            return_exceptions=True,
-        )
-        first_batch_error: Optional[BaseException] = None
-        for (batch_index, batch_numbers), batch_result in zip(
-            batch_specs,
-            batch_results,
-        ):
-            if isinstance(batch_result, BaseException):
-                if isinstance(batch_result, asyncio.CancelledError):
-                    raise batch_result
-                logger.exception(
-                    "Question visual grading batch %s failed",
-                    batch_index,
-                    exc_info=batch_result,
-                )
-                if first_batch_error is None:
-                    first_batch_error = batch_result
-                continue
-            returned, batch_usage = batch_result
-            if returned:
-                resolved_model = str(batch_usage.get("model") or resolved_model)
-                saved_grades.update(returned)
-                usage_key = "questions-" + "-".join(
-                    str(number) for number in sorted(set(batch_numbers))
-                )
-                saved_usages[usage_key] = batch_usage
-            checkpoint = await self._db[_RUNS_COLLECTION].update_one(
-                {
-                    "run_id": run_id,
-                    "generation_lease_token": generation_lease_token,
-                },
-                {
-                    "$set": {
-                        "evidence_graph_question_grades": saved_grades,
-                        "evidence_graph_question_grade_usages": saved_usages,
-                        "model_used": resolved_model,
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                },
-            )
-            if checkpoint.matched_count != 1:
-                raise FullDocumentGradingError(
-                    "Submission grading ownership expired while saving question grades"
-                )
-        if first_batch_error is not None:
-            raise first_batch_error
-
-        final_payload = merge_mapping_and_grading(
-            mapping,
-            [
-                {
-                    "evidence_graph_version": EVIDENCE_GRAPH_VERSION,
-                    "questions": list(saved_grades.values()),
-                }
-            ],
-        )
-        if mapping.errors:
-            final_payload["evidence_graph_validation_errors"] = mapping.errors
-        usage = _aggregate_usages(
-            [mapping_usage, *saved_usages.values()],
-            fallback_model=resolved_model,
-        )
-        raw_llm = json.dumps(
-            {
-                "evidence_mapping": mapping_payload,
-                "question_grades": saved_grades,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return final_payload, raw_llm, usage
-
     async def _materialize(
         self,
         *,
@@ -1343,15 +765,9 @@ class FullDocumentGradingService:
             question_id = str(grade.question.get("question_id") or "")
             raw_question_result = raw_by_number.get(grade.question_number, {})
             visual_evidence = {
-                "evidence_graph_version": raw_payload.get(
-                    "evidence_graph_version"
-                ),
-                "mapping_reason": raw_question_result.get("mapping_reason"),
-                "interpretation_hypotheses": list(
-                    raw_question_result.get("interpretation_hypotheses") or []
-                ),
-                "visual_semantics": dict(
-                    raw_question_result.get("visual_semantics") or {}
+                "method": "whole_copy_visual",
+                "source_page_numbers": list(
+                    raw_question_result.get("source_pages") or []
                 ),
             }
             semantic_evidence_signature = _semantic_evidence_signature(
@@ -1545,11 +961,7 @@ class FullDocumentGradingService:
                 "semantic_evidence_signature": semantic_evidence_signature,
                 "grading_consistency_key": grading_consistency_key or None,
                 "consistency_calibration": consistency_calibration,
-                "evidence_version": (
-                    3
-                    if prompt_version == _EVIDENCE_GRAPH_PROMPT_VERSION
-                    else 2
-                ),
+                "evidence_version": 4,
                 "evidence_atom_ids": [
                     _stable_id(
                         "region",
@@ -2120,17 +1532,6 @@ def _paper_requires_canonical_visual(
     )
 
 
-def _paper_requires_evidence_graph(
-    paper_version: Optional[Dict[str, Any]],
-) -> bool:
-    context = dict((paper_version or {}).get("paper_context") or {})
-    return bool(
-        context.get("ready")
-        and str(context.get("version") or "")
-        == "canonical-full-document-visual-v2"
-    )
-
-
 def _is_openai_visual_model(model_id: str) -> bool:
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
     if provider and provider != "openai":
@@ -2214,12 +1615,19 @@ async def _student_copy_content(
             raise FullDocumentGradingError(
                 f"Canonical student page {page_number} is not a valid image"
             ) from exc
-        optimized, media_type = await asyncio.to_thread(_optimize_image, original)
-        total_bytes += len(optimized)
+        media_type = _image_media_type(original)
+        if not media_type:
+            raise FullDocumentGradingError(
+                f"Canonical student page {page_number} has an unsupported image format"
+            )
+        total_bytes += len(original)
         content.append(
             {
                 "type": "input_text",
-                "text": f"Student answer-copy page {page_number}:",
+                "text": (
+                    f"Student answer-copy page {page_number}, unaltered original image. "
+                    "Read it in its natural orientation; do not require pre-cropping."
+                ),
             }
         )
         content.append(
@@ -2227,7 +1635,7 @@ async def _student_copy_content(
                 "type": "input_image",
                 "image_url": (
                     f"data:{media_type};base64,"
-                    + base64.b64encode(optimized).decode("ascii")
+                    + base64.b64encode(original).decode("ascii")
                 ),
                 "detail": "high",
             }
@@ -2235,514 +1643,255 @@ async def _student_copy_content(
     return content, total_bytes
 
 
-async def _student_page_assets(
+def _image_media_type(image_bytes: bytes) -> Optional[str]:
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(image_bytes) >= 12 and image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+async def _recover_unresolved_once(
+    *,
+    gate: FullDocumentGateProtocol,
+    primary_payload: Dict[str, Any],
+    primary_raw: str,
+    primary_usage: Dict[str, Any],
+    questions: List[Dict[str, Any]],
     answer_pages: List[Dict[str, Any]],
-) -> tuple[List[_StudentPageAsset], int]:
-    assets: List[_StudentPageAsset] = []
-    total_bytes = 0
+    paper_bytes: bytes,
+    solution_bytes: Optional[bytes],
+    document: Dict[str, Any],
+    model_id: str,
+    reasoning_effort: str,
+    temperature: float,
+    submission_id: str,
+    exam_id: str,
+    run_id: str,
+) -> tuple[Dict[str, Any], str, Dict[str, Any]]:
+    """Use at most one extra provider call for questions that truly need recovery."""
+
+    grades, _, _ = _validate_ledger(
+        primary_payload,
+        questions=questions,
+        page_count=len(answer_pages),
+    )
+    retry_numbers = {
+        grade.question_number
+        for grade in grades
+        if grade.attempt_status == "unresolved" or grade.manual_review_required
+    }
+    if not retry_numbers:
+        return primary_payload, primary_raw, primary_usage
+
+    retry_questions = [
+        question
+        for index, question in enumerate(questions, start=1)
+        if (_positive_int(question.get("question_number")) or index) in retry_numbers
+    ]
+    recovery_content, recovery_bytes = await _student_recovery_content(answer_pages)
+    if len(paper_bytes) + len(solution_bytes or b"") + recovery_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+        recovery_content, recovery_bytes = await _student_copy_content(answer_pages)
+    if len(paper_bytes) + len(solution_bytes or b"") + recovery_bytes > _MAX_REQUEST_PAYLOAD_BYTES:
+        logger.warning(
+            "Skipping bounded PCR recovery call for run %s because the original "
+            "whole-copy payload exceeds the request limit",
+            run_id,
+        )
+        return primary_payload, primary_raw, primary_usage
+
+    recovery_content.insert(
+        0,
+        {
+            "type": "input_text",
+            "text": (
+                "ONE BOUNDED RECOVERY PASS. Re-check only the requested questions. "
+                "Use the complete pages and any alternate upright views below. A dark, "
+                "sideways, faint, or Hindi answer is not unresolved if its meaning can "
+                "reasonably be read. Do not revisit questions outside this catalog."
+            ),
+        },
+    )
+    retry_input = _build_responses_input(
+        questions=retry_questions,
+        paper_bytes=paper_bytes,
+        solution_bytes=solution_bytes,
+        student_content=recovery_content,
+        paper_filename=str(document.get("filename") or "question-paper.pdf"),
+        solution_filename=str(
+            document.get("answer_sheet_filename") or "teacher-solution.pdf"
+        ),
+    )
+    try:
+        recovery_output_limit = _recovery_output_limit(len(retry_questions))
+        response = await gate.call(
+            model_id=model_id,
+            prompt="",
+            caller_id=_CALLER_ID,
+            responses_input=retry_input,
+            json_schema=_whole_copy_schema(retry_questions),
+            reasoning_effort=reasoning_effort,
+            temperature=temperature,
+            max_output_tokens=recovery_output_limit,
+            metadata={
+                "pcr_stage": "full_document_visual_recovery",
+                "prompt_version": _PROMPT_VERSION,
+                "submission_id": submission_id,
+                "exam_id": exam_id,
+                "question_count": len(retry_questions),
+                "page_count": len(answer_pages),
+                "run_id": run_id,
+                "provider_call_number": 2,
+                "provider_call_limit": 2,
+            },
+        )
+    except Exception:
+        logger.exception("Bounded whole-copy recovery call failed for run %s", run_id)
+        return primary_payload, primary_raw, primary_usage
+
+    recovery_usage = _usage_dict(response, fallback_model=model_id)
+    merged_usage = _aggregate_usages(
+        [primary_usage, recovery_usage],
+        fallback_model=model_id,
+    )
+    completion_failure = _response_completion_failure(response)
+    if completion_failure:
+        logger.warning(
+            "Bounded whole-copy recovery was incomplete for run %s: %s",
+            run_id,
+            completion_failure["incomplete_reason"] or "unknown reason",
+        )
+        return primary_payload, primary_raw, merged_usage
+
+    retry_raw = str(getattr(response, "content", "") or "")
+    retry_payload = _parse_json_object(retry_raw)
+    if retry_payload is None:
+        logger.warning("Bounded whole-copy recovery returned invalid JSON for run %s", run_id)
+        return primary_payload, primary_raw, merged_usage
+
+    retry_grades, _, _ = _validate_ledger(
+        retry_payload,
+        questions=retry_questions,
+        page_count=len(answer_pages),
+    )
+    retry_grade_by_number = {
+        grade.question_number: grade for grade in retry_grades
+    }
+
+    primary_items = [
+        dict(item)
+        for item in (primary_payload.get("questions") or [])
+        if isinstance(item, Mapping)
+    ]
+    primary_by_number = {
+        _positive_int(item.get("question_number")): item
+        for item in primary_items
+        if _positive_int(item.get("question_number"))
+    }
+    for item in retry_payload.get("questions") or []:
+        if not isinstance(item, Mapping):
+            continue
+        number = _positive_int(item.get("question_number"))
+        if number not in retry_numbers:
+            continue
+        replacement = dict(item)
+        validated_retry = retry_grade_by_number.get(number)
+        retry_resolved = bool(
+            validated_retry
+            and validated_retry.attempt_status != "unresolved"
+            and not validated_retry.manual_review_required
+        )
+        if retry_resolved:
+            primary_by_number[number] = replacement
+
+    merged_questions = []
+    for index, question in enumerate(questions, start=1):
+        number = _positive_int(question.get("question_number")) or index
+        if number in primary_by_number:
+            merged_questions.append(primary_by_number[number])
+    merged_payload = {"questions": merged_questions}
+    merged_raw = json.dumps(merged_payload, ensure_ascii=False, separators=(",", ":"))
+    return merged_payload, merged_raw, merged_usage
+
+
+async def _student_recovery_content(
+    answer_pages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """Return originals plus clean upright candidates only for sideways pages."""
+
+    content, total_bytes = await _student_copy_content(answer_pages)
     for page in answer_pages:
         page_number = int(page.get("page_number") or 0)
         raw_ref = page.get("raw_image_ref")
         if page_number <= 0 or not isinstance(raw_ref, str) or not raw_ref.strip():
-            raise FullDocumentGradingError(
-                f"Canonical student page {page_number or '?'} has no image asset"
-            )
+            continue
         image_b64 = await _resolve_image_base64(
             raw_ref,
             expected_sha256=page.get("asset_sha256"),
         )
         if not image_b64:
-            raise FullDocumentGradingError(
-                f"Canonical student page {page_number} could not be loaded"
-            )
+            continue
         try:
             original = base64.b64decode(image_b64, validate=True)
-        except Exception as exc:
-            raise FullDocumentGradingError(
-                f"Canonical student page {page_number} is not a valid image"
-            ) from exc
-        optimized, media_type = await asyncio.to_thread(_optimize_image, original)
-        total_bytes += len(optimized)
-        assets.append(
-            _StudentPageAsset(
-                page_number=page_number,
-                original_bytes=original,
-                global_bytes=optimized,
-                global_media_type=media_type,
-            )
-        )
-    return assets, total_bytes
-
-
-def _student_content_from_assets(
-    assets: Sequence[_StudentPageAsset],
-) -> List[Dict[str, Any]]:
-    content: List[Dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": (
-                "STUDENT ANSWER COPY. Inspect every page visually. Page labels below "
-                "are authoritative source-page numbers, not question numbers."
-            ),
-        }
-    ]
-    for asset in assets:
-        content.extend(
-            [
-                {
-                    "type": "input_text",
-                    "text": f"Student answer-copy page {asset.page_number}:",
-                },
-                {
-                    "type": "input_image",
-                    "image_url": (
-                        f"data:{asset.global_media_type};base64,"
-                        + base64.b64encode(asset.global_bytes).decode("ascii")
-                    ),
-                    "detail": "high",
-                },
-            ]
-        )
-    return content
-
-
-def _multistage_static_content(
-    *,
-    questions: List[Dict[str, Any]],
-    paper_bytes: bytes,
-    solution_bytes: Optional[bytes],
-    paper_filename: str,
-    solution_filename: str,
-) -> List[Dict[str, Any]]:
-    content: List[Dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": (
-                "IMMUTABLE MARKING CATALOG. Question IDs, ordering, maximum marks, "
-                "criterion maximums, method policy, and acceptable evidence are "
-                "authoritative. The PDFs remain visual evidence and may contain "
-                "handwriting, formulae, diagrams, tables, or graphs.\n"
-                + json.dumps(
-                    [_catalog_question(question) for question in questions],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            ),
-        },
-        {"type": "input_text", "text": "ORIGINAL QUESTION PAPER PDF:"},
-        {
-            "type": "input_file",
-            "filename": _safe_pdf_filename(paper_filename, "question-paper.pdf"),
-            "file_data": (
-                "data:application/pdf;base64,"
-                + base64.b64encode(paper_bytes).decode("ascii")
-            ),
-        },
-    ]
-    if solution_bytes:
-        content.extend(
-            [
-                {
-                    "type": "input_text",
-                    "text": "TEACHER-UPLOADED SOLUTION / MARKING-SCHEME PDF:",
-                },
-                {
-                    "type": "input_file",
-                    "filename": _safe_pdf_filename(
-                        solution_filename,
-                        "teacher-solution.pdf",
-                    ),
-                    "file_data": (
-                        "data:application/pdf;base64,"
-                        + base64.b64encode(solution_bytes).decode("ascii")
-                    ),
-                },
-            ]
-        )
-    return content
-
-
-def _multistage_system_instructions() -> str:
-    return (
-        mapping_system_instructions()
-        + "\n\n"
-        + grading_system_instructions()
-        + "\n\nFollow only the TASK in the final user message for this request."
-    )
-
-
-def _question_batches(
-    question_numbers: Sequence[int],
-    *,
-    mappings: Optional[Mapping[int, Dict[str, Any]]] = None,
-) -> List[List[int]]:
-    """Build bounded batches while keeping questions from shared pages together.
-
-    The grading request includes page context for every page referenced by a
-    batch. Grouping only by question number can upload the same photographed
-    page in several concurrent requests. This deterministic greedy grouping
-    preserves the question catalogue order while preferentially consuming
-    questions whose mapped evidence overlaps the pages already in the batch.
-    """
-    try:
-        configured = int(
-            os.getenv("PCR_VISUAL_QUESTIONS_PER_BATCH", "8") or 8
-        )
-    except (TypeError, ValueError):
-        configured = 8
-    size = max(1, min(8, configured))
-    numbers = [int(number) for number in question_numbers]
-    if not mappings or len(numbers) <= size:
-        return [numbers[index : index + size] for index in range(0, len(numbers), size)]
-
-    pages_by_question: Dict[int, set[int]] = {}
-    for number in numbers:
-        mapped = mappings.get(number) or {}
-        pages_by_question[number] = {
-            int(region.get("page_number") or 0)
-            for region in (mapped.get("evidence_regions") or [])
-            if int(region.get("page_number") or 0) > 0
-        }
-
-    pending = list(numbers)
-    batches: List[List[int]] = []
-    while pending:
-        seed = pending.pop(0)
-        batch = [seed]
-        batch_pages = set(pages_by_question.get(seed) or set())
-
-        overlapping = [
-            number
-            for number in pending
-            if batch_pages.intersection(pages_by_question.get(number) or set())
-        ]
-        for number in overlapping:
-            if len(batch) >= size:
-                break
-            batch.append(number)
-            batch_pages.update(pages_by_question.get(number) or set())
-            pending.remove(number)
-
-        while pending and len(batch) < size:
-            number = pending.pop(0)
-            batch.append(number)
-            batch_pages.update(pages_by_question.get(number) or set())
-
-        batches.append(sorted(batch, key=numbers.index))
-    return batches
-
-
-def _configured_output_tokens(name: str, default: int) -> int:
-    try:
-        configured = int(os.getenv(name, str(default)) or default)
-    except (TypeError, ValueError):
-        configured = default
-    return max(1_000, min(30_000, configured))
-
-
-def _mapping_output_token_budget(question_count: int) -> int:
-    """Reserve room for a concise whole-copy ownership map."""
-
-    per_question = _configured_output_tokens(
-        "PCR_VISUAL_MAPPING_OUTPUT_TOKENS_PER_QUESTION", 1_200
-    )
-    return min(20_000, max(6_000, per_question * max(1, question_count)))
-
-
-def _question_output_token_budget(
-    question_count: int,
-    minimum_output_tokens: int = 4_000,
-) -> int:
-    """Reserve enough capacity for the lean criterion-scoring JSON."""
-
-    per_question = _configured_output_tokens(
-        "PCR_VISUAL_GRADING_OUTPUT_TOKENS_PER_QUESTION", 2_500
-    )
-    return min(20_000, max(minimum_output_tokens, per_question * max(1, question_count)))
-
-
-def _fallback_question_output_tokens(min_tokens: int) -> int:
-    return max(6_000, min(20_000, min_tokens * 2))
-
-
-def _require_structured_payload(
-    response: Any,
-    *,
-    raw: str,
-    stage: str,
-) -> Dict[str, Any]:
-    """Accept only a completed strict-schema response from the model gate."""
-
-    completion_status = str(
-        getattr(response, "completion_status", "completed") or "completed"
-    ).strip().lower()
-    incomplete_reason = str(
-        getattr(response, "incomplete_reason", "") or ""
-    ).strip()
-    if completion_status != "completed":
-        suffix = f" ({incomplete_reason})" if incomplete_reason else ""
-        raise StructuredOutputContractError(
-            f"{stage} did not complete its strict JSON response{suffix}",
-            stage=stage,
-            completion_status=completion_status,
-            incomplete_reason=incomplete_reason,
-            raw=raw,
-        )
-    payload = _parse_json_object(raw)
-    if payload is None:
-        raise StructuredOutputContractError(
-            f"{stage} returned invalid structured output",
-            stage=stage,
-            completion_status=completion_status,
-            incomplete_reason=incomplete_reason,
-            raw=raw,
-        )
-    return payload
-
-
-def _is_max_output_token_exhaustion_error(exc: Exception) -> bool:
-    failure = getattr(exc, "structured_output_failure", None)
-    if not isinstance(failure, dict):
-        return False
-    completion = str(failure.get("completion_status") or "").strip().lower()
-    reason = str(failure.get("incomplete_reason") or "").strip().lower()
-    return completion == "incomplete" and reason == "max_output_tokens"
-
-
-def _build_question_grading_input(
-    *,
-    questions: List[Dict[str, Any]],
-    mappings: Mapping[int, Dict[str, Any]],
-    student_assets: Sequence[_StudentPageAsset],
-) -> tuple[List[Dict[str, Any]], int]:
-    assets = {asset.page_number: asset for asset in student_assets}
-    dynamic: List[Dict[str, Any]] = [
-        {
-            "type": "input_text",
-                "text": (
-                    "TASK: Grade exactly the requested questions from the fixed evidence "
-                    "regions below. Region ownership is immutable for this stage. The "
-                    "catalog below already contains the authoritative question text, "
-                    "reference solution, marking criteria, method policy, and maximum "
-                    "marks. Use the original high-resolution student images as answer "
-                    "evidence; no question-paper or solution PDF is needed in this stage.\n"
-                    "REQUESTED IMMUTABLE QUESTION CATALOG:\n"
-                + json.dumps(
-                    [_catalog_question(question) for question in questions],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            ),
-        }
-    ]
-    crop_bytes = 0
-    relevant_page_numbers = sorted(
-        {
-            int(region.get("page_number") or 0)
-            for question in questions
-            for region in (
-                (mappings.get(int(question.get("question_number") or 0)) or {}).get(
-                    "evidence_regions"
-                )
-                or []
-            )
-            if int(region.get("page_number") or 0) > 0
-        }
-    )
-    for page_number in relevant_page_numbers:
-        asset = assets.get(page_number)
-        if asset is None:
+        except Exception:
             continue
-        crop_bytes += len(asset.global_bytes)
-        dynamic.extend(
-            [
-                {
-                    "type": "input_text",
-                    "text": (
-                        f"Full page {page_number} context for the mapped evidence "
-                        "below. Use it only to recover clipped or immediately adjacent "
-                        "work belonging to the same mapped question."
-                    ),
-                },
-                {
-                    "type": "input_image",
-                    "image_url": (
-                        f"data:{asset.global_media_type};base64,"
-                        + base64.b64encode(asset.global_bytes).decode("ascii")
-                    ),
-                    # The crop below remains high detail and is the authoritative
-                    # answer evidence. This full page is only navigation context.
-                    "detail": "low",
-                },
-            ]
-        )
-    for index, question in enumerate(questions, start=1):
-        number = int(question.get("question_number") or index)
-        mapped = mappings.get(number) or {}
-        regions = list(mapped.get("evidence_regions") or [])
-        dynamic.append(
-            {
-                "type": "input_text",
-                "text": (
-                    f"QUESTION {number} FIXED EVIDENCE MAP:\n"
-                    + json.dumps(
-                        {
-                            "question_number": number,
-                            "content_type": mapped.get("content_type"),
-                            "mapping_reason": mapped.get("mapping_reason"),
-                            "evidence_regions": regions,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                ),
-            }
-        )
-        for region in regions:
-            page_number = int(region.get("page_number") or 0)
-            asset = assets.get(page_number)
-            if asset is None:
-                raise FullDocumentGradingError(
-                    f"Mapped evidence for Q{number} refers to missing page {page_number}"
-                )
-            cropped, media_type = _crop_student_region(asset, region)
-            crop_bytes += len(cropped)
-            dynamic.extend(
+        sideways, _ = await asyncio.to_thread(detect_sideways_page, original)
+        if not sideways:
+            continue
+        for rotation in (90, 270):
+            rotated = await asyncio.to_thread(
+                _rotate_image_clockwise,
+                original,
+                rotation,
+            )
+            total_bytes += len(rotated)
+            content.extend(
                 [
                     {
                         "type": "input_text",
                         "text": (
-                            f"Q{number} evidence region "
-                            f"{region.get('region_id')} from page {page_number}:"
+                            f"Page {page_number} alternate clean reading view, rotated "
+                            f"{rotation} degrees clockwise. It is the same physical page, "
+                            "not additional student work."
                         ),
                     },
                     {
                         "type": "input_image",
-                        "image_url": (
-                            f"data:{media_type};base64,"
-                            + base64.b64encode(cropped).decode("ascii")
-                        ),
+                        "image_url": "data:image/jpeg;base64,"
+                        + base64.b64encode(rotated).decode("ascii"),
                         "detail": "high",
                     },
                 ]
             )
-    return (
-        [
-            {
-                "role": "developer",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": grading_system_instructions(),
-                    }
-                ],
-            },
-            {"role": "user", "content": dynamic},
-        ],
-        crop_bytes,
-    )
+    return content, total_bytes
 
 
-def _crop_student_region(
-    asset: _StudentPageAsset,
-    region: Mapping[str, Any],
-) -> tuple[bytes, str]:
-    try:
-        from PIL import Image, ImageOps
+def _rotate_image_clockwise(image_bytes: bytes, rotation_degrees: int) -> bytes:
+    rotation = int(rotation_degrees or 0) % 360
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("Page rotation must be 0, 90, 180, or 270 degrees")
+    from PIL import Image, ImageOps
 
-        with Image.open(io.BytesIO(asset.original_bytes)) as opened:
-            image = ImageOps.exif_transpose(opened)
-            width, height = image.size
-            normalized_width = max(
-                1.0,
-                float(region.get("x_end") or 1000)
-                - float(region.get("x_start") or 0),
-            )
-            normalized_height = max(
-                1.0,
-                float(region.get("y_end") or 1000)
-                - float(region.get("y_start") or 0),
-            )
-            region_width = int(width * normalized_width / 1000.0)
-            region_height = int(height * normalized_height / 1000.0)
-            margin_x = max(12, int(width * 0.04), int(region_width * 0.18))
-            margin_y = max(12, int(height * 0.04), int(region_height * 0.18))
-            left = max(
-                0,
-                int(width * float(region.get("x_start") or 0) / 1000.0)
-                - margin_x,
-            )
-            top = max(
-                0,
-                int(height * float(region.get("y_start") or 0) / 1000.0)
-                - margin_y,
-            )
-            right = min(
-                width,
-                int(width * float(region.get("x_end") or 1000) / 1000.0)
-                + margin_x,
-            )
-            bottom = min(
-                height,
-                int(height * float(region.get("y_end") or 1000) / 1000.0)
-                + margin_y,
-            )
-            if right - left < 24 or bottom - top < 24:
-                raise ValueError("evidence crop is too small")
-            crop = image.crop((left, top, right, bottom))
-            if crop.mode not in {"RGB", "L"}:
-                background = Image.new("RGB", crop.size, "white")
-                if "A" in crop.getbands():
-                    background.paste(crop, mask=crop.getchannel("A"))
-                else:
-                    background.paste(crop.convert("RGB"))
-                crop = background
-            elif crop.mode == "L":
-                crop = crop.convert("RGB")
-            else:
-                crop = crop.copy()
-            crop.thumbnail((2600, 2600))
-            output = io.BytesIO()
-            crop.save(output, format="JPEG", quality=94, optimize=True)
-            value = output.getvalue()
-            if not value:
-                raise ValueError("evidence crop is empty")
-            return value, "image/jpeg"
-    except Exception as exc:
-        raise FullDocumentGradingError(
-            "Could not create a high-resolution student evidence crop for "
-            f"region {region.get('region_id') or '?'}"
-        ) from exc
-
-
-def _optimize_image(image_bytes: bytes) -> tuple[bytes, str]:
-    """Bound request size while retaining handwriting and diagram detail."""
-    try:
-        from PIL import Image, ImageOps
-
-        with Image.open(io.BytesIO(image_bytes)) as opened:
-            image = ImageOps.exif_transpose(opened)
-            if image.mode not in {"RGB", "L"}:
-                background = Image.new("RGB", image.size, "white")
-                if "A" in image.getbands():
-                    background.paste(image, mask=image.getchannel("A"))
-                else:
-                    background.paste(image.convert("RGB"))
-                image = background
-            elif image.mode == "L":
-                image = image.convert("RGB")
-            else:
-                image = image.copy()
-            image.thumbnail((2400, 2400))
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=88, optimize=True)
-            optimized = output.getvalue()
-            if optimized:
-                return optimized, "image/jpeg"
-    except Exception:
-        logger.warning("Could not optimize a student page; using canonical bytes")
-    media_type = "image/png" if image_bytes.startswith(b"\x89PNG") else "image/jpeg"
-    return image_bytes, media_type
+    with Image.open(io.BytesIO(image_bytes)) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        if rotation:
+            image = image.rotate(-rotation, expand=True, fillcolor="white")
+        output = io.BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=96,
+            subsampling=0,
+            optimize=True,
+        )
+        value = output.getvalue()
+        if not value:
+            raise ValueError("Recovery orientation image is empty")
+        return value
 
 
 def _usage_dict(response: Any, *, fallback_model: str) -> Dict[str, Any]:
@@ -2848,205 +1997,114 @@ def _build_responses_input(
 
 def _system_instructions() -> str:
     return (
-        "You are the primary visual examiner for a high-stakes handwritten exam. "
-        "Read the original question paper, the teacher solution/marking scheme, "
-        "and the student's complete answer copy directly. OCR text is not supplied "
-        "and must not be treated as a gate. Use visual reasoning for handwriting, "
-        "mathematics, arrows, tables, graphs, geometry, circuit diagrams, crossed-out "
-        "work, and answers written out of order.\n\n"
-        "Build a private evidence ledger across the entire student copy before grading. "
-        "Match work to questions using visible question labels, given values, requested "
-        "result, method, diagram semantics, and page continuity. Printed question or "
-        "teacher-solution content is never student evidence. Do not copy the answer key "
-        "into student_answer or evidence. A student may answer in any order and may put "
-        "several questions on one page or one question across several pages.\n\n"
-        "For catalog questions with grading_mode=objective, your role is extraction "
-        "only: transcribe the student's selected option label into student_answer "
-        "(for example A, B, C, or D). Do not decide whether it is correct and do not "
-        "calculate marks. Return empty criterion_marks, total_score 0, and "
-        "not_applicable method analysis; the server applies the immutable answer key "
-        "and negative-marking rule. If more than one option is plausible, return "
-        "unresolved instead of choosing one.\n\n"
-        "Before awarding marks, reconstruct the student's own approach for each "
-        "attempted question. Keep method identity separate from correctness: set "
-        "method_classification to reference_method, alternative_method, "
-        "specified_method, no_method_visible, not_applicable, or unresolved; then "
-        "set method_validity independently to valid, partially_valid, invalid, "
-        "not_applicable, or unresolved. alternative_method means only that the "
-        "approach differs from the reference; it does not itself say that the "
-        "approach is correct. The server derives whether the frozen method policy "
-        "was satisfied, so do not return that policy decision. The "
-        "teacher solution is an identity and correctness anchor, not a template that "
-        "the student's working must resemble. Equivalent algebra, reordered steps, "
-        "different valid formulae, concise mental steps, and valid diagram-based or "
-        "verbal reasoning must receive the same criterion decision when they establish "
-        "the same required fact. Never invent work that is not visible. Enforce a named "
-        "method only when the catalog method_policy says specified_method_required. "
-        "When error-carried-forward is enabled, isolate the earliest visible error and "
-        "still award later method/reasoning criteria that are internally correct using "
-        "the student's own value; do not repeatedly penalize one earlier error.\n\n"
-        "For every catalog question return exactly one result. attempt_status=attempted "
-        "only when student work is visibly present. Use not_attempted only after checking "
-        "every student page and finding no work for that question. Use unresolved when "
-        "ownership, handwriting, page coverage, or the correct award is genuinely "
-        "uncertain. Never guess a zero. For attempted answers, apply only the locked "
-        "criterion IDs and maximums from the catalog and return every locked criterion "
-        "exactly once. For not_attempted return empty student_answer, evidence_regions, "
-        "and criterion_marks with total_score 0. For unresolved return no award and empty "
-        "criterion_marks with total_score 0. For each attempted answer compare visible "
-        "student evidence to each criterion's acceptable_evidence independently; do not "
-        "grade by overall impression. Use decision=met only with the full criterion mark, "
-        "decision=not_met only with zero, decision=partially_met only when both achieved "
-        "and missing parts are identified, and decision=unresolved when the criterion "
-        "cannot be judged reliably. Any unresolved criterion makes the question review-only. "
-        "Equivalent evidence must receive the same criterion decision regardless of student, "
-        "handwriting style, answer order, or surrounding answers. Award step marks for "
-        "correct visible work even when the final answer is wrong. Set each criterion's "
-        "credit_basis to direct_evidence, error_carried_forward, no_credit, or unresolved "
-        "so every awarded mark can be audited. Evaluate diagrams visually. "
-        "Cite the student page and a short literal/visual description for every criterion, "
-        "including why a zero was awarded. Never use the teacher solution as student evidence. "
-        "Do not exceed any criterion or question maximum. Set needs_review for low-quality "
-        "images, ambiguous ownership, contradictory work, unreadable evidence, or any "
-        "uncertain award. Coordinates are approximate vertical bands from 0 at page top "
-        "to 1000 at page bottom.\n\n"
-        "Use the frozen paper context, including subject, board or course, class or standard, question genre, and teacher guidance, to apply an age- and subject-appropriate standard. Open-ended language and humanities responses need not match the reference wording; judge them only against the locked content, organization, language, style, format, or reasoning criteria. Return one criterion_marks row for every locked criterion, in the exact order shown; criterion ids are server-owned references and must not be invented or reordered. "
-        "The student_answer field is the Work shown record. Transcribe the visible "
-        "answer faithfully and concisely, preserving the student's meaningful steps, "
-        "values, equations, and final answer in reading order. Do not evaluate or "
-        "correct the work inside student_answer. Keep criterion evidence literal and "
-        "criterion rationale to one short sentence explaining the mark. Write "
-        "overall_feedback exactly as a teacher would write a correction: one or two "
-        "short, direct sentences stating what is correct and the specific correction "
-        "needed. For a fully correct response, use a direct statement such as "
-        "'Correct method and answer.' Do not mention AI, OCR, confidence, criteria, "
-        "rubrics, evidence regions, uploaded images, or phrases such as 'the student'.\n\n"
-        "For document_review, all_student_work_accounted means that every visible "
-        "student mark on every submitted page has been assigned to a catalog question "
-        "or the relevant questions were explicitly found not attempted. A routine note "
-        "that some questions were not attempted is not uncertainty. The warnings array "
-        "is explanatory only: if a warning describes cropped pages, unreadable work, "
-        "unassigned writing, or any other real coverage uncertainty, also set "
-        "all_student_work_accounted=false or lower confidence accordingly. Never put an "
-        "ordinary not-attempted summary in warnings."
+        "You are grading one complete handwritten answer copy. Read the original "
+        "question paper, teacher solution or marking scheme, and every student page "
+        "directly. The pages may be dark, sideways, photographed at an angle, marked "
+        "by a teacher, or written in Hindi or another language. Preserve the student's "
+        "meaning and script. Do not depend on OCR, crops, coordinates, confidence "
+        "thresholds, or exact wording.\n\n"
+        "First locate each answer across the complete copy, then grade it against the "
+        "matching catalog question and locked marking criteria. Several answers may "
+        "share one page and an answer may continue on another page. Use visible question "
+        "numbers, wording, context, and page continuity. Return every catalog question "
+        "exactly once.\n\n"
+        "Use attempted when relevant work is visible. Use not_attempted only after "
+        "checking every page and finding no work for that question. Use unresolved only "
+        "when the answer or its ownership is genuinely unreadable; never use it merely "
+        "because the photograph is imperfect or confidence is low. For readable work, "
+        "make the best evidence-supported award.\n\n"
+        "The catalog grading_mode is authoritative; never infer a different mode from "
+        "the wording or from the presence of options. A catalog item marked subjective "
+        "must return every locked criterion exactly once, even when it contains one or "
+        "more multiple-choice subparts. Keep marks within each criterion maximum. "
+        "Equivalent correct wording or methods receive credit. Award correct visible "
+        "steps even when the final answer is wrong. Only a catalog item explicitly "
+        "marked objective may return no criterion rows: transcribe its selected option "
+        "and set total_score 0 so the server can apply the answer key.\n\n"
+        "source_pages contains only physical answer-copy page numbers. student_answer is "
+        "a concise faithful transcription of visible work. overall_feedback is one or "
+        "two direct teacher-style sentences. needs_review is true only when unreadability "
+        "or ownership ambiguity materially prevents a reliable score. Do not mention AI, "
+        "OCR, confidence, image processing, schemas, or evidence mapping."
     )
 
 
-def _evidence_ledger_schema() -> Dict[str, Any]:
-    region = {
+def _whole_copy_schema(questions: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    question_variants = [
+        _question_output_schema(question, fallback_number=index)
+        for index, question in enumerate(questions, start=1)
+    ]
+    if not question_variants:
+        raise FullDocumentGradingError("Cannot build a grading schema without questions")
+    question_items: Dict[str, Any]
+    if len(question_variants) == 1:
+        question_items = question_variants[0]
+    else:
+        question_items = {"anyOf": question_variants}
+    return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "page_number": {"type": "integer", "minimum": 1},
-            "y_start": {"type": "number", "minimum": 0, "maximum": 1000},
-            "y_end": {"type": "number", "minimum": 0, "maximum": 1000},
-            "evidence": {"type": "string"},
-        },
-        "required": ["page_number", "y_start", "y_end", "evidence"],
-    }
-    criterion = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "criterion_id": {"type": "string"},
-            "decision": {
-                "type": "string",
-                "enum": ["met", "partially_met", "not_met", "unresolved"],
-            },
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "marks_awarded": {"type": "number", "minimum": 0},
-            "rationale": {"type": "string"},
-            "evidence": {"type": "string"},
-            "missing_evidence": {"type": "string"},
-            "credit_basis": {
-                "type": "string",
-                "enum": [
-                    "direct_evidence",
-                    "error_carried_forward",
-                    "no_credit",
-                    "unresolved",
-                ],
+            "questions": {
+                "type": "array",
+                "items": question_items,
+                "minItems": len(question_variants),
+                "maxItems": len(question_variants),
             },
         },
-        "required": [
-            "criterion_id",
-            "decision",
-            "confidence",
-            "marks_awarded",
-            "rationale",
-            "evidence",
-            "missing_evidence",
-            "credit_basis",
-        ],
+        "required": ["questions"],
     }
-    method_analysis = {
+
+
+def _question_output_schema(
+    question: Mapping[str, Any],
+    *,
+    fallback_number: int,
+) -> Dict[str, Any]:
+    """Bind one output row to its immutable grading mode and rubric shape."""
+
+    number = _positive_int(question.get("question_number")) or fallback_number
+    objective = _is_objective_question(dict(question))
+    criteria = [] if objective else _criteria(dict(question))
+    criterion_variants = [
+        _criterion_output_schema(criterion) for criterion in criteria
+    ]
+    if criterion_variants:
+        criterion_items: Dict[str, Any]
+        if len(criterion_variants) == 1:
+            criterion_items = criterion_variants[0]
+        else:
+            criterion_items = {"anyOf": criterion_variants}
+    else:
+        # ``items`` remains a valid schema even though objective rows are
+        # structurally constrained to an empty criterion array.
+        criterion_items = _criterion_output_schema(None)
+    required_criterion_count = len(criteria)
+    return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "detected_method": {"type": "string"},
-            "method_classification": {
-                "type": "string",
-                "enum": [
-                    "reference_method",
-                    "alternative_method",
-                    "specified_method",
-                    "no_method_visible",
-                    "not_applicable",
-                    "unresolved",
-                ],
-            },
-            "method_validity": {
-                "type": "string",
-                "enum": [
-                    "valid",
-                    "partially_valid",
-                    "invalid",
-                    "not_applicable",
-                    "unresolved",
-                ],
-            },
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "explanation": {"type": "string"},
-            "error_carried_forward": {
-                "type": "string",
-                "enum": [
-                    "applied",
-                    "not_applied",
-                    "not_applicable",
-                    "unresolved",
-                ],
-            },
-            "error_carried_forward_reason": {"type": "string"},
-        },
-        "required": [
-            "detected_method",
-            "method_classification",
-            "method_validity",
-            "confidence",
-            "explanation",
-            "error_carried_forward",
-            "error_carried_forward_reason",
-        ],
-    }
-    question = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "question_number": {"type": "integer", "minimum": 1},
+            "question_number": {"type": "integer", "enum": [number]},
             "attempt_status": {
                 "type": "string",
                 "enum": ["attempted", "not_attempted", "unresolved"],
             },
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "student_answer": {"type": "string"},
-            "content_type": {
-                "type": "string",
-                "enum": ["TEXT_ONLY", "MIXED", "DIAGRAM_HEAVY", "TABLE_PRESENT"],
+            "source_pages": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
             },
-            "evidence_regions": {"type": "array", "items": region},
-            "method_analysis": method_analysis,
-            "criterion_marks": {"type": "array", "items": criterion},
-            "total_score": {"type": "number", "minimum": 0},
+            "criterion_marks": {
+                "type": "array",
+                "items": criterion_items,
+                "minItems": required_criterion_count,
+                "maxItems": required_criterion_count,
+            },
+            "total_score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": _max_marks(dict(question)),
+            },
             "overall_feedback": {"type": "string"},
             "needs_review": {"type": "boolean"},
             "review_reason": {"type": "string"},
@@ -3054,11 +2112,8 @@ def _evidence_ledger_schema() -> Dict[str, Any]:
         "required": [
             "question_number",
             "attempt_status",
-            "confidence",
             "student_answer",
-            "content_type",
-            "evidence_regions",
-            "method_analysis",
+            "source_pages",
             "criterion_marks",
             "total_score",
             "overall_feedback",
@@ -3066,23 +2121,68 @@ def _evidence_ledger_schema() -> Dict[str, Any]:
             "review_reason",
         ],
     }
+
+
+def _criterion_output_schema(
+    criterion: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {
+        "criterion_id": {"type": "string"},
+        "marks_awarded": {"type": "number", "minimum": 0},
+        "rationale": {"type": "string"},
+        "evidence": {"type": "string"},
+        "credit_basis": {
+            "type": "string",
+            "enum": [
+                "direct_evidence",
+                "error_carried_forward",
+                "no_credit",
+            ],
+        },
+    }
+    if criterion is not None:
+        criterion_id = str(criterion.get("criterion_id") or "").strip()
+        if criterion_id:
+            properties["criterion_id"] = {"type": "string", "enum": [criterion_id]}
+        properties["marks_awarded"]["maximum"] = max(
+            0.0,
+            float(criterion.get("max_marks") or 0.0),
+        )
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "document_review": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "all_student_work_accounted": {"type": "boolean"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "warnings": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["all_student_work_accounted", "confidence", "warnings"],
-            },
-            "questions": {"type": "array", "items": question},
-        },
-        "required": ["document_review", "questions"],
+        "properties": properties,
+        "required": [
+            "criterion_id",
+            "marks_awarded",
+            "rationale",
+            "evidence",
+            "credit_basis",
+        ],
+    }
+
+
+def _whole_copy_output_limit(question_count: int) -> int:
+    """Budget reasoning plus JSON without forcing the model to spend the cap."""
+
+    count = max(1, int(question_count or 0))
+    return min(32_000, max(24_000, 1_600 * count))
+
+
+def _recovery_output_limit(question_count: int) -> int:
+    """Allow one smaller recovery ledger while keeping the second call bounded."""
+
+    count = max(1, int(question_count or 0))
+    return min(20_000, max(12_000, 1_600 * count))
+
+
+def _response_completion_failure(response: Any) -> Optional[Dict[str, str]]:
+    status = str(getattr(response, "completion_status", "completed") or "completed")
+    if status == "completed":
+        return None
+    return {
+        "completion_status": status,
+        "incomplete_reason": str(getattr(response, "incomplete_reason", "") or ""),
     }
 
 
@@ -3092,46 +2192,23 @@ def _validate_ledger(
     questions: List[Dict[str, Any]],
     page_count: int,
 ) -> tuple[List[_ValidatedGrade], List[str], _DocumentReview]:
-    raw_document_review = payload.get("document_review")
     structural_errors = [
         str(error).strip()[:500]
-        for error in (payload.get("evidence_graph_validation_errors") or [])
+        for error in (payload.get("validation_errors") or [])
         if str(error).strip()
     ]
     document_warnings: List[str] = []
-    coverage_complete = False
-    coverage_confidence = 0.0
-    if isinstance(raw_document_review, dict):
-        coverage_complete = bool(
-            raw_document_review.get("all_student_work_accounted")
-        )
-        coverage_confidence = _confidence(raw_document_review.get("confidence"))
-        for warning in raw_document_review.get("warnings") or []:
-            if str(warning).strip():
-                document_warnings.append(str(warning).strip()[:300])
-    else:
-        document_warnings.append("Model omitted the full-copy coverage review")
-
     document_review = _DocumentReview(
-        all_student_work_accounted=coverage_complete,
-        confidence=coverage_confidence,
+        all_student_work_accounted=not structural_errors,
+        confidence=1.0 if not structural_errors else 0.0,
         warnings=document_warnings,
-        required=(
-            not coverage_complete
-            or coverage_confidence < _AUTO_ACCEPT_CONFIDENCE
-        ),
+        required=bool(structural_errors),
     )
     if structural_errors:
         document_review.required = True
         document_warnings.append(
-            "The visual evidence graph has structural validation errors"
+            "The whole-copy grading result has structural validation errors"
         )
-    # Machine decisions use typed coverage fields, never the wording of a
-    # free-text note. A note may explain that Q1/Q2 were absent without
-    # contradicting high-confidence full-copy coverage. Genuine uncertainty
-    # remains blocking through the typed boolean/confidence fields.
-    absence_coverage_complete = coverage_complete
-
     candidates: Dict[int, List[Dict[str, Any]]] = {}
     for item in payload.get("questions") or []:
         if not isinstance(item, dict):
@@ -3157,8 +2234,6 @@ def _validate_ledger(
             question=question,
             question_number=number,
             page_count=page_count,
-            coverage_complete=absence_coverage_complete,
-            coverage_confidence=coverage_confidence,
         )
         grades.append(grade)
 
@@ -3173,7 +2248,6 @@ def _validate_ledger(
             + ", ".join(str(value) for value in unexpected)
         )
         document_review.required = True
-    _mark_overlapping_evidence_for_review(grades)
     return grades, structural_errors, document_review
 
 
@@ -3190,154 +2264,22 @@ def _not_applicable_method_analysis() -> Dict[str, Any]:
     }
 
 
-def _validate_method_analysis(
-    raw: Any,
-    *,
-    method_policy: Dict[str, Any],
-) -> tuple[Dict[str, Any], List[str], List[str]]:
-    """Normalize method metadata without turning metadata defects into lost marks.
-
-    Method identity and method validity are independent observations. Policy
-    satisfaction is derived here from those observations, rather than trusted
-    as another model-generated boolean that can contradict them.
-    """
-
-    if not isinstance(raw, dict):
-        return (
-            {
-                **_not_applicable_method_analysis(),
-                "method_classification": "unresolved",
-                "method_validity": "unresolved",
-                "method_requirement_satisfied": False,
-                "confidence": 0.0,
-                "explanation": "The model omitted method analysis.",
-                "error_carried_forward": "unresolved",
-            },
-            [],
-            ["The student's method could not be reconstructed reliably"],
-        )
-
-    classifications = {
-        "reference_method",
-        "alternative_method",
-        # Accepted only to rematerialize ledgers produced by the previous
-        # contract. It is normalized to alternative_method below.
-        "valid_alternative",
-        "specified_method",
-        "no_method_visible",
-        "not_applicable",
-        "unresolved",
-    }
-    validities = {
-        "valid",
-        "partially_valid",
-        "invalid",
-        "not_applicable",
-        "unresolved",
-    }
-    follow_through_states = {
-        "applied",
-        "not_applied",
-        "not_applicable",
-        "unresolved",
-    }
-    classification = str(raw.get("method_classification") or "").strip().lower()
-    validity = str(raw.get("method_validity") or "").strip().lower()
-    follow_through = str(raw.get("error_carried_forward") or "").strip().lower()
-    explanation = str(raw.get("explanation") or "").strip()
-    follow_through_reason = str(
-        raw.get("error_carried_forward_reason") or ""
-    ).strip()
-    detected_method = str(raw.get("detected_method") or "").strip()
-    confidence = _confidence(raw.get("confidence"))
-
-    errors: List[str] = []
-    review_reasons: List[str] = []
-    if classification == "valid_alternative":
-        classification = "alternative_method"
-    if classification not in classifications:
-        classification = "unresolved"
-        review_reasons.append("Method analysis has an invalid classification")
-    if validity not in validities:
-        validity = "unresolved"
-        review_reasons.append("Method analysis has an invalid validity decision")
-    if follow_through not in follow_through_states:
-        follow_through = "unresolved"
-        review_reasons.append("Method analysis has an invalid follow-through decision")
-    if not explanation:
-        explanation = "The model did not explain its method decision."
-        review_reasons.append("Method analysis has no explanation")
-    if classification in {
-        "reference_method",
-        "alternative_method",
-        "specified_method",
-    } and not detected_method:
-        review_reasons.append(
-            "Method analysis named a method class without describing the method"
-        )
-    if follow_through == "applied":
-        if not method_policy.get("allow_error_carried_forward", True):
-            errors.append("Follow-through marks were applied although the frozen policy forbids them")
-        if not follow_through_reason:
-            errors.append("Applied follow-through credit has no explanation")
-
-    mode = str(method_policy.get("mode") or ANY_VALID_METHOD)
-    if mode == SPECIFIED_METHOD_REQUIRED:
-        requirement_satisfied = (
-            classification == "specified_method" and validity == "valid"
-        )
-        if not requirement_satisfied:
-            review_reasons.append("The explicitly required method was not verified")
-    elif mode == NO_METHOD_REQUIRED:
-        requirement_satisfied = True
-    else:
-        requirement_satisfied = validity == "valid" and classification in {
-            "reference_method",
-            "alternative_method",
-            "specified_method",
-            "no_method_visible",
-        }
-
-    if classification == "unresolved" or validity == "unresolved":
-        review_reasons.append("The student's method could not be reconstructed reliably")
-    if confidence < _CRITERION_MIN_SCORE_CONFIDENCE:
-        review_reasons.append("Method reconstruction confidence is below the review threshold")
-
-    return (
-        {
-            "detected_method": detected_method[:2000],
-            "method_classification": classification,
-            "method_validity": validity,
-            "method_requirement_satisfied": bool(requirement_satisfied),
-            "confidence": confidence,
-            "explanation": explanation[:3000],
-            "error_carried_forward": follow_through,
-            "error_carried_forward_reason": follow_through_reason[:3000],
-        },
-        errors,
-        review_reasons,
-    )
-
-
 def _validate_question_grade(
     item: Dict[str, Any],
     *,
     question: Dict[str, Any],
     question_number: int,
     page_count: int,
-    coverage_complete: bool,
-    coverage_confidence: float,
 ) -> _ValidatedGrade:
     status = str(item.get("attempt_status") or "unresolved").strip().lower()
     if status not in {"attempted", "not_attempted", "unresolved"}:
         status = "unresolved"
-    confidence = _confidence(item.get("confidence"))
+    confidence = 1.0
     student_answer = str(item.get("student_answer") or "").strip()
-    content_type = str(item.get("content_type") or ContentType.MIXED.value)
-    if content_type not in {value.value for value in ContentType}:
-        content_type = ContentType.MIXED.value
-    source_pages, region_errors = _validate_regions(
-        item.get("evidence_regions"),
+    content_type = ContentType.MIXED.value
+    source_pages, region_errors = _validate_question_source_pages(
+        item,
+        question_number=question_number,
         page_count=page_count,
     )
     validation_errors = list(region_errors)
@@ -3346,33 +2288,14 @@ def _validate_question_grade(
         for region in source_pages
         if str(region.get("region_id") or "")
     }
-    evidence_graph_question = bool(evidence_region_ids)
     max_marks = _max_marks(question)
     criteria = _criteria(question)
-    method_policy = _question_method_policy(question)
     method_analysis = _not_applicable_method_analysis()
     criterion_marks: List[Dict[str, Any]] = []
     total_score: Optional[float] = None
     manual_review = bool(item.get("needs_review"))
     review_reason = str(item.get("review_reason") or "").strip()
     objective_question = _is_objective_question(question)
-    hypotheses = [
-        hypothesis
-        for hypothesis in (item.get("interpretation_hypotheses") or [])
-        if isinstance(hypothesis, Mapping)
-    ]
-    hypothesis_confidences = sorted(
-        (_confidence(hypothesis.get("confidence")) for hypothesis in hypotheses),
-        reverse=True,
-    )
-    if (
-        len(hypothesis_confidences) >= 2
-        and hypothesis_confidences[0] - hypothesis_confidences[1] < 0.10
-    ):
-        manual_review = True
-        review_reason = review_reason or (
-            "Two plausible visual readings are too close to choose automatically"
-        )
 
     if status == "unresolved":
         return _unresolved_grade(
@@ -3406,20 +2329,6 @@ def _validate_question_grade(
                 student_answer=student_answer,
                 content_type=content_type,
             )
-        if not coverage_complete or coverage_confidence < _ABSENCE_CONFIDENCE:
-            return _unresolved_grade(
-                question,
-                question_number,
-                "The full-copy scan did not prove that this question was unattempted",
-                confidence=min(confidence, coverage_confidence),
-            )
-        if confidence < _ABSENCE_CONFIDENCE:
-            return _unresolved_grade(
-                question,
-                question_number,
-                "The model was not confident enough to record a not-attempted zero",
-                confidence=confidence,
-            )
         criterion_marks = [
             {
                 "criterion_id": criterion["criterion_id"],
@@ -3427,7 +2336,7 @@ def _validate_question_grade(
                 "marks_awarded": 0.0,
                 "max_marks": criterion["max_marks"],
                 "decision": "not_met",
-                "confidence": min(confidence, coverage_confidence),
+                "confidence": 1.0,
                 "rationale": "No student attempt was found after reviewing the full copy.",
                 "evidence": "No student evidence located on any submitted page.",
                 "missing_evidence": criterion.get("acceptable_evidence") or "",
@@ -3457,14 +2366,6 @@ def _validate_question_grade(
         validation_errors.append("Attempted answer has no student transcription")
     if not source_pages:
         validation_errors.append("Attempted answer has no visual evidence region")
-    if confidence < 0.50:
-        manual_review = True
-        if not review_reason:
-            review_reason = (
-                "Question ownership confidence is low; the provisional marks require "
-                "teacher confirmation"
-            )
-
     if objective_question:
         if validation_errors:
             return _unresolved_grade(
@@ -3487,11 +2388,6 @@ def _validate_question_grade(
                 source_pages=source_pages,
                 student_answer=student_answer,
                 content_type=content_type,
-            )
-        if confidence < _AUTO_ACCEPT_CONFIDENCE:
-            manual_review = True
-            review_reason = review_reason or (
-                "The selected option could not be read with automatic-publish confidence"
             )
         selected = str(objective_result["selected_answer"])
         correct = str(objective_result["correct_answer"])
@@ -3519,21 +2415,6 @@ def _validate_question_grade(
             review_reason=review_reason,
         )
 
-    method_analysis, method_errors, method_review_reasons = (
-        _validate_method_analysis(
-            item.get("method_analysis"),
-            method_policy=method_policy,
-        )
-    )
-    validation_errors.extend(method_errors)
-    if (
-        str(method_policy.get("mode") or ANY_VALID_METHOD)
-        == SPECIFIED_METHOD_REQUIRED
-        and not method_analysis.get("method_requirement_satisfied")
-    ):
-        validation_errors.append(
-            "The specified required method was not verified in the student work"
-        )
     raw_marks_value = item.get("criterion_marks")
     if isinstance(raw_marks_value, Mapping):
         raw_marks = [
@@ -3556,7 +2437,7 @@ def _validate_question_grade(
         if evidence_fragments:
             student_answer = " ".join(evidence_fragments)[:4000]
         else:
-            student_answer = "Visible work is present in the mapped answer region."
+            student_answer = "Visible work is present on the cited answer page."
             manual_review = True
             review_reason = review_reason or (
                 "The work was graded visually, but its text transcription is incomplete"
@@ -3582,13 +2463,12 @@ def _validate_question_grade(
         validation_errors.append(
             "Criterion results do not match the locked marking plan"
         )
-    criterion_review_reasons: List[str] = []
     for criterion in criteria:
         criterion_id = str(criterion["criterion_id"])
         raw = raw_by_id.get(criterion_id)
         if raw is None:
             continue
-        criterion_confidence = _confidence(raw.get("confidence"))
+        criterion_confidence = 1.0
         awarded = _finite_float(raw.get("marks_awarded"))
         if awarded is None or awarded < 0 or awarded > criterion["max_marks"]:
             validation_errors.append(
@@ -3621,16 +2501,12 @@ def _validate_question_grade(
         credit_basis = str(raw.get("credit_basis") or "").strip().lower()
         if awarded <= 0.01:
             credit_basis = "no_credit"
-        elif credit_basis == "error_carried_forward" and method_policy.get(
-            "allow_error_carried_forward", True
-        ):
+        elif credit_basis == "error_carried_forward" and _question_method_policy(
+            question
+        ).get("allow_error_carried_forward", True):
             credit_basis = "error_carried_forward"
         else:
             credit_basis = "direct_evidence"
-        if criterion_confidence < _CRITERION_AUTO_ACCEPT_CONFIDENCE:
-            criterion_review_reasons.append(
-                f"Criterion {criterion_id} confidence is below the automatic threshold"
-            )
         criterion_marks.append(
             {
                 "criterion_id": criterion_id,
@@ -3684,23 +2560,6 @@ def _validate_question_grade(
             content_type=content_type,
         )
 
-    if criterion_review_reasons:
-        manual_review = True
-        if not review_reason:
-            review_reason = "; ".join(dict.fromkeys(criterion_review_reasons))
-
-    if method_review_reasons:
-        manual_review = True
-        if not review_reason:
-            review_reason = "; ".join(dict.fromkeys(method_review_reasons))
-
-    if confidence < _AUTO_ACCEPT_CONFIDENCE:
-        manual_review = True
-        if not review_reason:
-            review_reason = (
-                "The question ownership or visual evidence is below the automatic "
-                "acceptance threshold"
-            )
     return _ValidatedGrade(
         question=question,
         question_number=question_number,
@@ -3718,58 +2577,38 @@ def _validate_question_grade(
     )
 
 
-def _validate_regions(
-    raw_regions: Any,
+def _validate_question_source_pages(
+    item: Mapping[str, Any],
     *,
+    question_number: int,
     page_count: int,
 ) -> tuple[List[Dict[str, Any]], List[str]]:
+    raw_pages = item.get("source_pages")
+    if not isinstance(raw_pages, list):
+        return [], ["Source pages must be an array"]
     regions: List[Dict[str, Any]] = []
     errors: List[str] = []
-    if not isinstance(raw_regions, list):
-        return [], ["Evidence regions must be an array"]
-    for item in raw_regions:
-        if not isinstance(item, dict):
-            errors.append("Evidence region is not an object")
-            continue
-        page_number = _positive_int(item.get("page_number"))
-        x_start = _finite_float(item.get("x_start"))
-        x_end = _finite_float(item.get("x_end"))
-        start = _finite_float(item.get("y_start"))
-        end = _finite_float(item.get("y_end"))
+    seen: set[int] = set()
+    for value in raw_pages:
+        page_number = _positive_int(value)
         if not page_number or page_number > page_count:
-            errors.append("Evidence refers to a non-submitted page")
+            errors.append("Answer refers to a non-submitted page")
             continue
-        if start is None or end is None or start < 0 or end > 1000 or end <= start:
-            errors.append("Evidence has an invalid vertical page band")
+        if page_number in seen:
             continue
-        if x_start is None and x_end is None:
-            x_start, x_end = 0.0, 1000.0
-        if (
-            x_start is None
-            or x_end is None
-            or x_start < 0
-            or x_end > 1000
-            or x_end <= x_start
-        ):
-            errors.append("Evidence has an invalid horizontal page band")
-            continue
-        region: Dict[str, Any] = {
-            "page_number": page_number,
-            "x_start": round((x_start / 1000.0) * _A4_WIDTH_MM, 3),
-            "y_start": round((start / 1000.0) * _A4_HEIGHT_MM, 3),
-            "x_end": round((x_end / 1000.0) * _A4_WIDTH_MM, 3),
-            "y_end": round((end / 1000.0) * _A4_HEIGHT_MM, 3),
-        }
-        for key in (
-            "region_id",
-            "evidence_kind",
-            "continuation_group",
-            "evidence",
-            "mapping_confidence",
-        ):
-            if item.get(key) is not None:
-                region[key] = item.get(key)
-        regions.append(region)
+        seen.add(page_number)
+        regions.append(
+            {
+                "region_id": f"q{question_number}-page-{page_number}",
+                "page_number": page_number,
+                "x_start": 0.0,
+                "y_start": 0.0,
+                "x_end": _A4_WIDTH_MM,
+                "y_end": _A4_HEIGHT_MM,
+                "coordinate_space": "original_page_mm",
+                "evidence": "Complete source page cited by the whole-copy grader.",
+            }
+        )
     return regions, errors
 
 
@@ -3807,56 +2646,6 @@ def _unresolved_grade(
         review_reason=reason[:800],
         validation_errors=[reason[:800]],
     )
-
-
-def _mark_overlapping_evidence_for_review(grades: List[_ValidatedGrade]) -> None:
-    for left_index, left in enumerate(grades):
-        if left.attempt_status != "attempted":
-            continue
-        for right in grades[left_index + 1 :]:
-            if right.attempt_status != "attempted":
-                continue
-            if _regions_overlap(left.source_pages, right.source_pages):
-                reason = (
-                    f"Visual evidence overlaps Q{left.question_number} and "
-                    f"Q{right.question_number}; teacher ownership review is required"
-                )
-                left.manual_review_required = True
-                right.manual_review_required = True
-                left.review_reason = left.review_reason or reason
-                right.review_reason = right.review_reason or reason
-
-
-def _regions_overlap(
-    left: List[Dict[str, Any]],
-    right: List[Dict[str, Any]],
-) -> bool:
-    for a in left:
-        for b in right:
-            if a["page_number"] != b["page_number"]:
-                continue
-            overlap_y = min(a["y_end"], b["y_end"]) - max(
-                a["y_start"], b["y_start"]
-            )
-            overlap_x = min(
-                float(a.get("x_end", _A4_WIDTH_MM)),
-                float(b.get("x_end", _A4_WIDTH_MM)),
-            ) - max(float(a.get("x_start", 0.0)), float(b.get("x_start", 0.0)))
-            if overlap_y <= 0 or overlap_x <= 0:
-                continue
-            area_overlap = overlap_x * overlap_y
-            area_a = (
-                float(a.get("x_end", _A4_WIDTH_MM))
-                - float(a.get("x_start", 0.0))
-            ) * (a["y_end"] - a["y_start"])
-            area_b = (
-                float(b.get("x_end", _A4_WIDTH_MM))
-                - float(b.get("x_start", 0.0))
-            ) * (b["y_end"] - b["y_start"])
-            smaller = min(area_a, area_b)
-            if smaller > 0 and area_overlap / smaller >= 0.50:
-                return True
-    return False
 
 
 def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
@@ -4032,46 +2821,6 @@ def _assessment_units(question: Dict[str, Any]) -> List[Dict[str, Any]]:
         )
     except (TypeError, ValueError):
         return []
-
-
-def _semantic_grade_defects(
-    question: Mapping[str, Any],
-    grade: Mapping[str, Any],
-) -> List[str]:
-    """Validate that a model result actually fulfills the locked rubric contract."""
-
-    if _is_objective_question(dict(question)):
-        return []
-    attempt_status = str(grade.get("attempt_status") or "attempted").strip().lower()
-    if attempt_status != "attempted":
-        return []
-    expected = _criteria(dict(question))
-    if not expected:
-        return []
-    raw_rows = grade.get("criterion_marks")
-    rows = (
-        [dict(row) for row in raw_rows if isinstance(row, Mapping)]
-        if isinstance(raw_rows, list)
-        else []
-    )
-    defects: List[str] = []
-    if len(rows) != len(expected):
-        defects.append(
-            f"expected {len(expected)} criterion results, received {len(rows)}"
-        )
-    expected_ids = [str(row.get("criterion_id") or "") for row in expected]
-    returned_ids = [str(row.get("criterion_id") or "") for row in rows]
-    if len(rows) == len(expected) and sorted(returned_ids) != sorted(expected_ids):
-        defects.append("criterion IDs do not match the locked marking plan")
-    has_transcription = bool(str(grade.get("student_answer") or "").strip())
-    has_criterion_evidence = any(
-        bool(str(row.get("evidence") or "").strip())
-        or bool(row.get("evidence_region_ids"))
-        for row in rows
-    )
-    if not has_transcription and not has_criterion_evidence:
-        defects.append("attempted answer has no readable student work")
-    return defects
 
 
 def _question_marking_policy(question: Dict[str, Any]) -> Dict[str, Any]:
@@ -4362,13 +3111,6 @@ def _finite_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
-
-
-def _confidence(value: Any) -> float:
-    parsed = _finite_float(value)
-    if parsed is None:
-        return 0.0
-    return max(0.0, min(1.0, parsed))
 
 
 def _temperature(value: Any) -> float:

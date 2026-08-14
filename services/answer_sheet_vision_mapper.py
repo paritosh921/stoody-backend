@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.ai_gateway_service import AIGatewayService, estimate_ocr_tokens, estimate_text_tokens
+from services.page_orientation import detect_sideways_page
 from utils.s3_storage import get_public_url, upload_file
 
 
@@ -386,80 +387,10 @@ class AnswerSheetVisionMapper:
     def _detect_sideways_page(self, image_bytes: bytes) -> Tuple[bool, Dict[str, Any]]:
         if not self.auto_orientation_enabled:
             return False, {"method": "disabled"}
-        try:
-            import cv2
-            import numpy as np
-
-            encoded = np.frombuffer(image_bytes, dtype=np.uint8)
-            image = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
-            if image is None or image.size == 0:
-                return False, {"method": "line_projection", "reason": "decode_failed"}
-
-            height, width = image.shape[:2]
-            largest = max(height, width)
-            if largest > 1400:
-                scale = 1400.0 / largest
-                image = cv2.resize(
-                    image,
-                    (max(1, int(width * scale)), max(1, int(height * scale))),
-                    interpolation=cv2.INTER_AREA,
-                )
-                height, width = image.shape[:2]
-
-            edges = cv2.Canny(image, 50, 150, apertureSize=3)
-            longest = max(height, width)
-            lines = cv2.HoughLinesP(
-                edges,
-                1,
-                np.pi / 180,
-                threshold=max(30, int(min(height, width) * 0.06)),
-                minLineLength=max(60, int(longest * 0.22)),
-                maxLineGap=max(12, int(longest * 0.025)),
-            )
-            horizontal_support = 0.0
-            vertical_support = 0.0
-            horizontal_count = 0
-            vertical_count = 0
-            if lines is not None:
-                # OpenCV returns either N x 1 x 4 or N x 4 depending on build.
-                for raw_line in lines.reshape(-1, 4):
-                    x1, y1, x2, y2 = (int(value) for value in raw_line)
-                    dx, dy = x2 - x1, y2 - y1
-                    length = float((dx * dx + dy * dy) ** 0.5)
-                    if length <= 0:
-                        continue
-                    angle = abs(float(np.degrees(np.arctan2(dy, dx)))) % 180.0
-                    folded = min(angle, 180.0 - angle)
-                    if folded <= 12.0:
-                        horizontal_support += length
-                        horizontal_count += 1
-                    elif folded >= 78.0:
-                        vertical_support += length
-                        vertical_count += 1
-
-            enough_signal = (
-                vertical_count >= 2
-                and vertical_support >= longest
-                and (vertical_support + horizontal_support) >= longest * 1.5
-            )
-            sideways = bool(
-                enough_signal
-                and vertical_support > horizontal_support * self.orientation_line_ratio
-            )
-            return sideways, {
-                "method": "line_projection",
-                "horizontal_support": round(horizontal_support, 1),
-                "vertical_support": round(vertical_support, 1),
-                "horizontal_lines": horizontal_count,
-                "vertical_lines": vertical_count,
-                "sideways": sideways,
-            }
-        except Exception as exc:
-            return False, {
-                "method": "line_projection",
-                "reason": "detector_unavailable",
-                "error_type": type(exc).__name__,
-            }
+        return detect_sideways_page(
+            image_bytes,
+            line_ratio=self.orientation_line_ratio,
+        )
 
     def _rotate_png(
         self,

@@ -579,6 +579,9 @@ class TestOpenAIResponsesDocumentInput:
             assert client.payload["store"] is False
             assert client.payload["prompt_cache_key"] == "pcr-paper-static"
             assert client.payload["text"]["format"]["strict"] is True
+            assert client.payload["text"]["format"]["name"].startswith(
+                "exam_document_"
+            )
             assert client.payload["input"][0]["content"][0]["type"] == "input_file"
             assert "temperature" not in client.payload
             assert result.content == '{"questions":[]}'
@@ -587,6 +590,25 @@ class TestOpenAIResponsesDocumentInput:
             assert result.incomplete_reason == ""
 
         asyncio.run(_run())
+
+    def test_openai_structured_output_schema_names_are_content_addressed(self):
+        from llm_gate.provider import _structured_output_schema_name
+
+        mapper = {
+            "type": "object",
+            "properties": {"questions": {"type": "array"}},
+        }
+        grader = {
+            "type": "object",
+            "properties": {"scores": {"type": "array"}},
+        }
+
+        assert _structured_output_schema_name(mapper) == (
+            _structured_output_schema_name(dict(reversed(list(mapper.items()))))
+        )
+        assert _structured_output_schema_name(mapper) != (
+            _structured_output_schema_name(grader)
+        )
 
     def test_openai_responses_surfaces_incomplete_generation_status(self):
         class _HTTPResponse:

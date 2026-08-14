@@ -52,6 +52,7 @@ from api.v1.exam_orch_async import (
 )
 from services.answer_mapping_contract import normalize_answer_label
 from services.evalpen_flag_utils import is_flag_resolved, resolve_flag
+from services.exampen_workflow import public_processing_status
 from services.objective_scoring_service import is_integer_question
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
@@ -860,7 +861,7 @@ async def get_submission_summary(
             else None
         )
         processing_status = (
-            str(processing_job.get("status"))
+            public_processing_status(processing_job.get("status"))
             if isinstance(processing_job, dict) and processing_job.get("status")
             else None
         )
@@ -1412,6 +1413,30 @@ async def _refresh_unpublished_review_state(
             status_code=status.HTTP_409_CONFLICT,
             detail="The result was published while the review was being saved",
         )
+    if readiness.get("ready"):
+        # ``blocked_for_review`` describes the durable worker's terminal result,
+        # not a permanent property of the copy. Once a teacher has resolved the
+        # final readiness blocker, keep the job and submission on the same side
+        # of the lifecycle contract. Guard the transition so a review action can
+        # never hide a genuine processing failure or an in-flight reprocess.
+        await tenant_db["exampen_processing_jobs"].update_one(
+            {
+                "submission_id": submission_id,
+                "status": "blocked_for_review",
+            },
+            {
+                "$set": {
+                    "status": "completed",
+                    "last_error": None,
+                    "finished_at": now,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "failure_code": "",
+                    "next_retry_at": "",
+                },
+            },
+        )
     return review_state, readiness, str(state_update["publication_status"])
 
 
@@ -1506,29 +1531,12 @@ async def confirm_document_coverage_review(
             detail="The review changed while it was being confirmed. Refresh and retry.",
         )
 
-    from services.exampen_submission_readiness import assess_submission_readiness
-
-    readiness = await assess_submission_readiness(tenant_db, submission_id)
-    review_state, state_update = _review_transition_from_readiness(
-        readiness,
-        now=now,
-    )
-    state_changed = await tenant_db["evalpen_submissions"].update_one(
-        {
-            "submission_id": submission_id,
-            "publication_status": {"$ne": "published"},
-        },
-        {"$set": state_update},
-    )
-    if state_changed.matched_count != 1:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The result was published while this review was being confirmed",
+    review_state, readiness, publication_status = (
+        await _refresh_unpublished_review_state(
+            tenant_db,
+            submission_id,
+            now=now,
         )
-    publication_status = str(
-        state_update.get("publication_status")
-        or submission.get("publication_status")
-        or "pending"
     )
 
     return {
@@ -1746,6 +1754,23 @@ async def get_exam_roster(
             "created_at": 1,
         },
     ).to_list(length=5000)
+    failed_copy_attempts = await tenant_db["exampen_student_copy_uploads"].find(
+        {
+            "exam_id": exam_id,
+            "status": "ingest_failed",
+            "$or": [
+                {"submission_id": {"$exists": False}},
+                {"submission_id": None},
+                {"submission_id": ""},
+            ],
+        },
+        projection={"student_id": 1, "updated_at": 1, "created_at": 1},
+    ).to_list(length=5000)
+    ingest_failed_by_student = {
+        str(item.get("student_id") or "").strip(): item
+        for item in failed_copy_attempts
+        if str(item.get("student_id") or "").strip()
+    }
     if scoped_ids is not None and not has_full_exam_access:
         allowed = {str(item) for item in scoped_ids}
         submissions = [
@@ -1883,6 +1908,25 @@ async def get_exam_roster(
             source = "camera" if source in {"upload", "pdf", "image"} else source
 
         if not submission_id:
+            failed_attempt = ingest_failed_by_student.get(student_id)
+            if failed_attempt:
+                status_value = "blocked"
+                total_blocked += 1
+                last_activity = _dt_to_iso(
+                    failed_attempt.get("updated_at") or failed_attempt.get("created_at")
+                )
+                items.append(
+                    CollectionRosterItemAPI(
+                        student_id=student_id,
+                        student_name=name_by_id.get(student_id),
+                        submission_id=None,
+                        status=status_value,
+                        source="camera",
+                        last_activity=last_activity,
+                        open_recheck_count=open_recheck_count,
+                    )
+                )
+                continue
             status_value = "expected"
         elif open_recheck_count > 0:
             status_value = "review"
@@ -4339,7 +4383,7 @@ async def _correct_response_assignment_impl(
                     **region.model_dump(),
                     # A teacher split creates new evidence regions. Reusing the
                     # model mapper's identifier for two different questions
-                    # would make the evidence graph internally ambiguous.
+                    # would make persisted evidence ownership ambiguous.
                     "region_id": f"teacher-split-{uuid.uuid4().hex[:16]}",
                     "continuation_group": None,
                     "mapping_confidence": 1.0,

@@ -6,7 +6,9 @@ from mongomock_motor import AsyncMongoMockClient
 from services.pcr_grading_contract_migration import (
     GradingContractMigrationError,
     inspect_v5_contracts,
+    inspect_v11_contracts,
     migrate_v5_exam_to_v6,
+    migrate_v11_exam_to_v12,
 )
 
 
@@ -148,3 +150,45 @@ async def test_migration_requires_the_linked_frozen_paper_context():
 
     assert plans[0]["eligible"] is False
     assert plans[0]["blockers"] == ["frozen paper version PAPER-1 was not found"]
+
+
+@pytest.mark.asyncio
+async def test_v12_migration_requeues_v11_for_bounded_whole_copy_grading():
+    db = _db()
+    await _seed(db)
+    await db["exampen_exams"].update_one(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"pcr_grading_contract.prompt_version": "pcr-full-document-visual-v11"}},
+    )
+    await db["evalpen_document_grading_runs"].update_many(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"prompt_version": "pcr-full-document-visual-v11"}},
+    )
+
+    plans = await inspect_v11_contracts(db, db_name="skb_test", exam_id="EXAM-1")
+    assert plans[0]["eligible"] is True
+    assert plans[0]["target_prompt_version"] == "pcr-full-document-visual-v12"
+
+    result = await migrate_v11_exam_to_v12(
+        db,
+        db_name="skb_test",
+        exam_id="EXAM-1",
+        requested_by="OPS-WHOLE-COPY-UPGRADE",
+    )
+
+    assert result["status"] == "migrated"
+    exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-1"})
+    assert exam["pcr_grading_contract"]["prompt_version"] == (
+        "pcr-full-document-visual-v12"
+    )
+    assert exam["pcr_grading_contract"]["migrated_from"] == (
+        "pcr-full-document-visual-v11"
+    )
+    assert await db["exampen_processing_jobs"].count_documents(
+        {
+            "exam_id": "EXAM-1",
+            "status": "queued_pipeline_v3",
+            "pipeline_version": 3,
+            "reprocess_count": 1,
+        }
+    ) == 2

@@ -238,6 +238,31 @@ async def test_readiness_blocks_duplicate_evidence_ownership():
 
 
 @pytest.mark.asyncio
+async def test_readiness_allows_shared_page_atoms_from_whole_copy_visual_grading():
+    from services.exampen_submission_readiness import assess_submission_readiness
+
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_detected_responses"].update_many(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "evidence_atom_ids": ["immutable-page-1"],
+                "question_assignment.method": "full_document_visual",
+                "visual_evidence.method": "whole_copy_visual",
+            }
+        },
+    )
+
+    report = await assess_submission_readiness(db, "SUB-READY")
+
+    assert report["ready"] is True
+    assert "duplicate_evidence_ownership" not in {
+        item["code"] for item in report["blockers"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_readiness_keeps_scored_review_notes_nonblocking():
     from services.exampen_submission_readiness import assess_submission_readiness
 
@@ -300,6 +325,16 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
             }
         },
     )
+    await db["exampen_processing_jobs"].update_one(
+        {"submission_id": "SUB-READY"},
+        {
+            "$set": {
+                "status": "blocked_for_review",
+                "last_error": "Teacher review is required",
+                "failure_code": "ManualReviewRequired",
+            }
+        },
+    )
 
     before = await assess_submission_readiness(db, "SUB-READY")
     assert before["ready"] is True
@@ -333,6 +368,12 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
     assert stored["document_review"]["status"] == "accepted"
     assert stored["document_review"]["required"] is False
     assert stored["document_review_history"][-1]["actor_id"] == "TEACHER-1"
+    job = await db["exampen_processing_jobs"].find_one(
+        {"submission_id": "SUB-READY"}
+    )
+    assert job["status"] == "completed"
+    assert job["last_error"] is None
+    assert "failure_code" not in job
 
 
 @pytest.mark.asyncio

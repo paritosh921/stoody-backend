@@ -251,6 +251,49 @@ async def test_exam_roster_shows_full_owned_exam_not_only_generic_student_scope(
 
 
 @pytest.mark.asyncio
+async def test_exam_roster_marks_ingest_failed_student_copy_as_blocked():
+    from api.v1.evalpen_review_async import get_exam_roster
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-FAILED-COPY",
+            "created_by_tutor_id": "TUT-1",
+            "teacher_ids": ["TUT-1"],
+            "roster": ["rohan21"],
+        }
+    )
+    await db["exampen_student_copy_uploads"].insert_one(
+        {
+            "attempt_id": "attempt-ingest-failed",
+            "exam_id": "EXAM-FAILED-COPY",
+            "student_id": "rohan21",
+            "status": "ingest_failed",
+            "last_error": "'student_web' is not a valid ArtifactSource",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async.get_tutor_scoped_students",
+            return_value=[{"student_id": "rohan21"}],
+        ),
+    ):
+        result = await get_exam_roster(
+            exam_id="EXAM-FAILED-COPY",
+            current_user=_tutor_user(),
+            db=None,
+        )
+
+    assert result.expected_students[0].student_id == "rohan21"
+    assert result.expected_students[0].status == "blocked"
+    assert result.expected_students[0].submission_id is None
+    assert result.total_blocked == 1
+    assert result.total_submitted == 0
+
+
+@pytest.mark.asyncio
 async def test_teacher_bff_queue_uses_visible_exam_for_hub_submission():
     from api.v1.evalpen_teacher_bff_async import get_exam_queue
 

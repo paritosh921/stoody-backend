@@ -88,6 +88,25 @@ def _has_unresolved_blocking_flag(response: Dict[str, Any]) -> bool:
     return False
 
 
+def _uses_shareable_whole_copy_evidence(response: Dict[str, Any]) -> bool:
+    """Return whether an evidence atom is a page citation, not an owned crop.
+
+    The full-document visual grader cites the same immutable physical page for
+    every answer found on that page.  Those page atoms are intentionally
+    shareable.  OCR/model/teacher regions remain exclusive and must continue
+    to fail readiness when two active responses claim the same atom.
+    """
+
+    assignment = response.get("question_assignment")
+    visual_evidence = response.get("visual_evidence")
+    return bool(
+        isinstance(assignment, dict)
+        and str(assignment.get("method") or "") == "full_document_visual"
+        and isinstance(visual_evidence, dict)
+        and str(visual_evidence.get("method") or "") == "whole_copy_visual"
+    )
+
+
 def _absence_is_proven(response: Dict[str, Any]) -> bool:
     assignment = response.get("question_assignment")
     proof = assignment.get("absence_proof") if isinstance(assignment, dict) else None
@@ -247,7 +266,7 @@ async def assess_submission_readiness(
         if str(question.get("question_id") or "")
     }
     responses_by_question: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    responses_by_evidence_atom: Dict[str, List[str]] = defaultdict(list)
+    responses_by_evidence_atom: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     unassigned_response_ids: List[str] = []
     unresolved_flag_ids: List[str] = []
     unknown_question_response_ids: List[str] = []
@@ -266,7 +285,7 @@ async def assess_submission_readiness(
         for raw_atom_id in response.get("evidence_atom_ids") or []:
             atom_id = str(raw_atom_id or "").strip()
             if atom_id:
-                responses_by_evidence_atom[atom_id].append(response_id)
+                responses_by_evidence_atom[atom_id].append(response)
 
     if unassigned_response_ids:
         blockers.append(
@@ -293,9 +312,23 @@ async def assess_submission_readiness(
             )
         )
     duplicate_atoms = {
-        atom_id: sorted(set(owner_ids))
-        for atom_id, owner_ids in responses_by_evidence_atom.items()
-        if len(set(owner_ids)) > 1
+        atom_id: sorted(
+            {
+                str(owner.get("response_id") or "")
+                for owner in owners
+                if str(owner.get("response_id") or "")
+            }
+        )
+        for atom_id, owners in responses_by_evidence_atom.items()
+        if len(
+            {
+                str(owner.get("response_id") or "")
+                for owner in owners
+                if str(owner.get("response_id") or "")
+            }
+        )
+        > 1
+        and not all(_uses_shareable_whole_copy_evidence(owner) for owner in owners)
     }
     if duplicate_atoms:
         blockers.append(
