@@ -7,8 +7,10 @@ from services.pcr_grading_contract_migration import (
     GradingContractMigrationError,
     inspect_v5_contracts,
     inspect_v11_contracts,
+    inspect_v12_contracts,
     migrate_v5_exam_to_v6,
     migrate_v11_exam_to_v12,
+    migrate_v12_exam_to_v13,
 )
 
 
@@ -192,3 +194,92 @@ async def test_v12_migration_requeues_v11_for_bounded_whole_copy_grading():
             "reprocess_count": 1,
         }
     ) == 2
+
+
+@pytest.mark.asyncio
+async def test_v13_migration_requeues_complete_v12_cohort_and_preserves_contract():
+    db = _db()
+    await _seed(db)
+    await db["exampen_exams"].update_one(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"pcr_grading_contract.prompt_version": "pcr-full-document-visual-v12"}},
+    )
+    await db["evalpen_document_grading_runs"].update_many(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"prompt_version": "pcr-full-document-visual-v12"}},
+    )
+
+    plans = await inspect_v12_contracts(db, db_name="skb_test", exam_id="EXAM-1")
+
+    assert plans == [
+        {
+            "db_name": "skb_test",
+            "exam_id": "EXAM-1",
+            "exam_name": "Physics",
+            "source_prompt_version": "pcr-full-document-visual-v12",
+            "target_prompt_version": "pcr-full-document-visual-v13",
+            "submission_count": 2,
+            "published_count": 0,
+            "active_job_count": 0,
+            "missing_job_count": 0,
+            "eligible": True,
+            "blockers": [],
+        }
+    ]
+
+    result = await migrate_v12_exam_to_v13(
+        db,
+        db_name="skb_test",
+        exam_id="EXAM-1",
+        requested_by="OPS-GROUNDED-VISUAL-UPGRADE",
+    )
+
+    assert result["status"] == "migrated"
+    exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-1"})
+    contract = exam["pcr_grading_contract"]
+    assert contract["prompt_version"] == "pcr-full-document-visual-v13"
+    assert contract["migrated_from"] == "pcr-full-document-visual-v12"
+    assert contract["model_id"] == "gpt-5.1-2025-11-13"
+    assert contract["reasoning_effort"] == "medium"
+    assert contract["temperature"] == 0.1
+    assert contract["locked_at"] == "original-lock"
+    assert await db["exampen_processing_jobs"].count_documents(
+        {
+            "exam_id": "EXAM-1",
+            "status": "queued_pipeline_v3",
+            "pipeline_version": 4,
+            "mapping_pipeline_version": "evidence-first-visual-v4",
+            "required_processing_path": "full_document_visual",
+            "reprocess_count": 1,
+        }
+    ) == 2
+    old_run = await db["evalpen_document_grading_runs"].find_one({"run_id": "RUN-1"})
+    assert old_run["status"] == "superseded"
+    assert old_run["superseded_by_migration_id"] == result["migration_id"]
+
+
+@pytest.mark.asyncio
+async def test_v13_migration_refuses_published_v12_cohort():
+    db = _db()
+    await _seed(db, published=True)
+    await db["exampen_exams"].update_one(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"pcr_grading_contract.prompt_version": "pcr-full-document-visual-v12"}},
+    )
+
+    plans = await inspect_v12_contracts(db, db_name="skb_test", exam_id="EXAM-1")
+    assert plans[0]["eligible"] is False
+    assert "published submission" in " ".join(plans[0]["blockers"])
+
+    with pytest.raises(GradingContractMigrationError, match="published submission"):
+        await migrate_v12_exam_to_v13(
+            db,
+            db_name="skb_test",
+            exam_id="EXAM-1",
+            requested_by="OPS-GROUNDED-VISUAL-UPGRADE",
+        )
+
+    exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-1"})
+    assert exam["pcr_grading_contract"]["prompt_version"] == (
+        "pcr-full-document-visual-v12"
+    )

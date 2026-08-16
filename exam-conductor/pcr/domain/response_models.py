@@ -233,22 +233,27 @@ class Flag(BaseModel):
 
 
 class SourcePageRef(BaseModel):
-    """A reference to a page range contributing to a detected response."""
+    """A reference to an auditable region contributing to a response."""
 
     page_number: int = Field(..., ge=1)
+    coordinate_space: str = Field(
+        "original_page_mm",
+        pattern="^(original_page_mm|normalized_1000)$",
+        description="original_page_mm for legacy rows or normalized_1000 for v13",
+    )
     x_start: float = Field(
         0.0,
-        description="Start X in mm on this page (0 = left)",
+        description="Left edge in the declared coordinate space",
     )
     y_start: float = Field(
-        ..., description="Start Y in mm on this page (0 = top)"
+        ..., description="Top edge in the declared coordinate space"
     )
     x_end: float | None = Field(
         None,
-        description="End X in mm on this page; absent means full page width",
+        description="Right edge in the declared coordinate space",
     )
     y_end: float = Field(
-        ..., description="End Y in mm on this page (page_height = bottom)"
+        ..., description="Bottom edge in the declared coordinate space"
     )
     region_id: str | None = Field(
         None,
@@ -262,6 +267,15 @@ class SourcePageRef(BaseModel):
         None,
         description="Links disconnected regions belonging to one continued answer",
     )
+    sequence: int = Field(
+        1,
+        ge=1,
+        description="Reading order within a continuation group",
+    )
+    authorship: str | None = Field(
+        None,
+        description="student for verified answer work or uncertain for review",
+    )
     evidence: str | None = Field(
         None,
         description="Short model description used for visual evidence audit",
@@ -271,6 +285,10 @@ class SourcePageRef(BaseModel):
         ge=0.0,
         le=1.0,
         description="Question-ownership confidence for this region",
+    )
+    diagram_components: list[str] = Field(
+        default_factory=list,
+        description="Visible labels and structural relationships in diagram evidence",
     )
 
 

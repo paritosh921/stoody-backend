@@ -3851,3 +3851,1059 @@ Traceback (most recent call last):
   File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 318, in wait_for_read
     raise _OperationCancelled("operation cancelled")
 pymongo.errors._OperationCancelled: operation cancelled
+WARNING:  WatchFiles detected changes in 'tmp\debug_ciel_visibility.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-14 16:22:42,528 - main_async - INFO - \U0001f6d1 Shutting down services...
+2026-08-14 16:22:42,531 - main_async - INFO - \u2705 Session timeout monitor stopped
+2026-08-14 16:22:42,531 - main_async - INFO - \u2705 Note classification worker stopped
+2026-08-14 16:22:42,580 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor stopped
+2026-08-14 16:22:42,581 - main_async - INFO - \u2705 ExamPen local automatic PCR processor stopped
+2026-08-14 16:22:42,586 - core.cache - INFO - \U0001f50c Cache connection closed
+2026-08-14 16:22:42,629 - core.database - INFO - \U0001f50c MongoDB connection closed
+2026-08-14 16:22:42,629 - core.database - INFO - \U0001f50c Database connections closed
+2026-08-14 16:22:42,630 - main_async - INFO - \u2705 Cleanup completed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [42676]
+WARNING:  WatchFiles detected changes in 'tmp\debug_ciel_visibility2.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 131, in _main
+    prepare(preparation_data)
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 246, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\main_async.py", line 48, in <module>
+    from prometheus_fastapi_instrumentator import Instrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\__init__.py", line 1, in <module>
+    from .instrumentation import PrometheusFastApiInstrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\instrumentation.py", line 10, in <module>
+    from prometheus_client import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\__init__.py", line 3, in <module>
+    from . import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 58, in <module>
+    PLATFORM_COLLECTOR = PlatformCollector()
+                         ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 17, in __init__
+    system = self._platform.system()
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 987, in system
+    return uname().system
+           ^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 922, in uname
+    release, version, csd, ptype = win32_ver()
+                                   ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 450, in win32_ver
+    version, csd, ptype, is_client = _win32_ver(version, csd, ptype)
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 388, in _win32_ver
+    (version, product_type, ptype, spmajor, spminor)  = _wmi_query(
+                                                        ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 327, in _wmi_query
+    data = _wmi.exec_query("SELECT {} FROM {}".format(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+2026-08-14 16:23:54,003 - __mp_main__ - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 16:23:54,007 - __mp_main__ - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 16:23:54,076 - __mp_main__ - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 16:23:54,110 - __mp_main__ - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 16:23:54,124 - __mp_main__ - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 16:23:54,133 - __mp_main__ - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 16:23:54,169 - __mp_main__ - INFO - \u2705 Student Credits routes enabled
+2026-08-14 16:23:54,201 - __mp_main__ - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 16:23:54,290 - __mp_main__ - INFO - \u2705 Student Copies routes enabled
+2026-08-14 16:23:54,296 - __mp_main__ - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 16:23:54,350 - __mp_main__ - INFO - \u2705 Video routes enabled
+2026-08-14 16:23:54,375 - __mp_main__ - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 16:23:54,384 - __mp_main__ - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 16:23:54,395 - __mp_main__ - INFO - \u2705 Meeting routes enabled
+2026-08-14 16:23:54,418 - __mp_main__ - INFO - \u2705 Online Class routes enabled
+2026-08-14 16:23:54,425 - __mp_main__ - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 16:23:54,426 - __mp_main__ - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 16:23:54,430 - __mp_main__ - INFO - \u2705 Dashboard routes enabled
+2026-08-14 16:23:54,434 - __mp_main__ - INFO - \u2705 Hub routes enabled
+2026-08-14 16:23:54,443 - __mp_main__ - INFO - \u2705 Notes routes enabled
+2026-08-14 16:23:54,462 - __mp_main__ - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 16:23:54,464 - __mp_main__ - INFO - \u2705 OCR routes enabled
+2026-08-14 16:23:54,765 - __mp_main__ - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 16:23:54,790 - __mp_main__ - INFO - \u2705 Super Admin routes enabled
+2026-08-14 16:23:54,796 - __mp_main__ - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 16:23:54,800 - __mp_main__ - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 16:23:54,804 - __mp_main__ - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 16:23:54,822 - __mp_main__ - INFO - \u2705 Timetable routes enabled
+2026-08-14 16:23:54,930 - __mp_main__ - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 16:23:54,945 - __mp_main__ - INFO - \u2705 Exam Tally routes enabled
+2026-08-14 16:23:55,675 - main_async - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 16:23:55,677 - main_async - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 16:23:55,753 - main_async - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 16:23:55,789 - main_async - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 16:23:55,806 - main_async - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 16:23:55,815 - main_async - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 16:23:55,851 - main_async - INFO - \u2705 Student Credits routes enabled
+2026-08-14 16:23:55,926 - main_async - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 16:23:56,065 - main_async - INFO - \u2705 Student Copies routes enabled
+2026-08-14 16:23:56,071 - main_async - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 16:23:56,101 - main_async - INFO - \u2705 Video routes enabled
+2026-08-14 16:23:56,134 - main_async - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 16:23:56,164 - main_async - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 16:23:56,186 - main_async - INFO - \u2705 Meeting routes enabled
+2026-08-14 16:23:56,218 - main_async - INFO - \u2705 Online Class routes enabled
+2026-08-14 16:23:56,225 - main_async - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 16:23:56,228 - main_async - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 16:23:56,233 - main_async - INFO - \u2705 Dashboard routes enabled
+2026-08-14 16:23:56,239 - main_async - INFO - \u2705 Hub routes enabled
+2026-08-14 16:23:56,250 - main_async - INFO - \u2705 Notes routes enabled
+2026-08-14 16:23:56,280 - main_async - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 16:23:56,282 - main_async - INFO - \u2705 OCR routes enabled
+2026-08-14 16:23:56,297 - main_async - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 16:23:56,337 - main_async - INFO - \u2705 Super Admin routes enabled
+2026-08-14 16:23:56,346 - main_async - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 16:23:56,352 - main_async - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 16:23:56,357 - main_async - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 16:23:56,377 - main_async - INFO - \u2705 Timetable routes enabled
+2026-08-14 16:23:56,533 - main_async - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 16:23:56,552 - main_async - INFO - \u2705 Exam Tally routes enabled
+INFO:     Started server process [30304]
+INFO:     Waiting for application startup.
+2026-08-14 16:23:56,561 - main_async - INFO - \U0001f680 Starting SkillBot Async Backend...
+2026-08-14 16:23:58,467 - core.database - INFO - \u2705 MongoDB initialized - Master DB: skb_master
+2026-08-14 16:23:58,467 - core.database - INFO - \u2705 B2C MongoDB initialized - Database: STOODY-b2c
+2026-08-14 16:23:58,527 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:23:58,558 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:23:58,590 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:23:58,619 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:23:58,757 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704837, 44), 'signature': {'hash': b"U\r\xe0\xc3\xd2\xb6\x80\xfe\x9d\xf7\x85G\xcen'\x92;\xb0\xedQ", 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704837, 44)}
+2026-08-14 16:23:58,757 - core.database - INFO - \u2705 Database manager initialized successfully
+2026-08-14 16:23:58,766 - core.cache - INFO - Cache manager initialized successfully with Redis connection
+2026-08-14 16:23:58,767 - core.auth - INFO - \u2705 Auth manager initialized
+2026-08-14 16:23:58,767 - main_async - INFO - \u2705 Session timeout monitor started
+2026-08-14 16:23:58,774 - main_async - INFO - \u2705 Note classification worker started
+2026-08-14 16:23:59,221 - services.classification_worker - INFO - Classification worker started
+2026-08-14 16:23:59,398 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:23:59,434 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:23:59,475 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:23:59,484 - core.database - WARNING - Could not create one or more indexes on skb_master: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704838, 623), 'signature': {'hash': b'\xadM\x9d\xd2\xcd\xfc}Y\x16\x1b\xeau\xbb\xf0\xcff.\xf6d\xbf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704838, 623)}
+2026-08-14 16:23:59,509 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:23:59,690 - core.database - WARNING - Could not create one or more indexes on skb_indl-sgtb-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704838, 639), 'signature': {'hash': b'\xadM\x9d\xd2\xcd\xfc}Y\x16\x1b\xeau\xbb\xf0\xcff.\xf6d\xbf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704838, 639)}
+2026-08-14 16:23:59,756 - core.database - WARNING - Could not create one or more indexes on skb_indl-ciel-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704838, 654), 'signature': {'hash': b'\xadM\x9d\xd2\xcd\xfc}Y\x16\x1b\xeau\xbb\xf0\xcff.\xf6d\xbf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704838, 654)}
+2026-08-14 16:23:59,909 - exam-conductor.llm_gate.repository - INFO - LLM gate indexes ensured on skb_master
+2026-08-14 16:24:00,040 - core.database - WARNING - Could not create one or more indexes on skb_visc-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704838, 731), 'signature': {'hash': b'\xadM\x9d\xd2\xcd\xfc}Y\x16\x1b\xeau\xbb\xf0\xcff.\xf6d\xbf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704838, 731)}
+2026-08-14 16:24:00,114 - exam-conductor.ingest.repository - INFO - Ensured ingest indexes on evalpen_submissions and evalpen_answer_pages
+2026-08-14 16:24:00,114 - main_async - INFO - ExamPen indexes initialized on master DB
+2026-08-14 16:24:00,123 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor started (poll=3.0s, concurrency=3)
+2026-08-14 16:24:00,123 - main_async - INFO - \u2705 ExamPen local automatic PCR processor started
+2026-08-14 16:24:00,124 - main_async - INFO - \u2705 All services initialized successfully
+INFO:     Application startup complete.
+2026-08-14 16:24:00,175 - core.database - WARNING - Could not create one or more indexes on skb_rant-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704838, 756), 'signature': {'hash': b'\xadM\x9d\xd2\xcd\xfc}Y\x16\x1b\xeau\xbb\xf0\xcff.\xf6d\xbf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704838, 756)}
+2026-08-14 16:24:00,425 - core.database - WARNING - Could not create one or more indexes on skb_airf-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704839, 1), 'signature': {'hash': b'\x87,\x99\x99\xf4\x07P3\xdb&\xe9&\xb9\xea\xf54\x1a\\)%', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704839, 1)}
+2026-08-14 16:24:00,508 - core.database - WARNING - Could not create one or more indexes on skb_sgtb-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704839, 12), 'signature': {'hash': b'\x87,\x99\x99\xf4\x07P3\xdb&\xe9&\xb9\xea\xf54\x1a\\)%', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704839, 12)}
+2026-08-14 16:24:00,805 - core.database - WARNING - Could not create one or more indexes on skb_ciel-1008: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704839, 77), 'signature': {'hash': b'\x87,\x99\x99\xf4\x07P3\xdb&\xe9&\xb9\xea\xf54\x1a\\)%', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704839, 77)}
+2026-08-14 16:24:00,944 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:24:00,980 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:24:01,016 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:24:01,058 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:24:01,090 - core.database - WARNING - Could not create one or more indexes on skb_mtel-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704839, 127), 'signature': {'hash': b'\x87,\x99\x99\xf4\x07P3\xdb&\xe9&\xb9\xea\xf54\x1a\\)%', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704839, 127)}
+2026-08-14 16:24:01,202 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786704839, 138), 'signature': {'hash': b'\x87,\x99\x99\xf4\x07P3\xdb&\xe9&\xb9\xea\xf54\x1a\\)%', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786704839, 138)}
+2026-08-14 16:44:05,555 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcf09 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 16:44:05,657 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcf02 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 16:46:06,194 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcf06 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 16:46:06,330 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcef5 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 16:46:06,429 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcf08 due to inactivity (tenant=skb_ciel-1008)
+WARNING:  WatchFiles detected changes in 'tmp\debug_ciel_newcopy.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-14 16:57:41,357 - main_async - INFO - \U0001f6d1 Shutting down services...
+2026-08-14 16:57:41,359 - main_async - INFO - \u2705 Session timeout monitor stopped
+2026-08-14 16:57:41,360 - main_async - INFO - \u2705 Note classification worker stopped
+2026-08-14 16:57:41,485 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor stopped
+2026-08-14 16:57:41,486 - main_async - INFO - \u2705 ExamPen local automatic PCR processor stopped
+2026-08-14 16:57:41,491 - core.cache - INFO - \U0001f50c Cache connection closed
+2026-08-14 16:57:41,531 - core.database - INFO - \U0001f50c MongoDB connection closed
+2026-08-14 16:57:41,532 - core.database - INFO - \U0001f50c Database connections closed
+2026-08-14 16:57:41,532 - main_async - INFO - \u2705 Cleanup completed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [30304]
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+2026-08-14 16:58:43,031 - __mp_main__ - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 16:58:43,033 - __mp_main__ - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 16:58:43,103 - __mp_main__ - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 16:58:43,138 - __mp_main__ - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 16:58:43,152 - __mp_main__ - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 16:58:43,162 - __mp_main__ - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 16:58:43,200 - __mp_main__ - INFO - \u2705 Student Credits routes enabled
+2026-08-14 16:58:43,234 - __mp_main__ - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 16:58:43,319 - __mp_main__ - INFO - \u2705 Student Copies routes enabled
+2026-08-14 16:58:43,325 - __mp_main__ - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 16:58:43,378 - __mp_main__ - INFO - \u2705 Video routes enabled
+2026-08-14 16:58:43,402 - __mp_main__ - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 16:58:43,413 - __mp_main__ - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 16:58:43,424 - __mp_main__ - INFO - \u2705 Meeting routes enabled
+2026-08-14 16:58:43,452 - __mp_main__ - INFO - \u2705 Online Class routes enabled
+2026-08-14 16:58:43,462 - __mp_main__ - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 16:58:43,464 - __mp_main__ - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 16:58:43,469 - __mp_main__ - INFO - \u2705 Dashboard routes enabled
+2026-08-14 16:58:43,474 - __mp_main__ - INFO - \u2705 Hub routes enabled
+2026-08-14 16:58:43,482 - __mp_main__ - INFO - \u2705 Notes routes enabled
+2026-08-14 16:58:43,504 - __mp_main__ - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 16:58:43,505 - __mp_main__ - INFO - \u2705 OCR routes enabled
+2026-08-14 16:58:43,827 - __mp_main__ - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 16:58:43,852 - __mp_main__ - INFO - \u2705 Super Admin routes enabled
+2026-08-14 16:58:43,858 - __mp_main__ - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 16:58:43,862 - __mp_main__ - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 16:58:43,866 - __mp_main__ - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 16:58:43,886 - __mp_main__ - INFO - \u2705 Timetable routes enabled
+2026-08-14 16:58:43,999 - __mp_main__ - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 16:58:44,015 - __mp_main__ - INFO - \u2705 Exam Tally routes enabled
+2026-08-14 16:58:44,689 - main_async - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 16:58:44,692 - main_async - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 16:58:44,771 - main_async - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 16:58:44,807 - main_async - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 16:58:44,827 - main_async - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 16:58:44,837 - main_async - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 16:58:44,877 - main_async - INFO - \u2705 Student Credits routes enabled
+2026-08-14 16:58:44,912 - main_async - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 16:58:45,002 - main_async - INFO - \u2705 Student Copies routes enabled
+2026-08-14 16:58:45,009 - main_async - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 16:58:45,035 - main_async - INFO - \u2705 Video routes enabled
+2026-08-14 16:58:45,059 - main_async - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 16:58:45,070 - main_async - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 16:58:45,081 - main_async - INFO - \u2705 Meeting routes enabled
+2026-08-14 16:58:45,103 - main_async - INFO - \u2705 Online Class routes enabled
+2026-08-14 16:58:45,110 - main_async - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 16:58:45,112 - main_async - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 16:58:45,115 - main_async - INFO - \u2705 Dashboard routes enabled
+2026-08-14 16:58:45,118 - main_async - INFO - \u2705 Hub routes enabled
+2026-08-14 16:58:45,125 - main_async - INFO - \u2705 Notes routes enabled
+2026-08-14 16:58:45,148 - main_async - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 16:58:45,149 - main_async - INFO - \u2705 OCR routes enabled
+2026-08-14 16:58:45,155 - main_async - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 16:58:45,182 - main_async - INFO - \u2705 Super Admin routes enabled
+2026-08-14 16:58:45,188 - main_async - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 16:58:45,194 - main_async - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 16:58:45,197 - main_async - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 16:58:45,217 - main_async - INFO - \u2705 Timetable routes enabled
+2026-08-14 16:58:45,334 - main_async - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 16:58:45,351 - main_async - INFO - \u2705 Exam Tally routes enabled
+INFO:     Started server process [48256]
+INFO:     Waiting for application startup.
+2026-08-14 16:58:45,356 - main_async - INFO - \U0001f680 Starting SkillBot Async Backend...
+2026-08-14 16:58:47,187 - core.database - INFO - \u2705 MongoDB initialized - Master DB: skb_master
+2026-08-14 16:58:47,189 - core.database - INFO - \u2705 B2C MongoDB initialized - Database: STOODY-b2c
+2026-08-14 16:58:47,249 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:58:47,280 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:58:47,317 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:58:47,345 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:58:47,474 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706927, 80), 'signature': {'hash': b'4\x81\xd3i\xda-\x93\x8a:\xcaa\xcb\xa5\x7f\x8d\xee\x13o|\xcf', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706927, 80)}
+2026-08-14 16:58:47,474 - core.database - INFO - \u2705 Database manager initialized successfully
+2026-08-14 16:58:47,484 - core.cache - INFO - Cache manager initialized successfully with Redis connection
+2026-08-14 16:58:47,485 - core.auth - INFO - \u2705 Auth manager initialized
+2026-08-14 16:58:47,485 - main_async - INFO - \u2705 Session timeout monitor started
+2026-08-14 16:58:47,496 - main_async - INFO - \u2705 Note classification worker started
+2026-08-14 16:58:48,011 - services.classification_worker - INFO - Classification worker started
+2026-08-14 16:58:48,149 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:58:48,180 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:58:48,211 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:58:48,241 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:58:48,250 - core.database - WARNING - Could not create one or more indexes on skb_master: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706928, 56), 'signature': {'hash': b'\x96k\xff\x11O\x1a\x02[\x9f\xd5`A\x81\xccg\xfa\x80\xd8\xfd\xd5', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706928, 56)}
+2026-08-14 16:58:48,426 - core.database - WARNING - Could not create one or more indexes on skb_indl-sgtb-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706928, 71), 'signature': {'hash': b'\x96k\xff\x11O\x1a\x02[\x9f\xd5`A\x81\xccg\xfa\x80\xd8\xfd\xd5', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706928, 69)}
+2026-08-14 16:58:48,495 - core.database - WARNING - Could not create one or more indexes on skb_indl-ciel-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706928, 89), 'signature': {'hash': b'\x96k\xff\x11O\x1a\x02[\x9f\xd5`A\x81\xccg\xfa\x80\xd8\xfd\xd5', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706928, 89)}
+2026-08-14 16:58:48,732 - exam-conductor.llm_gate.repository - INFO - LLM gate indexes ensured on skb_master
+2026-08-14 16:58:48,759 - core.database - WARNING - Could not create one or more indexes on skb_visc-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706928, 110), 'signature': {'hash': b'\x96k\xff\x11O\x1a\x02[\x9f\xd5`A\x81\xccg\xfa\x80\xd8\xfd\xd5', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706928, 109)}
+2026-08-14 16:58:48,885 - core.database - WARNING - Could not create one or more indexes on skb_rant-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706928, 117), 'signature': {'hash': b'\x96k\xff\x11O\x1a\x02[\x9f\xd5`A\x81\xccg\xfa\x80\xd8\xfd\xd5', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706928, 117)}
+2026-08-14 16:58:48,938 - exam-conductor.ingest.repository - INFO - Ensured ingest indexes on evalpen_submissions and evalpen_answer_pages
+2026-08-14 16:58:48,939 - main_async - INFO - ExamPen indexes initialized on master DB
+2026-08-14 16:58:48,947 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor started (poll=3.0s, concurrency=3)
+2026-08-14 16:58:48,949 - main_async - INFO - \u2705 ExamPen local automatic PCR processor started
+2026-08-14 16:58:48,949 - main_async - INFO - \u2705 All services initialized successfully
+INFO:     Application startup complete.
+2026-08-14 16:58:49,126 - core.database - WARNING - Could not create one or more indexes on skb_airf-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706929, 21), 'signature': {'hash': b'\xda/s\x7f\xcf\xe4\xfc\xdc\xb8jV"\x1eE\xfb4Xg\xdb\x9b', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706929, 21)}
+2026-08-14 16:58:49,239 - core.database - WARNING - Could not create one or more indexes on skb_sgtb-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706929, 40), 'signature': {'hash': b'\xda/s\x7f\xcf\xe4\xfc\xdc\xb8jV"\x1eE\xfb4Xg\xdb\x9b', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706929, 40)}
+2026-08-14 16:58:49,480 - core.database - WARNING - Could not create one or more indexes on skb_ciel-1008: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706929, 57), 'signature': {'hash': b'\xda/s\x7f\xcf\xe4\xfc\xdc\xb8jV"\x1eE\xfb4Xg\xdb\x9b', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706929, 57)}
+2026-08-14 16:58:49,598 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 16:58:49,628 - core.database - WARNING - Could not create one or more indexes on skb_mtel-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706929, 72), 'signature': {'hash': b'\xda/s\x7f\xcf\xe4\xfc\xdc\xb8jV"\x1eE\xfb4Xg\xdb\x9b', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706929, 72)}
+2026-08-14 16:58:49,629 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 16:58:49,663 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 16:58:49,693 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 16:58:49,815 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786706929, 87), 'signature': {'hash': b'\xda/s\x7f\xcf\xe4\xfc\xdc\xb8jV"\x1eE\xfb4Xg\xdb\x9b', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786706929, 87)}
+2026-08-14 17:00:50,061 - main_async - INFO - Auto-logged out student 6a7b12de5ce06cbec99fcf12 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 17:04:51,026 - main_async - INFO - Auto-logged out student 6a7ef13b78c58f9c977d93a5 due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 17:56:36,599 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:56:36,638 - core.auth - WARNING - Token has expired
+2026-08-14 17:56:36,638 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:56:36,691 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:56:36,797 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:36,897 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams
+2026-08-14 17:56:36,900 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/queue
+2026-08-14 17:56:36,901 - main_async - INFO - \U0001f4e8 GET /api/v1/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/processing
+2026-08-14 17:56:36,901 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/flagged/queue
+2026-08-14 17:56:36,903 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/results
+2026-08-14 17:56:36,903 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/roster
+2026-08-14 17:56:37,296 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:37,303 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/recheck/requests
+2026-08-14 17:56:38,909 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:38,961 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,059 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,220 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,225 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,247 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/queue
+2026-08-14 17:56:39,249 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/results
+2026-08-14 17:56:39,471 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,681 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:56:39,744 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:57:07,338 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:57:07,340 - core.auth - WARNING - Token has expired
+2026-08-14 17:57:07,341 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:57:07,343 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:57:07,537 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:57:37,321 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:57:37,323 - core.auth - WARNING - Token has expired
+2026-08-14 17:57:37,324 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:57:37,364 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:57:37,437 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:58:07,327 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:58:07,330 - core.auth - WARNING - Token has expired
+2026-08-14 17:58:07,330 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:58:07,333 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:58:07,401 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:58:37,319 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:58:37,321 - core.auth - WARNING - Token has expired
+2026-08-14 17:58:37,321 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:58:37,323 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:58:37,427 - main_async - INFO - \U0001f4e4 200
+2026-08-14 17:59:07,320 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:59:07,322 - core.auth - WARNING - Token has expired
+2026-08-14 17:59:07,322 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:59:07,359 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:59:07,434 - main_async - INFO - \U0001f4e4 200
+WARNING:  WatchFiles detected changes in 'tmp\debug_rohan_submit.py'. Reloading...
+2026-08-14 17:59:37,317 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 17:59:37,320 - core.auth - WARNING - Token has expired
+2026-08-14 17:59:37,320 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 17:59:37,323 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 17:59:37,394 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:00:13,330 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:00:13,332 - core.auth - WARNING - Token has expired
+2026-08-14 18:00:13,333 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:00:13,377 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:00:13,457 - main_async - INFO - \U0001f4e4 200
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-14 18:01:08,591 - main_async - INFO - \U0001f6d1 Shutting down services...
+2026-08-14 18:01:08,592 - main_async - INFO - \u2705 Session timeout monitor stopped
+2026-08-14 18:01:08,593 - main_async - INFO - \u2705 Note classification worker stopped
+2026-08-14 18:01:08,608 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor stopped
+2026-08-14 18:01:08,609 - main_async - INFO - \u2705 ExamPen local automatic PCR processor stopped
+2026-08-14 18:01:08,609 - core.cache - INFO - \U0001f50c Cache connection closed
+2026-08-14 18:01:08,647 - core.database - INFO - \U0001f50c MongoDB connection closed
+2026-08-14 18:01:08,649 - core.database - INFO - \U0001f50c Database connections closed
+2026-08-14 18:01:08,649 - main_async - INFO - \u2705 Cleanup completed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [48256]
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+2026-08-14 18:02:21,756 - __mp_main__ - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:02:21,761 - __mp_main__ - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:02:21,845 - __mp_main__ - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:02:21,883 - __mp_main__ - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:02:21,899 - __mp_main__ - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:02:21,910 - __mp_main__ - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:02:21,946 - __mp_main__ - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:02:21,981 - __mp_main__ - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:02:22,078 - __mp_main__ - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:02:22,084 - __mp_main__ - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:02:22,139 - __mp_main__ - INFO - \u2705 Video routes enabled
+2026-08-14 18:02:22,166 - __mp_main__ - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:02:22,177 - __mp_main__ - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:02:22,185 - __mp_main__ - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:02:22,207 - __mp_main__ - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:02:22,214 - __mp_main__ - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:02:22,216 - __mp_main__ - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:02:22,218 - __mp_main__ - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:02:22,223 - __mp_main__ - INFO - \u2705 Hub routes enabled
+2026-08-14 18:02:22,230 - __mp_main__ - INFO - \u2705 Notes routes enabled
+2026-08-14 18:02:22,251 - __mp_main__ - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:02:22,252 - __mp_main__ - INFO - \u2705 OCR routes enabled
+2026-08-14 18:02:22,555 - __mp_main__ - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:02:22,583 - __mp_main__ - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:02:22,589 - __mp_main__ - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:02:22,593 - __mp_main__ - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:02:22,598 - __mp_main__ - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:02:22,620 - __mp_main__ - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:02:22,747 - __mp_main__ - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:02:22,761 - __mp_main__ - INFO - \u2705 Exam Tally routes enabled
+2026-08-14 18:02:23,611 - main_async - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:02:23,614 - main_async - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:02:23,693 - main_async - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:02:23,733 - main_async - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:02:23,748 - main_async - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:02:23,758 - main_async - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:02:23,797 - main_async - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:02:23,831 - main_async - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:02:23,921 - main_async - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:02:23,927 - main_async - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:02:23,955 - main_async - INFO - \u2705 Video routes enabled
+2026-08-14 18:02:23,988 - main_async - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:02:24,001 - main_async - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:02:24,014 - main_async - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:02:24,042 - main_async - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:02:24,049 - main_async - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:02:24,051 - main_async - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:02:24,054 - main_async - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:02:24,058 - main_async - INFO - \u2705 Hub routes enabled
+2026-08-14 18:02:24,067 - main_async - INFO - \u2705 Notes routes enabled
+2026-08-14 18:02:24,089 - main_async - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:02:24,092 - main_async - INFO - \u2705 OCR routes enabled
+2026-08-14 18:02:24,098 - main_async - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:02:24,128 - main_async - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:02:24,136 - main_async - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:02:24,142 - main_async - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:02:24,147 - main_async - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:02:24,169 - main_async - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:02:24,288 - main_async - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:02:24,303 - main_async - INFO - \u2705 Exam Tally routes enabled
+INFO:     Started server process [52776]
+INFO:     Waiting for application startup.
+2026-08-14 18:02:24,308 - main_async - INFO - \U0001f680 Starting SkillBot Async Backend...
+2026-08-14 18:02:26,211 - core.database - INFO - \u2705 MongoDB initialized - Master DB: skb_master
+2026-08-14 18:02:26,212 - core.database - INFO - \u2705 B2C MongoDB initialized - Database: STOODY-b2c
+2026-08-14 18:02:26,271 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:02:26,305 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:02:26,336 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:02:26,366 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:02:26,520 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710746, 47), 'signature': {'hash': b'"\xc1\xd1\xaa\xe7j\xc7\xdbg\xcfS\xd9\xf7b@|HO\xf95', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710746, 47)}
+2026-08-14 18:02:26,521 - core.database - INFO - \u2705 Database manager initialized successfully
+2026-08-14 18:02:26,529 - core.cache - INFO - Cache manager initialized successfully with Redis connection
+2026-08-14 18:02:26,530 - core.auth - INFO - \u2705 Auth manager initialized
+2026-08-14 18:02:26,530 - main_async - INFO - \u2705 Session timeout monitor started
+2026-08-14 18:02:26,539 - main_async - INFO - \u2705 Note classification worker started
+2026-08-14 18:02:26,963 - services.classification_worker - INFO - Classification worker started
+2026-08-14 18:02:27,073 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:02:27,099 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:02:27,130 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:02:27,159 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:02:27,232 - core.database - WARNING - Could not create one or more indexes on skb_master: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 14), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 14)}
+2026-08-14 18:02:27,285 - core.database - WARNING - Could not create one or more indexes on skb_indl-sgtb-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 32), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 32)}
+2026-08-14 18:02:27,432 - core.database - WARNING - Could not create one or more indexes on skb_indl-ciel-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 56), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 56)}
+2026-08-14 18:02:27,606 - core.database - WARNING - Could not create one or more indexes on skb_visc-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 82), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 82)}
+2026-08-14 18:02:27,668 - exam-conductor.llm_gate.repository - INFO - LLM gate indexes ensured on skb_master
+2026-08-14 18:02:27,842 - core.database - WARNING - Could not create one or more indexes on skb_rant-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 105), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 105)}
+2026-08-14 18:02:27,873 - exam-conductor.ingest.repository - INFO - Ensured ingest indexes on evalpen_submissions and evalpen_answer_pages
+2026-08-14 18:02:27,874 - main_async - INFO - ExamPen indexes initialized on master DB
+2026-08-14 18:02:27,883 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor started (poll=3.0s, concurrency=3)
+2026-08-14 18:02:27,884 - main_async - INFO - \u2705 ExamPen local automatic PCR processor started
+2026-08-14 18:02:27,884 - main_async - INFO - \u2705 All services initialized successfully
+INFO:     Application startup complete.
+2026-08-14 18:02:27,893 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:02:27,895 - core.auth - WARNING - Token has expired
+2026-08-14 18:02:27,895 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:02:27,964 - core.database - WARNING - Could not create one or more indexes on skb_airf-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710747, 114), 'signature': {'hash': b'\x97\x8ah}H0\x90B\xfc\x17Rw\x8cA\x0b\x8e\xd8\xc6\xe16', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710747, 114)}
+2026-08-14 18:02:28,128 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:02:28,195 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:02:28,200 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:02:28,203 - core.auth - WARNING - Token has expired
+2026-08-14 18:02:28,203 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:02:28,205 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:02:28,226 - core.database - WARNING - Could not create one or more indexes on skb_sgtb-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710748, 10), 'signature': {'hash': b'\xe2\xa6Zk\x03\xd5\x00\x8fr\x1a\xf8\xccm\xa2\x03DP\xf4S\xfb', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710748, 10)}
+2026-08-14 18:02:28,266 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:02:28,316 - core.database - WARNING - Could not create one or more indexes on skb_ciel-1008: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710748, 15), 'signature': {'hash': b'\xe2\xa6Zk\x03\xd5\x00\x8fr\x1a\xf8\xccm\xa2\x03DP\xf4S\xfb', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710748, 15)}
+2026-08-14 18:02:28,448 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:02:28,486 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:02:28,518 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:02:28,558 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:02:28,630 - core.database - WARNING - Could not create one or more indexes on skb_mtel-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710748, 54), 'signature': {'hash': b'\xe2\xa6Zk\x03\xd5\x00\x8fr\x1a\xf8\xccm\xa2\x03DP\xf4S\xfb', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710748, 54)}
+2026-08-14 18:02:28,686 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710748, 57), 'signature': {'hash': b'\xe2\xa6Zk\x03\xd5\x00\x8fr\x1a\xf8\xccm\xa2\x03DP\xf4S\xfb', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710748, 57)}
+2026-08-14 18:03:13,343 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:03:13,347 - core.auth - WARNING - Token has expired
+2026-08-14 18:03:13,347 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:03:13,350 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:03:13,417 - main_async - INFO - \U0001f4e4 200
+WARNING:  WatchFiles detected changes in 'api\v1\evalpen_student_submission_async.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-14 18:03:21,113 - main_async - INFO - \U0001f6d1 Shutting down services...
+2026-08-14 18:03:21,114 - main_async - INFO - \u2705 Session timeout monitor stopped
+2026-08-14 18:03:21,115 - main_async - INFO - \u2705 Note classification worker stopped
+2026-08-14 18:03:21,117 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor stopped
+2026-08-14 18:03:21,117 - main_async - INFO - \u2705 ExamPen local automatic PCR processor stopped
+2026-08-14 18:03:21,118 - core.cache - INFO - \U0001f50c Cache connection closed
+2026-08-14 18:03:21,148 - core.database - INFO - \U0001f50c MongoDB connection closed
+2026-08-14 18:03:21,149 - core.database - INFO - \U0001f50c Database connections closed
+2026-08-14 18:03:21,149 - main_async - INFO - \u2705 Cleanup completed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [52776]
+WARNING:  WatchFiles detected changes in 'api\v1\evalpen_student_submission_async.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 131, in _main
+    prepare(preparation_data)
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 246, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\main_async.py", line 48, in <module>
+    from prometheus_fastapi_instrumentator import Instrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\__init__.py", line 1, in <module>
+    from .instrumentation import PrometheusFastApiInstrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\instrumentation.py", line 10, in <module>
+    from prometheus_client import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\__init__.py", line 3, in <module>
+    from . import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 58, in <module>
+    PLATFORM_COLLECTOR = PlatformCollector()
+                         ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 17, in __init__
+    system = self._platform.system()
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 987, in system
+    return uname().system
+           ^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 922, in uname
+    release, version, csd, ptype = win32_ver()
+                                   ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 450, in win32_ver
+    version, csd, ptype, is_client = _win32_ver(version, csd, ptype)
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 388, in _win32_ver
+    (version, product_type, ptype, spmajor, spminor)  = _wmi_query(
+                                                        ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 327, in _wmi_query
+    data = _wmi.exec_query("SELECT {} FROM {}".format(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+WARNING:  WatchFiles detected changes in 'api\v1\evalpen_review_async.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 131, in _main
+    prepare(preparation_data)
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 246, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\main_async.py", line 182, in <module>
+    from api.v1.debugger_async import router as debugger_router  # type: ignore
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\api\v1\debugger_async.py", line 21, in <module>
+    from services.langchain_debugger_service import get_langchain_debugger_service
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\langchain_debugger_service.py", line 30, in <module>
+    from services.document_processor import get_document_processor
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\document_processor.py", line 38, in <module>
+    import pypdfium2 as pdfium
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pypdfium2\__init__.py", line 6, in <module>
+    from pypdfium2._helpers import *
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1091, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1190, in get_data
+KeyboardInterrupt
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+2026-08-14 18:03:45,092 - __mp_main__ - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:03:45,094 - __mp_main__ - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:03:45,176 - __mp_main__ - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:03:45,215 - __mp_main__ - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:03:45,232 - __mp_main__ - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:03:45,240 - __mp_main__ - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:03:45,284 - __mp_main__ - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:03:45,319 - __mp_main__ - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:03:45,415 - __mp_main__ - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:03:45,423 - __mp_main__ - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:03:45,460 - __mp_main__ - INFO - \u2705 Video routes enabled
+2026-08-14 18:03:45,484 - __mp_main__ - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:03:45,495 - __mp_main__ - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:03:45,505 - __mp_main__ - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:03:45,536 - __mp_main__ - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:03:45,548 - __mp_main__ - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:03:45,552 - __mp_main__ - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:03:45,557 - __mp_main__ - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:03:45,565 - __mp_main__ - INFO - \u2705 Hub routes enabled
+2026-08-14 18:03:45,576 - __mp_main__ - INFO - \u2705 Notes routes enabled
+2026-08-14 18:03:45,601 - __mp_main__ - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:03:45,603 - __mp_main__ - INFO - \u2705 OCR routes enabled
+2026-08-14 18:03:45,612 - __mp_main__ - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:03:46,019 - __mp_main__ - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:03:46,027 - __mp_main__ - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:03:46,035 - __mp_main__ - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:03:46,043 - __mp_main__ - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:03:46,068 - __mp_main__ - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:03:46,197 - __mp_main__ - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:03:46,213 - __mp_main__ - INFO - \u2705 Exam Tally routes enabled
+2026-08-14 18:03:46,315 - main_async - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:03:46,318 - main_async - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:03:46,400 - main_async - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:03:46,437 - main_async - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:03:46,456 - main_async - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:03:46,466 - main_async - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:03:46,502 - main_async - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:03:46,535 - main_async - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:03:46,626 - main_async - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:03:46,632 - main_async - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:03:46,656 - main_async - INFO - \u2705 Video routes enabled
+2026-08-14 18:03:46,681 - main_async - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:03:46,691 - main_async - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:03:46,702 - main_async - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:03:46,725 - main_async - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:03:46,733 - main_async - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:03:46,734 - main_async - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:03:46,737 - main_async - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:03:46,742 - main_async - INFO - \u2705 Hub routes enabled
+2026-08-14 18:03:46,753 - main_async - INFO - \u2705 Notes routes enabled
+2026-08-14 18:03:46,787 - main_async - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:03:46,789 - main_async - INFO - \u2705 OCR routes enabled
+2026-08-14 18:03:46,798 - main_async - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:03:46,833 - main_async - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:03:46,839 - main_async - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:03:46,843 - main_async - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:03:46,853 - main_async - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:03:46,877 - main_async - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:03:47,034 - main_async - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:03:47,053 - main_async - INFO - \u2705 Exam Tally routes enabled
+INFO:     Started server process [57880]
+INFO:     Waiting for application startup.
+2026-08-14 18:03:47,058 - main_async - INFO - \U0001f680 Starting SkillBot Async Backend...
+2026-08-14 18:03:48,681 - core.database - INFO - \u2705 MongoDB initialized - Master DB: skb_master
+2026-08-14 18:03:48,682 - core.database - INFO - \u2705 B2C MongoDB initialized - Database: STOODY-b2c
+2026-08-14 18:03:48,738 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:03:48,768 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:03:48,799 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:03:48,830 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:03:48,966 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710828, 187), 'signature': {'hash': b'h\xe3\xe6\x94\xc3\xb0\xe0\xc50=\xa55\xf0/v@\x90\xbb\xa4\xb7', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710828, 187)}
+2026-08-14 18:03:48,967 - core.database - INFO - \u2705 Database manager initialized successfully
+2026-08-14 18:03:48,974 - core.cache - INFO - Cache manager initialized successfully with Redis connection
+2026-08-14 18:03:48,974 - core.auth - INFO - \u2705 Auth manager initialized
+2026-08-14 18:03:48,975 - main_async - INFO - \u2705 Session timeout monitor started
+2026-08-14 18:03:48,976 - main_async - INFO - \u2705 Note classification worker started
+2026-08-14 18:03:49,362 - services.classification_worker - INFO - Classification worker started
+2026-08-14 18:03:49,501 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:03:49,536 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:03:49,568 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:03:49,603 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:03:49,637 - core.database - WARNING - Could not create one or more indexes on skb_master: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710829, 1828), 'signature': {'hash': b'\x05\x01\x0b\x1cPx\xe5h+w\xd7\xea\xa63\xf8\xd7kg\xb1h', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710829, 1828)}
+2026-08-14 18:03:49,739 - core.database - WARNING - Could not create one or more indexes on skb_indl-sgtb-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710829, 1832), 'signature': {'hash': b'\x05\x01\x0b\x1cPx\xe5h+w\xd7\xea\xa63\xf8\xd7kg\xb1h', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710829, 1832)}
+2026-08-14 18:03:49,848 - core.database - WARNING - Could not create one or more indexes on skb_indl-ciel-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710829, 1840), 'signature': {'hash': b'\x05\x01\x0b\x1cPx\xe5h+w\xd7\xea\xa63\xf8\xd7kg\xb1h', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710829, 1840)}
+2026-08-14 18:03:50,063 - exam-conductor.llm_gate.repository - INFO - LLM gate indexes ensured on skb_master
+2026-08-14 18:03:50,071 - core.database - WARNING - Could not create one or more indexes on skb_visc-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710829, 1859), 'signature': {'hash': b'\x05\x01\x0b\x1cPx\xe5h+w\xd7\xea\xa63\xf8\xd7kg\xb1h', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710829, 1859)}
+2026-08-14 18:03:50,337 - core.database - WARNING - Could not create one or more indexes on skb_rant-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710830, 29), 'signature': {'hash': b'(\xb9]\x89\xde\xd0\x8e\xefk+~h\x13\xf9^\x84w\xb2V\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710830, 29)}
+2026-08-14 18:03:50,432 - exam-conductor.ingest.repository - INFO - Ensured ingest indexes on evalpen_submissions and evalpen_answer_pages
+2026-08-14 18:03:50,433 - main_async - INFO - ExamPen indexes initialized on master DB
+2026-08-14 18:03:50,435 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor started (poll=3.0s, concurrency=3)
+2026-08-14 18:03:50,436 - main_async - INFO - \u2705 ExamPen local automatic PCR processor started
+2026-08-14 18:03:50,436 - main_async - INFO - \u2705 All services initialized successfully
+INFO:     Application startup complete.
+2026-08-14 18:03:50,445 - main_async - INFO - \U0001f4e8 GET /api/v1/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/processing
+2026-08-14 18:03:50,446 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/queue
+2026-08-14 18:03:50,446 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/results
+2026-08-14 18:03:50,447 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/flagged/queue
+2026-08-14 18:03:50,447 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams
+2026-08-14 18:03:50,448 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/roster
+2026-08-14 18:03:50,497 - core.database - WARNING - Could not create one or more indexes on skb_airf-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710830, 47), 'signature': {'hash': b'(\xb9]\x89\xde\xd0\x8e\xefk+~h\x13\xf9^\x84w\xb2V\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710830, 47)}
+2026-08-14 18:03:51,359 - core.database - WARNING - Could not create one or more indexes on skb_sgtb-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710830, 124), 'signature': {'hash': b'(\xb9]\x89\xde\xd0\x8e\xefk+~h\x13\xf9^\x84w\xb2V\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710830, 124)}
+2026-08-14 18:03:51,397 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:51,415 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/recheck/requests
+2026-08-14 18:03:51,439 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:51,499 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:51,534 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:51,647 - core.database - WARNING - Could not create one or more indexes on skb_ciel-1008: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710831, 87), 'signature': {'hash': b'\xf5s\xe5\xc2\x96c\x9dy:p\x87\xf0\x9fe\xeaG\t\xeb\xe0\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710831, 87)}
+2026-08-14 18:03:51,801 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:03:51,859 - core.database - WARNING - Could not create one or more indexes on skb_mtel-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710831, 102), 'signature': {'hash': b'\xf5s\xe5\xc2\x96c\x9dy:p\x87\xf0\x9fe\xeaG\t\xeb\xe0\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710831, 102)}
+2026-08-14 18:03:51,863 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:03:51,923 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:03:51,950 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:03:51,975 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:51,978 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:03:52,076 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710831, 125), 'signature': {'hash': b'\xf5s\xe5\xc2\x96c\x9dy:p\x87\xf0\x9fe\xeaG\t\xeb\xe0\xfe', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710831, 125)}
+2026-08-14 18:03:52,492 - main_async - INFO - \U0001f4e4 200
+WARNING:  WatchFiles detected changes in 'tests\exam_conductor\test_student_answer_copy_submission.py'. Reloading...
+2026-08-14 18:04:13,343 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:04:13,346 - core.auth - WARNING - Token has expired
+2026-08-14 18:04:13,348 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:04:13,352 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:04:13,424 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:05:13,347 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:05:13,351 - core.auth - WARNING - Token has expired
+2026-08-14 18:05:13,352 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:05:13,396 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:05:13,465 - main_async - INFO - \U0001f4e4 200
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-14 18:05:41,317 - main_async - INFO - \U0001f6d1 Shutting down services...
+2026-08-14 18:05:41,318 - main_async - INFO - \u2705 Session timeout monitor stopped
+2026-08-14 18:05:41,318 - main_async - INFO - \u2705 Note classification worker stopped
+2026-08-14 18:05:41,321 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor stopped
+2026-08-14 18:05:41,321 - main_async - INFO - \u2705 ExamPen local automatic PCR processor stopped
+2026-08-14 18:05:41,322 - core.cache - INFO - \U0001f50c Cache connection closed
+2026-08-14 18:05:41,350 - core.database - INFO - \U0001f50c MongoDB connection closed
+2026-08-14 18:05:41,351 - core.database - INFO - \U0001f50c Database connections closed
+2026-08-14 18:05:41,352 - main_async - INFO - \u2705 Cleanup completed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [57880]
+WARNING:  WatchFiles detected changes in 'tests\exam_conductor\test_student_answer_copy_submission.py', 'tests\exam_conductor\test_evalpen_teacher_bff_scope.py'. Reloading...
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 131, in _main
+    prepare(preparation_data)
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 246, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\multiprocessing\spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 287, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\main_async.py", line 48, in <module>
+    from prometheus_fastapi_instrumentator import Instrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\__init__.py", line 1, in <module>
+    from .instrumentation import PrometheusFastApiInstrumentator
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_fastapi_instrumentator\instrumentation.py", line 10, in <module>
+    from prometheus_client import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\__init__.py", line 3, in <module>
+    from . import (
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 58, in <module>
+    PLATFORM_COLLECTOR = PlatformCollector()
+                         ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\prometheus_client\platform_collector.py", line 17, in __init__
+    system = self._platform.system()
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 987, in system
+    return uname().system
+           ^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 922, in uname
+    release, version, csd, ptype = win32_ver()
+                                   ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 450, in win32_ver
+    version, csd, ptype, is_client = _win32_ver(version, csd, ptype)
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 388, in _win32_ver
+    (version, product_type, ptype, spmajor, spminor)  = _wmi_query(
+                                                        ^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\platform.py", line 327, in _wmi_query
+    data = _wmi.exec_query("SELECT {} FROM {}".format(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (6.0.0.post1)/charset_normalizer (3.4.0) doesn't match a supported version!
+  warnings.warn(
+2026-08-14 18:05:54,807 - __mp_main__ - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:05:54,810 - __mp_main__ - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:05:54,884 - __mp_main__ - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:05:54,922 - __mp_main__ - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:05:54,939 - __mp_main__ - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:05:54,950 - __mp_main__ - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:05:54,992 - __mp_main__ - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:05:55,031 - __mp_main__ - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:05:55,127 - __mp_main__ - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:05:55,132 - __mp_main__ - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:05:55,172 - __mp_main__ - INFO - \u2705 Video routes enabled
+2026-08-14 18:05:55,195 - __mp_main__ - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:05:55,206 - __mp_main__ - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:05:55,216 - __mp_main__ - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:05:55,239 - __mp_main__ - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:05:55,245 - __mp_main__ - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:05:55,247 - __mp_main__ - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:05:55,250 - __mp_main__ - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:05:55,255 - __mp_main__ - INFO - \u2705 Hub routes enabled
+2026-08-14 18:05:55,264 - __mp_main__ - INFO - \u2705 Notes routes enabled
+2026-08-14 18:05:55,281 - __mp_main__ - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:05:55,283 - __mp_main__ - INFO - \u2705 OCR routes enabled
+2026-08-14 18:05:55,630 - __mp_main__ - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:05:55,660 - __mp_main__ - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:05:55,665 - __mp_main__ - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:05:55,670 - __mp_main__ - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:05:55,674 - __mp_main__ - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:05:55,694 - __mp_main__ - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:05:55,809 - __mp_main__ - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:05:55,822 - __mp_main__ - INFO - \u2705 Exam Tally routes enabled
+2026-08-14 18:05:55,915 - main_async - INFO - \u2705 Rate limiter using Redis (development)
+2026-08-14 18:05:55,917 - main_async - INFO - \u2705 Prometheus metrics instrumentation enabled
+2026-08-14 18:05:55,992 - main_async - INFO - \u2705 Cookie-based authentication routes enabled
+2026-08-14 18:05:56,028 - main_async - INFO - \u2705 Student Bulk Upload routes enabled
+2026-08-14 18:05:56,045 - main_async - INFO - \u2705 Diagram generation pipeline routes enabled
+2026-08-14 18:05:56,055 - main_async - INFO - \u2705 Paper Builder routes enabled
+2026-08-14 18:05:56,097 - main_async - INFO - \u2705 Student Credits routes enabled
+2026-08-14 18:05:56,128 - main_async - INFO - \u2705 Teacher Bulk Upload routes enabled
+2026-08-14 18:05:56,224 - main_async - INFO - \u2705 Student Copies routes enabled
+2026-08-14 18:05:56,230 - main_async - INFO - \u2705 Copy Sets routes enabled
+2026-08-14 18:05:56,254 - main_async - INFO - \u2705 Video routes enabled
+2026-08-14 18:05:56,278 - main_async - INFO - \u2705 B2C authentication routes enabled
+2026-08-14 18:05:56,287 - main_async - INFO - \u2705 TOTP 2FA authentication routes enabled
+2026-08-14 18:05:56,298 - main_async - INFO - \u2705 Meeting routes enabled
+2026-08-14 18:05:56,322 - main_async - INFO - \u2705 Online Class routes enabled
+2026-08-14 18:05:56,330 - main_async - INFO - \u2705 SmartBoard routes enabled
+2026-08-14 18:05:56,332 - main_async - INFO - \u2705 SmartBoard Token routes enabled
+2026-08-14 18:05:56,334 - main_async - INFO - \u2705 Dashboard routes enabled
+2026-08-14 18:05:56,339 - main_async - INFO - \u2705 Hub routes enabled
+2026-08-14 18:05:56,348 - main_async - INFO - \u2705 Notes routes enabled
+2026-08-14 18:05:56,369 - main_async - INFO - \u2705 Note Organisation routes enabled
+2026-08-14 18:05:56,370 - main_async - INFO - \u2705 OCR routes enabled
+2026-08-14 18:05:56,379 - main_async - INFO - \u2705 Question Attempts routes enabled
+2026-08-14 18:05:56,410 - main_async - INFO - \u2705 Super Admin routes enabled
+2026-08-14 18:05:56,424 - main_async - INFO - \u2705 Smartboard Sessions routes enabled
+2026-08-14 18:05:56,432 - main_async - INFO - \u2705 Smartboard Pairing routes enabled
+2026-08-14 18:05:56,437 - main_async - INFO - \u2705 Teaching Materials routes enabled
+2026-08-14 18:05:56,459 - main_async - INFO - \u2705 Timetable routes enabled
+2026-08-14 18:05:56,593 - main_async - INFO - \u2705 ExamPen routes enabled (18 routers)
+2026-08-14 18:05:56,612 - main_async - INFO - \u2705 Exam Tally routes enabled
+INFO:     Started server process [53764]
+INFO:     Waiting for application startup.
+2026-08-14 18:05:56,618 - main_async - INFO - \U0001f680 Starting SkillBot Async Backend...
+2026-08-14 18:05:58,154 - core.database - INFO - \u2705 MongoDB initialized - Master DB: skb_master
+2026-08-14 18:05:58,155 - core.database - INFO - \u2705 B2C MongoDB initialized - Database: STOODY-b2c
+2026-08-14 18:05:58,221 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:05:58,256 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:05:58,287 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:05:58,317 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:05:58,456 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710958, 32), 'signature': {'hash': b'\xd8\nw\xf1;\x15/8\\\xc8\xd0Vr\x05\xd0\x8f<\xe9S\x8f', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710958, 32)}
+2026-08-14 18:05:58,457 - core.database - INFO - \u2705 Database manager initialized successfully
+2026-08-14 18:05:58,466 - core.cache - INFO - Cache manager initialized successfully with Redis connection
+2026-08-14 18:05:58,467 - core.auth - INFO - \u2705 Auth manager initialized
+2026-08-14 18:05:58,468 - main_async - INFO - \u2705 Session timeout monitor started
+2026-08-14 18:05:58,470 - main_async - INFO - \u2705 Note classification worker started
+2026-08-14 18:05:58,985 - services.classification_worker - INFO - Classification worker started
+2026-08-14 18:05:59,115 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:05:59,149 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:05:59,184 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:05:59,216 - core.database - INFO - Equivalent index already exists on skb_indl-sgtb-1001.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:05:59,250 - core.database - WARNING - Could not create one or more indexes on skb_master: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 10), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 10)}
+2026-08-14 18:05:59,343 - core.database - WARNING - Could not create one or more indexes on skb_indl-sgtb-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 32), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 32)}
+2026-08-14 18:05:59,457 - core.database - WARNING - Could not create one or more indexes on skb_indl-ciel-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 60), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 60)}
+2026-08-14 18:05:59,668 - exam-conductor.llm_gate.repository - INFO - LLM gate indexes ensured on skb_master
+2026-08-14 18:05:59,686 - core.database - WARNING - Could not create one or more indexes on skb_visc-1001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 84), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 84)}
+2026-08-14 18:05:59,819 - core.database - WARNING - Could not create one or more indexes on skb_rant-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 112), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 111)}
+2026-08-14 18:05:59,861 - exam-conductor.ingest.repository - INFO - Ensured ingest indexes on evalpen_submissions and evalpen_answer_pages
+2026-08-14 18:05:59,862 - main_async - INFO - ExamPen indexes initialized on master DB
+2026-08-14 18:05:59,863 - services.exampen_inline_processor - INFO - ExamPen inline PCR processor started (poll=3.0s, concurrency=3)
+2026-08-14 18:05:59,864 - main_async - INFO - \u2705 ExamPen local automatic PCR processor started
+2026-08-14 18:05:59,864 - main_async - INFO - \u2705 All services initialized successfully
+INFO:     Application startup complete.
+2026-08-14 18:05:59,873 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams
+2026-08-14 18:05:59,874 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/results
+2026-08-14 18:05:59,875 - main_async - INFO - \U0001f4e8 GET /api/v1/teacher/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/queue
+2026-08-14 18:05:59,875 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/review/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/roster
+2026-08-14 18:05:59,876 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/flagged/queue
+2026-08-14 18:05:59,876 - main_async - INFO - \U0001f4e8 GET /api/v1/exams/exam-775bb886628b4a5f8b1bbdaddde6fc19/processing
+2026-08-14 18:06:00,135 - core.database - WARNING - Could not create one or more indexes on skb_airf-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710959, 157), 'signature': {'hash': b'\xd6\xea\x0f\xa6\xa0"\xba\x06D\x1e\xa2 g\x19\xa2\xa1\xa8\xe0dQ', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710959, 157)}
+2026-08-14 18:06:00,204 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:00,209 - main_async - INFO - \U0001f4e8 GET /api/v1/evalpen/recheck/requests
+2026-08-14 18:06:00,729 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:00,735 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:00,781 - core.database - WARNING - Could not create one or more indexes on skb_sgtb-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710960, 312), 'signature': {'hash': b"\xefqO\xb3\x9d\x13v)\x96\x94\x11\x81\xe7\xd5'\x85\x94zzy", 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710960, 312)}
+2026-08-14 18:06:00,902 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:01,053 - core.database - WARNING - Could not create one or more indexes on skb_ciel-1008: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710960, 2131), 'signature': {'hash': b"\xefqO\xb3\x9d\x13v)\x96\x94\x11\x81\xe7\xd5'\x85\x94zzy", 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710960, 2131)}
+2026-08-14 18:06:01,151 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:01,208 - core.database - INFO - Equivalent index already exists on STOODY-b2c.students as 'uniq_student_username_lower'; skipping 'uniq_students_username_lower'
+2026-08-14 18:06:01,224 - core.database - WARNING - Could not create one or more indexes on skb_mtel-0001: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710961, 8), 'signature': {'hash': b'~^k\x94UtY#<&\x17\xb7\xd3d\xac\xa9\xcc\xf8MA', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710961, 8)}
+2026-08-14 18:06:01,239 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username'; skipping 'uniq_tutors_username'
+2026-08-14 18:06:01,267 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:01,268 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_username_lower'; skipping 'uniq_tutors_username_lower'
+2026-08-14 18:06:01,298 - core.database - INFO - Equivalent index already exists on STOODY-b2c.tutors as 'uniq_tutor_id'; skipping 'uniq_tutors_tutor_id'
+2026-08-14 18:06:01,445 - core.database - WARNING - Could not create one or more indexes on STOODY-b2c: The field 'unique' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }, full error: {'ok': 0.0, 'errmsg': 'The field \'unique\' is not valid for an _id index specification. Specification: { name: "uniq_student_credit_policy", unique: true, key: { _id: 1 }, v: 2 }', 'code': 197, 'codeName': 'InvalidIndexSpecificationOption', '$clusterTime': {'clusterTime': Timestamp(1786710961, 37), 'signature': {'hash': b'~^k\x94UtY#<&\x17\xb7\xd3d\xac\xa9\xcc\xf8MA', 'keyId': 7639060031308038244}}, 'operationTime': Timestamp(1786710961, 37)}
+2026-08-14 18:06:01,676 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:06:13,348 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:06:13,351 - core.auth - WARNING - Token has expired
+2026-08-14 18:06:13,352 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:06:13,356 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:06:13,547 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:07:13,330 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:07:13,332 - core.auth - WARNING - Token has expired
+2026-08-14 18:07:13,333 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:07:13,373 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:07:13,436 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:08:13,325 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:08:13,328 - core.auth - WARNING - Token has expired
+2026-08-14 18:08:13,329 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:08:13,331 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:08:13,400 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:09:13,343 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:09:13,345 - core.auth - WARNING - Token has expired
+2026-08-14 18:09:13,346 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:09:13,591 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:09:13,654 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:10:13,340 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:10:13,343 - core.auth - WARNING - Token has expired
+2026-08-14 18:10:13,343 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:10:13,347 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:10:13,424 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:11:13,339 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:11:13,344 - core.auth - WARNING - Token has expired
+2026-08-14 18:11:13,344 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:11:13,385 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:11:13,453 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:12:13,351 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:12:13,353 - core.auth - WARNING - Token has expired
+2026-08-14 18:12:13,354 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:12:13,410 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:12:13,472 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:13:13,344 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:13:13,346 - core.auth - WARNING - Token has expired
+2026-08-14 18:13:13,347 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:13:13,350 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:13:13,423 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:14:13,322 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:14:13,325 - core.auth - WARNING - Token has expired
+2026-08-14 18:14:13,326 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:14:13,364 - core.cookie_auth - WARNING - Authenticated via header (deprecated). Migrate to cookie auth.
+2026-08-14 18:14:13,435 - main_async - INFO - \U0001f4e4 200
+2026-08-14 18:15:13,328 - main_async - INFO - \U0001f4e8 GET /api/v1/auth/verify
+2026-08-14 18:15:13,330 - core.auth - WARNING - Token has expired
+2026-08-14 18:15:13,332 - core.cookie_auth - INFO - Ignoring invalid token in cookie
+2026-08-14 18:15:13,368 - core.auth - INFO - Token rejected: iat 1786652648 < min_token_issued_at 1786711491.1266496
+2026-08-14 18:15:13,376 - main_async - INFO - \U0001f4e4 401
+2026-08-14 18:20:03,679 - main_async - INFO - Auto-logged out student 6a1eb665cc4080d6bc86a8eb due to inactivity (tenant=skb_ciel-1008)
+2026-08-14 23:53:08,352 - services.exampen_inline_processor - ERROR - Inline PCR processor polling pass failed
+Traceback (most recent call last):
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_inline_processor.py", line 170, in _run_loop
+    await self.run_once()
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_inline_processor.py", line 127, in run_once
+    recovered = await recover_stale_processing_jobs(tenant_db)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_workflow.py", line 608, in recover_stale_processing_jobs
+    current_retry_result = await jobs.update_many(
+                           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1437, in update_many
+    self._update_retryable(
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1118, in _update_retryable
+    return self._database.client._retryable_write(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2082, in _retryable_write
+    return self._retry_with_session(retryable, func, s, bulk, operation, operation_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 1968, in _retry_with_session
+    return self._retry_internal(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\_csot.py", line 125, in csot_wrapper
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2014, in _retry_internal
+    ).run()
+      ^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2765, in run
+    return self._read() if self._is_read else self._write()
+                                              ^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2897, in _write
+    return self._func(self._session, conn, self._retryable)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1098, in _update
+    return self._update(
+           ^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1049, in _update
+    conn.command(
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\helpers.py", line 47, in inner
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\pool.py", line 441, in command
+    self._raise_connection_failure(error)
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\pool.py", line 413, in command
+    return command(
+           ^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\network.py", line 198, in command
+    reply = receive_message(conn, request_id)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 759, in receive_message
+    length, _, response_to, op_code = _UNPACK_HEADER(receive_data(conn, 16, deadline))
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 343, in receive_data
+    wait_for_read(conn, deadline)
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 318, in wait_for_read
+    raise _OperationCancelled("operation cancelled")
+pymongo.errors._OperationCancelled: operation cancelled
+2026-08-14 23:57:49,235 - services.exampen_inline_processor - ERROR - Inline PCR processor polling pass failed
+Traceback (most recent call last):
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\pool.py", line 413, in command
+    return command(
+           ^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\network.py", line 198, in command
+    reply = receive_message(conn, request_id)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 759, in receive_message
+    length, _, response_to, op_code = _UNPACK_HEADER(receive_data(conn, 16, deadline))
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\network_layer.py", line 379, in receive_data
+    raise OSError("connection closed")
+OSError: connection closed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_inline_processor.py", line 170, in _run_loop
+    await self.run_once()
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_inline_processor.py", line 127, in run_once
+    recovered = await recover_stale_processing_jobs(tenant_db)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\Music\Stoody\stoody-backend\services\exampen_workflow.py", line 576, in recover_stale_processing_jobs
+    exhausted_result = await jobs.update_many(
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1437, in update_many
+    self._update_retryable(
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1118, in _update_retryable
+    return self._database.client._retryable_write(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2082, in _retryable_write
+    return self._retry_with_session(retryable, func, s, bulk, operation, operation_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 1968, in _retry_with_session
+    return self._retry_internal(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\_csot.py", line 125, in csot_wrapper
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2014, in _retry_internal
+    ).run()
+      ^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2765, in run
+    return self._read() if self._is_read else self._write()
+                                              ^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\mongo_client.py", line 2897, in _write
+    return self._func(self._session, conn, self._retryable)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1098, in _update
+    return self._update(
+           ^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\collection.py", line 1049, in _update
+    conn.command(
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\helpers.py", line 47, in inner
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\pool.py", line 441, in command
+    self._raise_connection_failure(error)
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\synchronous\pool.py", line 643, in _raise_connection_failure
+    _raise_connection_failure(self.address, error, timeout_details=details)
+  File "C:\Users\Paritosh Mishra\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\pymongo\pool_shared.py", line 150, in _raise_connection_failure
+    raise AutoReconnect(msg) from error
+pymongo.errors.AutoReconnect: ac-pzsvfcb-shard-00-01.44wdyum.mongodb.net:27017: connection closed (configured timeouts: socketTimeoutMS: 10000.0ms, connectTimeoutMS: 5000.0ms)
+2026-08-15 01:16:24,332 - main_async - INFO - Auto-logged out student 696bb9c243c2529d30cd1d3c due to inactivity (tenant=skb_indl-ciel-1001)

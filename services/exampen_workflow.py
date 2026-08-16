@@ -19,13 +19,35 @@ logger = logging.getLogger(__name__)
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v3"
+# Pipeline 5 deliberately has its own queue capability.  A pre-v14 worker
+# knows only ``queued_pipeline_v3`` and therefore cannot claim a newly migrated
+# v14 job during a rolling restart.
+V14_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v5"
+V15_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v6"
+V16_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v7"
 DISPATCHABLE_JOB_STATUSES = {
     "queued",
     "retryable_error",
     "enqueue_failed",
     CAPABILITY_QUEUED_JOB_STATUS,
+    V14_CAPABILITY_QUEUED_JOB_STATUS,
+    V15_CAPABILITY_QUEUED_JOB_STATUS,
+    V16_CAPABILITY_QUEUED_JOB_STATUS,
 }
-CURRENT_PCR_PIPELINE_VERSION = 3
+CURRENT_PCR_PIPELINE_VERSION = 4
+CURRENT_PCR_MAPPING_VERSION = "evidence-first-visual-v4"
+# v14 is intentionally named here even while the default worker remains v13
+# during rollout.  The bounded worker can opt into these values explicitly;
+# old workers must continue to claim only pipeline 4 jobs.
+PCR_V14_PIPELINE_VERSION = 5
+PCR_V14_MAPPING_VERSION = "bounded-evidence-visual-v5"
+PCR_V14_REQUIRED_PROCESSING_PATH = "full_document_visual"
+PCR_V15_PIPELINE_VERSION = 6
+PCR_V15_MAPPING_VERSION = "bounded-evidence-visual-v6"
+PCR_V15_REQUIRED_PROCESSING_PATH = "full_document_visual"
+PCR_V16_PIPELINE_VERSION = 7
+PCR_V16_MAPPING_VERSION = "whole-copy-rubric-v7"
+PCR_V16_REQUIRED_PROCESSING_PATH = "full_document_visual"
 FULL_DOCUMENT_PROCESSING_PATH = "full_document_visual"
 PROCESSING_LEASE_MINUTES = 30
 PROCESSING_HEARTBEAT_SECONDS = 60
@@ -38,6 +60,12 @@ PROCESSING_RETRY_MAX_SECONDS = 15 * 60
 # conservative crash detector while the lease token still fences late writes
 # from the old owner.
 PROCESSING_HEARTBEAT_STALE_SECONDS = PROCESSING_HEARTBEAT_SECONDS * 3
+SUPPORTED_PCR_PIPELINE_VERSIONS = frozenset({
+    4,
+    PCR_V14_PIPELINE_VERSION,
+    PCR_V15_PIPELINE_VERSION,
+    PCR_V16_PIPELINE_VERSION,
+})
 
 
 def _celery_broker_available() -> bool:
@@ -89,12 +117,18 @@ def _now() -> datetime:
 
 
 def _queued_status_for_pipeline(pipeline_version: Any) -> str:
-    """Keep new-contract work invisible to pre-v3 workers during rollout."""
+    """Fence each incompatible worker generation behind its own queue."""
 
     try:
         version = int(pipeline_version or 0)
     except (TypeError, ValueError):
         version = 0
+    if version >= PCR_V16_PIPELINE_VERSION:
+        return V16_CAPABILITY_QUEUED_JOB_STATUS
+    if version >= PCR_V15_PIPELINE_VERSION:
+        return V15_CAPABILITY_QUEUED_JOB_STATUS
+    if version >= PCR_V14_PIPELINE_VERSION:
+        return V14_CAPABILITY_QUEUED_JOB_STATUS
     return CAPABILITY_QUEUED_JOB_STATUS if version >= 3 else "queued"
 
 
@@ -102,18 +136,44 @@ def _retryable_status_for_pipeline(pipeline_version: Any) -> str:
     """Preserve legacy retry semantics while fencing v3 work from old workers."""
 
     queued_status = _queued_status_for_pipeline(pipeline_version)
-    return (
-        CAPABILITY_QUEUED_JOB_STATUS
-        if queued_status == CAPABILITY_QUEUED_JOB_STATUS
-        else "retryable_error"
-    )
+    return queued_status if queued_status.startswith("queued_pipeline_") else "retryable_error"
 
 
 def public_processing_status(status: Any) -> str:
     """Expose capability-fenced queued work through the stable API status."""
 
     normalized = str(status or "").strip().lower()
-    return "queued" if normalized == CAPABILITY_QUEUED_JOB_STATUS else normalized
+    return (
+        "queued"
+        if normalized in {
+            CAPABILITY_QUEUED_JOB_STATUS,
+            V14_CAPABILITY_QUEUED_JOB_STATUS,
+            V15_CAPABILITY_QUEUED_JOB_STATUS,
+            V16_CAPABILITY_QUEUED_JOB_STATUS,
+        }
+        else normalized
+    )
+
+
+def is_supported_pcr_grading_contract(contract: Any) -> bool:
+    """Return whether this worker generation can execute a frozen contract."""
+
+    payload = contract if isinstance(contract, dict) else {}
+    candidate = payload.get("pipeline_version")
+    if candidate is None:
+        prompt_version = str(payload.get("prompt_version") or "").strip()
+        if prompt_version.endswith("-v16"):
+            candidate = PCR_V16_PIPELINE_VERSION
+        elif prompt_version.endswith("-v15"):
+            candidate = PCR_V15_PIPELINE_VERSION
+        elif prompt_version.endswith("-v14"):
+            candidate = PCR_V14_PIPELINE_VERSION
+        elif prompt_version.endswith("-v13") or not prompt_version:
+            candidate = CURRENT_PCR_PIPELINE_VERSION
+    try:
+        return int(candidate) in SUPPORTED_PCR_PIPELINE_VERSIONS
+    except (TypeError, ValueError):
+        return False
 
 
 def _job_id(submission_id: str) -> str:
@@ -249,6 +309,59 @@ async def _required_processing_path(tenant_db: Any, exam_id: str) -> str:
     return "legacy_ocr_mapping"
 
 
+async def _pipeline_metadata_for_exam(
+    tenant_db: Any,
+    exam_id: str,
+    *,
+    job: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, str]:
+    """Resolve the immutable worker contract without downgrading v14 jobs."""
+
+    contract: Dict[str, Any] = {}
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id}, {"pcr_grading_contract": 1}
+    )
+    if exam:
+        contract = dict(exam.get("pcr_grading_contract") or {})
+    candidate = contract.get("pipeline_version")
+    if candidate is None:
+        prompt_version = str(contract.get("prompt_version") or "")
+        if prompt_version.endswith("-v16"):
+            candidate = PCR_V16_PIPELINE_VERSION
+        elif prompt_version.endswith("-v15"):
+            candidate = PCR_V15_PIPELINE_VERSION
+        elif prompt_version.endswith("-v14"):
+            candidate = PCR_V14_PIPELINE_VERSION
+        elif prompt_version.endswith("-v13"):
+            candidate = CURRENT_PCR_PIPELINE_VERSION
+    if candidate is None:
+        candidate = (job or {}).get("pipeline_version")
+    if candidate is None:
+        candidate = CURRENT_PCR_PIPELINE_VERSION
+    try:
+        pipeline_version = int(candidate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported PCR pipeline version: {candidate!r}") from exc
+    if pipeline_version not in SUPPORTED_PCR_PIPELINE_VERSIONS:
+        # Pre-v4 jobs are legacy records.  An explicit reprocess upgrades them
+        # to the current immutable v13 lane; unknown future revisions fail
+        # closed instead of being silently downgraded.
+        if pipeline_version in {1, 2, 3}:
+            pipeline_version = CURRENT_PCR_PIPELINE_VERSION
+        else:
+            raise ValueError(f"Unsupported PCR pipeline version: {pipeline_version}")
+    mapping_version = (
+        PCR_V16_MAPPING_VERSION
+        if pipeline_version == PCR_V16_PIPELINE_VERSION
+        else PCR_V15_MAPPING_VERSION
+        if pipeline_version == PCR_V15_PIPELINE_VERSION
+        else PCR_V14_MAPPING_VERSION
+        if pipeline_version == PCR_V14_PIPELINE_VERSION
+        else CURRENT_PCR_MAPPING_VERSION
+    )
+    return pipeline_version, mapping_version
+
+
 async def ensure_processing_job(
     tenant_db: Any,
     *,
@@ -260,6 +373,9 @@ async def ensure_processing_job(
     """Create the exactly-once processing record for a canonical submission."""
     await ensure_indexes(tenant_db)
     required_processing_path = await _required_processing_path(tenant_db, exam_id)
+    pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
+        tenant_db, exam_id
+    )
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     job_id = _job_id(submission_id)
     now = _now()
@@ -272,10 +388,11 @@ async def ensure_processing_job(
                 "exam_id": exam_id,
                 "student_id": student_id,
                 "db_name": db_name,
-                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "pipeline_version": pipeline_version,
+                "mapping_pipeline_version": mapping_pipeline_version,
                 "required_processing_path": required_processing_path,
                 "status": _queued_status_for_pipeline(
-                    CURRENT_PCR_PIPELINE_VERSION
+                    pipeline_version
                 ),
                 "attempts": 0,
                 "lease_generation": 0,
@@ -287,6 +404,24 @@ async def ensure_processing_job(
         upsert=True,
     )
     job = await jobs.find_one({"submission_id": submission_id})
+    if job is not None and result.upserted_id is None:
+        persisted_pipeline = job.get("pipeline_version")
+        try:
+            persisted_pipeline = int(persisted_pipeline)
+        except (TypeError, ValueError):
+            persisted_pipeline = None
+        if persisted_pipeline != pipeline_version:
+            raise ValueError(
+                f"Submission {submission_id} is attached to pipeline "
+                f"{persisted_pipeline!r}, but exam {exam_id} requires "
+                f"pipeline {pipeline_version}; run the explicit migration/reprocess"
+            )
+        if str(job.get("mapping_pipeline_version") or "") != mapping_pipeline_version:
+            raise ValueError(
+                f"Submission {submission_id} has mapping pipeline "
+                f"{job.get('mapping_pipeline_version')!r}, expected "
+                f"{mapping_pipeline_version}; run the explicit migration/reprocess"
+            )
     return job, result.upserted_id is not None
 
 
@@ -312,9 +447,16 @@ async def dispatch_processing_job(
         return job
 
     now = _now()
-    required_processing_path = await _required_processing_path(
+    required_processing_path = str(job.get("required_processing_path") or "").strip()
+    if not required_processing_path:
+        required_processing_path = await _required_processing_path(
+            tenant_db,
+            str(job.get("exam_id") or ""),
+        )
+    pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
         tenant_db,
         str(job.get("exam_id") or ""),
+        job=job,
     )
     queue_filter: Dict[str, Any] = {
         "job_id": job["job_id"],
@@ -325,14 +467,15 @@ async def dispatch_processing_job(
     else:
         queue_filter["enqueue_attempted_at"] = job["enqueue_attempted_at"]
     capability_status = _queued_status_for_pipeline(
-        CURRENT_PCR_PIPELINE_VERSION
+        pipeline_version
     )
     queued = await jobs.update_one(
         queue_filter,
         {
             "$set": {
                 "status": capability_status,
-                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "pipeline_version": pipeline_version,
+                "mapping_pipeline_version": mapping_pipeline_version,
                 "required_processing_path": required_processing_path,
                 "db_name": db_name,
                 "enqueue_attempted_at": now,
@@ -378,7 +521,7 @@ async def dispatch_processing_job(
         process_exampen_pcr_submission.delay(
             db_name,
             job_id,
-            CURRENT_PCR_PIPELINE_VERSION,
+            pipeline_version,
         )
     except Exception as exc:
         logger.exception("Unable to enqueue PCR processing job %s", job_id)
@@ -443,11 +586,11 @@ async def reprocess_processing_job(
 ) -> Dict[str, Any]:
     """Safely rerun full-document visual marking for an existing copy.
 
-    The canonical uploaded pages remain unchanged. The primary path inspects
-    the immutable paper, teacher solution, and full answer copy together; the
-    OCR/segmentation service is retained only for legacy sessions without the
-    required canonical files. Fresh response rows supersede old mappings, so
-    stale marks cannot be mixed with the new evidence ledger.
+    The canonical uploaded pages remain unchanged. The primary path first maps
+    student-owned evidence without an answer key, then grades that fixed map
+    against the immutable solution and criteria. OCR/segmentation is retained
+    only for legacy sessions without the required canonical files. Fresh rows
+    supersede old mappings, so stale marks cannot mix with the new ledger.
     """
     await ensure_indexes(tenant_db)
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
@@ -456,9 +599,16 @@ async def reprocess_processing_job(
         raise ValueError(f"Processing job {job_id} not found")
 
     now = _now()
-    required_processing_path = await _required_processing_path(
+    required_processing_path = str(job.get("required_processing_path") or "").strip()
+    if not required_processing_path:
+        required_processing_path = await _required_processing_path(
+            tenant_db,
+            str(job.get("exam_id") or ""),
+        )
+    pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
         tenant_db,
         str(job.get("exam_id") or ""),
+        job=job,
     )
     current_status = str(job.get("status") or "queued")
     if _lease_is_active(job, now=now):
@@ -500,10 +650,8 @@ async def reprocess_processing_job(
         reset_filter,
         {
             "$set": {
-                "status": _queued_status_for_pipeline(
-                    CURRENT_PCR_PIPELINE_VERSION
-                ),
-                "pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "status": _queued_status_for_pipeline(pipeline_version),
+                "pipeline_version": pipeline_version,
                 "required_processing_path": required_processing_path,
                 "db_name": db_name,
                 "last_error": None,
@@ -512,7 +660,7 @@ async def reprocess_processing_job(
                 "reprocess_requested_at": now,
                 "reprocess_requested_by": requested_by or "unknown",
                 "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": "whole-copy-rubric-v3",
+                "mapping_pipeline_version": mapping_pipeline_version,
                 "attempts": 0,
                 "updated_at": now,
             },
@@ -605,12 +753,98 @@ async def recover_stale_processing_jobs(
             {"attempts": {"$exists": False}},
         ]
     }
+    v14_retry_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                retryable_attempt_predicate,
+                {"pipeline_version": PCR_V14_PIPELINE_VERSION},
+            ]
+        },
+        {
+            "$set": {
+                "status": V14_CAPABILITY_QUEUED_JOB_STATUS,
+                "last_error": (
+                    "Processing worker heartbeat stopped; queued for automatic recovery"
+                ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "next_retry_at": recovered_at
+                + timedelta(seconds=PROCESSING_RETRY_BASE_SECONDS),
+                "stale_worker_recovered_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
+        },
+    )
+    v16_retry_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                retryable_attempt_predicate,
+                {"pipeline_version": {"$gte": PCR_V16_PIPELINE_VERSION}},
+            ]
+        },
+        {
+            "$set": {
+                "status": V16_CAPABILITY_QUEUED_JOB_STATUS,
+                "last_error": (
+                    "Processing worker heartbeat stopped; queued for automatic recovery"
+                ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "next_retry_at": recovered_at
+                + timedelta(seconds=PROCESSING_RETRY_BASE_SECONDS),
+                "stale_worker_recovered_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
+        },
+    )
+    v15_retry_result = await jobs.update_many(
+        {
+            "$and": [
+                *stale_predicates,
+                retryable_attempt_predicate,
+                {"pipeline_version": PCR_V15_PIPELINE_VERSION},
+            ]
+        },
+        {
+            "$set": {
+                "status": V15_CAPABILITY_QUEUED_JOB_STATUS,
+                "last_error": (
+                    "Processing worker heartbeat stopped; queued for automatic recovery"
+                ),
+                "failure_code": "ProcessingWorkerHeartbeatExpired",
+                "next_retry_at": recovered_at
+                + timedelta(seconds=PROCESSING_RETRY_BASE_SECONDS),
+                "stale_worker_recovered_at": recovered_at,
+                "updated_at": recovered_at,
+            },
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "finished_at": "",
+            },
+        },
+    )
     current_retry_result = await jobs.update_many(
         {
             "$and": [
                 *stale_predicates,
                 retryable_attempt_predicate,
-                {"pipeline_version": {"$gte": 3}},
+                {
+                    "pipeline_version": {
+                        "$gte": 3,
+                        "$lt": PCR_V14_PIPELINE_VERSION,
+                    }
+                },
             ]
         },
         {
@@ -683,6 +917,9 @@ async def recover_stale_processing_jobs(
     )
     return int(
         exhausted_result.modified_count
+        + v14_retry_result.modified_count
+        + v15_retry_result.modified_count
+        + v16_retry_result.modified_count
         + current_retry_result.modified_count
         + legacy_retry_result.modified_count
         + malformed_result.modified_count
@@ -742,6 +979,9 @@ async def reconcile_processing_jobs(
         if updated.get("status") in {
             "queued",
             CAPABILITY_QUEUED_JOB_STATUS,
+            V14_CAPABILITY_QUEUED_JOB_STATUS,
+            V15_CAPABILITY_QUEUED_JOB_STATUS,
+            V16_CAPABILITY_QUEUED_JOB_STATUS,
             "processing",
         }:
             dispatched += 1
@@ -766,20 +1006,39 @@ async def _claim_job(
     claim_filter: Dict[str, Any] = {
         "job_id": job_id,
         "status": {"$in": list(DISPATCHABLE_JOB_STATUSES)},
-        "$or": [
-            {"next_retry_at": {"$exists": False}},
-            {"next_retry_at": None},
-            {"next_retry_at": {"$lte": now}},
+        "$and": [
+            {
+                "$or": [
+                    {"next_retry_at": {"$exists": False}},
+                    {"next_retry_at": None},
+                    {"next_retry_at": {"$lte": now}},
+                ]
+            }
         ],
     }
     if required_pipeline_version is not None:
-        claim_filter["pipeline_version"] = int(required_pipeline_version)
+        required_pipeline_version = int(required_pipeline_version)
+        claim_filter["pipeline_version"] = required_pipeline_version
+    else:
+        claim_filter["$and"].append(
+            {
+                "$or": [
+                    {"pipeline_version": {"$in": list(SUPPORTED_PCR_PIPELINE_VERSIONS)}},
+                    {"pipeline_version": {"$exists": False}},
+                ]
+            }
+        )
+    worker_pipeline_version = int(required_pipeline_version or 0)
+    if not worker_pipeline_version:
+        # The claim filter is restricted to supported versions; this value is
+        # replaced with the actual persisted target after the atomic claim.
+        worker_pipeline_version = CURRENT_PCR_PIPELINE_VERSION
     result = await jobs.update_one(
         claim_filter,
         {
             "$set": {
                 "status": "processing",
-                "worker_pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "worker_pipeline_version": worker_pipeline_version,
                 "started_at": now,
                 "updated_at": now,
                 "lease_token": lease_token,
@@ -791,7 +1050,19 @@ async def _claim_job(
     )
     if result.matched_count != 1:
         return None
-    return await jobs.find_one({"job_id": job_id, "lease_token": lease_token})
+    claimed = await jobs.find_one({"job_id": job_id, "lease_token": lease_token})
+    if claimed is not None and required_pipeline_version is None:
+        actual_pipeline_version = int(
+            claimed.get("pipeline_version") or CURRENT_PCR_PIPELINE_VERSION
+        )
+        if actual_pipeline_version not in SUPPORTED_PCR_PIPELINE_VERSIONS:
+            raise ValueError(f"Unsupported PCR pipeline version: {actual_pipeline_version}")
+        await jobs.update_one(
+            {"job_id": job_id, "lease_token": lease_token},
+            {"$set": {"worker_pipeline_version": actual_pipeline_version}},
+        )
+        claimed["worker_pipeline_version"] = actual_pipeline_version
+    return claimed
 
 
 async def _maybe_mark_exam_ready_for_review(tenant_db: Any, exam_id: str) -> None:
@@ -955,12 +1226,15 @@ async def process_pcr_processing_job(
         tenant_db,
         str(submission.get("exam_id") or ""),
     )
+    worker_pipeline_version = int(job.get("pipeline_version") or CURRENT_PCR_PIPELINE_VERSION)
+    if worker_pipeline_version not in SUPPORTED_PCR_PIPELINE_VERSIONS:
+        raise ValueError(f"Unsupported PCR pipeline version: {worker_pipeline_version}")
     await jobs.update_one(
         lease_filter,
         {
             "$set": {
                 "required_processing_path": required_processing_path,
-                "worker_pipeline_version": CURRENT_PCR_PIPELINE_VERSION,
+                "worker_pipeline_version": worker_pipeline_version,
                 "updated_at": _now(),
             }
         },

@@ -21,6 +21,7 @@ from services.exampen_workflow import (
     CURRENT_PCR_PIPELINE_VERSION,
     DISPATCHABLE_JOB_STATUSES,
     PROCESSING_JOBS_COLLECTION,
+    SUPPORTED_PCR_PIPELINE_VERSIONS,
     process_pcr_processing_job,
     record_processing_job_failure,
     recover_stale_processing_jobs,
@@ -181,11 +182,22 @@ class InlinePCRProcessor:
         async with self._semaphore:
             execution_token = f"inline:{uuid.uuid4().hex}"
             try:
+                job = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one(
+                    {"job_id": job_id}, {"pipeline_version": 1}
+                )
+                pipeline_version = int(
+                    (job or {}).get("pipeline_version")
+                    or CURRENT_PCR_PIPELINE_VERSION
+                )
+                if pipeline_version not in SUPPORTED_PCR_PIPELINE_VERSIONS:
+                    raise ValueError(
+                        f"Unsupported PCR pipeline version: {pipeline_version}"
+                    )
                 await process_pcr_processing_job(
                     tenant_db,
                     job_id,
                     execution_token=execution_token,
-                    required_pipeline_version=CURRENT_PCR_PIPELINE_VERSION,
+                    required_pipeline_version=pipeline_version,
                 )
                 self._retry_not_before.pop(key, None)
             except asyncio.CancelledError:

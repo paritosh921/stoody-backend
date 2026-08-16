@@ -393,6 +393,42 @@ async def test_v3_capability_queue_cannot_be_claimed_by_v2_worker():
 
 
 @pytest.mark.asyncio
+async def test_v5_capability_queue_cannot_be_claimed_by_v4_worker():
+    from services.exampen_workflow import _claim_job
+
+    db = _fresh_db()
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-V5-FENCE",
+            "submission_id": "SUB-V5-FENCE",
+            "exam_id": "EXAM-V5-FENCE",
+            "pipeline_version": 5,
+            "mapping_pipeline_version": "bounded-evidence-visual-v5",
+            "status": "queued_pipeline_v5",
+            "attempts": 0,
+        }
+    )
+
+    stale_claim = await _claim_job(
+        db,
+        "JOB-V5-FENCE",
+        execution_token="v4-worker",
+        required_pipeline_version=4,
+    )
+    assert stale_claim is None
+
+    current_claim = await _claim_job(
+        db,
+        "JOB-V5-FENCE",
+        execution_token="v5-worker",
+        required_pipeline_version=5,
+    )
+    assert current_claim is not None
+    assert current_claim["pipeline_version"] == 5
+    assert current_claim["lease_token"] == "v5-worker"
+
+
+@pytest.mark.asyncio
 async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatch):
     """A teacher retry must be a fresh, auditable mapping run, not a mutation race."""
     from services.exampen_workflow import (
@@ -437,14 +473,14 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     )
 
     assert result["status"] == "queued_pipeline_v3"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1", 3)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 4)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
     assert stored["segmentation"] == {}
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
-    assert stored["mapping_pipeline_version"] == "whole-copy-rubric-v3"
+    assert stored["mapping_pipeline_version"] == "evidence-first-visual-v4"
     assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
@@ -550,7 +586,7 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
     )
 
     assert result["status"] == "queued_pipeline_v3"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 3)]
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 4)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored
@@ -699,7 +735,7 @@ async def test_concurrent_dispatch_reserves_job_once(monkeypatch):
         dispatch_processing_job(db, db_name="skb_test", job=dict(job)),
     )
 
-    assert task.calls == [("skb_test", "pcr-job-dispatch-once", 3)]
+    assert task.calls == [("skb_test", "pcr-job-dispatch-once", 4)]
 
 
 @pytest.mark.asyncio
@@ -746,7 +782,7 @@ async def test_reconciler_dispatches_only_due_retries(monkeypatch):
     result = await reconcile_processing_jobs(db, db_name="skb_test")
 
     assert result["pending"] == 1
-    assert task.calls == [("skb_test", "pcr-job-due", 3)]
+    assert task.calls == [("skb_test", "pcr-job-due", 4)]
     future = await jobs.find_one({"job_id": "pcr-job-future"})
     due = await jobs.find_one({"job_id": "pcr-job-due"})
     assert future["status"] == "retryable_error"

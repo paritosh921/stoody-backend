@@ -21,6 +21,62 @@ def _admin_user():
 
 
 @pytest.mark.asyncio
+async def test_supported_migrated_contract_reenables_reprocess_after_stale_worker_failure():
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-V14-RECOVER",
+            "pcr_grading_contract": {
+                "prompt_version": "pcr-full-document-visual-v14",
+                "pipeline_version": 5,
+                "mapping_pipeline_version": "bounded-evidence-visual-v5",
+            },
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-V14-RECOVER",
+            "exam_id": "EXAM-V14-RECOVER",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "complete",
+            "publication_status": "ready",
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-V14-RECOVER",
+            "submission_id": "SUB-V14-RECOVER",
+            "exam_id": "EXAM-V14-RECOVER",
+            "status": "failed",
+            "pipeline_version": 3,
+            "failure_code": "UnsupportedGradingContractError",
+            "last_error": "An old worker did not support v14",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-V14-RECOVER",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.processing_status == "failed"
+    assert result.processing_failure_code == "UnsupportedGradingContractError"
+    assert result.can_reprocess is True
+    assert result.reprocess_block_reason is None
+
+
+@pytest.mark.asyncio
 async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
     """The teacher workspace must receive the artefacts used to mark a copy."""
     from api.v1.evalpen_review_async import get_submission_summary
@@ -357,6 +413,82 @@ async def test_failed_ocr_does_not_look_like_a_zero_mark_blank_paper():
 
 
 @pytest.mark.asyncio
+async def test_failed_reprocess_does_not_project_previous_generation_marks_as_current():
+    """Old immutable rows remain auditable but are not the current result."""
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-FAILED-REPROCESS",
+            "exam_id": "EXAM-FAILED-REPROCESS",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "complete",
+            "document_review": {"status": "ready", "grading_run_id": "OLD-RUN"},
+        }
+    )
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-FAILED-REPROCESS::Q-1",
+            "exam_id": "EXAM-FAILED-REPROCESS",
+            "question_number": 1,
+            "max_marks": 5,
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-OLD-GENERATION",
+            "submission_id": "SUB-FAILED-REPROCESS",
+            "question_id": "EXAM-FAILED-REPROCESS::Q-1",
+            "question_number": 1,
+            "detected_text": "Previous model transcription",
+            "eval_status": "evaluated",
+            "source_pages": [{"page_number": 1, "region_id": "OLD-REGION"}],
+            "flags": [],
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-OLD-GENERATION",
+            "response_id": "RESP-OLD-GENERATION",
+            "total_score": 5,
+            "max_score": 5,
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-FAILED-REPROCESS",
+            "submission_id": "SUB-FAILED-REPROCESS",
+            "status": "failed",
+            "failure_code": "ProviderHTTPError",
+            "last_error": "The current grading request was rejected",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-FAILED-REPROCESS",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.score_state == "unavailable"
+    assert result.responses == []
+    assert result.unassigned_responses == []
+    assert result.total_score == 0.0
+    assert result.evaluated_count == 0
+    assert result.document_review is None
+    assert result.review_state == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_scheduled_retry_remains_processing_without_fake_missing_answers():
     from api.v1.evalpen_review_async import get_submission_summary
 
@@ -579,6 +711,70 @@ async def test_exam_results_exclude_fake_questions_and_use_the_paper_denominator
     assert student.pcr_total_score == 1.5
     assert student.pcr_max_score == 4
     assert student.blocked_responses == 1
+    assert student.score_state == "available"
+
+
+@pytest.mark.asyncio
+async def test_exam_results_label_old_marks_unavailable_after_failed_reprocess():
+    from api.v1.evalpen_review_async import get_exam_results
+
+    db = _fresh_db()
+    await db["evalpen_questions"].insert_one(
+        {
+            "question_id": "EXAM-STALE-RESULT::Q-1",
+            "exam_id": "EXAM-STALE-RESULT",
+            "question_number": 1,
+            "max_marks": 5,
+        }
+    )
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-STALE-RESULT",
+            "exam_id": "EXAM-STALE-RESULT",
+            "student_id": "STU-1",
+            "publication_status": "pending",
+        }
+    )
+    await db["evalpen_detected_responses"].insert_one(
+        {
+            "response_id": "RESP-STALE-RESULT",
+            "submission_id": "SUB-STALE-RESULT",
+            "question_id": "EXAM-STALE-RESULT::Q-1",
+            "eval_status": "evaluated",
+        }
+    )
+    await db["evalpen_evaluations"].insert_one(
+        {
+            "evaluation_id": "EVAL-STALE-RESULT",
+            "response_id": "RESP-STALE-RESULT",
+            "total_score": 5,
+            "max_score": 5,
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-STALE-RESULT",
+            "submission_id": "SUB-STALE-RESULT",
+            "status": "failed",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_exam_results(
+            exam_id="EXAM-STALE-RESULT",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.students[0].pcr_total_score == 5
+    assert result.students[0].score_state == "unavailable"
 
 
 @pytest.mark.asyncio

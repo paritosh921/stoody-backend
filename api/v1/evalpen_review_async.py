@@ -52,7 +52,10 @@ from api.v1.exam_orch_async import (
 )
 from services.answer_mapping_contract import normalize_answer_label
 from services.evalpen_flag_utils import is_flag_resolved, resolve_flag
-from services.exampen_workflow import public_processing_status
+from services.exampen_workflow import (
+    is_supported_pcr_grading_contract,
+    public_processing_status,
+)
 from services.objective_scoring_service import is_integer_question
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
@@ -462,6 +465,10 @@ class ExamResultStudentAPI(BaseModel):
     combined_max: float = 0.0
     publication_status: Optional[str] = None
     blocked_responses: int = 0
+    # Scores from an older successful materialization can remain in the audit
+    # ledger while an explicit reprocess is running or has failed. Consumers
+    # must only present the numeric fields as current when this is ``available``.
+    score_state: str = "available"
 
 
 class ExamResultsAPI(BaseModel):
@@ -901,6 +908,19 @@ async def get_submission_summary(
         contract_migration_required = (
             processing_failure_code == "UnsupportedGradingContractError"
         )
+        if contract_migration_required:
+            current_exam = await tenant_db["exampen_exams"].find_one(
+                {"exam_id": str(sub_dict.get("exam_id") or "")},
+                {"_id": 0, "pcr_grading_contract": 1},
+            )
+            # A job can retain this terminal error when an old worker claimed
+            # it immediately before a contract migration or rolling restart.
+            # Reprocess must become available once the currently running
+            # worker supports the exam's frozen contract; the reprocess
+            # endpoint will atomically rewrite the stale job metadata.
+            contract_migration_required = not is_supported_pcr_grading_contract(
+                (current_exam or {}).get("pcr_grading_contract")
+            )
         can_reprocess = bool(
             processing_job_id
             and publication_status != "published"
@@ -1198,11 +1218,21 @@ async def get_submission_summary(
                 )
                 blocked_count += 1
 
-        # Display every persisted award once evaluation has settled. Review
-        # and blocking states are reported separately and still prevent
-        # publication; they must not hide already-materialized marks.
+        # A failed explicit reprocess invalidates the previous materialization
+        # as the current result. Historical rows stay immutable for audit, but
+        # they must not be projected as present-tense answers or marks. This is
+        # the server-side freshness boundary; clients should not have to infer
+        # row generations from response IDs.
         if processing_failed:
             score_state = "unavailable"
+            response_summaries = []
+            unassigned_summaries = []
+            total_score = 0.0
+            evaluated_max = 0.0
+            evaluated_count = 0
+            blocked_count = 0
+            pending_count = 0
+            review_count = 0
         elif processing_active or segmentation_status != "complete" or pending_count > 0:
             score_state = "processing"
         else:
@@ -1210,7 +1240,8 @@ async def get_submission_summary(
 
         document_review = (
             sub_dict.get("document_review")
-            if isinstance(sub_dict.get("document_review"), dict)
+            if not processing_failed
+            and isinstance(sub_dict.get("document_review"), dict)
             else None
         )
         # Derive the displayed state from canonical rows on every read. The
@@ -2660,6 +2691,31 @@ async def get_exam_results(
             )
             submissions = await submissions_cursor.to_list(length=5000)
 
+            latest_jobs_by_submission: Dict[str, Dict[str, Any]] = {}
+            result_submission_ids = [
+                str(item.get("submission_id") or "")
+                for item in submissions
+                if str(item.get("submission_id") or "")
+            ]
+            if result_submission_ids:
+                jobs_cursor = tenant_db["exampen_processing_jobs"].find(
+                    {"submission_id": {"$in": result_submission_ids}},
+                    {
+                        "submission_id": 1,
+                        "status": 1,
+                        "next_retry_at": 1,
+                        "created_at": 1,
+                        "updated_at": 1,
+                    },
+                ).sort([("created_at", -1), ("updated_at", -1)])
+                for job in await jobs_cursor.to_list(length=5000):
+                    owner_submission_id = str(job.get("submission_id") or "")
+                    if (
+                        owner_submission_id
+                        and owner_submission_id not in latest_jobs_by_submission
+                    ):
+                        latest_jobs_by_submission[owner_submission_id] = job
+
             # Read responses/evaluations in two bounded batch queries. The
             # former nested repository loop performed one response query per
             # student and then one evaluation query per question, which made
@@ -2722,6 +2778,29 @@ async def get_exam_results(
             for sub in submissions:
                 student_id = sub.get("student_id", "")
                 submission_id = sub.get("submission_id", "")
+                publication_status = str(sub.get("publication_status") or "pending")
+                latest_job = latest_jobs_by_submission.get(str(submission_id))
+                latest_processing_status = (
+                    public_processing_status(latest_job.get("status"))
+                    if latest_job and latest_job.get("status")
+                    else None
+                )
+                retry_scheduled = bool(
+                    latest_processing_status == "retryable_error"
+                    and latest_job
+                    and latest_job.get("next_retry_at") is not None
+                )
+                score_state = (
+                    "available"
+                    if publication_status == "published"
+                    else "processing"
+                    if latest_processing_status in {"queued", "processing"}
+                    or retry_scheduled
+                    else "unavailable"
+                    if latest_processing_status
+                    in {"failed", "retryable_error", "enqueue_failed"}
+                    else "available"
+                )
                 submission_responses = responses_by_submission.get(
                     str(submission_id), []
                 )
@@ -2770,8 +2849,11 @@ async def get_exam_results(
                         student_id=student_id,
                         submission_id=submission_id,
                         publication_status=sub.get("publication_status"),
+                        score_state=score_state,
                     )
                     student_results[student_id] = entry
+
+                entry.score_state = score_state
 
                 entry.pcr_total_score = pcr_total
                 entry.pcr_max_score = paper_max_score or evaluated_max

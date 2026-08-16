@@ -1118,6 +1118,7 @@ def _extract_omr_grid_payload(
         )
         region = _omr_evidence_region(
             asset=asset,
+            question_number=question_number,
             group=group,
             row=row,
             width=width,
@@ -1570,6 +1571,7 @@ def _read_omr_row(
 def _omr_evidence_region(
     *,
     asset: _PageAsset,
+    question_number: int,
     group: _OmrGroup,
     row: _OmrRow,
     width: int,
@@ -1591,7 +1593,9 @@ def _omr_evidence_region(
         else f"OMR row: {state}"
     )
     return {
+        "region_id": f"objective-q{question_number}-page-{asset.page_number}",
         "page_number": asset.page_number,
+        "coordinate_space": "normalized_1000",
         "x_start": round(x_start * 1000.0 / width, 3),
         "y_start": round(y_start * 1000.0 / height, 3),
         "x_end": round(x_end * 1000.0 / width, 3),
@@ -1842,6 +1846,7 @@ def _validate_payload(
         source_pages = _valid_regions(
             raw.get("evidence_regions"),
             page_count=page_count,
+            question_number=number,
         )
         reason = str(raw.get("reason") or "").strip()
 
@@ -1905,7 +1910,12 @@ def _validate_payload(
     return validated, list(dict.fromkeys(document_warnings))
 
 
-def _valid_regions(value: Any, *, page_count: int) -> List[Dict[str, Any]]:
+def _valid_regions(
+    value: Any,
+    *,
+    page_count: int,
+    question_number: int,
+) -> List[Dict[str, Any]]:
     regions: List[Dict[str, Any]] = []
     if not isinstance(value, list):
         return regions
@@ -1930,7 +1940,9 @@ def _valid_regions(value: Any, *, page_count: int) -> List[Dict[str, Any]]:
             continue
         regions.append(
             {
+                "region_id": f"objective-q{question_number}-region-{len(regions) + 1}",
                 "page_number": page_number,
+                "coordinate_space": "normalized_1000",
                 "x_start": x_start,
                 "y_start": y_start,
                 "x_end": x_end,
