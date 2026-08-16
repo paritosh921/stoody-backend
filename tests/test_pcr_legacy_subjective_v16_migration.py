@@ -576,6 +576,165 @@ async def test_legacy_cli_apply_can_resume_when_legacy_inspection_is_empty(monke
 
 
 @pytest.mark.asyncio
+async def test_fleet_cli_rejects_wrong_confirmation_before_database(monkeypatch):
+    from scripts import migrate_pcr_legacy_to_v16 as script
+
+    initialized = False
+
+    async def initialize(_self):
+        nonlocal initialized
+        initialized = True
+
+    monkeypatch.setattr(script.DatabaseManager, "initialize", initialize)
+    args = script.build_parser().parse_args(
+        ["--apply-eligible", "--confirm", script.CONFIRMATION_TOKEN]
+    )
+
+    assert await script.run(args) == 2
+    assert initialized is False
+
+
+@pytest.mark.asyncio
+async def test_fleet_cli_discovers_tenants_and_applies_only_the_bounded_eligible_batch(
+    monkeypatch,
+):
+    from scripts import migrate_pcr_legacy_to_v16 as script
+
+    databases = {"skb_a": object(), "skb_b": object()}
+    migrated: list[tuple[str, str]] = []
+
+    class _Manager:
+        async def initialize(self):
+            return None
+
+        async def get_tenant_db(self, db_name):
+            return databases.get(db_name)
+
+        async def close(self):
+            return None
+
+    async def tenant_names(_manager):
+        return ["skb_a", "skb_b"]
+
+    async def inspect(db, *, db_name, exam_id):
+        assert db is databases[db_name]
+        assert exam_id is None
+        if db_name == "skb_a":
+            return [
+                {
+                    "db_name": db_name,
+                    "exam_id": "EXAM-1",
+                    "submission_count": 2,
+                    "eligible": True,
+                    "blockers": [],
+                },
+                {
+                    "db_name": db_name,
+                    "exam_id": "EXAM-2",
+                    "submission_count": 5,
+                    "eligible": True,
+                    "blockers": [],
+                },
+                {
+                    "db_name": db_name,
+                    "exam_id": "EXAM-PUBLISHED",
+                    "submission_count": 1,
+                    "eligible": False,
+                    "blockers": ["published"],
+                },
+            ]
+        return [
+            {
+                "db_name": db_name,
+                "exam_id": "EXAM-3",
+                "submission_count": 3,
+                "eligible": True,
+                "blockers": [],
+            }
+        ]
+
+    async def migrate(db, *, db_name, exam_id, **kwargs):
+        assert db is databases[db_name]
+        assert kwargs["confirmation_token"] == script.CONFIRMATION_TOKEN
+        migrated.append((db_name, exam_id))
+        return {"db_name": db_name, "exam_id": exam_id, "status": "migrated"}
+
+    monkeypatch.setattr(script, "DatabaseManager", _Manager)
+    monkeypatch.setattr(script, "_tenant_names", tenant_names)
+    monkeypatch.setattr(script, "inspect_legacy_contracts", inspect)
+    monkeypatch.setattr(script, "migrate_legacy_exam_to_v16", migrate)
+    args = script.build_parser().parse_args(
+        [
+            "--apply-eligible",
+            "--max-exams",
+            "2",
+            "--max-submissions",
+            "5",
+            "--confirm",
+            script.FLEET_CONFIRMATION_TOKEN,
+        ]
+    )
+
+    assert await script.run(args) == 0
+    assert migrated == [("skb_a", "EXAM-1"), ("skb_b", "EXAM-3")]
+
+
+@pytest.mark.asyncio
+async def test_fleet_cli_continues_safe_tenants_but_returns_nonzero_on_scan_error(
+    monkeypatch,
+):
+    from scripts import migrate_pcr_legacy_to_v16 as script
+
+    good_db = object()
+    migrated: list[str] = []
+
+    class _Manager:
+        async def initialize(self):
+            return None
+
+        async def get_tenant_db(self, db_name):
+            return good_db if db_name == "skb_good" else None
+
+        async def close(self):
+            return None
+
+    async def tenant_names(_manager):
+        return ["skb_broken", "skb_good"]
+
+    async def inspect(db, *, db_name, exam_id):
+        assert db is good_db
+        assert exam_id is None
+        return [
+            {
+                "db_name": db_name,
+                "exam_id": "EXAM-GOOD",
+                "submission_count": 1,
+                "eligible": True,
+                "blockers": [],
+            }
+        ]
+
+    async def migrate(_db, *, exam_id, **_kwargs):
+        migrated.append(exam_id)
+        return {"exam_id": exam_id, "status": "migrated"}
+
+    monkeypatch.setattr(script, "DatabaseManager", _Manager)
+    monkeypatch.setattr(script, "_tenant_names", tenant_names)
+    monkeypatch.setattr(script, "inspect_legacy_contracts", inspect)
+    monkeypatch.setattr(script, "migrate_legacy_exam_to_v16", migrate)
+    args = script.build_parser().parse_args(
+        [
+            "--apply-eligible",
+            "--confirm",
+            script.FLEET_CONFIRMATION_TOKEN,
+        ]
+    )
+
+    assert await script.run(args) == 4
+    assert migrated == ["EXAM-GOOD"]
+
+
+@pytest.mark.asyncio
 async def test_worker_pauses_v16_job_while_migration_is_failed():
     from services.exampen_workflow import process_pcr_processing_job
 
