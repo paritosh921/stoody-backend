@@ -359,14 +359,9 @@ class DatabaseManager:
             )
 
             # Student contribution credits collections (append-only ledger + async jobs).
-            student_credit_policies = db["student_credit_policies"]
-            await self._ensure_index_with_spec_check(
-                student_credit_policies,
-                [("_id", 1)],
-                unique=True,
-                name="uniq_student_credit_policy",
-            )
-
+            # MongoDB already creates a unique ``_id_`` index.  A second named
+            # unique index on ``_id`` is invalid on Atlas and made every
+            # operational script report a misleading startup warning.
             student_credit_jobs = db["student_credit_jobs"]
             await self._ensure_index_with_spec_check(
                 student_credit_jobs,

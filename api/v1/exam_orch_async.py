@@ -36,12 +36,15 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
 from api.v1.auth_async import get_current_user, get_database
-from services.exampen_workflow import public_processing_status
+from services.exampen_workflow import (
+    is_supported_pcr_grading_contract,
+    public_processing_status,
+)
 from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,30 @@ MAX_PEN_BINDINGS = 256
 CAPTURE_MODES = {"pen", "camera", "hybrid"}
 DEFAULT_PCR_CAMERA_MAX_PAGES = 40
 ACTIVE_COLLECTION_STATES = {"draft", "armed", "in_progress"}
+
+
+def _require_reprocessable_grading_contract(exam: Dict[str, Any]) -> None:
+    """Reject per-copy reruns when the immutable exam cohort needs migration."""
+
+    migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
+    migration_status = str(migration_state.get("status") or "").strip().lower()
+    if migration_status in {"applying", "failed"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "grading_contract_migration_incomplete: The whole-exam grading "
+                "contract migration must complete successfully before reprocessing."
+            ),
+        )
+    if not is_supported_pcr_grading_contract(exam.get("pcr_grading_contract")):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "grading_contract_migration_required: This exam uses an unsupported "
+                "frozen grading contract. Run the guarded whole-exam legacy-to-v16 "
+                "migration before reprocessing copies."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2118,6 +2145,7 @@ async def retry_exam_processing_job(
     if exam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
     await _require_tutor_visibility(exam, current_user, db)
+    _require_reprocessable_grading_contract(exam)
     job = await tenant_db["exampen_processing_jobs"].find_one({"job_id": job_id, "exam_id": exam_id})
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Processing job {job_id} not found")
@@ -2169,7 +2197,11 @@ async def retry_exam_processing_job(
         ) from exc
 
     try:
-        from services.exampen_workflow import ProcessingJobBusyError, reprocess_processing_job
+        from services.exampen_workflow import (
+            GradingContractMigrationRequiredError,
+            ProcessingJobBusyError,
+            reprocess_processing_job,
+        )
 
         # Recheck after acquiring the shared review fence. Publication may
         # have committed between the first read and the lease acquisition.
@@ -2190,6 +2222,8 @@ async def retry_exam_processing_job(
             reason=(body.reason if body else None),
         )
     except ProcessingJobBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except GradingContractMigrationRequiredError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -2221,6 +2255,7 @@ async def batch_reprocess_exam_submissions(
             detail=f"Exam {exam_id} not found",
         )
     await _require_tutor_visibility(exam, current_user, db)
+    _require_reprocessable_grading_contract(exam)
 
     requested_submission_ids = {
         str(value).strip()
@@ -2296,6 +2331,7 @@ async def batch_reprocess_exam_submissions(
         release_submission_review_lease,
     )
     from services.exampen_workflow import (
+        GradingContractMigrationRequiredError,
         ProcessingJobBusyError,
         reprocess_processing_job,
         schedule_submission_processing,
@@ -2341,6 +2377,8 @@ async def batch_reprocess_exam_submissions(
                 return "queued", queued_job, None
             except (SubmissionReviewBusyError, ProcessingJobBusyError) as exc:
                 return "skipped", None, str(exc)[:240]
+            except GradingContractMigrationRequiredError as exc:
+                return "migration_required", None, str(exc)[:240]
             except Exception as exc:
                 logger.exception(
                     "Batch PCR queue failed for submission %s",
@@ -2366,6 +2404,7 @@ async def batch_reprocess_exam_submissions(
     errors: List[str] = []
     skipped = 0
     failed = 0
+    migration_required_errors: List[str] = []
     for outcome, job, error in results:
         if outcome == "queued" and job:
             queued_items.append(_processing_job_to_response(job))
@@ -2373,10 +2412,22 @@ async def batch_reprocess_exam_submissions(
             skipped += 1
             if error:
                 errors.append(error)
+        elif outcome == "migration_required":
+            if error:
+                migration_required_errors.append(error)
         else:
             failed += 1
             if error:
                 errors.append(error)
+
+    if migration_required_errors:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "grading_contract_migration_required: "
+                + migration_required_errors[0]
+            ),
+        )
 
     return ProcessingBatchResponse(
         exam_id=exam_id,

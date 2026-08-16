@@ -13,12 +13,14 @@ from uuid import uuid4
 
 from services.exampen_workflow import (
     CAPABILITY_QUEUED_JOB_STATUS,
+    CONTRACT_MIGRATION_PENDING_JOB_STATUS,
     V14_CAPABILITY_QUEUED_JOB_STATUS,
     V15_CAPABILITY_QUEUED_JOB_STATUS,
     V16_CAPABILITY_QUEUED_JOB_STATUS,
 )
 
 
+V4_PROMPT_VERSION = "pcr-full-document-visual-v4"
 V5_PROMPT_VERSION = "pcr-full-document-visual-v5"
 V6_PROMPT_VERSION = "pcr-full-document-visual-v6"
 V11_PROMPT_VERSION = "pcr-full-document-visual-v11"
@@ -42,6 +44,25 @@ V16_REQUIRED_PROCESSING_PATH = "full_document_visual"
 V13_TO_V14_CONFIRMATION_TOKEN = "MIGRATE_PCR_V13_TO_V14"
 V14_TO_V15_CONFIRMATION_TOKEN = "MIGRATE_PCR_V14_TO_V15"
 V15_TO_V16_CONFIRMATION_TOKEN = "MIGRATE_PCR_V15_TO_V16"
+LEGACY_TO_V16_CONFIRMATION_TOKEN = "MIGRATE_PCR_LEGACY_TO_V16"
+LEGACY_V16_SOURCE_PROMPT_VERSIONS = (
+    V4_PROMPT_VERSION,
+    V5_PROMPT_VERSION,
+    V6_PROMPT_VERSION,
+    V11_PROMPT_VERSION,
+    V12_PROMPT_VERSION,
+    V13_PROMPT_VERSION,
+    V14_PROMPT_VERSION,
+    V15_PROMPT_VERSION,
+)
+LEGACY_V16_PIPELINE_VERSIONS = (1, 2, 3, 4, 5, 6)
+LEGACY_V16_MAPPING_PIPELINE_VERSIONS = (
+    "full-document-visual-v2",
+    "whole-copy-rubric-v3",
+    "evidence-first-visual-v4",
+    V14_MAPPING_PIPELINE_VERSION,
+    V15_MAPPING_PIPELINE_VERSION,
+)
 # Backward-compatible exports used by the existing v5 migration CLI.
 SOURCE_PROMPT_VERSION = V5_PROMPT_VERSION
 TARGET_PROMPT_VERSION = V6_PROMPT_VERSION
@@ -231,6 +252,213 @@ async def _inspect_contracts(
             }
         )
     return plans
+
+
+def _is_explicit_objective(payload: Any) -> bool:
+    """Recognize objective cohorts without treating missing legacy fields as objective."""
+
+    item = payload if isinstance(payload, dict) else {}
+    values = {
+        str(item.get(field) or "").strip().lower()
+        for field in ("grading_mode", "marking_mode", "assessment_mode")
+    }
+    return bool(values & {"objective", "omr", "mcq"})
+
+
+async def _inspect_legacy_v16_exam(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam: dict[str, Any],
+    allowed_migration_id: str | None = None,
+) -> dict[str, Any]:
+    """Build one fail-closed whole-cohort plan for a legacy subjective exam."""
+
+    current_exam_id = str(exam.get("exam_id") or "").strip()
+    contract = dict(exam.get("pcr_grading_contract") or {})
+    source_prompt_version = str(contract.get("prompt_version") or "").strip()
+    blockers = await _validate_frozen_paper_version(tenant_db, exam)
+
+    exam_type = str(exam.get("exam_type") or "").strip().lower()
+    if exam_type and exam_type != "pcr":
+        blockers.append(f"exam type {exam_type} is not PCR")
+    if _is_explicit_objective(exam) or _is_explicit_objective(contract):
+        blockers.append("objective PCR cohorts use a separate grading contract")
+
+    exam_status = str(exam.get("status") or "").strip().lower()
+    publication_status = str(exam.get("publication_status") or "").strip().lower()
+    if exam_status in {"active", "in_progress", "published"}:
+        blockers.append(f"exam is {exam_status} and cannot be migrated live")
+    elif publication_status in {"active", "in_progress", "published"}:
+        blockers.append(
+            f"exam is {publication_status} and cannot be migrated live"
+        )
+
+    migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
+    applying_migration_id = str(migration_state.get("migration_id") or "").strip()
+    if (
+        migration_state.get("status") == "applying"
+        and applying_migration_id != str(allowed_migration_id or "").strip()
+    ):
+        blockers.append(
+            f"grading contract migration {applying_migration_id or 'unknown'} is already applying"
+        )
+
+    submissions = await tenant_db[SUBMISSIONS_COLLECTION].find(
+        {"exam_id": current_exam_id},
+        {
+            "_id": 0,
+            "submission_id": 1,
+            "grading_mode": 1,
+            "marking_mode": 1,
+            "assessment_mode": 1,
+            "publication_status": 1,
+            "published_at": 1,
+        },
+    ).to_list(length=None)
+    jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].find(
+        {"exam_id": current_exam_id},
+        {
+            "_id": 0,
+            "job_id": 1,
+            "submission_id": 1,
+            "status": 1,
+            "pipeline_version": 1,
+            "mapping_pipeline_version": 1,
+            "migration_id": 1,
+        },
+    ).to_list(length=None)
+
+    submission_ids = [
+        str(item.get("submission_id") or "").strip() for item in submissions
+    ]
+    valid_submission_ids = {value for value in submission_ids if value}
+    published_count = sum(
+        1
+        for item in submissions
+        if str(item.get("publication_status") or "").strip().lower() == "published"
+        or item.get("published_at") is not None
+    )
+    objective_submission_count = sum(
+        1 for item in submissions if _is_explicit_objective(item)
+    )
+    if published_count:
+        blockers.append(
+            f"{published_count} published submission(s) require an explicit unpublish/regrade decision"
+        )
+    if objective_submission_count:
+        blockers.append(
+            f"{objective_submission_count} objective submission(s) cannot enter the subjective migration"
+        )
+
+    jobs_by_submission: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        submission_id = str(job.get("submission_id") or "").strip()
+        jobs_by_submission.setdefault(submission_id, []).append(job)
+
+    missing_job_count = sum(
+        1
+        for submission_id in submission_ids
+        if not submission_id or len(jobs_by_submission.get(submission_id, [])) == 0
+    )
+    duplicate_job_count = sum(
+        max(len(jobs_by_submission.get(submission_id, [])) - 1, 0)
+        for submission_id in valid_submission_ids
+    )
+    orphan_job_count = sum(
+        len(group)
+        for submission_id, group in jobs_by_submission.items()
+        if not submission_id or submission_id not in valid_submission_ids
+    )
+    invalid_job_id_count = sum(1 for job in jobs if not str(job.get("job_id") or "").strip())
+    active_job_count = sum(
+        1
+        for job in jobs
+        if str(job.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES
+    )
+
+    mixed_job_count = 0
+    for job in jobs:
+        pipeline_value = job.get("pipeline_version")
+        try:
+            pipeline_version = int(pipeline_value) if pipeline_value is not None else None
+        except (TypeError, ValueError):
+            pipeline_version = -1
+        mapping_version = str(job.get("mapping_pipeline_version") or "").strip()
+        if (
+            pipeline_version == V16_PIPELINE_VERSION
+            or mapping_version == V16_MAPPING_PIPELINE_VERSION
+            or pipeline_version not in {None, *LEGACY_V16_PIPELINE_VERSIONS}
+        ):
+            mixed_job_count += 1
+
+    if missing_job_count:
+        blockers.append(
+            f"{missing_job_count} submitted copy/copies have no durable processing job"
+        )
+    if duplicate_job_count:
+        blockers.append(
+            f"{duplicate_job_count} duplicate processing job(s) prevent exactly-once migration"
+        )
+    if orphan_job_count:
+        blockers.append(
+            f"{orphan_job_count} orphan processing job(s) do not belong to a submission"
+        )
+    if invalid_job_id_count:
+        blockers.append(f"{invalid_job_id_count} processing job(s) have no durable job ID")
+    if active_job_count:
+        blockers.append(
+            f"{active_job_count} processing job(s) still own an active lease or queue slot"
+        )
+    if mixed_job_count:
+        blockers.append(
+            f"{mixed_job_count} job(s) already use a mixed or unsupported grading contract"
+        )
+
+    return {
+        "db_name": db_name,
+        "exam_id": current_exam_id,
+        "exam_name": exam.get("exam_name") or exam.get("title") or current_exam_id,
+        "source_prompt_version": source_prompt_version,
+        "source_prompt_versions": list(LEGACY_V16_SOURCE_PROMPT_VERSIONS),
+        "target_prompt_version": V16_PROMPT_VERSION,
+        "submission_count": len(submissions),
+        "job_count": len(jobs),
+        "published_count": published_count,
+        "active_job_count": active_job_count,
+        "missing_job_count": missing_job_count,
+        "duplicate_job_count": duplicate_job_count,
+        "orphan_job_count": orphan_job_count,
+        "mixed_job_count": mixed_job_count,
+        "eligible": not blockers,
+        "blockers": blockers,
+    }
+
+
+async def inspect_legacy_contracts(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect released legacy subjective contracts for one direct v16 migration."""
+
+    query: dict[str, Any] = {
+        "pcr_grading_contract.prompt_version": {
+            "$in": list(LEGACY_V16_SOURCE_PROMPT_VERSIONS)
+        }
+    }
+    if exam_id:
+        query["exam_id"] = exam_id
+    exams = await tenant_db[EXAMS_COLLECTION].find(query).to_list(length=None)
+    return [
+        await _inspect_legacy_v16_exam(
+            tenant_db,
+            db_name=db_name,
+            exam=exam,
+        )
+        for exam in exams
+    ]
 
 
 async def _inspect_v13_contracts(
@@ -1112,6 +1340,731 @@ async def _migrate_exam_contract(
             },
         )
         raise
+
+
+async def _reconcile_completed_v16_pending_jobs(
+    tenant_db: Any,
+    *,
+    exam_id: str,
+    migration_id: str,
+    requested_by: str,
+) -> dict[str, int]:
+    """Drain the only crash window left after the exam fence closes."""
+
+    if not migration_id:
+        raise GradingContractMigrationError(
+            f"Exam {exam_id} has a completed migration without a durable migration ID"
+        )
+    now = _utcnow()
+    foreign_pending = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one(
+        {
+            "exam_id": exam_id,
+            "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+            "migration_id": {"$nin": [None, "", migration_id]},
+        },
+        {"_id": 0, "job_id": 1, "migration_id": 1},
+    )
+    if foreign_pending:
+        raise GradingContractMigrationError(
+            "Pending job "
+            f"{foreign_pending.get('job_id')} belongs to a different migration"
+        )
+    pending_submission_ids = await tenant_db[PROCESSING_JOBS_COLLECTION].distinct(
+        "submission_id",
+        {
+            "exam_id": exam_id,
+            "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+        },
+    )
+    await tenant_db[PROCESSING_JOBS_COLLECTION].update_many(
+        {
+            "exam_id": exam_id,
+            "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+        },
+        {
+            "$set": {
+                "status": V16_CAPABILITY_QUEUED_JOB_STATUS,
+                "pipeline_version": V16_PIPELINE_VERSION,
+                "mapping_pipeline_version": V16_MAPPING_PIPELINE_VERSION,
+                "required_processing_path": V16_REQUIRED_PROCESSING_PATH,
+                "migration_id": migration_id,
+                "attempts": 0,
+                "queued_at": now,
+                "updated_at": now,
+                "reprocess_requested_at": now,
+                "reprocess_requested_by": requested_by,
+                "reprocess_reason": "grading_contract_migration_pending_drain",
+            },
+            "$unset": {
+                "last_error": "",
+                "failure_code": "",
+                "retry_at": "",
+                "next_retry_at": "",
+                "started_at": "",
+                "finished_at": "",
+                "lease_token": "",
+                "lease_owner": "",
+                "lease_expires_at": "",
+                "heartbeat_at": "",
+            },
+        },
+    )
+    if pending_submission_ids:
+        await tenant_db[SUBMISSIONS_COLLECTION].update_many(
+            {
+                "exam_id": exam_id,
+                "submission_id": {"$in": pending_submission_ids},
+            },
+            {
+                "$set": {
+                    "review_state": "processing",
+                    "updated_at": now,
+                    "grading_contract_migration_id": migration_id,
+                }
+            },
+        )
+
+    submission_ids = await tenant_db[SUBMISSIONS_COLLECTION].distinct(
+        "submission_id", {"exam_id": exam_id}
+    )
+    for submission_id in submission_ids:
+        jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].find(
+            {"exam_id": exam_id, "submission_id": submission_id}
+        ).to_list(length=2)
+        if len(jobs) != 1:
+            raise GradingContractMigrationError(
+                f"Post-fence cohort check failed for submission {submission_id}"
+            )
+        job = jobs[0]
+        if (
+            int(job.get("pipeline_version") or 0) != V16_PIPELINE_VERSION
+            or str(job.get("mapping_pipeline_version") or "")
+            != V16_MAPPING_PIPELINE_VERSION
+            or str(job.get("status") or "")
+            == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+        ):
+            raise GradingContractMigrationError(
+                f"Post-fence cohort check found a non-v16 job for submission {submission_id}"
+            )
+    return {
+        "cohort_submission_count": len(submission_ids),
+        "queued_job_count": await tenant_db[PROCESSING_JOBS_COLLECTION].count_documents(
+            {
+                "exam_id": exam_id,
+                "migration_id": migration_id,
+                "pipeline_version": V16_PIPELINE_VERSION,
+                "mapping_pipeline_version": V16_MAPPING_PIPELINE_VERSION,
+            }
+        ),
+    }
+
+
+async def _migrate_legacy_exam_to_v16(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str,
+    requested_by: str,
+) -> dict[str, Any]:
+    """Move one complete released subjective cohort directly onto v16.
+
+    The exam-level ``applying`` state is the reprocess fence.  The contract is
+    changed with compare-and-set semantics, then each pre-existing durable job
+    is independently reconciled to pipeline 7.  A retry reuses the same
+    migration identity and never appends a second reprocess history entry.
+    """
+
+    exam = await tenant_db[EXAMS_COLLECTION].find_one({"exam_id": exam_id})
+    if not exam:
+        raise GradingContractMigrationError(f"Exam {exam_id} was not found in {db_name}")
+
+    contract = dict(exam.get("pcr_grading_contract") or {})
+    current_version = str(contract.get("prompt_version") or "").strip()
+    migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
+    state_source = str(migration_state.get("source_prompt_version") or "").strip()
+    state_target = str(migration_state.get("target_prompt_version") or "").strip()
+    state_status = str(migration_state.get("status") or "").strip().lower()
+    matching_state = (
+        state_source in LEGACY_V16_SOURCE_PROMPT_VERSIONS
+        and state_target == V16_PROMPT_VERSION
+    )
+
+    if current_version == V16_PROMPT_VERSION and matching_state and state_status == "complete":
+        migration_id = str(migration_state.get("migration_id") or "").strip()
+        repaired = await _reconcile_completed_v16_pending_jobs(
+            tenant_db,
+            exam_id=exam_id,
+            migration_id=migration_id,
+            requested_by=requested_by,
+        )
+        await tenant_db[EXAMS_COLLECTION].update_one(
+            {"exam_id": exam_id, "pcr_grading_contract.migration_id": migration_id},
+            {
+                "$set": {
+                    "pcr_grading_contract_migration.queued_job_count": repaired[
+                        "queued_job_count"
+                    ],
+                    "pcr_grading_contract_migration.cohort_submission_count": repaired[
+                        "cohort_submission_count"
+                    ],
+                    "updated_at": _utcnow(),
+                }
+            },
+        )
+        return {
+            "db_name": db_name,
+            "exam_id": exam_id,
+            "status": "already_migrated",
+            "migration_id": migration_state.get("migration_id"),
+            "queued_job_count": repaired["queued_job_count"],
+        }
+    if current_version == V16_PROMPT_VERSION:
+        if not matching_state or state_status not in {"applying", "failed"}:
+            raise GradingContractMigrationError(
+                f"Exam {exam_id} already uses v16 and is not a resumable legacy migration"
+            )
+        source_prompt_version = state_source
+        resuming_after_contract_change = True
+    elif current_version in LEGACY_V16_SOURCE_PROMPT_VERSIONS:
+        source_prompt_version = current_version
+        resuming_after_contract_change = False
+    else:
+        raise GradingContractMigrationError(
+            f"Exam {exam_id} has unsupported legacy source contract "
+            f"{current_version or 'missing'}"
+        )
+
+    if _is_explicit_objective(exam) or _is_explicit_objective(contract):
+        raise GradingContractMigrationError(
+            f"Exam {exam_id} is objective and cannot use the subjective v16 migration"
+        )
+
+    if not resuming_after_contract_change:
+        plans = await inspect_legacy_contracts(
+            tenant_db,
+            db_name=db_name,
+            exam_id=exam_id,
+        )
+        if not plans or not plans[0]["eligible"]:
+            blockers = plans[0]["blockers"] if plans else [
+                "exam no longer matches a released legacy source contract"
+            ]
+            raise GradingContractMigrationError(
+                f"Exam {exam_id} cannot be migrated: {'; '.join(blockers)}"
+            )
+
+    now = _utcnow()
+    reusable_state = matching_state and state_status in {"applying", "failed"}
+    migration_id = (
+        str(migration_state.get("migration_id") or "").strip()
+        if reusable_state
+        else ""
+    ) or f"PCR-MIG-{uuid4().hex}"
+    started_at = migration_state.get("started_at") if reusable_state else None
+
+    audit = {
+        "migration_id": migration_id,
+        "db_name": db_name,
+        "exam_id": exam_id,
+        "source_prompt_version": source_prompt_version,
+        "source_prompt_versions": list(LEGACY_V16_SOURCE_PROMPT_VERSIONS),
+        "target_prompt_version": V16_PROMPT_VERSION,
+        "requested_by": requested_by,
+        "status": "applying",
+        "updated_at": now,
+    }
+    await tenant_db[MIGRATIONS_COLLECTION].update_one(
+        {"migration_id": migration_id},
+        {
+            "$set": audit,
+            "$setOnInsert": {
+                "started_at": started_at or now,
+                "contract_before": contract,
+            },
+        },
+        upsert=True,
+    )
+
+    try:
+        if not resuming_after_contract_change:
+            fence_filter: dict[str, Any] = {
+                "exam_id": exam_id,
+                "paper_version_id": exam.get("paper_version_id"),
+                "prepared_document_id": exam.get("prepared_document_id"),
+                "pcr_grading_contract.prompt_version": source_prompt_version,
+            }
+            if reusable_state:
+                fence_filter["pcr_grading_contract_migration.migration_id"] = migration_id
+            else:
+                fence_filter["pcr_grading_contract_migration.status"] = {"$ne": "applying"}
+            fenced = await tenant_db[EXAMS_COLLECTION].update_one(
+                fence_filter,
+                {
+                    "$set": {
+                        "pcr_grading_contract_migration": {
+                            "migration_id": migration_id,
+                            "source_prompt_version": source_prompt_version,
+                            "source_prompt_versions": list(
+                                LEGACY_V16_SOURCE_PROMPT_VERSIONS
+                            ),
+                            "target_prompt_version": V16_PROMPT_VERSION,
+                            "requested_by": requested_by,
+                            "started_at": started_at or now,
+                            "status": "applying",
+                        },
+                        "updated_at": now,
+                    }
+                },
+            )
+            if fenced.matched_count != 1:
+                raise GradingContractMigrationError(
+                    f"Exam {exam_id} changed concurrently; migration fence was not acquired"
+                )
+
+            # Re-read every invariant after acquiring the exam fence.  A
+            # reprocess that won immediately before the fence is now visible
+            # as an active job and prevents the contract change.
+            fenced_exam = await tenant_db[EXAMS_COLLECTION].find_one(
+                {"exam_id": exam_id}
+            )
+            fenced_plan = await _inspect_legacy_v16_exam(
+                tenant_db,
+                db_name=db_name,
+                exam=fenced_exam or {},
+                allowed_migration_id=migration_id,
+            )
+            if not fenced_plan["eligible"]:
+                raise GradingContractMigrationError(
+                    f"Exam {exam_id} changed while migration was fenced: "
+                    f"{'; '.join(fenced_plan['blockers'])}"
+                )
+
+            migrated_contract = {
+                **contract,
+                "prompt_version": V16_PROMPT_VERSION,
+                "pipeline_version": V16_PIPELINE_VERSION,
+                "mapping_pipeline_version": V16_MAPPING_PIPELINE_VERSION,
+                "required_processing_path": V16_REQUIRED_PROCESSING_PATH,
+                "migrated_from": source_prompt_version,
+                "migrated_at": now,
+                "migration_id": migration_id,
+            }
+            updated = await tenant_db[EXAMS_COLLECTION].update_one(
+                {
+                    "exam_id": exam_id,
+                    "paper_version_id": exam.get("paper_version_id"),
+                    "prepared_document_id": exam.get("prepared_document_id"),
+                    "pcr_grading_contract.prompt_version": source_prompt_version,
+                    "pcr_grading_contract_migration.migration_id": migration_id,
+                    "pcr_grading_contract_migration.status": "applying",
+                },
+                {
+                    "$set": {
+                        "pcr_grading_contract": migrated_contract,
+                        "updated_at": now,
+                    }
+                },
+            )
+            if updated.modified_count != 1:
+                raise GradingContractMigrationError(
+                    f"Exam {exam_id} changed concurrently; no contract was migrated"
+                )
+
+        supersede_filter = {
+            "exam_id": exam_id,
+            "status": {"$ne": "superseded"},
+            "$or": [
+                {
+                    "prompt_version": {
+                        "$in": list(LEGACY_V16_SOURCE_PROMPT_VERSIONS)
+                    }
+                },
+                {"pipeline_version": {"$in": list(LEGACY_V16_PIPELINE_VERSIONS)}},
+                {
+                    "mapping_pipeline_version": {
+                        "$in": list(LEGACY_V16_MAPPING_PIPELINE_VERSIONS)
+                    }
+                },
+            ],
+        }
+        await tenant_db[GRADING_RUNS_COLLECTION].update_many(
+            supersede_filter,
+            {
+                "$set": {
+                    "status": "superseded",
+                    "superseded_at": now,
+                    "superseded_reason": "grading_contract_migration",
+                    "superseded_by_migration_id": migration_id,
+                    "updated_at": now,
+                }
+            },
+        )
+
+        submissions = await tenant_db[SUBMISSIONS_COLLECTION].find(
+            {"exam_id": exam_id},
+            {
+                "_id": 0,
+                "submission_id": 1,
+                "grading_mode": 1,
+                "marking_mode": 1,
+                "assessment_mode": 1,
+                "publication_status": 1,
+                "published_at": 1,
+            },
+        ).to_list(length=None)
+        submission_ids = [
+            str(item.get("submission_id") or "").strip() for item in submissions
+        ]
+        if any(not value for value in submission_ids):
+            raise GradingContractMigrationError(
+                "One or more submissions have no durable submission ID"
+            )
+        if any(
+            _is_explicit_objective(item)
+            or str(item.get("publication_status") or "").strip().lower()
+            == "published"
+            or item.get("published_at") is not None
+            for item in submissions
+        ):
+            raise GradingContractMigrationError(
+                "The cohort became objective or published while migration was applying"
+            )
+
+        history_entry = {
+            "requested_at": now,
+            "requested_by": requested_by,
+            "reason": "grading_contract_migration",
+            "migration_id": migration_id,
+            "source_prompt_version": source_prompt_version,
+            "target_prompt_version": V16_PROMPT_VERSION,
+        }
+        for submission_id in submission_ids:
+            matching_jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].find(
+                {"exam_id": exam_id, "submission_id": submission_id}
+            ).to_list(length=2)
+            if len(matching_jobs) != 1:
+                raise GradingContractMigrationError(
+                    f"Submission {submission_id} must have exactly one durable processing job"
+                )
+            job = matching_jobs[0]
+            job_id = str(job.get("job_id") or "").strip()
+            if not job_id:
+                raise GradingContractMigrationError(
+                    f"Submission {submission_id} has a processing job without a durable ID"
+                )
+            try:
+                pipeline_version = int(job.get("pipeline_version"))
+            except (TypeError, ValueError):
+                pipeline_version = None
+            mapping_version = str(job.get("mapping_pipeline_version") or "").strip()
+            job_status = str(job.get("status") or "").strip().lower()
+            job_migration_id = str(job.get("migration_id") or "").strip()
+            already_target = (
+                pipeline_version == V16_PIPELINE_VERSION
+                and mapping_version == V16_MAPPING_PIPELINE_VERSION
+            )
+            same_migration = job_migration_id == migration_id
+
+            if already_target:
+                if not same_migration:
+                    owner = job_migration_id or "no migration"
+                    raise GradingContractMigrationError(
+                        f"Target v16 job {job_id} belongs to {owner}, not migration "
+                        f"{migration_id}"
+                    )
+                if job_status == "processing":
+                    raise GradingContractMigrationError(
+                        f"Target v16 job {job_id} became active while migration was applying"
+                    )
+                if same_migration and job_status not in {
+                    V16_CAPABILITY_QUEUED_JOB_STATUS,
+                    "queued",
+                    "completed",
+                }:
+                    # Resume a partially applied migration without charging a
+                    # second reprocess count/history entry.
+                    await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+                        {
+                            "job_id": job_id,
+                            "migration_id": migration_id,
+                            "status": job.get("status"),
+                        },
+                        {
+                            "$set": {
+                                "status": V16_CAPABILITY_QUEUED_JOB_STATUS,
+                                "attempts": 0,
+                                "queued_at": now,
+                                "updated_at": now,
+                                "reprocess_requested_at": now,
+                                "reprocess_requested_by": requested_by,
+                                "reprocess_reason": "grading_contract_migration_resume",
+                            },
+                            "$unset": {
+                                "last_error": "",
+                                "failure_code": "",
+                                "retry_at": "",
+                                "next_retry_at": "",
+                                "started_at": "",
+                                "finished_at": "",
+                                "lease_token": "",
+                                "lease_owner": "",
+                                "lease_expires_at": "",
+                                "heartbeat_at": "",
+                            },
+                        },
+                    )
+                continue
+
+            if job_status in ACTIVE_JOB_STATUSES:
+                raise GradingContractMigrationError(
+                    f"Legacy job {job_id} became active while migration was applying"
+                )
+            result = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+                {
+                    "job_id": job_id,
+                    "exam_id": exam_id,
+                    "submission_id": submission_id,
+                    "status": job.get("status"),
+                    "pipeline_version": job.get("pipeline_version"),
+                    "mapping_pipeline_version": job.get(
+                        "mapping_pipeline_version"
+                    ),
+                },
+                {
+                    "$set": {
+                        "status": V16_CAPABILITY_QUEUED_JOB_STATUS,
+                        "pipeline_version": V16_PIPELINE_VERSION,
+                        "mapping_pipeline_version": V16_MAPPING_PIPELINE_VERSION,
+                        "required_processing_path": V16_REQUIRED_PROCESSING_PATH,
+                        "migration_id": migration_id,
+                        "attempts": 0,
+                        "queued_at": now,
+                        "updated_at": now,
+                        "reprocess_requested_at": now,
+                        "reprocess_requested_by": requested_by,
+                        "reprocess_reason": "grading_contract_migration",
+                    },
+                    "$unset": {
+                        "last_error": "",
+                        "failure_code": "",
+                        "retry_at": "",
+                        "next_retry_at": "",
+                        "started_at": "",
+                        "finished_at": "",
+                        "lease_token": "",
+                        "lease_owner": "",
+                        "lease_expires_at": "",
+                        "heartbeat_at": "",
+                    },
+                    "$inc": {"reprocess_count": 1},
+                    "$push": {
+                        "reprocess_history": {
+                            "$each": [history_entry],
+                            "$slice": -20,
+                        }
+                    },
+                },
+            )
+            if result.modified_count != 1:
+                latest = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one(
+                    {"job_id": job_id}
+                )
+                if not (
+                    latest
+                    and int(latest.get("pipeline_version") or 0)
+                    == V16_PIPELINE_VERSION
+                    and str(latest.get("mapping_pipeline_version") or "")
+                    == V16_MAPPING_PIPELINE_VERSION
+                ):
+                    raise GradingContractMigrationError(
+                        f"Processing job {job_id} changed concurrently"
+                    )
+
+        # Final whole-cohort assertion.  Submissions created after the exam
+        # contract CAS are valid only when their own exactly-once job already
+        # carries the v16 metadata.
+        final_submissions = await tenant_db[SUBMISSIONS_COLLECTION].distinct(
+            "submission_id", {"exam_id": exam_id}
+        )
+        for submission_id in final_submissions:
+            final_jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].find(
+                {"exam_id": exam_id, "submission_id": submission_id}
+            ).to_list(length=2)
+            if len(final_jobs) != 1:
+                raise GradingContractMigrationError(
+                    f"Final cohort check failed for submission {submission_id}"
+                )
+            final_job = final_jobs[0]
+            if (
+                int(final_job.get("pipeline_version") or 0) != V16_PIPELINE_VERSION
+                or str(final_job.get("mapping_pipeline_version") or "")
+                != V16_MAPPING_PIPELINE_VERSION
+            ):
+                raise GradingContractMigrationError(
+                    f"Final cohort check found a non-v16 job for submission {submission_id}"
+                )
+
+        migrated_submission_ids = await tenant_db[PROCESSING_JOBS_COLLECTION].distinct(
+            "submission_id",
+            {
+                "exam_id": exam_id,
+                "migration_id": migration_id,
+                "status": {"$ne": "completed"},
+            },
+        )
+        if migrated_submission_ids:
+            await tenant_db[SUBMISSIONS_COLLECTION].update_many(
+                {
+                    "exam_id": exam_id,
+                    "submission_id": {"$in": migrated_submission_ids},
+                },
+                {
+                    "$set": {
+                        "review_state": "processing",
+                        "updated_at": now,
+                        "grading_contract_migration_id": migration_id,
+                    }
+                },
+            )
+
+        # Close the ingestion fence before the final pending-job drain.  A
+        # scheduler that observed ``applying`` before this CAS either gets
+        # drained below or re-reads ``complete`` and reconciles its own job to
+        # v16 before dispatch.
+        completed_at = _utcnow()
+        closed = await tenant_db[EXAMS_COLLECTION].update_one(
+            {
+                "exam_id": exam_id,
+                "pcr_grading_contract.prompt_version": V16_PROMPT_VERSION,
+                "pcr_grading_contract.migration_id": migration_id,
+            },
+            {
+                "$set": {
+                    "pcr_grading_contract_migration": {
+                        "status": "complete",
+                        "completed_at": completed_at,
+                        "updated_at": completed_at,
+                        "migration_id": migration_id,
+                        "source_prompt_version": source_prompt_version,
+                        "source_prompt_versions": list(
+                            LEGACY_V16_SOURCE_PROMPT_VERSIONS
+                        ),
+                        "target_prompt_version": V16_PROMPT_VERSION,
+                        "requested_by": requested_by,
+                        "started_at": started_at or now,
+                    },
+                    "updated_at": completed_at,
+                }
+            },
+        )
+        if closed.matched_count != 1:
+            raise GradingContractMigrationError(
+                f"Exam {exam_id} changed concurrently while closing the migration fence"
+            )
+
+        reconciled = await _reconcile_completed_v16_pending_jobs(
+            tenant_db,
+            exam_id=exam_id,
+            migration_id=migration_id,
+            requested_by=requested_by,
+        )
+        queued_job_count = reconciled["queued_job_count"]
+        final_submission_count = reconciled["cohort_submission_count"]
+        superseded_run_count = await tenant_db[GRADING_RUNS_COLLECTION].count_documents(
+            {
+                "exam_id": exam_id,
+                "superseded_by_migration_id": migration_id,
+            }
+        )
+        completion = {
+            "status": "complete",
+            "completed_at": completed_at,
+            "updated_at": completed_at,
+            "queued_job_count": queued_job_count,
+            "cohort_submission_count": final_submission_count,
+            "superseded_run_count": superseded_run_count,
+        }
+        await tenant_db[EXAMS_COLLECTION].update_one(
+            {
+                "exam_id": exam_id,
+                "pcr_grading_contract.migration_id": migration_id,
+            },
+            {
+                "$set": {
+                    "pcr_grading_contract_migration.queued_job_count": queued_job_count,
+                    "pcr_grading_contract_migration.cohort_submission_count": final_submission_count,
+                    "pcr_grading_contract_migration.superseded_run_count": superseded_run_count,
+                    "updated_at": completed_at,
+                }
+            },
+        )
+        await tenant_db[MIGRATIONS_COLLECTION].update_one(
+            {"migration_id": migration_id}, {"$set": completion}
+        )
+        return {
+            "db_name": db_name,
+            "exam_id": exam_id,
+            "status": "migrated",
+            "source_prompt_version": source_prompt_version,
+            "target_prompt_version": V16_PROMPT_VERSION,
+            "migration_id": migration_id,
+            "queued_job_count": queued_job_count,
+            "cohort_submission_count": final_submission_count,
+            "superseded_run_count": superseded_run_count,
+        }
+    except Exception as exc:
+        failed_at = _utcnow()
+        await tenant_db[MIGRATIONS_COLLECTION].update_one(
+            {"migration_id": migration_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "failure_code": exc.__class__.__name__,
+                    "failure_detail": str(exc),
+                    "failed_at": failed_at,
+                    "updated_at": failed_at,
+                }
+            },
+        )
+        await tenant_db[EXAMS_COLLECTION].update_one(
+            {
+                "exam_id": exam_id,
+                "pcr_grading_contract_migration.migration_id": migration_id,
+            },
+            {
+                "$set": {
+                    "pcr_grading_contract_migration.status": "failed",
+                    "pcr_grading_contract_migration.failure_code": exc.__class__.__name__,
+                    "pcr_grading_contract_migration.failure_detail": str(exc),
+                    "pcr_grading_contract_migration.failed_at": failed_at,
+                    "updated_at": failed_at,
+                }
+            },
+        )
+        raise
+
+
+async def migrate_legacy_exam_to_v16(
+    tenant_db: Any,
+    *,
+    db_name: str,
+    exam_id: str,
+    requested_by: str,
+    confirmation_token: str,
+) -> dict[str, Any]:
+    """Apply a direct legacy subjective -> v16 cohort migration."""
+
+    if confirmation_token != LEGACY_TO_V16_CONFIRMATION_TOKEN:
+        raise GradingContractMigrationError(
+            "legacy to v16 migration requires confirmation token "
+            f"{LEGACY_TO_V16_CONFIRMATION_TOKEN}"
+        )
+    return await _migrate_legacy_exam_to_v16(
+        tenant_db,
+        db_name=db_name,
+        exam_id=exam_id,
+        requested_by=requested_by,
+    )
 
 
 async def inspect_v5_contracts(

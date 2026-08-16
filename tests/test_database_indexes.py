@@ -42,4 +42,7 @@ async def test_note_page_index_is_copy_scoped_without_legacy_recreation():
         ("book_type", 1),
         ("page_number", 1),
     ]
+    policy_indexes = await db["student_credit_policies"].index_information()
+    assert set(policy_indexes) <= {"_id_"}
+    assert "uniq_student_credit_policy" not in policy_indexes
     assert db.name in manager._indexed_dbs

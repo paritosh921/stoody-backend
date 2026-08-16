@@ -25,6 +25,8 @@ CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v3"
 V14_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v5"
 V15_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v6"
 V16_CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v7"
+CONTRACT_MIGRATION_PENDING_JOB_STATUS = "grading_contract_migration_pending"
+CONTRACT_MIGRATION_BLOCKING_STATUSES = frozenset({"applying", "failed"})
 DISPATCHABLE_JOB_STATUSES = {
     "queued",
     "retryable_error",
@@ -112,6 +114,10 @@ class ProcessingJobBusyError(RuntimeError):
     """
 
 
+class GradingContractMigrationRequiredError(RuntimeError):
+    """Raised before a per-copy rerun can mutate an unsupported exam cohort."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -150,6 +156,7 @@ def public_processing_status(status: Any) -> str:
             V14_CAPABILITY_QUEUED_JOB_STATUS,
             V15_CAPABILITY_QUEUED_JOB_STATUS,
             V16_CAPABILITY_QUEUED_JOB_STATUS,
+            CONTRACT_MIGRATION_PENDING_JOB_STATUS,
         }
         else normalized
     )
@@ -174,6 +181,15 @@ def is_supported_pcr_grading_contract(contract: Any) -> bool:
         return int(candidate) in SUPPORTED_PCR_PIPELINE_VERSIONS
     except (TypeError, ValueError):
         return False
+
+
+def _grading_contract_migration_blocks_processing(exam: Any) -> bool:
+    payload = exam if isinstance(exam, dict) else {}
+    migration = dict(payload.get("pcr_grading_contract_migration") or {})
+    return (
+        str(migration.get("status") or "").strip().lower()
+        in CONTRACT_MIGRATION_BLOCKING_STATUSES
+    )
 
 
 def _job_id(submission_id: str) -> str:
@@ -376,34 +392,119 @@ async def ensure_processing_job(
     pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
         tenant_db, exam_id
     )
+    migration_exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {"_id": 0, "pcr_grading_contract_migration": 1},
+    )
+    migration_state = dict(
+        (migration_exam or {}).get("pcr_grading_contract_migration") or {}
+    )
+    migration_applying = (
+        str(migration_state.get("status") or "").strip().lower()
+        in CONTRACT_MIGRATION_BLOCKING_STATUSES
+    )
+    migration_id = str(migration_state.get("migration_id") or "").strip()
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     job_id = _job_id(submission_id)
     now = _now()
+    initial_status = (
+        CONTRACT_MIGRATION_PENDING_JOB_STATUS
+        if migration_applying
+        else _queued_status_for_pipeline(pipeline_version)
+    )
+    set_on_insert: Dict[str, Any] = {
+        "job_id": job_id,
+        "submission_id": submission_id,
+        "exam_id": exam_id,
+        "student_id": student_id,
+        "db_name": db_name,
+        "pipeline_version": pipeline_version,
+        "mapping_pipeline_version": mapping_pipeline_version,
+        "required_processing_path": required_processing_path,
+        "status": initial_status,
+        "attempts": 0,
+        "lease_generation": 0,
+        "created_at": now,
+        "updated_at": now,
+        "last_error": None,
+    }
+    if migration_applying and migration_id:
+        set_on_insert["migration_id"] = migration_id
     result = await jobs.update_one(
         {"submission_id": submission_id},
-        {
-            "$setOnInsert": {
-                "job_id": job_id,
-                "submission_id": submission_id,
-                "exam_id": exam_id,
-                "student_id": student_id,
-                "db_name": db_name,
-                "pipeline_version": pipeline_version,
-                "mapping_pipeline_version": mapping_pipeline_version,
-                "required_processing_path": required_processing_path,
-                "status": _queued_status_for_pipeline(
-                    pipeline_version
-                ),
-                "attempts": 0,
-                "lease_generation": 0,
-                "created_at": now,
-                "updated_at": now,
-                "last_error": None,
-            }
-        },
+        {"$setOnInsert": set_on_insert},
         upsert=True,
     )
     job = await jobs.find_one({"submission_id": submission_id})
+
+    # Fence the narrow race in which a submission scheduler reads the legacy
+    # contract immediately before an operator migrates the exam.  The exam CAS
+    # happens before this job can be dispatched, so a newly inserted job is
+    # reconciled to the latest contract metadata here.
+    latest_pipeline_version, latest_mapping_pipeline_version = (
+        await _pipeline_metadata_for_exam(tenant_db, exam_id, job=job)
+    )
+    latest_migration_exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {"_id": 0, "pcr_grading_contract_migration": 1},
+    )
+    latest_migration_state = dict(
+        (latest_migration_exam or {}).get("pcr_grading_contract_migration") or {}
+    )
+    latest_migration_applying = (
+        str(latest_migration_state.get("status") or "").strip().lower()
+        in CONTRACT_MIGRATION_BLOCKING_STATUSES
+    )
+    job_status = str((job or {}).get("status") or "").strip().lower()
+    should_reconcile = bool(
+        job is not None
+        and not latest_migration_applying
+        and (
+            result.upserted_id is not None
+            or job_status == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+        )
+        and (
+            latest_pipeline_version != job.get("pipeline_version")
+            or latest_mapping_pipeline_version
+            != str(job.get("mapping_pipeline_version") or "")
+            or job_status == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+        )
+    )
+    if should_reconcile:
+        reconciled = await jobs.update_one(
+            {
+                "submission_id": submission_id,
+                "status": job.get("status"),
+                "pipeline_version": job.get("pipeline_version"),
+                "mapping_pipeline_version": job.get("mapping_pipeline_version"),
+            },
+            {
+                "$set": {
+                    "status": _queued_status_for_pipeline(latest_pipeline_version),
+                    "pipeline_version": latest_pipeline_version,
+                    "mapping_pipeline_version": latest_mapping_pipeline_version,
+                    "required_processing_path": await _required_processing_path(
+                        tenant_db, exam_id
+                    ),
+                    "updated_at": _now(),
+                }
+            },
+        )
+        if reconciled.modified_count != 1:
+            raise ValueError(
+                f"Submission {submission_id} changed while its exam grading contract was migrated"
+            )
+        job = await jobs.find_one({"submission_id": submission_id})
+    pipeline_version = latest_pipeline_version
+    mapping_pipeline_version = latest_mapping_pipeline_version
+
+    if (
+        job is not None
+        and latest_migration_applying
+        and job_status == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+    ):
+        return job, result.upserted_id is not None
+
     if job is not None and result.upserted_id is None:
         persisted_pipeline = job.get("pipeline_version")
         try:
@@ -445,6 +546,24 @@ async def dispatch_processing_job(
         return job
     if not force and status not in DISPATCHABLE_JOB_STATUSES:
         return job
+
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": str(job.get("exam_id") or "")},
+        {"_id": 0, "pcr_grading_contract_migration": 1},
+    )
+    if _grading_contract_migration_blocks_processing(exam):
+        migration = dict((exam or {}).get("pcr_grading_contract_migration") or {})
+        await jobs.update_one(
+            {"job_id": job.get("job_id"), "status": status},
+            {
+                "$set": {
+                    "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+                    "migration_id": migration.get("migration_id"),
+                    "updated_at": _now(),
+                }
+            },
+        )
+        return await jobs.find_one({"job_id": job.get("job_id")}) or job
 
     now = _now()
     required_processing_path = str(job.get("required_processing_path") or "").strip()
@@ -597,6 +716,28 @@ async def reprocess_processing_job(
     job = await jobs.find_one({"job_id": job_id})
     if job is None:
         raise ValueError(f"Processing job {job_id} not found")
+
+    exam_id = str(job.get("exam_id") or "").strip()
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {"_id": 0, "pcr_grading_contract": 1, "pcr_grading_contract_migration": 1},
+    )
+    if exam is None:
+        raise ValueError(f"Exam {exam_id} not found")
+    migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
+    if (
+        str(migration_state.get("status") or "").strip().lower()
+        in CONTRACT_MIGRATION_BLOCKING_STATUSES
+    ):
+        raise GradingContractMigrationRequiredError(
+            "The whole-exam grading contract migration is incomplete. "
+            "Resume it successfully before reprocessing a copy."
+        )
+    if not is_supported_pcr_grading_contract(exam.get("pcr_grading_contract")):
+        raise GradingContractMigrationRequiredError(
+            "This exam uses an unsupported frozen grading contract. "
+            "Run the guarded whole-exam legacy-to-v16 migration first."
+        )
 
     now = _now()
     required_processing_path = str(job.get("required_processing_path") or "").strip()
@@ -785,7 +926,7 @@ async def recover_stale_processing_jobs(
             "$and": [
                 *stale_predicates,
                 retryable_attempt_predicate,
-                {"pipeline_version": {"$gte": PCR_V16_PIPELINE_VERSION}},
+                {"pipeline_version": PCR_V16_PIPELINE_VERSION},
             ]
         },
         {
@@ -1203,6 +1344,81 @@ async def process_pcr_processing_job(
         if failed.matched_count != 1:
             return {"job_id": job_id, "status": "lease_lost", "claimed": False}
         return {"job_id": job_id, "status": "failed", "error": "Not a PCR session"}
+
+    if _grading_contract_migration_blocks_processing(exam):
+        migration = dict(exam.get("pcr_grading_contract_migration") or {})
+        paused = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+                    "migration_id": migration.get("migration_id"),
+                    "updated_at": _now(),
+                },
+                "$unset": {
+                    "lease_token": "",
+                    "lease_owner": "",
+                    "lease_expires_at": "",
+                    "heartbeat_at": "",
+                },
+            },
+        )
+        if paused.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+        return {
+            "job_id": job_id,
+            "status": CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+            "claimed": False,
+        }
+
+    expected_pipeline_version, expected_mapping_version = (
+        await _pipeline_metadata_for_exam(
+            tenant_db,
+            str(submission.get("exam_id") or ""),
+            job=job,
+        )
+    )
+    frozen_contract = exam.get("pcr_grading_contract")
+    has_frozen_contract = isinstance(frozen_contract, dict) and bool(frozen_contract)
+    persisted_pipeline_version = int(
+        job.get("pipeline_version") or CURRENT_PCR_PIPELINE_VERSION
+    )
+    if (
+        has_frozen_contract
+        and (
+            not is_supported_pcr_grading_contract(frozen_contract)
+            or persisted_pipeline_version != expected_pipeline_version
+            or str(job.get("mapping_pipeline_version") or "")
+            != expected_mapping_version
+        )
+    ):
+        failed = await jobs.update_one(
+            lease_filter,
+            {
+                "$set": {
+                    "status": "failed",
+                    "failure_code": "GradingContractJobMismatch",
+                    "last_error": (
+                        "Processing job metadata does not match the exam's frozen "
+                        "grading contract; run the whole-exam migration"
+                    ),
+                    "updated_at": _now(),
+                },
+                "$unset": {
+                    "lease_token": "",
+                    "lease_owner": "",
+                    "lease_expires_at": "",
+                    "heartbeat_at": "",
+                },
+            },
+        )
+        if failed.matched_count != 1:
+            return {"job_id": job_id, "status": "lease_lost", "claimed": False}
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error": "Grading contract job mismatch",
+        }
 
     from api.v1._exampen_imports import load_exampen
     from api.v1.evalpen_evaluate_async import _build_eval_core

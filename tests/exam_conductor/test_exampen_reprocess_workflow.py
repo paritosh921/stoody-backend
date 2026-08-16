@@ -15,6 +15,20 @@ def _fresh_db():
     return AsyncMongoMockClient()["skb_test"]
 
 
+async def _seed_supported_subjective_exam(db, exam_id: str) -> None:
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": exam_id,
+            "exam_type": "pcr",
+            "pcr_grading_contract": {
+                "prompt_version": "pcr-full-document-visual-v13",
+                "pipeline_version": 4,
+                "mapping_pipeline_version": "evidence-first-visual-v4",
+            },
+        }
+    )
+
+
 class _RecordedTask:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
@@ -437,6 +451,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
     )
 
     db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-1")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
@@ -499,6 +514,139 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_reprocess_rejects_unsupported_exam_before_mutating_job(monkeypatch):
+    from services.exampen_workflow import (
+        GradingContractMigrationRequiredError,
+        PROCESSING_JOBS_COLLECTION,
+        reprocess_processing_job,
+    )
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-LEGACY",
+            "pcr_grading_contract": {
+                "prompt_version": "pcr-full-document-visual-v5"
+            },
+        }
+    )
+    await db[PROCESSING_JOBS_COLLECTION].insert_one(
+        {
+            "job_id": "pcr-job-LEGACY",
+            "submission_id": "SUB-LEGACY",
+            "exam_id": "EXAM-LEGACY",
+            "status": "failed",
+            "pipeline_version": 2,
+        }
+    )
+    task = _RecordedTask()
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=task),
+    )
+
+    with pytest.raises(
+        GradingContractMigrationRequiredError, match="legacy-to-v16"
+    ):
+        await reprocess_processing_job(
+            db,
+            db_name="skb_test",
+            job_id="pcr-job-LEGACY",
+            requested_by="TUT-1",
+        )
+
+    stored = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "pcr-job-LEGACY"}
+    )
+    assert stored["status"] == "failed"
+    assert "reprocess_count" not in stored
+    assert task.calls == []
+
+
+@pytest.mark.asyncio
+async def test_new_job_reconciles_if_exam_contract_changes_during_insert(monkeypatch):
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        ensure_processing_job,
+    )
+
+    db = _fresh_db()
+    contracts = iter(
+        [
+            (4, "evidence-first-visual-v4"),
+            (7, "whole-copy-rubric-v7"),
+        ]
+    )
+
+    async def pipeline_metadata(_db, _exam_id, *, job=None):
+        return next(contracts)
+
+    monkeypatch.setattr(
+        "services.exampen_workflow._pipeline_metadata_for_exam",
+        pipeline_metadata,
+    )
+    await ensure_processing_job(
+        db,
+        exam_id="EXAM-RACE",
+        submission_id="SUB-RACE",
+    )
+    job = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"submission_id": "SUB-RACE"}
+    )
+    assert job["status"] == "queued_pipeline_v7"
+    assert job["pipeline_version"] == 7
+    assert job["mapping_pipeline_version"] == "whole-copy-rubric-v7"
+
+
+@pytest.mark.asyncio
+async def test_new_job_is_not_dispatched_while_whole_exam_migration_is_applying(
+    monkeypatch,
+):
+    from services.exampen_workflow import (
+        CONTRACT_MIGRATION_PENDING_JOB_STATUS,
+        dispatch_processing_job,
+        ensure_processing_job,
+    )
+
+    db = _fresh_db()
+    await db["exampen_exams"].insert_one(
+        {
+            "exam_id": "EXAM-MIGRATING",
+            "pcr_grading_contract": {
+                "prompt_version": "pcr-full-document-visual-v5"
+            },
+            "pcr_grading_contract_migration": {
+                "migration_id": "PCR-MIG-TEST",
+                "status": "applying",
+            },
+        }
+    )
+    job, created = await ensure_processing_job(
+        db,
+        exam_id="EXAM-MIGRATING",
+        submission_id="SUB-MIGRATING",
+    )
+    assert created is True
+    assert job["status"] == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+    assert job["migration_id"] == "PCR-MIG-TEST"
+
+    task = _RecordedTask()
+    monkeypatch.setitem(
+        sys.modules,
+        "celery_app",
+        SimpleNamespace(process_exampen_pcr_submission=task),
+    )
+    result = await dispatch_processing_job(
+        db,
+        db_name="skb_test",
+        job=job,
+    )
+    assert result["status"] == CONTRACT_MIGRATION_PENDING_JOB_STATUS
+    assert task.calls == []
+
+
+@pytest.mark.asyncio
 async def test_teacher_reprocess_rejects_an_active_processing_lease(monkeypatch):
     """A teacher must not start a second mapper while a live worker owns it."""
     from services.exampen_workflow import (
@@ -508,11 +656,13 @@ async def test_teacher_reprocess_rejects_an_active_processing_lease(monkeypatch)
     )
 
     db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-2")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
             "job_id": "pcr-job-SUB-2",
             "submission_id": "SUB-2",
+            "exam_id": "EXAM-2",
             "status": "processing",
             "attempts": 1,
             "updated_at": datetime.now(timezone.utc),
@@ -554,11 +704,13 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
     )
 
     db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-expired")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
             "job_id": "pcr-job-SUB-expired",
             "submission_id": "SUB-expired",
+            "exam_id": "EXAM-expired",
             "status": "processing",
             "attempts": 1,
             "updated_at": datetime.now(timezone.utc) - timedelta(minutes=40),
@@ -917,6 +1069,37 @@ async def test_stale_worker_recovery_honors_global_attempt_budget():
     assert "retry budget was exhausted" in stored["last_error"]
     assert "next_retry_at" not in stored
     assert "lease_token" not in stored
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_recovery_does_not_downgrade_unknown_future_pipeline():
+    from services.exampen_workflow import (
+        PROCESSING_HEARTBEAT_STALE_SECONDS,
+        PROCESSING_JOBS_COLLECTION,
+        recover_stale_processing_jobs,
+    )
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    now = datetime.now(timezone.utc)
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-future-pipeline",
+            "submission_id": "SUB-future-pipeline",
+            "status": "processing",
+            "pipeline_version": 8,
+            "attempts": 1,
+            "lease_token": "future-worker",
+            "lease_expires_at": now + timedelta(minutes=20),
+            "updated_at": now
+            - timedelta(seconds=PROCESSING_HEARTBEAT_STALE_SECONDS + 1),
+        }
+    )
+
+    assert await recover_stale_processing_jobs(db, now=now) == 1
+    stored = await jobs.find_one({"job_id": "pcr-job-future-pipeline"})
+    assert stored["pipeline_version"] == 8
+    assert stored["status"] == "retryable_error"
 
 
 @pytest.mark.asyncio
