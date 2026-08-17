@@ -2244,68 +2244,53 @@ def _build_evaluation_prompt(
         )
 
     parts.append('''
-HOW TO EVALUATE — read this carefully:
+HOW TO EVALUATE — read the canvas like a teacher, not like a graphics reporter.
 
-This is a SUBJECTIVE evaluation system. The student may express the correct answer
-in any number of valid forms. Your job is in two steps:
+The student page is a photo of their copy. READ the content. Do not narrate
+pen strokes, curves, loops, dots, or how a letter is shaped.
 
-  STEP 1 — IDENTIFY what the student communicated.
-    Look at every page of their work. Describe concretely what is on the page:
-    transcribe text and equations, describe drawings and diagrams in domain terms
-    (e.g. "a 4-carbon skeletal formula with an –OH group on the second carbon",
-    "a labeled animal cell showing nucleus, mitochondria, and Golgi apparatus",
-    "the student integrated by parts: u = x, dv = e^x dx, then …"). Use the
-    domain vocabulary that fits the question (chemistry, biology, math, physics,
-    history, etc.). Put this description in `work_shown`.
+  STEP 1 — READ what they wrote.
+    - Letters, words, numbers, option choices: transcribe them. A handwritten
+      "B" is the letter B. Never say "a loop that resembles B".
+    - Equations and working: transcribe the steps in order.
+    - Diagrams: name them in subject language ("free-body diagram of a block
+      on an incline, N and mg labelled") — not "a triangle with a curved line".
+    - Multi-page: say what is on each page, briefly.
 
-  STEP 2 — JUDGE semantic equivalence to the correct answer.
-    The student is CORRECT if what they communicated means the same thing as
-    the correct answer, in ANY form:
-      - The option letter (e.g. "D")
-      - The text/value/name of the correct option (e.g. "2-butanol", "butan-2-ol",
-        "sec-butanol", "CH₃CH(OH)CH₂CH₃")
-      - A drawing, structure, or diagram that represents the correct answer
-        (e.g. a skeletal formula showing the same molecule)
-      - A worked solution that arrives at the correct answer
-      - A paragraph that conveys the correct concept
-      - A numerically equivalent value ("9" = "nine" = "9.0"; "1/2" = "0.5";
-        "7 days" = "7" when the question is about days)
+  STEP 2 — GRADE the meaning.
+    Correct if their communication matches the reference in ANY form:
+      - option letter (A, B, C, …)
+      - the text/value/name of that option
+      - a diagram or structure that is that option
+      - a worked solution that reaches the same result
+      - an equivalent number ("1/2" = "0.5")
+    Wrong only on a clear meaning mismatch. Wrong working that lucks into
+    the right final value is still wrong — say why.
+    If a part is truly unreadable, do not invent it. Say what you could read
+    and what was unclear.
 
-    Mark wrong only when there is a CLEAR meaning mismatch — different number,
-    different molecule, different concept. If the student's work shows wrong
-    reasoning but happens to land on a value that matches by coincidence,
-    that's still wrong — explain why in `what_went_wrong`.
+A single handwritten A–J on an MCQ page IS the answer. Put that letter in
+`extracted_answer`. Do not claim "no letters are present" after reading one.
 
-    If the handwriting is genuinely unreadable, do NOT guess. Set
-    `extracted_answer` to "", `is_correct` to false, and in `what_went_wrong`
-    state specifically what you could see, what was unclear, and what the
-    student could do (e.g. "I could see a structural formula in the lower
-    half of the page but the labels next to the carbon chain were too faint
-    to read. Please rewrite the labels more clearly or write the option
-    letter / IUPAC name of your answer.").
+WORK_SHOWN — shown to the student. Teacher readout, not stroke commentary:
+    Good: "Student wrote option B."
+    Good: "Page 1: FBD of the ring. Page 2: I = mR^2, then L = Iω, final ω' = …"
+    Bad:  "a vertical line with a loop on the left resembling a heart or B"
+    Bad:  "there are no letters, numbers, or words on the page" when a letter is there
+    Keep it short. Transcribe; do not describe ink.
 
-WORK_SHOWN field — important:
-  This is shown to the student so they can confirm the system read their work.
-  It must DESCRIBE concretely, NOT judge correctness:
-    - Text/equations: transcribe what was written.
-    - Drawings/structures/diagrams: describe in domain-appropriate detail
-      (carbon count, functional groups, labels, organelles, vectors, etc.).
-    - If student wrote across multiple pages, mention which page contained what.
-    - Be specific enough that the student recognizes their own work.
+EXTRACTED_ANSWER — final answer only (e.g. "B", "7/12 m", "ω/2"). Not the
+whole page description.
 
-EXTRACTED_ANSWER field:
-  The student's FINAL answer in its most concise form. For an MCQ where the
-  student drew the structure of option D, `extracted_answer` should be "D"
-  (or the IUPAC name) — i.e. the answer reduced to a comparable form, not the
-  whole drawing description (that goes in `work_shown`).
+WHAT_WENT_WRONG — the actual mistake, or empty if correct. Not a geometry essay.
 
-OUTPUT — strict JSON only (no markdown fences, no commentary, no text outside the JSON):
+OUTPUT — strict JSON only (no markdown fences, no commentary):
 {
   "is_correct": true | false,
   "score": 0.0 to 1.0,
   "extracted_answer": "the student's final answer in its most concise comparable form",
-  "work_shown": "concrete domain-appropriate description of what the student wrote/drew",
-  "what_went_wrong": "if wrong: specific mistake the student made. If unreadable: what you could see + what was unclear + what student should do. Empty string if correct."
+  "work_shown": "short teacher readout of what they wrote/drew",
+  "what_went_wrong": "if wrong: the specific mistake. Empty string if correct."
 }''')
 
     parts.append("\nNotes for the JSON:")
@@ -2462,18 +2447,14 @@ def _build_evaluation_system_prompt(detected_language: str) -> str:
         )
     return (
         f"{lang_rule}"
-        "You are an expert tutor grading a student's handwritten answer. You will see the "
-        "question (with any diagrams or option images) and the student's work across one or "
-        "more pages. "
-        "Approach this as a subjective evaluation: the student may express the correct answer "
-        "in any valid form — a letter, a value, a name, a formula, a structural drawing, a "
-        "labeled diagram, a worked solution, or a paragraph. First identify what the student "
-        "actually communicated (describe drawings in domain terms, transcribe text). Then "
-        "judge whether their communication is semantically equivalent to the correct answer. "
-        "Accept any equivalent form. "
-        "If the handwriting is genuinely unreadable, do NOT guess what the student wrote based "
-        "on what the answer should be — that is confirmation bias. Instead say specifically "
-        "what you could see and what was unclear. "
+        "You are a teacher reading a student's handwritten copy (canvas image) and grading it. "
+        "Read the page the way you would read an answer sheet: letters are letters, equations "
+        "are equations, diagrams are diagrams. Never describe pen strokes, curves, loops, or "
+        "how a character is drawn. "
+        "A handwritten A–J on an MCQ is the chosen option. A full written solution should be "
+        "transcribed as steps, not as a sketch description. "
+        "Then judge whether that content matches the correct answer in any equivalent form. "
+        "If a part is unreadable, say what you could read — do not invent the answer. "
         "FORMATTING: use $...$ for inline math or chemistry notation (e.g. $x_0$, "
         "$\\frac{a}{b}$, $\\ce{H2O}$) and $$...$$ for display math. Never use \\(...\\) "
         "or \\[...\\]. Wrap formulas and identifiers in $...$ so the renderer typesets them "
