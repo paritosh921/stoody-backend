@@ -33,6 +33,10 @@ from services.question_marking_contract import (
     normalize_question_penalty,
     parse_question_penalty,
 )
+from services.question_paper_marks_contract import (
+    effective_question_marks,
+    summarize_question_marks,
+)
 from utils.s3_storage import (
     PrivateObjectStorageError,
     download_file,
@@ -331,17 +335,7 @@ async def migrate_legacy_paper_snapshot_assets(
 
 
 def _question_marks(question: Dict[str, Any]) -> Optional[float]:
-    for key in ("max_marks", "marks", "points", "total_points"):
-        raw = question.get(key)
-        if raw in (None, "") or isinstance(raw, bool):
-            continue
-        try:
-            marks = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if marks > 0:
-            return marks
-    return None
+    return effective_question_marks(question)
 
 
 def _is_objective_question(question: Dict[str, Any]) -> bool:
@@ -1055,15 +1049,42 @@ def validate_pcr_questions(
     policy_module = _marking_policy_module()
     policy = policy_module.normalize_marking_policy(marking_policy)
     uses_structured_criteria = policy_module.is_structured_rubric_policy(policy)
+    question_list = list(questions)
+    expected_total = None
+    for question in question_list:
+        metadata = question.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        paper_summary = metadata.get("paper_marks_summary")
+        if isinstance(paper_summary, dict) and paper_summary.get("expected_total") is not None:
+            expected_total = paper_summary.get("expected_total")
+            break
+    current_marks_summary = summarize_question_marks(
+        question_list,
+        expected_total=expected_total,
+    )
+
     errors: List[str] = []
-    for position, question in enumerate(questions, start=1):
+    for position, question in enumerate(question_list, start=1):
         label = _source_question_id(question) or str(position)
         if not _source_question_id(question):
             errors.append(f"Q {label}: missing stable question id")
         if not _question_text(question):
             errors.append(f"Q {label}: missing question text")
         if _question_marks(question) is None:
-            errors.append(f"Q {label}: assign marks greater than zero")
+            errors.append(
+                f"Q {label}: verify the printed marks or enter marks greater than zero"
+            )
+        metadata = question.get("metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("paper_marks_reconciled") is False
+            and current_marks_summary.get("reconciled") is False
+            and int(current_marks_summary.get("unresolved_count") or 0) == 0
+        ):
+            errors.append(
+                f"Q {label}: resolve the mismatch between question marks and the paper total"
+            )
         extraction_metadata = question.get("extraction_metadata")
         if isinstance(extraction_metadata, dict) and extraction_metadata.get(
             "manual_review_required"

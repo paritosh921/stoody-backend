@@ -71,6 +71,15 @@ from services.question_marking_contract import (
     parse_question_penalty,
     supports_negative_marking,
 )
+from services.question_paper_marks_contract import (
+    effective_question_marks,
+    extracted_marks_metadata,
+    positive_marks,
+    project_question_marks_for_authoring,
+    summarize_question_marks,
+    teacher_confirmed_marks_metadata,
+    visual_paper_total,
+)
 from services.region_crop_service import RegionCropService
 from services.tally_question_map_service import build_tally_question_map
 
@@ -99,6 +108,10 @@ ANSWER_MAPPING_VISION_MODEL = os.getenv("ANSWER_MAPPING_VISION_MODEL", "gpt-5.4-
 PCR_AUTHORING_VISION_MODEL = os.getenv(
     "PCR_AUTHORING_VISION_MODEL",
     ANSWER_MAPPING_VISION_MODEL,
+)
+QUESTION_PAPER_VISION_MODEL = os.getenv(
+    "QUESTION_PAPER_VISION_MODEL",
+    PCR_AUTHORING_VISION_MODEL,
 )
 
 _PCR_AUTHORING_VISUAL_HINT_RE = re.compile(
@@ -135,7 +148,7 @@ class ExtractedQuestion(BaseModel):
     correct_answer: Optional[str] = None
     images: List[Dict[str, Any]] = []
     metadata: Dict[str, Any] = {}
-    points: Optional[float] = 4.0  # Default 4 points for Test Series (JEE style)
+    points: Optional[float] = None
     penalty: Optional[float] = None  # Resolved from objective/subjective scoring semantics
 
 class PDFProcessingResult(BaseModel):
@@ -192,7 +205,7 @@ class Question(BaseModel):
     options: List[str] = []
     correct_answer: Optional[str] = None
     metadata: Dict[str, Any] = {}
-    points: Optional[float] = 4.0
+    points: Optional[float] = None
     penalty: Optional[float] = None
 
 def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -1683,6 +1696,56 @@ async def save_image_to_disk(
         logger.error(f"Failed to save image {image_id}: {str(e)}")
         return []
 
+def _render_question_paper_pages_for_structuring(
+    pdf_bytes: bytes,
+) -> List[Dict[str, Any]]:
+    """Render original paper pages for one image-authoritative parse call.
+
+    The OCR transcript remains a useful hint, but page images are the only
+    source that can reliably preserve printed mark formulae, diagrams, tables,
+    multi-column layout, and regional-language glyphs.
+    """
+
+    import fitz
+    from PIL import Image
+
+    if not pdf_bytes:
+        return []
+    max_pages = max(1, min(80, int(os.getenv("QUESTION_PAPER_VISUAL_MAX_PAGES", "40"))))
+    pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if pdf.page_count > max_pages:
+            raise ValueError(
+                f"Question paper has {pdf.page_count} pages; visual authoring limit is {max_pages}"
+            )
+        rendered: List[Dict[str, Any]] = []
+        for page_index in range(pdf.page_count):
+            page = pdf[page_index]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False)
+            png_bytes = pixmap.tobytes("png")
+            with Image.open(io.BytesIO(png_bytes)) as opened:
+                image = opened.convert("RGB")
+                if max(image.size) > 2000:
+                    image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=88, optimize=True)
+                jpeg_bytes = output.getvalue()
+            rendered.append(
+                {
+                    "index": page_index,
+                    "label": f"Original question-paper page {page_index + 1}",
+                    "data_uri": (
+                        "data:image/jpeg;base64,"
+                        + base64.b64encode(jpeg_bytes).decode("ascii")
+                    ),
+                    "byte_size": len(jpeg_bytes),
+                }
+            )
+        return rendered
+    finally:
+        pdf.close()
+
+
 async def extract_questions_with_gpt(
     ocr_result: Dict[str, Any],
     subject: str,
@@ -1692,11 +1755,16 @@ async def extract_questions_with_gpt(
     gateway_context: Optional[Dict[str, Any]] = None,
     layout_report: Optional[Dict[str, Any]] = None,
     retry_reason: Optional[str] = None,
+    pdf_bytes: Optional[bytes] = None,
+    expected_total_points: Optional[float] = None,
+    require_visual_source: bool = False,
 ) -> List[ExtractedQuestion]:
     """
-    Use LLM to extract structured questions from OCR text.
-    Uses Groq (GPT-OSS 120B) as primary, falls back to OpenAI GPT-5-mini.
-    Works with ANY question paper format — no hardcoded regex patterns.
+    Extract a structured paper once during authoring.
+
+    When original PDF bytes are available, page images are authoritative and
+    OCR text is only a hint. Text-only parsing remains as a compatibility
+    fallback for region extraction and environments without a vision model.
     """
     import json as _json
     from openai import AsyncOpenAI
@@ -1712,9 +1780,30 @@ async def extract_questions_with_gpt(
         md = page.get("markdown", "")
         full_text += f"\n=== PAGE {pidx} ===\n{md}"
 
-    # Select LLM provider: Groq (primary) or OpenAI (fallback)
-    # Groq API is OpenAI-compatible — same AsyncOpenAI client, different base_url
-    if GROQ_API_KEY:
+    visual_pages: List[Dict[str, Any]] = []
+    if pdf_bytes and os.getenv("OPENAI_API_KEY", ""):
+        try:
+            visual_pages = await asyncio.to_thread(
+                _render_question_paper_pages_for_structuring,
+                pdf_bytes,
+            )
+        except Exception as exc:
+            logger.warning("Visual question-paper rendering failed; using OCR text: %s", exc)
+
+    visual_source = bool(visual_pages)
+    visual_payload_bytes = sum(int(item.get("byte_size") or 0) for item in visual_pages)
+    if require_visual_source and not visual_source:
+        raise ValueError(
+            "Original question-paper page images could not be prepared for visual extraction"
+        )
+
+    # Visual paper parsing requires a vision-capable OpenAI model. The cheaper
+    # text provider remains available for non-visual/manual-region paths.
+    if visual_source:
+        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        extract_model = QUESTION_PAPER_VISION_MODEL
+        provider_name = "OpenAI"
+    elif GROQ_API_KEY:
         client = AsyncOpenAI(
             api_key=GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
@@ -1734,7 +1823,11 @@ async def extract_questions_with_gpt(
     # client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
     # extract_model = OCR_FALLBACK_MODEL
 
-    print(f"[Q-EXTRACT] Sending {len(full_text)} chars from {len(pages)} pages (provider: {provider_name}, model: {extract_model})", flush=True)
+    print(
+        f"[Q-EXTRACT] Sending {len(full_text)} OCR chars from {len(pages)} pages "
+        f"(provider: {provider_name}, model: {extract_model}, visual={visual_source})",
+        flush=True,
+    )
     anchor_instruction = ""
     if document_anchor_text and document_anchor_text.strip():
         anchor_instruction = (
@@ -1763,13 +1856,15 @@ async def extract_questions_with_gpt(
             f"\nRETRY REASON: {retry_reason}. Re-check option association before returning JSON.\n"
         )
 
+    ocr_hint = full_text[:60000] if visual_source else full_text
     extraction_prompt = (
-        "You are a question paper parser. Extract ONLY the questions from the text below.\n\n"
+        f"Parse this complete question paper. "
+        f"{'The attached original page images are authoritative; use OCR only as a reading hint.' if visual_source else 'Use the OCR transcript below.'}\n\n"
         f"{anchor_instruction}"
         f"{layout_instruction}"
         "RULES:\n"
         "- Extract every question (MCQ, subjective, fill-in-the-blank, true/false, assertion-reason, case study, etc.)\n"
-        "- Ignore headers, instructions, school name, exam title, general instructions, section headers, marks info\n"
+        "- Ignore school/header prose as questions, but read printed total marks and section mark allocations\n"
         "- For MCQs: separate the question text from the options\n"
         "- For subjective questions: include the full question text, leave options as empty array\n"
         "- IMPORTANT: If a question has sub-parts (a, b, c or i, ii, iii or (1), (2) etc.), keep them as ONE question. Include ALL sub-parts in the question text. Do NOT split sub-parts into separate questions.\n"
@@ -1778,27 +1873,47 @@ async def extract_questions_with_gpt(
         "- Preserve ALL math notation, LaTeX, symbols, superscripts, subscripts exactly as they appear\n"
         "- Preserve Hindi or regional language text exactly as-is\n"
         "- If a question references a figure/diagram/graph/image/table, set has_figure to true\n"
-        "- Report the page number (from the === PAGE N === markers) where each question starts\n"
-        "- If a question's maximum marks are printed near the question or in the section instructions, set max_marks to that numeric value\n"
-        "- If marks are not explicit or not confidently tied to the question, set max_marks to null\n\n"
+        "- Use zero-based page numbers and list every continuation page for multi-page questions\n"
+        "- For each mark, copy the exact printed expression (for example 5x1=5, [2], or 2 marks), its page, confidence, and bbox in normalized 0..1000 page coordinates\n"
+        "- Arithmetic must agree: in AxB=C, max_marks is C only when A*B=C\n"
+        "- Never infer or default marks. If printed evidence is unclear, return null values and confidence 0\n"
+        "- Record diagram/table bboxes; a diagram can be the answer format or part of the question\n\n"
         "Return ONLY valid JSON in this exact format (no markdown fences, no explanation):\n"
-        '{"questions": [\n'
-        '  {"number": "1", "text": "full question text here", "options": ["option a", "option b", "option c", "option d"], "page": 0, "has_figure": false, "max_marks": 1},\n'
-        '  {"number": "27", "text": "(a) first sub-part here\\n(b) second sub-part here", "options": [], "page": 3, "has_figure": true, "max_marks": null}\n'
-        "]}\n\n"
-        "--- DOCUMENT TEXT ---\n"
-        f"{full_text}"
+        '{"paper_total_marks":{"value":20,"printed_text":"M.M. 20","page":0,"bbox":{"x0":0,"y0":0,"x1":100,"y1":50},"confidence":0.99},'
+        '"questions":[{"number":"1","text":"full question text","options":[],"page":0,'
+        '"continuation_pages":[],"has_figure":false,"diagram_regions":[],'
+        '"max_marks":5,"marks_evidence":{"value":5,"printed_text":"5x1=5","page":0,'
+        '"bbox":{"x0":800,"y0":100,"x1":980,"y1":150},"confidence":0.99}}]}\n\n'
+        "--- OCR HINT (NOT VISUAL AUTHORITY) ---\n"
+        f"{ocr_hint}"
     )
 
     # Try extraction with retry — model can return empty responses
     raw_response = ""
     max_retries = 2
+    max_completion_tokens = min(16384, max(4096, len(pages) * 2048))
     async def _chat_completion(prompt: str):
+        message_content: Any = prompt
+        if visual_source:
+            content_parts: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+            for visual_page in visual_pages:
+                content_parts.append({"type": "text", "text": visual_page["label"]})
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": visual_page["data_uri"],
+                            "detail": "high",
+                        },
+                    }
+                )
+            message_content = content_parts
+
         async def _raw_call():
             return await client.chat.completions.create(
                 model=extract_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=16384,
+                messages=[{"role": "user", "content": message_content}],
+                max_completion_tokens=max_completion_tokens,
             )
 
         if not gateway_context:
@@ -1813,13 +1928,36 @@ async def extract_questions_with_gpt(
             document_id=gateway_context.get("document_id"),
             region_id=gateway_context.get("region_id"),
             region_scope=gateway_context.get("region_scope"),
-            stage="question_structuring_retry" if retry_reason else "question_structuring",
+            stage=(
+                "question_structuring_visual_retry"
+                if visual_source and retry_reason
+                else "question_structuring_visual"
+                if visual_source
+                else "question_structuring_retry"
+                if retry_reason
+                else "question_structuring"
+            ),
             provider=provider_name.lower(),
             model=extract_model,
-            input_kind="text",
-            estimated_input_tokens=estimate_text_tokens(prompt),
-            estimated_output_tokens=4096,
-            max_output_tokens=16384,
+            input_kind="multimodal" if visual_source else "text",
+            estimated_input_tokens=(
+                estimate_text_tokens(prompt)
+                + (
+                    estimate_ocr_tokens(
+                        image_bytes=visual_payload_bytes,
+                        page_count=len(visual_pages),
+                    )
+                    if visual_source
+                    else 0
+                )
+            ),
+            estimated_output_tokens=min(4096, max_completion_tokens),
+            max_output_tokens=max_completion_tokens,
+            input_units={
+                "questions": 1,
+                "page_count": len(pages),
+                "images": len(visual_pages),
+            },
             call_fn=_raw_call,
         )
 
@@ -2181,18 +2319,8 @@ async def extract_questions_with_gpt(
         q_page = q.get("page", 0)
         options = q.get("options", [])
         has_image = q.get("has_figure", False) or "![" in q_text or "figure" in q_text.lower() or "diagram" in q_text.lower() or "graph" in q_text.lower()
-        extracted_max_marks: Optional[float] = None
-        for marks_key in ("max_marks", "marks", "points"):
-            raw_marks = q.get(marks_key)
-            if raw_marks in (None, ""):
-                continue
-            try:
-                parsed_marks = float(raw_marks)
-            except (TypeError, ValueError):
-                continue
-            if parsed_marks > 0:
-                extracted_max_marks = parsed_marks
-                break
+        marks_contract = extracted_marks_metadata(q, visual_source=visual_source)
+        extracted_max_marks = marks_contract.pop("points")
 
         # Image assignment: prefer the deterministic positional map (built from
         # PyMuPDF text-block y-positions) over the cursor heuristic. The
@@ -2250,7 +2378,9 @@ async def extract_questions_with_gpt(
             "image_refs": img_refs,
             "question_image_refs": img_refs,
             "is_image_based_mcq": False,
-            "max_marks_extracted": extracted_max_marks is not None,
+            "source_pages": [q_page, *(q.get("continuation_pages") or [])],
+            "diagram_regions": q.get("diagram_regions") or [],
+            **marks_contract,
         }
 
         # For Practice Sets mode, inline options into the question text
@@ -2262,7 +2392,7 @@ async def extract_questions_with_gpt(
                 id=str(uuid.uuid4()),
                 text=inline.strip(),
                 options=[],
-                points=extracted_max_marks if extracted_max_marks is not None else 4.0,
+                points=extracted_max_marks,
                 metadata={
                     **base_metadata,
                     "options_inline": True,
@@ -2273,13 +2403,36 @@ async def extract_questions_with_gpt(
                 id=str(uuid.uuid4()),
                 text=q_text,
                 options=[o for o in options if o.strip()],
-                points=extracted_max_marks if extracted_max_marks is not None else 4.0,
+                points=extracted_max_marks,
                 metadata=base_metadata,
             ))
 
         q_preview = q_text[:80].replace('\n', ' | ')
         fig_flag = " [HAS_FIGURE]" if has_image else ""
         print(f"[Q-EXTRACT]   Q#{q_num} p{q_page}: \"{q_preview}\" opts={len(options)}{fig_flag}", flush=True)
+
+    paper_total_evidence = visual_paper_total(data) if visual_source else {}
+    expected_total = positive_marks(expected_total_points)
+    if expected_total is None and paper_total_evidence.get("verified"):
+        expected_total = positive_marks(paper_total_evidence.get("value"))
+    marks_summary = summarize_question_marks(
+        [
+            {"id": item.id, "points": item.points, "metadata": item.metadata}
+            for item in questions
+        ],
+        expected_total=expected_total,
+    )
+    for item in questions:
+        item.metadata["paper_total_evidence"] = paper_total_evidence or None
+        item.metadata["paper_marks_summary"] = marks_summary
+        item.metadata["paper_marks_reconciled"] = marks_summary.get("reconciled")
+        if marks_summary.get("reconciled") is False and not item.metadata.get(
+            "marks_review_required"
+        ):
+            item.metadata["marks_review_required"] = True
+            item.metadata["marks_review_reason"] = (
+                "Question marks do not reconcile with the printed or teacher-provided paper total."
+            )
 
     # Validation: warn if extracted count seems low for the number of pages
     expected_min = max(1, len(pages) * 2)  # heuristic: at least 2 questions per page
@@ -4139,16 +4292,7 @@ async def run_document_ocr_pipeline(
         document_type = document.get("document_type", "Chapter Notes")
         logger.info(f"Extracting questions from OCR result for job {job_id}, document_type: {document_type}")
 
-        # Delete old questions/images for this document before re-processing
         is_b2c_pre = is_b2c_admin(current_user)
-        if is_b2c_pre:
-            old_q = await db.b2c_delete_many("questions", {"document_id": document_id})
-            old_i = await db.b2c_delete_many("images", {"source_pdf": document.get("filename", "")})
-        else:
-            old_q = await db.mongo_delete_many("questions", {"document_id": document_id})
-            old_i = await db.mongo_delete_many("images", {"source_pdf": document.get("filename", "")})
-        print(f"[OCR-PIPELINE] Cleaned up old data for {document_id}: questions={old_q}, images={old_i}", flush=True)
-
         # For Practice Sets, don't extract options separately - keep them in question text
         skip_option_extraction = document_type == "Practice Sets"
 
@@ -4165,6 +4309,29 @@ async def run_document_ocr_pipeline(
                 is_b2c=is_b2c_pre,
             ),
             layout_report=layout_context,
+            pdf_bytes=file_content,
+            expected_total_points=(
+                document.get("total_points")
+                if document.get("total_points_source") == "teacher"
+                else None
+            ),
+            require_visual_source=document_type == "Test Series",
+        )
+        if not extracted_questions:
+            raise ValueError("Question-paper extraction returned no questions")
+
+        # Replace prior OCR output only after the new visual parse succeeds.
+        # A provider/rendering error must never erase a paper teachers already
+        # reviewed or finalized.
+        if is_b2c_pre:
+            old_q = await db.b2c_delete_many("questions", {"document_id": document_id})
+            old_i = await db.b2c_delete_many("images", {"source_pdf": document.get("filename", "")})
+        else:
+            old_q = await db.mongo_delete_many("questions", {"document_id": document_id})
+            old_i = await db.mongo_delete_many("images", {"source_pdf": document.get("filename", "")})
+        print(
+            f"[OCR-PIPELINE] Replaced old data for {document_id}: questions={old_q}, images={old_i}",
+            flush=True,
         )
 
         full_document_validator = FullDocumentExtractionValidator()
@@ -4520,9 +4687,10 @@ async def run_document_ocr_pipeline(
             document_fresh = await db.b2c_find_one("documents", {"document_id": document_id})
         else:
             document_fresh = await db.mongo_find_one("documents", {"document_id": document_id})
-        total_calculated_points = sum(
-            q.points if hasattr(q, 'points') and q.points else 1.0
-            for q in extracted_questions
+        marks_summary = (
+            dict((extracted_questions[0].metadata or {}).get("paper_marks_summary") or {})
+            if extracted_questions
+            else summarize_question_marks([])
         )
 
         update_data = {
@@ -4535,13 +4703,25 @@ async def run_document_ocr_pipeline(
             "ocr_quality_score": quality_summary.get("score"),
             "ocr_quality_summary": quality_summary,
             "ocr_manual_segmentation_recommended": quality_summary.get("manual_segmentation_recommended", False),
+            "marks_extraction_summary": marks_summary,
+            "marks_review_required": bool(marks_summary.get("unresolved_count"))
+            or marks_summary.get("reconciled") is False,
         }
 
         if document_fresh and document_fresh.get("document_type") == "Test Series":
-            existing_total = document_fresh.get("total_points")
-            if existing_total is None or existing_total == 0:
-                update_data["total_points"] = total_calculated_points
-                logger.info(f"Auto-calculated total_points for {document_id}: {total_calculated_points}")
+            total_is_complete = (
+                int(marks_summary.get("unresolved_count") or 0) == 0
+                and marks_summary.get("reconciled") is not False
+                and positive_marks(marks_summary.get("calculated_total")) is not None
+            )
+            if total_is_complete and document_fresh.get("total_points_source") != "teacher":
+                update_data["total_points"] = marks_summary["calculated_total"]
+                update_data["total_points_source"] = "visual_question_marks"
+                logger.info(
+                    "Visually reconciled total_points for %s: %s",
+                    document_id,
+                    marks_summary["calculated_total"],
+                )
 
         tally_source_mode = str(
             (document_fresh or document).get("tally_question_source_mode") or ""
@@ -5280,6 +5460,9 @@ async def upload_pdf(
             "extracted_images_count": 0,
             "pages_count": pages_count,  # Store page count for Notes display
             "total_points": total_points if document_type == "Test Series" else None,
+            "total_points_source": (
+                "teacher" if document_type == "Test Series" and total_points is not None else None
+            ),
             "total_minutes": total_minutes if document_type == "Test Series" else None,
             "is_validated": False,
             "question_type": (
@@ -8366,14 +8549,43 @@ async def recalculate_document_points(
             )
 
         # Get all questions for this document
-        questions = await db.mongo_find("questions", {"pdf_source": document_id})
-        total_points = sum(q.get("points", 4.0) for q in questions)  # Default 4 marks per question
+        questions = await db.mongo_find("questions", {"document_id": document_id})
+        if not questions:
+            questions = await db.mongo_find(
+                "questions",
+                {"pdf_source": {"$in": [document_id, document.get("filename")] }},
+            )
+        marks_summary = summarize_question_marks(
+            questions,
+            expected_total=(
+                document.get("total_points")
+                if document.get("total_points_source") == "teacher"
+                else None
+            ),
+        )
+        if (
+            int(marks_summary.get("unresolved_count") or 0) > 0
+            or marks_summary.get("reconciled") is False
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "message": "Total marks cannot be calculated until every printed mark is verified.",
+                    "marks_summary": marks_summary,
+                },
+            )
+        total_points = marks_summary["calculated_total"]
 
         # Update document's total_points
         await db.mongo_update_one(
             "documents",
             {"document_id": document_id},
-            {"$set": {"total_points": total_points}}
+            {"$set": {
+                "total_points": total_points,
+                "total_points_source": "teacher_question_marks",
+                "marks_extraction_summary": marks_summary,
+                "marks_review_required": False,
+            }}
         )
 
         logger.info(f"Recalculated total_points for {document_id}: {total_points}")
@@ -8628,6 +8840,7 @@ async def update_document_metadata(
                     detail="Total points must be greater than or equal to 0"
                 )
             update_data["total_points"] = total_points
+            update_data["total_points_source"] = "teacher" if total_points > 0 else None
 
         if "total_minutes" in metadata:
             total_minutes = metadata["total_minutes"]
@@ -9093,6 +9306,7 @@ async def get_document_questions(
             # Auto-clean orphaned images from the question
             from utils.image_validator import clean_question_images
             cleaned_q, removed_count = await clean_question_images(q, db, is_b2c)
+            cleaned_q = project_question_marks_for_authoring(cleaned_q)
 
             # If orphaned images were found and removed, update the database
             if removed_count > 0:
@@ -9244,10 +9458,20 @@ async def get_document_questions(
 
             serialized_questions.append(question_dict)
 
+        marks_summary = summarize_question_marks(
+            serialized_questions,
+            expected_total=(
+                document.get("total_points")
+                if document.get("total_points_source") == "teacher"
+                else None
+            ),
+        )
+
         return {
             "document_id": document_id,
             "document_title": document["title"],
             "questions_count": len(serialized_questions),
+            "marks_summary": marks_summary,
             "ocr_quality_status": document.get("ocr_quality_status"),
             "ocr_quality_score": document.get("ocr_quality_score"),
             "ocr_quality_summary": document.get("ocr_quality_summary"),
@@ -9839,7 +10063,18 @@ async def update_question(
             update_data["enhanced_options"] = question_data["enhanced_options"]
 
         if "points" in question_data:
-            update_data["points"] = question_data["points"]
+            confirmed_points = positive_marks(question_data["points"])
+            if confirmed_points is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="points must be a finite number greater than zero",
+                )
+            update_data["points"] = confirmed_points
+            update_data["metadata"] = teacher_confirmed_marks_metadata(
+                existing_question.get("metadata"),
+                actor_id=current_user.get("user_id"),
+                confirmed_at=datetime.utcnow(),
+            )
         if "penalty" in question_data:
             raw_penalty = question_data["penalty"]
             try:
@@ -10001,22 +10236,43 @@ async def update_question(
                         else:
                             all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
 
-                    total_points = sum(q.get("points", 4.0) for q in all_questions)  # Default 4 marks per question
+                    marks_summary = summarize_question_marks(
+                        all_questions,
+                        expected_total=(
+                            document.get("total_points")
+                            if document.get("total_points_source") == "teacher"
+                            else None
+                        ),
+                    )
+                    document_marks_update: Dict[str, Any] = {
+                        "marks_extraction_summary": marks_summary,
+                        "marks_review_required": bool(marks_summary.get("unresolved_count"))
+                        or marks_summary.get("reconciled") is False,
+                    }
+                    if (
+                        int(marks_summary.get("unresolved_count") or 0) == 0
+                        and marks_summary.get("reconciled") is not False
+                    ):
+                        document_marks_update["total_points"] = marks_summary["calculated_total"]
+                        document_marks_update["total_points_source"] = (
+                            "teacher"
+                            if document.get("total_points_source") == "teacher"
+                            else "teacher_question_marks"
+                        )
 
-                    # Update document's total_points
                     if is_b2c:
                         await db.b2c_update_one(
                             "documents",
                             {"document_id": document_id},
-                            {"$set": {"total_points": total_points}}
+                            {"$set": document_marks_update}
                         )
                     else:
                         await db.mongo_update_one(
                             "documents",
                             {"document_id": document_id},
-                            {"$set": {"total_points": total_points}}
+                            {"$set": document_marks_update}
                         )
-                    logger.info(f"Updated document {document_id} total_points to {total_points}")
+                    logger.info("Updated document %s marks summary: %s", document_id, marks_summary)
 
         if "assessment_units" in update_data and _parent_doc:
             try:
@@ -10071,9 +10327,21 @@ async def bulk_update_questions(
         set_fields = {}
         if "points" in update_data:
             pts = update_data["points"]
-            if not isinstance(pts, (int, float)) or pts < 0:
-                raise HTTPException(status_code=400, detail="points must be >= 0")
-            set_fields["points"] = pts
+            confirmed_points = positive_marks(pts)
+            if confirmed_points is None:
+                raise HTTPException(status_code=400, detail="points must be greater than zero")
+            set_fields.update(
+                {
+                    "points": confirmed_points,
+                    "metadata.max_marks_extracted": True,
+                    "metadata.marks_status": "teacher_confirmed",
+                    "metadata.marks_source": "teacher",
+                    "metadata.marks_review_required": False,
+                    "metadata.marks_review_reason": None,
+                    "metadata.marks_confirmed_by": current_user.get("user_id"),
+                    "metadata.marks_confirmed_at": datetime.utcnow(),
+                }
+            )
         requested_penalty = None
         if "penalty" in update_data:
             pen = update_data["penalty"]
@@ -10133,11 +10401,30 @@ async def bulk_update_questions(
                 all_qs = await db.b2c_find("questions", query)
             else:
                 all_qs = await db.mongo_find("questions", query)
-            total = sum(q.get("points", set_fields.get("points", 4)) for q in all_qs)
+            marks_summary = summarize_question_marks(all_qs)
+            document_marks_update: Dict[str, Any] = {
+                "marks_extraction_summary": marks_summary,
+                "marks_review_required": bool(marks_summary.get("unresolved_count")),
+            }
+            if int(marks_summary.get("unresolved_count") or 0) == 0:
+                document_marks_update.update(
+                    {
+                        "total_points": marks_summary["calculated_total"],
+                        "total_points_source": "teacher_question_marks",
+                    }
+                )
             if is_b2c:
-                await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+                await db.b2c_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": document_marks_update},
+                )
             else:
-                await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": {"total_points": total}})
+                await db.mongo_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": document_marks_update},
+                )
 
         return {
             "success": True,
@@ -12814,7 +13101,7 @@ async def process_regions_ocr(
                         "layout_risks": layout_report.get("layout_risks", []),
                         "manual_review_required": bool(validation_result.get("manual_review_required")),
                     },
-                    "points": parsed_question.points if parsed_question and parsed_question.points else 4.0,
+                    "points": parsed_question.points if parsed_question else None,
                     "penalty": normalize_question_penalty(
                         parsed_question.penalty if parsed_question else None,
                         question_type=_default_extracted_question_type(document),
