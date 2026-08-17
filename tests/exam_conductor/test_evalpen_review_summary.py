@@ -77,6 +77,68 @@ async def test_supported_migrated_contract_reenables_reprocess_after_stale_worke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("migration", "expected_can_reprocess"),
+    [(None, True), ({"status": "failed"}, False)],
+)
+async def test_legacy_contract_reprocess_respects_migration_fence(
+    migration,
+    expected_can_reprocess,
+):
+    from api.v1.evalpen_review_async import get_submission_summary
+
+    db = _fresh_db()
+    exam = {
+        "exam_id": "EXAM-V12-ON-DEMAND",
+        "pcr_grading_contract": {
+            "prompt_version": "pcr-full-document-visual-v12",
+            "pipeline_version": 3,
+        },
+    }
+    if migration is not None:
+        exam["pcr_grading_contract_migration"] = migration
+    await db["exampen_exams"].insert_one(exam)
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": "SUB-V12-ON-DEMAND",
+            "exam_id": "EXAM-V12-ON-DEMAND",
+            "student_id": "STU-1",
+            "source": "camera",
+            "segmentation_status": "failed",
+            "publication_status": "ready",
+        }
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "JOB-V12-ON-DEMAND",
+            "submission_id": "SUB-V12-ON-DEMAND",
+            "exam_id": "EXAM-V12-ON-DEMAND",
+            "status": "failed",
+            "failure_code": "UnsupportedGradingContractError",
+        }
+    )
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+    ):
+        result = await get_submission_summary(
+            submission_id="SUB-V12-ON-DEMAND",
+            current_user=_admin_user(),
+            db=None,
+        )
+
+    assert result.can_reprocess is expected_can_reprocess
+    if expected_can_reprocess:
+        assert result.reprocess_block_reason is None
+    else:
+        assert "migration" in str(result.reprocess_block_reason).lower()
+
+
+@pytest.mark.asyncio
 async def test_review_summary_includes_staff_visible_answer_and_ai_correction():
     """The teacher workspace must receive the artefacts used to mark a copy."""
     from api.v1.evalpen_review_async import get_submission_summary

@@ -14,6 +14,18 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from services.pcr_grading_contract_policy import (
+    SELECTED_COPY_CONTRACT_SCOPE,
+    V16_MAPPING_PIPELINE_VERSION,
+    V16_PIPELINE_VERSION,
+    V16_REQUIRED_PROCESSING_PATH,
+    build_selected_copy_v16_override,
+    effective_grading_contract,
+    is_legacy_selected_copy_source,
+    is_supported_worker_contract,
+    selected_copy_contract_override,
+)
+
 logger = logging.getLogger(__name__)
 
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
@@ -35,6 +47,15 @@ DISPATCHABLE_JOB_STATUSES = {
     V14_CAPABILITY_QUEUED_JOB_STATUS,
     V15_CAPABILITY_QUEUED_JOB_STATUS,
     V16_CAPABILITY_QUEUED_JOB_STATUS,
+}
+REPROCESS_IN_FLIGHT_STATUSES = {
+    "queued",
+    "processing",
+    CAPABILITY_QUEUED_JOB_STATUS,
+    V14_CAPABILITY_QUEUED_JOB_STATUS,
+    V15_CAPABILITY_QUEUED_JOB_STATUS,
+    V16_CAPABILITY_QUEUED_JOB_STATUS,
+    CONTRACT_MIGRATION_PENDING_JOB_STATUS,
 }
 CURRENT_PCR_PIPELINE_VERSION = 4
 CURRENT_PCR_MAPPING_VERSION = "evidence-first-visual-v4"
@@ -165,22 +186,13 @@ def public_processing_status(status: Any) -> str:
 def is_supported_pcr_grading_contract(contract: Any) -> bool:
     """Return whether this worker generation can execute a frozen contract."""
 
-    payload = contract if isinstance(contract, dict) else {}
-    candidate = payload.get("pipeline_version")
-    if candidate is None:
-        prompt_version = str(payload.get("prompt_version") or "").strip()
-        if prompt_version.endswith("-v16"):
-            candidate = PCR_V16_PIPELINE_VERSION
-        elif prompt_version.endswith("-v15"):
-            candidate = PCR_V15_PIPELINE_VERSION
-        elif prompt_version.endswith("-v14"):
-            candidate = PCR_V14_PIPELINE_VERSION
-        elif prompt_version.endswith("-v13") or not prompt_version:
-            candidate = CURRENT_PCR_PIPELINE_VERSION
-    try:
-        return int(candidate) in SUPPORTED_PCR_PIPELINE_VERSIONS
-    except (TypeError, ValueError):
-        return False
+    return is_supported_worker_contract(contract)
+
+
+def can_upgrade_legacy_pcr_contract_on_demand(contract: Any) -> bool:
+    """Return whether one explicit unpublished copy may opt into v16."""
+
+    return is_legacy_selected_copy_source(contract)
 
 
 def _grading_contract_migration_blocks_processing(exam: Any) -> bool:
@@ -325,6 +337,130 @@ async def _required_processing_path(tenant_db: Any, exam_id: str) -> str:
     return "legacy_ocr_mapping"
 
 
+def _is_explicit_objective(payload: Any) -> bool:
+    item = payload if isinstance(payload, dict) else {}
+    values = {
+        str(item.get(field) or "").strip().lower()
+        for field in (
+            "grading_mode",
+            "marking_mode",
+            "assessment_mode",
+            "question_type",
+            "response_type",
+        )
+    }
+    return bool(values & {"objective", "omr", "mcq"})
+
+
+async def _build_on_demand_selected_copy_contract(
+    tenant_db: Any,
+    *,
+    exam: Dict[str, Any],
+    submission: Dict[str, Any],
+    requested_by: str,
+    requested_at: datetime,
+) -> Dict[str, Any]:
+    """Validate and build one audited v16 override without touching the cohort."""
+
+    source_contract = dict(exam.get("pcr_grading_contract") or {})
+    if not is_legacy_selected_copy_source(source_contract):
+        version = str(source_contract.get("prompt_version") or "missing")
+        raise GradingContractMigrationRequiredError(
+            f"Grading contract {version} cannot be upgraded for one selected copy"
+        )
+    if str(exam.get("exam_type") or "").strip().lower() != "pcr":
+        raise GradingContractMigrationRequiredError("Selected-copy upgrade requires a PCR exam")
+    if str(exam.get("publication_status") or "").strip().lower() == "published":
+        raise GradingContractMigrationRequiredError(
+            "Published exams cannot be changed by selected-copy reprocessing"
+        )
+    if (
+        _is_explicit_objective(exam)
+        or _is_explicit_objective(source_contract)
+        or _is_explicit_objective(submission)
+    ):
+        raise GradingContractMigrationRequiredError(
+            "Objective answer sheets use their separate deterministic reprocess lane"
+        )
+    if str(submission.get("publication_status") or "").lower() == "published":
+        raise GradingContractMigrationRequiredError(
+            "Published results cannot be reprocessed; use the recheck workflow"
+        )
+    questions = await tenant_db["evalpen_questions"].find(
+        {"exam_id": str(exam.get("exam_id") or "")},
+        {
+            "grading_mode": 1,
+            "marking_mode": 1,
+            "assessment_mode": 1,
+            "question_type": 1,
+            "response_type": 1,
+        },
+    ).to_list(length=2000)
+    if not questions:
+        raise GradingContractMigrationRequiredError(
+            "The frozen question catalog is unavailable for selected-copy reprocessing"
+        )
+    if all(_is_explicit_objective(question) for question in questions):
+        raise GradingContractMigrationRequiredError(
+            "Pure Objective papers use their separate deterministic reprocess lane"
+        )
+    answer_page = await tenant_db["evalpen_answer_pages"].find_one(
+        {"submission_id": str(submission.get("submission_id") or "")},
+        {"_id": 1},
+    )
+    if answer_page is None:
+        raise GradingContractMigrationRequiredError(
+            "The original uploaded answer pages are unavailable for reprocessing"
+        )
+
+    paper_version_id = str(exam.get("paper_version_id") or "").strip()
+    paper_version = await tenant_db["exampen_paper_versions"].find_one(
+        {"paper_version_id": paper_version_id}
+    )
+    if not paper_version:
+        raise GradingContractMigrationRequiredError(
+            "The frozen paper version is unavailable for selected-copy reprocessing"
+        )
+    prepared_document_id = str(exam.get("prepared_document_id") or "").strip()
+    if prepared_document_id and str(paper_version.get("document_id") or "") != prepared_document_id:
+        raise GradingContractMigrationRequiredError(
+            "The frozen paper version does not belong to this exam"
+        )
+    context = dict(paper_version.get("paper_context") or {})
+    if not context.get("ready") or str(context.get("version") or "") != (
+        "canonical-full-document-visual-v2"
+    ):
+        raise GradingContractMigrationRequiredError(
+            "This legacy paper does not have the canonical visual package required by v16"
+        )
+    assets = dict(paper_version.get("paper_assets") or {})
+    question_asset = dict(assets.get("question_paper") or {})
+    if (
+        not question_asset.get("asset_id")
+        or not question_asset.get("storage_uri")
+        or context.get("question_paper_asset_id") != question_asset.get("asset_id")
+    ):
+        raise GradingContractMigrationRequiredError(
+            "The frozen question-paper asset is unavailable or inconsistent"
+        )
+    if context.get("has_teacher_solution_asset"):
+        solution_asset = dict(assets.get("teacher_solution") or {})
+        if (
+            not solution_asset.get("asset_id")
+            or not solution_asset.get("storage_uri")
+            or context.get("teacher_solution_asset_id") != solution_asset.get("asset_id")
+        ):
+            raise GradingContractMigrationRequiredError(
+                "The frozen teacher-solution asset is unavailable or inconsistent"
+            )
+    return build_selected_copy_v16_override(
+        source_contract,
+        submission_id=str(submission.get("submission_id") or ""),
+        requested_by=requested_by,
+        requested_at=requested_at,
+    )
+
+
 async def _pipeline_metadata_for_exam(
     tenant_db: Any,
     exam_id: str,
@@ -333,12 +469,13 @@ async def _pipeline_metadata_for_exam(
 ) -> Tuple[int, str]:
     """Resolve the immutable worker contract without downgrading v14 jobs."""
 
-    contract: Dict[str, Any] = {}
+    exam_contract: Dict[str, Any] = {}
     exam = await tenant_db["exampen_exams"].find_one(
         {"exam_id": exam_id}, {"pcr_grading_contract": 1}
     )
     if exam:
-        contract = dict(exam.get("pcr_grading_contract") or {})
+        exam_contract = dict(exam.get("pcr_grading_contract") or {})
+    contract, _ = effective_grading_contract(exam_contract, job)
     candidate = contract.get("pipeline_version")
     if candidate is None:
         prompt_version = str(contract.get("prompt_version") or "")
@@ -720,7 +857,19 @@ async def reprocess_processing_job(
     exam_id = str(job.get("exam_id") or "").strip()
     exam = await tenant_db["exampen_exams"].find_one(
         {"exam_id": exam_id},
-        {"_id": 0, "pcr_grading_contract": 1, "pcr_grading_contract_migration": 1},
+        {
+            "_id": 0,
+            "exam_id": 1,
+            "exam_type": 1,
+            "paper_version_id": 1,
+            "prepared_document_id": 1,
+            "grading_mode": 1,
+            "marking_mode": 1,
+            "assessment_mode": 1,
+            "publication_status": 1,
+            "pcr_grading_contract": 1,
+            "pcr_grading_contract_migration": 1,
+        },
     )
     if exam is None:
         raise ValueError(f"Exam {exam_id} not found")
@@ -733,31 +882,71 @@ async def reprocess_processing_job(
             "The whole-exam grading contract migration is incomplete. "
             "Resume it successfully before reprocessing a copy."
         )
-    if not is_supported_pcr_grading_contract(exam.get("pcr_grading_contract")):
+    submission_id = str(job.get("submission_id") or "").strip()
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id, "exam_id": exam_id}
+    )
+    if submission is None:
+        raise ValueError(f"Canonical submission {submission_id} not found")
+    if str(submission.get("publication_status") or "").strip().lower() == "published":
         raise GradingContractMigrationRequiredError(
-            "This exam uses an unsupported frozen grading contract. "
-            "Run the guarded whole-exam legacy-to-v16 migration first."
+            "Published results cannot be reprocessed; use the recheck workflow"
         )
 
     now = _now()
-    required_processing_path = str(job.get("required_processing_path") or "").strip()
-    if not required_processing_path:
-        required_processing_path = await _required_processing_path(
+    exam_contract = dict(exam.get("pcr_grading_contract") or {})
+    contract_override = selected_copy_contract_override(job)
+    if not contract_override and is_legacy_selected_copy_source(exam_contract):
+        contract_override = await _build_on_demand_selected_copy_contract(
             tenant_db,
-            str(job.get("exam_id") or ""),
+            exam=exam,
+            submission=submission,
+            requested_by=requested_by or "unknown",
+            requested_at=now,
         )
-    pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
-        tenant_db,
-        str(job.get("exam_id") or ""),
-        job=job,
+    effective_contract, contract_scope = effective_grading_contract(
+        exam_contract,
+        {**job, "grading_contract_override": contract_override}
+        if contract_override
+        else job,
     )
-    current_status = str(job.get("status") or "queued")
+    if not is_supported_pcr_grading_contract(effective_contract):
+        version = str(exam_contract.get("prompt_version") or "missing")
+        raise GradingContractMigrationRequiredError(
+            f"Grading contract {version} cannot be reprocessed by this worker"
+        )
+
+    if contract_override:
+        pipeline_version = V16_PIPELINE_VERSION
+        mapping_pipeline_version = V16_MAPPING_PIPELINE_VERSION
+        required_processing_path = V16_REQUIRED_PROCESSING_PATH
+    else:
+        pipeline_version, mapping_pipeline_version = await _pipeline_metadata_for_exam(
+            tenant_db,
+            exam_id,
+            job=job,
+        )
+        required_processing_path = str(
+            effective_contract.get("required_processing_path")
+            or job.get("required_processing_path")
+            or ""
+        ).strip()
+        if not required_processing_path:
+            required_processing_path = await _required_processing_path(
+                tenant_db,
+                exam_id,
+            )
+    current_status = str(job.get("status") or "queued").strip().lower()
     if _lease_is_active(job, now=now):
         expiry = _lease_expiry(job)
         raise ProcessingJobBusyError(
             "This answer copy is still being processed by an active worker"
             + (f" until {expiry.isoformat()}" if expiry else "")
             + ". Wait for it to finish before reprocessing."
+        )
+    if current_status in REPROCESS_IN_FLIGHT_STATUSES and current_status != "processing":
+        raise ProcessingJobBusyError(
+            "This answer copy is already queued for checking. Wait for that run to finish."
         )
 
     # Reclaiming is allowed only after the observed lease expires.  Include the
@@ -786,30 +975,46 @@ async def reprocess_processing_job(
         "previous_last_error": job.get("last_error"),
         "previous_pipeline_version": job.get("pipeline_version"),
         "force_reclaim": current_status == "processing",
+        "contract_scope": contract_scope,
+        "selected_copy_only": contract_scope == SELECTED_COPY_CONTRACT_SCOPE,
+        "source_prompt_version": (
+            contract_override.get("source_prompt_version")
+            if contract_override
+            else str(exam_contract.get("prompt_version") or "")
+        ),
+        "target_prompt_version": str(effective_contract.get("prompt_version") or ""),
+        "contract_override_id": (
+            contract_override.get("override_id") if contract_override else None
+        ),
     }
+    reset_fields: Dict[str, Any] = {
+        "status": _queued_status_for_pipeline(pipeline_version),
+        "pipeline_version": pipeline_version,
+        "required_processing_path": required_processing_path,
+        "db_name": db_name,
+        "last_error": None,
+        "segmentation": {},
+        "evaluation": {},
+        "reprocess_requested_at": now,
+        "reprocess_requested_by": requested_by or "unknown",
+        "reprocess_reason": history_entry["reason"],
+        "mapping_pipeline_version": mapping_pipeline_version,
+        "attempts": 0,
+        "updated_at": now,
+    }
+    if contract_override:
+        reset_fields["grading_contract_override"] = contract_override
     reset = await jobs.update_one(
         reset_filter,
         {
-            "$set": {
-                "status": _queued_status_for_pipeline(pipeline_version),
-                "pipeline_version": pipeline_version,
-                "required_processing_path": required_processing_path,
-                "db_name": db_name,
-                "last_error": None,
-                "segmentation": {},
-                "evaluation": {},
-                "reprocess_requested_at": now,
-                "reprocess_requested_by": requested_by or "unknown",
-                "reprocess_reason": history_entry["reason"],
-                "mapping_pipeline_version": mapping_pipeline_version,
-                "attempts": 0,
-                "updated_at": now,
-            },
+            "$set": reset_fields,
             "$unset": {
                 "finished_at": "",
                 "started_at": "",
                 "lease_token": "",
+                "lease_owner": "",
                 "lease_expires_at": "",
+                "heartbeat_at": "",
                 "next_retry_at": "",
                 "failure_code": "",
             },
@@ -1378,15 +1583,18 @@ async def process_pcr_processing_job(
             job=job,
         )
     )
-    frozen_contract = exam.get("pcr_grading_contract")
-    has_frozen_contract = isinstance(frozen_contract, dict) and bool(frozen_contract)
+    effective_contract, contract_scope = effective_grading_contract(
+        exam.get("pcr_grading_contract"),
+        job,
+    )
+    has_frozen_contract = bool(effective_contract)
     persisted_pipeline_version = int(
         job.get("pipeline_version") or CURRENT_PCR_PIPELINE_VERSION
     )
     if (
         has_frozen_contract
         and (
-            not is_supported_pcr_grading_contract(frozen_contract)
+            not is_supported_pcr_grading_contract(effective_contract)
             or persisted_pipeline_version != expected_pipeline_version
             or str(job.get("mapping_pipeline_version") or "")
             != expected_mapping_version
@@ -1399,8 +1607,8 @@ async def process_pcr_processing_job(
                     "status": "failed",
                     "failure_code": "GradingContractJobMismatch",
                     "last_error": (
-                        "Processing job metadata does not match the exam's frozen "
-                        "grading contract; run the whole-exam migration"
+                        "Processing job metadata does not match its effective frozen "
+                        f"grading contract ({contract_scope})"
                     ),
                     "updated_at": _now(),
                 },

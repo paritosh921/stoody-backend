@@ -21,10 +21,24 @@ async def _seed_supported_subjective_exam(db, exam_id: str) -> None:
             "exam_id": exam_id,
             "exam_type": "pcr",
             "pcr_grading_contract": {
-                "prompt_version": "pcr-full-document-visual-v13",
-                "pipeline_version": 4,
-                "mapping_pipeline_version": "evidence-first-visual-v4",
+                "prompt_version": "pcr-full-document-visual-v16",
+                "pipeline_version": 7,
+                "mapping_pipeline_version": "whole-copy-rubric-v7",
+                "required_processing_path": "full_document_visual",
             },
+        }
+    )
+
+
+async def _seed_submission(db, submission_id: str, exam_id: str, **extra) -> None:
+    await db["evalpen_submissions"].insert_one(
+        {
+            "submission_id": submission_id,
+            "exam_id": exam_id,
+            "student_id": f"STU-{submission_id}",
+            "source": "camera",
+            "publication_status": "pending",
+            **extra,
         }
     )
 
@@ -452,6 +466,7 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
 
     db = _fresh_db()
     await _seed_supported_subjective_exam(db, "EXAM-1")
+    await _seed_submission(db, "SUB-1", "EXAM-1")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
@@ -487,15 +502,15 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
         reason="Run the full-document answer mapper again",
     )
 
-    assert result["status"] == "queued_pipeline_v3"
-    assert task.calls == [("skb_test", "pcr-job-SUB-1", 4)]
+    assert result["status"] == "queued_pipeline_v7"
+    assert task.calls == [("skb_test", "pcr-job-SUB-1", 7)]
 
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-1"})
     assert stored["last_error"] is None
     assert stored["segmentation"] == {}
     assert stored["evaluation"] == {}
     assert "finished_at" not in stored
-    assert stored["mapping_pipeline_version"] == "evidence-first-visual-v4"
+    assert stored["mapping_pipeline_version"] == "whole-copy-rubric-v7"
     assert stored["attempts"] == 0
     assert stored["reprocess_count"] == 1
     assert stored["reprocess_requested_by"] == "TUT-1"
@@ -509,6 +524,11 @@ async def test_reprocess_resets_terminal_copy_with_audit_and_requeues(monkeypatc
             "previous_last_error": "OCR produced a collapsed full-page response",
             "previous_pipeline_version": 1,
             "force_reclaim": False,
+            "contract_scope": "exam",
+            "selected_copy_only": False,
+            "source_prompt_version": "pcr-full-document-visual-v16",
+            "target_prompt_version": "pcr-full-document-visual-v16",
+            "contract_override_id": None,
         }
     ]
 
@@ -525,11 +545,13 @@ async def test_reprocess_rejects_unsupported_exam_before_mutating_job(monkeypatc
     await db["exampen_exams"].insert_one(
         {
             "exam_id": "EXAM-LEGACY",
+            "exam_type": "pcr",
             "pcr_grading_contract": {
-                "prompt_version": "pcr-full-document-visual-v5"
+                "prompt_version": "pcr-full-document-visual-v99"
             },
         }
     )
+    await _seed_submission(db, "SUB-LEGACY", "EXAM-LEGACY")
     await db[PROCESSING_JOBS_COLLECTION].insert_one(
         {
             "job_id": "pcr-job-LEGACY",
@@ -547,7 +569,7 @@ async def test_reprocess_rejects_unsupported_exam_before_mutating_job(monkeypatc
     )
 
     with pytest.raises(
-        GradingContractMigrationRequiredError, match="legacy-to-v16"
+        GradingContractMigrationRequiredError, match="cannot be reprocessed"
     ):
         await reprocess_processing_job(
             db,
@@ -657,6 +679,7 @@ async def test_teacher_reprocess_rejects_an_active_processing_lease(monkeypatch)
 
     db = _fresh_db()
     await _seed_supported_subjective_exam(db, "EXAM-2")
+    await _seed_submission(db, "SUB-2", "EXAM-2")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
@@ -705,6 +728,7 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
 
     db = _fresh_db()
     await _seed_supported_subjective_exam(db, "EXAM-expired")
+    await _seed_submission(db, "SUB-expired", "EXAM-expired")
     jobs = db[PROCESSING_JOBS_COLLECTION]
     await jobs.insert_one(
         {
@@ -737,8 +761,8 @@ async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monke
         reason="Recover expired worker",
     )
 
-    assert result["status"] == "queued_pipeline_v3"
-    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 4)]
+    assert result["status"] == "queued_pipeline_v7"
+    assert task.calls == [("skb_test", "pcr-job-SUB-expired", 7)]
     stored = await jobs.find_one({"job_id": "pcr-job-SUB-expired"})
     assert "lease_token" not in stored
     assert "lease_expires_at" not in stored

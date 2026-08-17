@@ -81,7 +81,7 @@ ACTIVE_COLLECTION_STATES = {"draft", "armed", "in_progress"}
 
 
 def _require_reprocessable_grading_contract(exam: Dict[str, Any]) -> None:
-    """Reject per-copy reruns when the immutable exam cohort needs migration."""
+    """Reject cohort-wide reruns when the immutable exam contract needs migration."""
 
     migration_state = dict(exam.get("pcr_grading_contract_migration") or {})
     migration_status = str(migration_state.get("status") or "").strip().lower()
@@ -2145,7 +2145,6 @@ async def retry_exam_processing_job(
     if exam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
     await _require_tutor_visibility(exam, current_user, db)
-    _require_reprocessable_grading_contract(exam)
     job = await tenant_db["exampen_processing_jobs"].find_one({"job_id": job_id, "exam_id": exam_id})
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Processing job {job_id} not found")

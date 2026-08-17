@@ -615,6 +615,107 @@ async def test_normal_service_path_uses_one_mapping_and_one_grading_call(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_selected_legacy_copy_uses_v16_without_mutating_exam_contract(monkeypatch):
+    from datetime import datetime, timezone
+    from services.pcr_grading_contract_policy import build_selected_copy_v16_override
+
+    module = _module()
+    db = _db()
+    await _seed(db)
+    source_contract = {
+        "prompt_version": "pcr-full-document-visual-v12",
+        "pipeline_version": 3,
+        "mapping_pipeline_version": "evidence-first-visual-v3",
+        "required_processing_path": "full_document_visual",
+        "model_id": "gpt-5.1-2025-11-13",
+    }
+    await db["exampen_exams"].update_one(
+        {"exam_id": "EXAM-1"},
+        {"$set": {"pcr_grading_contract": source_contract}},
+    )
+    override = build_selected_copy_v16_override(
+        source_contract,
+        submission_id="SUB-1",
+        requested_by="TUT-1",
+        requested_at=datetime.now(timezone.utc),
+    )
+    await db["exampen_processing_jobs"].insert_one(
+        {
+            "job_id": "pcr-job-SUB-1",
+            "submission_id": "SUB-1",
+            "exam_id": "EXAM-1",
+            "status": "processing",
+            "pipeline_version": 7,
+            "mapping_pipeline_version": "whole-copy-rubric-v7",
+            "required_processing_path": "full_document_visual",
+            "reprocess_count": 1,
+            "grading_contract_override": override,
+        }
+    )
+    payload = {
+        "all_student_work_accounted": True,
+        "questions": [
+            {
+                "question_number": number,
+                "attempt_status": "attempted",
+                "confidence": 0.94,
+                "student_answer": f"Visible answer {number}",
+                "content_type": "TEXT_ONLY",
+                "source_pages": [1],
+                "criterion_marks": [
+                    {
+                        "criterion_id": criterion_id,
+                        "marks_awarded": 2,
+                        "confidence": 0.92,
+                        "rationale": "The visible work satisfies the criterion.",
+                        "evidence": "The answer is visible on page 1.",
+                        "credit_basis": "direct_evidence",
+                    }
+                ],
+                "total_score": 2,
+                "overall_feedback": "Correct.",
+                "needs_review": False,
+                "review_reason": "",
+            }
+            for number, criterion_id in ((1, "c1"), (2, "c2"))
+        ],
+    }
+    gate = _Gate([payload])
+    monkeypatch.setattr(
+        module,
+        "_read_canonical_file",
+        lambda *args, **kwargs: _value(b"%PDF-1.4 canonical"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_student_copy_content",
+        lambda *args, **kwargs: _value(
+            ([{"type": "input_text", "text": "complete copy"}], 20)
+        ),
+    )
+
+    async def must_not_freeze_exam(*_args, **_kwargs):
+        raise AssertionError("A selected-copy override must not mutate the exam contract")
+
+    monkeypatch.setattr(module, "_freeze_exam_grading_contract", must_not_freeze_exam)
+
+    result = await module.FullDocumentGradingService(
+        db, gate, model_id="gpt-5.1-2025-11-13"
+    ).grade_submission("SUB-1")
+
+    assert result.evaluated_count == 2
+    assert len(gate.calls) == 1
+    assert gate.calls[0]["metadata"]["pcr_stage"] == "whole_copy_visual_grading"
+    run = await db["evalpen_document_grading_runs"].find_one({"run_id": result.run_id})
+    assert run["prompt_version"] == "pcr-full-document-visual-v16"
+    assert run["contract_scope"] == "selected_submission_reprocess"
+    assert run["contract_override_id"] == override["override_id"]
+    assert run["source_prompt_version"] == "pcr-full-document-visual-v12"
+    exam = await db["exampen_exams"].find_one({"exam_id": "EXAM-1"})
+    assert exam["pcr_grading_contract"] == source_contract
+
+
+@pytest.mark.asyncio
 async def test_no_attempts_need_mapping_only_and_receive_zero(monkeypatch):
     module = _module()
     db = _db()

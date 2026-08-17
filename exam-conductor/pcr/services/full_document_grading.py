@@ -29,6 +29,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
 
 from pymongo.errors import DuplicateKeyError
+from services.pcr_grading_contract_policy import (
+    SELECTED_COPY_CONTRACT_SCOPE,
+    effective_grading_contract,
+    selected_copy_contract_override,
+)
 from services.objective_scoring_service import (
     ObjectiveScoringContractError,
     score_objective_response,
@@ -52,12 +57,10 @@ from .visual_evidence_graph import (
     PROMPT_VERSION as _EVIDENCE_GRAPH_PROMPT_VERSION,
     V15_PROMPT_VERSION as _EVIDENCE_GRAPH_V15_PROMPT_VERSION,
     evidence_mapping_schema,
-    compact_evidence_region_schema,
     compact_mapping_schema,
     compact_mapping_system_instructions,
     merge_compact_mapping_payloads,
     reconcile_compact_mapping_recovery,
-    normalize_compact_mapping_payload,
     grading_schema as evidence_grading_schema,
     grading_system_instructions,
     mapping_system_instructions,
@@ -72,8 +75,6 @@ from .orientation_views import (
     view_region_to_original,
 )
 from .whole_copy_grading import (
-    MAPPING_PIPELINE_VERSION as _V16_MAPPING_PIPELINE_VERSION,
-    PIPELINE_VERSION as _V16_PIPELINE_VERSION,
     PROMPT_VERSION as _V16_PROMPT_VERSION,
     merge_recovery_payload as _merge_whole_copy_recovery_payload,
     normalize_payload as _normalize_whole_copy_payload,
@@ -349,7 +350,18 @@ class FullDocumentGradingService:
                 submission_id=submission_id,
                 skipped_reason="Full-document visual grading is disabled for a legacy exam",
             )
-        grading_contract = dict(exam.get("pcr_grading_contract") or {})
+        processing_job = await self._db["exampen_processing_jobs"].find_one(
+            {"submission_id": submission_id, "exam_id": exam_id}
+        )
+        grading_contract, contract_scope = effective_grading_contract(
+            exam.get("pcr_grading_contract"),
+            processing_job,
+        )
+        contract_override = selected_copy_contract_override(processing_job)
+        contract_override_id = str(contract_override.get("override_id") or "")
+        source_prompt_version = str(
+            contract_override.get("source_prompt_version") or ""
+        )
         contract_version = str(grading_contract.get("prompt_version") or "").strip()
         # A frozen cohort selects its pipeline explicitly.  Existing exams with
         # no contract remain on v13; v14 is opt-in through migration and can
@@ -584,6 +596,9 @@ class FullDocumentGradingService:
                 requested_model_id=model_id,
                 page_count=len(answer_pages),
                 prompt_version=prompt_version,
+                contract_scope=contract_scope,
+                contract_override_id=contract_override_id or None,
+                source_prompt_version=source_prompt_version or None,
             )
 
         if existing_run and existing_run.get("status") in {
@@ -689,34 +704,35 @@ class FullDocumentGradingService:
                     f"Full-document model request failed: {str(exc)[:400]}"
                 ) from exc
 
-            try:
-                await _freeze_exam_grading_contract(
-                    self._db,
-                    exam_id=exam_id,
-                    model_id=str(usage.get("model") or model_id),
-                    temperature=temperature,
-                    reasoning_effort=reasoning_effort,
-                    prompt_version=prompt_version,
-                )
-            except Exception as exc:
-                await self._db[_RUNS_COLLECTION].update_one(
-                    {
-                        "run_id": run_id,
-                        "generation_lease_token": generation_lease_token,
-                    },
-                    {
-                        "$set": {
-                            "status": "failed",
-                            "generation_error": str(exc)[:500],
-                            "updated_at": datetime.now(timezone.utc),
+            if contract_scope != SELECTED_COPY_CONTRACT_SCOPE:
+                try:
+                    await _freeze_exam_grading_contract(
+                        self._db,
+                        exam_id=exam_id,
+                        model_id=str(usage.get("model") or model_id),
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
+                        prompt_version=prompt_version,
+                    )
+                except Exception as exc:
+                    await self._db[_RUNS_COLLECTION].update_one(
+                        {
+                            "run_id": run_id,
+                            "generation_lease_token": generation_lease_token,
                         },
-                        "$unset": {
-                            "generation_lease_token": "",
-                            "generation_lease_expires_at": "",
+                        {
+                            "$set": {
+                                "status": "failed",
+                                "generation_error": str(exc)[:500],
+                                "updated_at": datetime.now(timezone.utc),
+                            },
+                            "$unset": {
+                                "generation_lease_token": "",
+                                "generation_lease_expires_at": "",
+                            },
                         },
-                    },
-                )
-                raise
+                    )
+                    raise
             now = datetime.now(timezone.utc)
             saved_run = await self._db[_RUNS_COLLECTION].update_one(
                 {
@@ -727,6 +743,9 @@ class FullDocumentGradingService:
                     "$set": {
                         "status": "validated",
                         "prompt_version": prompt_version,
+                        "contract_scope": contract_scope,
+                        "contract_override_id": contract_override_id or None,
+                        "source_prompt_version": source_prompt_version or None,
                         "model_used": usage.get("model") or model_id,
                         "validated_payload": raw_payload,
                         "raw_llm_response": raw_llm,
@@ -1192,6 +1211,9 @@ async def _claim_or_wait_for_run(
     requested_model_id: str,
     page_count: int,
     prompt_version: str,
+    contract_scope: str = "exam",
+    contract_override_id: Optional[str] = None,
+    source_prompt_version: Optional[str] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Single-flight technical retries for one submission grading generation.
 
@@ -1231,6 +1253,9 @@ async def _claim_or_wait_for_run(
                         "grading_revision": generation_revision,
                         "generation_revision": generation_revision,
                         "prompt_version": prompt_version,
+                        "contract_scope": contract_scope,
+                        "contract_override_id": contract_override_id,
+                        "source_prompt_version": source_prompt_version,
                         "requested_model_id": requested_model_id,
                         "input_fingerprint": input_fingerprint,
                         "generation_fingerprint": generation_fingerprint,
@@ -1798,8 +1823,7 @@ def _build_whole_copy_responses_input(
         {
             "type": "input_file",
             "filename": _safe_pdf_filename(paper_filename, "question-paper.pdf"),
-            "file_data": "data:application/pdf;base64,"
-            + base64.b64encode(paper_bytes).decode("ascii"),
+            "file_data": "data:application/pdf;base64," + base64.b64encode(paper_bytes).decode("ascii"),
         },
     ]
     if solution_bytes:
@@ -3340,7 +3364,8 @@ def _build_compact_mapping_responses_input(
         {
             "type": "input_file",
             "filename": _safe_pdf_filename(paper_filename, "question-paper.pdf"),
-            "file_data": "data:application/pdf;base64," + base64.b64encode(paper_bytes).decode("ascii"),
+            "file_data": "data:application/pdf;base64,"
+            + base64.b64encode(paper_bytes).decode("ascii"),
         },
     ]
     unit_content: List[Dict[str, Any]] = [

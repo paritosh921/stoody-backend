@@ -53,6 +53,7 @@ from api.v1.exam_orch_async import (
 from services.answer_mapping_contract import normalize_answer_label
 from services.evalpen_flag_utils import is_flag_resolved, resolve_flag
 from services.exampen_workflow import (
+    can_upgrade_legacy_pcr_contract_on_demand,
     is_supported_pcr_grading_contract,
     public_processing_status,
 )
@@ -911,15 +912,30 @@ async def get_submission_summary(
         if contract_migration_required:
             current_exam = await tenant_db["exampen_exams"].find_one(
                 {"exam_id": str(sub_dict.get("exam_id") or "")},
-                {"_id": 0, "pcr_grading_contract": 1},
+                {
+                    "_id": 0,
+                    "pcr_grading_contract": 1,
+                    "pcr_grading_contract_migration": 1,
+                },
             )
             # A job can retain this terminal error when an old worker claimed
             # it immediately before a contract migration or rolling restart.
             # Reprocess must become available once the currently running
             # worker supports the exam's frozen contract; the reprocess
             # endpoint will atomically rewrite the stale job metadata.
-            contract_migration_required = not is_supported_pcr_grading_contract(
-                (current_exam or {}).get("pcr_grading_contract")
+            current_contract = (current_exam or {}).get("pcr_grading_contract")
+            migration_status = str(
+                ((current_exam or {}).get("pcr_grading_contract_migration") or {}).get(
+                    "status"
+                )
+                or ""
+            ).strip().lower()
+            contract_migration_required = bool(
+                migration_status in {"applying", "failed"}
+                or not (
+                    is_supported_pcr_grading_contract(current_contract)
+                    or can_upgrade_legacy_pcr_contract_on_demand(current_contract)
+                )
             )
         can_reprocess = bool(
             processing_job_id
@@ -933,8 +949,8 @@ async def get_submission_summary(
             reprocess_block_reason = "Published results must use the recheck workflow"
         elif contract_migration_required:
             reprocess_block_reason = (
-                "This exam uses an unsupported frozen grading contract. "
-                "Migrate and reprocess the complete cohort."
+                "This paper cannot use safe selected-copy reprocessing until its "
+                "grading contract migration is completed."
             )
         elif retry_scheduled:
             reprocess_block_reason = "An automatic retry is already scheduled"
