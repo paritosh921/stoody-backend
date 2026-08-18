@@ -109,6 +109,7 @@ PCR_AUTHORING_VISION_MODEL = os.getenv(
     "PCR_AUTHORING_VISION_MODEL",
     ANSWER_MAPPING_VISION_MODEL,
 )
+PCR_MARKING_PLAN_CONTRACT = "pcr-assessment-units-v2"
 QUESTION_PAPER_VISION_MODEL = os.getenv(
     "QUESTION_PAPER_VISION_MODEL",
     PCR_AUTHORING_VISION_MODEL,
@@ -365,6 +366,32 @@ async def _prepare_pcr_finalization(
         document_id=str(document.get("document_id") or ""),
         questions=questions,
     )
+    expected_total = (
+        document.get("total_points")
+        if str(document.get("total_points_source") or "").lower() == "teacher"
+        else None
+    )
+    if expected_total is None:
+        for question in finalized_questions:
+            metadata = question.get("metadata")
+            paper_summary = metadata.get("paper_marks_summary") if isinstance(metadata, dict) else None
+            if isinstance(paper_summary, dict) and paper_summary.get("expected_total") is not None:
+                expected_total = paper_summary.get("expected_total")
+                break
+    marks_summary = summarize_question_marks(
+        finalized_questions,
+        expected_total=expected_total,
+    )
+    mark_warnings: List[str] = []
+    provisional_count = int(marks_summary.get("provisional_count") or 0)
+    if provisional_count:
+        mark_warnings.append(
+            f"{provisional_count} question(s) use a provisional 1-mark default because printed marks were unavailable; review is recommended."
+        )
+    if provisional_count and marks_summary.get("reconciled") is False:
+        mark_warnings.append(
+            "The provisional question-mark total does not match the printed or teacher-provided paper total."
+        )
     marking_errors = validate_pcr_questions(
         finalized_questions,
         marking_policy=marking_policy,
@@ -384,11 +411,12 @@ async def _prepare_pcr_finalization(
         "errors": readiness_errors,
         "marking_errors": marking_errors,
         "paper_context_errors": paper_context_errors,
-        "warnings": list(layout_resolution.get("warnings") or []),
+        "warnings": [*mark_warnings, *list(layout_resolution.get("warnings") or [])],
         "questions": finalized_questions,
         "question_layout": list(layout_resolution.get("question_layout") or []),
         "marking_policy": marking_policy,
         "marking_plan": marking_plan_summary,
+        "marks_summary": marks_summary,
         "strategy": layout_resolution.get("strategy") or "unavailable",
         "paper_context": dict(layout_resolution.get("paper_context") or {}),
     }
@@ -402,6 +430,7 @@ def _public_pcr_finalization_readiness(
     errors = list(preflight.get("errors") or [])
     warnings = list(preflight.get("warnings") or [])
     marking_plan = dict(preflight.get("marking_plan") or {})
+    marks_summary = dict(preflight.get("marks_summary") or {})
     strategy = str(preflight.get("strategy") or "unavailable")
     marking_ready = not preflight.get("marking_errors")
     paper_context_ready = strategy in {
@@ -418,6 +447,7 @@ def _public_pcr_finalization_readiness(
         "errors": errors,
         "warnings": warnings,
         "marking_plan": marking_plan,
+        "marks_summary": marks_summary,
         "paper_context": preflight.get("paper_context") or {},
         "checks": [
             {
@@ -435,6 +465,17 @@ def _public_pcr_finalization_readiness(
                 "label": "Questions understood",
                 "ready": bool(questions),
                 "detail": f"{len(questions)} questions in the canonical catalog",
+            },
+            {
+                "id": "marks",
+                "label": "Question marks",
+                "ready": True,
+                "review_required": bool(marks_summary.get("review_required_count")),
+                "detail": (
+                    f"{int(marks_summary.get('provisional_count') or 0)} question(s) provisionally use 1 mark — review recommended"
+                    if marks_summary.get("review_required_count")
+                    else "Printed or teacher-confirmed question marks are ready"
+                ),
             },
             {
                 "id": "marking-plan",
@@ -3253,6 +3294,59 @@ def _expected_pcr_assessment_unit_count(question_text: str, question_marks: floa
     return None
 
 
+def _printed_pcr_unit_marks(
+    question_text: str,
+    question_marks: float,
+) -> Optional[List[float]]:
+    """Return an exact repeated subpart ledger only when it is printed."""
+
+    for match in _PCR_MARKS_MULTIPLIER_RE.finditer(str(question_text or "")):
+        count = int(match.group("count"))
+        each = float(match.group("each"))
+        declared_total = float(match.group("total"))
+        if (
+            1 < count <= 30
+            and abs(count * each - declared_total) <= 0.01
+            and abs(declared_total - float(question_marks or 0)) <= 0.01
+        ):
+            return [each] * count
+    return None
+
+
+def _semantic_weighted_assessment_units(value: Any) -> Any:
+    """Map semantic weights to the legacy numeric slots before compilation.
+
+    The model proposes relative importance, never authoritative marks. Keeping
+    this adapter at the response boundary also accepts older provider output
+    that still calls those suggestions ``max_marks``.
+    """
+
+    if not isinstance(value, list):
+        return value
+    weighted_units: List[Any] = []
+    for raw_unit in value:
+        if not isinstance(raw_unit, dict):
+            weighted_units.append(raw_unit)
+            continue
+        unit = dict(raw_unit)
+        if unit.get("relative_weight") is not None:
+            unit["max_marks"] = unit.get("relative_weight")
+        raw_criteria = unit.get("marking_criteria", unit.get("criteria", []))
+        if isinstance(raw_criteria, list):
+            criteria = []
+            for raw_criterion in raw_criteria:
+                if not isinstance(raw_criterion, dict):
+                    criteria.append(raw_criterion)
+                    continue
+                criterion = dict(raw_criterion)
+                if criterion.get("relative_weight") is not None:
+                    criterion["max_marks"] = criterion.get("relative_weight")
+                criteria.append(criterion)
+            unit["marking_criteria"] = criteria
+        weighted_units.append(unit)
+    return weighted_units
+
+
 def _parse_pcr_marking_plan_draft(
     raw_response: str,
     *,
@@ -3284,7 +3378,7 @@ def _parse_pcr_marking_plan_draft(
     try:
         if raw_units is not None:
             assessment_units = policy_module.normalize_assessment_units(
-                raw_units,
+                _semantic_weighted_assessment_units(raw_units),
                 assign_missing_ids=True,
             )
         else:
@@ -3323,6 +3417,19 @@ def _parse_pcr_marking_plan_draft(
                 ],
                 assign_missing_ids=True,
             )
+    except ValueError as exc:
+        raise ValueError(f"The AI returned invalid assessment units: {exc}") from exc
+
+    try:
+        assessment_units = policy_module.compile_assessment_units_to_budget(
+            assessment_units,
+            question_marks,
+            question_text=question_text,
+            explicit_unit_marks=_printed_pcr_unit_marks(
+                question_text,
+                question_marks,
+            ),
+        )
     except ValueError as exc:
         raise ValueError(f"The AI returned invalid assessment units: {exc}") from exc
 
@@ -3373,6 +3480,53 @@ def _parse_pcr_marking_plan_draft(
     }
 
 
+def _saved_pcr_marking_plan_errors(question: Dict[str, Any]) -> List[str]:
+    """Validate one saved plan against its current runtime mark budget."""
+
+    question_marks = effective_question_marks(question)
+    if question_marks is None:
+        return ["question mark budget is unavailable"]
+    reference_solution = str(question.get("reference_solution") or "").strip()
+    if not reference_solution:
+        return ["reference solution is missing"]
+
+    policy_module = _pcr_marking_policy_module()
+    raw_units = question.get("assessment_units")
+    if raw_units:
+        try:
+            units = policy_module.normalize_assessment_units(
+                raw_units,
+                assign_missing_ids=False,
+            )
+        except ValueError as exc:
+            return [str(exc)]
+        errors = policy_module.validate_assessment_units(
+            units,
+            question_marks,
+            require_reference_solution=True,
+        )
+        projected = policy_module.flatten_assessment_unit_criteria(units)
+        try:
+            saved = policy_module.normalize_marking_criteria(
+                question.get("marking_criteria") or [],
+                assign_missing_ids=False,
+            )
+        except ValueError as exc:
+            return [*errors, str(exc)]
+        if policy_module.snapshot_criteria(projected) != policy_module.snapshot_criteria(saved):
+            errors.append("assessment-unit criteria projection is out of sync")
+        return errors
+
+    try:
+        criteria = policy_module.normalize_marking_criteria(
+            question.get("marking_criteria") or [],
+            assign_missing_ids=False,
+        )
+    except ValueError as exc:
+        return [str(exc)]
+    return policy_module.validate_marking_criteria(criteria, question_marks)
+
+
 def _build_answer_key_pcr_marking_plan_draft(
     *,
     document: Dict[str, Any],
@@ -3387,10 +3541,7 @@ def _build_answer_key_pcr_marking_plan_draft(
     full-mark result criterion with no method requirement.
     """
 
-    try:
-        question_marks = float(question.get("points") or question.get("max_marks") or 0)
-    except (TypeError, ValueError):
-        question_marks = 0.0
+    question_marks = float(effective_question_marks(question) or 0)
     if question_marks <= 0:
         raise ValueError("Set question marks before drafting marking criteria")
 
@@ -3809,10 +3960,7 @@ async def generate_pcr_marking_plan_draft(
     from openai import AsyncOpenAI
 
     question_text = str(question.get("question_text") or question.get("text") or "").strip()
-    try:
-        question_marks = float(question.get("points") or question.get("max_marks") or 0)
-    except (TypeError, ValueError):
-        question_marks = 0.0
+    question_marks = float(effective_question_marks(question) or 0)
     if not question_text:
         raise ValueError("The question text is empty")
     if question_marks <= 0:
@@ -3888,14 +4036,21 @@ async def generate_pcr_marking_plan_draft(
         "Treat the teacher's marking guidance as authoritative. Use the document subject, board or course, class or standard, difficulty, and question wording to infer the expected level and response type.\n"
         "For mathematics and science, reward correct results, valid reasoning, method steps, units, diagrams, and error-carried-forward only where they are relevant to the available marks. Accept equivalent valid methods unless the teacher or question requires a named method.\n"
         "For languages, humanities, essays, speeches, paragraphs, and other open responses, assess meaning rather than exact wording. Build criteria appropriate to the task, such as relevance and accuracy of ideas, organization, reasoning, evidence, language control, style, format, or creativity. Do not require the teacher answer's exact phrasing.\n"
-        "First decompose the printed question into leaf ASSESSMENT UNITS: each unit must be something a student answers and receives its own stated marks for. Preserve printed labels such as 4(a)(i), 4(b), etc. Keep one unit only when the printed question is genuinely one assessable response. "
+        "First identify the leaf ANSWER COMPONENTS in the printed question. Preserve printed labels such as 4(a)(i), 4(b), etc. A requested component is not automatically a separately marked unit. "
         + (
             f"The printed marks formula declares exactly {expected_unit_count} separately marked units; return exactly {expected_unit_count} assessment_units. "
             if expected_unit_count
-            else "Infer the smallest defensible set of separately marked leaf units from the wording and mark allocation. "
+            else (
+                "Because no printed subpart allocation is available, use the smallest defensible set of scoring units. "
+                + (
+                    "This question has a one-mark budget: return one inclusive assessment unit whose prompt, reference solution, and criterion cover every requested component. "
+                    if question_marks <= 1.0
+                    else "Separate units only when they represent genuinely independent achievements within the question total. "
+                )
+            )
         )
-        + "The assessment-unit marks MUST sum exactly to the displayed question marks. Assign a visual only to the unit that actually depends on it; refer to attached visuals using their supplied labels in figure_refs. "
-        "For every unit, choose scoring_model=point_based for independently countable facts, steps, labels, results, or listed items; each point_based criterion must be worth at most 1 mark. Choose scoring_model=holistic_banded only for an indivisible quality range such as essay organization, language quality, creativity, or an integrated explanation; multi-mark criteria are allowed only there. "
+        + "Use relative_weight only to express the importance of units and criteria; the server, not you, owns and compiles the numeric marks ledger. Assign a visual only to the unit that actually depends on it; refer to attached visuals using their supplied labels in figure_refs. "
+        "For every unit, choose scoring_model=point_based for independently countable facts, steps, labels, results, or listed items. Choose scoring_model=holistic_banded for an indivisible quality range such as essay organization, language quality, creativity, or an integrated explanation. "
         "Create clear criterion rows using requirements supported by the teacher solution when supplied, otherwise by the generated reference answer. "
         "Do not automatically require method, intermediate work, and a final answer when the source or mark value does not require all three. "
         "Never make a criterion stricter than the teacher solution, and do not invent facts, alternate answers, steps, or marks that are not supported by the source.\n"
@@ -3904,18 +4059,18 @@ async def generate_pcr_marking_plan_draft(
         "A question that merely names an operation, calculation route, or tool is not enough when the completed result independently proves the awarded criteria. "
         "When specified_method_required is justified, copy the requirement into required_method and include explicit method-mark criteria. "
         "Use no_method_required when a result alone earns the available marks. Enable error-carried-forward unless the question or scheme clearly forbids it.\n"
-        f"The displayed question is worth exactly {question_marks:g} marks. For every unit, criterion max_marks must sum to that unit's max_marks; all unit max_marks must sum to {question_marks:g}.\n"
-        "For procedural mathematics and science, prefer independently assessable one-mark rows when the work genuinely contains distinct achievements. "
-        "For open-ended language or humanities responses, use a small set of meaningful criteria and allow a criterion to carry multiple marks so teachers can award proportional credit. "
-        "Do not split a holistic writing quality into artificial one-mark rows merely to satisfy a template.\n"
-        "Use at least one positive-mark criterion. Each description must state what earns that mark; acceptable_evidence must include the reference solution's method and conclusion plus clearly equivalent valid alternatives. "
-        "For a one-mark question, normally use one inclusive criterion rather than demanding extra proof absent from the uploaded solution.\n"
+        f"The displayed question budget is exactly {question_marks:g} marks. Do not increase it because the question contains multiple parts. The server will convert relative weights into an exact ledger totaling {question_marks:g}.\n"
+        "For procedural mathematics and science, use distinct criterion rows when the work genuinely contains independently assessable achievements. "
+        "For open-ended language or humanities responses, use a small set of meaningful weighted criteria so teachers can award proportional credit. "
+        "Do not split a holistic writing quality into artificial rows merely to satisfy a template.\n"
+        "Use at least one criterion with a positive relative_weight. Each description must state what earns credit; acceptable_evidence must include the reference solution's method and conclusion plus clearly equivalent valid alternatives. "
+        "For a one-mark question without printed subpart marks, always use one inclusive assessment unit and one inclusive criterion rather than assigning one mark to every requested part.\n"
         f"Teacher marking standard: {strictness}. {policy_module.strictness_instruction(strictness)}\n"
         "Return ONLY valid JSON, without markdown fences, in this exact shape:\n"
         '{"assessment_units":[{"unit_id":"unit_1","label":"4(a)(i)","prompt":"leaf question text",'
-        '"max_marks":2,"scoring_model":"point_based","figure_refs":[],"reference_solution":"teacher-ready answer for this leaf",'
+        '"relative_weight":2,"scoring_model":"point_based","figure_refs":[],"reference_solution":"teacher-ready answer for this leaf",'
         '"method_policy":{"mode":"any_valid_method","required_method":null,"allow_error_carried_forward":true},'
-        '"marking_criteria":[{"criterion_id":"criterion_1","description":"...","max_marks":1,"acceptable_evidence":"..."}]}]}\n\n'
+        '"marking_criteria":[{"criterion_id":"criterion_1","description":"...","relative_weight":1,"acceptable_evidence":"..."}]}]}\n\n'
         f"Document: {document.get('title') or document.get('document_id') or ''}\n"
         f"Subject: {question.get('subject') or document.get('subject') or 'General'}\n"
         f"Board/course: {document.get('course_plan') or document.get('board') or document.get('curriculum') or 'Not specified'}\n"
@@ -4010,8 +4165,9 @@ async def generate_pcr_marking_plan_draft(
         repair_prompt = (
             "Repair this PCR authoring JSON. Return the complete corrected JSON only.\n"
             "Do not change the displayed question total, teacher solution facts, or visual interpretation. "
-            "Correct the assessment-unit hierarchy and marks ledger according to the validation error. "
-            "Point-based criteria may be worth at most 1 mark; holistic_banded may be multi-mark only for genuinely indivisible response quality.\n\n"
+            "Correct the assessment-unit hierarchy and semantic coverage according to the validation error. "
+            "Use relative_weight for importance; the server compiles all authoritative numeric marks. "
+            "When the total is one and no printed subpart allocation exists, return one inclusive unit and criterion covering every required part.\n\n"
             f"VALIDATION ERROR:\n{initial_error}\n\n"
             f"QUESTION MARKS: {question_marks:g}\n"
             f"EXPECTED UNIT COUNT: {expected_unit_count or 'infer from printed parts'}\n"
@@ -4704,19 +4860,22 @@ async def run_document_ocr_pipeline(
             "ocr_quality_summary": quality_summary,
             "ocr_manual_segmentation_recommended": quality_summary.get("manual_segmentation_recommended", False),
             "marks_extraction_summary": marks_summary,
-            "marks_review_required": bool(marks_summary.get("unresolved_count"))
+            "marks_review_required": bool(marks_summary.get("review_required_count"))
             or marks_summary.get("reconciled") is False,
         }
 
         if document_fresh and document_fresh.get("document_type") == "Test Series":
             total_is_complete = (
                 int(marks_summary.get("unresolved_count") or 0) == 0
-                and marks_summary.get("reconciled") is not False
                 and positive_marks(marks_summary.get("calculated_total")) is not None
             )
             if total_is_complete and document_fresh.get("total_points_source") != "teacher":
                 update_data["total_points"] = marks_summary["calculated_total"]
-                update_data["total_points_source"] = "visual_question_marks"
+                update_data["total_points_source"] = (
+                    "provisional_question_marks"
+                    if int(marks_summary.get("provisional_count") or 0) > 0
+                    else "visual_question_marks"
+                )
                 logger.info(
                     "Visually reconciled total_points for %s: %s",
                     document_id,
@@ -8563,14 +8722,11 @@ async def recalculate_document_points(
                 else None
             ),
         )
-        if (
-            int(marks_summary.get("unresolved_count") or 0) > 0
-            or marks_summary.get("reconciled") is False
-        ):
+        if int(marks_summary.get("unresolved_count") or 0) > 0:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={
-                    "message": "Total marks cannot be calculated until every printed mark is verified.",
+                    "message": "Total marks cannot be calculated because a runtime mark budget is unavailable.",
                     "marks_summary": marks_summary,
                 },
             )
@@ -9962,7 +10118,7 @@ async def update_question(
                         update_data["marking_plan_generation_status"] = "completed"
                         update_data["marking_plan_generation_error"] = None
                         update_data["marking_plan_generation_contract"] = (
-                            "pcr-assessment-units-v1"
+                            PCR_MARKING_PLAN_CONTRACT
                         )
                 elif existing_question.get("assessment_units"):
                     update_data["marking_criteria"] = []
@@ -10246,18 +10402,21 @@ async def update_question(
                     )
                     document_marks_update: Dict[str, Any] = {
                         "marks_extraction_summary": marks_summary,
-                        "marks_review_required": bool(marks_summary.get("unresolved_count"))
+                        "marks_review_required": bool(marks_summary.get("review_required_count"))
                         or marks_summary.get("reconciled") is False,
                     }
                     if (
                         int(marks_summary.get("unresolved_count") or 0) == 0
-                        and marks_summary.get("reconciled") is not False
                     ):
                         document_marks_update["total_points"] = marks_summary["calculated_total"]
                         document_marks_update["total_points_source"] = (
                             "teacher"
                             if document.get("total_points_source") == "teacher"
-                            else "teacher_question_marks"
+                            else (
+                                "provisional_question_marks"
+                                if int(marks_summary.get("provisional_count") or 0) > 0
+                                else "teacher_question_marks"
+                            )
                         )
 
                     if is_b2c:
@@ -10404,13 +10563,17 @@ async def bulk_update_questions(
             marks_summary = summarize_question_marks(all_qs)
             document_marks_update: Dict[str, Any] = {
                 "marks_extraction_summary": marks_summary,
-                "marks_review_required": bool(marks_summary.get("unresolved_count")),
+                "marks_review_required": bool(marks_summary.get("review_required_count")),
             }
             if int(marks_summary.get("unresolved_count") or 0) == 0:
                 document_marks_update.update(
                     {
                         "total_points": marks_summary["calculated_total"],
-                        "total_points_source": "teacher_question_marks",
+                        "total_points_source": (
+                            "provisional_question_marks"
+                            if int(marks_summary.get("provisional_count") or 0) > 0
+                            else "teacher_question_marks"
+                        ),
                     }
                 )
             if is_b2c:
@@ -11887,10 +12050,15 @@ async def generate_document_solutions(
                 existing_reference = str(question.get("reference_solution") or "").strip()
                 has_existing_reference = bool(existing_reference)
                 has_existing_criteria = bool(existing_criteria)
-                has_existing_plan = bool(has_existing_reference and has_existing_criteria)
+                existing_plan_errors = (
+                    _saved_pcr_marking_plan_errors(question)
+                    if has_existing_reference and has_existing_criteria
+                    else ["marking plan is incomplete"]
+                )
+                has_existing_plan = not existing_plan_errors
                 may_replace_plan = bool(
-                    generation_request.replaceExisting
-                    and existing_plan_source == "ai_generated"
+                    existing_plan_source == "ai_generated"
+                    and (generation_request.replaceExisting or bool(existing_plan_errors))
                 )
                 has_teacher_owned_plan_content = bool(
                     existing_plan_source != "ai_generated"
@@ -11898,6 +12066,25 @@ async def generate_document_solutions(
                 )
                 if has_existing_plan and not may_replace_plan:
                     preserved_teacher_content += 1
+                    continue
+
+                if has_teacher_owned_plan_content and existing_plan_errors:
+                    marking_plan_failed += 1
+                    failure_detail = (
+                        "Teacher-owned marking plan needs review: "
+                        + "; ".join(existing_plan_errors[:3])
+                    )
+                    marking_plan_failures.append(
+                        {
+                            "questionId": question_id,
+                            "questionLabel": str(
+                                question.get("question_number")
+                                or question.get("extraction_order")
+                                or question_id
+                            ),
+                            "error": failure_detail[:1000],
+                        }
+                    )
                     continue
 
                 mapping = existing_mapping_by_question.get(question_id) or {}
@@ -11962,7 +12149,7 @@ async def generate_document_solutions(
                             else "ai_generated"
                         ),
                         "marking_plan_review_status": "needs_review",
-                        "marking_plan_generation_contract": "pcr-assessment-units-v1",
+                        "marking_plan_generation_contract": PCR_MARKING_PLAN_CONTRACT,
                         "marking_plan_generator_provider": plan_draft.get("provider"),
                         "marking_plan_generator_model": plan_draft.get("model"),
                         "marking_plan_generated_at": datetime.utcnow(),

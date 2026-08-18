@@ -1081,6 +1081,7 @@ def validate_pcr_questions(
             and metadata.get("paper_marks_reconciled") is False
             and current_marks_summary.get("reconciled") is False
             and int(current_marks_summary.get("unresolved_count") or 0) == 0
+            and int(current_marks_summary.get("provisional_count") or 0) == 0
         ):
             errors.append(
                 f"Q {label}: resolve the mismatch between question marks and the paper total"

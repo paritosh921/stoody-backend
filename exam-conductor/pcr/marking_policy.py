@@ -506,6 +506,221 @@ def normalize_assessment_units(
     return units
 
 
+def _mark_quantum(total_marks: float, item_count: int) -> Optional[float]:
+    """Choose the coarsest conventional increment that can fund every item."""
+
+    for quantum in (1.0, 0.5, 0.25, 0.1, 0.05, 0.01):
+        ticks = round(total_marks / quantum)
+        if (
+            ticks >= item_count
+            and math.isclose(ticks * quantum, total_marks, abs_tol=_MARK_TOLERANCE)
+        ):
+            return quantum
+    return None
+
+
+def _allocate_mark_budget(
+    total_marks: float,
+    weights: Iterable[Any],
+) -> Optional[List[float]]:
+    """Allocate an exact budget using relative semantic weights.
+
+    Model-produced numbers are treated only as relative importance. The
+    server owns the mark ledger, uses conventional school-mark increments,
+    and guarantees an exact total. ``None`` means the budget cannot give every
+    requested row a positive mark and the caller should collapse the rows.
+    """
+
+    normalized_weights: List[float] = []
+    for raw_weight in weights:
+        try:
+            weight = float(raw_weight or 0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        normalized_weights.append(weight if math.isfinite(weight) and weight > 0 else 1.0)
+    if not normalized_weights:
+        return []
+
+    quantum = _mark_quantum(total_marks, len(normalized_weights))
+    if quantum is None:
+        return None
+    total_ticks = int(round(total_marks / quantum))
+    base_ticks = [1] * len(normalized_weights)
+    remaining = total_ticks - len(normalized_weights)
+    if remaining <= 0:
+        return [round(quantum, 2) for _ in normalized_weights]
+
+    weight_total = sum(normalized_weights)
+    raw_extras = [remaining * weight / weight_total for weight in normalized_weights]
+    extra_ticks = [int(math.floor(value)) for value in raw_extras]
+    undistributed = remaining - sum(extra_ticks)
+    priority = sorted(
+        range(len(raw_extras)),
+        key=lambda index: (raw_extras[index] - extra_ticks[index], normalized_weights[index], -index),
+        reverse=True,
+    )
+    for index in priority[:undistributed]:
+        extra_ticks[index] += 1
+    return [
+        round((base_ticks[index] + extra_ticks[index]) * quantum, 2)
+        for index in range(len(normalized_weights))
+    ]
+
+
+def _inclusive_criterion(
+    criteria: Iterable[Mapping[str, Any]],
+    *,
+    max_marks: float,
+) -> Dict[str, Any]:
+    normalized = normalize_marking_criteria(list(criteria), assign_missing_ids=True)
+    descriptions = [
+        str(item.get("description") or "").strip()
+        for item in normalized
+        if str(item.get("description") or "").strip()
+    ]
+    evidence = [
+        str(item.get("acceptable_evidence") or "").strip()
+        for item in normalized
+        if str(item.get("acceptable_evidence") or "").strip()
+    ]
+    description = "Provides a correct and sufficiently complete response to the required question parts."
+    if descriptions:
+        description += " Required achievements: " + "; ".join(descriptions)
+    acceptable_evidence = "Accept the reference solution and clearly equivalent valid responses."
+    if evidence:
+        acceptable_evidence += " Evidence may include: " + "; ".join(evidence)
+    return {
+        "criterion_id": "complete_response",
+        "description": description[:1600],
+        "max_marks": round(max_marks, 2),
+        "acceptable_evidence": acceptable_evidence[:1600],
+    }
+
+
+def _compile_unit_criteria(unit: Dict[str, Any]) -> Dict[str, Any]:
+    compiled = dict(unit)
+    criteria = list(compiled.get("marking_criteria") or [])
+    unit_marks = float(compiled.get("max_marks") or 0)
+    if not criteria:
+        return compiled
+
+    allocations = _allocate_mark_budget(
+        unit_marks,
+        [item.get("max_marks") for item in criteria],
+    )
+    if allocations is None or (unit_marks <= 1.0 and len(criteria) > 1):
+        compiled["marking_criteria"] = [
+            _inclusive_criterion(criteria, max_marks=unit_marks)
+        ]
+        compiled["scoring_model"] = (
+            POINT_BASED_SCORING if unit_marks <= 1.0 else HOLISTIC_BANDED_SCORING
+        )
+        return compiled
+
+    compiled_criteria: List[Dict[str, Any]] = []
+    for criterion, marks in zip(criteria, allocations):
+        row = dict(criterion)
+        row["max_marks"] = marks
+        compiled_criteria.append(row)
+    compiled["marking_criteria"] = compiled_criteria
+    if (
+        compiled.get("scoring_model") == POINT_BASED_SCORING
+        and any(float(item.get("max_marks") or 0) > 1.0 for item in compiled_criteria)
+    ):
+        compiled["scoring_model"] = HOLISTIC_BANDED_SCORING
+    return compiled
+
+
+def compile_assessment_units_to_budget(
+    value: Any,
+    question_max_marks: Any,
+    *,
+    question_text: str = "",
+    explicit_unit_marks: Optional[List[float]] = None,
+) -> List[Dict[str, Any]]:
+    """Compile semantic assessment units into a server-owned mark ledger.
+
+    Printed subpart marks, when supplied, remain exact. Otherwise the model's
+    suggested numbers are relative weights only. A one-mark question without
+    printed subpart allocation becomes one inclusive question-level unit, so
+    several requested parts can never accidentally inflate the total marks.
+    """
+
+    units = normalize_assessment_units(value, assign_missing_ids=True)
+    if not units:
+        return []
+    try:
+        question_marks = float(question_max_marks)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Question marks must be a positive number") from exc
+    if not math.isfinite(question_marks) or question_marks <= 0:
+        raise ValueError("Question marks must be a positive number")
+
+    printed_allocations = list(explicit_unit_marks or [])
+    if printed_allocations:
+        if len(printed_allocations) != len(units):
+            return units
+        if not math.isclose(sum(printed_allocations), question_marks, abs_tol=_MARK_TOLERANCE):
+            raise ValueError("Printed subpart marks do not match the question total")
+        allocations = [round(float(value), 2) for value in printed_allocations]
+    else:
+        allocations = _allocate_mark_budget(
+            question_marks,
+            [unit.get("max_marks") for unit in units],
+        )
+
+    if allocations is None or (question_marks <= 1.0 and len(units) > 1 and not printed_allocations):
+        labels = [str(unit.get("label") or "").strip() for unit in units]
+        reference_sections = []
+        all_criteria: List[Dict[str, Any]] = []
+        figure_refs: List[str] = []
+        for position, unit in enumerate(units, start=1):
+            label = str(unit.get("label") or f"Part {position}").strip()
+            reference = str(unit.get("reference_solution") or "").strip()
+            if reference:
+                reference_sections.append(f"{label}: {reference}")
+            all_criteria.extend(unit.get("marking_criteria") or [])
+            for figure_ref in unit.get("figure_refs") or []:
+                if figure_ref not in figure_refs:
+                    figure_refs.append(figure_ref)
+        method_policies = [unit.get("method_policy") for unit in units]
+        method_policy = (
+            method_policies[0]
+            if method_policies and all(item == method_policies[0] for item in method_policies)
+            else default_method_policy()
+        )
+        return normalize_assessment_units(
+            [
+                {
+                    "unit_id": "unit_1",
+                    "label": "Whole question",
+                    "prompt": str(question_text or "").strip()
+                    or "Complete all required parts of the question.",
+                    "max_marks": question_marks,
+                    "scoring_model": (
+                        POINT_BASED_SCORING
+                        if question_marks <= 1.0
+                        else HOLISTIC_BANDED_SCORING
+                    ),
+                    "reference_solution": "\n".join(reference_sections),
+                    "marking_criteria": [
+                        _inclusive_criterion(all_criteria, max_marks=question_marks)
+                    ],
+                    "method_policy": method_policy,
+                    "figure_refs": figure_refs,
+                }
+            ],
+            assign_missing_ids=False,
+        )
+
+    compiled_units: List[Dict[str, Any]] = []
+    for unit, marks in zip(units, allocations):
+        compiled = dict(unit)
+        compiled["max_marks"] = marks
+        compiled_units.append(_compile_unit_criteria(compiled))
+    return normalize_assessment_units(compiled_units, assign_missing_ids=False)
+
+
 def validate_assessment_units(
     units: Iterable[Mapping[str, Any]],
     question_max_marks: Any,

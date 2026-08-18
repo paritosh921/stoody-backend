@@ -4,10 +4,11 @@ The historical PDF pipeline stored ``4`` whenever OCR could not read a mark.
 That made an unknown value indistinguishable from a real four-mark question.
 This module provides a migration-free compatibility boundary:
 
-* legacy rows carrying ``metadata.max_marks_extracted == False`` are unresolved;
-* new visual extraction must include readable printed evidence;
-* teacher edits are an explicit, authoritative confirmation; and
-* totals are only calculated from resolved marks.
+* readable printed marks remain authoritative;
+* teacher edits are an explicit, authoritative confirmation;
+* missing, unclear, and legacy implicit marks use a provisional one-mark
+  authoring budget instead of blocking the whole paper; and
+* provenance is retained so provisional marks remain visible for review.
 
 No function in this module mutates a persisted document.
 """
@@ -21,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 VERIFIED_MARK_STATUSES = {"verified", "teacher_confirmed"}
 UNRESOLVED_MARK_STATUS = "unresolved"
+PROVISIONAL_MARK_STATUS = "provisional_default"
+PROVISIONAL_DEFAULT_MARKS = 1.0
 _ARITHMETIC_MARK_RE = re.compile(
     r"(?P<count>\d+(?:\.\d+)?)\s*[xX×*]\s*"
     r"(?P<each>\d+(?:\.\d+)?)\s*=\s*(?P<total>\d+(?:\.\d+)?)"
@@ -55,26 +58,26 @@ def question_marks_status(question: Dict[str, Any]) -> str:
     )
 
     if explicit_status == "teacher_confirmed" or source == "teacher":
-        return "teacher_confirmed" if has_positive_marks else UNRESOLVED_MARK_STATUS
+        return "teacher_confirmed" if has_positive_marks else PROVISIONAL_MARK_STATUS
     if explicit_status == "verified":
-        return "verified" if has_positive_marks else UNRESOLVED_MARK_STATUS
-    if explicit_status == UNRESOLVED_MARK_STATUS:
-        return UNRESOLVED_MARK_STATUS
+        return "verified" if has_positive_marks else PROVISIONAL_MARK_STATUS
+    if explicit_status in {UNRESOLVED_MARK_STATUS, PROVISIONAL_MARK_STATUS}:
+        return PROVISIONAL_MARK_STATUS
 
     # This is the exact signature of the old fabricated-four fallback.
     if metadata.get("max_marks_extracted") is False:
-        return UNRESOLVED_MARK_STATUS
+        return PROVISIONAL_MARK_STATUS
 
     # Manually-created questions and older successfully-extracted questions do
     # not have the new status field. Preserve those existing valid contracts.
-    return "legacy_verified" if has_positive_marks else UNRESOLVED_MARK_STATUS
+    return "legacy_verified" if has_positive_marks else PROVISIONAL_MARK_STATUS
 
 
 def effective_question_marks(question: Dict[str, Any]) -> Optional[float]:
-    """Return marks only when they have a defensible owner."""
+    """Return the authoritative or provisional runtime mark budget."""
 
-    if question_marks_status(question) == UNRESOLVED_MARK_STATUS:
-        return None
+    if question_marks_status(question) == PROVISIONAL_MARK_STATUS:
+        return PROVISIONAL_DEFAULT_MARKS
     for key in ("points", "max_marks", "marks", "total_points"):
         value = positive_marks(question.get(key))
         if value is not None:
@@ -85,20 +88,23 @@ def effective_question_marks(question: Dict[str, Any]) -> Optional[float]:
 def project_question_marks_for_authoring(question: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-time authoring projection for old and new questions.
 
-    The stored legacy value remains untouched.  Clients receive ``points=None``
-    for the old implicit default so it cannot be mistaken for a real mark.
+    The stored legacy value remains untouched. Clients receive a provisional
+    one-mark value and explicit review metadata, so authoring can continue
+    without presenting the fallback as printed or teacher-confirmed evidence.
     """
 
     projected = dict(question)
     metadata = dict(projected.get("metadata") or {})
     status = question_marks_status(projected)
     metadata["marks_status"] = status
-    metadata["marks_review_required"] = status == UNRESOLVED_MARK_STATUS
-    if status == UNRESOLVED_MARK_STATUS:
-        projected["points"] = None
+    metadata["marks_review_required"] = status == PROVISIONAL_MARK_STATUS
+    if status == PROVISIONAL_MARK_STATUS:
+        projected["points"] = PROVISIONAL_DEFAULT_MARKS
+        metadata["marks_source"] = "system_default"
+        metadata["max_marks_extracted"] = False
         metadata.setdefault(
             "marks_review_reason",
-            "Printed marks were not verified; the historical implicit default is ignored.",
+            "Printed marks were not verified, so this question provisionally uses 1 mark.",
         )
     projected["metadata"] = metadata
     return projected
@@ -213,10 +219,10 @@ def extracted_marks_metadata(raw_question: Dict[str, Any], *, visual_source: boo
         evidence = validate_visual_marks_evidence(raw_evidence)
         verified = bool(evidence.get("verified"))
         return {
-            "points": evidence.get("value") if verified else None,
+            "points": evidence.get("value") if verified else PROVISIONAL_DEFAULT_MARKS,
             "max_marks_extracted": verified,
-            "marks_status": "verified" if verified else UNRESOLVED_MARK_STATUS,
-            "marks_source": "visual_printed_evidence",
+            "marks_status": "verified" if verified else PROVISIONAL_MARK_STATUS,
+            "marks_source": "visual_printed_evidence" if verified else "system_default",
             "marks_evidence": evidence,
             "marks_review_required": not verified,
             "marks_review_reason": None if verified else evidence.get("reason"),
@@ -228,13 +234,17 @@ def extracted_marks_metadata(raw_question: Dict[str, Any], *, visual_source: boo
         if value is not None:
             break
     return {
-        "points": value,
+        "points": value if value is not None else PROVISIONAL_DEFAULT_MARKS,
         "max_marks_extracted": value is not None,
-        "marks_status": "verified" if value is not None else UNRESOLVED_MARK_STATUS,
-        "marks_source": "ocr_text" if value is not None else "unresolved",
+        "marks_status": "verified" if value is not None else PROVISIONAL_MARK_STATUS,
+        "marks_source": "ocr_text" if value is not None else "system_default",
         "marks_evidence": None,
         "marks_review_required": value is None,
-        "marks_review_reason": None if value is not None else "marks were not explicit in OCR text",
+        "marks_review_reason": (
+            None
+            if value is not None
+            else "Marks were not explicit in the paper, so this question provisionally uses 1 mark."
+        ),
     }
 
 
@@ -253,12 +263,20 @@ def summarize_question_marks(
     question_list = list(questions)
     values: List[float] = []
     unresolved_ids: List[str] = []
+    provisional_ids: List[str] = []
+    authoritative_count = 0
     for index, question in enumerate(question_list, start=1):
+        question_id = str(question.get("id") or question.get("question_number") or index)
+        mark_status = question_marks_status(question)
         marks = effective_question_marks(question)
         if marks is None:
-            unresolved_ids.append(str(question.get("id") or question.get("question_number") or index))
+            unresolved_ids.append(question_id)
         else:
             values.append(marks)
+            if mark_status == PROVISIONAL_MARK_STATUS:
+                provisional_ids.append(question_id)
+            else:
+                authoritative_count += 1
 
     expected = positive_marks(expected_total)
     calculated = sum(values)
@@ -272,8 +290,12 @@ def summarize_question_marks(
     return {
         "question_count": len(question_list),
         "resolved_count": len(values),
+        "authoritative_count": authoritative_count,
         "unresolved_count": len(unresolved_ids),
         "unresolved_question_ids": unresolved_ids,
+        "provisional_count": len(provisional_ids),
+        "provisional_question_ids": provisional_ids,
+        "review_required_count": len(provisional_ids) + len(unresolved_ids),
         "calculated_total": calculated,
         "expected_total": expected,
         "reconciled": reconciled,

@@ -24,7 +24,7 @@ def _visual_evidence(value, text, confidence=0.99):
     }
 
 
-def test_legacy_implicit_four_is_unresolved_without_mutating_stored_row():
+def test_legacy_implicit_four_projects_provisional_one_without_mutating_stored_row():
     stored = {
         "id": "q2",
         "points": 4.0,
@@ -34,9 +34,10 @@ def test_legacy_implicit_four_is_unresolved_without_mutating_stored_row():
     projected = project_question_marks_for_authoring(stored)
 
     assert stored["points"] == 4.0
-    assert effective_question_marks(stored) is None
-    assert projected["points"] is None
-    assert projected["metadata"]["marks_status"] == "unresolved"
+    assert effective_question_marks(stored) == 1.0
+    assert projected["points"] == 1.0
+    assert projected["metadata"]["marks_status"] == "provisional_default"
+    assert projected["metadata"]["marks_source"] == "system_default"
     assert projected["metadata"]["marks_review_required"] is True
 
 
@@ -70,8 +71,9 @@ def test_low_confidence_visual_mark_is_not_converted_to_a_score():
         {"marks_evidence": _visual_evidence(4, "4 marks", confidence=0.52)},
         visual_source=True,
     )
-    assert result["points"] is None
-    assert result["marks_status"] == "unresolved"
+    assert result["points"] == 1.0
+    assert result["marks_status"] == "provisional_default"
+    assert result["marks_source"] == "system_default"
     assert result["marks_review_required"] is True
 
 
@@ -92,8 +94,12 @@ def test_hindi_paper_marks_reconcile_to_twenty_without_a_default():
     assert summary == {
         "question_count": 9,
         "resolved_count": 9,
+        "authoritative_count": 9,
         "unresolved_count": 0,
         "unresolved_question_ids": [],
+        "provisional_count": 0,
+        "provisional_question_ids": [],
+        "review_required_count": 0,
         "calculated_total": 20.0,
         "expected_total": 20.0,
         "reconciled": True,
@@ -114,8 +120,8 @@ def test_teacher_confirmation_owns_a_previously_unresolved_mark():
     assert question["metadata"]["marks_status"] == "teacher_confirmed"
 
 
-def test_pcr_finalization_rejects_legacy_fake_marks_and_total_mismatch():
-    unresolved_errors = validate_pcr_questions(
+def test_pcr_finalization_allows_provisional_one_but_rejects_authoritative_total_mismatch():
+    provisional_errors = validate_pcr_questions(
         [
             {
                 "id": "q2",
@@ -128,7 +134,7 @@ def test_pcr_finalization_rejects_legacy_fake_marks_and_total_mismatch():
         ],
         marking_policy={"mode": "legacy"},
     )
-    assert any("verify the printed marks" in error for error in unresolved_errors)
+    assert not any("verify the printed marks" in error for error in provisional_errors)
 
     mismatch_errors = validate_pcr_questions(
         [
@@ -186,7 +192,7 @@ async def test_test_series_visual_requirement_fails_closed_without_openai(monkey
 
 
 @pytest.mark.asyncio
-async def test_full_paper_structuring_sends_original_pages_and_never_defaults_marks(monkeypatch):
+async def test_full_paper_structuring_sends_original_pages_and_defaults_missing_marks_to_reviewable_one(monkeypatch):
     from api.v1 import pdf_async
     import openai
 
@@ -256,6 +262,72 @@ async def test_full_paper_structuring_sends_original_pages_and_never_defaults_ma
     assert questions[0].points == 5
     assert questions[0].metadata["marks_source"] == "visual_printed_evidence"
     assert questions[0].metadata["diagram_regions"]
-    assert questions[1].points is None
-    assert questions[1].metadata["marks_status"] == "unresolved"
+    assert questions[1].points == 1.0
+    assert questions[1].metadata["marks_status"] == "provisional_default"
+    assert questions[1].metadata["marks_review_required"] is True
     assert all(question.points != 4 for question in questions)
+
+
+def _weighted_unit(label: str) -> dict:
+    suffix = label.strip("()")
+    return {
+        "unit_id": f"unit_{suffix}",
+        "label": label,
+        "prompt": f"Answer part {label}",
+        "relative_weight": 1,
+        "scoring_model": "point_based",
+        "reference_solution": f"Solution {label}",
+        "marking_criteria": [
+            {
+                "criterion_id": f"criterion_{suffix}",
+                "description": f"Correctly answers {label}",
+                "relative_weight": 1,
+                "acceptable_evidence": f"Solution {label} or an equivalent answer",
+            }
+        ],
+    }
+
+
+def test_one_mark_multipart_draft_compiles_to_one_inclusive_unit():
+    from api.v1.pdf_async import _parse_pcr_marking_plan_draft
+
+    draft = _parse_pcr_marking_plan_draft(
+        json.dumps({"assessment_units": [_weighted_unit("(a)"), _weighted_unit("(b)"), _weighted_unit("(c)")]}),
+        question_marks=1,
+        question_text="Answer (a), (b), and (c).",
+    )
+
+    assert len(draft["assessment_units"]) == 1
+    assert draft["assessment_units"][0]["max_marks"] == 1.0
+    assert draft["assessment_units"][0]["label"] == "Whole question"
+    assert len(draft["marking_criteria"]) == 1
+    assert draft["marking_criteria"][0]["max_marks"] == 1.0
+    assert all(part in draft["reference_solution"] for part in ("(a)", "(b)", "(c)"))
+
+
+def test_known_question_total_compiles_relative_weights_to_exact_step_marks():
+    from api.v1.pdf_async import _parse_pcr_marking_plan_draft
+
+    draft = _parse_pcr_marking_plan_draft(
+        json.dumps({"assessment_units": [_weighted_unit("(a)"), _weighted_unit("(b)"), _weighted_unit("(c)")]}),
+        question_marks=5,
+        question_text="Answer (a), (b), and (c). [5]",
+    )
+
+    unit_marks = [unit["max_marks"] for unit in draft["assessment_units"]]
+    assert len(unit_marks) == 3
+    assert sum(unit_marks) == 5.0
+    assert all(mark > 0 for mark in unit_marks)
+    assert sum(item["max_marks"] for item in draft["marking_criteria"]) == 5.0
+
+
+def test_printed_fractional_subpart_ledger_is_preserved_for_one_mark_question():
+    from api.v1.pdf_async import _parse_pcr_marking_plan_draft
+
+    draft = _parse_pcr_marking_plan_draft(
+        json.dumps({"assessment_units": [_weighted_unit("(a)"), _weighted_unit("(b)")]}),
+        question_marks=1,
+        question_text="Answer both parts. (2 x 0.5 = 1)",
+    )
+
+    assert [unit["max_marks"] for unit in draft["assessment_units"]] == [0.5, 0.5]
