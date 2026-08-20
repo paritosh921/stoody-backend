@@ -80,6 +80,12 @@ from services.question_paper_marks_contract import (
     teacher_confirmed_marks_metadata,
     visual_paper_total,
 )
+from services.question_extraction_contract import (
+    QUESTION_EXTRACTION_CONTRACT_VERSION,
+    QuestionExtractionContractError,
+    normalize_question_extraction_payload,
+    question_extraction_response_format,
+)
 from services.region_crop_service import RegionCropService
 from services.tally_question_map_service import build_tally_question_map
 
@@ -1920,7 +1926,8 @@ async def extract_questions_with_gpt(
         "- Never infer or default marks. If printed evidence is unclear, return null values and confidence 0\n"
         "- Record diagram/table bboxes; a diagram can be the answer format or part of the question\n\n"
         "Return ONLY valid JSON in this exact format (no markdown fences, no explanation):\n"
-        '{"paper_total_marks":{"value":20,"printed_text":"M.M. 20","page":0,"bbox":{"x0":0,"y0":0,"x1":100,"y1":50},"confidence":0.99},'
+        '{"contract_version":"question-paper-visual-v2",'
+        '"paper_total_marks":{"value":20,"printed_text":"M.M. 20","page":0,"bbox":{"x0":0,"y0":0,"x1":100,"y1":50},"confidence":0.99},'
         '"questions":[{"number":"1","text":"full question text","options":[],"page":0,'
         '"continuation_pages":[],"has_figure":false,"diagram_regions":[],'
         '"max_marks":5,"marks_evidence":{"value":5,"printed_text":"5x1=5","page":0,'
@@ -1951,10 +1958,15 @@ async def extract_questions_with_gpt(
             message_content = content_parts
 
         async def _raw_call():
+            request_kwargs: Dict[str, Any] = {
+                "model": extract_model,
+                "messages": [{"role": "user", "content": message_content}],
+                "max_completion_tokens": max_completion_tokens,
+            }
+            if provider_name == "OpenAI":
+                request_kwargs["response_format"] = question_extraction_response_format()
             return await client.chat.completions.create(
-                model=extract_model,
-                messages=[{"role": "user", "content": message_content}],
-                max_completion_tokens=max_completion_tokens,
+                **request_kwargs,
             )
 
         if not gateway_context:
@@ -2005,7 +2017,19 @@ async def extract_questions_with_gpt(
     for attempt in range(1, max_retries + 1):
         try:
             response = await _chat_completion(extraction_prompt)
-            raw_response = response.choices[0].message.content or ""
+            choice = response.choices[0]
+            refusal = getattr(choice.message, "refusal", None)
+            if refusal:
+                raise QuestionExtractionContractError(
+                    "model_refusal",
+                    "Question extraction could not process this paper safely.",
+                )
+            if getattr(choice, "finish_reason", None) == "length":
+                raise QuestionExtractionContractError(
+                    "model_output_truncated",
+                    "Question extraction output was truncated before the paper was complete.",
+                )
+            raw_response = choice.message.content or ""
             print(f"[Q-EXTRACT] Attempt {attempt}: got {len(raw_response)} chars", flush=True)
             if raw_response.strip():
                 break
@@ -2013,16 +2037,23 @@ async def extract_questions_with_gpt(
                 print(f"[Q-EXTRACT] Empty response, retrying...", flush=True)
         except Exception as e:
             print(f"[Q-EXTRACT] Attempt {attempt} failed: {e}", flush=True)
+            if isinstance(e, QuestionExtractionContractError):
+                raise
             if attempt >= max_retries:
                 logger.error(f"Question extraction failed after {max_retries} attempts: {e}")
-                return []
+                raise QuestionExtractionContractError(
+                    "question_extraction_request_failed",
+                    "Question extraction service failed before producing a result.",
+                ) from e
 
     if not raw_response.strip():
         print(f"[Q-EXTRACT] All {max_retries} attempts returned empty response", flush=True)
-        return []
+        raise QuestionExtractionContractError(
+            "empty_model_output",
+            "Question extraction returned an empty response.",
+        )
 
     # Parse JSON — handle markdown fences, then fix LaTeX backslash issues
-    import re as _re
     raw_response = raw_response.strip()
     if raw_response.startswith("```"):
         raw_response = raw_response.split("\n", 1)[-1]  # remove first ```json line
@@ -2105,8 +2136,12 @@ async def extract_questions_with_gpt(
             logger.error(f"Failed to parse GPT extraction response as JSON: {e2}")
             print(f"[Q-EXTRACT] JSON parse failed even after backslash fix: {e2}", flush=True)
             print(f"[Q-EXTRACT] Raw response (first 500): {raw_response[:500]}", flush=True)
-            return []
+            raise QuestionExtractionContractError(
+                "invalid_model_json",
+                "Question extraction returned malformed structured data.",
+            ) from e2
 
+    data = normalize_question_extraction_payload(data)
     raw_questions = data.get("questions", [])
     print(f"[Q-EXTRACT] Parsed {len(raw_questions)} questions from GPT response", flush=True)
 
@@ -2126,96 +2161,10 @@ async def extract_questions_with_gpt(
     # case-study headings that use "Case Study Based- 3" instead of "19.").
     positional_image_map: Dict[int, List[str]] = {}
 
-    # Build page text lookup for targeted retries
-    page_texts: Dict[int, str] = {}
-    for page in pages:
-        page_texts[page.get("index", 0)] = page.get("markdown", "")
-
-    # Detect questions with empty text — collect for targeted retry
-    failed_questions: List[Dict[str, Any]] = []  # {"number", "page"} for retry
-    good_questions: List[Dict[str, Any]] = []
-    for q in raw_questions:
-        q_text = q.get("text", "").strip()
-        if not q_text:
-            failed_questions.append(q)
-        else:
-            good_questions.append(q)
-
-    if failed_questions:
-        print(
-            f"[Q-EXTRACT] {len(failed_questions)} questions have empty text — "
-            f"retrying: {[q.get('number', '?') for q in failed_questions]}",
-            flush=True,
-        )
-
-        # Collect ONLY the page text for the failed questions' pages
-        failed_pages: set = set()
-        for q in failed_questions:
-            p = q.get("page", 0)
-            failed_pages.add(p)
-
-        retry_text = ""
-        for pidx in sorted(failed_pages):
-            md = page_texts.get(pidx, "")
-            if md:
-                retry_text += f"\n=== PAGE {pidx} ===\n{md}"
-
-        if retry_text.strip():
-            failed_nums = [q.get("number", "?") for q in failed_questions]
-            retry_prompt = (
-                "You previously failed to extract the text for these question numbers: "
-                f"{failed_nums}\n\n"
-                "Below is the page text containing those questions. "
-                "Extract ONLY the questions listed above.\n\n"
-                f"{anchor_instruction}"
-                "RULES:\n"
-                "- Include full question text with all sub-parts\n"
-                "- For MCQs: separate question text from options\n"
-                "- Preserve ALL math notation, LaTeX, symbols exactly\n"
-                "- If a question references a figure/diagram, set has_figure to true\n"
-                "- Report the page number from === PAGE N === markers\n\n"
-                "Return ONLY valid JSON:\n"
-                '{"questions": [{"number": "1", "text": "...", "options": [...], "page": 0, "has_figure": false}]}\n\n'
-                "--- PAGE TEXT ---\n"
-                f"{retry_text}"
-            )
-
-            try:
-                retry_response = await _chat_completion(retry_prompt)
-                retry_raw = (retry_response.choices[0].message.content or "").strip()
-                if retry_raw:
-                    if retry_raw.startswith("```"):
-                        retry_raw = retry_raw.split("\n", 1)[-1]
-                        if retry_raw.endswith("```"):
-                            retry_raw = retry_raw[:-3].strip()
-                    retry_fixed = _fix_json_backslashes(retry_raw)
-                    try:
-                        retry_data = _json.loads(retry_raw)
-                    except _json.JSONDecodeError:
-                        retry_data = _json.loads(retry_fixed)
-                    retry_qs = retry_data.get("questions", [])
-
-                    # Merge retried questions back — match by question number
-                    retry_by_num = {str(rq.get("number", "")): rq for rq in retry_qs if rq.get("text", "").strip()}
-                    recovered = 0
-                    for fq in failed_questions:
-                        fnum = str(fq.get("number", ""))
-                        if fnum in retry_by_num:
-                            good_questions.append(retry_by_num[fnum])
-                            recovered += 1
-                            print(f"[Q-EXTRACT] Recovered Q#{fnum} via retry", flush=True)
-                        else:
-                            # Still failed — add as empty placeholder so numbering is preserved
-                            good_questions.append(fq)
-                            print(f"[Q-EXTRACT] Q#{fnum} still empty after retry", flush=True)
-
-                    print(f"[Q-EXTRACT] Retry recovered {recovered}/{len(failed_questions)} questions", flush=True)
-                else:
-                    print(f"[Q-EXTRACT] Retry returned empty — keeping original results", flush=True)
-                    good_questions.extend(failed_questions)
-            except Exception as retry_err:
-                print(f"[Q-EXTRACT] Retry failed: {retry_err} — keeping original results", flush=True)
-                good_questions.extend(failed_questions)
+    # The versioned contract requires non-empty text for every question, so a
+    # second LLM call is neither necessary nor useful here. Contract failures
+    # are surfaced once with a durable error instead of silently spending more.
+    good_questions: List[Dict[str, Any]] = list(raw_questions)
 
     # Sort by question number to restore original order
     def _sort_key(q: Dict) -> int:
@@ -2421,6 +2370,7 @@ async def extract_questions_with_gpt(
             "is_image_based_mcq": False,
             "source_pages": [q_page, *(q.get("continuation_pages") or [])],
             "diagram_regions": q.get("diagram_regions") or [],
+            "question_extraction_contract": QUESTION_EXTRACTION_CONTRACT_VERSION,
             **marks_contract,
         }
 
@@ -2443,7 +2393,7 @@ async def extract_questions_with_gpt(
             questions.append(ExtractedQuestion(
                 id=str(uuid.uuid4()),
                 text=q_text,
-                options=[o for o in options if o.strip()],
+                options=options,
                 points=extracted_max_marks,
                 metadata=base_metadata,
             ))
@@ -4497,6 +4447,28 @@ async def generate_pcr_marking_plan_draft(
 #     pass  # Full implementation preserved in git history
 
 
+def _document_ocr_failure_fields(
+    exc: Exception,
+    *,
+    stage: str,
+    job_id: str,
+) -> Dict[str, Any]:
+    message = re.sub(r"\s+", " ", str(exc) or "").strip()
+    message = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "[redacted]", message)
+    if not message:
+        message = "Question-paper processing failed before completion."
+    return {
+        "ocr_status": "error",
+        "ocr_job_id": job_id,
+        "ocr_error": message[:800],
+        "ocr_error_code": str(
+            getattr(exc, "code", None) or "document_ocr_pipeline_failed"
+        )[:120],
+        "ocr_error_stage": stage,
+        "ocr_failed_at": datetime.utcnow(),
+    }
+
+
 async def run_document_ocr_pipeline(
     document: Dict[str, Any],
     file_content: bytes,
@@ -4508,6 +4480,11 @@ async def run_document_ocr_pipeline(
 ) -> PDFProcessingResult:
     """Run the full OCR extraction pipeline for a stored document."""
     document_id = document["document_id"]
+    pipeline_stage = "layout_analysis"
+    document_committed = False
+    replacement_started = False
+    prior_questions: List[Dict[str, Any]] = []
+    prior_images: List[Dict[str, Any]] = []
     try:
         layout_report = await DocumentLayoutProvider().analyze(
             pdf_bytes=file_content,
@@ -4517,6 +4494,7 @@ async def run_document_ocr_pipeline(
         layout_context = compact_layout_context(layout_report)
         page_count = int(layout_report.get("page_count") or _count_pdf_pages(file_content) or 1)
 
+        pipeline_stage = "document_ocr"
         logger.info(f"Calling OCR for job {job_id}")
         ocr_result = await call_sarvam_ocr(
             file_content,
@@ -4548,6 +4526,7 @@ async def run_document_ocr_pipeline(
         # For Practice Sets, don't extract options separately - keep them in question text
         skip_option_extraction = document_type == "Practice Sets"
 
+        pipeline_stage = "question_extraction"
         extracted_questions = await extract_questions_with_gpt(
             ocr_result,
             document.get("subject", "General"),
@@ -4572,20 +4551,7 @@ async def run_document_ocr_pipeline(
         if not extracted_questions:
             raise ValueError("Question-paper extraction returned no questions")
 
-        # Replace prior OCR output only after the new visual parse succeeds.
-        # A provider/rendering error must never erase a paper teachers already
-        # reviewed or finalized.
-        if is_b2c_pre:
-            old_q = await db.b2c_delete_many("questions", {"document_id": document_id})
-            old_i = await db.b2c_delete_many("images", {"source_pdf": document.get("filename", "")})
-        else:
-            old_q = await db.mongo_delete_many("questions", {"document_id": document_id})
-            old_i = await db.mongo_delete_many("images", {"source_pdf": document.get("filename", "")})
-        print(
-            f"[OCR-PIPELINE] Replaced old data for {document_id}: questions={old_q}, images={old_i}",
-            flush=True,
-        )
-
+        pipeline_stage = "extraction_validation"
         full_document_validator = FullDocumentExtractionValidator()
         option_evidence_by_question = full_document_validator.option_evidence_by_question(
             layout_report,
@@ -4621,6 +4587,38 @@ async def run_document_ocr_pipeline(
             }
             question.metadata["layout_provider"] = layout_report.get("provider")
             question.metadata["layout_risks"] = layout_report.get("document_layout_risks", [])
+
+        # Reprocessing is a replace-on-success operation. Provider, parsing,
+        # and validation failures above leave the last usable extraction
+        # untouched. Only now is the previous generation removed.
+        pipeline_stage = "question_persistence"
+        if is_b2c_pre:
+            prior_questions = await db.b2c_find(
+                "questions", {"document_id": document_id}
+            )
+            prior_images = await db.b2c_find(
+                "images", {"source_pdf": document.get("filename", "")}
+            )
+            old_q = await db.b2c_delete_many("questions", {"document_id": document_id})
+            old_i = await db.b2c_delete_many(
+                "images", {"source_pdf": document.get("filename", "")}
+            )
+        else:
+            prior_questions = await db.mongo_find(
+                "questions", {"document_id": document_id}
+            )
+            prior_images = await db.mongo_find(
+                "images", {"source_pdf": document.get("filename", "")}
+            )
+            old_q = await db.mongo_delete_many("questions", {"document_id": document_id})
+            old_i = await db.mongo_delete_many(
+                "images", {"source_pdf": document.get("filename", "")}
+            )
+        replacement_started = True
+        print(
+            f"[OCR-PIPELINE] Replaced old data for {document_id}: questions={old_q}, images={old_i}",
+            flush=True,
+        )
         
         if skip_option_extraction:
             logger.info(f"📝 Practice Sets mode: Options kept inline with question text")
@@ -4929,6 +4927,9 @@ async def run_document_ocr_pipeline(
                 saved_question_docs.append(question_doc)
             except Exception as db_err:
                 print(f"[OCR-PIPELINE] ERROR saving question {question.id}: {db_err}", flush=True)
+                raise RuntimeError(
+                    f"Could not persist extracted question {question_index}."
+                ) from db_err
 
         print(f"[OCR-PIPELINE] All {len(extracted_questions)} questions stored in DB", flush=True)
 
@@ -4947,6 +4948,11 @@ async def run_document_ocr_pipeline(
 
         update_data = {
             "ocr_status": "completed",
+            "ocr_error": None,
+            "ocr_error_code": None,
+            "ocr_error_stage": None,
+            "ocr_failed_at": None,
+            "question_extraction_contract": QUESTION_EXTRACTION_CONTRACT_VERSION,
             "extracted_questions_count": len(extracted_questions),
             "extracted_images_count": len(all_images),
             "ocr_completed_at": datetime.utcnow(),
@@ -5043,22 +5049,64 @@ async def run_document_ocr_pipeline(
                 {"document_id": document_id},
                 {"$set": update_data}
             )
+        document_committed = True
+
+        new_image_paths = {
+            str(image.get("file_path"))
+            for image in all_images
+            if image.get("file_path")
+        }
+        for prior_image in prior_images:
+            prior_path = prior_image.get("file_path")
+            if (
+                prior_path
+                and str(prior_path) not in new_image_paths
+                and os.path.isfile(prior_path)
+            ):
+                try:
+                    os.remove(prior_path)
+                except OSError as cleanup_error:
+                    logger.warning(
+                        "Could not remove superseded image %s: %s",
+                        prior_path,
+                        cleanup_error,
+                    )
 
         if document_fresh:
-            deferred_mapping_result = await map_completed_answer_sheet_after_question_ocr(
-                document={**document_fresh, **update_data},
-                current_user=current_user,
-                db=db,
-            )
-            if deferred_mapping_result:
-                processing_result["mapped_answers"] = deferred_mapping_result.get("mapped_count", 0)
-                processing_result["answer_sheet_mapping_summary"] = deferred_mapping_result.get("summary", {})
+            try:
+                deferred_mapping_result = await map_completed_answer_sheet_after_question_ocr(
+                    document={**document_fresh, **update_data},
+                    current_user=current_user,
+                    db=db,
+                )
+                if deferred_mapping_result:
+                    processing_result["mapped_answers"] = deferred_mapping_result.get("mapped_count", 0)
+                    processing_result["answer_sheet_mapping_summary"] = deferred_mapping_result.get("summary", {})
+            except Exception as mapping_error:
+                # Question extraction is already committed. Answer mapping has
+                # its own review lifecycle and must not roll OCR back to error.
+                logger.error(
+                    "Deferred answer mapping failed for %s: %s",
+                    document_id,
+                    mapping_error,
+                    exc_info=True,
+                )
+                processing_result["answer_mapping_error"] = str(mapping_error)[:500]
 
-        await refresh_answer_solution_coverage(
-            db=db,
-            is_b2c=is_b2c,
-            document_id=document_id,
-        )
+        try:
+            await refresh_answer_solution_coverage(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=document_id,
+            )
+        except Exception as coverage_error:
+            logger.error(
+                "Answer coverage refresh failed for %s: %s",
+                document_id,
+                coverage_error,
+                exc_info=True,
+            )
+            processing_result["answer_coverage_error"] = str(coverage_error)[:500]
 
         processing_result["status"] = "completed"
         processing_result["progress"] = 100
@@ -5071,19 +5119,60 @@ async def run_document_ocr_pipeline(
         print(f"[OCR-PIPELINE] FAILED for {document_id}: {type(exc).__name__}: {exc}", flush=True)
         logger.error(f"OCR pipeline failed for document {document_id}: {exc}", exc_info=True)
         # Check if B2C admin for error update
-        is_b2c = is_b2c_admin(current_user)
-        if is_b2c:
-            await db.b2c_update_one(
-                "documents",
-                {"document_id": document_id},
-                {"$set": {"ocr_status": "error"}}
+        if not document_committed:
+            is_b2c = is_b2c_admin(current_user)
+            if replacement_started:
+                try:
+                    if is_b2c:
+                        await db.b2c_delete_many(
+                            "questions", {"document_id": document_id}
+                        )
+                        await db.b2c_delete_many(
+                            "images", {"source_pdf": document.get("filename", "")}
+                        )
+                        for prior_question in prior_questions:
+                            await db.b2c_insert_one("questions", prior_question)
+                        for prior_image in prior_images:
+                            await db.b2c_insert_one("images", prior_image)
+                    else:
+                        await db.mongo_delete_many(
+                            "questions", {"document_id": document_id}
+                        )
+                        await db.mongo_delete_many(
+                            "images", {"source_pdf": document.get("filename", "")}
+                        )
+                        for prior_question in prior_questions:
+                            await db.mongo_insert_one("questions", prior_question)
+                        for prior_image in prior_images:
+                            await db.mongo_insert_one("images", prior_image)
+                    logger.info(
+                        "Restored previous extraction for %s after persistence failure",
+                        document_id,
+                    )
+                except Exception as restore_error:
+                    logger.critical(
+                        "Could not restore previous extraction for %s: %s",
+                        document_id,
+                        restore_error,
+                        exc_info=True,
+                    )
+            error_fields = _document_ocr_failure_fields(
+                exc,
+                stage=pipeline_stage,
+                job_id=job_id,
             )
-        else:
-            await db.mongo_update_one(
-                "documents",
-                {"document_id": document_id},
-                {"$set": {"ocr_status": "error"}}
-            )
+            if is_b2c:
+                await db.b2c_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": error_fields}
+                )
+            else:
+                await db.mongo_update_one(
+                    "documents",
+                    {"document_id": document_id},
+                    {"$set": error_fields}
+                )
 
         error_result = {
             "job_id": job_id,
@@ -5114,6 +5203,11 @@ class DocumentMetadata(BaseModel):
     uploaded_at: datetime
     ocr_status: str
     ocr_job_id: Optional[str] = None
+    ocr_error: Optional[str] = None
+    ocr_error_code: Optional[str] = None
+    ocr_error_stage: Optional[str] = None
+    ocr_failed_at: Optional[datetime] = None
+    question_extraction_contract: Optional[str] = None
     ocr_quality_status: Optional[str] = None
     ocr_quality_score: Optional[float] = None
     ocr_quality_summary: Optional[Dict[str, Any]] = None
@@ -7361,38 +7455,8 @@ async def process_document_ocr(
                 detail="OCR processing already in progress"
             )
 
-        if document.get("ocr_status") == "completed":
-            logger.info(f"Reprocessing document {document_id} - cleaning up old data")
-
-            if is_b2c:
-                questions_deleted_result = await db.b2c_delete_many("questions", {"document_id": document_id})
-                # delete_many returns bool in our implementation, not count directly unless we change it. 
-                # Checking database.py implementation: returns bool (deleted_count > 0).
-                # Actually, standard mongo driver returns DeleteResult.
-                # Our wrapper b2c_delete_many returns bool.
-                logger.info(f"Deleted questions for document {document_id} from B2C DB")
-            else:
-                questions_deleted = await db.mongo_delete_many("questions", {"document_id": document_id})
-                logger.info(f"Deleted {questions_deleted} questions for document {document_id}")
-
-            if is_b2c:
-                images_result = await db.b2c_find("images", {"source_pdf": document["filename"]})
-            else:
-                images_result = await db.mongo_find("images", {"source_pdf": document["filename"]})
-
-            for img in images_result:
-                file_path = img.get("file_path")
-                if file_path and os.path.exists(file_path):
-                    try:
-                        os.remove(file_path)
-                        logger.info(f"Deleted image file: {file_path}")
-                    except Exception as exc:
-                        logger.error(f"Failed to delete image file {file_path}: {exc}")
-
-            if is_b2c:
-                await db.b2c_delete_many("images", {"source_pdf": document["filename"]})
-            else:
-                await db.mongo_delete_many("images", {"source_pdf": document["filename"]})
+        # The pipeline owns replacement after the new extraction has passed
+        # schema and quality validation. Never erase a live paper at retry start.
 
         from pathlib import Path as _Path
         backend_dir = _Path(os.getcwd())
@@ -7467,6 +7531,10 @@ async def process_document_ocr(
                     "ocr_quality_score": None,
                     "ocr_quality_summary": None,
                     "ocr_manual_segmentation_recommended": False,
+                    "ocr_error": None,
+                    "ocr_error_code": None,
+                    "ocr_error_stage": None,
+                    "ocr_failed_at": None,
                 }}
             )
         else:
@@ -7480,6 +7548,10 @@ async def process_document_ocr(
                     "ocr_quality_score": None,
                     "ocr_quality_summary": None,
                     "ocr_manual_segmentation_recommended": False,
+                    "ocr_error": None,
+                    "ocr_error_code": None,
+                    "ocr_error_stage": None,
+                    "ocr_failed_at": None,
                 }}
             )
 
@@ -7882,6 +7954,11 @@ async def get_documents(
                 uploaded_at=doc["uploaded_at"],
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
+                ocr_error=doc.get("ocr_error"),
+                ocr_error_code=doc.get("ocr_error_code"),
+                ocr_error_stage=doc.get("ocr_error_stage"),
+                ocr_failed_at=doc.get("ocr_failed_at"),
+                question_extraction_contract=doc.get("question_extraction_contract"),
                 ocr_quality_status=doc.get("ocr_quality_status"),
                 ocr_quality_score=doc.get("ocr_quality_score"),
                 ocr_quality_summary=doc.get("ocr_quality_summary"),
@@ -8541,6 +8618,11 @@ async def get_student_available_options(
                 uploaded_at=doc["uploaded_at"],
                 ocr_status=doc["ocr_status"],
                 ocr_job_id=doc.get("ocr_job_id"),
+                ocr_error=doc.get("ocr_error"),
+                ocr_error_code=doc.get("ocr_error_code"),
+                ocr_error_stage=doc.get("ocr_error_stage"),
+                ocr_failed_at=doc.get("ocr_failed_at"),
+                question_extraction_contract=doc.get("question_extraction_contract"),
                 ocr_quality_status=doc.get("ocr_quality_status"),
                 ocr_quality_score=doc.get("ocr_quality_score"),
                 ocr_quality_summary=doc.get("ocr_quality_summary"),
@@ -9724,6 +9806,11 @@ async def get_document_questions(
             "document_title": document["title"],
             "questions_count": len(serialized_questions),
             "ocr_status": document.get("ocr_status"),
+            "ocr_error": document.get("ocr_error"),
+            "ocr_error_code": document.get("ocr_error_code"),
+            "ocr_error_stage": document.get("ocr_error_stage"),
+            "ocr_failed_at": document.get("ocr_failed_at"),
+            "question_extraction_contract": document.get("question_extraction_contract"),
             "marks_summary": marks_summary,
             "ocr_quality_status": document.get("ocr_quality_status"),
             "ocr_quality_score": document.get("ocr_quality_score"),

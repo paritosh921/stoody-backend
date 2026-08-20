@@ -259,6 +259,8 @@ async def test_full_paper_structuring_sends_original_pages_and_defaults_missing_
 
     content = captured["messages"][0]["content"]
     assert any(part.get("type") == "image_url" for part in content)
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
     assert questions[0].points == 5
     assert questions[0].metadata["marks_source"] == "visual_printed_evidence"
     assert questions[0].metadata["diagram_regions"]
@@ -266,6 +268,75 @@ async def test_full_paper_structuring_sends_original_pages_and_defaults_missing_
     assert questions[1].metadata["marks_status"] == "provisional_default"
     assert questions[1].metadata["marks_review_required"] is True
     assert all(question.points != 4 for question in questions)
+
+
+def test_question_extraction_contract_normalises_compound_language_option_objects():
+    from services.question_extraction_contract import (
+        QUESTION_EXTRACTION_CONTRACT_VERSION,
+        normalize_question_extraction_payload,
+    )
+
+    result = normalize_question_extraction_payload({
+        "paper_total_marks": None,
+        "questions": [{
+            "number": "4",
+            "text": "Read the extract and answer all parts.",
+            "options": [
+                {"label": "A", "text": "the river was rising"},
+                {"B": "the bridge remained firm"},
+                "personification",
+            ],
+            "page": 0,
+            "has_figure": False,
+            "max_marks": 8,
+            "marks_evidence": None,
+        }],
+    })
+
+    assert result["contract_version"] == QUESTION_EXTRACTION_CONTRACT_VERSION
+    assert result["questions"][0]["options"] == [
+        "the river was rising",
+        "the bridge remained firm",
+        "personification",
+    ]
+    assert result["questions"][0]["continuation_pages"] == []
+    assert result["questions"][0]["diagram_regions"] == []
+
+
+def test_question_extraction_contract_rejects_missing_question_text():
+    from services.question_extraction_contract import (
+        QuestionExtractionContractError,
+        normalize_question_extraction_payload,
+    )
+
+    with pytest.raises(QuestionExtractionContractError) as captured:
+        normalize_question_extraction_payload({
+            "paper_total_marks": None,
+            "questions": [{"number": "1", "text": "", "options": []}],
+        })
+
+    assert captured.value.code == "incomplete_model_output"
+
+
+def test_document_ocr_failure_fields_are_durable_bounded_and_stage_specific():
+    from api.v1.pdf_async import _document_ocr_failure_fields
+    from services.question_extraction_contract import QuestionExtractionContractError
+
+    result = _document_ocr_failure_fields(
+        QuestionExtractionContractError(
+            "invalid_model_output",
+            "Question extraction returned an invalid response shape.",
+        ),
+        stage="question_extraction",
+        job_id="job-123",
+    )
+
+    assert result["ocr_status"] == "error"
+    assert result["ocr_job_id"] == "job-123"
+    assert result["ocr_error_code"] == "invalid_model_output"
+    assert result["ocr_error_stage"] == "question_extraction"
+    assert result["ocr_error"] == "Question extraction returned an invalid response shape."
+    assert result["ocr_failed_at"] is not None
 
 
 def _weighted_unit(label: str) -> dict:
