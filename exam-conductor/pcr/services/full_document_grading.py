@@ -39,7 +39,17 @@ from services.objective_scoring_service import (
     score_objective_response,
 )
 from ..domain.response_models import ContentType
+from ..language_assessment import (
+    LANGUAGE_FEEDBACK_VERSION,
+    format_language_feedback,
+    infer_language_paper,
+    language_feedback_profile,
+    normalize_language_feedback,
+)
 from ..marking_policy import (
+    compile_assessment_units_to_budget,
+    derive_response_selection,
+    instruction_only_question_reason,
     method_policy_instruction,
     flatten_assessment_unit_criteria,
     normalize_assessment_units,
@@ -403,6 +413,8 @@ class FullDocumentGradingService:
         questions = [q for q in questions if str(q.get("question_id") or "")]
         if not questions:
             raise FullDocumentGradingError("Immutable PCR question catalog is empty")
+        if prompt_version == _V16_PROMPT_VERSION:
+            questions = _prepare_runtime_question_catalog(questions)
         catalog_errors = _validate_question_catalog(questions)
         if catalog_errors:
             raise FullDocumentGradingError(
@@ -743,6 +755,11 @@ class FullDocumentGradingService:
                     "$set": {
                         "status": "validated",
                         "prompt_version": prompt_version,
+                        "language_feedback_version": (
+                            LANGUAGE_FEEDBACK_VERSION
+                            if prompt_version == _V16_PROMPT_VERSION
+                            else None
+                        ),
                         "contract_scope": contract_scope,
                         "contract_override_id": contract_override_id or None,
                         "source_prompt_version": source_prompt_version or None,
@@ -1147,25 +1164,26 @@ class FullDocumentGradingService:
             if document_review.required
             else "ready"
         )
+        submission_update: Dict[str, Any] = {
+            "$set": {
+                "segmentation_status": "complete",
+                "processing_path": "full_document_visual",
+                "document_grading_run_id": run_id,
+                "document_grading_materialization_id": materialization_id,
+                "grading_input_hash": grading_input_hash,
+                "resumed_grading_run": resumed_grading_run,
+                "document_review": document_review.as_dict(
+                    run_id=run_id,
+                    prompt_version=prompt_version,
+                ),
+                "review_state": review_state,
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"reused_grading_input": ""},
+        }
         await self._db["evalpen_submissions"].update_one(
             {"submission_id": submission_id},
-            {
-                "$set": {
-                    "segmentation_status": "complete",
-                    "processing_path": "full_document_visual",
-                    "document_grading_run_id": run_id,
-                    "document_grading_materialization_id": materialization_id,
-                    "grading_input_hash": grading_input_hash,
-                    "resumed_grading_run": resumed_grading_run,
-                    "document_review": document_review.as_dict(
-                        run_id=run_id,
-                        prompt_version=prompt_version,
-                    ),
-                    "review_state": review_state,
-                    "updated_at": datetime.now(timezone.utc),
-                },
-                "$unset": {"reused_grading_input": ""},
-            },
+            submission_update,
         )
 
         evaluated = len(evaluation_docs)
@@ -1652,6 +1670,7 @@ async def _run_whole_copy_grading(
             metadata={
                 "pcr_stage": "whole_copy_visual_grading",
                 "prompt_version": _V16_PROMPT_VERSION,
+                "language_feedback_version": LANGUAGE_FEEDBACK_VERSION,
                 "submission_id": submission_id,
                 "exam_id": exam_id,
                 "question_count": len(questions),
@@ -1746,6 +1765,7 @@ async def _run_whole_copy_grading(
             metadata={
                 "pcr_stage": "whole_copy_visual_recovery",
                 "prompt_version": _V16_PROMPT_VERSION,
+                "language_feedback_version": LANGUAGE_FEEDBACK_VERSION,
                 "submission_id": submission_id,
                 "exam_id": exam_id,
                 "question_count": len(retry_questions),
@@ -3591,6 +3611,9 @@ def _stage_cache_key(
         [
             prompt_version,
             EVIDENCE_GRAPH_VERSION,
+            LANGUAGE_FEEDBACK_VERSION
+            if prompt_version == _V16_PROMPT_VERSION
+            else "",
             stage,
             paper_hash,
             solution_hash or "",
@@ -3908,12 +3931,41 @@ def _not_applicable_method_analysis() -> Dict[str, Any]:
     }
 
 
+def _selection_criterion_ids(
+    question: Mapping[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
+    raw_selection = question.get("response_selection")
+    if not isinstance(raw_selection, Mapping):
+        return None, {}
+    units = _assessment_units(dict(question))
+    try:
+        selection = derive_response_selection(
+            question.get("question_text"),
+            units,
+            _max_marks(dict(question)),
+            explicit=raw_selection,
+        )
+    except (TypeError, ValueError):
+        return None, {}
+    by_unit: Dict[str, List[str]] = {
+        str(unit_id): [] for unit_id in selection.get("available_unit_ids") or []
+    }
+    for criterion in flatten_assessment_unit_criteria(units):
+        unit_id = str(criterion.get("assessment_unit_id") or "")
+        criterion_id = str(criterion.get("criterion_id") or "")
+        if unit_id in by_unit and criterion_id:
+            by_unit[unit_id].append(criterion_id)
+    return selection, by_unit
+
+
 def _validate_question_grade(
     item: Dict[str, Any],
     *,
     question: Dict[str, Any],
     question_number: int,
     page_count: int,
+    coverage_complete: Optional[bool] = None,
+    coverage_confidence: Optional[float] = None,
 ) -> _ValidatedGrade:
     status = str(item.get("attempt_status") or "unresolved").strip().lower()
     if status not in {"attempted", "not_attempted", "unresolved"}:
@@ -3923,12 +3975,27 @@ def _validate_question_grade(
     content_type = str(item.get("content_type") or ContentType.MIXED.value).upper()
     if content_type not in {value.value for value in ContentType}:
         content_type = ContentType.MIXED.value
+    source_item = item
+    if (
+        not isinstance(item.get("source_pages"), list)
+        and isinstance(item.get("evidence_regions"), list)
+    ):
+        # Read compatibility for already validated v12/v13 ledgers. New v16
+        # output uses source_pages, but an explicit reprocess must still be
+        # able to validate the prior evidence shape without rewriting it.
+        source_item = {**item, "source_pages": item.get("evidence_regions")}
     source_pages, region_errors = _validate_question_source_pages(
-        item,
+        source_item,
         question_number=question_number,
         page_count=page_count,
     )
     validation_errors = list(region_errors)
+    if coverage_complete is False:
+        validation_errors.append(
+            "The full-copy evidence search did not complete for this question"
+        )
+    if coverage_confidence is not None:
+        confidence = min(confidence, _bounded_confidence(coverage_confidence))
     evidence_region_ids = {
         str(region.get("region_id") or "")
         for region in source_pages
@@ -3942,6 +4009,34 @@ def _validate_question_grade(
     manual_review = bool(item.get("needs_review"))
     review_reason = str(item.get("review_reason") or "").strip()
     objective_question = _is_objective_question(question)
+    catalog_integrity_error = str(
+        question.get("catalog_integrity_error") or ""
+    ).strip()
+    if catalog_integrity_error:
+        return _unresolved_grade(
+            question,
+            question_number,
+            catalog_integrity_error,
+            confidence=confidence,
+            source_pages=source_pages,
+            student_answer=student_answer,
+            content_type=content_type,
+        )
+    response_selection, criterion_ids_by_unit = _selection_criterion_ids(question)
+    raw_attempted_unit_ids = item.get("attempted_unit_ids")
+    attempted_unit_ids = [
+        str(value or "").strip()
+        for value in (
+            raw_attempted_unit_ids if isinstance(raw_attempted_unit_ids, list) else []
+        )
+        if str(value or "").strip()
+    ]
+    if response_selection:
+        available_unit_ids = set(response_selection["available_unit_ids"])
+        if len(attempted_unit_ids) != len(set(attempted_unit_ids)):
+            validation_errors.append("Attempted optional assessment units are duplicated")
+        if set(attempted_unit_ids) - available_unit_ids:
+            validation_errors.append("Attempted optional assessment unit is not in the locked plan")
 
     if status == "unresolved":
         return _unresolved_grade(
@@ -3964,6 +4059,7 @@ def _validate_question_grade(
             or raw_total is None
             or abs(raw_total) > 0.01
             or manual_review
+            or bool(attempted_unit_ids)
         ):
             return _unresolved_grade(
                 question,
@@ -3975,7 +4071,7 @@ def _validate_question_grade(
                 student_answer=student_answer,
                 content_type=content_type,
             )
-        criterion_marks = [
+        criterion_marks = [] if response_selection else [
             {
                 "criterion_id": criterion["criterion_id"],
                 "description": criterion["description"],
@@ -4089,13 +4185,50 @@ def _validate_question_grade(
                 "The work was graded visually, but its text transcription is incomplete"
             )
 
+    all_criteria = list(criteria)
+    ignored_optional_ids: set[str] = set()
+    if response_selection:
+        if not attempted_unit_ids:
+            validation_errors.append(
+                "Attempted optional question does not identify which response units were answered"
+            )
+            criteria = []
+        else:
+            required_count = int(response_selection["required_count"])
+            if len(attempted_unit_ids) > required_count:
+                manual_review = True
+                review_reason = review_reason or (
+                    f"Student attempted more than the permitted {required_count} alternatives; "
+                    "the first visible responses were scored"
+                )
+            selected_unit_ids = attempted_unit_ids[:required_count]
+            selected_criterion_ids = {
+                criterion_id
+                for unit_id in selected_unit_ids
+                for criterion_id in criterion_ids_by_unit.get(unit_id, [])
+            }
+            available_criterion_ids = {
+                criterion_id
+                for unit_ids in criterion_ids_by_unit.values()
+                for criterion_id in unit_ids
+            }
+            ignored_optional_ids = available_criterion_ids - selected_criterion_ids
+            criteria = [
+                criterion
+                for criterion in all_criteria
+                if str(criterion.get("criterion_id") or "") in selected_criterion_ids
+            ]
+            if not criteria:
+                validation_errors.append(
+                    "Selected optional responses have no locked marking criteria"
+                )
     expected_ids = [str(criterion["criterion_id"]) for criterion in criteria]
     raw_by_id: Dict[str, Dict[str, Any]] = {}
     duplicate_ids: set[str] = set()
     for position, raw in enumerate(raw_marks):
         fallback_id = expected_ids[position] if position < len(expected_ids) else ""
         criterion_id = str(raw.get("criterion_id") or fallback_id).strip()
-        if not criterion_id:
+        if not criterion_id or criterion_id in ignored_optional_ids:
             continue
         if criterion_id in raw_by_id:
             duplicate_ids.add(criterion_id)
@@ -4224,6 +4357,12 @@ def _validate_question_grade(
             content_type=content_type,
         )
 
+    diagnostic_feedback = normalize_language_feedback(
+        item.get("language_feedback"),
+        profile=language_feedback_profile(question),
+        attempted=True,
+    )
+    curated_feedback = format_language_feedback(diagnostic_feedback)
     return _ValidatedGrade(
         question=question,
         question_number=question_number,
@@ -4235,7 +4374,10 @@ def _validate_question_grade(
         method_analysis=method_analysis,
         criterion_marks=criterion_marks,
         total_score=total_score,
-        overall_feedback=str(item.get("overall_feedback") or "").strip(),
+        overall_feedback=(
+            curated_feedback
+            or str(item.get("overall_feedback") or "").strip()
+        ),
         manual_review_required=manual_review,
         review_reason=review_reason,
     )
@@ -4389,6 +4531,64 @@ def _unresolved_grade(
     )
 
 
+def _prepare_runtime_question_catalog(
+    questions: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Repair derivable v16 contracts in memory without rewriting an exam.
+
+    Older papers may have correct question text but stale subject metadata or
+    may have flattened an ``answer any N`` choice into mandatory rows.  Both
+    facts can be reconstructed from the frozen question itself. Missing or
+    corrupted question content cannot be reconstructed and is marked
+    unresolved instead of being guessed.
+    """
+
+    prepared: List[Dict[str, Any]] = []
+    for raw_question in questions:
+        question = dict(raw_question)
+        question_text = str(question.get("question_text") or "")
+        integrity_error = instruction_only_question_reason(question_text)
+        if integrity_error:
+            question["catalog_integrity_error"] = integrity_error
+
+        if not _is_objective_question(question) and question.get("assessment_units"):
+            try:
+                raw_units = normalize_assessment_units(
+                    question.get("assessment_units"),
+                    assign_missing_ids=False,
+                )
+                selection = derive_response_selection(
+                    question_text,
+                    raw_units,
+                    _max_marks(question),
+                    explicit=question.get("response_selection"),
+                )
+                if selection:
+                    compiled_units = compile_assessment_units_to_budget(
+                        raw_units,
+                        _max_marks(question),
+                        question_text=question_text,
+                        response_selection=selection,
+                    )
+                    question["assessment_units"] = compiled_units
+                    question["marking_criteria"] = flatten_assessment_unit_criteria(
+                        compiled_units
+                    )
+                    question["response_selection"] = selection
+            except (TypeError, ValueError) as exc:
+                question["assessment_units_invalid"] = True
+                question["assessment_units_runtime_error"] = str(exc)[:300]
+        prepared.append(question)
+
+    inference = infer_language_paper(prepared)
+    if inference.get("enabled"):
+        for question in prepared:
+            if not _is_objective_question(question):
+                question["language_subject_inferred"] = True
+                question["language_subject_inference"] = inference
+    return prepared
+
+
 def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
     policy = _question_marking_policy(question)
     method_policy = _question_method_policy(question)
@@ -4403,10 +4603,13 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
             )
         except (TypeError, ValueError):
             assessment_units_invalid = True
+    language_profile = language_feedback_profile(question)
     return {
         "question_number": _positive_int(question.get("question_number")),
         "question_id": str(question.get("question_id") or ""),
         "question_text": str(question.get("question_text") or "")[:4000],
+        "subject": str(question.get("subject") or "")[:200],
+        "eval_template": str(question.get("eval_template") or "")[:100],
         "max_marks": _max_marks(question),
         "grading_mode": "objective" if objective else "subjective",
         "answer_format": "option_label" if objective else "worked_response",
@@ -4417,6 +4620,10 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
         "marking_criteria": [] if objective else _criteria(question),
         "assessment_units": assessment_units,
         "assessment_units_invalid": assessment_units_invalid,
+        "response_selection": question.get("response_selection"),
+        "catalog_integrity_error": str(
+            question.get("catalog_integrity_error") or ""
+        )[:500],
         "marking_policy": policy,
         "method_policy": method_policy,
         "method_standard": method_policy_instruction(method_policy),
@@ -4424,6 +4631,7 @@ def _catalog_question(question: Dict[str, Any]) -> Dict[str, Any]:
             str(policy.get("strictness") or "balanced")
         ),
         "expects_diagram": bool(question.get("expects_diagram")),
+        "language_feedback_profile": language_profile,
     }
 
 
@@ -4475,6 +4683,7 @@ def _validate_question_catalog(questions: List[Dict[str, Any]]) -> List[str]:
             errors.append(f"Q{number} has no positive maximum mark")
         criteria = _criteria(question)
         assessment_units = _assessment_units(question)
+        response_selection = None
         if bool(question.get("assessment_units_invalid")):
             errors.append(f"Q{number} has invalid assessment-unit metadata")
         if assessment_units:
@@ -4482,8 +4691,19 @@ def _validate_question_catalog(questions: List[Dict[str, Any]]) -> List[str]:
                 assessment_units,
                 max_marks,
                 require_reference_solution=True,
+                question_text=str(question.get("question_text") or ""),
+                response_selection=question.get("response_selection"),
             )
             errors.extend(f"Q{number} {error}" for error in unit_errors)
+            try:
+                response_selection = derive_response_selection(
+                    question.get("question_text"),
+                    assessment_units,
+                    max_marks,
+                    explicit=question.get("response_selection"),
+                )
+            except ValueError as exc:
+                errors.append(f"Q{number} {exc}")
             projected_criteria = normalize_marking_criteria(
                 flatten_assessment_unit_criteria(assessment_units),
                 assign_missing_ids=False,
@@ -4514,7 +4734,7 @@ def _validate_question_catalog(questions: List[Dict[str, Any]]) -> List[str]:
                         f"Q{number} criterion {criterion['criterion_id']} has no acceptable evidence"
                     )
             criterion_total = round(sum(item["max_marks"] for item in criteria), 2)
-            if abs(criterion_total - max_marks) > 0.01:
+            if response_selection is None and abs(criterion_total - max_marks) > 0.01:
                 errors.append(
                     f"Q{number} criterion maximums total {criterion_total:g}, "
                     f"question maximum is {max_marks:g}"

@@ -468,6 +468,29 @@ def _question_assessment_units(question: Dict[str, Any]) -> List[Dict[str, Any]]
         return []
 
 
+def _raw_question_response_selection(question: Dict[str, Any]) -> Any:
+    raw_value = question.get("response_selection")
+    if raw_value is None and isinstance(question.get("metadata"), dict):
+        raw_value = question["metadata"].get("response_selection")
+    return raw_value
+
+
+def _question_response_selection(question: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    units = _question_assessment_units(question)
+    marks = _question_marks(question)
+    if not units or marks is None:
+        return None
+    try:
+        return _marking_policy_module().derive_response_selection(
+            _question_text(question),
+            units,
+            marks,
+            explicit=_raw_question_response_selection(question),
+        )
+    except ValueError:
+        return None
+
+
 def _question_method_policy(question: Dict[str, Any]) -> Dict[str, Any]:
     """Return the explicit method contract, defaulting to any valid method."""
 
@@ -605,6 +628,7 @@ def _content_hash(
                 "reference_solution": _question_reference_solution(question),
                 "marking_criteria": _question_marking_criteria(question),
                 "assessment_units": _question_assessment_units(question),
+                "response_selection": _question_response_selection(question),
                 "options": copy.deepcopy(question.get("options") or []),
                 "enhanced_options": copy.deepcopy(
                     question.get("enhanced_options") or []
@@ -1071,6 +1095,13 @@ def validate_pcr_questions(
             errors.append(f"Q {label}: missing stable question id")
         if not _question_text(question):
             errors.append(f"Q {label}: missing question text")
+        instruction_error = policy_module.instruction_only_question_reason(
+            _question_text(question)
+        )
+        if instruction_error:
+            errors.append(
+                f"Q {label}: {instruction_error}; correct the extracted question before finalizing"
+            )
         if _question_marks(question) is None:
             errors.append(
                 f"Q {label}: verify the printed marks or enter marks greater than zero"
@@ -1141,6 +1172,8 @@ def validate_pcr_questions(
                     assessment_units,
                     _question_marks(question),
                     require_reference_solution=True,
+                    question_text=_question_text(question),
+                    response_selection=_raw_question_response_selection(question),
                 )
                 errors.extend(f"Q {label}: {error}" for error in unit_errors)
                 projected_criteria = policy_module.flatten_assessment_unit_criteria(
@@ -1263,6 +1296,11 @@ async def create_paper_snapshot(
                 clean_question["assessment_units"] = (
                     policy_module.snapshot_assessment_units(assessment_units)
                 )
+                response_selection = _question_response_selection(clean_question)
+                if response_selection:
+                    clean_question["response_selection"] = copy.deepcopy(
+                        response_selection
+                    )
         question_docs.append(
             {
                 "paper_version_id": paper_version_id,
@@ -1515,6 +1553,7 @@ async def snapshot_paper_to_session(
             pcr_doc["marking_criteria"] = _question_marking_criteria(raw_question)
             pcr_doc["method_policy"] = _question_method_policy(raw_question)
             pcr_doc["assessment_units"] = _question_assessment_units(raw_question)
+            pcr_doc["response_selection"] = _question_response_selection(raw_question)
             if policy_module.is_structured_rubric_policy(marking_policy):
                 pcr_doc["evaluation_mode"] = policy_module.STRUCTURED_RUBRIC_MODE
             pcr_doc["question_text"] = _question_text(raw_question)

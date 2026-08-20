@@ -3390,6 +3390,16 @@ def _parse_pcr_marking_plan_draft(
                 raw_criteria,
                 assign_missing_ids=True,
             )
+            # The legacy flat format carries explicit mark values, not
+            # relative assessment-unit weights. Reject a mismatched ledger
+            # before compilation instead of silently rescaling teacher marks.
+            flat_criterion_errors = policy_module.validate_marking_criteria(
+                criteria,
+                question_marks,
+                require_atomic=False,
+            )
+            if flat_criterion_errors:
+                raise ValueError("; ".join(flat_criterion_errors[:3]))
             reference_solution = str(
                 payload.get("reference_solution")
                 or payload.get("teacher_reference_solution")
@@ -3433,10 +3443,22 @@ def _parse_pcr_marking_plan_draft(
     except ValueError as exc:
         raise ValueError(f"The AI returned invalid assessment units: {exc}") from exc
 
+    try:
+        response_selection = policy_module.derive_response_selection(
+            question_text,
+            assessment_units,
+            question_marks,
+            explicit=payload.get("response_selection"),
+        )
+    except ValueError as exc:
+        raise ValueError(f"The AI returned invalid response selection: {exc}") from exc
+
     errors = policy_module.validate_assessment_units(
         assessment_units,
         question_marks,
         require_reference_solution=True,
+        question_text=question_text,
+        response_selection=response_selection,
     )
     expected_unit_count = _expected_pcr_assessment_unit_count(
         question_text,
@@ -3477,6 +3499,7 @@ def _parse_pcr_marking_plan_draft(
         "marking_criteria": criteria,
         "method_policy": method_policy,
         "assessment_units": assessment_units,
+        "response_selection": response_selection,
     }
 
 
@@ -3504,6 +3527,8 @@ def _saved_pcr_marking_plan_errors(question: Dict[str, Any]) -> List[str]:
             units,
             question_marks,
             require_reference_solution=True,
+            question_text=str(question.get("question_text") or question.get("text") or ""),
+            response_selection=question.get("response_selection"),
         )
         projected = policy_module.flatten_assessment_unit_criteria(units)
         try:
@@ -9819,7 +9844,19 @@ async def create_question(
             normalized_assessment_units = policy_module.normalize_assessment_units(
                 assessment_units,
             )
+            normalized_response_selection = None
             if normalized_assessment_units:
+                normalized_response_selection = policy_module.derive_response_selection(
+                    question_text,
+                    normalized_assessment_units,
+                    points,
+                )
+                normalized_assessment_units = policy_module.compile_assessment_units_to_budget(
+                    normalized_assessment_units,
+                    points,
+                    question_text=question_text,
+                    response_selection=normalized_response_selection,
+                )
                 normalized_marking_criteria = policy_module.flatten_assessment_unit_criteria(
                     normalized_assessment_units
                 )
@@ -9876,6 +9913,7 @@ async def create_question(
             "marking_criteria": normalized_marking_criteria,
             "method_policy": normalized_method_policy,
             "assessment_units": normalized_assessment_units,
+            "response_selection": normalized_response_selection,
             "points": float(points),
             "penalty": normalize_question_penalty(
                 penalty,
@@ -10082,8 +10120,32 @@ async def update_question(
                 normalized_units = policy_module.normalize_assessment_units(
                     question_data["assessment_units"]
                 )
+                effective_marks = question_data.get(
+                    "points",
+                    existing_question.get("points", existing_question.get("max_marks", 0)),
+                )
+                effective_question_text = str(
+                    question_data.get("text")
+                    or question_data.get("question_text")
+                    or existing_question.get("question_text")
+                    or existing_question.get("text")
+                    or ""
+                )
+                response_selection = policy_module.derive_response_selection(
+                    effective_question_text,
+                    normalized_units,
+                    effective_marks,
+                    explicit=question_data.get("response_selection"),
+                )
+                normalized_units = policy_module.compile_assessment_units_to_budget(
+                    normalized_units,
+                    effective_marks,
+                    question_text=effective_question_text,
+                    response_selection=response_selection,
+                )
                 submitted_assessment_units = normalized_units
                 update_data["assessment_units"] = normalized_units
+                update_data["response_selection"] = response_selection
                 if normalized_units:
                     # Assessment units are the authoring authority. Keep the
                     # existing top-level fields as a compatibility projection
@@ -10100,14 +10162,12 @@ async def update_question(
                         update_data["method_policy"] = unit_policies[0]
                     else:
                         update_data["method_policy"] = policy_module.default_method_policy()
-                    effective_marks = question_data.get(
-                        "points",
-                        existing_question.get("points", existing_question.get("max_marks", 0)),
-                    )
                     unit_errors = policy_module.validate_assessment_units(
                         normalized_units,
                         effective_marks,
                         require_reference_solution=True,
+                        question_text=effective_question_text,
+                        response_selection=response_selection,
                     )
                     if unit_errors:
                         update_data["marking_plan_generation_status"] = "not_generated"
@@ -10124,6 +10184,7 @@ async def update_question(
                     update_data["marking_criteria"] = []
                     update_data["reference_solution"] = None
                     update_data["method_policy"] = policy_module.default_method_policy()
+                    update_data["response_selection"] = None
                     update_data["marking_plan_generation_status"] = "not_generated"
                     update_data["marking_plan_generation_error"] = (
                         "Assessment units were removed; prepare and review a new marking plan"
@@ -10336,6 +10397,7 @@ async def update_question(
             update_data.update(
                 {
                     "assessment_units": [],
+                    "response_selection": None,
                     "marking_criteria": [],
                     "reference_solution": None,
                     "marking_plan_generation_status": "not_generated",
@@ -12112,6 +12174,7 @@ async def generate_document_solutions(
                     ).strip()
                     generated_criteria = plan_draft.get("marking_criteria") or []
                     generated_assessment_units = plan_draft.get("assessment_units") or []
+                    generated_response_selection = plan_draft.get("response_selection")
                     reference_solution = (
                         existing_reference
                         if has_existing_reference and not may_replace_plan
@@ -12142,6 +12205,11 @@ async def generate_document_solutions(
                             (question.get("assessment_units") or [])
                             if has_existing_criteria and not may_replace_plan
                             else generated_assessment_units
+                        ),
+                        "response_selection": (
+                            question.get("response_selection")
+                            if has_existing_criteria and not may_replace_plan
+                            else generated_response_selection
                         ),
                         "marking_plan_source": (
                             "teacher_and_ai"

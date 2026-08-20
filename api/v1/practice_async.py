@@ -3,9 +3,10 @@ Async Practice API for SkillBot
 Practice session management endpoints with analytics
 """
 
+import json
 import logging
 import aiofiles
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Mapping
 from datetime import datetime, timedelta
 from bson import ObjectId
 
@@ -42,6 +43,9 @@ _gate_module = None          # lazily imported exam-conductor.llm_gate
 _gate_import_attempted = False  # True once we have tried (success or failure)
 _gate_unavailable = False    # True when import was attempted and failed
 
+_language_assessment_module = None
+_language_assessment_import_attempted = False
+
 
 def _try_load_gate_module():
     """Attempt to import the LLM gate module once.  Returns the module or None."""
@@ -66,6 +70,97 @@ def _try_load_gate_module():
             "Deploy exam-conductor to restore compliance."
         )
         return None
+
+
+def _try_load_language_assessment_module():
+    """Load the shared PCR/practice language contract without a hard dependency."""
+
+    global _language_assessment_module, _language_assessment_import_attempted
+    if _language_assessment_module is not None:
+        return _language_assessment_module
+    if _language_assessment_import_attempted:
+        return None
+    _language_assessment_import_attempted = True
+    try:
+        from api.v1._exampen_imports import load_exampen
+
+        _language_assessment_module = load_exampen("pcr.language_assessment")
+        return _language_assessment_module
+    except ImportError:
+        logger.warning(
+            "Shared language-assessment contract is unavailable; practice feedback "
+            "will remain subject-only."
+        )
+        return None
+
+
+def _practice_language_feedback_profile(
+    question: Mapping[str, Any],
+    *,
+    is_mcq: bool,
+    reference_solution: str = "",
+) -> Dict[str, Any]:
+    """Derive feedback eligibility from question metadata, never answer script.
+
+    A Hindi-medium Physics answer remains Physics.  Conversely, a subjective
+    Hindi/English language-writing task gets the shared seven-dimension profile.
+    The derivation is read-time only, so historical practice sets need no migration.
+    """
+
+    module = _try_load_language_assessment_module()
+    if module is None:
+        return {"enabled": False, "version": "language-feedback-v1"}
+    metadata = question.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    subject = (
+        question.get("subject")
+        or metadata.get("subject")
+        or metadata.get("subject_name")
+        or ""
+    )
+    adapted = {
+        **dict(question),
+        "subject": subject,
+        "question_text": question.get("text") or question.get("question_text") or "",
+        "reference_solution": reference_solution
+        or question.get("reference_solution")
+        or question.get("correctAnswer")
+        or question.get("correct_answer")
+        or "",
+        "grading_mode": "objective" if is_mcq else "subjective",
+        "question_type": "mcq" if is_mcq else "subjective",
+    }
+    return module.language_feedback_profile(adapted)
+
+
+def _practice_language_feedback_example(
+    profile: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not profile.get("enabled"):
+        return None
+    dimensions: Dict[str, Any] = {}
+    for dimension in profile.get("dimensions") or []:
+        if not isinstance(dimension, Mapping):
+            continue
+        dimension_id = str(dimension.get("dimension_id") or "").strip()
+        applicable = bool(dimension.get("applicable"))
+        dimensions[dimension_id] = {
+            "applicability": "applicable" if applicable else "not_applicable",
+            "level": "secure" if applicable else "not_applicable",
+            "evidence": "specific evidence from this answer" if applicable else "",
+            "feedback": "one actionable improvement" if applicable else "",
+        }
+    if len(dimensions) != 7:
+        return None
+    return {
+        "version": "language-feedback-v1",
+        "response_family": str(profile.get("response_family") or "short_language_response"),
+        "feedback_language": "language used for the feedback",
+        "summary": "brief writing-skills summary",
+        "priority_actions": ["up to three concrete improvements"],
+        "example_revision": "a concise improved example, or an empty string",
+        "dimensions": dimensions,
+    }
 
 
 async def _gate_text_call(
@@ -2134,6 +2229,7 @@ def _build_evaluation_prompt(
     num_student_images: int,
     num_question_figures: int,
     num_option_images: int,
+    language_feedback_profile: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Build a single, universal evaluation prompt.
 
@@ -2243,7 +2339,39 @@ def _build_evaluation_prompt(
             "question's cached model answer; treat it as the authoritative correct answer."
         )
 
-    parts.append('''
+    language_example = _practice_language_feedback_example(
+        language_feedback_profile or {}
+    )
+    output_contract: Dict[str, Any] = {
+        "is_correct": True,
+        "score": 1.0,
+        "extracted_answer": "the student's final answer in its most concise comparable form",
+        "work_shown": "short teacher readout of what they wrote or drew",
+        "what_went_wrong": "if wrong: the specific mistake; empty if correct",
+    }
+    if language_example is not None:
+        output_contract["language_feedback"] = language_example
+        parts.append(
+            "\nLANGUAGE-WRITING DIAGNOSTIC (does not change the score):\n"
+            "This is a recognized language-subject writing task. Alongside semantic "
+            "correctness, give evidence-based feedback for the seven supplied dimensions. "
+            "For applicable dimensions, level must be one of excellent, secure, developing, "
+            "needs_improvement, or not_assessed. Use only evidence visible in this answer. "
+            "For non-applicable dimensions return not_applicable with empty evidence and "
+            "feedback. This diagnostic must never alter is_correct or score; those remain "
+            "the task-correctness verdict."
+        )
+    else:
+        parts.append(
+            "\nNON-LANGUAGE SUBJECT BOUNDARY:\n"
+            "Evaluate only the subject knowledge and method requested by the question. "
+            "Do not lower the score or criticize spelling, grammar, punctuation, tone, "
+            "style, handwriting, or answer language unless the question explicitly tests "
+            "that skill. A Physics, Chemistry, Mathematics, Biology, or other subject answer "
+            "written in Hindi remains that subject. Do not return language_feedback."
+        )
+
+    evaluation_rules = '''
 HOW TO EVALUATE — read the canvas like a teacher, not like a graphics reporter.
 
 The student page is a photo of their copy. READ the content. Do not narrate
@@ -2285,13 +2413,13 @@ whole page description.
 WHAT_WENT_WRONG — the actual mistake, or empty if correct. Not a geometry essay.
 
 OUTPUT — strict JSON only (no markdown fences, no commentary):
-{
-  "is_correct": true | false,
-  "score": 0.0 to 1.0,
-  "extracted_answer": "the student's final answer in its most concise comparable form",
-  "work_shown": "short teacher readout of what they wrote/drew",
-  "what_went_wrong": "if wrong: the specific mistake. Empty string if correct."
-}''')
+__OUTPUT_CONTRACT__'''
+    parts.append(
+        evaluation_rules.replace(
+            "__OUTPUT_CONTRACT__",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        )
+    )
 
     parts.append("\nNotes for the JSON:")
     parts.append("  - is_correct must be a boolean (true/false), not a string.")
@@ -2431,7 +2559,11 @@ OUTPUT - strict JSON only (no markdown fences, no commentary, no text outside JS
     return "\n".join(parts)
 
 
-def _build_evaluation_system_prompt(detected_language: str) -> str:
+def _build_evaluation_system_prompt(
+    detected_language: str,
+    *,
+    language_feedback_enabled: bool = False,
+) -> str:
     """Subjective-first system prompt for the evaluator.
 
     Core stance: the student may express a correct answer in many forms (letter, value,
@@ -2445,8 +2577,28 @@ def _build_evaluation_system_prompt(detected_language: str) -> str:
             "CRITICAL: The question is in Hindi (Devanagari script). Respond ENTIRELY in Hindi "
             "(work_shown and what_went_wrong fields must be in Hindi). "
         )
+    subject_boundary = (
+        "This is a recognized language-subject writing task. Return the requested "
+        "seven-dimension language_feedback as a diagnostic alongside the verdict, but "
+        "never change is_correct or score because of that diagnostic. "
+        if language_feedback_enabled
+        else
+        "This is not a recognized language-writing task. Grade only the requested subject "
+        "knowledge and method. Do not deduct or criticize grammar, spelling, punctuation, "
+        "tone, style, handwriting, or the language used to express a PCMB answer. Do not "
+        "return language_feedback. "
+    )
+    output_fields = (
+        "six required keys (is_correct, score, extracted_answer, work_shown, "
+        "what_went_wrong, language_feedback)"
+        if language_feedback_enabled
+        else
+        "five required keys (is_correct, score, extracted_answer, work_shown, "
+        "what_went_wrong)"
+    )
     return (
         f"{lang_rule}"
+        f"{subject_boundary}"
         "You are a teacher reading a student's handwritten copy (canvas image) and grading it. "
         "Read the page the way you would read an answer sheet: letters are letters, equations "
         "are equations, diagrams are diagrams. Never describe pen strokes, curves, loops, or "
@@ -2460,8 +2612,7 @@ def _build_evaluation_system_prompt(detected_language: str) -> str:
         "or \\[...\\]. Wrap formulas and identifiers in $...$ so the renderer typesets them "
         "correctly. Use LaTeX commands (\\frac, \\sqrt, \\alpha, \\ce), not raw Unicode "
         "for symbols that need typesetting. "
-        "OUTPUT: only valid JSON with the five required keys (is_correct, score, "
-        "extracted_answer, work_shown, what_went_wrong). No markdown fences, no commentary, "
+        f"OUTPUT: only valid JSON with the {output_fields}. No markdown fences, no commentary, "
         "no extra fields."
     )
 
@@ -2493,6 +2644,7 @@ def _parse_evaluation_response(
     has_correct_answer: bool,
     answer_text: str,
     evaluation_mode: str = EVALUATION_MODE_STANDARD,
+    language_feedback_profile: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Parse the LLM evaluator JSON output.
 
@@ -2553,6 +2705,22 @@ def _parse_evaluation_response(
     evaluation_data["whatWentWrong"] = _normalize_latex_for_render(
         str(parsed.get("what_went_wrong", "")).strip()
     )
+
+    profile = language_feedback_profile or {}
+    if profile.get("enabled"):
+        module = _try_load_language_assessment_module()
+        if module is not None:
+            language_feedback = module.normalize_language_feedback(
+                parsed.get("language_feedback"),
+                profile=profile,
+                attempted=True,
+            )
+            if language_feedback is not None:
+                # Curate the validated seven-dimension output into the existing
+                # feedback field. The UI and API shape stay unchanged.
+                curated_feedback = module.format_language_feedback(language_feedback)
+                if curated_feedback:
+                    evaluation_data["whatWentWrong"] = curated_feedback
 
     return evaluation_data
 
@@ -2878,6 +3046,18 @@ async def evaluate_submission(
             correct_answer_display = _normalize_latex_for_render(cached_final_answer)
             has_correct_answer = True
 
+        language_profile: Dict[str, Any] = {
+            "enabled": False,
+            "version": "language-feedback-v1",
+        }
+        if evaluation_mode == EVALUATION_MODE_STANDARD:
+            language_profile = _practice_language_feedback_profile(
+                question_doc,
+                is_mcq=is_mcq,
+                reference_solution=cached_solution_text,
+            )
+        language_feedback_enabled = bool(language_profile.get("enabled"))
+
         # 6. Build the single, unified prompt + system prompt
         if evaluation_mode == EVALUATION_MODE_CASE_STUDY:
             prompt = _build_case_study_evaluation_prompt(
@@ -2905,27 +3085,36 @@ async def evaluate_submission(
                 num_student_images=num_student_images,
                 num_question_figures=num_question_figures,
                 num_option_images=num_option_images,
+                language_feedback_profile=language_profile,
             )
-            system_prompt = _build_evaluation_system_prompt(detected_language)
+            system_prompt = _build_evaluation_system_prompt(
+                detected_language,
+                language_feedback_enabled=language_feedback_enabled,
+            )
 
-        # 7. ONE LLM call. Output is now small (5 fields, no solution/feedback/reasoning),
-        # so 1000 tokens is plenty.
+        # 7. ONE LLM call. Non-language answers retain the compact five-field
+        # budget; recognized language-writing answers receive room for the
+        # seven diagnostic dimensions without making a second provider call.
         # Image order MUST match the per-image labelling produced by the prompt builder:
         #   question figures first, then option images, then student pages (one per page).
         all_images = all_question_images + student_images
+        # The higher value is a ceiling, not a forced spend. It prevents a
+        # seven-dimension JSON object from being truncated and invalidating the
+        # verdict; normal concise responses stop well before this limit.
+        evaluation_max_tokens = 2400 if language_feedback_enabled else 1000
         if all_images:
             response = await _gate_vision_call(
                 db, current_user, all_images,
                 prompt,
                 system_prompt=system_prompt,
-                max_tokens=1000,
+                max_tokens=evaluation_max_tokens,
                 temperature=0.2,
             )
         else:
             response = await _gate_text_call(
                 db, current_user, prompt,
                 system_prompt=system_prompt,
-                max_tokens=1000,
+                max_tokens=evaluation_max_tokens,
                 temperature=0.2,
             )
 
@@ -2939,6 +3128,7 @@ async def evaluate_submission(
             has_correct_answer=has_correct_answer,
             answer_text=answer_text,
             evaluation_mode=evaluation_mode,
+            language_feedback_profile=language_profile,
         )
         evaluation_data["correctSolution"] = cached_solution_text
         if cached.get("source") and not has_correct_answer:

@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 POLICY_VERSION = "criterion-rubric-v2"
 METHOD_POLICY_VERSION = "method-policy-v1"
 ASSESSMENT_UNIT_VERSION = "assessment-unit-v1"
+RESPONSE_SELECTION_VERSION = "response-selection-v1"
 STRUCTURED_RUBRIC_MODE = "criterion_rubric_v1"
 LEGACY_AI_MODE = "legacy_ai_v1"
 MAX_AI_TEMPERATURE = 0.20
@@ -69,6 +70,67 @@ STRICTNESS_PROFILES: Dict[str, str] = {
 
 _CRITERION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MARK_TOLERANCE = 0.01
+
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "एक": 1,
+    "दो": 2,
+    "तीन": 3,
+    "चार": 4,
+    "पांच": 5,
+    "पाँच": 5,
+    "छह": 6,
+    "सात": 7,
+    "आठ": 8,
+    "नौ": 9,
+    "दस": 10,
+}
+_COUNT_TOKEN_PATTERN = "|".join(
+    sorted((re.escape(value) for value in _COUNT_WORDS), key=len, reverse=True)
+)
+_ATTEMPT_ANY_PATTERNS = (
+    re.compile(
+        rf"\b(?:answer|attempt|solve|write)\s+(?:only\s+)?any\s+"
+        rf"(?P<count>\d+|{_COUNT_TOKEN_PATTERN})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:answer|attempt|solve|write)\s+(?P<count>\d+|{_COUNT_TOKEN_PATTERN})\s+"
+        r"(?:of|out\s+of)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:किन्हीं|किन्ही|किसी|कोई)\s*(?P<count>\d+|{_COUNT_TOKEN_PATTERN})\s*"
+        r"(?:प्रश्न|प्रश्नों|भाग|खंड|विकल्प)",
+        re.IGNORECASE,
+    ),
+)
+
+_INSTRUCTION_CUES = (
+    re.compile(r"\bthis\s+(?:question\s+)?paper\s+is\s+divided\b", re.IGNORECASE),
+    re.compile(r"\ball\s+(?:the\s+)?questions?\s+are\s+compulsory\b", re.IGNORECASE),
+    re.compile(r"\bmarks?\s+(?:are|is)\s+indicated\b", re.IGNORECASE),
+    re.compile(r"\b(?:attempt|answer)\s+all\s+(?:the\s+)?questions?\b", re.IGNORECASE),
+    re.compile(r"\bwrite\s+(?:the\s+)?answers?\s+(?:in|on)\s+(?:the\s+)?answer\s+", re.IGNORECASE),
+    re.compile(r"\bread\s+(?:the\s+)?instructions?\s+carefully\b", re.IGNORECASE),
+    re.compile(r"(?:सभी|समस्त)\s+प्रश्न\s+अनिवार्य", re.IGNORECASE),
+    re.compile(r"प्रश्न.?पत्र\s+(?:को|में).*(?:खंड|भाग)", re.IGNORECASE),
+)
+_ASSESSABLE_TASK_CUE = re.compile(
+    r"(?:\?|\b(?:find|calculate|explain|describe|discuss|compare|define|prove|derive|"
+    r"write\s+(?:a|an|about)|draft|identify|state|evaluate|analyse|analyze)\b|"
+    r"(?:ज्ञात|गणना|समझाइए|वर्णन|चर्चा|तुलना|परिभाषित|सिद्ध|व्याख्या|लिखिए|बताइए))",
+    re.IGNORECASE,
+)
 
 
 def normalize_scoring_model(value: Any) -> str:
@@ -506,6 +568,140 @@ def normalize_assessment_units(
     return units
 
 
+def _positive_count(value: Any) -> Optional[int]:
+    raw = str(value or "").strip().casefold()
+    if not raw:
+        return None
+    if raw.isdigit():
+        count = int(raw)
+    else:
+        count = _COUNT_WORDS.get(raw)
+    return count if count and count > 0 else None
+
+
+def normalize_response_selection(
+    value: Any,
+    *,
+    available_unit_ids: Optional[Iterable[Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize the question-level rule that selects optional response units.
+
+    This rule is deliberately stored beside, rather than inside, assessment
+    units.  Every alternative can retain its honest mark value while the
+    parent question still owns the maximum selectable budget.
+    """
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Response selection must be valid JSON") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError("Response selection must be an object")
+    mode = str(value.get("mode") or "").strip().lower().replace("-", "_")
+    if mode not in {"attempt_any"}:
+        raise ValueError("Response selection mode must be attempt_any")
+    required_count = _positive_count(value.get("required_count"))
+    if required_count is None:
+        raise ValueError("Response selection requires a positive required_count")
+
+    allowed_ids = [
+        str(item or "").strip()
+        for item in (available_unit_ids or [])
+        if str(item or "").strip()
+    ]
+    raw_ids = value.get("available_unit_ids")
+    if raw_ids is None:
+        unit_ids = list(allowed_ids)
+    elif not isinstance(raw_ids, list):
+        raise ValueError("Response selection available_unit_ids must be a list")
+    else:
+        unit_ids = [str(item or "").strip() for item in raw_ids if str(item or "").strip()]
+    if not unit_ids:
+        raise ValueError("Response selection requires available assessment units")
+    if len(unit_ids) != len(set(unit_ids)):
+        raise ValueError("Response selection assessment unit ids must be unique")
+    if allowed_ids and (set(unit_ids) - set(allowed_ids)):
+        raise ValueError("Response selection references an unknown assessment unit")
+    if required_count >= len(unit_ids):
+        raise ValueError("attempt_any must select fewer than the available assessment units")
+
+    return {
+        "version": RESPONSE_SELECTION_VERSION,
+        "mode": "attempt_any",
+        "required_count": required_count,
+        "available_unit_ids": unit_ids,
+    }
+
+
+def derive_response_selection(
+    question_text: Any,
+    units: Any,
+    question_max_marks: Any,
+    *,
+    explicit: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Derive a strict ``attempt any N`` rule without mutating stored data."""
+
+    normalized_units = normalize_assessment_units(units, assign_missing_ids=True)
+    unit_ids = [str(unit.get("unit_id") or "") for unit in normalized_units]
+    if explicit is not None and explicit != "":
+        selection = normalize_response_selection(
+            explicit,
+            available_unit_ids=unit_ids,
+        )
+    else:
+        text = " ".join(str(question_text or "").split())
+        required_count: Optional[int] = None
+        for pattern in _ATTEMPT_ANY_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                required_count = _positive_count(match.group("count"))
+                break
+        if required_count is None or required_count >= len(unit_ids):
+            return None
+        selection = normalize_response_selection(
+            {
+                "mode": "attempt_any",
+                "required_count": required_count,
+                "available_unit_ids": unit_ids,
+            },
+            available_unit_ids=unit_ids,
+        )
+
+    try:
+        question_marks = float(question_max_marks)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Question marks must be a positive number") from exc
+    if not math.isfinite(question_marks) or question_marks <= 0:
+        raise ValueError("Question marks must be a positive number")
+    required_count = int(selection["required_count"])
+    per_unit_marks = round(question_marks / required_count, 2)
+    if per_unit_marks <= 0 or not math.isclose(
+        per_unit_marks * required_count,
+        question_marks,
+        abs_tol=_MARK_TOLERANCE,
+    ):
+        raise ValueError(
+            "Question marks cannot be divided exactly across the required optional responses"
+        )
+    return {**selection, "per_unit_marks": per_unit_marks}
+
+
+def instruction_only_question_reason(question_text: Any) -> str:
+    """Identify high-confidence paper directions accidentally catalogued as a question."""
+
+    text = " ".join(str(question_text or "").split())
+    if not text:
+        return "Question text is empty"
+    cue_count = sum(1 for pattern in _INSTRUCTION_CUES if pattern.search(text))
+    if cue_count < 2 or _ASSESSABLE_TASK_CUE.search(text):
+        return ""
+    return "Appears to contain paper instructions rather than an assessable question"
+
+
 def _mark_quantum(total_marks: float, item_count: int) -> Optional[float]:
     """Choose the coarsest conventional increment that can fund every item."""
 
@@ -637,6 +833,7 @@ def compile_assessment_units_to_budget(
     *,
     question_text: str = "",
     explicit_unit_marks: Optional[List[float]] = None,
+    response_selection: Any = None,
 ) -> List[Dict[str, Any]]:
     """Compile semantic assessment units into a server-owned mark ledger.
 
@@ -656,8 +853,29 @@ def compile_assessment_units_to_budget(
     if not math.isfinite(question_marks) or question_marks <= 0:
         raise ValueError("Question marks must be a positive number")
 
+    selection = derive_response_selection(
+        question_text,
+        units,
+        question_marks,
+        explicit=response_selection,
+    )
     printed_allocations = list(explicit_unit_marks or [])
-    if printed_allocations:
+    if selection:
+        per_unit_marks = float(selection["per_unit_marks"])
+        if printed_allocations:
+            if len(printed_allocations) != len(units):
+                raise ValueError(
+                    "Printed optional-part marks do not match the available responses"
+                )
+            if any(
+                not math.isclose(float(value), per_unit_marks, abs_tol=_MARK_TOLERANCE)
+                for value in printed_allocations
+            ):
+                raise ValueError(
+                    "Printed optional-part marks do not match the selectable question budget"
+                )
+        allocations = [per_unit_marks for _unit in units]
+    elif printed_allocations:
         if len(printed_allocations) != len(units):
             return units
         if not math.isclose(sum(printed_allocations), question_marks, abs_tol=_MARK_TOLERANCE):
@@ -726,6 +944,8 @@ def validate_assessment_units(
     question_max_marks: Any,
     *,
     require_reference_solution: bool = False,
+    question_text: str = "",
+    response_selection: Any = None,
 ) -> List[str]:
     """Validate the complete marks ledger below one displayed question."""
 
@@ -740,6 +960,16 @@ def validate_assessment_units(
         return ["assign question marks greater than zero before setting assessment units"]
 
     errors: List[str] = []
+    try:
+        selection = derive_response_selection(
+            question_text,
+            normalized,
+            question_marks,
+            explicit=response_selection,
+        )
+    except ValueError as exc:
+        selection = None
+        errors.append(str(exc))
     unit_total = 0.0
     seen_ids: set[str] = set()
     for position, unit in enumerate(normalized, start=1):
@@ -765,7 +995,26 @@ def validate_assessment_units(
         )
         errors.extend(f"assessment unit {label}: {error}" for error in criterion_errors)
 
-    if abs(unit_total - question_marks) > _MARK_TOLERANCE:
+    if selection:
+        expected_marks = float(selection["per_unit_marks"])
+        selectable_ids = set(selection["available_unit_ids"])
+        known_ids = {str(unit.get("unit_id") or "") for unit in normalized}
+        if selectable_ids != known_ids:
+            errors.append("response selection must cover every optional assessment unit")
+        for unit in normalized:
+            marks = float(unit.get("max_marks") or 0)
+            if not math.isclose(marks, expected_marks, abs_tol=_MARK_TOLERANCE):
+                errors.append(
+                    f"assessment unit {unit.get('label')}: expected {expected_marks:g} marks "
+                    "for each selectable response"
+                )
+        selected_total = expected_marks * int(selection["required_count"])
+        if not math.isclose(selected_total, question_marks, abs_tol=_MARK_TOLERANCE):
+            errors.append(
+                f"selected assessment-unit marks total {selected_total:g}, but this question "
+                f"is worth {question_marks:g}"
+            )
+    elif abs(unit_total - question_marks) > _MARK_TOLERANCE:
         errors.append(
             f"assessment unit marks total {unit_total:g}, but this question is worth {question_marks:g}"
         )

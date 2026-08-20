@@ -15,6 +15,8 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Mapping, Optional, Sequence
 
+from ..language_assessment import language_feedback_schema
+
 
 PROMPT_VERSION = "pcr-full-document-visual-v16"
 PIPELINE_VERSION = 7
@@ -56,7 +58,28 @@ def system_instructions() -> str:
         "only physical answer-copy page numbers. student_answer is a concise faithful "
         "transcription or visual description of the student's work. Criterion evidence "
         "must state what is actually visible and why it earns or loses marks. Keep "
-        "feedback short. Set all_student_work_accounted=true only after every visible "
+        "feedback short. When a catalog question includes language_feedback_profile, "
+        "also return its seven diagnostic writing dimensions. This developmental profile "
+        "never changes marks: criterion_marks remain the only score source. Follow the "
+        "profile's applicability exactly, use not_applicable for excluded dimensions, "
+        "and use not_assessed with empty evidence and feedback when the answer is not "
+        "attempted or genuinely unresolved. Write feedback in the language used by the "
+        "student where practical. For each "
+        "applicable dimension, cite a short visible phrase or feature and give one concrete "
+        "next step. Do not penalize one defect twice across dimensions, do not call uncertain "
+        "handwriting a spelling or grammar error, and do not fabricate a correction. "
+        "For every question without an enabled language_feedback_profile, assess only the "
+        "locked subject criteria. Do not reduce marks or criticize spelling, grammar, "
+        "punctuation, tone, style, or handwriting quality unless a locked criterion "
+        "explicitly requires that skill. The language in which a Physics, Chemistry, "
+        "Mathematics, or Biology answer is written never turns it into a language task. "
+        "When response_selection is present, the question contains alternatives. Identify "
+        "the assessment units the student actually attempted from visible labels and answer "
+        "content, and return their unit IDs in visible answer order. Grade only the first "
+        "required_count attempted units; do not emit criterion rows for unattempted alternatives. "
+        "If more alternatives were attempted than permitted, keep the first required_count for "
+        "the score and set needs_review=true so the teacher can confirm the intended selection. "
+        "Set all_student_work_accounted=true only after every visible "
         "student answer block has been associated or explicitly represented as unresolved. "
         "Do not return coordinates, crops, OCR commentary, confidence thresholds, or "
         "implementation details."
@@ -109,6 +132,13 @@ def output_limit(
         for contract in question_contracts
         if isinstance(contract, Mapping)
     )
+    language_dimension_count = sum(
+        len((contract.get("language_feedback_profile") or {}).get("dimensions") or [])
+        for contract in question_contracts
+        if isinstance(contract, Mapping)
+        and isinstance(contract.get("language_feedback_profile"), Mapping)
+        and (contract.get("language_feedback_profile") or {}).get("enabled")
+    )
     reserve = {
         "none": 1_000,
         "minimal": 2_000,
@@ -116,9 +146,19 @@ def output_limit(
         "medium": 7_000,
         "high": 10_000,
     }.get(str(reasoning_effort or "").strip().lower(), 7_000)
-    visible = 1_500 + question_count * 650 + max(1, criterion_count) * 650
+    visible = (
+        1_500
+        + question_count * 650
+        + max(1, criterion_count) * 650
+        + language_dimension_count * 180
+    )
     if recovery:
-        visible = 1_000 + question_count * 550 + max(1, criterion_count) * 550
+        visible = (
+            1_000
+            + question_count * 550
+            + max(1, criterion_count) * 550
+            + language_dimension_count * 160
+        )
     rounded = int(math.ceil((reserve + visible) / 2_000.0) * 2_000)
     lower = 12_000 if recovery else 24_000
     upper = 24_000 if recovery else 32_000
@@ -250,36 +290,57 @@ def _question_schema(
     else:
         criterion_items = {"anyOf": criterion_variants}
     maximum = _finite_nonnegative(contract.get("max_marks"))
+    properties: Dict[str, Any] = {
+        "question_number": {"type": "integer", "enum": [number]},
+        "attempt_status": {"type": "string", "enum": list(_ATTEMPT_STATUSES)},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "student_answer": {"type": "string", "maxLength": 5000},
+        "content_type": {"type": "string", "enum": list(_CONTENT_TYPES)},
+        "source_pages": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "maxItems": 50,
+        },
+        "criterion_marks": {
+            "type": "array",
+            "items": criterion_items,
+            "minItems": 0,
+            "maxItems": len(criteria),
+        },
+        "total_score": {"type": "number", "minimum": 0, "maximum": maximum},
+        "overall_feedback": {"type": "string", "maxLength": 1000},
+        "needs_review": {"type": "boolean"},
+        "review_reason": {"type": "string", "maxLength": 1000},
+    }
+    response_selection = contract.get("response_selection")
+    if isinstance(response_selection, Mapping):
+        available_ids = [
+            str(value or "").strip()
+            for value in response_selection.get("available_unit_ids") or []
+            if str(value or "").strip()
+        ]
+        if available_ids:
+            properties["attempted_unit_ids"] = {
+                "type": "array",
+                "items": {"type": "string", "enum": available_ids},
+                "minItems": 0,
+                "maxItems": len(available_ids),
+            }
+    required = list(properties)
+    profile = contract.get("language_feedback_profile")
+    feedback_schema = (
+        language_feedback_schema(profile)
+        if isinstance(profile, Mapping)
+        else None
+    )
+    if feedback_schema is not None:
+        properties["language_feedback"] = feedback_schema
+        required.append("language_feedback")
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "question_number": {"type": "integer", "enum": [number]},
-            "attempt_status": {"type": "string", "enum": list(_ATTEMPT_STATUSES)},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "student_answer": {"type": "string", "maxLength": 5000},
-            "content_type": {"type": "string", "enum": list(_CONTENT_TYPES)},
-            "source_pages": {
-                "type": "array",
-                "items": {"type": "integer", "minimum": 1},
-                "maxItems": 50,
-            },
-            "criterion_marks": {
-                "type": "array",
-                "items": criterion_items,
-                "minItems": 0,
-                "maxItems": len(criteria),
-            },
-            "total_score": {"type": "number", "minimum": 0, "maximum": maximum},
-            "overall_feedback": {"type": "string", "maxLength": 1000},
-            "needs_review": {"type": "boolean"},
-            "review_reason": {"type": "string", "maxLength": 1000},
-        },
-        "required": [
-            "question_number", "attempt_status", "confidence", "student_answer",
-            "content_type", "source_pages", "criterion_marks", "total_score",
-            "overall_feedback", "needs_review", "review_reason",
-        ],
+        "properties": properties,
+        "required": required,
     }
 
 
