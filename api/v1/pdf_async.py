@@ -2568,34 +2568,105 @@ async def refresh_answer_solution_coverage(
     questions: Optional[List[Dict[str, Any]]] = None,
     mappings: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Recompute answer readiness without touching question OCR quality fields."""
-    if document is None:
-        if is_b2c:
-            document = await db.b2c_find_one("documents", {"document_id": document_id})
-        else:
-            document = await db.mongo_find_one("documents", {"document_id": document_id})
-    if not document:
-        return {}
-    if questions is None:
-        if is_b2c:
-            questions = await db.b2c_find("questions", {"document_id": document_id})
-        else:
-            questions = await db.mongo_find("questions", {"document_id": document_id})
-    if mappings is None:
-        if is_b2c:
-            mappings = await db.b2c_find("answer_question_mappings", {"document_id": document_id})
-        else:
-            mappings = await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+    """Derive and cache answer readiness from one current authoring snapshot.
 
-    coverage = AnswerSolutionCoverageService().compute(
-        document=document,
-        questions=questions or [],
-        mappings=mappings or [],
+    Question OCR and answer-sheet OCR are intentionally independent jobs and
+    may complete in either order.  A coverage calculation made while question
+    OCR is still running must therefore not be allowed to overwrite a newer
+    calculation made after question OCR completed.  The document-state guard
+    below provides optimistic concurrency without a migration or a distributed
+    process lock.  API callers still receive the freshly derived value even if
+    another worker changes the source state during the cache write.
+    """
+
+    guard_fields = (
+        "ocr_status",
+        "ocr_completed_at",
+        "answer_sheet_ocr_status",
+        "answer_sheet_ocr_completed_at",
+        "answer_solution_mode",
+        "generated_solutions_status",
+        "answer_sheet_path",
     )
-    if is_b2c:
-        await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": coverage})
-    else:
-        await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": coverage})
+
+    async def _load_document() -> Optional[Dict[str, Any]]:
+        if is_b2c:
+            return await db.b2c_find_one("documents", {"document_id": document_id})
+        return await db.mongo_find_one("documents", {"document_id": document_id})
+
+    async def _load_questions() -> List[Dict[str, Any]]:
+        if is_b2c:
+            return await db.b2c_find("questions", {"document_id": document_id})
+        return await db.mongo_find("questions", {"document_id": document_id})
+
+    async def _load_mappings() -> List[Dict[str, Any]]:
+        if is_b2c:
+            return await db.b2c_find("answer_question_mappings", {"document_id": document_id})
+        return await db.mongo_find("answer_question_mappings", {"document_id": document_id})
+
+    snapshot_document = document
+    snapshot_questions = questions
+    snapshot_mappings = mappings
+    coverage: Dict[str, Any] = {}
+
+    for _attempt in range(3):
+        if snapshot_document is None:
+            snapshot_document = await _load_document()
+        if not snapshot_document:
+            return {}
+        if snapshot_questions is None:
+            snapshot_questions = await _load_questions()
+        if snapshot_mappings is None:
+            snapshot_mappings = await _load_mappings()
+
+        coverage = AnswerSolutionCoverageService().compute(
+            document=snapshot_document,
+            questions=snapshot_questions or [],
+            mappings=snapshot_mappings or [],
+        )
+        guarded_filter: Dict[str, Any] = {"document_id": document_id}
+        for field in guard_fields:
+            if field in snapshot_document:
+                guarded_filter[field] = snapshot_document.get(field)
+            else:
+                guarded_filter[field] = {"$exists": False}
+
+        if is_b2c:
+            persisted = await db.b2c_update_one(
+                "documents", guarded_filter, {"$set": coverage}
+            )
+        else:
+            persisted = await db.mongo_update_one(
+                "documents", guarded_filter, {"$set": coverage}
+            )
+        if persisted:
+            return coverage
+
+        latest_document = await _load_document()
+        if not latest_document:
+            return {}
+        latest_summary = latest_document.get("answer_solution_coverage_summary") or {}
+        desired_summary = coverage.get("answer_solution_coverage_summary") or {}
+        if (
+            latest_document.get("answer_solution_coverage_status")
+            == coverage.get("answer_solution_coverage_status")
+            and latest_document.get("answer_solution_coverage_score")
+            == coverage.get("answer_solution_coverage_score")
+            and latest_summary == desired_summary
+        ):
+            return coverage
+
+        # A concurrent OCR job changed the source state.  Discard every part of
+        # the old snapshot and derive again from the now-current collections.
+        snapshot_document = latest_document
+        snapshot_questions = None
+        snapshot_mappings = None
+
+    logger.warning(
+        "Answer solution coverage changed repeatedly while refreshing %s; "
+        "returning the latest derived snapshot without forcing a stale write",
+        document_id,
+    )
     return coverage
 
 
@@ -9652,6 +9723,7 @@ async def get_document_questions(
             "document_id": document_id,
             "document_title": document["title"],
             "questions_count": len(serialized_questions),
+            "ocr_status": document.get("ocr_status"),
             "marks_summary": marks_summary,
             "ocr_quality_status": document.get("ocr_quality_status"),
             "ocr_quality_score": document.get("ocr_quality_score"),

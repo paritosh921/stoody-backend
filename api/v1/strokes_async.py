@@ -262,6 +262,9 @@ class CanvasPageStroke(BaseModel):
     practiceSessionId: Optional[str] = None
     questionId: Optional[str] = None
     virtualPageOrdinal: Optional[int] = None
+    coordinateSpace: Optional[str] = None
+    screenCanvasW: Optional[float] = None
+    screenCanvasH: Optional[float] = None
 
     @field_validator("points", mode="before")
     @classmethod
@@ -292,8 +295,8 @@ class CanvasPageStroke(BaseModel):
             return self
         if self.processingVersion != CANONICAL_STROKE_PROCESSING_VERSION:
             raise ValueError(f"unsupported processingVersion: {self.processingVersion}")
-        if self.sourceMode not in {"live", "offlineReplay"}:
-            raise ValueError("canonical stroke requires sourceMode live or offlineReplay")
+        if self.sourceMode not in {"live", "offlineReplay", "touch"}:
+            raise ValueError("canonical stroke requires sourceMode live, offlineReplay, or touch")
         if self.pageNumber is None or not isinstance(self.pageNumber, int):
             raise ValueError("canonical stroke requires pageNumber")
         if not isinstance(self.bookType, str) or not self.bookType.strip():

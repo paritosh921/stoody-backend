@@ -19,6 +19,10 @@ from core.database import DatabaseManager
 from core.cache import CacheManager
 from api.v1.auth_async import get_current_user, get_database, get_cache
 from config_async import settings
+from services.practice_stroke_evidence import (
+    PracticeStrokeEvidenceError,
+    resolve_practice_stroke_evidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2969,7 +2973,33 @@ async def evaluate_submission(
         #     light enhancement pass genuinely helps the model read them.
         # We process the two paths separately so each gets the treatment it actually needs.
         canvas_pages_raw: List[str] = []
-        if payload.canvasPages:
+        canonical_evidence_receipt = None
+        has_question_page_refs = bool(
+            payload.questionPageRefs
+            and (
+                payload.questionPageRefs.activePages
+                or payload.questionPageRefs.virtualPages
+            )
+        )
+        if has_question_page_refs:
+            try:
+                resolved_evidence = await resolve_practice_stroke_evidence(
+                    current_user=current_user,
+                    db=db,
+                    refs=payload.questionPageRefs,
+                    payload_question_id=qid,
+                )
+            except PracticeStrokeEvidenceError as evidence_error:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Practice writing is not fully synchronized. "
+                        f"{evidence_error} Keep the pen connected and retry."
+                    ),
+                ) from evidence_error
+            canvas_pages_raw = resolved_evidence.data_urls
+            canonical_evidence_receipt = resolved_evidence.receipt
+        elif payload.canvasPages:
             canvas_pages_raw = list(payload.canvasPages)
         elif canvas_data:
             canvas_pages_raw = [canvas_data]
@@ -3188,6 +3218,7 @@ async def evaluate_submission(
                 "what_went_wrong": evaluation_data.get("whatWentWrong", ""),
                 "correct_solution": evaluation_data.get("correctSolution", ""),
                 "question_page_refs": question_page_refs,
+                "canonical_evidence_receipt": canonical_evidence_receipt,
                 "created_at": datetime.utcnow(),
                 "subject": question_doc.get("subject", ""),
                 "difficulty": question_doc.get("difficulty", ""),

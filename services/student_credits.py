@@ -659,11 +659,11 @@ def _eligible_strokes(page: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         if stroke.get("processingVersion") != "ble-canonical-v1":
             continue
-        if stroke.get("sourceMode") not in {"live", "offlineReplay"}:
+        if stroke.get("sourceMode") not in {"live", "offlineReplay", "touch"}:
             continue
         points = stroke.get("points") or []
         valid_points = [point for point in points if isinstance(point, list) and len(point) >= 6]
-        if len(valid_points) < 2:
+        if len(valid_points) < 1:
             continue
         seen.add(stroke_id)
         result.append({**stroke, "points": valid_points})
@@ -728,6 +728,9 @@ def render_stroke_page(page: Dict[str, Any], *, width: int = 1024, height: int =
         points = [(float(p[0]) * scale_x, float(p[1]) * scale_y) for p in stroke["points"]]
         if len(points) >= 2:
             draw.line(points, fill="#111827", width=3, joint="curve")
+        elif points:
+            x, y = points[0]
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill="#111827")
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
     return output.getvalue()
