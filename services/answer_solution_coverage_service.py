@@ -8,7 +8,9 @@ from typing import Any, Dict, List
 from services.answer_mapping_contract import (
     effective_answer_mappings,
     mapping_question_id,
+    rebind_uploaded_answer_mappings,
 )
+from services.answer_mapping_lifecycle import ANSWER_MAPPING_ACTIVE_STATUSES
 
 
 class AnswerSolutionCoverageService:
@@ -41,10 +43,21 @@ class AnswerSolutionCoverageService:
             for mapping in all_answer_mappings
             if self._mapping_matches_answer_source(mapping, answer_source)
         ]
+        rebound_source_mappings = rebind_uploaded_answer_mappings(
+            questions,
+            source_mappings,
+        )
+        rebound_mapping_count = len(
+            [
+                mapping
+                for mapping in rebound_source_mappings
+                if mapping.get("mapping_rebound_to_current_catalog")
+            ]
+        )
         stale_mapping_count = len(
             [
                 mapping
-                for mapping in source_mappings
+                for mapping in rebound_source_mappings
                 if current_question_ids
                 and self._mapping_question_id(mapping)
                 and self._mapping_question_id(mapping) not in current_question_ids
@@ -52,7 +65,7 @@ class AnswerSolutionCoverageService:
         )
         current_source_mappings = [
             mapping
-            for mapping in source_mappings
+            for mapping in rebound_source_mappings
             if (
                 not current_question_ids
                 or not self._mapping_question_id(mapping)
@@ -102,9 +115,9 @@ class AnswerSolutionCoverageService:
         elif question_count == 0:
             status = "pending"
             reasons.append("question_ocr_pending")
-        elif self._processing_pending(document=document, answer_source=answer_source) and mapped_answer_count == 0:
+        elif self._processing_pending(document=document, answer_source=answer_source):
             status = "pending"
-            reasons.append(self._pending_reason(answer_source))
+            reasons.append(self._pending_reason(document=document, answer_source=answer_source))
         elif mapped_answer_count == 0:
             status = "not_ready"
             reasons.append("no_answers_mapped")
@@ -121,6 +134,8 @@ class AnswerSolutionCoverageService:
             status = "ready"
         if stale_mapping_count:
             reasons.append("stale_answer_mappings_ignored")
+        if rebound_mapping_count:
+            reasons.append("stale_answer_mappings_rebound_by_answer_number")
 
         if (
             document.get("answer_sheet_path")
@@ -152,6 +167,7 @@ class AnswerSolutionCoverageService:
             ),
             "manual_review_count": manual_review_count,
             "stale_mapping_count": stale_mapping_count,
+            "rebound_mapping_count": rebound_mapping_count,
             "answer_source": answer_source,
             "reasons": sorted(set(reasons)),
             "manual_segmentation_recommended": manual_segmentation_recommended,
@@ -181,12 +197,15 @@ class AnswerSolutionCoverageService:
             for mapping in (mappings or [])
             if mapping.get("mapping_strategy")
         }
-        if mode == "auto":
-            return "generated"
+        # A real teacher upload is authoritative even when an older document
+        # still carries the legacy ``auto`` flag.  This is a read-time contract
+        # correction, so existing production records need no migration.
         if mode == "upload" or document.get("answer_sheet_path"):
             if "manual_answer_segmentation" in sources or document.get("answer_sheet_processed_regions_count"):
                 return "manual"
             return "upload"
+        if mode == "auto":
+            return "generated"
         if "ai_generated" in sources or document.get("generated_solutions_count"):
             return "generated"
         if "manual_answer_segmentation" in sources or document.get("answer_sheet_processed_regions_count"):
@@ -233,15 +252,21 @@ class AnswerSolutionCoverageService:
                 "processing",
             }
         if answer_source == "upload":
+            mapping_status = str(document.get("answer_mapping_status") or "").strip().lower()
+            if mapping_status in ANSWER_MAPPING_ACTIVE_STATUSES:
+                return True
             return str(document.get("answer_sheet_ocr_status") or "not_processed") in {
                 "not_processed",
                 "processing",
             }
         return False
 
-    def _pending_reason(self, answer_source: str) -> str:
+    def _pending_reason(self, *, document: Dict[str, Any], answer_source: str) -> str:
         if answer_source == "generated":
             return "generated_solutions_pending"
         if answer_source == "upload":
+            mapping_status = str(document.get("answer_mapping_status") or "").strip().lower()
+            if mapping_status in ANSWER_MAPPING_ACTIVE_STATUSES:
+                return "answer_mapping_pending"
             return "answer_sheet_ocr_pending"
         return "answer_mapping_pending"

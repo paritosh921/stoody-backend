@@ -1,5 +1,7 @@
 from services.answer_mapping_contract import (
     build_answer_key_mapping,
+    effective_answer_mappings,
+    rebind_uploaded_answer_mappings,
     select_effective_answer_mapping,
 )
 from services.answer_solution_coverage_service import AnswerSolutionCoverageService
@@ -154,3 +156,65 @@ def test_key_only_uploaded_answer_sheet_has_complete_pcr_coverage():
     assert result["answer_solution_coverage_summary"]["mapped_answer_count"] == 2
     assert result["answer_solution_coverage_summary"]["answer_key_mapped_count"] == 2
     assert result["answer_solution_coverage_summary"]["worked_solution_mapped_count"] == 0
+
+
+def test_reocr_stale_uploaded_mapping_rebinds_by_unique_answer_number():
+    questions = [
+        {"id": "new-q1", "question_number": 1, "text": "Q1. Read the passage."},
+        {"id": "new-q2", "question_number": 2, "text": "Q2. Edit the sentence."},
+    ]
+    mappings = [
+        {
+            "mapping_id": "doc:old-q1:a1",
+            "question_id": "old-q1",
+            "answer_number": "1",
+            "answer_text": "Teacher answer one",
+            "source": "answer_sheet_full_ocr",
+            "review_status": "accepted",
+        },
+        {
+            "mapping_id": "doc:old-q2:a2",
+            "question_id": "old-q2",
+            "answer_number": "2",
+            "answer_text": "Teacher answer two",
+            "source": "answer_sheet_full_ocr",
+            "review_status": "needs_review",
+            "manual_review_required": True,
+        },
+    ]
+
+    rebound = rebind_uploaded_answer_mappings(questions, mappings)
+    effective = effective_answer_mappings(_document(), questions, mappings)
+
+    assert [mapping["question_id"] for mapping in rebound] == ["new-q1", "new-q2"]
+    assert rebound[0]["source_question_id"] == "old-q1"
+    assert rebound[0]["mapping_id"] == "doc:old-q1:a1"
+    assert all(mapping["mapping_rebound_to_current_catalog"] for mapping in rebound)
+    assert [mapping["question_id"] for mapping in effective] == ["new-q1", "new-q2"]
+
+
+def test_uploaded_answer_path_overrides_stale_auto_mode_without_migration():
+    result = AnswerSolutionCoverageService().compute(
+        document={
+            "document_id": "doc-race",
+            "exam_mode": "pcr",
+            "answer_solution_mode": "auto",
+            "answer_sheet_path": "s3://bucket/teacher-answer.pdf",
+            "answer_sheet_ocr_status": "completed",
+            "answer_mapping_status": "needs_review",
+        },
+        questions=[{"id": "new-q1", "question_number": 1}],
+        mappings=[{
+            "question_id": "old-q1",
+            "answer_number": "1",
+            "answer_text": "Teacher supplied answer",
+            "source": "answer_sheet_full_ocr",
+            "review_status": "accepted",
+            "manual_review_required": False,
+        }],
+    )
+
+    assert result["answer_solution_coverage_status"] == "ready"
+    assert result["answer_solution_coverage_summary"]["answer_source"] == "upload"
+    assert result["answer_solution_coverage_summary"]["mapped_answer_count"] == 1
+    assert result["answer_solution_coverage_summary"]["rebound_mapping_count"] == 1

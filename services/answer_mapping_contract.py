@@ -15,6 +15,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 _VALID_ANSWER_LABELS = {"A", "B", "C", "D", "E", "F"}
+_REBINDABLE_UPLOAD_SOURCES = {
+    "answer_key",
+    "answer_sheet",
+    "answer_sheet_full_ocr",
+    "upload",
+    "uploaded_answer_sheet",
+}
 
 
 def normalize_answer_label(value: Any) -> str:
@@ -42,6 +49,110 @@ def question_id(question: Dict[str, Any]) -> str:
 
 def question_text(question: Dict[str, Any]) -> str:
     return str(question.get("question_text") or question.get("text") or "").strip()
+
+
+def _positive_question_number(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(?:q(?:uestion)?\s*)?(\d{1,4})", text, re.IGNORECASE)
+    if not match:
+        return ""
+    number = int(match.group(1))
+    return str(number) if number > 0 else ""
+
+
+def _question_number(question: Dict[str, Any], fallback: int) -> str:
+    for value in (
+        question.get("question_number"),
+        question.get("extraction_order"),
+    ):
+        number = _positive_question_number(value)
+        if number:
+            return number
+
+    text = question_text(question)
+    match = re.search(
+        r"^\s*(?:q(?:uestion)?\.?\s*)?(\d{1,4})(?:\s*[.):-]|\s+)",
+        text,
+        re.IGNORECASE,
+    )
+    if match and int(match.group(1)) > 0:
+        return str(int(match.group(1)))
+    return str(fallback)
+
+
+def rebind_uploaded_answer_mappings(
+    questions: Iterable[Dict[str, Any]],
+    mappings: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Project stale uploaded mappings onto the current OCR question IDs.
+
+    Re-OCR intentionally replaces question rows only after a successful
+    extraction.  An answer-mapping worker may have started against the prior
+    generation, so its immutable question IDs can become stale even though its
+    saved ``answer_number`` is still valid.  Rebinding is deliberately strict:
+    only uploaded-answer evidence with a unique positive answer number can be
+    projected, and only onto a unique current question number.  Ambiguous or
+    generated answers remain untouched and therefore stay reviewable.
+    """
+
+    current_questions = list(questions or [])
+    raw_mappings = list(mappings or [])
+    current_ids = {
+        question_id(question)
+        for question in current_questions
+        if question_id(question)
+    }
+    questions_by_number: Dict[str, List[Dict[str, Any]]] = {}
+    for index, question in enumerate(current_questions, start=1):
+        number = _question_number(question, index)
+        questions_by_number.setdefault(number, []).append(question)
+
+    rebound: List[Dict[str, Any]] = []
+    # A mapping already attached to the current catalog has higher authority
+    # than a stale row that merely shares its answer number.
+    used_target_ids: set[str] = {
+        mapping_question_id(mapping)
+        for mapping in raw_mappings
+        if mapping_question_id(mapping) in current_ids
+    }
+    for mapping in raw_mappings:
+        original = dict(mapping)
+        original_question_id = mapping_question_id(original)
+        if original_question_id in current_ids:
+            used_target_ids.add(original_question_id)
+            rebound.append(original)
+            continue
+
+        source = str(original.get("source") or "").strip().lower()
+        answer_number = _positive_question_number(original.get("answer_number"))
+        candidates = questions_by_number.get(answer_number, []) if answer_number else []
+        if source not in _REBINDABLE_UPLOAD_SOURCES or len(candidates) != 1:
+            rebound.append(original)
+            continue
+
+        target_id = question_id(candidates[0])
+        if not target_id or target_id in used_target_ids:
+            rebound.append(original)
+            continue
+
+        projected = dict(original)
+        projected["source_question_id"] = original_question_id or None
+        projected["question_id"] = target_id
+        projected["question_region_id"] = target_id
+        projected["mapping_rebound_to_current_catalog"] = True
+        reasons = [
+            str(reason)
+            for reason in (projected.get("mapping_reasons") or [])
+            if str(reason).strip()
+        ]
+        reasons.append("rebound_to_current_question_catalog_by_answer_number")
+        projected["mapping_reasons"] = sorted(set(reasons))
+        used_target_ids.add(target_id)
+        rebound.append(projected)
+
+    return rebound
 
 
 def _candidate_for_question(
@@ -251,9 +362,10 @@ def effective_answer_mappings(
 ) -> List[Dict[str, Any]]:
     """Return at most one effective mapped answer for every current question."""
 
-    raw_mappings = list(mappings or [])
+    current_questions = list(questions or [])
+    raw_mappings = rebind_uploaded_answer_mappings(current_questions, mappings)
     selected: List[Dict[str, Any]] = []
-    for question in questions or []:
+    for question in current_questions:
         mapping = select_effective_answer_mapping(
             document,
             question,

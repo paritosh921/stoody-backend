@@ -29,6 +29,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 import aiofiles
 from bson import ObjectId as BsonObjectId
+from pymongo import ReturnDocument
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
@@ -60,6 +61,10 @@ from services.answer_mapping_contract import (
 from services.answer_key_reconciliation_service import AnswerKeyReconciliationService
 from services.answer_sheet_mapping_service import AnswerSheetMappingService
 from services.answer_solution_coverage_service import AnswerSolutionCoverageService
+from services.answer_mapping_lifecycle import (
+    completed_answer_mapping_status,
+    effective_answer_mapping_status,
+)
 from services.answer_sheet_block_normalizer import AnswerSheetBlockNormalizer
 from services.document_layout_provider import DocumentLayoutProvider, compact_layout_context
 from services.extraction_validator import ExtractionValidator
@@ -5241,6 +5246,12 @@ class DocumentMetadata(BaseModel):
     answer_sheet_manual_segmentation_recommended: Optional[bool] = None
     answer_sheet_processed_regions_count: Optional[int] = None
     answer_sheet_mapped_answers_count: Optional[int] = None
+    answer_mapping_status: Optional[str] = None
+    answer_mapping_progress: Optional[int] = None
+    answer_mapping_error: Optional[str] = None
+    answer_mapping_started_at: Optional[datetime] = None
+    answer_mapping_completed_at: Optional[datetime] = None
+    answer_mapping_updated_at: Optional[datetime] = None
     answer_solution_coverage_status: Optional[str] = None
     answer_solution_coverage_score: Optional[float] = None
     answer_solution_coverage_summary: Optional[Dict[str, Any]] = None
@@ -5567,6 +5578,11 @@ async def upload_pdf(
             )
 
         answer_solution_mode = (answer_solution_mode or ("upload" if answer_sheet is not None else "none")).strip().lower()
+        if answer_sheet is not None:
+            # A teacher-provided answer sheet is the authoritative source.  Do
+            # not let a stale/form-default ``auto`` value hide the uploaded
+            # evidence from mapping and coverage.
+            answer_solution_mode = "upload"
         if answer_solution_mode not in {"none", "upload", "auto"}:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -5836,6 +5852,12 @@ async def upload_pdf(
             "answer_sheet_ocr_status": "not_processed" if answer_sheet_path else None,
             "answer_sheet_ocr_job_id": None,
             "answer_sheet_mapped_answers_count": 0,
+            "answer_mapping_status": "not_started" if answer_sheet_path else "not_expected",
+            "answer_mapping_progress": 0,
+            "answer_mapping_error": None,
+            "answer_mapping_started_at": None,
+            "answer_mapping_completed_at": None,
+            "answer_mapping_updated_at": datetime.utcnow(),
             "answer_solution_mode": answer_solution_mode,
             "generated_solutions_status": "not_generated" if answer_solution_mode == "auto" else None,
             "generated_solutions_count": 0,
@@ -6845,6 +6867,109 @@ def _ocr_pages_for_storage(ocr_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     return pages
 
 
+async def _answer_mapping_document_collection(
+    *,
+    db: DatabaseManager,
+    is_b2c: bool,
+):
+    if is_b2c:
+        get_b2c_collection = getattr(db, "get_b2c_collection", None)
+        if not callable(get_b2c_collection):
+            return None
+        return await get_b2c_collection("documents")
+    get_context_db = getattr(db, "get_context_db", None)
+    if not callable(get_context_db):
+        return None
+    context_db = await get_context_db()
+    return context_db["documents"] if context_db is not None else None
+
+
+async def _set_answer_mapping_lifecycle(
+    *,
+    db: DatabaseManager,
+    is_b2c: bool,
+    document_id: str,
+    lifecycle: Dict[str, Any],
+    release_lease: bool = False,
+) -> None:
+    now = datetime.utcnow()
+    update: Dict[str, Any] = {
+        "$set": {
+            **lifecycle,
+            "answer_mapping_updated_at": now,
+        }
+    }
+    if release_lease:
+        update["$unset"] = {
+            "answer_mapping_lease_expires_at": "",
+            "answer_mapping_run_id": "",
+        }
+    collection = await _answer_mapping_document_collection(db=db, is_b2c=is_b2c)
+    if collection is not None:
+        await collection.update_one({"document_id": document_id}, update)
+        return
+    # Retain the existing database abstraction as a safe fallback for tests or
+    # deployments where the context collection is temporarily unavailable.
+    if is_b2c:
+        await db.b2c_update_one("documents", {"document_id": document_id}, update)
+    else:
+        await db.mongo_update_one("documents", {"document_id": document_id}, update)
+
+
+async def _claim_answer_mapping_run(
+    *,
+    db: DatabaseManager,
+    is_b2c: bool,
+    document_id: str,
+) -> Optional[str]:
+    """Atomically ensure only one OCR completion trigger spends mapping credits."""
+
+    now = datetime.utcnow()
+    run_id = str(uuid.uuid4())
+    collection = await _answer_mapping_document_collection(db=db, is_b2c=is_b2c)
+    if collection is None:
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+            lifecycle={
+                "answer_mapping_status": "mapping",
+                "answer_mapping_progress": 70,
+                "answer_mapping_error": None,
+                "answer_mapping_started_at": now,
+            },
+        )
+        return run_id
+
+    claimed = await collection.find_one_and_update(
+        {
+            "document_id": document_id,
+            "$or": [
+                {"answer_mapping_status": {"$ne": "mapping"}},
+                {"answer_mapping_lease_expires_at": {"$lte": now}},
+                {
+                    "answer_mapping_status": "mapping",
+                    "answer_mapping_lease_expires_at": {"$exists": False},
+                },
+            ],
+        },
+        {
+            "$set": {
+                "answer_mapping_status": "mapping",
+                "answer_mapping_progress": 70,
+                "answer_mapping_error": None,
+                "answer_mapping_started_at": now,
+                "answer_mapping_updated_at": now,
+                "answer_mapping_run_id": run_id,
+                "answer_mapping_lease_expires_at": now + timedelta(minutes=20),
+            },
+            "$unset": {"answer_mapping_completed_at": ""},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    return run_id if claimed is not None else None
+
+
 async def map_completed_answer_sheet_after_question_ocr(
     *,
     document: Dict[str, Any],
@@ -6860,16 +6985,116 @@ async def map_completed_answer_sheet_after_question_ocr(
 
     mapping_summary = document.get("answer_sheet_mapping_summary") or {}
     mapped_count = int(document.get("answer_sheet_mapped_answers_count") or 0)
-    if mapped_count > 0 and not mapping_summary.get("mapping_deferred"):
-        return {}
 
     is_b2c = is_b2c_admin(current_user)
+    if str(document.get("ocr_status") or "").strip().lower() != "completed":
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=str(document_id),
+            lifecycle={
+                "answer_mapping_status": "waiting_for_questions",
+                "answer_mapping_progress": 55,
+                "answer_mapping_error": None,
+            },
+        )
+        return {"status": "waiting_for_questions", "mapped_count": 0}
+
     if is_b2c:
         question_docs = await db.b2c_find("questions", {"document_id": document_id})
+        existing_mappings = await db.b2c_find(
+            "answer_question_mappings", {"document_id": document_id}
+        )
     else:
         question_docs = await db.mongo_find("questions", {"document_id": document_id})
+        existing_mappings = await db.mongo_find(
+            "answer_question_mappings", {"document_id": document_id}
+        )
     if not question_docs:
-        return {}
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=str(document_id),
+            lifecycle={
+                "answer_mapping_status": "waiting_for_questions",
+                "answer_mapping_progress": 55,
+                "answer_mapping_error": None,
+            },
+        )
+        return {"status": "waiting_for_questions", "mapped_count": 0}
+    current_mappings = effective_answer_mappings(
+        document,
+        question_docs,
+        existing_mappings,
+        include_answer_key=str(document.get("exam_mode") or "").strip().lower() == "pcr",
+    )
+    current_solution_count = len(
+        {
+            str(mapping.get("question_id") or mapping.get("question_region_id") or "")
+            for mapping in current_mappings
+            if str(mapping.get("answer_text") or mapping.get("final_answer_text") or "").strip()
+        }
+    )
+    current_manual_review_count = len(
+        [
+            mapping
+            for mapping in current_mappings
+            if mapping.get("manual_review_required")
+            or str(mapping.get("review_status") or "").strip().lower() in {"draft", "needs_review"}
+        ]
+    )
+    current_accepted_count = len(
+        [
+            mapping
+            for mapping in current_mappings
+            if not mapping.get("manual_review_required")
+            and str(mapping.get("review_status") or "accepted").strip().lower() in {"accepted", "trusted"}
+        ]
+    )
+    if current_solution_count >= len(question_docs):
+        current_status = (
+            "completed" if current_manual_review_count == 0 else "needs_review"
+        )
+        rebound_count = len(
+            [
+                mapping
+                for mapping in current_mappings
+                if mapping.get("mapping_rebound_to_current_catalog")
+            ]
+        )
+        reused_summary = {
+            **mapping_summary,
+            "question_count": len(question_docs),
+            "persisted_mapping_count": current_solution_count,
+            "mapped_count": current_accepted_count,
+            "manual_review_count": current_manual_review_count,
+            "mapping_deferred": False,
+            "current_catalog_reused": True,
+            "rebound_mapping_count": rebound_count,
+        }
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=str(document_id),
+            lifecycle={
+                "answer_sheet_mapped_answers_count": current_accepted_count,
+                "answer_sheet_mapping_summary": reused_summary,
+                "answer_solution_mode": "upload",
+                "answer_mapping_status": current_status,
+                "answer_mapping_progress": 100,
+                "answer_mapping_error": None,
+                "answer_mapping_completed_at": datetime.utcnow(),
+            },
+            release_lease=True,
+        )
+        return {
+            "status": current_status,
+            "mapped_count": current_accepted_count,
+            "solution_count": current_solution_count,
+            "manual_review_count": current_manual_review_count,
+            "summary": reused_summary,
+            "already_current": True,
+        }
 
     answer_blocks = document.get("answer_sheet_extracted_answers") or []
     page_summaries = document.get("answer_sheet_ocr_pages") or []
@@ -6906,39 +7131,97 @@ async def map_completed_answer_sheet_after_question_ocr(
             "Deferred answer-sheet mapping skipped for %s: no parsed answer blocks and no answer-sheet PDF bytes",
             document_id,
         )
-        return {}
+        now = datetime.utcnow()
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=str(document_id),
+            lifecycle={
+                "answer_mapping_status": "needs_review",
+                "answer_mapping_progress": 100,
+                "answer_mapping_error": "The uploaded answer sheet could not be read well enough to locate answers.",
+                "answer_mapping_completed_at": now,
+            },
+            release_lease=True,
+        )
+        return {"status": "needs_review", "mapped_count": 0}
+
+    mapping_run_id = await _claim_answer_mapping_run(
+        db=db,
+        is_b2c=is_b2c,
+        document_id=str(document_id),
+    )
+    if mapping_run_id is None:
+        return {"status": "mapping", "mapping_in_progress": True, "mapped_count": mapped_count}
 
     stored_text = str(document.get("answer_sheet_extracted_text") or "")
     layout_report = document.get("answer_sheet_layout_summary") or {}
-    mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
-        db=db,
-        is_b2c=is_b2c,
-        document_id=document_id,
-        question_docs=question_docs,
-        answer_blocks=answer_blocks,
-        page_summaries=page_summaries,
-        layout_report=layout_report,
-        pdf_bytes=answer_pdf_bytes,
-        gateway_context=_build_ai_gateway_context(
-            current_user=current_user,
+    try:
+        mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
             db=db,
-            document_id=document_id,
-            region_scope="answer_mapping_vision",
             is_b2c=is_b2c,
-        ),
-    )
-    answer_key_result = await AnswerKeyReconciliationService().reconcile(
-        db=db,
-        is_b2c=is_b2c,
-        document_id=document_id,
-        question_docs=question_docs,
-        page_summaries=page_summaries,
-        mappings=mapping_result.get("mappings") or [],
-        mapping_summary=mapping_result.get("summary") or {},
-    )
+            document_id=document_id,
+            question_docs=question_docs,
+            answer_blocks=answer_blocks,
+            page_summaries=page_summaries,
+            layout_report=layout_report,
+            pdf_bytes=answer_pdf_bytes,
+            gateway_context=_build_ai_gateway_context(
+                current_user=current_user,
+                db=db,
+                document_id=document_id,
+                region_scope="answer_mapping_vision",
+                is_b2c=is_b2c,
+            ),
+        )
+        new_mapping_summary = mapping_result.get("summary") or {}
+        if new_mapping_summary.get("mapping_deferred"):
+            await _set_answer_mapping_lifecycle(
+                db=db,
+                is_b2c=is_b2c,
+                document_id=str(document_id),
+                lifecycle={
+                    "answer_mapping_status": "waiting_for_questions",
+                    "answer_mapping_progress": 55,
+                    "answer_mapping_error": None,
+                },
+                release_lease=True,
+            )
+            return {
+                **mapping_result,
+                "status": "waiting_for_questions",
+            }
+        answer_key_result = await AnswerKeyReconciliationService().reconcile(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=document_id,
+            question_docs=question_docs,
+            page_summaries=page_summaries,
+            mappings=mapping_result.get("mappings") or [],
+            mapping_summary=mapping_result.get("summary") or {},
+        )
+    except Exception as exc:
+        await _set_answer_mapping_lifecycle(
+            db=db,
+            is_b2c=is_b2c,
+            document_id=str(document_id),
+            lifecycle={
+                "answer_mapping_status": "error",
+                "answer_mapping_progress": 100,
+                "answer_mapping_error": str(exc)[:500],
+                "answer_mapping_completed_at": datetime.utcnow(),
+            },
+            release_lease=True,
+        )
+        raise
 
     new_mapped_count = int(mapping_result.get("mapped_count") or 0)
     new_mapping_summary = mapping_result.get("summary") or {}
+    final_mapping_status = completed_answer_mapping_status(
+        mapped_count=new_mapped_count,
+        question_count=len(question_docs),
+        manual_review_count=int(mapping_result.get("manual_review_count") or 0),
+    )
     quality_summary = FullDocumentExtractionValidator().validate_answer_sheet(
         extracted_text=stored_text,
         page_summaries=page_summaries,
@@ -6962,11 +7245,30 @@ async def map_completed_answer_sheet_after_question_ocr(
             quality_summary.get("manual_segmentation_recommended", False)
             or new_mapping_summary.get("manual_segmentation_recommended", False)
         ),
+        "answer_solution_mode": "upload",
+        "answer_mapping_status": final_mapping_status,
+        "answer_mapping_progress": 100,
+        "answer_mapping_error": None,
+        "answer_mapping_completed_at": datetime.utcnow(),
+        "answer_mapping_updated_at": datetime.utcnow(),
     }
-    if is_b2c:
-        await db.b2c_update_one("documents", {"document_id": document_id}, {"$set": update_data})
+    collection = await _answer_mapping_document_collection(db=db, is_b2c=is_b2c)
+    update_operation = {
+        "$set": update_data,
+        "$unset": {
+            "answer_mapping_lease_expires_at": "",
+            "answer_mapping_run_id": "",
+        },
+    }
+    if collection is not None:
+        await collection.update_one(
+            {"document_id": document_id, "answer_mapping_run_id": mapping_run_id},
+            update_operation,
+        )
+    elif is_b2c:
+        await db.b2c_update_one("documents", {"document_id": document_id}, update_operation)
     else:
-        await db.mongo_update_one("documents", {"document_id": document_id}, {"$set": update_data})
+        await db.mongo_update_one("documents", {"document_id": document_id}, update_operation)
 
     logger.info(
         "Deferred answer-sheet mapping completed for %s: %s mapped, %s review",
@@ -6976,6 +7278,7 @@ async def map_completed_answer_sheet_after_question_ocr(
     )
     return {
         **mapping_result,
+        "status": final_mapping_status,
         "answer_key_result": answer_key_result,
         "quality_summary": quality_summary,
     }
@@ -7030,47 +7333,24 @@ async def run_answer_sheet_ocr_pipeline(
             question_docs=question_docs,
         )
 
+        # Persist OCR first, then let the single claimed mapping coordinator use
+        # a fresh completed question catalog.  Mapping directly from the stale
+        # request snapshot is what allowed re-OCR to orphan valid answers.
         answer_mapping_result: Dict[str, Any] = {
             "mapped_count": 0,
             "manual_review_count": 0,
             "summary": {
                 "source": "answer_sheet_full_ocr",
-                "mapping_deferred": document.get("ocr_status") != "completed",
-                "reason": "question_ocr_not_completed" if document.get("ocr_status") != "completed" else None,
+                "mapping_deferred": True,
+                "reason": "answer_ocr_persisting_before_mapping",
             },
         }
-        if document.get("ocr_status") == "completed" and question_docs:
-            answer_mapping_result = await AnswerSheetMappingService().map_full_document_blocks(
-                db=db,
-                is_b2c=is_b2c,
-                document_id=document_id,
-                question_docs=question_docs,
-                answer_blocks=answer_blocks.get("answers", []),
-                page_summaries=page_summaries,
-                layout_report=layout_report,
-                pdf_bytes=file_content,
-                gateway_context=_build_ai_gateway_context(
-                    current_user=current_user,
-                    db=db,
-                    document_id=document_id,
-                    region_scope="answer_mapping_vision",
-                    is_b2c=is_b2c,
-                ),
-            )
 
         mapped_count = int(answer_mapping_result.get("mapped_count") or 0)
         mapping_summary = answer_mapping_result.get("summary") or {}
+        mapping_was_deferred = True
+        mapping_status = "waiting_for_questions"
         answer_key_result: Dict[str, Any] = {}
-        if document.get("ocr_status") == "completed" and question_docs:
-            answer_key_result = await AnswerKeyReconciliationService().reconcile(
-                db=db,
-                is_b2c=is_b2c,
-                document_id=document_id,
-                question_docs=question_docs,
-                page_summaries=page_summaries,
-                mappings=answer_mapping_result.get("mappings") or [],
-                mapping_summary=mapping_summary,
-            )
         quality_summary = FullDocumentExtractionValidator().validate_answer_sheet(
             extracted_text=extracted_text,
             page_summaries=page_summaries,
@@ -7105,6 +7385,12 @@ async def run_answer_sheet_ocr_pipeline(
             ),
             "answer_sheet_document_anchor_text": document_anchor_text.strip() if document_anchor_text else None,
             "answer_sheet_mapped_answers_count": mapped_count,
+            "answer_solution_mode": "upload",
+            "answer_mapping_status": mapping_status,
+            "answer_mapping_progress": 55 if mapping_was_deferred else 100,
+            "answer_mapping_error": None,
+            "answer_mapping_completed_at": None if mapping_was_deferred else datetime.utcnow(),
+            "answer_mapping_updated_at": datetime.utcnow(),
         }
 
         if is_b2c:
@@ -7175,6 +7461,11 @@ async def run_answer_sheet_ocr_pipeline(
             "answer_sheet_ocr_status": "error",
             "answer_sheet_ocr_error": str(exc),
             "answer_sheet_ocr_job_id": job_id,
+            "answer_mapping_status": "error",
+            "answer_mapping_progress": 100,
+            "answer_mapping_error": str(exc)[:500],
+            "answer_mapping_completed_at": datetime.utcnow(),
+            "answer_mapping_updated_at": datetime.utcnow(),
         }
         if is_b2c:
             await db.b2c_update_one(
@@ -7271,11 +7562,27 @@ async def process_answer_sheet_ocr(
             "answer_sheet_ocr_quality_score": None,
             "answer_sheet_ocr_quality_summary": None,
             "answer_sheet_mapping_summary": None,
+            "answer_sheet_mapped_answers_count": 0,
+            "answer_mapping_status": "extracting",
+            "answer_mapping_progress": 15,
+            "answer_mapping_error": None,
+            "answer_mapping_started_at": datetime.utcnow(),
+            "answer_mapping_completed_at": None,
+            "answer_mapping_updated_at": datetime.utcnow(),
+            "answer_solution_coverage_status": "pending",
+            "answer_solution_coverage_score": 0.0,
+            "answer_solution_coverage_summary": {
+                "question_count": int(document.get("extracted_questions_count") or 0),
+                "mapped_answer_count": 0,
+                "answer_source": "upload",
+                "reasons": ["answer_mapping_processing"],
+            },
             "answer_key_extraction_summary": None,
             "answer_key_candidates": [],
             "answer_key_auto_applied_count": 0,
             "answer_key_review_required_count": 0,
             "answer_sheet_manual_segmentation_recommended": False,
+            "answer_solution_mode": "upload",
             "answer_sheet_document_anchor_text": (
                 ocr_request.documentAnchorText.strip()
                 if ocr_request and ocr_request.documentAnchorText
@@ -7988,6 +8295,12 @@ async def get_documents(
                 answer_sheet_manual_segmentation_recommended=doc.get("answer_sheet_manual_segmentation_recommended"),
                 answer_sheet_processed_regions_count=doc.get("answer_sheet_processed_regions_count"),
                 answer_sheet_mapped_answers_count=doc.get("answer_sheet_mapped_answers_count"),
+                answer_mapping_status=effective_answer_mapping_status(doc),
+                answer_mapping_progress=doc.get("answer_mapping_progress"),
+                answer_mapping_error=doc.get("answer_mapping_error"),
+                answer_mapping_started_at=doc.get("answer_mapping_started_at"),
+                answer_mapping_completed_at=doc.get("answer_mapping_completed_at"),
+                answer_mapping_updated_at=doc.get("answer_mapping_updated_at"),
                 answer_solution_coverage_status=doc.get("answer_solution_coverage_status"),
                 answer_solution_coverage_score=doc.get("answer_solution_coverage_score"),
                 answer_solution_coverage_summary=doc.get("answer_solution_coverage_summary"),
@@ -8649,6 +8962,12 @@ async def get_student_available_options(
                 answer_sheet_manual_segmentation_recommended=None,
                 answer_sheet_processed_regions_count=None,
                 answer_sheet_mapped_answers_count=None,
+                answer_mapping_status=None,
+                answer_mapping_progress=None,
+                answer_mapping_error=None,
+                answer_mapping_started_at=None,
+                answer_mapping_completed_at=None,
+                answer_mapping_updated_at=None,
                 answer_solution_coverage_status=doc.get("answer_solution_coverage_status"),
                 answer_solution_coverage_score=doc.get("answer_solution_coverage_score"),
                 answer_solution_coverage_summary=doc.get("answer_solution_coverage_summary"),
@@ -9832,8 +10151,19 @@ async def get_document_questions(
                 if include_worked_answers
                 else document.get("answer_sheet_mapped_answers_count")
             ),
+            "answer_mapping_status": effective_answer_mapping_status(
+                document,
+                question_count=len(serialized_questions),
+            ),
+            "answer_mapping_progress": document.get("answer_mapping_progress"),
+            "answer_mapping_error": document.get("answer_mapping_error"),
+            "answer_mapping_started_at": document.get("answer_mapping_started_at"),
+            "answer_mapping_completed_at": document.get("answer_mapping_completed_at"),
+            "answer_mapping_updated_at": document.get("answer_mapping_updated_at"),
             "has_answer_sheet": bool(document.get("answer_sheet_path")),
-            "answer_solution_mode": document.get("answer_solution_mode"),
+            "answer_solution_mode": (
+                "upload" if document.get("answer_sheet_path") else document.get("answer_solution_mode")
+            ),
             "generated_solutions_status": document.get("generated_solutions_status"),
             "generated_solutions_count": document.get("generated_solutions_count"),
             **coverage_fields,
@@ -11701,7 +12031,20 @@ async def get_document_answer_mappings(
             "hasAnswerSheet": bool(document.get("answer_sheet_path")),
             "questionOcrStatus": document.get("ocr_status"),
             "answerSheetOcrStatus": document.get("answer_sheet_ocr_status") or "not_processed",
-            "answerSolutionMode": document.get("answer_solution_mode") or ("upload" if document.get("answer_sheet_path") else "none"),
+            "answerMappingStatus": effective_answer_mapping_status(
+                document,
+                question_count=len(questions),
+            ),
+            "answerMappingProgress": document.get("answer_mapping_progress"),
+            "answerMappingError": document.get("answer_mapping_error"),
+            "answerMappingStartedAt": document.get("answer_mapping_started_at"),
+            "answerMappingCompletedAt": document.get("answer_mapping_completed_at"),
+            "answerMappingUpdatedAt": document.get("answer_mapping_updated_at"),
+            "answerSolutionMode": (
+                "upload"
+                if document.get("answer_sheet_path")
+                else document.get("answer_solution_mode") or "none"
+            ),
             "generatedSolutionsStatus": document.get("generated_solutions_status"),
             "generatedSolutionCount": generated_solution_count,
             "questionCount": len(questions),

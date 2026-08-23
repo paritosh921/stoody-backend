@@ -7,6 +7,10 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.answer_mapping_contract import (
+    mapping_question_id,
+    rebind_uploaded_answer_mappings,
+)
 from services.answer_sheet_vision_mapper import AnswerSheetVisionMapper
 
 
@@ -143,10 +147,59 @@ class AnswerSheetMappingService:
             acceptance_policy=acceptance_policy,
         )
 
+        # The question OCR job and answer-sheet OCR job are independent.  A
+        # re-OCR can replace question IDs while the vision call is running, so
+        # the persistence boundary must use the current completed catalog, not
+        # the snapshot that happened to start the model request.
+        current_document = await self._find_current_document(db, is_b2c, document_id)
+        current_questions = await self._find_current_questions(db, is_b2c, document_id)
+        if current_document is None and not current_questions:
+            # Small unit-test adapters and offline callers may not expose the
+            # document collection.  In production the live catalog is always
+            # available and remains authoritative.
+            current_questions = questions
+        if current_document and str(current_document.get("ocr_status") or "").lower() != "completed":
+            return self._deferred_result(
+                questions=questions,
+                blocks=blocks,
+                reason="question_ocr_in_progress_at_mapping_commit",
+                vision_result=vision_result,
+            )
+        if not current_questions:
+            return self._deferred_result(
+                questions=questions,
+                blocks=blocks,
+                reason="current_question_catalog_unavailable_at_mapping_commit",
+                vision_result=vision_result,
+            )
+
+        deterministic = rebind_uploaded_answer_mappings(
+            current_questions,
+            deterministic,
+        )
+        questions = self._sorted_questions(current_questions)
+        current_question_ids = {
+            str(question.get("id") or question.get("question_id") or "").strip()
+            for question in questions
+            if question.get("id") or question.get("question_id")
+        }
+        for mapping in deterministic:
+            question_id = mapping_question_id(mapping)
+            if not mapping.get("mapping_rebound_to_current_catalog") or not question_id:
+                continue
+            answer_item_id = str(
+                mapping.get("answer_item_id")
+                or mapping.get("answer_region_id")
+                or mapping.get("answer_block_id")
+                or "answer"
+            )
+            mapping["mapping_id"] = f"{document_id}:{question_id}:{answer_item_id}"
+
         mappings_to_persist = [
             mapping
             for mapping in deterministic
             if mapping.get("question_id")
+            and str(mapping.get("question_id")) in current_question_ids
             and mapping.get("answer_text")
             and str(mapping.get("question_id")) not in protected_question_ids
         ]
@@ -611,6 +664,54 @@ class AnswerSheetMappingService:
         if hasattr(db, "mongo_find"):
             return await db.mongo_find("answer_question_mappings", {"document_id": document_id})
         return []
+
+    async def _find_current_document(
+        self,
+        db: Any,
+        is_b2c: bool,
+        document_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if is_b2c and hasattr(db, "b2c_find_one"):
+            return await db.b2c_find_one("documents", {"document_id": document_id})
+        if hasattr(db, "mongo_find_one"):
+            return await db.mongo_find_one("documents", {"document_id": document_id})
+        return None
+
+    async def _find_current_questions(
+        self,
+        db: Any,
+        is_b2c: bool,
+        document_id: str,
+    ) -> List[Dict[str, Any]]:
+        if is_b2c and hasattr(db, "b2c_find"):
+            return await db.b2c_find("questions", {"document_id": document_id})
+        if hasattr(db, "mongo_find"):
+            return await db.mongo_find("questions", {"document_id": document_id})
+        return []
+
+    def _deferred_result(
+        self,
+        *,
+        questions: List[Dict[str, Any]],
+        blocks: List[Dict[str, Any]],
+        reason: str,
+        vision_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "mappings": [],
+            "mapped_count": 0,
+            "manual_review_count": 0,
+            "summary": {
+                "source": self.SOURCE,
+                "answer_blocks_count": len(blocks),
+                "question_count": len(questions),
+                "mapping_deferred": True,
+                "reason": reason,
+                "vision_used": bool(vision_result.get("used")),
+                "vision_model": vision_result.get("model"),
+                "vision_provider": vision_result.get("provider"),
+            },
+        }
 
     async def _clear_existing_full_ocr_mappings(self, db: Any, is_b2c: bool, document_id: str) -> None:
         query = {"document_id": document_id, "source": self.SOURCE}
