@@ -29,7 +29,7 @@ References
 - Test IDs:     U-EVAL-01, I-PCR-01, I-PCR-02, I-PCR-03
 """
 
-from .ocr_service import OCRAdapter, OCRResult, LLMVisionCameraAdapter, LLMVisionPenAdapter, VisionGateProtocol, create_ocr_adapter
+from .ocr_service import OCRAdapter, OCRProviderError, OCRResult, LLMVisionCameraAdapter, LLMVisionPenAdapter, VisionGateProtocol, create_ocr_adapter
 from .solution_cache import SolutionCache
 from .submission_service import SubmissionService
 from .eval_core import EvalCore
@@ -50,6 +50,7 @@ from .objective_answer_sheet import (
 __all__ = [
     # OCR
     "OCRAdapter",
+    "OCRProviderError",
     "OCRResult",
     "LLMVisionCameraAdapter",
     "LLMVisionPenAdapter",

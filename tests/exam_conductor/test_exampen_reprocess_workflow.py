@@ -811,6 +811,41 @@ async def test_failure_record_schedules_one_bounded_durable_retry():
 
 
 @pytest.mark.asyncio
+async def test_failure_record_preserves_provider_failure_code():
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        record_processing_job_failure,
+    )
+
+    class _OCRProviderFailure(RuntimeError):
+        retryable = False
+        failure_code = "ProviderHTTPError"
+
+    db = _fresh_db()
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-provider-code",
+            "submission_id": "SUB-provider-code",
+            "status": "processing",
+            "attempts": 1,
+            "lease_token": "worker-one",
+        }
+    )
+
+    result = await record_processing_job_failure(
+        db,
+        "pcr-job-provider-code",
+        _OCRProviderFailure("model is unavailable"),
+        expected_lease_token="worker-one",
+    )
+
+    assert result["terminal"] is True
+    stored = await jobs.find_one({"job_id": "pcr-job-provider-code"})
+    assert stored["failure_code"] == "ProviderHTTPError"
+
+
+@pytest.mark.asyncio
 async def test_failure_record_stops_after_global_attempt_budget():
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,

@@ -46,6 +46,7 @@ from ..domain.segmenter import segment_submission
 from .ocr_service import (
     AssetIntegrityError,
     OCRAdapter,
+    OCRProviderError,
     OCRResult,
     VisionGateProtocol,
     create_ocr_adapter,
@@ -332,6 +333,16 @@ class SubmissionService:
                     "re-upload is required"
                 ),
             )
+        except OCRProviderError:
+            # Provider/infrastructure failures must reach the durable worker
+            # boundary. It owns the bounded retry budget and persists the
+            # safe provider reason; converting this to the old generic result
+            # would make a valid replacement copy terminal immediately.
+            logger.exception(
+                "OCR provider failed for submission %s",
+                submission_id,
+            )
+            raise
         except Exception:
             logger.exception(
                 "OCR failed for submission %s", submission_id

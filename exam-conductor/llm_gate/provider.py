@@ -340,11 +340,17 @@ async def _call_openai(
             json=payload,
         )
         if resp.status_code >= 400:
-            error_body = resp.text
-            logger.error(
-                f"OpenAI API error {resp.status_code} for model={model_id}: {error_body[:500]}"
+            provider_error = _provider_http_error(
+                resp,
+                provider="OpenAI Chat Completions API",
             )
-        resp.raise_for_status()
+            logger.error(
+                "OpenAI Chat Completions API error %s for model=%s: %s",
+                resp.status_code,
+                model_id,
+                str(provider_error),
+            )
+            raise provider_error
         data = resp.json()
 
     choice = data["choices"][0]["message"]["content"] if data.get("choices") else ""
@@ -757,7 +763,7 @@ def _openai_messages_to_gemini_contents(
 
 # Maps provider name -> (env var, fallback default)
 _DEFAULT_MODEL_MAP: Dict[str, tuple[str, str]] = {
-    "openai": ("OPENAI_MODEL", "gpt-4o"),
+    "openai": ("OPENAI_MODEL", "gpt-5.1"),
     "mistral": ("MISTRAL_OCR_MODEL", "mistral-ocr-latest"),
     "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
     "gemini": ("GEMINI_MODEL", "gemini-2.5-flash"),
@@ -771,13 +777,13 @@ def get_default_model() -> str:
     back to ``"openai"`` when unset).  Each provider reads its own env var
     for the model name, with a sensible fallback:
 
-    - ``openai``    -> ``OPENAI_MODEL``       (default ``gpt-4o``)
+    - ``openai``    -> ``OPENAI_MODEL``       (default ``gpt-5.1``)
     - ``mistral``   -> ``MISTRAL_OCR_MODEL``  (default ``mistral-ocr-latest``)
     - ``anthropic`` -> ``ANTHROPIC_MODEL``     (default ``claude-sonnet-4-20250514``)
     - ``gemini``    -> ``GEMINI_MODEL``        (default ``gemini-2.5-flash``)
     """
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
-    env_var, fallback = _DEFAULT_MODEL_MAP.get(provider, ("OPENAI_MODEL", "gpt-4o"))
+    env_var, fallback = _DEFAULT_MODEL_MAP.get(provider, ("OPENAI_MODEL", "gpt-5.1"))
     return os.getenv(env_var, fallback)
 
 

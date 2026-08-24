@@ -2296,7 +2296,9 @@ async def record_processing_job_failure(
     terminal = not retryable or attempts >= PROCESSING_MAX_AUTOMATIC_ATTEMPTS
     now = _now()
     error_text = _short_error(error)
-    failure_code = type(error).__name__
+    failure_code = str(
+        getattr(error, "failure_code", "") or type(error).__name__
+    )[:120]
 
     if terminal:
         update: Dict[str, Any] = {

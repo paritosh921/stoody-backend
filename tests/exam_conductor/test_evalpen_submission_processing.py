@@ -210,6 +210,19 @@ class _RecordingVisionGate:
         )
 
 
+class _ProviderFailingOCRAdapter:
+    async def recognize_pages(self, _pages_data, *, source: str = "camera"):
+        from api.v1._exampen_imports import load_exampen
+
+        ocr_service = load_exampen("pcr.services.ocr_service")
+        raise ocr_service.OCRProviderError(
+            page_number=1,
+            source=source,
+            model_id="gpt-5.1",
+            cause=RuntimeError("temporary provider outage"),
+        )
+
+
 def test_ocr_model_resolver_uses_explicit_ocr_override(monkeypatch):
     from api.v1._exampen_imports import load_exampen
 
@@ -234,6 +247,18 @@ def test_ocr_model_resolver_uses_gate_provider_default(monkeypatch):
     assert ocr_service._get_ocr_vision_model() == "gemini-2.5-pro"
 
 
+def test_ocr_model_resolver_uses_shared_openai_model(monkeypatch):
+    from api.v1._exampen_imports import load_exampen
+
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    monkeypatch.delenv("OCR_VISION_MODEL", raising=False)
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+
+    assert ocr_service._get_ocr_vision_model() == "gpt-5.1"
+
+
 def test_ocr_model_resolver_ignores_blank_ocr_override(monkeypatch):
     from api.v1._exampen_imports import load_exampen
 
@@ -255,7 +280,7 @@ def test_ocr_model_resolver_defaults_to_openai_when_provider_unset(monkeypatch):
     monkeypatch.delenv("AI_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
-    assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+    assert ocr_service._get_ocr_vision_model() == "gpt-5.1"
 
 
 def test_ocr_model_resolver_falls_back_when_provider_import_fails(monkeypatch):
@@ -269,7 +294,7 @@ def test_ocr_model_resolver_falls_back_when_provider_import_fails(monkeypatch):
         "import_module",
         side_effect=ImportError("missing provider"),
     ):
-        assert ocr_service._get_ocr_vision_model() == "gpt-4o"
+        assert ocr_service._get_ocr_vision_model() == "gpt-5.1"
 
 
 @pytest.mark.asyncio
@@ -279,7 +304,10 @@ async def test_pen_ocr_adapter_raises_when_gate_call_fails():
     ocr_service = load_exampen("pcr.services.ocr_service")
     adapter = ocr_service.LLMVisionPenAdapter(gate=_FailingVisionGate())
 
-    with pytest.raises(RuntimeError, match="LLM Vision OCR failed"):
+    with pytest.raises(
+        ocr_service.OCRProviderError,
+        match=r"OCR provider failed on pen page 1.*provider unavailable",
+    ) as caught:
         await adapter.recognize_pages(
             [
                 {
@@ -296,6 +324,9 @@ async def test_pen_ocr_adapter_raises_when_gate_call_fails():
             ],
             source="pen",
         )
+
+    assert caught.value.retryable is True
+    assert caught.value.failure_code == "RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -329,6 +360,43 @@ async def test_pen_ocr_adapter_logs_prompt_version_metadata(monkeypatch):
     assert metadata["pcr_stage"] == "ocr_pen"
     assert metadata["stroke_count"] == 1
     assert metadata["ocr_prompt_version"] == "exampen-layout-v5"
+
+
+@pytest.mark.asyncio
+async def test_submission_service_preserves_provider_failure_for_worker_retry():
+    from api.v1._exampen_imports import load_exampen
+
+    submission_service = load_exampen("pcr.services.submission_service")
+    ocr_service = load_exampen("pcr.services.ocr_service")
+
+    class _Ingest:
+        async def get_submission(self, _submission_id):
+            return {
+                "submission_id": "SUB-OCR-RETRY",
+                "exam_id": "EXAM-1",
+                "student_id": "STU-1",
+                "source": "camera",
+            }
+
+        async def get_answer_pages(self, _submission_id):
+            return [{"page_number": 1, "raw_image_ref": "page.jpg"}]
+
+        async def update_segmentation_status(self, *_args):
+            raise AssertionError("A retryable provider failure was made terminal")
+
+    service = submission_service.SubmissionService(
+        ingest=_Ingest(),
+        response_repo=object(),
+        question_repo=object(),
+        gate=object(),
+        ocr_adapter=_ProviderFailingOCRAdapter(),
+    )
+
+    with pytest.raises(ocr_service.OCRProviderError) as caught:
+        await service.process_submission("SUB-OCR-RETRY")
+
+    assert caught.value.retryable is True
+    assert caught.value.failure_code == "RuntimeError"
 
 
 @pytest.mark.asyncio

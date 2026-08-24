@@ -49,6 +49,35 @@ class AssetIntegrityError(RuntimeError):
     """Raised when stored answer-copy bytes do not match their ingest digest."""
 
 
+class OCRProviderError(RuntimeError):
+    """Safe OCR-provider failure with an explicit worker retry contract.
+
+    Student page bytes must never be copied into a durable job error.  The
+    shared provider layer already sanitises HTTP failures; this envelope adds
+    the OCR page/source context and preserves whether the durable worker may
+    retry the request.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_number: int,
+        source: str,
+        model_id: str,
+        cause: Exception,
+    ) -> None:
+        self.page_number = int(page_number)
+        self.source = str(source)
+        self.model_id = str(model_id)
+        self.failure_code = type(cause).__name__
+        self.retryable = _provider_failure_is_retryable(cause)
+        safe_detail = " ".join(str(cause or "Provider request failed").split())[:800]
+        super().__init__(
+            f"OCR provider failed on {self.source} page {self.page_number} "
+            f"using {self.model_id} [{self.failure_code}]: {safe_detail}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # A4 defaults (mm)
 # ---------------------------------------------------------------------------
@@ -60,8 +89,11 @@ _A4_HEIGHT_MM = 297.0
 _RENDER_WIDTH_PX = 1240   # ~148 DPI at A4 width
 _RENDER_HEIGHT_PX = 1754  # ~148 DPI at A4 height
 
-# OpenAI OCR is intentionally independent from the primary grading model.
-_DEFAULT_OCR_VISION_MODEL = "gpt-5.6-terra"
+# Last-resort OpenAI OCR model when the shared provider resolver is unavailable.
+# Normal operation follows OPENAI_MODEL so question-paper preparation, first
+# processing, and replacement-copy processing cannot silently use different
+# model families.
+_DEFAULT_OCR_VISION_MODEL = "gpt-5.1"
 
 # LLM OCR extraction prompt
 #
@@ -451,16 +483,13 @@ def _get_ocr_vision_model() -> str:
     """Resolve the model to use for vision OCR calls.
 
     Reads from ``OCR_VISION_MODEL`` env var when an OCR-specific override is
-    configured. OpenAI uses Terra by default while other providers continue to
-    use their provider-specific default.
+    intentionally configured. Otherwise OCR follows the shared gate provider
+    default, keeping initial and replacement-copy processing on one model
+    contract.
     """
     override = os.getenv("OCR_VISION_MODEL", "").strip()
     if override:
         return override
-
-    provider_name = os.getenv("AI_PROVIDER", "openai").strip().lower()
-    if provider_name == "openai":
-        return _DEFAULT_OCR_VISION_MODEL
 
     try:
         # The package name contains a hyphen, so use importlib just like the
@@ -481,6 +510,77 @@ def _get_ocr_vision_model() -> str:
             "Failed to resolve OCR model from gate provider defaults"
         )
         raise
+
+
+def _provider_failure_is_retryable(exc: Exception) -> bool:
+    """Return the provider's retry decision without guessing on HTTP 4xx.
+
+    Provider adapters expose ``retryable`` on sanitised HTTP errors. Network
+    timeouts are transient. Configuration and request-shape errors are
+    deterministic and must not burn credits through repeated attempts.
+    """
+
+    explicit = getattr(exc, "retryable", None)
+    if explicit is not None:
+        return bool(explicit)
+
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = int(exc.response.status_code)
+            return status_code in {408, 409, 425, 429} or status_code >= 500
+    except ImportError:  # pragma: no cover - httpx is a runtime dependency
+        pass
+
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, (ValueError, TypeError, ImportError, AttributeError)):
+        return False
+    if "api_key is not set" in str(exc).lower():
+        return False
+    # Unknown runtime/provider outages are safer to place behind the existing
+    # bounded durable worker retry budget than to fail a valid student copy.
+    return True
+
+
+async def _call_vision_ocr(
+    gate: VisionGateProtocol,
+    *,
+    model_id: str,
+    page_number: int,
+    source: str,
+    messages: List[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> str:
+    """Execute one OCR request and preserve a safe, retry-aware failure."""
+
+    try:
+        response = await gate.call(
+            model_id=model_id,
+            prompt="",
+            caller_id=_CALLER_ID,
+            messages=messages,
+            max_output_tokens=2048,
+            temperature=0.0,
+            metadata=metadata,
+        )
+        return str(response.content or "")
+    except Exception as exc:
+        logger.exception(
+            "LLM Vision OCR failed for page %d (%s) with model %s",
+            page_number,
+            source,
+            model_id,
+        )
+        raise OCRProviderError(
+            page_number=page_number,
+            source=source,
+            model_id=model_id,
+            cause=exc,
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -562,29 +662,18 @@ class LLMVisionCameraAdapter:
 
             # Build multimodal messages and call gate
             messages = _build_vision_messages(image_b64, media_type)
-            try:
-                gate_response = await self._gate.call(
-                    model_id=model_id,
-                    prompt="",
-                    caller_id=_CALLER_ID,
-                    messages=messages,
-                    max_output_tokens=2048,
-                    temperature=0.0,
-                    metadata={
-                        "pcr_stage": "ocr_camera",
-                        "page_number": page_number,
-                        "ocr_prompt_version": _OCR_PROMPT_VERSION,
-                    },
-                )
-                llm_content = gate_response.content
-            except Exception as exc:
-                logger.exception(
-                    "LLM Vision OCR failed for page %d (camera)",
-                    page_number,
-                )
-                raise RuntimeError(
-                    f"LLM Vision OCR failed for page {page_number} (camera)"
-                ) from exc
+            llm_content = await _call_vision_ocr(
+                self._gate,
+                model_id=model_id,
+                page_number=page_number,
+                source="camera",
+                messages=messages,
+                metadata={
+                    "pcr_stage": "ocr_camera",
+                    "page_number": page_number,
+                    "ocr_prompt_version": _OCR_PROMPT_VERSION,
+                },
+            )
 
             # Parse LLM response into TextBlocks
             text_blocks = _parse_ocr_response_to_text_blocks(
@@ -690,30 +779,19 @@ class LLMVisionPenAdapter:
 
             # Build multimodal messages and call gate
             messages = _build_vision_messages(image_b64, "image/png")
-            try:
-                gate_response = await self._gate.call(
-                    model_id=model_id,
-                    prompt="",
-                    caller_id=_CALLER_ID,
-                    messages=messages,
-                    max_output_tokens=2048,
-                    temperature=0.0,
-                    metadata={
-                        "pcr_stage": "ocr_pen",
-                        "page_number": page_number,
-                        "stroke_count": len(raw_strokes),
-                        "ocr_prompt_version": _OCR_PROMPT_VERSION,
-                    },
-                )
-                llm_content = gate_response.content
-            except Exception as exc:
-                logger.exception(
-                    "LLM Vision OCR failed for page %d (pen)",
-                    page_number,
-                )
-                raise RuntimeError(
-                    f"LLM Vision OCR failed for page {page_number} (pen)"
-                ) from exc
+            llm_content = await _call_vision_ocr(
+                self._gate,
+                model_id=model_id,
+                page_number=page_number,
+                source="pen",
+                messages=messages,
+                metadata={
+                    "pcr_stage": "ocr_pen",
+                    "page_number": page_number,
+                    "stroke_count": len(raw_strokes),
+                    "ocr_prompt_version": _OCR_PROMPT_VERSION,
+                },
+            )
 
             # Parse LLM response into TextBlocks
             text_blocks = _parse_ocr_response_to_text_blocks(

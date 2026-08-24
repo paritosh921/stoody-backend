@@ -923,7 +923,7 @@ OCR, confidence, rubrics, or uploaded images in student-facing feedback."""
 
 
 def _select_vision_eval_model() -> str:
-    """Resolve the PCR-only vision model without changing the main grader."""
+    """Resolve the vision evaluator through the shared provider contract."""
     override = (
         os.getenv("PCR_VISION_EVAL_MODEL", "").strip()
         or os.getenv("OCR_VISION_MODEL", "").strip()
@@ -931,17 +931,10 @@ def _select_vision_eval_model() -> str:
     if override:
         return override
 
-    # OPENAI_MODEL remains the primary full-document grading model. Keep the
-    # visual fallback independent so GPT-5.1 grading does not silently select
-    # the legacy GPT-4o vision path (or vice versa).
-    provider_name = os.getenv("AI_PROVIDER", "openai").strip().lower()
-    if provider_name == "openai":
-        return "gpt-5.6-terra"
-
     try:
         return _get_gate_provider_default_model()
     except Exception:
-        return os.getenv("OCR_FALLBACK_MODEL", "gpt-5.6-terra")
+        return os.getenv("OCR_FALLBACK_MODEL", "gpt-5.1")
 
 
 # ---------------------------------------------------------------------------

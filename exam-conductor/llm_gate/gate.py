@@ -178,8 +178,9 @@ class LLMGate:
             If any budget period is exhausted (GATE-01, §9.1).
         RuntimeError
             If the provider API key is missing.
-        httpx.HTTPStatusError
-            On provider-level HTTP failures.
+        ProviderHTTPError
+            On provider-level HTTP failures. The error is sanitised and
+            carries the provider retry contract.
         """
 
         # ── Step 1: Validate caller_id (GATE-02 mitigation) ────────────

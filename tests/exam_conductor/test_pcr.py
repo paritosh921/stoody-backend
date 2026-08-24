@@ -784,6 +784,26 @@ class TestUEval01:
 
         assert eval_core._select_eval_model("L2", cache_hit=False) == "gpt-5.1"
 
+    def test_u_eval_01_vision_model_uses_shared_openai_model(self, monkeypatch):
+        """Visual evaluation follows the same model contract as OCR/grading."""
+        from pcr.services import eval_core
+
+        monkeypatch.delenv("PCR_VISION_EVAL_MODEL", raising=False)
+        monkeypatch.delenv("OCR_VISION_MODEL", raising=False)
+        monkeypatch.setenv("AI_PROVIDER", "openai")
+        monkeypatch.setenv("OPENAI_MODEL", "gpt-5.1")
+
+        assert eval_core._select_vision_eval_model() == "gpt-5.1"
+
+    def test_u_eval_01_vision_model_respects_explicit_override(self, monkeypatch):
+        """A deliberate vision override remains a supported operator choice."""
+        from pcr.services import eval_core
+
+        monkeypatch.setenv("PCR_VISION_EVAL_MODEL", "vision-model-override")
+        monkeypatch.setenv("OCR_VISION_MODEL", "ocr-model-override")
+
+        assert eval_core._select_vision_eval_model() == "vision-model-override"
+
     def test_u_eval_01_eval_model_keeps_anthropic_tiers(self, monkeypatch):
         """Anthropic deployments keep the configured Haiku/Sonnet tiers."""
         from pcr.services import eval_core

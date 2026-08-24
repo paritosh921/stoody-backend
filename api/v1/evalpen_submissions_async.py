@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -44,6 +44,15 @@ from api.v1.exam_orch_async import (
     _current_tutor_id,
     _is_exam_visible_to_tutor,
     _is_tutor_admin_role,
+)
+from services.exampen_review_lease import (
+    SubmissionReviewBusyError,
+    acquire_submission_review_lease,
+    release_submission_review_lease,
+)
+from services.exampen_submission_deletion import (
+    SubmissionCopyBusyError,
+    delete_submission_copy,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,6 +188,26 @@ class ResolveFlagRequest(BaseModel):
 
     resolution: str
     note: Optional[str] = None
+
+
+class DeleteCopyRequest(BaseModel):
+    """Explicit reason and confirmation for destructive copy removal."""
+
+    reason: Literal["wrong_student", "wrong_file", "duplicate", "unusable"] = (
+        "wrong_student"
+    )
+    note: Optional[str] = Field(default=None, max_length=500)
+    confirm_published: bool = False
+
+
+class DeleteCopyResultAPI(BaseModel):
+    deletion_id: str
+    submission_id: str
+    exam_id: str
+    student_id: str
+    status: Literal["deleted"]
+    deleted_counts: Dict[str, int]
+    storage_cleanup_pending: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +464,141 @@ async def create_submission(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Submission ingest encountered an internal error",
         )
+
+
+@router.post(
+    "/{submission_id}/delete-copy",
+    response_model=DeleteCopyResultAPI,
+    summary="Delete a wrongly assigned answer copy and all awarded marks",
+    responses={
+        403: {"description": "Submission is outside the teacher's exam scope"},
+        404: {"description": "Submission not found"},
+        409: {"description": "Published confirmation missing or grading is active"},
+        503: {"description": "Tenant database unavailable"},
+    },
+)
+async def delete_copy(
+    submission_id: str,
+    body: DeleteCopyRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> DeleteCopyResultAPI:
+    """Remove one complete, incorrectly assigned answer-copy lifecycle.
+
+    This command performs no AI work.  It removes active page, mapping,
+    evaluation, publication, recheck, upload-reservation, and processing state,
+    then removes the canonical submission last.  An audit summary is retained
+    so an administrator can explain who removed the result and why.
+    """
+
+    tenant_db = await _get_tenant_db_for_user(db, current_user)
+    submission = await tenant_db["evalpen_submissions"].find_one(
+        {"submission_id": submission_id}
+    )
+    if submission is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Submission {submission_id} not found",
+        )
+    await _require_submission_visible_to_user(tenant_db, submission, current_user)
+
+    is_published = str(submission.get("publication_status") or "") == "published"
+    if is_published and not body.confirm_published:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This result is published. Confirm that Delete copy should withdraw "
+                "the result and clear its marks."
+            ),
+        )
+
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or "unknown"
+    )
+    lease_token: Optional[str] = None
+    try:
+        lease_token = await acquire_submission_review_lease(
+            tenant_db,
+            submission_id,
+            actor_id=actor_id,
+            operation="delete_copy",
+        )
+        # Re-read after acquiring the mutation fence.  Published state may
+        # have changed between the initial authorization check and the lease.
+        leased_submission = await tenant_db["evalpen_submissions"].find_one(
+            {
+                "submission_id": submission_id,
+                "review_mutation_lease_token": lease_token,
+            }
+        )
+        if leased_submission is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The answer copy changed while deletion was being requested. Try again.",
+            )
+        if (
+            str(leased_submission.get("publication_status") or "") == "published"
+            and not body.confirm_published
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This result was published while deletion was requested. "
+                    "Confirm the published-result deletion and try again."
+                ),
+            )
+
+        result = await delete_submission_copy(
+            tenant_db,
+            leased_submission,
+            actor_id=actor_id,
+            actor_role=str(current_user.get("user_type") or "unknown"),
+            reason_code=body.reason,
+            reason_note=body.note,
+        )
+        logger.warning(
+            "Answer copy deleted: submission=%s exam=%s student=%s actor=%s reason=%s",
+            submission_id,
+            result.get("exam_id"),
+            result.get("student_id"),
+            actor_id,
+            body.reason,
+        )
+        return DeleteCopyResultAPI(**result)
+    except HTTPException:
+        raise
+    except (SubmissionReviewBusyError, SubmissionCopyBusyError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception("Could not delete answer copy %s", submission_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                "The answer copy could not be deleted completely. No replacement "
+                "copy was accepted; try Delete copy again."
+            ),
+        ) from exc
+    finally:
+        if lease_token:
+            try:
+                await release_submission_review_lease(
+                    tenant_db, submission_id, lease_token
+                )
+            except Exception:
+                logger.exception(
+                    "Could not release delete-copy lease for %s", submission_id
+                )
 
 
 @router.get(

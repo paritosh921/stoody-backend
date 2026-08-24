@@ -50,6 +50,7 @@ from llm_gate.gate import LLMGate
 from llm_gate.provider import (
     ProviderHTTPError,
     ProviderResponse,
+    _call_openai,
     _call_openai_responses,
     estimate_tokens_for_messages,
 )
@@ -742,6 +743,48 @@ class TestOpenAIResponsesDocumentInput:
             assert "Invalid schema for response_format" in str(error)
             assert "student_page" not in str(error)
             assert "raw response" not in str(error)
+
+        asyncio.run(_run())
+
+    def test_openai_chat_preserves_safe_error_and_retry_contract(self):
+        class _HTTPResponse:
+            status_code = 404
+
+            def json(self):
+                return {
+                    "error": {
+                        "message": "The requested model is unavailable",
+                        "type": "invalid_request_error",
+                        "param": "model",
+                        "code": "model_not_found",
+                    },
+                    "student_page": "must-not-leak",
+                }
+
+        class _HTTPClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, _url, *, headers, json):
+                return _HTTPResponse()
+
+        async def _run():
+            with patch("llm_gate.provider.httpx.AsyncClient", return_value=_HTTPClient()):
+                with pytest.raises(ProviderHTTPError) as caught:
+                    await _call_openai(
+                        "gpt-5.1",
+                        "",
+                        messages=[{"role": "user", "content": "read page"}],
+                        api_key="secret",
+                    )
+            error = caught.value
+            assert error.retryable is False
+            assert error.error_code == "model_not_found"
+            assert "param=model" in str(error)
+            assert "student_page" not in str(error)
 
         asyncio.run(_run())
 
