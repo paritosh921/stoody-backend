@@ -12,7 +12,7 @@ import hashlib
 import json
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping
 
 from services.evalpen_flag_utils import is_flag_resolved
 
@@ -30,6 +30,118 @@ TERMINAL_RESPONSE_STATUSES = {
 
 def _blocker(code: str, message: str, **details: Any) -> Dict[str, Any]:
     return {"code": code, "message": message, **details}
+
+
+def extract_unassigned_document_regions(
+    grading_run: Mapping[str, Any] | None,
+) -> List[Dict[str, Any]]:
+    """Return the current run's unassigned evidence in a stable API shape.
+
+    Full-document grading contracts evolved from one validated payload to
+    bounded mapping units.  Read-time normalization keeps old and new runs
+    actionable without rewriting tenant data or repeating an LLM call.
+    """
+
+    if not isinstance(grading_run, Mapping):
+        return []
+
+    payloads: List[Mapping[str, Any]] = []
+    for key in ("validated_payload", "evidence_mapping_payload"):
+        payload = grading_run.get(key)
+        if isinstance(payload, Mapping):
+            payloads.append(payload)
+    for key in (
+        "evidence_mapping_units",
+        "evidence_mapping_recovery_units",
+    ):
+        units = grading_run.get(key)
+        if not isinstance(units, list):
+            continue
+        for unit in units:
+            payload = unit.get("payload") if isinstance(unit, Mapping) else None
+            if isinstance(payload, Mapping):
+                payloads.append(payload)
+
+    findings: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        for raw in payload.get("unassigned_student_regions") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                page_number = int(raw.get("page_number") or 0)
+            except (TypeError, ValueError):
+                page_number = 0
+            if page_number <= 0:
+                continue
+            region_id = str(raw.get("region_id") or "").strip()
+            geometry_key = ":".join(
+                str(raw.get(key) or "")
+                for key in ("x_start", "y_start", "x_end", "y_end")
+            )
+            identity = region_id or f"page:{page_number}:{geometry_key}"
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            finding: Dict[str, Any] = {
+                "region_id": region_id or identity,
+                "page_number": page_number,
+            }
+            for key in ("x_start", "y_start", "x_end", "y_end"):
+                value = _number(raw.get(key))
+                if value is not None:
+                    finding[key] = value
+            confidence = _number(raw.get("mapping_confidence"))
+            if confidence is not None:
+                finding["mapping_confidence"] = max(0.0, min(1.0, confidence))
+            evidence = str(
+                raw.get("evidence") or raw.get("observed_content") or ""
+            ).strip()
+            if evidence:
+                finding["evidence"] = evidence[:600]
+            evidence_kind = str(raw.get("evidence_kind") or "").strip()
+            if evidence_kind:
+                finding["evidence_kind"] = evidence_kind[:80]
+            findings.append(finding)
+            if len(findings) >= 100:
+                return findings
+    return findings
+
+
+def build_document_coverage_action(
+    document_review: Mapping[str, Any] | None,
+    grading_run: Mapping[str, Any] | None,
+) -> Dict[str, Any] | None:
+    """Build the explicit teacher action required before publication."""
+
+    if not isinstance(document_review, Mapping) or not document_review.get("required"):
+        return None
+    return _blocker(
+        "document_coverage_requires_review",
+        "Review answer-copy work that was not used in the score",
+        action_type="resolve_unassigned_work",
+        review_status=str(document_review.get("status") or "pending_review"),
+        grading_run_id=str(document_review.get("grading_run_id") or ""),
+        confidence=document_review.get("confidence"),
+        warnings=[
+            str(value) for value in (document_review.get("warnings") or [])[:10]
+        ],
+        findings=extract_unassigned_document_regions(grading_run),
+    )
+
+
+def document_grading_run_id(submission: Mapping[str, Any]) -> str:
+    document_review = submission.get("document_review")
+    return str(
+        (
+            document_review.get("grading_run_id")
+            if isinstance(document_review, Mapping)
+            else None
+        )
+        or submission.get("document_grading_run_id")
+        or ""
+    ).strip()
 
 
 def _number(value: Any) -> float | None:
@@ -141,12 +253,14 @@ async def assess_submission_readiness(
             "submission_id": submission_id,
             "ready": False,
             "blockers": [_blocker("submission_not_found", "Submission was not found")],
+            "required_actions": [],
             "review_notes": [],
             "counts": {},
         }
 
     exam_id = str(submission.get("exam_id") or "")
     blockers: List[Dict[str, Any]] = []
+    required_actions: List[Dict[str, Any]] = []
     review_notes: List[Dict[str, Any]] = []
 
     if _preloaded is not None:
@@ -175,20 +289,21 @@ async def assess_submission_readiness(
 
     document_review = submission.get("document_review")
     if isinstance(document_review, dict) and document_review.get("required"):
-        review_notes.append(
-            _blocker(
-                "document_coverage_requires_review",
-                "Some page-level work could not be assigned confidently to a question",
-                review_status=str(
-                    document_review.get("status") or "pending_review"
-                ),
-                confidence=document_review.get("confidence"),
-                warnings=[
-                    str(value)
-                    for value in (document_review.get("warnings") or [])[:10]
-                ],
+        grading_run_id = document_grading_run_id(submission)
+        document_run = (
+            _preloaded.get("document_run")
+            if _preloaded is not None
+            else (
+                await tenant_db["evalpen_document_grading_runs"].find_one(
+                    {"run_id": grading_run_id}
+                )
+                if grading_run_id
+                else None
             )
         )
+        action = build_document_coverage_action(document_review, document_run)
+        if action is not None:
+            required_actions.append(action)
 
     segmentation_status = str(submission.get("segmentation_status") or "")
     if segmentation_status != "complete":
@@ -483,8 +598,12 @@ async def assess_submission_readiness(
     return {
         "submission_id": submission_id,
         "exam_id": exam_id,
-        "ready": not blockers,
+        # ``ready`` is publication readiness. A completed score may still need
+        # one explicit, no-LLM teacher decision before it is publishable.
+        "ready": not blockers and not required_actions,
+        "grading_complete": not blockers,
         "blockers": blockers,
+        "required_actions": required_actions,
         "review_notes": review_notes,
         "counts": {
             "question_count": len(catalog_by_id),
@@ -516,6 +635,27 @@ async def assess_submissions_readiness(
     ).to_list(length=len(ordered_ids))
     submissions_by_id = {
         str(item.get("submission_id") or ""): item for item in submissions
+    }
+    grading_run_ids = sorted(
+        {
+            document_grading_run_id(item)
+            for item in submissions
+            if (
+                isinstance(item.get("document_review"), dict)
+                and (item.get("document_review") or {}).get("required")
+            )
+        }
+        - {""}
+    )
+    document_runs = (
+        await tenant_db["evalpen_document_grading_runs"].find(
+            {"run_id": {"$in": grading_run_ids}}
+        ).to_list(length=len(grading_run_ids))
+        if grading_run_ids
+        else []
+    )
+    document_runs_by_id = {
+        str(item.get("run_id") or ""): item for item in document_runs
     }
     exam_ids = sorted(
         {
@@ -590,6 +730,7 @@ async def assess_submissions_readiness(
     for submission_id in ordered_ids:
         submission = submissions_by_id.get(submission_id)
         exam_id = str((submission or {}).get("exam_id") or "")
+        grading_run_id = document_grading_run_id(submission or {})
         reports[submission_id] = await assess_submission_readiness(
             tenant_db,
             submission_id,
@@ -600,13 +741,16 @@ async def assess_submissions_readiness(
                 "exam": exams_by_id.get(exam_id),
                 "responses": responses_by_submission.get(submission_id, []),
                 "evaluations": evaluations_by_submission.get(submission_id, []),
+                "document_run": document_runs_by_id.get(grading_run_id),
             },
         )
     return reports
 
 
 def readiness_message(report: Dict[str, Any], *, limit: int = 3) -> str:
-    blockers = report.get("blockers") or []
+    blockers = list(report.get("blockers") or []) + list(
+        report.get("required_actions") or []
+    )
     messages = [str(item.get("message") or item.get("code") or "Not ready") for item in blockers[:limit]]
     suffix = f" (+{len(blockers) - limit} more)" if len(blockers) > limit else ""
     return "; ".join(messages) + suffix

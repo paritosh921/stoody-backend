@@ -300,10 +300,12 @@ async def test_readiness_keeps_scored_review_notes_nonblocking():
 
 
 @pytest.mark.asyncio
-async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_it():
+async def test_document_coverage_is_required_before_publish_and_teacher_can_resolve_it():
     from api.v1.evalpen_review_async import (
         DocumentCoverageReviewRequest,
+        PublishRequest,
         confirm_document_coverage_review,
+        publish_submission,
     )
     from services.exampen_submission_readiness import assess_submission_readiness
 
@@ -317,13 +319,33 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
                 "document_review": {
                     "status": "pending_review",
                     "required": True,
-                    "all_student_work_accounted": True,
+                    "all_student_work_accounted": False,
                     "confidence": 0.78,
                     "warnings": ["Confirm that the faint bottom edge has no work."],
                     "grading_run_id": "DOCGR-run-1",
                 },
             }
         },
+    )
+    await db["evalpen_document_grading_runs"].insert_one(
+        {
+            "run_id": "DOCGR-run-1",
+            "submission_id": "SUB-READY",
+            "validated_payload": {
+                "unassigned_student_regions": [
+                    {
+                        "region_id": "page-8-unassigned",
+                        "page_number": 8,
+                        "x_start": 2,
+                        "y_start": 4,
+                        "x_end": 98,
+                        "y_end": 96,
+                        "evidence": "Chemistry work unrelated to this Physics exam",
+                        "mapping_confidence": 0.99,
+                    }
+                ]
+            },
+        }
     )
     await db["exampen_processing_jobs"].update_one(
         {"submission_id": "SUB-READY"},
@@ -337,11 +359,61 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
     )
 
     before = await assess_submission_readiness(db, "SUB-READY")
-    assert before["ready"] is True
+    assert before["ready"] is False
+    assert before["grading_complete"] is True
     assert before["blockers"] == []
-    assert [item["code"] for item in before["review_notes"]] == [
+    assert before["review_notes"] == []
+    assert [item["code"] for item in before["required_actions"]] == [
         "document_coverage_requires_review"
     ]
+    assert before["required_actions"][0]["findings"] == [
+        {
+            "region_id": "page-8-unassigned",
+            "page_number": 8,
+            "x_start": 2.0,
+            "y_start": 4.0,
+            "x_end": 98.0,
+            "y_end": 96.0,
+            "mapping_confidence": 0.99,
+            "evidence": "Chemistry work unrelated to this Physics exam",
+        }
+    ]
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+        pytest.raises(HTTPException) as publish_error,
+    ):
+        await publish_submission(
+            "SUB-READY",
+            PublishRequest(),
+            current_user=_admin_user(),
+            db=None,
+        )
+    assert publish_error.value.status_code == 409
+
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch(
+            "api.v1.evalpen_review_async._get_tutor_scoped_student_ids",
+            return_value=None,
+        ),
+        pytest.raises(HTTPException) as incomplete_review_error,
+    ):
+        await confirm_document_coverage_review(
+            "SUB-READY",
+            DocumentCoverageReviewRequest(
+                grading_run_id="DOCGR-run-1",
+                note="Checked only part of the uploaded answer copy",
+                region_ids=[],
+            ),
+            current_user=_admin_user(),
+            db=None,
+        )
+    assert incomplete_review_error.value.status_code == 409
 
     with (
         patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
@@ -355,6 +427,7 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
             DocumentCoverageReviewRequest(
                 grading_run_id="DOCGR-run-1",
                 note="Checked every uploaded page against the original copy",
+                region_ids=["page-8-unassigned"],
             ),
             current_user=_admin_user(),
             db=None,
@@ -367,7 +440,12 @@ async def test_document_coverage_warning_is_nonblocking_and_teacher_can_confirm_
     )
     assert stored["document_review"]["status"] == "accepted"
     assert stored["document_review"]["required"] is False
+    assert stored["document_review"]["resolution"] == "exclude_unassigned_work"
+    assert stored["document_review"]["resolved_page_numbers"] == [8]
     assert stored["document_review_history"][-1]["actor_id"] == "TEACHER-1"
+    assert stored["document_review_history"][-1]["action"] == (
+        "unassigned_work_excluded"
+    )
     job = await db["exampen_processing_jobs"].find_one(
         {"submission_id": "SUB-READY"}
     )

@@ -269,10 +269,15 @@ class PublishReadyRequest(BaseModel):
 
 
 class DocumentCoverageReviewRequest(BaseModel):
-    """Teacher confirmation that every submitted page was visually reviewed."""
+    """Teacher resolution of work not used by the current grading run."""
 
     grading_run_id: str = Field(..., min_length=1, max_length=128)
     note: str = Field(..., min_length=5, max_length=1000)
+    resolution: str = Field(
+        default="exclude_unassigned_work",
+        pattern="^exclude_unassigned_work$",
+    )
+    region_ids: List[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("grading_run_id", "note")
     @classmethod
@@ -281,6 +286,13 @@ class DocumentCoverageReviewRequest(BaseModel):
         if not value:
             raise ValueError("Value must not be blank")
         return value
+
+    @field_validator("region_ids")
+    @classmethod
+    def normalize_document_region_ids(cls, values: List[str]) -> List[str]:
+        return list(
+            dict.fromkeys(str(value).strip() for value in values if str(value).strip())
+        )
 
 
 class ResponseRegionCorrection(BaseModel):
@@ -1260,6 +1272,24 @@ async def get_submission_summary(
             and isinstance(sub_dict.get("document_review"), dict)
             else None
         )
+        if document_review and document_review.get("required"):
+            from services.exampen_submission_readiness import (
+                document_grading_run_id,
+                extract_unassigned_document_regions,
+            )
+
+            grading_run_id = document_grading_run_id(sub_dict)
+            grading_run = (
+                await tenant_db["evalpen_document_grading_runs"].find_one(
+                    {"run_id": grading_run_id}
+                )
+                if grading_run_id
+                else None
+            )
+            document_review = {
+                **document_review,
+                "findings": extract_unassigned_document_regions(grading_run),
+            }
         # Derive the displayed state from canonical rows on every read. The
         # stored field is an index hint and can briefly lag behind a review or
         # reprocess write; it must never hide a current blocker.
@@ -1269,7 +1299,7 @@ async def get_submission_summary(
             else "processing"
             if score_state == "processing"
             else "needs_review"
-            if review_count
+            if review_count or bool(document_review and document_review.get("required"))
             else "ready"
         )
 
@@ -1363,11 +1393,17 @@ def _review_transition_from_readiness(
         for item in (readiness.get("blockers") or [])
         if str(item.get("code") or "")
     }
+    required_action_codes = {
+        str(item.get("code") or "")
+        for item in (readiness.get("required_actions") or [])
+        if str(item.get("code") or "")
+    }
+    unresolved_codes = blocker_codes | required_action_codes
     review_state = (
         "ready"
         if readiness.get("ready")
         else "needs_review"
-        if blocker_codes and blocker_codes.issubset(_REVIEWABLE_READINESS_CODES)
+        if unresolved_codes and unresolved_codes.issubset(_REVIEWABLE_READINESS_CODES)
         else "blocked"
     )
     state_update: Dict[str, Any] = {
@@ -1531,10 +1567,43 @@ async def confirm_document_coverage_review(
             status_code=status.HTTP_409_CONFLICT,
             detail="This submission has no document-coverage review to confirm",
         )
+    if not current_review.get("required"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This answer-copy review has already been resolved",
+        )
     if str(current_review.get("grading_run_id") or "") != body.grading_run_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="The answer copy was reprocessed. Refresh before confirming it.",
+        )
+    from services.exampen_submission_readiness import (
+        document_grading_run_id,
+        extract_unassigned_document_regions,
+    )
+
+    current_grading_run_id = document_grading_run_id(submission)
+    if current_grading_run_id != body.grading_run_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The answer copy was reprocessed. Refresh before confirming it.",
+        )
+
+    grading_run = await tenant_db["evalpen_document_grading_runs"].find_one(
+        {"run_id": body.grading_run_id}
+    )
+    findings = extract_unassigned_document_regions(grading_run)
+    expected_region_ids = {
+        str(item.get("region_id") or "") for item in findings if item.get("region_id")
+    }
+    supplied_region_ids = set(body.region_ids)
+    if expected_region_ids and supplied_region_ids != expected_region_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "The unused answer regions changed or were not all selected. "
+                "Refresh and review every listed region before continuing."
+            ),
         )
 
     now = datetime.now(timezone.utc)
@@ -1546,6 +1615,15 @@ async def confirm_document_coverage_review(
         "accepted_at": now,
         "accepted_by": actor_id,
         "acceptance_note": body.note,
+        "resolution": body.resolution,
+        "resolved_region_ids": sorted(expected_region_ids or supplied_region_ids),
+        "resolved_page_numbers": sorted(
+            {
+                int(item.get("page_number") or 0)
+                for item in findings
+                if int(item.get("page_number") or 0) > 0
+            }
+        ),
         "updated_at": now,
     }
     updated = await tenant_db["evalpen_submissions"].update_one(
@@ -1553,6 +1631,7 @@ async def confirm_document_coverage_review(
             "submission_id": submission_id,
             "publication_status": {"$ne": "published"},
             "document_review.grading_run_id": body.grading_run_id,
+            "document_review.required": True,
         },
         {
             "$set": {
@@ -1561,8 +1640,10 @@ async def confirm_document_coverage_review(
             },
             "$push": {
                 "document_review_history": {
-                    "action": "coverage_confirmed",
+                    "action": "unassigned_work_excluded",
                     "grading_run_id": body.grading_run_id,
+                    "resolution": body.resolution,
+                    "region_ids": sorted(expected_region_ids or supplied_region_ids),
                     "actor_id": actor_id,
                     "note": body.note,
                     "timestamp": now,

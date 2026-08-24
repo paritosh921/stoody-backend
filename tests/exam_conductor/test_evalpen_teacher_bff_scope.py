@@ -367,7 +367,7 @@ async def test_teacher_bff_queue_separates_review_from_technical_failure():
 
 @pytest.mark.asyncio
 async def test_teacher_bff_approved_submission_with_advisory_is_ready_to_publish():
-    """An approved ready state must outrank a non-blocking coverage advisory."""
+    """A completed coverage decision must not remain in the review queue."""
     from api.v1.evalpen_teacher_bff_async import get_exam_queue, list_exams
 
     db = _fresh_db()
@@ -379,8 +379,8 @@ async def test_teacher_bff_approved_submission_with_advisory_is_ready_to_publish
                 "review_state": "ready",
                 "publication_status": "ready",
                 "document_review": {
-                    "status": "pending_review",
-                    "required": True,
+                    "status": "accepted",
+                    "required": False,
                     "confidence": 0.93,
                     "warnings": ["Confirm four unassigned visible regions."],
                     "grading_run_id": "DOCGR-approved",

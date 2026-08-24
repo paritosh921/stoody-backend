@@ -1001,18 +1001,17 @@ async def list_exams(
                     for blocker in (readiness.get("blockers") or [])
                     if str(blocker.get("code") or "")
                 }
-                review_codes = {
-                    str(note.get("code") or "")
-                    for note in (readiness.get("review_notes") or [])
-                    if str(note.get("code") or "")
-                    == "document_coverage_requires_review"
+                required_action_codes = {
+                    str(action.get("code") or "")
+                    for action in (readiness.get("required_actions") or [])
+                    if str(action.get("code") or "")
                 }
                 reviewable_codes = {
                     "document_coverage_requires_review",
                     "response_assignment_requires_review",
                     "evaluation_requires_review",
                 }
-                action_codes = blocker_codes | review_codes
+                action_codes = blocker_codes | required_action_codes
                 needs_teacher_review = bool(action_codes) and action_codes.issubset(
                     reviewable_codes
                 )
@@ -1369,18 +1368,17 @@ async def get_exam_queue(
                 for item in (readiness.get("blockers") or [])
                 if str(item.get("code") or "")
             }
-            review_codes = {
+            required_action_codes = {
                 str(item.get("code") or "")
-                for item in (readiness.get("review_notes") or [])
+                for item in (readiness.get("required_actions") or [])
                 if str(item.get("code") or "")
-                == "document_coverage_requires_review"
             }
             reviewable_codes = {
                 "document_coverage_requires_review",
                 "response_assignment_requires_review",
                 "evaluation_requires_review",
             }
-            action_codes = blocker_codes | review_codes
+            action_codes = blocker_codes | required_action_codes
             needs_teacher_review = bool(action_codes) and action_codes.issubset(
                 reviewable_codes
             )
