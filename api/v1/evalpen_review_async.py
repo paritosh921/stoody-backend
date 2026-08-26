@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from core.database import DatabaseManager
@@ -3032,6 +3033,95 @@ async def get_exam_results(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve exam results",
         )
+
+
+@router.get(
+    "/exams/{exam_id}/results/export",
+    summary="Download all student marks as an Excel workbook",
+    responses={
+        200: {
+            "description": "Excel workbook containing the full exam roster and current marks",
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
+            },
+        },
+        403: {"description": "Insufficient permissions"},
+        404: {"description": "Exam not found"},
+        503: {"description": "Tenant database or exam-conductor unavailable"},
+    },
+)
+async def export_exam_results(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> StreamingResponse:
+    """Export every expected student, including missing and unfinished copies."""
+
+    roster = await get_exam_roster(
+        exam_id=exam_id,
+        current_user=current_user,
+        db=db,
+    )
+    results = await get_exam_results(
+        exam_id=exam_id,
+        current_user=current_user,
+        db=db,
+    )
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {
+            "title": 1,
+            "name": 1,
+            "class_name": 1,
+            "standard": 1,
+            "section_name": 1,
+            "section": 1,
+        },
+    )
+    if exam is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Exam {exam_id} not found",
+        )
+
+    exam_title = str(exam.get("title") or exam.get("name") or exam_id)
+    class_name = str(exam.get("class_name") or exam.get("standard") or "").strip()
+    section_name = str(exam.get("section_name") or exam.get("section") or "").strip()
+    class_label = (
+        f"Class {class_name} - Section {section_name}"
+        if class_name and section_name
+        else f"Class {class_name}"
+        if class_name
+        else f"Section {section_name}"
+        if section_name
+        else None
+    )
+
+    from services.exam_marks_export import (
+        build_exam_marks_workbook,
+        exam_marks_filename,
+    )
+
+    workbook = build_exam_marks_workbook(
+        exam_id=exam_id,
+        exam_title=exam_title,
+        class_label=class_label,
+        roster_rows=[row.model_dump() for row in roster.expected_students],
+        result_rows=[row.model_dump() for row in results.students],
+        generated_at=datetime.now(timezone.utc),
+    )
+    filename = exam_marks_filename(exam_title)
+    return StreamingResponse(
+        iter([workbook]),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.post(

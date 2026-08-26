@@ -76,6 +76,37 @@ paths:
         "503":
           description: Tenant database or exam-conductor unavailable
 
+  /api/v1/evalpen/review/exams/{exam_id}/results/export:
+    get:
+      operationId: exportExamResults
+      summary: Download all student marks as an Excel workbook
+      description: |
+        Exports the full authorized exam roster, including students who have
+        not submitted, together with current PCR/DCR totals, publication state,
+        processing state, and open recheck count. Processing or unavailable
+        scores are left blank rather than exported as zero.
+      tags: [Review]
+      parameters:
+        - $ref: "#/components/parameters/ExamIdPath"
+      responses:
+        "200":
+          description: Excel workbook containing the full roster and current marks
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+        "403":
+          description: Insufficient permissions
+        "404":
+          description: Exam not found
+        "503":
+          description: Tenant database or exam-conductor unavailable
+
   /api/v1/evalpen/review/evaluations/{evaluation_id}/override:
     post:
       operationId: overrideEvaluationScore
