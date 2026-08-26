@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
@@ -6,41 +5,32 @@ from openpyxl import load_workbook
 import pytest
 
 
-def test_exam_marks_workbook_includes_full_roster_and_hides_stale_scores():
+def test_exam_marks_workbook_is_simple_and_hides_stale_scores():
     from services.exam_marks_export import build_exam_marks_workbook
 
     content = build_exam_marks_workbook(
-        exam_id="EXAM-1",
         exam_title="Vectors and Projectile",
         class_label="Class 10 - Section A",
-        generated_at=datetime(2026, 8, 27, 10, 30, tzinfo=timezone.utc),
         roster_rows=[
             {
                 "student_id": "aaradhya",
                 "student_name": "Aaradhya Tomar",
                 "status": "published",
-                "open_recheck_count": 0,
             },
             {
                 "student_id": "missing-student",
                 "student_name": "Missing Student",
                 "status": "expected",
-                "open_recheck_count": 0,
             },
             {
                 "student_id": "stale-student",
-                "student_name": "=HYPERLINK(\"https://invalid.example\")",
+                "student_name": '=HYPERLINK("https://invalid.example")',
                 "status": "blocked",
-                "open_recheck_count": 1,
             },
         ],
         result_rows=[
             {
                 "student_id": "aaradhya",
-                "pcr_total_score": 17,
-                "pcr_max_score": 25,
-                "dcr_total_score": 0,
-                "dcr_max_score": 0,
                 "combined_total": 17,
                 "combined_max": 25,
                 "publication_status": "published",
@@ -48,43 +38,97 @@ def test_exam_marks_workbook_includes_full_roster_and_hides_stale_scores():
             },
             {
                 "student_id": "stale-student",
-                "pcr_total_score": 14,
-                "pcr_max_score": 25,
-                "dcr_total_score": 0,
-                "dcr_max_score": 0,
                 "combined_total": 14,
                 "combined_max": 25,
                 "publication_status": "pending",
                 "score_state": "unavailable",
             },
         ],
+        question_rows=[
+            {
+                "question_number": 1,
+                "question_text": "Find x.",
+                "max_marks": 5,
+                "assessed_count": 2,
+                "average_score": 3.5,
+                "average_percent": 70,
+            },
+            {
+                "question_number": 2,
+                "question_text": "Draw the vector.",
+                "max_marks": 4,
+                "assessed_count": 0,
+                "average_score": 0,
+                "average_percent": 0,
+            },
+        ],
     )
 
     workbook = load_workbook(BytesIO(content), data_only=False)
-    sheet = workbook["Student marks"]
+    assert workbook.sheetnames == ["Student Marks", "Question Accuracy"]
 
-    assert sheet["A1"].value == "Vectors and Projectile"
-    assert sheet["G2"].value == "Class: Class 10 - Section A"
-    assert sheet["A5"].value == "S.No."
-    assert sheet["M5"].value == "Open rechecks"
-    assert sheet.freeze_panes == "A6"
-    assert sheet.auto_filter.ref == "A5:M8"
+    marks = workbook["Student Marks"]
+    assert marks["A1"].value == "Vectors and Projectile"
+    assert marks["A2"].value == "Student Marks | Class 10 - Section A"
+    assert [cell.value for cell in marks[3]] == [
+        "S.No.",
+        "Student name",
+        "Student ID",
+        "Marks scored",
+        "Total marks",
+        "Percentage",
+        "Status",
+    ]
+    assert marks.freeze_panes == "A4"
+    assert marks.auto_filter.ref == "A3:G6"
 
-    assert sheet["B6"].value == "Aaradhya Tomar"
-    assert sheet["E6"].value == 17
-    assert sheet["F6"].value == 25
-    assert sheet["G6"].value == 17 / 25
-    assert sheet["L6"].value == "Published"
+    assert marks["B4"].value == "Aaradhya Tomar"
+    assert marks["D4"].value == 17
+    assert marks["E4"].value == 25
+    assert marks["F4"].value == 17 / 25
+    assert marks["G4"].value == "Published"
 
-    assert sheet["D7"].value == "Not submitted"
-    assert sheet["E7"].value is None
-    assert sheet["L7"].value == "Not submitted"
+    assert marks["D5"].value is None
+    assert marks["E5"].value is None
+    assert marks["F5"].value is None
+    assert marks["G5"].value == "Not submitted"
 
-    assert sheet["B8"].value.startswith("'=")
-    assert sheet["E8"].value is None
-    assert sheet["F8"].value is None
-    assert sheet["L8"].value == "Unavailable"
-    assert sheet["M8"].value == 1
+    assert marks["B6"].value.startswith("'=")
+    assert marks["D6"].value is None
+    assert marks["E6"].value is None
+    assert marks["F6"].value is None
+    assert marks["G6"].value == "Needs attention"
+
+    accuracy = workbook["Question Accuracy"]
+    assert [cell.value for cell in accuracy[4]] == [
+        "Question No.",
+        "Question",
+        "Maximum marks",
+        "Students assessed",
+        "Average marks",
+        "Class accuracy",
+    ]
+    assert accuracy.freeze_panes == "A5"
+    assert accuracy.auto_filter.ref == "A4:F6"
+    assert accuracy["A5"].value == 1
+    assert accuracy["B5"].value == "Find x."
+    assert accuracy["C5"].value == 5
+    assert accuracy["D5"].value == 2
+    assert accuracy["E5"].value == 3.5
+    assert accuracy["F5"].value == 0.7
+    assert accuracy["E6"].value is None
+    assert accuracy["F6"].value is None
+
+    visible_text = " ".join(
+        str(cell.value or "")
+        for sheet in workbook.worksheets
+        for row in sheet.iter_rows()
+        for cell in row
+    ).lower()
+    assert "pcr" not in visible_text
+    assert "dcr" not in visible_text
+    assert "recheck" not in visible_text
+    assert "exam id" not in visible_text
 
 
 def test_exam_marks_filename_is_safe_and_readable():
@@ -97,7 +141,7 @@ def test_exam_marks_filename_is_safe_and_readable():
 
 
 @pytest.mark.asyncio
-async def test_export_endpoint_returns_a_real_workbook_for_the_authorized_roster():
+async def test_export_endpoint_returns_marks_and_persisted_question_accuracy():
     from mongomock_motor import AsyncMongoMockClient
 
     from api.v1.evalpen_review_async import (
@@ -144,6 +188,28 @@ async def test_export_endpoint_returns_a_real_workbook_for_the_authorized_roster
         ],
         total_students=1,
     )
+    analytics = {
+        "questions": [
+            {
+                "question_id": "question-1",
+                "question_number": 1,
+                "question_text": "Find x.",
+                "max_marks": 5,
+                "assessed_count": 0,
+                "average_score": 0,
+                "average_percent": 0,
+            }
+        ]
+    }
+    await tenant_db["exampen_dcr_results"].insert_one(
+        {
+            "exam_id": "EXAM-EXPORT",
+            "student_id": "student-1",
+            "question_id": "question-1",
+            "score": 4,
+            "max_score": 5,
+        }
+    )
 
     with (
         patch(
@@ -153,6 +219,10 @@ async def test_export_endpoint_returns_a_real_workbook_for_the_authorized_roster
         patch(
             "api.v1.evalpen_review_async.get_exam_results",
             new=AsyncMock(return_value=results),
+        ),
+        patch(
+            "api.v1.evalpen_review_async.get_exam_analytics",
+            new=AsyncMock(return_value=analytics),
         ),
         patch(
             "api.v1.evalpen_review_async._get_tenant_db",
@@ -171,7 +241,8 @@ async def test_export_endpoint_returns_a_real_workbook_for_the_authorized_roster
 
     content = b"".join([chunk async for chunk in response.body_iterator])
     workbook = load_workbook(BytesIO(content))
-    sheet = workbook["Student marks"]
+    marks = workbook["Student Marks"]
+    accuracy = workbook["Question Accuracy"]
 
     assert response.media_type == (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -180,6 +251,8 @@ async def test_export_endpoint_returns_a_real_workbook_for_the_authorized_roster
         response.headers["content-disposition"]
         == 'attachment; filename="vectors-and-projectile-student-marks.xlsx"'
     )
-    assert sheet["B6"].value == "Student One"
-    assert sheet["E6"].value == 22
-    assert sheet["F6"].value == 25
+    assert marks["B4"].value == "Student One"
+    assert marks["D4"].value == 22
+    assert marks["E4"].value == 25
+    assert accuracy["B5"].value == "Find x."
+    assert accuracy["F5"].value == 0.8

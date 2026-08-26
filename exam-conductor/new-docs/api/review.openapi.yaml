@@ -79,18 +79,18 @@ paths:
   /api/v1/evalpen/review/exams/{exam_id}/results/export:
     get:
       operationId: exportExamResults
-      summary: Download all student marks as an Excel workbook
+      summary: Download student marks and question accuracy as an Excel workbook
       description: |
-        Exports the full authorized exam roster, including students who have
-        not submitted, together with current PCR/DCR totals, publication state,
-        processing state, and open recheck count. Processing or unavailable
-        scores are left blank rather than exported as zero.
+        Downloads a simple school-facing workbook with one sheet for student
+        marks and one sheet for question-wise class accuracy. Internal grading
+        modes and review data are not included. Processing or unavailable scores
+        are left blank rather than exported as zero.
       tags: [Review]
       parameters:
         - $ref: "#/components/parameters/ExamIdPath"
       responses:
         "200":
-          description: Excel workbook containing the full roster and current marks
+          description: Workbook containing student marks and question accuracy
           headers:
             Content-Disposition:
               schema:

@@ -86,6 +86,7 @@ def _has_full_exam_access(
 # Auth dependencies
 # ---------------------------------------------------------------------------
 
+
 def require_admin_or_tutor(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -102,6 +103,7 @@ def require_admin_or_tutor(
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
+
 
 class ScoreOverrideRequest(BaseModel):
     """Request body for overriding an evaluation score.
@@ -497,6 +499,7 @@ class ExamResultsAPI(BaseModel):
 # Helper: resolve tenant DB
 # ---------------------------------------------------------------------------
 
+
 async def _get_tenant_db(
     db: DatabaseManager,
     current_user: Dict[str, Any],
@@ -520,6 +523,7 @@ async def _get_tenant_db(
 # ---------------------------------------------------------------------------
 # Helper: safe datetime to ISO string
 # ---------------------------------------------------------------------------
+
 
 def _dt_to_iso(val: Any) -> Optional[str]:
     """Convert a datetime or string to ISO format string."""
@@ -552,8 +556,7 @@ def _catalog_grading_mode(question: Dict[str, Any]) -> str:
     grading_mode = str(question.get("grading_mode") or "").strip().lower()
     question_type = str(question.get("question_type") or "").strip().lower()
     if (
-        grading_mode in {"objective", "mcq"}
-        or question_type in {"objective", "mcq"}
+        grading_mode in {"objective", "mcq"} or question_type in {"objective", "mcq"}
     ) and not is_integer_question(question):
         return "objective"
     return "subjective"
@@ -592,23 +595,27 @@ async def _get_pcr_question_catalog(
     """
     if not exam_id:
         return []
-    cursor = tenant_db["evalpen_questions"].find(
-        {"exam_id": exam_id},
-        projection={
-            "question_id": 1,
-            "question_number": 1,
-            "question_text": 1,
-            "max_marks": 1,
-            "reference_solution": 1,
-            "source_page_number": 1,
-            "source_region_id": 1,
-            "source_bbox_percent": 1,
-            "grading_mode": 1,
-            "question_type": 1,
-            "options": 1,
-            "enhanced_options": 1,
-        },
-    ).sort([("question_number", 1), ("question_id", 1)])
+    cursor = (
+        tenant_db["evalpen_questions"]
+        .find(
+            {"exam_id": exam_id},
+            projection={
+                "question_id": 1,
+                "question_number": 1,
+                "question_text": 1,
+                "max_marks": 1,
+                "reference_solution": 1,
+                "source_page_number": 1,
+                "source_region_id": 1,
+                "source_bbox_percent": 1,
+                "grading_mode": 1,
+                "question_type": 1,
+                "options": 1,
+                "enhanced_options": 1,
+            },
+        )
+        .sort([("question_number", 1), ("question_id", 1)])
+    )
     docs = await cursor.to_list(length=1000)
     catalog: List[Dict[str, Any]] = []
     for doc in docs:
@@ -642,6 +649,7 @@ async def _get_pcr_question_catalog(
 # ---------------------------------------------------------------------------
 # Helper: tutor visibility scoping
 # ---------------------------------------------------------------------------
+
 
 async def _get_tutor_scoped_student_ids(
     current_user: Dict[str, Any],
@@ -689,11 +697,7 @@ async def _get_tutor_scoped_student_ids(
         db=db,
     )
 
-    return [
-        s.get("student_id")
-        for s in scoped_students
-        if s.get("student_id")
-    ]
+    return [s.get("student_id") for s in scoped_students if s.get("student_id")]
 
 
 def _check_student_in_scope(
@@ -819,6 +823,7 @@ async def _amend_published_submission_snapshot(
 # Endpoints
 # ---------------------------------------------------------------------------
 
+
 @router.get(
     "/submissions/{submission_id}/summary",
     response_model=SubmissionSummaryReviewAPI,
@@ -866,9 +871,7 @@ async def get_submission_summary(
             if hasattr(submission, "__dict__")
             else {}
         )
-        _check_student_in_scope(
-            _sub_dict_for_scope.get("student_id", ""), scoped_ids
-        )
+        _check_student_in_scope(_sub_dict_for_scope.get("student_id", ""), scoped_ids)
 
         sub_dict = _sub_dict_for_scope
         segmentation_status = str(sub_dict.get("segmentation_status") or "pending")
@@ -908,8 +911,8 @@ async def get_submission_summary(
             )
         except (TypeError, ValueError):
             processing_attempts = 0
-        retry_scheduled = (
-            processing_status == "retryable_error" and bool(processing_retry_at)
+        retry_scheduled = processing_status == "retryable_error" and bool(
+            processing_retry_at
         )
         terminal_reprocess_statuses = {
             "completed",
@@ -937,12 +940,16 @@ async def get_submission_summary(
             # worker supports the exam's frozen contract; the reprocess
             # endpoint will atomically rewrite the stale job metadata.
             current_contract = (current_exam or {}).get("pcr_grading_contract")
-            migration_status = str(
-                ((current_exam or {}).get("pcr_grading_contract_migration") or {}).get(
-                    "status"
+            migration_status = (
+                str(
+                    (
+                        (current_exam or {}).get("pcr_grading_contract_migration") or {}
+                    ).get("status")
+                    or ""
                 )
-                or ""
-            ).strip().lower()
+                .strip()
+                .lower()
+            )
             contract_migration_required = bool(
                 migration_status in {"applying", "failed"}
                 or not (
@@ -971,7 +978,9 @@ async def get_submission_summary(
             reprocess_block_reason = "No canonical processing job is available yet"
         elif processing_status not in terminal_reprocess_statuses:
             reprocess_block_reason = "The current processing job is still active"
-        processing_active = processing_status in {"queued", "processing"} or retry_scheduled
+        processing_active = (
+            processing_status in {"queued", "processing"} or retry_scheduled
+        )
         processing_failed = (
             (segmentation_status == "failed" and not processing_active)
             or processing_status in {"failed", "enqueue_failed"}
@@ -981,15 +990,11 @@ async def get_submission_summary(
             tenant_db,
             str(sub_dict.get("exam_id") or ""),
         )
-        catalog_by_id = {
-            item["question_id"]: item for item in question_catalog
-        }
+        catalog_by_id = {item["question_id"]: item for item in question_catalog}
 
         # Fetch all detected responses
         resp_repo = DetectedResponseRepository(tenant_db)
-        response_docs = await resp_repo.get_responses_by_submission(
-            submission_id
-        )
+        response_docs = await resp_repo.get_responses_by_submission(submission_id)
 
         # Fetch all evaluations in one query. The previous per-response lookup
         # made a 100-question review perform 100 sequential database calls.
@@ -1033,8 +1038,7 @@ async def get_submission_summary(
             # Check for blocking flags
             flags = resp_doc.get("flags", [])
             has_blocking = any(
-                f.get("severity") == "blocking"
-                and not is_flag_resolved(f)
+                f.get("severity") == "blocking" and not is_flag_resolved(f)
                 for f in flags
             )
 
@@ -1088,8 +1092,7 @@ async def get_submission_summary(
                     else None
                 )
                 manual_review_required = bool(
-                    evaluation.get("manual_review_required")
-                    or manual_review_required
+                    evaluation.get("manual_review_required") or manual_review_required
                 )
                 raw_step_marks = evaluation.get("step_marks")
                 if isinstance(raw_step_marks, list):
@@ -1168,52 +1171,52 @@ async def get_submission_summary(
             ]
 
             response_summary = ResponseSummaryAPI(
-                    response_id=response_id,
-                    evaluation_id=evaluation.get("evaluation_id") if evaluation else None,
-                    question_id=question_id or None,
-                    question_number=(
-                        resp_doc.get("question_number")
-                        if resp_doc.get("question_number") is not None
-                        else catalog_question.get("question_number")
-                        if catalog_question is not None
-                        else None
-                    ),
-                    content_type=resp_doc.get("content_type", "TEXT_ONLY"),
-                    eval_status=eval_status,
-                    detected_text=resp_doc.get("detected_text"),
-                    total_score=resp_score,
-                    max_score=resp_max,
-                    overall_feedback=feedback,
-                    reference_solution=reference_solution,
-                    step_marks=step_marks,
-                    criterion_marks=criterion_marks,
-                    marking_policy=marking_policy,
-                    method_policy=method_policy,
-                    method_analysis=method_analysis,
-                    eval_path=(evaluation.get("eval_path") if evaluation else None),
-                    manual_review_required=manual_review_required,
-                    flags=api_flags if api_flags else None,
-                    has_blocking_flags=has_blocking,
-                    is_missing_response=bool(resp_doc.get("is_missing_response")),
-                    answer_state=resp_doc.get("answer_state"),
-                    source_pages=[
-                        item
-                        for item in (resp_doc.get("source_pages") or [])
-                        if isinstance(item, dict)
-                    ],
-                    question_assignment=(
-                        resp_doc.get("question_assignment")
-                        if isinstance(resp_doc.get("question_assignment"), dict)
-                        else None
-                    ),
-                    manual_review_reason=resp_doc.get("manual_review_reason"),
-                    grading_mode=(
-                        str(resp_doc.get("grading_mode") or "").strip()
-                        or str((evaluation or {}).get("grading_mode") or "").strip()
-                        or str((catalog_question or {}).get("grading_mode") or "").strip()
-                        or None
-                    ),
-                )
+                response_id=response_id,
+                evaluation_id=evaluation.get("evaluation_id") if evaluation else None,
+                question_id=question_id or None,
+                question_number=(
+                    resp_doc.get("question_number")
+                    if resp_doc.get("question_number") is not None
+                    else catalog_question.get("question_number")
+                    if catalog_question is not None
+                    else None
+                ),
+                content_type=resp_doc.get("content_type", "TEXT_ONLY"),
+                eval_status=eval_status,
+                detected_text=resp_doc.get("detected_text"),
+                total_score=resp_score,
+                max_score=resp_max,
+                overall_feedback=feedback,
+                reference_solution=reference_solution,
+                step_marks=step_marks,
+                criterion_marks=criterion_marks,
+                marking_policy=marking_policy,
+                method_policy=method_policy,
+                method_analysis=method_analysis,
+                eval_path=(evaluation.get("eval_path") if evaluation else None),
+                manual_review_required=manual_review_required,
+                flags=api_flags if api_flags else None,
+                has_blocking_flags=has_blocking,
+                is_missing_response=bool(resp_doc.get("is_missing_response")),
+                answer_state=resp_doc.get("answer_state"),
+                source_pages=[
+                    item
+                    for item in (resp_doc.get("source_pages") or [])
+                    if isinstance(item, dict)
+                ],
+                question_assignment=(
+                    resp_doc.get("question_assignment")
+                    if isinstance(resp_doc.get("question_assignment"), dict)
+                    else None
+                ),
+                manual_review_reason=resp_doc.get("manual_review_reason"),
+                grading_mode=(
+                    str(resp_doc.get("grading_mode") or "").strip()
+                    or str((evaluation or {}).get("grading_mode") or "").strip()
+                    or str((catalog_question or {}).get("grading_mode") or "").strip()
+                    or None
+                ),
+            )
             if is_unassigned:
                 unassigned_summaries.append(response_summary)
             else:
@@ -1262,7 +1265,9 @@ async def get_submission_summary(
             blocked_count = 0
             pending_count = 0
             review_count = 0
-        elif processing_active or segmentation_status != "complete" or pending_count > 0:
+        elif (
+            processing_active or segmentation_status != "complete" or pending_count > 0
+        ):
             score_state = "processing"
         else:
             score_state = "available"
@@ -1660,12 +1665,14 @@ async def confirm_document_coverage_review(
             detail="The review changed while it was being confirmed. Refresh and retry.",
         )
 
-    review_state, readiness, publication_status = (
-        await _refresh_unpublished_review_state(
-            tenant_db,
-            submission_id,
-            now=now,
-        )
+    (
+        review_state,
+        readiness,
+        publication_status,
+    ) = await _refresh_unpublished_review_state(
+        tenant_db,
+        submission_id,
+        now=now,
     )
 
     return {
@@ -1711,23 +1718,30 @@ async def get_submission_pages(
         )
     _check_student_in_scope(str(submission.get("student_id") or ""), scoped_ids)
 
-    page_docs = await tenant_db["evalpen_answer_pages"].find(
-        {"submission_id": submission_id}
-    ).sort("page_number", 1).to_list(length=100)
-    active_responses = await tenant_db["evalpen_detected_responses"].find(
-        {
-            "submission_id": submission_id,
-            "superseded_at": {"$exists": False},
-            "eval_status": {"$ne": "superseded"},
-        },
-        {
-            "response_id": 1,
-            "question_id": 1,
-            "question_number": 1,
-            "source_pages": 1,
-            "answer_state": 1,
-        },
-    ).to_list(length=5000)
+    page_docs = (
+        await tenant_db["evalpen_answer_pages"]
+        .find({"submission_id": submission_id})
+        .sort("page_number", 1)
+        .to_list(length=100)
+    )
+    active_responses = (
+        await tenant_db["evalpen_detected_responses"]
+        .find(
+            {
+                "submission_id": submission_id,
+                "superseded_at": {"$exists": False},
+                "eval_status": {"$ne": "superseded"},
+            },
+            {
+                "response_id": 1,
+                "question_id": 1,
+                "question_number": 1,
+                "source_pages": 1,
+                "answer_state": 1,
+            },
+        )
+        .to_list(length=5000)
+    )
     regions_by_page: Dict[int, List[Dict[str, Any]]] = {}
     for response in active_responses:
         for source_region in response.get("source_pages") or []:
@@ -1870,31 +1884,39 @@ async def get_exam_roster(
         except Exception:
             logger.debug("Student name lookup failed for exam %s roster", exam_id)
 
-    submissions = await tenant_db["evalpen_submissions"].find(
-        {"exam_id": exam_id},
-        projection={
-            "submission_id": 1,
-            "student_id": 1,
-            "source": 1,
-            "publication_status": 1,
-            "segmentation_status": 1,
-            "review_state": 1,
-            "updated_at": 1,
-            "created_at": 1,
-        },
-    ).to_list(length=5000)
-    failed_copy_attempts = await tenant_db["exampen_student_copy_uploads"].find(
-        {
-            "exam_id": exam_id,
-            "status": "ingest_failed",
-            "$or": [
-                {"submission_id": {"$exists": False}},
-                {"submission_id": None},
-                {"submission_id": ""},
-            ],
-        },
-        projection={"student_id": 1, "updated_at": 1, "created_at": 1},
-    ).to_list(length=5000)
+    submissions = (
+        await tenant_db["evalpen_submissions"]
+        .find(
+            {"exam_id": exam_id},
+            projection={
+                "submission_id": 1,
+                "student_id": 1,
+                "source": 1,
+                "publication_status": 1,
+                "segmentation_status": 1,
+                "review_state": 1,
+                "updated_at": 1,
+                "created_at": 1,
+            },
+        )
+        .to_list(length=5000)
+    )
+    failed_copy_attempts = (
+        await tenant_db["exampen_student_copy_uploads"]
+        .find(
+            {
+                "exam_id": exam_id,
+                "status": "ingest_failed",
+                "$or": [
+                    {"submission_id": {"$exists": False}},
+                    {"submission_id": None},
+                    {"submission_id": ""},
+                ],
+            },
+            projection={"student_id": 1, "updated_at": 1, "created_at": 1},
+        )
+        .to_list(length=5000)
+    )
     ingest_failed_by_student = {
         str(item.get("student_id") or "").strip(): item
         for item in failed_copy_attempts
@@ -1903,20 +1925,22 @@ async def get_exam_roster(
     if scoped_ids is not None and not has_full_exam_access:
         allowed = {str(item) for item in scoped_ids}
         submissions = [
-            doc
-            for doc in submissions
-            if str(doc.get("student_id") or "") in allowed
+            doc for doc in submissions if str(doc.get("student_id") or "") in allowed
         ]
 
-    jobs = await tenant_db["exampen_processing_jobs"].find(
-        {"exam_id": exam_id},
-        projection={
-            "submission_id": 1,
-            "student_id": 1,
-            "status": 1,
-            "updated_at": 1,
-        },
-    ).to_list(length=5000)
+    jobs = (
+        await tenant_db["exampen_processing_jobs"]
+        .find(
+            {"exam_id": exam_id},
+            projection={
+                "submission_id": 1,
+                "student_id": 1,
+                "status": 1,
+                "updated_at": 1,
+            },
+        )
+        .to_list(length=5000)
+    )
     job_by_submission = {
         str(job.get("submission_id") or ""): job
         for job in jobs
@@ -1929,12 +1953,16 @@ async def get_exam_roster(
     }
     if scoped_ids is not None and not has_full_exam_access:
         recheck_match["student_id"] = {"$in": list(scoped_ids)}
-    recheck_rows = await tenant_db["evalpen_recheck_requests"].aggregate(
-        [
-            {"$match": recheck_match},
-            {"$group": {"_id": "$student_id", "count": {"$sum": 1}}},
-        ]
-    ).to_list(length=5000)
+    recheck_rows = (
+        await tenant_db["evalpen_recheck_requests"]
+        .aggregate(
+            [
+                {"$match": recheck_match},
+                {"$group": {"_id": "$student_id", "count": {"$sum": 1}}},
+            ]
+        )
+        .to_list(length=5000)
+    )
     open_rechecks_by_student = {
         str(row.get("_id") or ""): int(row.get("count") or 0)
         for row in recheck_rows
@@ -2010,7 +2038,9 @@ async def get_exam_roster(
                 elif any(s.startswith("evaluated") for s in statuses):
                     ready_submissions.add(sid)
         except Exception:
-            logger.debug("Roster response status aggregation failed for exam %s", exam_id)
+            logger.debug(
+                "Roster response status aggregation failed for exam %s", exam_id
+            )
 
     items: List[CollectionRosterItemAPI] = []
     total_submitted = 0
@@ -2022,7 +2052,9 @@ async def get_exam_roster(
     for student_id in all_student_ids:
         submission = sub_by_student.get(student_id)
         submission_id = (
-            str(submission.get("submission_id")) if submission and submission.get("submission_id") else None
+            str(submission.get("submission_id"))
+            if submission and submission.get("submission_id")
+            else None
         )
         job = job_by_submission.get(submission_id or "")
         publication = str((submission or {}).get("publication_status") or "").lower()
@@ -2069,11 +2101,16 @@ async def get_exam_roster(
             total_published += 1
             total_submitted += 1
             total_ready += 1
-        elif submission_id in blocked_submissions or review_state == "blocked" or job_status in {
-            "failed",
-            "retryable_error",
-            "enqueue_failed",
-        }:
+        elif (
+            submission_id in blocked_submissions
+            or review_state == "blocked"
+            or job_status
+            in {
+                "failed",
+                "retryable_error",
+                "enqueue_failed",
+            }
+        ):
             status_value = "blocked"
             total_blocked += 1
             total_submitted += 1
@@ -2081,9 +2118,13 @@ async def get_exam_roster(
             status_value = "ready"
             total_ready += 1
             total_submitted += 1
-        elif review_state == "needs_review" or submission_id in review_submissions or (
-            job_status == "blocked_for_review"
-            and submission_id not in blocked_submissions
+        elif (
+            review_state == "needs_review"
+            or submission_id in review_submissions
+            or (
+                job_status == "blocked_for_review"
+                and submission_id not in blocked_submissions
+            )
         ):
             status_value = "review"
             total_needs_review += 1
@@ -2166,10 +2207,14 @@ async def get_exam_analytics(
             detail=f"No finalized PCR questions found for exam {exam_id}",
         )
 
-    taxonomy_docs = await tenant_db["evalpen_question_taxonomy"].find(
-        {"exam_id": exam_id},
-        {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1},
-    ).to_list(length=max(len(question_catalog), 100))
+    taxonomy_docs = (
+        await tenant_db["evalpen_question_taxonomy"]
+        .find(
+            {"exam_id": exam_id},
+            {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1},
+        )
+        .to_list(length=max(len(question_catalog), 100))
+    )
     taxonomy_by_question = {
         str(item.get("question_id") or ""): item
         for item in taxonomy_docs
@@ -2183,15 +2228,14 @@ async def get_exam_analytics(
             continue
         taxonomy = taxonomy_by_question.get(question_id, {})
         topic = str(
-            taxonomy.get("topic")
-            or raw_question.get("topic")
-            or "Uncategorized"
+            taxonomy.get("topic") or raw_question.get("topic") or "Uncategorized"
         ).strip()
-        sub_topic = str(
-            taxonomy.get("sub_topic")
-            or raw_question.get("sub_topic")
-            or ""
-        ).strip() or None
+        sub_topic = (
+            str(
+                taxonomy.get("sub_topic") or raw_question.get("sub_topic") or ""
+            ).strip()
+            or None
+        )
         questions[question_id] = {
             "question_id": question_id,
             "question_number": raw_question.get("question_number") or index + 1,
@@ -2212,15 +2256,19 @@ async def get_exam_analytics(
     submission_query: Dict[str, Any] = {"exam_id": exam_id}
     if scoped_ids is not None:
         submission_query["student_id"] = {"$in": scoped_ids}
-    submissions = await tenant_db["evalpen_submissions"].find(
-        submission_query,
-        {
-            "_id": 0,
-            "submission_id": 1,
-            "student_id": 1,
-            "publication_status": 1,
-        },
-    ).to_list(length=5000)
+    submissions = (
+        await tenant_db["evalpen_submissions"]
+        .find(
+            submission_query,
+            {
+                "_id": 0,
+                "submission_id": 1,
+                "student_id": 1,
+                "publication_status": 1,
+            },
+        )
+        .to_list(length=5000)
+    )
     submission_ids = [
         str(item.get("submission_id") or "")
         for item in submissions
@@ -2386,7 +2434,9 @@ async def get_exam_analytics(
         topic_row["question_count"] += 1
         topic_row["assessed_answers"] += question["assessed_count"]
         topic_row["review_count"] += question["review_count"]
-        topic_row["total_score"] += question["average_score"] * question["assessed_count"]
+        topic_row["total_score"] += (
+            question["average_score"] * question["assessed_count"]
+        )
         topic_row["total_max"] += question["max_marks"] * question["assessed_count"]
         if question.get("sub_topic"):
             topic_row["sub_topics"].add(question["sub_topic"])
@@ -2421,7 +2471,9 @@ async def get_exam_analytics(
             )
         topic_performance.sort(key=lambda item: (-item["percent"], item["topic"]))
         strengths = [item for item in topic_performance if item["percent"] >= 70][:2]
-        focus = sorted(topic_performance, key=lambda item: (item["percent"], item["topic"]))[:2]
+        focus = sorted(
+            topic_performance, key=lambda item: (item["percent"], item["topic"])
+        )[:2]
         total_max = float(student["total_max"])
         percent = (
             round((float(student["total_score"]) / total_max) * 100, 1)
@@ -2432,7 +2484,9 @@ async def get_exam_analytics(
             feedback = "No evaluated answers are available yet."
         else:
             strength_text = (
-                ", ".join(f"{item['topic']} ({item['percent']:.0f}%)" for item in strengths)
+                ", ".join(
+                    f"{item['topic']} ({item['percent']:.0f}%)" for item in strengths
+                )
                 if strengths
                 else "no topic is consistently secure yet"
             )
@@ -2465,7 +2519,9 @@ async def get_exam_analytics(
         "class_summary": {
             "submitted_students": len(submissions),
             "evaluated_students": len(percentages),
-            "average_percent": round(sum(percentages) / len(percentages), 1) if percentages else 0.0,
+            "average_percent": round(sum(percentages) / len(percentages), 1)
+            if percentages
+            else 0.0,
             "highest_percent": max(percentages) if percentages else 0.0,
             "lowest_percent": min(percentages) if percentages else 0.0,
             "questions": len(question_rows),
@@ -2542,10 +2598,14 @@ async def auto_tag_exam_questions(
             detail=f"No finalized PCR questions found for exam {exam_id}",
         )
 
-    existing_docs = await tenant_db["evalpen_question_taxonomy"].find(
-        {"exam_id": exam_id},
-        {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1, "source": 1},
-    ).to_list(length=max(len(catalog), 100))
+    existing_docs = (
+        await tenant_db["evalpen_question_taxonomy"]
+        .find(
+            {"exam_id": exam_id},
+            {"_id": 0, "question_id": 1, "topic": 1, "sub_topic": 1, "source": 1},
+        )
+        .to_list(length=max(len(catalog), 100))
+    )
     existing_by_question = {
         str(item.get("question_id") or ""): item
         for item in existing_docs
@@ -2556,7 +2616,9 @@ async def auto_tag_exam_questions(
         for question in catalog
         if body.replace_existing
         or not str(
-            (existing_by_question.get(str(question.get("question_id") or "")) or {}).get("topic")
+            (
+                existing_by_question.get(str(question.get("question_id") or "")) or {}
+            ).get("topic")
             or ""
         ).strip()
     ]
@@ -2568,19 +2630,22 @@ async def auto_tag_exam_questions(
             "message": "Every question already has a persisted topic",
         }
 
-    exam = await tenant_db["exampen_exams"].find_one(
-        {"exam_id": exam_id},
-        {
-            "_id": 0,
-            "title": 1,
-            "exam_title": 1,
-            "subject": 1,
-            "exam_subject": 1,
-            "standard": 1,
-            "class_name": 1,
-            "grade": 1,
-        },
-    ) or {}
+    exam = (
+        await tenant_db["exampen_exams"].find_one(
+            {"exam_id": exam_id},
+            {
+                "_id": 0,
+                "title": 1,
+                "exam_title": 1,
+                "subject": 1,
+                "exam_subject": 1,
+                "standard": 1,
+                "class_name": 1,
+                "grade": 1,
+            },
+        )
+        or {}
+    )
     classifier_questions = [
         {
             "id": str(question.get("question_id") or ""),
@@ -2694,7 +2759,9 @@ async def auto_tag_exam_questions(
         {
             "audit_id": f"QTA-{uuid.uuid4().hex[:20]}",
             "exam_id": exam_id,
-            "action": "replace_ai_taxonomy" if body.replace_existing else "tag_missing_questions",
+            "action": "replace_ai_taxonomy"
+            if body.replace_existing
+            else "tag_missing_questions",
             "question_ids": [item["question_id"] for item in tagged],
             "tagged_count": len(tagged),
             "preserved_count": len(catalog) - len(candidates),
@@ -2796,16 +2863,20 @@ async def get_exam_results(
                 if str(item.get("submission_id") or "")
             ]
             if result_submission_ids:
-                jobs_cursor = tenant_db["exampen_processing_jobs"].find(
-                    {"submission_id": {"$in": result_submission_ids}},
-                    {
-                        "submission_id": 1,
-                        "status": 1,
-                        "next_retry_at": 1,
-                        "created_at": 1,
-                        "updated_at": 1,
-                    },
-                ).sort([("created_at", -1), ("updated_at", -1)])
+                jobs_cursor = (
+                    tenant_db["exampen_processing_jobs"]
+                    .find(
+                        {"submission_id": {"$in": result_submission_ids}},
+                        {
+                            "submission_id": 1,
+                            "status": 1,
+                            "next_retry_at": 1,
+                            "created_at": 1,
+                            "updated_at": 1,
+                        },
+                    )
+                    .sort([("created_at", -1), ("updated_at", -1)])
+                )
                 for job in await jobs_cursor.to_list(length=5000):
                     owner_submission_id = str(job.get("submission_id") or "")
                     if (
@@ -2984,9 +3055,7 @@ async def get_exam_results(
                         "max_score": 0.0,
                     }
                 dcr_by_student[sid]["total_score"] += doc.get("score", 0.0)
-                dcr_by_student[sid]["max_score"] += doc.get(
-                    "max_score", 0.0
-                )
+                dcr_by_student[sid]["max_score"] += doc.get("max_score", 0.0)
 
             for sid, dcr_scores in dcr_by_student.items():
                 entry = student_results.get(sid)
@@ -2998,9 +3067,7 @@ async def get_exam_results(
 
         # Compute combined totals
         for entry in student_results.values():
-            entry.combined_total = (
-                entry.pcr_total_score + entry.dcr_total_score
-            )
+            entry.combined_total = entry.pcr_total_score + entry.dcr_total_score
             entry.combined_max = entry.pcr_max_score + entry.dcr_max_score
 
         students_list = sorted(
@@ -3037,10 +3104,13 @@ async def get_exam_results(
 
 @router.get(
     "/exams/{exam_id}/results/export",
-    summary="Download all student marks as an Excel workbook",
+    summary="Download student marks and question accuracy as an Excel workbook",
     responses={
         200: {
-            "description": "Excel workbook containing the full exam roster and current marks",
+            "description": (
+                "Excel workbook containing simple student marks and "
+                "question-wise class accuracy"
+            ),
             "content": {
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
             },
@@ -3055,7 +3125,7 @@ async def export_exam_results(
     current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
     db: DatabaseManager = Depends(get_database),
 ) -> StreamingResponse:
-    """Export every expected student, including missing and unfinished copies."""
+    """Export school-facing marks and persisted question-wise accuracy."""
 
     roster = await get_exam_roster(
         exam_id=exam_id,
@@ -3098,18 +3168,115 @@ async def export_exam_results(
         else None
     )
 
+    try:
+        analytics = await get_exam_analytics(
+            exam_id=exam_id,
+            current_user=current_user,
+            db=db,
+        )
+        question_rows = [dict(row) for row in analytics.get("questions") or []]
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+        question_rows = []
+
+    # Objective and subjective questions share one school-facing accuracy table.
+    # If a question has an objective result, that persisted result is the score
+    # authority for the question and replaces any empty evaluation placeholder.
+    export_student_ids = [
+        str(row.student_id)
+        for row in roster.expected_students
+        if str(row.student_id).strip()
+    ]
+    objective_rows = (
+        await tenant_db["exampen_dcr_results"]
+        .find(
+            {
+                "exam_id": exam_id,
+                "student_id": {"$in": export_student_ids},
+            },
+            {
+                "_id": 0,
+                "student_id": 1,
+                "question_id": 1,
+                "question_number": 1,
+                "question_text": 1,
+                "score": 1,
+                "max_score": 1,
+                "updated_at": 1,
+                "created_at": 1,
+            },
+        )
+        .sort([("updated_at", -1), ("created_at", -1)])
+        .to_list(length=max(len(export_student_ids) * 1000, 5000))
+        if export_student_ids
+        else []
+    )
+    objective_by_question: Dict[str, Dict[str, Any]] = {}
+    seen_objective_scores: set[tuple[str, str]] = set()
+    for result in objective_rows:
+        student_id = str(result.get("student_id") or "")
+        question_id = str(result.get("question_id") or "")
+        score_key = (student_id, question_id)
+        maximum = _safe_marks(result.get("max_score"))
+        if (
+            not student_id
+            or not question_id
+            or maximum <= 0
+            or score_key in seen_objective_scores
+        ):
+            continue
+        seen_objective_scores.add(score_key)
+        score = min(_safe_score(result.get("score")), maximum)
+        summary = objective_by_question.setdefault(
+            question_id,
+            {
+                "assessed_count": 0,
+                "total_score": 0.0,
+                "total_max": 0.0,
+                "question_number": result.get("question_number"),
+                "question_text": result.get("question_text"),
+            },
+        )
+        summary["assessed_count"] += 1
+        summary["total_score"] += score
+        summary["total_max"] += maximum
+
+    question_by_id = {
+        str(row.get("question_id") or ""): row
+        for row in question_rows
+        if str(row.get("question_id") or "")
+    }
+    for question_id, summary in objective_by_question.items():
+        assessed_count = int(summary["assessed_count"])
+        total_score = float(summary["total_score"])
+        total_max = float(summary["total_max"])
+        row = question_by_id.get(question_id)
+        if row is None:
+            number = summary.get("question_number") or len(question_rows) + 1
+            row = {
+                "question_id": question_id,
+                "question_number": number,
+                "question_text": summary.get("question_text") or f"Question {number}",
+                "max_marks": round(total_max / assessed_count, 2),
+            }
+            question_rows.append(row)
+            question_by_id[question_id] = row
+        row["assessed_count"] = assessed_count
+        row["average_score"] = round(total_score / assessed_count, 2)
+        row["average_percent"] = round(total_score / total_max * 100, 1)
+
     from services.exam_marks_export import (
         build_exam_marks_workbook,
         exam_marks_filename,
     )
 
     workbook = build_exam_marks_workbook(
-        exam_id=exam_id,
         exam_title=exam_title,
         class_label=class_label,
         roster_rows=[row.model_dump() for row in roster.expected_students],
         result_rows=[row.model_dump() for row in results.students],
-        generated_at=datetime.now(timezone.utc),
+        question_rows=question_rows,
     )
     filename = exam_marks_filename(exam_title)
     return StreamingResponse(
@@ -3159,9 +3326,7 @@ async def override_evaluation_score(
     try:
         from api.v1._exampen_imports import load_exampen
 
-        EvaluationRepository = load_exampen(
-            "pcr.storage"
-        ).EvaluationRepository
+        EvaluationRepository = load_exampen("pcr.storage").EvaluationRepository
 
         eval_repo = EvaluationRepository(tenant_db)
 
@@ -3217,10 +3382,9 @@ async def override_evaluation_score(
                 {"submission_id": review_submission_id},
             )
             eval_student_id = eval_student_id or (_sub_doc or {}).get("student_id")
-        if (
-            (_sub_doc or {}).get("publication_status") == "published"
-            and not body.amend_published
-        ):
+        if (_sub_doc or {}).get(
+            "publication_status"
+        ) == "published" and not body.amend_published:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -3257,10 +3421,9 @@ async def override_evaluation_score(
             _sub_doc = await tenant_db["evalpen_submissions"].find_one(
                 {"submission_id": review_submission_id}
             )
-            if (
-                (_sub_doc or {}).get("publication_status") == "published"
-                and not body.amend_published
-            ):
+            if (_sub_doc or {}).get(
+                "publication_status"
+            ) == "published" and not body.amend_published:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
@@ -3319,7 +3482,9 @@ async def override_evaluation_score(
             )
             teacher_review_fields["teacher_total_override"] = {
                 "source": "student_recheck",
-                "request_id": str(verified_recheck.get("request_id") or body.recheck_request_id),
+                "request_id": str(
+                    verified_recheck.get("request_id") or body.recheck_request_id
+                ),
                 "previous_score": float(old_score),
                 "rubric_total": rubric_total,
                 "new_score": float(body.new_score),
@@ -3357,10 +3522,9 @@ async def override_evaluation_score(
         )
 
         amendment: Dict[str, Any] = {}
-        if (
-            (_sub_doc or {}).get("publication_status") == "published"
-            and review_lease_token
-        ):
+        if (_sub_doc or {}).get(
+            "publication_status"
+        ) == "published" and review_lease_token:
             try:
                 amendment = await _amend_published_submission_snapshot(
                     tenant_db,
@@ -3392,14 +3556,18 @@ async def override_evaluation_score(
 
         review_state = None
         readiness: Dict[str, Any] = {}
-        publication_status = str((_sub_doc or {}).get("publication_status") or "pending")
+        publication_status = str(
+            (_sub_doc or {}).get("publication_status") or "pending"
+        )
         if publication_status != "published" and review_submission_id:
-            review_state, readiness, publication_status = (
-                await _refresh_unpublished_review_state(
-                    tenant_db,
-                    review_submission_id,
-                    now=teacher_reviewed_at,
-                )
+            (
+                review_state,
+                readiness,
+                publication_status,
+            ) = await _refresh_unpublished_review_state(
+                tenant_db,
+                review_submission_id,
+                now=teacher_reviewed_at,
             )
 
         return {
@@ -3482,7 +3650,9 @@ async def resolve_response_manually(
         {"submission_id": submission_id}
     )
     if submission is None:
-        raise HTTPException(status_code=404, detail="The answer-copy submission no longer exists")
+        raise HTTPException(
+            status_code=404, detail="The answer-copy submission no longer exists"
+        )
     if str(submission.get("publication_status") or "").lower() == "published":
         raise HTTPException(
             status_code=409,
@@ -3504,7 +3674,9 @@ async def resolve_response_manually(
     max_score = float(question.get("max_marks") or 0.0)
     awarded_marks = float(body.awarded_marks)
     if max_score <= 0:
-        raise HTTPException(status_code=409, detail="The finalized question has no valid maximum mark")
+        raise HTTPException(
+            status_code=409, detail="The finalized question has no valid maximum mark"
+        )
     if not math.isfinite(awarded_marks) or awarded_marks > max_score:
         raise HTTPException(
             status_code=400,
@@ -3532,7 +3704,10 @@ async def resolve_response_manually(
         current_submission = await tenant_db["evalpen_submissions"].find_one(
             {"submission_id": submission_id}
         )
-        if str((current_submission or {}).get("publication_status") or "").lower() == "published":
+        if (
+            str((current_submission or {}).get("publication_status") or "").lower()
+            == "published"
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="This result was published while the review was being saved",
@@ -3548,7 +3723,9 @@ async def resolve_response_manually(
             )
 
         now = datetime.now(timezone.utc)
-        evaluation_id = str((existing or {}).get("evaluation_id") or f"eval-{uuid.uuid4().hex}")
+        evaluation_id = str(
+            (existing or {}).get("evaluation_id") or f"eval-{uuid.uuid4().hex}"
+        )
         previous_score = (existing or {}).get("total_score")
         evaluation_fields: Dict[str, Any] = {
             "evaluation_id": evaluation_id,
@@ -3642,7 +3819,11 @@ async def resolve_response_manually(
                 "created_at": now,
             }
         )
-        review_state, readiness, publication_status = await _refresh_unpublished_review_state(
+        (
+            review_state,
+            readiness,
+            publication_status,
+        ) = await _refresh_unpublished_review_state(
             tenant_db,
             submission_id,
             now=now,
@@ -3832,7 +4013,9 @@ async def approve_evaluation_review(
             "submission_id": submission_id,
             "exam_id": response.get("exam_id"),
             "student_id": student_id,
-            "action": "award_full_marks" if body.award_full_marks else "approve_current_score",
+            "action": "award_full_marks"
+            if body.award_full_marks
+            else "approve_current_score",
             "before": {
                 "total_score": previous_score,
                 "manual_review_required": bool(
@@ -3961,11 +4144,12 @@ async def override_criterion_marks(
             submission_doc = await tenant_db["evalpen_submissions"].find_one(
                 {"submission_id": review_submission_id},
             )
-            eval_student_id = eval_student_id or (submission_doc or {}).get("student_id")
-        if (
-            (submission_doc or {}).get("publication_status") == "published"
-            and not body.amend_published
-        ):
+            eval_student_id = eval_student_id or (submission_doc or {}).get(
+                "student_id"
+            )
+        if (submission_doc or {}).get(
+            "publication_status"
+        ) == "published" and not body.amend_published:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -4000,10 +4184,9 @@ async def override_criterion_marks(
             submission_doc = await tenant_db["evalpen_submissions"].find_one(
                 {"submission_id": review_submission_id}
             )
-            if (
-                (submission_doc or {}).get("publication_status") == "published"
-                and not body.amend_published
-            ):
+            if (submission_doc or {}).get(
+                "publication_status"
+            ) == "published" and not body.amend_published:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
@@ -4103,10 +4286,9 @@ async def override_criterion_marks(
         )
 
         amendment: Dict[str, Any] = {}
-        if (
-            (submission_doc or {}).get("publication_status") == "published"
-            and review_lease_token
-        ):
+        if (submission_doc or {}).get(
+            "publication_status"
+        ) == "published" and review_lease_token:
             try:
                 amendment = await _amend_published_submission_snapshot(
                     tenant_db,
@@ -4146,12 +4328,14 @@ async def override_criterion_marks(
             (submission_doc or {}).get("publication_status") or "pending"
         )
         if publication_status != "published" and review_submission_id:
-            review_state, readiness, publication_status = (
-                await _refresh_unpublished_review_state(
-                    tenant_db,
-                    review_submission_id,
-                    now=teacher_reviewed_at,
-                )
+            (
+                review_state,
+                readiness,
+                publication_status,
+            ) = await _refresh_unpublished_review_state(
+                tenant_db,
+                review_submission_id,
+                now=teacher_reviewed_at,
             )
 
         return {
@@ -4243,9 +4427,11 @@ async def _correct_response_assignment_impl(
     student_id = str(submission.get("student_id") or "")
     actor_id = str(current_user.get("user_id") or "unknown")
     now = datetime.now(timezone.utc)
-    questions = await tenant_db["evalpen_questions"].find(
-        {"exam_id": exam_id}
-    ).to_list(length=1000)
+    questions = (
+        await tenant_db["evalpen_questions"]
+        .find({"exam_id": exam_id})
+        .to_list(length=1000)
+    )
     catalog = {
         str(question.get("question_id") or ""): question
         for question in questions
@@ -4284,13 +4470,17 @@ async def _correct_response_assignment_impl(
         *,
         replacing_response_ids: Optional[set[str]] = None,
     ) -> None:
-        owners = await tenant_db["evalpen_detected_responses"].find(
-            {
-                "submission_id": submission_id,
-                "question_id": question_id,
-                "superseded_at": {"$exists": False},
-            }
-        ).to_list(length=20)
+        owners = (
+            await tenant_db["evalpen_detected_responses"]
+            .find(
+                {
+                    "submission_id": submission_id,
+                    "question_id": question_id,
+                    "superseded_at": {"$exists": False},
+                }
+            )
+            .to_list(length=20)
+        )
         replacing_response_ids = replacing_response_ids or set()
         real_owners = [
             item
@@ -4326,14 +4516,18 @@ async def _correct_response_assignment_impl(
         *,
         replacing_response_ids: Optional[set[str]] = None,
     ) -> None:
-        owners = await tenant_db["evalpen_detected_responses"].find(
-            {
-                "submission_id": submission_id,
-                "question_id": question_id,
-                "superseded_at": {"$exists": False},
-            },
-            {"response_id": 1, "is_missing_response": 1},
-        ).to_list(length=20)
+        owners = (
+            await tenant_db["evalpen_detected_responses"]
+            .find(
+                {
+                    "submission_id": submission_id,
+                    "question_id": question_id,
+                    "superseded_at": {"$exists": False},
+                },
+                {"response_id": 1, "is_missing_response": 1},
+            )
+            .to_list(length=20)
+        )
         replacing_response_ids = replacing_response_ids or set()
         if any(
             not owner.get("is_missing_response")
@@ -4401,7 +4595,8 @@ async def _correct_response_assignment_impl(
         response = {
             key: value
             for key, value in source.items()
-            if key not in {
+            if key
+            not in {
                 "_id",
                 "response_id",
                 "question_id",
@@ -4413,7 +4608,9 @@ async def _correct_response_assignment_impl(
                 "objective_result",
             }
         }
-        text_source = source.get("detected_text") if detected_text is None else detected_text
+        text_source = (
+            source.get("detected_text") if detected_text is None else detected_text
+        )
         text = str(text_source or "").strip()
         pages = source.get("source_pages") if source_pages is None else source_pages
         resolved_atoms = (
@@ -4421,7 +4618,11 @@ async def _correct_response_assignment_impl(
             if evidence_atom_ids is not None
             else _region_evidence_atoms(list(pages or []))
             if source_pages is not None
-            else [str(item) for item in (source.get("evidence_atom_ids") or []) if str(item)]
+            else [
+                str(item)
+                for item in (source.get("evidence_atom_ids") or [])
+                if str(item)
+            ]
         )
         response.update(
             {
@@ -4436,11 +4637,7 @@ async def _correct_response_assignment_impl(
                 "evidence_version": 1,
                 "evidence_atom_ids": sorted(set(resolved_atoms)),
                 "evidence_source": f"teacher_{operation}",
-                "flags": (
-                    []
-                    if clear_flags
-                    else _resolved_flags(source.get("flags"))
-                ),
+                "flags": ([] if clear_flags else _resolved_flags(source.get("flags"))),
                 "question_assignment": {
                     "method": f"teacher_{operation}",
                     "confidence": 1.0,
@@ -4545,7 +4742,9 @@ async def _correct_response_assignment_impl(
 
     elif body.action == "assign":
         if not body.response_id or not body.question_id:
-            raise HTTPException(status_code=400, detail="assign requires response_id and question_id")
+            raise HTTPException(
+                status_code=400, detail="assign requires response_id and question_id"
+            )
         source = await _active_response(body.response_id)
         await _assert_target_slot_available(
             body.question_id,
@@ -4564,9 +4763,15 @@ async def _correct_response_assignment_impl(
 
     elif body.action == "split":
         if not body.response_id or len(body.parts) < 2:
-            raise HTTPException(status_code=400, detail="split requires response_id and at least two parts")
+            raise HTTPException(
+                status_code=400,
+                detail="split requires response_id and at least two parts",
+            )
         if len({part.question_id for part in body.parts}) != len(body.parts):
-            raise HTTPException(status_code=400, detail="Each split part must target a different question")
+            raise HTTPException(
+                status_code=400,
+                detail="Each split part must target a different question",
+            )
         source = await _active_response(body.response_id)
         original_regions = [
             region
@@ -4675,7 +4880,10 @@ async def _correct_response_assignment_impl(
     elif body.action == "merge":
         merge_ids = list(dict.fromkeys(body.response_ids))
         if len(merge_ids) < 2 or not body.question_id:
-            raise HTTPException(status_code=400, detail="merge requires at least two response_ids and question_id")
+            raise HTTPException(
+                status_code=400,
+                detail="merge requires at least two response_ids and question_id",
+            )
         sources = [await _active_response(response_id) for response_id in merge_ids]
         await _assert_target_slot_available(
             body.question_id,
@@ -4726,7 +4934,9 @@ async def _correct_response_assignment_impl(
 
     elif body.action == "confirm_not_attempted":
         if not body.question_id:
-            raise HTTPException(status_code=400, detail="confirm_not_attempted requires question_id")
+            raise HTTPException(
+                status_code=400, detail="confirm_not_attempted requires question_id"
+            )
         await _clear_target_slot(body.question_id)
         question = catalog[body.question_id]
         response_id = f"RESP-TEACH-BLANK-{uuid.uuid4().hex[:12]}"
@@ -4772,7 +4982,9 @@ async def _correct_response_assignment_impl(
 
     elif body.action == "discard_non_answer":
         if not body.response_id:
-            raise HTTPException(status_code=400, detail="discard_non_answer requires response_id")
+            raise HTTPException(
+                status_code=400, detail="discard_non_answer requires response_id"
+            )
         source = await _active_response(body.response_id)
         await _supersede(source, "discard_non_answer")
         source_ids.append(body.response_id)
@@ -4785,7 +4997,9 @@ async def _correct_response_assignment_impl(
             "student_id": student_id,
             "action": body.action,
             "source_response_ids": source_ids,
-            "created_response_ids": [str(item.get("response_id") or "") for item in created],
+            "created_response_ids": [
+                str(item.get("response_id") or "") for item in created
+            ],
             "question_ids": sorted(requested_question_ids),
             "selected_answer": (
                 normalize_answer_label(body.selected_answer)
@@ -4864,7 +5078,9 @@ async def _correct_response_assignment_impl(
     return {
         "submission_id": submission_id,
         "action": body.action,
-        "created_response_ids": [str(item.get("response_id") or "") for item in created],
+        "created_response_ids": [
+            str(item.get("response_id") or "") for item in created
+        ],
         "evaluation_errors": evaluation_errors,
         "review_state": review_state,
         "readiness": readiness,
@@ -4950,9 +5166,7 @@ async def _publish_submission_impl(
         submissions_col = tenant_db["evalpen_submissions"]
 
         # Verify submission exists
-        submission = await submissions_col.find_one(
-            {"submission_id": submission_id}
-        )
+        submission = await submissions_col.find_one({"submission_id": submission_id})
         if submission is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -4965,9 +5179,7 @@ async def _publish_submission_impl(
             )
 
         # Tutor scoping: verify this submission's student is visible
-        _check_student_in_scope(
-            submission.get("student_id", ""), scoped_ids
-        )
+        _check_student_in_scope(submission.get("student_id", ""), scoped_ids)
 
         from services.exampen_submission_readiness import (
             assess_submission_readiness,
@@ -5149,10 +5361,14 @@ async def publish_ready_submissions(
     """
 
     tenant_db = await _get_tenant_db(db, current_user)
-    submissions = await tenant_db["evalpen_submissions"].find(
-        {"submission_id": {"$in": body.submission_ids}},
-        {"submission_id": 1, "exam_id": 1, "publication_status": 1},
-    ).to_list(length=len(body.submission_ids))
+    submissions = (
+        await tenant_db["evalpen_submissions"]
+        .find(
+            {"submission_id": {"$in": body.submission_ids}},
+            {"submission_id": 1, "exam_id": 1, "publication_status": 1},
+        )
+        .to_list(length=len(body.submission_ids))
+    )
     submissions_by_id = {
         str(submission.get("submission_id") or ""): submission
         for submission in submissions
