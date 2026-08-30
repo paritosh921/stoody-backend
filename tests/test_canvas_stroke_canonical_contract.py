@@ -74,6 +74,22 @@ def test_canvas_stroke_preserves_canonical_geometry_and_metadata():
     assert stored["qualityFlags"] == ["offline_replay_gap"]
 
 
+def test_canvas_stroke_normalizes_legacy_null_quality_flags():
+    stroke = CanvasPageStroke(
+        id="legacy-null-flags",
+        points=[[1, 2, 0, 120, 0.47, 0]],
+        processingVersion=CANONICAL_STROKE_PROCESSING_VERSION,
+        qualityFlags=None,
+        sourceMode="live",
+        pageNumber=4,
+        bookType="MS",
+        startedAt=10.0,
+        endedAt=20.0,
+    )
+
+    assert stroke.qualityFlags == []
+
+
 def test_canvas_stroke_preserves_replay_corpus_canonical_geometry():
     canonical_points = canonical_points_from_case("normal_stroke")
     stroke = CanvasPageStroke(

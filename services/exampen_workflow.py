@@ -29,6 +29,7 @@ from services.pcr_grading_contract_policy import (
 logger = logging.getLogger(__name__)
 
 PROCESSING_JOBS_COLLECTION = "exampen_processing_jobs"
+ECONOMY_WAITING_JOB_STATUS = "waiting_for_batch"
 TERMINAL_JOB_STATUSES = {"completed", "blocked_for_review", "failed"}
 CAPABILITY_QUEUED_JOB_STATUS = "queued_pipeline_v3"
 # Pipeline 5 deliberately has its own queue capability.  A pre-v14 worker
@@ -522,6 +523,7 @@ async def ensure_processing_job(
     submission_id: str,
     student_id: Optional[str] = None,
     db_name: Optional[str] = None,
+    processing_mode: str = "immediate",
 ) -> Tuple[Dict[str, Any], bool]:
     """Create the exactly-once processing record for a canonical submission."""
     await ensure_indexes(tenant_db)
@@ -544,9 +546,14 @@ async def ensure_processing_job(
     jobs = tenant_db[PROCESSING_JOBS_COLLECTION]
     job_id = _job_id(submission_id)
     now = _now()
+    normalized_processing_mode = str(processing_mode or "immediate").strip().lower()
+    if normalized_processing_mode not in {"immediate", "economy"}:
+        raise ValueError("processing_mode must be immediate or economy")
     initial_status = (
         CONTRACT_MIGRATION_PENDING_JOB_STATUS
         if migration_applying
+        else ECONOMY_WAITING_JOB_STATUS
+        if normalized_processing_mode == "economy"
         else _queued_status_for_pipeline(pipeline_version)
     )
     set_on_insert: Dict[str, Any] = {
@@ -564,6 +571,7 @@ async def ensure_processing_job(
         "created_at": now,
         "updated_at": now,
         "last_error": None,
+        "processing_mode": normalized_processing_mode,
     }
     if migration_applying and migration_id:
         set_on_insert["migration_id"] = migration_id
@@ -608,6 +616,11 @@ async def ensure_processing_job(
         )
     )
     if should_reconcile:
+        reconciled_status = (
+            ECONOMY_WAITING_JOB_STATUS
+            if str(job.get("processing_mode") or "immediate").strip().lower() == "economy"
+            else _queued_status_for_pipeline(latest_pipeline_version)
+        )
         reconciled = await jobs.update_one(
             {
                 "submission_id": submission_id,
@@ -617,7 +630,7 @@ async def ensure_processing_job(
             },
             {
                 "$set": {
-                    "status": _queued_status_for_pipeline(latest_pipeline_version),
+                    "status": reconciled_status,
                     "pipeline_version": latest_pipeline_version,
                     "mapping_pipeline_version": latest_mapping_pipeline_version,
                     "required_processing_path": await _required_processing_path(
@@ -804,15 +817,27 @@ async def schedule_submission_processing(
     exam_id: str,
     submission_id: str,
     student_id: Optional[str] = None,
+    processing_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Persist then dispatch a PCR job after canonical ingest succeeds."""
+    if processing_mode is None:
+        exam = await tenant_db["exampen_exams"].find_one(
+            {"exam_id": exam_id},
+            {"_id": 0, "checking_mode": 1},
+        )
+        processing_mode = str(
+            (exam or {}).get("checking_mode") or "immediate"
+        ).strip().lower()
     job, _ = await ensure_processing_job(
         tenant_db,
         exam_id=exam_id,
         submission_id=submission_id,
         student_id=student_id,
         db_name=db_name,
+        processing_mode=processing_mode,
     )
+    if str(processing_mode or "immediate").strip().lower() == "economy":
+        return job
     return await dispatch_processing_job(tenant_db, db_name=db_name, job=job)
 
 

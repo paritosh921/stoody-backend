@@ -26,12 +26,19 @@ from pydantic import BaseModel, Field
 from api.v1.auth_async import get_database
 from api.v1.evalpen_student_bff_async import _get_student_identity_ids, require_student
 from core.database import DatabaseManager
+from config_async import settings
 from core.upload_security.service import CleanUpload, secure_upload, secure_upload_many
 from core.upload_security.storage import PrivateUploadStorage, safe_storage_segment
 from services import student_credits
+from services.exampen_upload_window import (
+    answer_copy_upload_is_open,
+    release_answer_copy_ingest,
+    reserve_answer_copy_ingest,
+)
 from utils.s3_storage import (
     PrivateObjectStorageError,
     delete_private_object,
+    private_object_exists,
     upload_private_object,
 )
 
@@ -200,6 +207,221 @@ async def _cleanup_released_student_copy_paths(released_paths: List[str]) -> Lis
     return failed_paths
 
 
+async def reconcile_answer_copy_local_cleanup(
+    tenant_db: Any,
+    *,
+    limit: int = 500,
+) -> Dict[str, int]:
+    """Retry failed scan-stage cleanup only after every S3 asset is verified.
+
+    Canonical answer copies never read these paths.  They are retained solely
+    when an immediate local deletion failed, then removed by the periodic
+    reconciler after an S3 HEAD check proves the durable copy still exists.
+    """
+
+    attempts = await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION].find(
+        {
+            "local_scan_cleanup_status": "failed",
+            "local_scan_cleanup_pending_paths.0": {"$exists": True},
+            "storage_backend": "s3",
+            "storage_handoff_status": "complete",
+        }
+    ).sort("updated_at", 1).to_list(length=max(1, min(5000, int(limit))))
+    summary = {
+        "attempts_scanned": 0,
+        "attempts_cleaned": 0,
+        "attempts_deferred": 0,
+        "legacy_scanned": 0,
+        "legacy_cleaned": 0,
+        "legacy_deferred": 0,
+    }
+    for attempt in attempts:
+        summary["attempts_scanned"] += 1
+        pending_paths = [
+            str(value or "").strip()
+            for value in (attempt.get("local_scan_cleanup_pending_paths") or [])
+            if str(value or "").strip()
+        ]
+        assets: List[str] = []
+        original_asset = attempt.get("original_asset")
+        if isinstance(original_asset, dict):
+            assets.append(str(original_asset.get("storage_path") or "").strip())
+        for page in attempt.get("pages") or []:
+            if isinstance(page, dict):
+                assets.append(str(page.get("storage_path") or "").strip())
+        s3_assets = sorted({value for value in assets if value.startswith("s3://")})
+        if not pending_paths or not s3_assets:
+            summary["attempts_deferred"] += 1
+            continue
+        try:
+            durable = all(
+                await asyncio.gather(
+                    *(
+                        private_object_exists(
+                            storage_path,
+                            allowed_key_prefix=PRIVATE_STUDENT_COPY_S3_PREFIX,
+                        )
+                        for storage_path in s3_assets
+                    )
+                )
+            )
+        except PrivateObjectStorageError:
+            durable = False
+        if not durable:
+            summary["attempts_deferred"] += 1
+            continue
+
+        remaining = await _cleanup_released_student_copy_paths(pending_paths)
+        if remaining:
+            await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION].update_one(
+                {
+                    "attempt_id": attempt.get("attempt_id"),
+                    "local_scan_cleanup_status": "failed",
+                },
+                {
+                    "$set": {
+                        "local_scan_cleanup_pending_paths": remaining,
+                        "local_scan_cleanup_failed_count": len(remaining),
+                        "local_scan_cleanup_last_attempt_at": datetime.now(timezone.utc),
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            summary["attempts_deferred"] += 1
+            continue
+
+        result = await tenant_db[STUDENT_COPY_UPLOADS_COLLECTION].update_one(
+            {
+                "attempt_id": attempt.get("attempt_id"),
+                "local_scan_cleanup_status": "failed",
+            },
+            {
+                "$set": {
+                    "local_scan_cleanup_status": "complete",
+                    "local_scan_cleanup_failed_count": 0,
+                    "local_scan_cleanup_completed_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$unset": {"local_scan_cleanup_pending_paths": ""},
+            },
+        )
+        if result.matched_count:
+            summary["attempts_cleaned"] += 1
+
+    # Staff uploads created before durable attempt ownership was introduced may
+    # have a completed S3 transfer recorded only in the upload-security audit.
+    # Migrate their scan staging out safely: verify the original S3 object and
+    # every canonical answer page before touching the constrained local policy
+    # directory.
+    verdicts = await tenant_db["upload_security_verdicts"].find(
+        {
+            "policy_id": {"$in": ["student_answer_copy_pdf", "student_answer_copy_image"]},
+            "storage_backend": "s3",
+            "storage_transfer_status": "complete",
+            "released_storage_path": {"$regex": "^s3://"},
+            "local_scan_cleanup_status": {"$ne": "complete"},
+        }
+    ).sort("created_at", 1).to_list(length=max(1, min(5000, int(limit))))
+    storage = PrivateUploadStorage()
+    released_root = (storage.local_root / storage.released_prefix).resolve(strict=False)
+    for verdict in verdicts:
+        summary["legacy_scanned"] += 1
+        metadata = verdict.get("purpose_metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        exam_id = str(metadata.get("exam_id") or "").strip()
+        student_id = str(metadata.get("student_id") or "").strip()
+        original_s3 = str(verdict.get("released_storage_path") or "").strip()
+        if not exam_id or not student_id or not original_s3.startswith("s3://"):
+            summary["legacy_deferred"] += 1
+            continue
+        submission = await tenant_db["evalpen_submissions"].find_one(
+            {"exam_id": exam_id, "student_id": student_id},
+            {"submission_id": 1},
+        )
+        submission_id = str((submission or {}).get("submission_id") or "")
+        pages = (
+            await tenant_db["evalpen_answer_pages"].find(
+                {"submission_id": submission_id},
+                {"raw_image_ref": 1},
+            ).to_list(length=100)
+            if submission_id
+            else []
+        )
+        page_s3 = sorted(
+            {
+                str(page.get("raw_image_ref") or "").strip()
+                for page in pages
+                if str(page.get("raw_image_ref") or "").strip().startswith("s3://")
+            }
+        )
+        if not page_s3 or len(page_s3) != len(pages):
+            summary["legacy_deferred"] += 1
+            continue
+        try:
+            durable = all(
+                await asyncio.gather(
+                    *(
+                        private_object_exists(
+                            storage_path,
+                            allowed_key_prefix=PRIVATE_STUDENT_COPY_S3_PREFIX,
+                        )
+                        for storage_path in [original_s3, *page_s3]
+                    )
+                )
+            )
+        except PrivateObjectStorageError:
+            durable = False
+        if not durable:
+            summary["legacy_deferred"] += 1
+            continue
+
+        policy_id = str(verdict.get("policy_id") or "")
+        upload_id = safe_storage_segment(str(verdict.get("upload_id") or ""))
+        tenant_segment = safe_storage_segment(str(verdict.get("tenant_db") or ""))
+        policy_root = (
+            released_root / tenant_segment / safe_storage_segment(policy_id)
+        ).resolve(strict=False)
+        local_paths: List[str] = []
+        if policy_root.exists() and policy_root != released_root and released_root in policy_root.parents:
+            for candidate_dir in policy_root.iterdir():
+                if not candidate_dir.is_dir():
+                    continue
+                if candidate_dir.name != upload_id and not candidate_dir.name.startswith(f"{upload_id}-page-"):
+                    continue
+                for candidate in candidate_dir.rglob("*"):
+                    if candidate.is_file() and not candidate.name.endswith(".metadata.json"):
+                        resolved = candidate.resolve(strict=False)
+                        if released_root in resolved.parents:
+                            local_paths.append(str(resolved))
+        remaining = await _cleanup_released_student_copy_paths(local_paths)
+        now = datetime.now(timezone.utc)
+        if remaining:
+            await tenant_db["upload_security_verdicts"].update_one(
+                {"upload_id": verdict.get("upload_id")},
+                {
+                    "$set": {
+                        "local_scan_cleanup_status": "failed",
+                        "local_scan_cleanup_pending_count": len(remaining),
+                        "local_scan_cleanup_last_attempt_at": now,
+                    }
+                },
+            )
+            summary["legacy_deferred"] += 1
+            continue
+        await tenant_db["upload_security_verdicts"].update_one(
+            {"upload_id": verdict.get("upload_id")},
+            {
+                "$set": {
+                    "local_scan_cleanup_status": "complete",
+                    "local_scan_cleanup_pending_count": 0,
+                    "local_scan_cleanup_completed_at": now,
+                }
+            },
+        )
+        summary["legacy_cleaned"] += 1
+    return summary
+
+
 async def _update_upload_verdict_storage(
     tenant_db: Any,
     *,
@@ -276,6 +498,7 @@ async def _reserve_student_copy_attempt(
     student_id: str,
     admin_id: str,
     submission_channel: str = "student_web",
+    submitted_by: Optional[str] = None,
 ) -> str:
     """Atomically reserve the student's single final-copy upload slot.
 
@@ -293,7 +516,7 @@ async def _reserve_student_copy_attempt(
                 "exam_id": exam_id,
                 "student_id": student_id,
                 "admin_id": admin_id,
-                "submitted_by": student_id,
+                "submitted_by": str(submitted_by or student_id).strip() or student_id,
                 "submission_channel": str(submission_channel or "student_web").strip() or "student_web",
                 "status": "receiving",
                 "lease_expires_at": lease_expires_at,
@@ -344,6 +567,7 @@ async def _reserve_student_copy_attempt(
                 "$set": {
                     "status": "receiving",
                     "submission_channel": str(submission_channel or "student_web").strip() or "student_web",
+                    "submitted_by": str(submitted_by or student_id).strip() or student_id,
                     "updated_at": now,
                     "lease_expires_at": lease_expires_at,
                     "last_error": None,
@@ -438,6 +662,8 @@ def _student_upload_availability(exam: Dict[str, Any], student_id: str) -> tuple
         if lifecycle == "ready_for_eval":
             return False, "This exam is already in teacher review"
         return False, "This exam is not accepting answer-copy uploads"
+    if not answer_copy_upload_is_open(exam):
+        return False, "Answer-copy uploads have been closed by your teacher"
     return True, None
 
 
@@ -582,12 +808,21 @@ async def _queue_pcr_processing(
 ) -> Dict[str, Any]:
     from services.exampen_workflow import schedule_submission_processing
 
+    exam = await tenant_db["exampen_exams"].find_one(
+        {"exam_id": exam_id},
+        {"_id": 0, "checking_mode": 1},
+    )
+    processing_mode = str((exam or {}).get("checking_mode") or "immediate").strip().lower()
+    if processing_mode not in {"economy", "immediate"}:
+        processing_mode = "immediate"
+
     return await schedule_submission_processing(
         tenant_db,
         db_name=db_name,
         exam_id=exam_id,
         submission_id=submission_id,
         student_id=student_id,
+        processing_mode=processing_mode,
     )
 
 
@@ -993,6 +1228,7 @@ async def list_answer_copy_options(
             "student_self_submission_enabled": 1,
             "exam_type": 1,
             "capture_mode": 1,
+            "answer_copy_upload_state": 1,
             "prepared_document_id": 1,
             "subject": 1,
             "content_category_id": 1,
@@ -1535,6 +1771,20 @@ async def submit_answer_copy(
         admin_id=admin_id,
         submission_channel=submission_channel,
     )
+    try:
+        reservation_token = await reserve_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            actor_id=student_id,
+            reservation_token=attempt_id,
+        )
+    except HTTPException as exc:
+        await _mark_attempt_upload_failed(
+            upload_collection,
+            attempt_id=attempt_id,
+            reason=str(exc.detail),
+        )
+        raise
 
     released_local_paths: List[str] = []
     uploaded_storage_paths: List[str] = []
@@ -1559,6 +1809,11 @@ async def submit_answer_copy(
             max_pages=max_pages,
         )
     except HTTPException as exc:
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
         await _mark_attempt_upload_failed(
             upload_collection,
             attempt_id=attempt_id,
@@ -1567,6 +1822,11 @@ async def submit_answer_copy(
         raise
     except Exception as exc:
         logger.exception("Student answer-copy upload failed: exam=%s student=%s", exam_id, student_id)
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
         await _mark_attempt_upload_failed(
             upload_collection,
             attempt_id=attempt_id,
@@ -1636,6 +1896,11 @@ async def submit_answer_copy(
                 }
             },
         )
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A final answer copy was received for this exam while your upload was being prepared",
@@ -1670,6 +1935,11 @@ async def submit_answer_copy(
             {"attempt_id": attempt_id},
             {"$set": {"status": "ingest_failed", "last_error": str(exc)[:500], "updated_at": datetime.now(timezone.utc)}},
         )
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Your copy was received but could not be prepared for evaluation. Please contact your teacher.",
@@ -1693,6 +1963,11 @@ async def submit_answer_copy(
                 }
             },
         )
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A final answer copy was received for this exam while your upload was being prepared",
@@ -1715,6 +1990,7 @@ async def submit_answer_copy(
                 "$set": {
                     "local_scan_cleanup_status": "failed",
                     "local_scan_cleanup_failed_count": len(cleanup_failures),
+                    "local_scan_cleanup_pending_paths": cleanup_failures,
                     "updated_at": datetime.now(timezone.utc),
                 }
             },
@@ -1725,8 +2001,10 @@ async def submit_answer_copy(
             {
                 "$set": {
                     "local_scan_cleanup_status": "complete",
+                    "local_scan_cleanup_failed_count": 0,
                     "updated_at": datetime.now(timezone.utc),
-                }
+                },
+                "$unset": {"local_scan_cleanup_pending_paths": ""},
             },
         )
 
@@ -1763,6 +2041,15 @@ async def submit_answer_copy(
                 "updated_at": datetime.now(timezone.utc),
             }
         },
+    )
+
+    # Keep the upload-window fence until the durable processing job exists.
+    # Otherwise a teacher could close uploads after canonical ingest but before
+    # this economy copy becomes visible to the Batch snapshot.
+    await release_answer_copy_ingest(
+        tenant_db,
+        exam_id=exam_id,
+        reservation_token=reservation_token,
     )
 
     return StudentCopySubmissionAck(

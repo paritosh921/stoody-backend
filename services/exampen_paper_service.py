@@ -1063,6 +1063,7 @@ def validate_pcr_questions(
     questions: Iterable[Dict[str, Any]],
     *,
     marking_policy: Optional[Dict[str, Any]] = None,
+    expected_total: Any = None,
 ) -> List[str]:
     """Return human-readable readiness errors for a PCR marking paper.
 
@@ -1074,24 +1075,39 @@ def validate_pcr_questions(
     policy = policy_module.normalize_marking_policy(marking_policy)
     uses_structured_criteria = policy_module.is_structured_rubric_policy(policy)
     question_list = list(questions)
-    expected_total = None
-    for question in question_list:
-        metadata = question.get("metadata")
-        if not isinstance(metadata, dict):
-            continue
-        paper_summary = metadata.get("paper_marks_summary")
-        if isinstance(paper_summary, dict) and paper_summary.get("expected_total") is not None:
-            expected_total = paper_summary.get("expected_total")
-            break
+    if expected_total is None:
+        for question in question_list:
+            metadata = question.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            paper_summary = metadata.get("paper_marks_summary")
+            if isinstance(paper_summary, dict) and paper_summary.get("expected_total") is not None:
+                expected_total = paper_summary.get("expected_total")
+                break
     current_marks_summary = summarize_question_marks(
         question_list,
         expected_total=expected_total,
     )
 
     errors: List[str] = []
+    if (
+        current_marks_summary.get("reconciled") is False
+        and int(current_marks_summary.get("unresolved_count") or 0) == 0
+        and int(current_marks_summary.get("provisional_count") or 0) == 0
+    ):
+        errors.append(
+            "Question marks total "
+            f"{float(current_marks_summary.get('calculated_total') or 0):g} does not match "
+            f"the paper total {float(current_marks_summary.get('expected_total') or 0):g}"
+        )
     for position, question in enumerate(question_list, start=1):
-        label = _source_question_id(question) or str(position)
-        if not _source_question_id(question):
+        source_id = _source_question_id(question)
+        label = str(
+            question.get("question_number")
+            or question.get("extraction_order")
+            or position
+        )
+        if not source_id:
             errors.append(f"Q {label}: missing stable question id")
         if not _question_text(question):
             errors.append(f"Q {label}: missing question text")
@@ -1105,17 +1121,6 @@ def validate_pcr_questions(
         if _question_marks(question) is None:
             errors.append(
                 f"Q {label}: verify the printed marks or enter marks greater than zero"
-            )
-        metadata = question.get("metadata")
-        if (
-            isinstance(metadata, dict)
-            and metadata.get("paper_marks_reconciled") is False
-            and current_marks_summary.get("reconciled") is False
-            and int(current_marks_summary.get("unresolved_count") or 0) == 0
-            and int(current_marks_summary.get("provisional_count") or 0) == 0
-        ):
-            errors.append(
-                f"Q {label}: resolve the mismatch between question marks and the paper total"
             )
         extraction_metadata = question.get("extraction_metadata")
         if isinstance(extraction_metadata, dict) and extraction_metadata.get(

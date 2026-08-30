@@ -14,6 +14,7 @@ Hard constraint: C4 — All LLM calls through the gate.
 """
 
 from .gate import LLMGate
+from .batch import BatchReplayGate, DeferredBatchCall
 from .models import (
     ALLOWED_CALLER_IDS,
     BudgetExhaustedError,
@@ -37,6 +38,7 @@ from .rollup import run_all_rollups, run_daily_rollup, run_monthly_rollup, run_w
 __all__ = [
     # Core
     "LLMGate",
+    "BatchReplayGate",
     "GateRepository",
     # Models — request / response
     "GateRequest",
@@ -58,6 +60,7 @@ __all__ = [
     "BudgetExhaustedError",
     "TokenLimitExceededError",
     "UnregisteredCallerError",
+    "DeferredBatchCall",
     # Utilities
     "estimate_cost",
     "estimate_tokens",

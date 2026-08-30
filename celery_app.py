@@ -58,6 +58,14 @@ app.conf.beat_schedule = {
         "task": "celery_app.reconcile_exampen_processing_jobs",
         "schedule": 60.0,
     },
+    "exampen-openai-batch-reconciler": {
+        "task": "celery_app.reconcile_exampen_economy_batches",
+        "schedule": 60.0,
+    },
+    "exampen-answer-copy-storage-reconciler": {
+        "task": "celery_app.reconcile_exampen_answer_copy_storage",
+        "schedule": 300.0,
+    },
     "student-credit-reconciler": {
         "task": "celery_app.reconcile_student_credit_jobs",
         "schedule": 60.0,
@@ -215,6 +223,140 @@ def process_exampen_pcr_submission(
         # is the single retry authority and the periodic reconciler redelivers it.
         logger.exception("PCR worker infrastructure failed before job state was recorded")
         raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+
+
+@app.task(name="celery_app.prepare_exampen_economy_batch", bind=True, max_retries=2)
+def prepare_exampen_economy_batch(
+    self,
+    db_name: str,
+    batch_group_id: str,
+) -> dict:
+    """Build canonical per-copy JSONL and submit discounted provider batches."""
+    from core.database import DatabaseManager
+
+    async def _run() -> dict:
+        db_mgr = DatabaseManager()
+        await db_mgr.initialize()
+        tenant_db = await db_mgr.get_tenant_db(db_name)
+        if tenant_db is None:
+            raise RuntimeError(f"Tenant database {db_name} is not available")
+        from services.exampen_openai_batch import prepare_economy_batch_group
+
+        result = await prepare_economy_batch_group(
+            tenant_db,
+            batch_group_id=batch_group_id,
+        )
+        return {
+            "batch_group_id": batch_group_id,
+            "status": str((result or {}).get("status") or "unknown"),
+        }
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Economy Batch preparation failed for %s", batch_group_id)
+        raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+
+
+@app.task(name="celery_app.reconcile_exampen_economy_batches", bind=True, max_retries=2)
+def reconcile_exampen_economy_batches(self) -> dict:
+    """Poll/import OpenAI Batch work and resume interrupted preparation."""
+    from core.database import DatabaseManager
+
+    async def _run() -> dict:
+        db_mgr = DatabaseManager()
+        await db_mgr.initialize()
+        master_db = await db_mgr.get_master_db()
+        tenants = await master_db["tenants"].find(
+            {"status": "active"}, {"db_name": 1, "_id": 0}
+        ).to_list(length=1000)
+        summary = {"tenants_processed": 0, "parts_polled": 0, "items_imported": 0, "errors": []}
+        from services.exampen_openai_batch import reconcile_economy_batch_groups
+
+        for tenant in tenants:
+            db_name = str(tenant.get("db_name") or "")
+            if not db_name:
+                continue
+            try:
+                tenant_db = await db_mgr.get_tenant_db(db_name)
+                if tenant_db is None:
+                    continue
+                result = await reconcile_economy_batch_groups(tenant_db)
+                summary["tenants_processed"] += 1
+                summary["parts_polled"] += int(result.get("parts_polled") or 0)
+                summary["items_imported"] += int(result.get("items_imported") or 0)
+            except Exception as exc:
+                logger.exception("Economy Batch reconciliation failed for tenant %s", db_name)
+                summary["errors"].append({"tenant": db_name, "error": str(exc)[:300]})
+        return summary
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Economy Batch reconciler failed")
+        raise self.retry(exc=exc, countdown=60)
+
+
+@app.task(name="celery_app.reconcile_exampen_answer_copy_storage", bind=True, max_retries=2)
+def reconcile_exampen_answer_copy_storage(self) -> dict:
+    """Remove retryable local scan staging after verifying canonical S3 assets."""
+
+    from core.database import DatabaseManager
+
+    async def _run() -> dict:
+        db_mgr = DatabaseManager()
+        await db_mgr.initialize()
+        master_db = await db_mgr.get_master_db()
+        tenants = await master_db["tenants"].find(
+            {"status": "active"}, {"db_name": 1, "_id": 0}
+        ).to_list(length=1000)
+        summary = {
+            "tenants_processed": 0,
+            "attempts_scanned": 0,
+            "attempts_cleaned": 0,
+            "attempts_deferred": 0,
+            "legacy_scanned": 0,
+            "legacy_cleaned": 0,
+            "legacy_deferred": 0,
+            "errors": [],
+        }
+        from api.v1.evalpen_student_submission_async import (
+            reconcile_answer_copy_local_cleanup,
+        )
+
+        for tenant in tenants:
+            db_name = str(tenant.get("db_name") or "")
+            if not db_name:
+                continue
+            try:
+                tenant_db = await db_mgr.get_tenant_db(db_name)
+                if tenant_db is None:
+                    continue
+                result = await reconcile_answer_copy_local_cleanup(tenant_db)
+                summary["tenants_processed"] += 1
+                for key in (
+                    "attempts_scanned",
+                    "attempts_cleaned",
+                    "attempts_deferred",
+                    "legacy_scanned",
+                    "legacy_cleaned",
+                    "legacy_deferred",
+                ):
+                    summary[key] += int(result.get(key) or 0)
+            except Exception as exc:
+                logger.exception(
+                    "Answer-copy storage reconciliation failed for tenant %s", db_name
+                )
+                summary["errors"].append(
+                    {"tenant": db_name, "error": str(exc)[:300]}
+                )
+        return summary
+
+    try:
+        return asyncio.run(_run())
+    except Exception as exc:
+        logger.exception("Answer-copy storage reconciler failed")
+        raise self.retry(exc=exc, countdown=60)
 
 
 @app.task(name="celery_app.process_student_credit_job", bind=True, max_retries=3)

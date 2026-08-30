@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pymongo import ReturnDocument
 from pydantic import BaseModel, Field
 
 from core.database import DatabaseManager
@@ -44,6 +45,10 @@ from api.v1.auth_async import get_current_user, get_database
 from services.exampen_workflow import (
     is_supported_pcr_grading_contract,
     public_processing_status,
+)
+from services.exampen_openai_batch import (
+    classify_economy_batch_failure,
+    provider_batch_failure,
 )
 from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
 
@@ -76,6 +81,7 @@ LIFECYCLE_TRANSITIONS = {
 PEN_MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 MAX_PEN_BINDINGS = 256
 CAPTURE_MODES = {"pen", "camera", "hybrid"}
+CHECKING_MODES = {"economy", "immediate"}
 DEFAULT_PCR_CAMERA_MAX_PAGES = 40
 ACTIVE_COLLECTION_STATES = {"draft", "armed", "in_progress"}
 
@@ -210,6 +216,10 @@ class ExamCreateRequest(BaseModel):
         le=50,
         description="Maximum rendered/uploaded answer pages a student may submit.",
     )
+    checking_mode: str = Field(
+        "economy",
+        description="PCR checking transport: economy (OpenAI Batch) or immediate.",
+    )
 
 
 class ExamDetailResponse(BaseModel):
@@ -234,6 +244,8 @@ class ExamDetailResponse(BaseModel):
     student_self_submission_enabled: bool = False
     student_submission_max_pages: int = 20
     session_request_id: Optional[str] = None
+    checking_mode: str = "immediate"
+    answer_copy_upload_state: str = "closed"
 
 
 class ExamListResponse(BaseModel):
@@ -252,6 +264,7 @@ class ExamSetupUpdateRequest(BaseModel):
     capture_mode: Optional[str] = None
     student_self_submission_enabled: Optional[bool] = None
     student_submission_max_pages: Optional[int] = Field(None, ge=1, le=50)
+    checking_mode: Optional[str] = None
 
 
 class AssignHubRequest(BaseModel):
@@ -300,6 +313,13 @@ class ProcessingJobReprocessRequest(BaseModel):
     submission_ids: Optional[List[str]] = None
 
 
+class EconomyBatchStartRequest(BaseModel):
+    """Teacher-confirmed selection and collection boundary for Economy checking."""
+
+    submission_ids: Optional[List[str]] = None
+    close_collection: bool = False
+
+
 class ProcessingJobResponse(BaseModel):
     job_id: str
     submission_id: str
@@ -332,6 +352,24 @@ class ProcessingBatchResponse(BaseModel):
     errors: List[str] = Field(default_factory=list)
 
 
+class EconomyBatchResponse(BaseModel):
+    batch_group_id: str
+    exam_id: str
+    status: str
+    requested_count: int = 0
+    provider_request_count: int = 0
+    local_completed_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    requested_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    last_error: Optional[str] = None
+    failure_code: Optional[str] = None
+    retryable: bool = True
+    operator_action: Optional[str] = None
+    parts: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Helper: build exam document
 # ---------------------------------------------------------------------------
@@ -355,6 +393,7 @@ def _build_exam_doc(
     student_submission_max_pages: int = 20,
     session_request_id: Optional[str] = None,
     legacy_requested_exam_id: Optional[str] = None,
+    checking_mode: str = "immediate",
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     return {
@@ -382,6 +421,12 @@ def _build_exam_doc(
         "legacy_requested_exam_id": legacy_requested_exam_id,
         "session_snapshot_status": "pending",
         "absent_student_ids": [],
+        "checking_mode": checking_mode,
+        # The lifecycle still prevents draft/armed uploads.  Keeping the
+        # independent window open means camera/student collection is ready as
+        # soon as the session enters an uploadable lifecycle.
+        "answer_copy_upload_state": "open",
+        "answer_copy_upload_reservations": [],
     }
 
 
@@ -446,6 +491,8 @@ def _doc_to_response(doc: Dict[str, Any]) -> ExamDetailResponse:
         raw_teacher_ids = []
     teacher_ids = [str(t) for t in raw_teacher_ids]
 
+    from services.exampen_upload_window import answer_copy_upload_state
+
     return ExamDetailResponse(
         exam_id=doc.get("exam_id", ""),
         title=_fmt(doc.get("title")),
@@ -468,6 +515,8 @@ def _doc_to_response(doc: Dict[str, Any]) -> ExamDetailResponse:
         student_self_submission_enabled=bool(doc.get("student_self_submission_enabled", False)),
         student_submission_max_pages=int(doc.get("student_submission_max_pages") or 20),
         session_request_id=_fmt(doc.get("session_request_id")),
+        checking_mode=str(doc.get("checking_mode") or "immediate"),
+        answer_copy_upload_state=answer_copy_upload_state(doc),
     )
 
 
@@ -640,6 +689,20 @@ def _normalize_capture_mode(raw_capture_mode: Optional[str], exam_type: str) -> 
             detail="DCR sessions require pen capture; camera fallback is PCR-only",
         )
     return capture_mode
+
+
+def _normalize_checking_mode(raw_checking_mode: Optional[str], exam_type: str) -> str:
+    """Keep discounted delayed checking explicit and PCR-only."""
+
+    if exam_type != "pcr":
+        return "immediate"
+    checking_mode = str(raw_checking_mode or "economy").strip().lower()
+    if checking_mode not in CHECKING_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"checking_mode must be one of: {sorted(CHECKING_MODES)}",
+        )
+    return checking_mode
 
 
 def _normalize_student_self_submission_config(
@@ -1102,6 +1165,7 @@ async def create_exam(
         )
 
     capture_mode = _normalize_capture_mode(body.capture_mode, derived_exam_type)
+    checking_mode = _normalize_checking_mode(body.checking_mode, derived_exam_type)
     student_self_submission_enabled, student_submission_max_pages = (
         _normalize_student_self_submission_config(
             enabled=body.student_self_submission_enabled,
@@ -1157,6 +1221,7 @@ async def create_exam(
         student_submission_max_pages=student_submission_max_pages,
         session_request_id=request_id,
         legacy_requested_exam_id=str(body.exam_id or "").strip() or None,
+        checking_mode=checking_mode,
     )
     if request_key:
         doc["session_request_key"] = request_key
@@ -1530,6 +1595,7 @@ async def update_exam_setup(
         and body.capture_mode is None
         and body.student_self_submission_enabled is None
         and body.student_submission_max_pages is None
+        and body.checking_mode is None
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1576,6 +1642,12 @@ async def update_exam_setup(
         body.pen_bindings if body.pen_bindings is not None else doc.get("pen_bindings"),
         roster,
     )
+    checking_mode = _normalize_checking_mode(
+        body.checking_mode
+        if body.checking_mode is not None
+        else (doc.get("checking_mode") or "immediate"),
+        str(doc.get("exam_type") or ""),
+    )
 
     now = datetime.now(timezone.utc)
     result = await collection.update_one(
@@ -1587,6 +1659,7 @@ async def update_exam_setup(
                 "capture_mode": capture_mode,
                 "student_self_submission_enabled": student_self_submission_enabled,
                 "student_submission_max_pages": student_submission_max_pages,
+                "checking_mode": checking_mode,
                 "updated_at": now,
             }
         },
@@ -1598,6 +1671,78 @@ async def update_exam_setup(
         )
     updated = await collection.find_one({"exam_id": exam_id})
     return _doc_to_response(updated)
+
+
+async def _economy_batch_to_response(
+    tenant_db: Any,
+    doc: Dict[str, Any],
+) -> EconomyBatchResponse:
+    def _fmt(value: Any) -> Optional[str]:
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+        return str(value) if value is not None else None
+
+    raw_parts = await tenant_db["exampen_provider_batch_parts"].find(
+        {"batch_group_id": doc.get("batch_group_id")},
+        {
+            "_id": 0,
+            "local_part_id": 1,
+            "provider_batch_id": 1,
+            "stage": 1,
+            "status": 1,
+            "item_count": 1,
+            "input_bytes": 1,
+            "last_error": 1,
+            "provider_state": 1,
+        },
+    ).sort("created_at", 1).to_list(length=1000)
+
+    last_error = _fmt(doc.get("last_error"))
+    if not last_error:
+        for part in raw_parts:
+            last_error = _fmt(part.get("last_error"))
+            if last_error:
+                break
+            provider_state = part.get("provider_state")
+            if isinstance(provider_state, dict):
+                last_error = provider_batch_failure(provider_state)
+                if last_error:
+                    break
+
+    # Provider payloads can contain internal diagnostics.  Return only the
+    # stable public part contract after extracting the user-actionable reason.
+    parts = [
+        {key: value for key, value in part.items() if key != "provider_state"}
+        for part in raw_parts
+    ]
+    failure_contract = (
+        classify_economy_batch_failure(last_error)
+        if last_error
+        else {
+            "failure_code": None,
+            "retryable": True,
+            "operator_action": None,
+        }
+    )
+    return EconomyBatchResponse(
+        batch_group_id=str(doc.get("batch_group_id") or ""),
+        exam_id=str(doc.get("exam_id") or ""),
+        status=str(doc.get("status") or "queued"),
+        requested_count=int(doc.get("requested_count") or 0),
+        provider_request_count=int(doc.get("provider_request_count") or 0),
+        local_completed_count=int(doc.get("local_completed_count") or 0),
+        completed_count=int(doc.get("completed_count") or 0),
+        failed_count=int(doc.get("failed_count") or 0),
+        requested_at=_fmt(doc.get("requested_at")),
+        completed_at=_fmt(doc.get("completed_at")),
+        last_error=last_error,
+        failure_code=_fmt(doc.get("failure_code") or failure_contract.get("failure_code")),
+        retryable=bool(doc.get("retryable", failure_contract.get("retryable", True))),
+        operator_action=_fmt(
+            doc.get("operator_action") or failure_contract.get("operator_action")
+        ),
+        parts=parts,
+    )
 
 
 @router.get(
@@ -2235,10 +2380,282 @@ async def retry_exam_processing_job(
     return _processing_job_to_response(retried)
 
 
+@router.get(
+    "/{exam_id}/economy-batch",
+    response_model=Optional[EconomyBatchResponse],
+    summary="Get the latest discounted economy-check batch for an exam",
+)
+async def get_latest_economy_batch(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Optional[EconomyBatchResponse]:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
+    await _require_tutor_visibility(exam, current_user, db)
+    batch = await tenant_db["exampen_provider_batches"].find_one(
+        {"exam_id": exam_id},
+        sort=[("created_at", -1)],
+    )
+    return await _economy_batch_to_response(tenant_db, batch) if batch else None
+
+
+@router.post(
+    "/{exam_id}/economy-batch",
+    response_model=EconomyBatchResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Close answer-copy uploads and start discounted delayed AI checking",
+)
+async def start_economy_batch(
+    exam_id: str,
+    body: Optional[EconomyBatchStartRequest] = None,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> EconomyBatchResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
+    await _require_tutor_visibility(exam, current_user, db)
+    if str(exam.get("exam_type") or "") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Economy checking is available for PCR answer copies only",
+        )
+    if str(exam.get("checking_mode") or "immediate").strip().lower() != "economy":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This exam uses Immediate checking, so an Economy batch cannot be started",
+        )
+    _require_reprocessable_grading_contract(exam)
+    lifecycle_state = str(exam.get("lifecycle_state") or "draft")
+    close_collection_requested = bool(body and body.close_collection)
+    if lifecycle_state == "in_progress":
+        if not close_collection_requested:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Confirm that collection should close before starting economy checking",
+            )
+        now = datetime.now(timezone.utc)
+        closed = await tenant_db["exampen_exams"].find_one_and_update(
+            {"exam_id": exam_id, "lifecycle_state": "in_progress"},
+            {
+                "$set": {
+                    "lifecycle_state": "collection_closed",
+                    "collection_closed_at": now,
+                    "collection_closed_by": str(
+                        current_user.get("user_id")
+                        or current_user.get("tutor_id")
+                        or current_user.get("admin_id")
+                        or current_user.get("username")
+                        or "unknown"
+                    ),
+                    "updated_at": now,
+                }
+            },
+            return_document=ReturnDocument.AFTER,
+        )
+        if closed is None:
+            exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+            lifecycle_state = str((exam or {}).get("lifecycle_state") or "draft")
+            if lifecycle_state not in {"collection_closed", "uploading"}:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="The exam collection changed while it was being closed. Refresh and try again.",
+                )
+        else:
+            exam = closed
+            lifecycle_state = "collection_closed"
+            logger.info(
+                "Exam %s collection closed by %s while starting Economy checking",
+                exam_id,
+                str(closed.get("collection_closed_by") or "unknown"),
+            )
+    if lifecycle_state not in {"collection_closed", "uploading"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Close the live exam collection before starting economy checking",
+        )
+    requested_ids = [
+        str(value).strip()
+        for value in ((body.submission_ids if body else None) or [])
+        if str(value).strip()
+    ]
+    if len(requested_ids) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A maximum of 500 answer copies can be selected",
+        )
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or current_user.get("username")
+        or "unknown"
+    )
+    from services.exampen_upload_window import (
+        answer_copy_upload_is_open,
+        close_answer_copy_uploads,
+        reopen_answer_copy_uploads,
+    )
+
+    # This CAS closes the upload window, waits for any final canonical ingest,
+    # and advances collection_closed -> uploading before the Batch snapshot is
+    # selected.  New student/staff copies cannot race into this group.
+    upload_window_was_open = answer_copy_upload_is_open(exam)
+    exam = await close_answer_copy_uploads(
+        tenant_db,
+        exam_id=exam_id,
+        actor_id=actor_id,
+    )
+    from services.exampen_openai_batch import (
+        create_economy_batch_group,
+        prepare_economy_batch_group,
+    )
+
+    try:
+        group = await create_economy_batch_group(
+            tenant_db,
+            exam_id=exam_id,
+            db_name=str(current_user.get("db_name") or ""),
+            requested_by=actor_id,
+            submission_ids=requested_ids or None,
+        )
+    except ValueError as exc:
+        # A stale browser can ask to start after the last waiting job changed.
+        # Do not leave a previously open collection unexpectedly locked when
+        # no provider group was created.
+        if upload_window_was_open:
+            await reopen_answer_copy_uploads(
+                tenant_db,
+                exam_id=exam_id,
+                actor_id=actor_id,
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    if str(group.get("status") or "") == "queued":
+        dispatched = False
+        try:
+            from services.exampen_workflow import _celery_broker_available
+
+            if _celery_broker_available():
+                from celery_app import prepare_exampen_economy_batch
+
+                prepare_exampen_economy_batch.delay(
+                    str(current_user.get("db_name") or ""),
+                    str(group.get("batch_group_id") or ""),
+                )
+                dispatched = True
+        except Exception:
+            logger.exception("Could not dispatch economy Batch preparation through Celery")
+        if not dispatched:
+            # The durable queued group is still reconciled by Celery/beat after
+            # restart. This local task makes development usable without Redis.
+            asyncio.create_task(
+                prepare_economy_batch_group(
+                    tenant_db,
+                    batch_group_id=str(group.get("batch_group_id") or ""),
+                )
+            )
+    return await _economy_batch_to_response(tenant_db, group)
+
+
+@router.post(
+    "/{exam_id}/answer-copy-uploads/reopen",
+    response_model=ExamDetailResponse,
+    summary="Reopen answer-copy uploads for a later Economy batch",
+)
+async def reopen_exam_answer_copy_uploads(
+    exam_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> ExamDetailResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
+    await _require_tutor_visibility(exam, current_user, db)
+    if str(exam.get("exam_type") or "") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Answer-copy uploads can be reopened only for PCR exams",
+        )
+    active_batch = await tenant_db["exampen_provider_batches"].find_one(
+        {
+            "exam_id": exam_id,
+            "status": {
+                "$in": [
+                    "queued",
+                    "preparing",
+                    "provider_processing",
+                    "importing",
+                    "cancelling",
+                ]
+            },
+        },
+        {"batch_group_id": 1},
+    )
+    if active_batch is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Wait for the active economy check to finish or cancel it before reopening uploads",
+        )
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or current_user.get("username")
+        or "unknown"
+    )
+    from services.exampen_upload_window import reopen_answer_copy_uploads
+
+    updated = await reopen_answer_copy_uploads(
+        tenant_db,
+        exam_id=exam_id,
+        actor_id=actor_id,
+    )
+    return _doc_to_response(updated)
+
+
+@router.post(
+    "/{exam_id}/economy-batch/{batch_group_id}/cancel",
+    response_model=EconomyBatchResponse,
+    summary="Cancel unfinished economy-check provider batches",
+)
+async def cancel_economy_batch(
+    exam_id: str,
+    batch_group_id: str,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> EconomyBatchResponse:
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam = await tenant_db["exampen_exams"].find_one({"exam_id": exam_id})
+    if exam is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Exam {exam_id} not found")
+    await _require_tutor_visibility(exam, current_user, db)
+    owned_group = await tenant_db["exampen_provider_batches"].find_one(
+        {"batch_group_id": batch_group_id, "exam_id": exam_id}
+    )
+    if not owned_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Economy batch was not found")
+    from services.exampen_openai_batch import cancel_economy_batch_group
+
+    try:
+        group = await cancel_economy_batch_group(
+            tenant_db,
+            batch_group_id=batch_group_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return await _economy_batch_to_response(tenant_db, group)
+
+
 @router.post(
     "/{exam_id}/processing/batch",
     response_model=ProcessingBatchResponse,
-    summary="Queue AI checking for every unpublished submitted answer copy",
+    summary="Recheck explicitly selected unpublished answer copies",
 )
 async def batch_reprocess_exam_submissions(
     exam_id: str,
@@ -2261,7 +2678,7 @@ async def batch_reprocess_exam_submissions(
         for value in ((body.submission_ids if body else None) or [])
         if str(value).strip()
     }
-    if body and body.submission_ids is not None and not requested_submission_ids:
+    if not requested_submission_ids:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Choose at least one submitted answer copy",
@@ -2276,8 +2693,7 @@ async def batch_reprocess_exam_submissions(
         "exam_id": exam_id,
         "publication_status": {"$ne": "published"},
     }
-    if requested_submission_ids:
-        submission_filter["submission_id"] = {"$in": sorted(requested_submission_ids)}
+    submission_filter["submission_id"] = {"$in": sorted(requested_submission_ids)}
 
     submissions = await tenant_db["evalpen_submissions"].find(
         submission_filter,
@@ -2286,20 +2702,19 @@ async def batch_reprocess_exam_submissions(
             "student_id": 1,
         },
     ).to_list(length=5000)
-    if requested_submission_ids:
-        found_submission_ids = {
-            str(item.get("submission_id") or "").strip()
-            for item in submissions
-            if str(item.get("submission_id") or "").strip()
-        }
-        if requested_submission_ids - found_submission_ids:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "One or more selected answer copies are unavailable, already published, "
-                    "or do not belong to this exam"
-                ),
-            )
+    found_submission_ids = {
+        str(item.get("submission_id") or "").strip()
+        for item in submissions
+        if str(item.get("submission_id") or "").strip()
+    }
+    if requested_submission_ids - found_submission_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "One or more selected answer copies are unavailable, already published, "
+                "or do not belong to this exam"
+            ),
+        )
     jobs = await tenant_db["exampen_processing_jobs"].find(
         {"exam_id": exam_id}
     ).sort("created_at", -1).to_list(length=5000)

@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 
@@ -183,7 +183,14 @@ _COST_TABLE: Dict[str, tuple[float, float]] = {
 }
 
 
-def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float:
+def estimate_cost(
+    model_id: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_read_tokens: int = 0,
+    batch: bool = False,
+) -> float:
     """
     Estimate USD cost for a call.  Matches the longest prefix in the cost
     table so that e.g. ``gpt-4o-2024-08-06`` maps to ``gpt-4o``.
@@ -195,7 +202,18 @@ def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float
     if not best_match:
         return 0.0
     inp_rate, out_rate = _COST_TABLE[best_match]
-    return (input_tokens * inp_rate + output_tokens * out_rate) / 1_000_000
+    cached_tokens = min(max(0, int(cache_read_tokens or 0)), max(0, int(input_tokens or 0)))
+    uncached_tokens = max(0, int(input_tokens or 0)) - cached_tokens
+    # OpenAI's cached-input rate for the models used by ExamPen is one tenth
+    # of normal input. Other providers retain the conservative full-input
+    # estimate because their cache billing contracts differ.
+    cached_rate = inp_rate * 0.1 if best_match.startswith(("gpt-", "o1", "o3")) else inp_rate
+    transport_multiplier = 0.5 if batch else 1.0
+    return transport_multiplier * (
+        uncached_tokens * inp_rate
+        + cached_tokens * cached_rate
+        + max(0, int(output_tokens or 0)) * out_rate
+    ) / 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +407,54 @@ async def _call_openai_responses(
     if not responses_input:
         raise ValueError("responses_input must contain at least one item")
 
+    payload = build_openai_responses_payload(
+        model_id,
+        responses_input=responses_input,
+        json_schema=json_schema,
+        prompt_cache_key=prompt_cache_key,
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
+        temperature=temperature,
+    )
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        resp = await client.post(
+            f"{base_url}/responses",
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code >= 400:
+            provider_error = _provider_http_error(resp, provider="OpenAI Responses API")
+            logger.error(
+                "OpenAI Responses API error %s for model=%s: %s",
+                resp.status_code,
+                model_id,
+                str(provider_error),
+            )
+            raise provider_error
+        data = resp.json()
+
+    return provider_response_from_responses_body(data, fallback_model=model_id)
+
+
+def build_openai_responses_payload(
+    model_id: str,
+    *,
+    responses_input: List[Dict[str, Any]],
+    json_schema: Optional[Dict[str, Any]] = None,
+    prompt_cache_key: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build the canonical Responses request used by sync and Batch transports."""
+
+    if not responses_input:
+        raise ValueError("responses_input must contain at least one item")
     payload: Dict[str, Any] = {
         "model": model_id,
         "input": responses_input,
@@ -423,27 +489,15 @@ async def _call_openai_responses(
                 "schema": json_schema,
             }
         }
+    return payload
 
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
-        resp = await client.post(
-            f"{base_url}/responses",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        if resp.status_code >= 400:
-            provider_error = _provider_http_error(resp, provider="OpenAI Responses API")
-            logger.error(
-                "OpenAI Responses API error %s for model=%s: %s",
-                resp.status_code,
-                model_id,
-                str(provider_error),
-            )
-            raise provider_error
-        data = resp.json()
+
+def provider_response_from_responses_body(
+    data: Mapping[str, Any],
+    *,
+    fallback_model: str,
+) -> ProviderResponse:
+    """Normalize a synchronous or Batch `/v1/responses` response body."""
 
     output_text_parts: List[str] = []
     for output_item in data.get("output") or []:
@@ -469,7 +523,7 @@ async def _call_openai_responses(
         output_tokens=int(usage.get("output_tokens") or 0),
         cache_read_tokens=int(input_details.get("cached_tokens") or 0),
         cache_creation_tokens=0,
-        model=str(data.get("model") or model_id),
+        model=str(data.get("model") or fallback_model),
         completion_status=str(data.get("status") or "completed"),
         incomplete_reason=incomplete_reason,
         raw=data,

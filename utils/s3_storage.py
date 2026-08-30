@@ -268,6 +268,34 @@ async def delete_private_object(
         raise PrivateObjectStorageError("Private S3 delete failed") from exc
 
 
+async def private_object_exists(
+    storage_path: str,
+    *,
+    allowed_key_prefix: str | None = None,
+) -> bool:
+    """Verify a private S3 object exists without downloading student data."""
+
+    bucket, key = _parse_private_s3_path(
+        storage_path,
+        allowed_key_prefix=allowed_key_prefix,
+    )
+    client = _private_s3_client_or_raise()
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: client.head_object(Bucket=bucket, Key=key),
+        )
+        return True
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        error = response.get("Error") if isinstance(response, dict) else None
+        code = str((error or {}).get("Code") or "") if isinstance(error, dict) else ""
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        logger.error("Private S3 head failed for key %s: %s", key, exc)
+        raise PrivateObjectStorageError("Private S3 object could not be verified") from exc
+
+
 def create_private_download_url(
     storage_path: str,
     *,

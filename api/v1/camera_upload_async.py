@@ -11,9 +11,9 @@ Architecture:
     new-docs/api/copy-upload.openapi.yaml
 
 Ownership Declaration:
-    - Writes:  evalpen_answer_pages (via IngestService), exampen_camera_uploads (tracking)
+    - Writes:  evalpen_answer_pages (via IngestService), exampen_camera_uploads (tracking),
+               answer-copy ingest reservations on exampen_exams
     - Reads from: exampen_exams (lifecycle + exam_type validation)
-    - Never writes to: exampen_exams
 
 Hard constraints:
     - C1: MongoDB only
@@ -37,6 +37,11 @@ from pydantic import BaseModel, Field
 from core.database import DatabaseManager
 from core.upload_security.service import secure_upload
 from api.v1.auth_async import get_current_user, get_database
+from services.exampen_upload_window import (
+    answer_copy_upload_is_open,
+    release_answer_copy_ingest,
+    reserve_answer_copy_ingest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +188,14 @@ async def _require_camera_upload_context(
                 "this answer-copy upload"
             ),
         )
+    if not answer_copy_upload_is_open(exam_doc):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Answer-copy uploads are closed for this exam. Reopen uploads "
+                "before adding a late copy."
+            ),
+        )
     roster = [str(item) for item in (exam_doc.get("roster") or [])]
     if roster and student_id not in roster:
         raise HTTPException(
@@ -245,87 +258,104 @@ async def complete_camera_submission(
             detail="Exam is missing its canonical admin owner",
         )
 
-    try:
-        from api.v1._exampen_imports import load_exampen
-
-        IngestService = load_exampen("ingest.service").IngestService
-        service = IngestService(tenant_db)
-        await service.initialize()
-        result = await service.ingest_submission(
-            exam_id=exam_id,
-            student_id=student_id,
-            admin_id=canonical_admin_id,
-            source="camera",
-            pen_mac=None,
-            pages=[
-                {
-                    "page_number": page["page_number"],
-                    "raw_strokes": None,
-                    # OCR receives the protected local/S3 reference, not a
-                    # public URL and not a mutable client payload.
-                    "raw_image_ref": page.get("storage_path") or page.get("artifact_id"),
-                    "asset_sha256": page.get("content_hash"),
-                    "content_hash": page.get("content_hash"),
-                    "content_type": page.get("content_type"),
-                    "file_size_bytes": page.get("file_size_bytes"),
-                    "original_filename": page.get("original_filename"),
-                    "upload_id": page.get("upload_id"),
-                }
-                for page in pages
-            ],
-        )
-    except ImportError as exc:
-        logger.error("Camera canonical ingest is unavailable: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Camera ingestion is not available in this deployment",
-        )
-    except Exception as exc:
-        logger.exception("Camera submission ingest failed: exam=%s student=%s", exam_id, student_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not finalize the uploaded camera copy",
-        ) from exc
-
-    await camera_col.update_many(
-        {"exam_id": exam_id, "student_id": student_id},
-        {
-            "$set": {
-                "submission_id": result.submission_id,
-                "submission_completed_at": datetime.now(timezone.utc),
-            }
-        },
-    )
-
-    processing_job_id = None
-    processing_status = None
-    try:
-        from services.exampen_workflow import schedule_submission_processing
-
-        job = await schedule_submission_processing(
-            tenant_db,
-            db_name=str(current_user.get("db_name") or ""),
-            exam_id=exam_id,
-            submission_id=result.submission_id,
-            student_id=student_id,
-        )
-        processing_job_id = job.get("job_id")
-        processing_status = job.get("status")
-    except Exception:
-        # The canonical submission is durable and the reconciler can dispatch
-        # its persisted job later.  Surface the copy as accepted rather than
-        # inviting the invigilator to upload it again.
-        logger.exception("Unable to schedule camera PCR job for %s", result.submission_id)
-
-    return CameraSubmissionAck(
+    reservation_token = await reserve_answer_copy_ingest(
+        tenant_db,
         exam_id=exam_id,
-        student_id=student_id,
-        submission_id=result.submission_id,
-        page_count=len(pages),
-        processing_job_id=processing_job_id,
-        processing_status=processing_status,
-        accepted_at=datetime.now(timezone.utc).isoformat(),
+        actor_id=str(
+            current_user.get("user_id")
+            or current_user.get("tutor_id")
+            or current_user.get("admin_id")
+            or "staff-camera"
+        ),
     )
+    try:
+        try:
+            from api.v1._exampen_imports import load_exampen
+
+            IngestService = load_exampen("ingest.service").IngestService
+            service = IngestService(tenant_db)
+            await service.initialize()
+            result = await service.ingest_submission(
+                exam_id=exam_id,
+                student_id=student_id,
+                admin_id=canonical_admin_id,
+                source="camera",
+                pen_mac=None,
+                pages=[
+                    {
+                        "page_number": page["page_number"],
+                        "raw_strokes": None,
+                        # OCR receives the protected local/S3 reference, not a
+                        # public URL and not a mutable client payload.
+                        "raw_image_ref": page.get("storage_path") or page.get("artifact_id"),
+                        "asset_sha256": page.get("content_hash"),
+                        "content_hash": page.get("content_hash"),
+                        "content_type": page.get("content_type"),
+                        "file_size_bytes": page.get("file_size_bytes"),
+                        "original_filename": page.get("original_filename"),
+                        "upload_id": page.get("upload_id"),
+                    }
+                    for page in pages
+                ],
+            )
+        except ImportError as exc:
+            logger.error("Camera canonical ingest is unavailable: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Camera ingestion is not available in this deployment",
+            )
+        except Exception as exc:
+            logger.exception("Camera submission ingest failed: exam=%s student=%s", exam_id, student_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Could not finalize the uploaded camera copy",
+            ) from exc
+
+        await camera_col.update_many(
+            {"exam_id": exam_id, "student_id": student_id},
+            {
+                "$set": {
+                    "submission_id": result.submission_id,
+                    "submission_completed_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+
+        processing_job_id = None
+        processing_status = None
+        try:
+            from services.exampen_workflow import schedule_submission_processing
+
+            job = await schedule_submission_processing(
+                tenant_db,
+                db_name=str(current_user.get("db_name") or ""),
+                exam_id=exam_id,
+                submission_id=result.submission_id,
+                student_id=student_id,
+            )
+            processing_job_id = job.get("job_id")
+            processing_status = job.get("status")
+        except Exception:
+            # The canonical submission is durable and the reconciler can dispatch
+            # its persisted job later.  Surface the copy as accepted rather than
+            # inviting the invigilator to upload it again.
+            logger.exception("Unable to schedule camera PCR job for %s", result.submission_id)
+
+        return CameraSubmissionAck(
+            exam_id=exam_id,
+            student_id=student_id,
+            submission_id=result.submission_id,
+            page_count=len(pages),
+            processing_job_id=processing_job_id,
+            processing_status=processing_status,
+            accepted_at=datetime.now(timezone.utc).isoformat(),
+        )
+    finally:
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
 
 
 @router.post(
@@ -403,24 +433,64 @@ async def upload_complete_answer_copy(
         )
 
     from api.v1.evalpen_student_submission_async import (
+        STUDENT_COPY_UPLOADS_COLLECTION,
         _canonical_ingest,
         _cleanup_released_student_copy_paths,
         _delete_private_student_copy_objects,
+        _ensure_student_copy_indexes,
+        _mark_attempt_upload_failed,
         _queue_pcr_processing,
+        _reserve_student_copy_attempt,
         _secure_student_copy_pages,
+        _update_upload_verdict_storage,
     )
 
     attempt_id = f"staff-{uuid.uuid4().hex}"
+    actor_id = str(
+        current_user.get("user_id")
+        or current_user.get("tutor_id")
+        or current_user.get("admin_id")
+        or "staff"
+    )
+    upload_collection = tenant_db[STUDENT_COPY_UPLOADS_COLLECTION]
+    await _ensure_student_copy_indexes(upload_collection)
+    attempt_id = await _reserve_student_copy_attempt(
+        upload_collection,
+        attempt_id=attempt_id,
+        exam_id=exam_id,
+        student_id=student_id,
+        admin_id=canonical_admin_id,
+        submission_channel="staff_web",
+        submitted_by=actor_id,
+    )
     released_local_paths: List[str] = []
     uploaded_storage_paths: List[str] = []
+    verdict_transfers: List[Dict[str, str]] = []
+    storage_handoff_complete = False
+    reservation_active = False
+    try:
+        reservation_token = await reserve_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            actor_id=actor_id,
+            reservation_token=attempt_id,
+        )
+        reservation_active = True
+    except HTTPException as exc:
+        await _mark_attempt_upload_failed(
+            upload_collection,
+            attempt_id=attempt_id,
+            reason=str(exc.detail),
+        )
+        raise
     try:
         (
             page_records,
             source_format,
-            _original_asset,
+            original_asset,
             released_local_paths,
             uploaded_storage_paths,
-            _verdict_transfers,
+            verdict_transfers,
         ) = await _secure_student_copy_pages(
             image_files=image_files,
             answer_pdf=answer_pdf if has_pdf else None,
@@ -431,14 +501,60 @@ async def upload_complete_answer_copy(
             student_id=student_id,
             attempt_id=attempt_id,
             max_pages=max_pages,
-            upload_actor_id=str(
-                current_user.get("user_id")
-                or current_user.get("tutor_id")
-                or current_user.get("admin_id")
-                or "staff"
-            ),
+            upload_actor_id=actor_id,
             authorization_scope="staff-answer-copy",
         )
+        now = datetime.now(timezone.utc)
+        attempt_update = await upload_collection.update_one(
+            {"attempt_id": attempt_id, "status": "receiving"},
+            {
+                "$set": {
+                    "source_format": source_format,
+                    "storage_backend": "s3",
+                    "storage_handoff_status": "complete",
+                    "original_asset": original_asset,
+                    "pages": [
+                        {
+                            "page_number": page["page_number"],
+                            "storage_path": page["storage_path"],
+                            "original_filename": page.get("original_filename"),
+                            "upload_id": page.get("upload_id"),
+                            "content_hash": page.get("content_hash"),
+                            "content_type": page.get("content_type", "image/png"),
+                            "file_size_bytes": page.get("file_size_bytes"),
+                        }
+                        for page in page_records
+                    ],
+                    "page_count": len(page_records),
+                    "status": "received",
+                    "updated_at": now,
+                }
+            },
+        )
+        if attempt_update.matched_count != 1:
+            raise RuntimeError("Staff answer-copy upload ownership expired before ingest")
+        storage_handoff_complete = True
+
+        canonical_after_upload = await tenant_db["evalpen_submissions"].find_one(
+            {"exam_id": exam_id, "student_id": student_id},
+            {"submission_id": 1},
+        )
+        if canonical_after_upload is not None:
+            await upload_collection.update_one(
+                {"attempt_id": attempt_id, "status": "received"},
+                {
+                    "$set": {
+                        "status": "superseded",
+                        "submission_id": canonical_after_upload.get("submission_id"),
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A final answer copy was received for this student while the upload was being prepared",
+            )
+
         result = await _canonical_ingest(
             tenant_db,
             exam_id=exam_id,
@@ -447,11 +563,70 @@ async def upload_complete_answer_copy(
             pages=page_records,
             source="scan" if source_format == "pdf" else "camera",
         )
-    except HTTPException:
+        if getattr(result, "already_existed", False):
+            await upload_collection.update_one(
+                {"attempt_id": attempt_id, "status": "received"},
+                {
+                    "$set": {
+                        "status": "superseded",
+                        "submission_id": result.submission_id,
+                        "updated_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A final answer copy was received for this student while the upload was being prepared",
+            )
+    except HTTPException as exc:
         await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
+        if reservation_active:
+            await release_answer_copy_ingest(
+                tenant_db,
+                exam_id=exam_id,
+                reservation_token=reservation_token,
+            )
+            reservation_active = False
+        await upload_collection.update_one(
+            {"attempt_id": attempt_id, "status": {"$in": ["receiving", "received"]}},
+            {
+                "$set": {
+                    "status": "ingest_failed" if storage_handoff_complete else "upload_failed",
+                    "last_error": str(exc.detail)[:500],
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
         raise
     except Exception as exc:
         await _delete_private_student_copy_objects(uploaded_storage_paths)
+        await _update_upload_verdict_storage(
+            tenant_db,
+            transfers=verdict_transfers,
+            status_value="failed",
+        )
+        if reservation_active:
+            await release_answer_copy_ingest(
+                tenant_db,
+                exam_id=exam_id,
+                reservation_token=reservation_token,
+            )
+            reservation_active = False
+        await upload_collection.update_one(
+            {"attempt_id": attempt_id, "status": {"$in": ["receiving", "received"]}},
+            {
+                "$set": {
+                    "status": "ingest_failed" if storage_handoff_complete else "upload_failed",
+                    "last_error": str(exc)[:500],
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
         logger.exception(
             "Staff answer-copy ingest failed: exam=%s student=%s",
             exam_id,
@@ -462,7 +637,23 @@ async def upload_complete_answer_copy(
             detail="Could not create the canonical answer-copy submission",
         ) from exc
     finally:
-        await _cleanup_released_student_copy_paths(released_local_paths)
+        cleanup_failures = await _cleanup_released_student_copy_paths(released_local_paths)
+        if storage_handoff_complete:
+            cleanup_update: Dict[str, Any] = {
+                "$set": {
+                    "local_scan_cleanup_status": "failed" if cleanup_failures else "complete",
+                    "local_scan_cleanup_failed_count": len(cleanup_failures),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            }
+            if cleanup_failures:
+                cleanup_update["$set"]["local_scan_cleanup_pending_paths"] = cleanup_failures
+            else:
+                cleanup_update["$unset"] = {"local_scan_cleanup_pending_paths": ""}
+            await upload_collection.update_one(
+                {"attempt_id": attempt_id},
+                cleanup_update,
+            )
 
     processing_job_id = None
     processing_status = None
@@ -480,6 +671,29 @@ async def upload_complete_answer_copy(
         logger.exception(
             "Unable to schedule staff-uploaded PCR copy %s",
             result.submission_id,
+        )
+        processing_status = "enqueue_failed"
+
+    await upload_collection.update_one(
+        {"attempt_id": attempt_id, "status": "received"},
+        {
+            "$set": {
+                "status": "queued",
+                "submission_id": result.submission_id,
+                "processing_job_id": processing_job_id,
+                "processing_status": processing_status,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+    # The copy and its economy/immediate processing job are now visible as one
+    # fenced operation to a concurrently starting Batch snapshot.
+    if reservation_active:
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
         )
 
     return CameraSubmissionAck(
@@ -535,106 +749,117 @@ async def upload_camera_page(
             detail="Camera source must be 'camera' or 'photographed_copy'",
         )
 
-    clean_upload = await secure_upload(
-        file=image,
-        policy_id="camera_answer_image",
-        actor=current_user,
-        db=db,
-        purpose_metadata={
-            "purpose": "camera_answer_image",
-            "collection": "exampen_camera_uploads",
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "page_number": page_num,
-            "created_by": current_user.get("user_id", "unknown"),
-        },
-        authorization_subject=f"camera:{exam_id}:{student_id}:{page_num}",
+    reservation_token = await reserve_answer_copy_ingest(
+        tenant_db,
+        exam_id=exam_id,
+        actor_id=str(
+            current_user.get("user_id")
+            or current_user.get("tutor_id")
+            or current_user.get("admin_id")
+            or "staff-camera"
+        ),
     )
-
-    content_hash = clean_upload.sha256
-
-    camera_col = tenant_db["exampen_camera_uploads"]
-    await _ensure_indexes(camera_col)
-
-    # Deduplication check
-    existing = await camera_col.find_one({
-        "exam_id": exam_id,
-        "student_id": student_id,
-        "page_number": page_num,
-    })
-
-    if existing:
-        if str(existing.get("content_hash") or "") != content_hash:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "This page number already contains different image bytes. "
-                    "Remove or explicitly replace the existing draft page before completing the copy."
-                ),
-            )
-        # Same bytes for the same page — return an idempotent acknowledgement.
-        return CameraUploadAck(
-            artifact_id=existing.get("artifact_id", str(existing["_id"])),
-            exam_id=exam_id,
-            student_id=student_id,
-            page_number=page_num,
-            exam_type="pcr",
-            routed_engine="pcr",
-            deduplicated=True,
-            accepted_at=_fmt(existing.get("uploaded_at")) or datetime.now(timezone.utc).isoformat(),
+    try:
+        clean_upload = await secure_upload(
+            file=image,
+            policy_id="camera_answer_image",
+            actor=current_user,
+            db=db,
+            purpose_metadata={
+                "purpose": "camera_answer_image",
+                "collection": "exampen_camera_uploads",
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "page_number": page_num,
+                "created_by": current_user.get("user_id", "unknown"),
+            },
+            authorization_subject=f"camera:{exam_id}:{student_id}:{page_num}",
         )
 
-    now = datetime.now(timezone.utc)
-    artifact_id = f"cam-{exam_id}-{student_id}-p{page_num}"
+        content_hash = clean_upload.sha256
+        camera_col = tenant_db["exampen_camera_uploads"]
+        await _ensure_indexes(camera_col)
+        existing = await camera_col.find_one(
+            {
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "page_number": page_num,
+            }
+        )
 
-    # Store image artifact reference
-    # Actual image bytes would go to S3/GridFS in production;
-    # here we store the hash and metadata for canonical tracking.
-    doc = {
-        "artifact_id": artifact_id,
-        "exam_id": exam_id,
-        "student_id": student_id,
-        "page_number": page_num,
-        "source": source,
-        "captured_by": "mobile",
-        "content_hash": content_hash,
-        "content_type": clean_upload.content_type or "image/jpeg",
-        "file_size_bytes": clean_upload.size_bytes,
-        "original_filename": clean_upload.original_filename,
-        "upload_id": clean_upload.upload_id,
-        "storage_path": clean_upload.released_storage_path,
-        "uploaded_by": current_user.get("user_id", "unknown"),
-        "uploaded_at": now,
-        "routed_engine": "pcr",
-    }
-
-    try:
-        await camera_col.insert_one(doc)
-    except Exception as exc:
-        if hasattr(exc, "code") and exc.code == 11000:
+        if existing:
+            if str(existing.get("content_hash") or "") != content_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "This page number already contains different image bytes. "
+                        "Remove or explicitly replace the existing draft page before completing the copy."
+                    ),
+                )
             return CameraUploadAck(
-                artifact_id=artifact_id,
+                artifact_id=existing.get("artifact_id", str(existing["_id"])),
                 exam_id=exam_id,
                 student_id=student_id,
                 page_number=page_num,
                 exam_type="pcr",
                 routed_engine="pcr",
                 deduplicated=True,
-                accepted_at=now.isoformat(),
+                accepted_at=_fmt(existing.get("uploaded_at")) or datetime.now(timezone.utc).isoformat(),
             )
-        raise
 
-    return CameraUploadAck(
-        artifact_id=artifact_id,
-        exam_id=exam_id,
-        student_id=student_id,
-        page_number=page_num,
-        exam_type="pcr",
-        routed_engine="pcr",
-        deduplicated=False,
-        accepted_at=now.isoformat(),
-        completion_required=True,
-    )
+        now = datetime.now(timezone.utc)
+        artifact_id = f"cam-{exam_id}-{student_id}-p{page_num}"
+        doc = {
+            "artifact_id": artifact_id,
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "page_number": page_num,
+            "source": source,
+            "captured_by": "mobile",
+            "content_hash": content_hash,
+            "content_type": clean_upload.content_type or "image/jpeg",
+            "file_size_bytes": clean_upload.size_bytes,
+            "original_filename": clean_upload.original_filename,
+            "upload_id": clean_upload.upload_id,
+            "storage_path": clean_upload.released_storage_path,
+            "uploaded_by": current_user.get("user_id", "unknown"),
+            "uploaded_at": now,
+            "routed_engine": "pcr",
+        }
+
+        try:
+            await camera_col.insert_one(doc)
+        except Exception as exc:
+            if hasattr(exc, "code") and exc.code == 11000:
+                return CameraUploadAck(
+                    artifact_id=artifact_id,
+                    exam_id=exam_id,
+                    student_id=student_id,
+                    page_number=page_num,
+                    exam_type="pcr",
+                    routed_engine="pcr",
+                    deduplicated=True,
+                    accepted_at=now.isoformat(),
+                )
+            raise
+
+        return CameraUploadAck(
+            artifact_id=artifact_id,
+            exam_id=exam_id,
+            student_id=student_id,
+            page_number=page_num,
+            exam_type="pcr",
+            routed_engine="pcr",
+            deduplicated=False,
+            accepted_at=now.isoformat(),
+            completion_required=True,
+        )
+    finally:
+        await release_answer_copy_ingest(
+            tenant_db,
+            exam_id=exam_id,
+            reservation_token=reservation_token,
+        )
 
 
 @router.get(

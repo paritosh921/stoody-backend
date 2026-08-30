@@ -42,7 +42,14 @@ from .models import (
     TokenUsageLogEntry,
     UnregisteredCallerError,
 )
-from .provider import ProviderResponse, call_provider, estimate_cost, estimate_tokens, estimate_tokens_for_messages
+from .provider import (
+    ProviderResponse,
+    build_openai_responses_payload,
+    call_provider,
+    estimate_cost,
+    estimate_tokens,
+    estimate_tokens_for_messages,
+)
 from .repository import GateRepository
 
 logger = logging.getLogger(__name__)
@@ -229,7 +236,12 @@ class LLMGate:
 
         # ── Compute usage metadata ──────────────────────────────────────
         total_tokens = provider_resp.input_tokens + provider_resp.output_tokens
-        cost = estimate_cost(model_id, provider_resp.input_tokens, provider_resp.output_tokens)
+        cost = estimate_cost(
+            model_id,
+            provider_resp.input_tokens,
+            provider_resp.output_tokens,
+            cache_read_tokens=provider_resp.cache_read_tokens,
+        )
         now = datetime.utcnow()
 
         usage = TokenUsage(
@@ -277,6 +289,120 @@ class LLMGate:
             completion_status=provider_resp.completion_status,
             incomplete_reason=provider_resp.incomplete_reason,
         )
+
+    async def prepare_batch_responses_call(
+        self,
+        model_id: str,
+        prompt: str,
+        caller_id: str,
+        *,
+        responses_input: List[Dict[str, Any]],
+        json_schema: Optional[Dict[str, Any]] = None,
+        prompt_cache_key: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Authorize and build one delayed `/v1/responses` Batch request.
+
+        Batch work still passes the same caller allow-list, per-call limits and
+        tenant budgets as an immediate call. Usage is appended later, when the
+        provider result is imported, because only then are actual tokens known.
+        """
+
+        if caller_id not in ALLOWED_CALLER_IDS:
+            raise UnregisteredCallerError(caller_id)
+        estimated_input = estimate_tokens_for_messages(
+            prompt,
+            None,
+            responses_input,
+        )
+        config = await self._repo.get_config()
+        BudgetChecker.check_per_call_input(config, estimated_input)
+        BudgetChecker.check_per_call_output(config, max_output_tokens)
+        effective_max_output = max_output_tokens
+        if effective_max_output is None and config.max_output_tokens is not None:
+            effective_max_output = config.max_output_tokens
+        await self._budget.check_budgets(config)
+        return build_openai_responses_payload(
+            model_id,
+            responses_input=responses_input,
+            json_schema=json_schema,
+            prompt_cache_key=prompt_cache_key,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=effective_max_output,
+            temperature=temperature,
+        )
+
+    async def record_batch_response(
+        self,
+        *,
+        requested_model_id: str,
+        caller_id: str,
+        provider_response: ProviderResponse,
+        metadata: Optional[Dict[str, Any]] = None,
+        persist_log: bool = True,
+    ) -> GateResponse:
+        """Record actual usage for one successfully imported Batch item."""
+
+        if caller_id not in ALLOWED_CALLER_IDS:
+            raise UnregisteredCallerError(caller_id)
+        total_tokens = provider_response.input_tokens + provider_response.output_tokens
+        cost = estimate_cost(
+            requested_model_id,
+            provider_response.input_tokens,
+            provider_response.output_tokens,
+            cache_read_tokens=provider_response.cache_read_tokens,
+            batch=True,
+        )
+        now = datetime.utcnow()
+        usage = TokenUsage(
+            model=provider_response.model or requested_model_id,
+            caller=caller_id,
+            input_tokens=provider_response.input_tokens,
+            output_tokens=provider_response.output_tokens,
+            cache_read_tokens=provider_response.cache_read_tokens,
+            cache_creation_tokens=provider_response.cache_creation_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=cost,
+            timestamp=now,
+        )
+        log_metadata = dict(metadata or {})
+        log_metadata["billing_mode"] = "openai_batch"
+        try:
+            if persist_log:
+                await self._repo.append_log(
+                    TokenUsageLogEntry(
+                        model=usage.model,
+                        caller=usage.caller,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cache_read_tokens=usage.cache_read_tokens,
+                        cache_creation_tokens=usage.cache_creation_tokens,
+                        total_tokens=usage.total_tokens,
+                        estimated_cost_usd=usage.estimated_cost_usd,
+                        called_at=now,
+                        metadata=log_metadata,
+                    )
+                )
+        except Exception:
+            logger.exception(
+                "GATE-03: Failed to persist Batch token usage for caller=%s model=%s",
+                caller_id,
+                requested_model_id,
+            )
+        return GateResponse(
+            content=provider_response.content,
+            usage=usage,
+            completion_status=provider_response.completion_status,
+            incomplete_reason=provider_response.incomplete_reason,
+        )
+
+    async def check_batch_reservation(self, reserved_tokens: int) -> None:
+        """Check a delayed group's upper-bound tokens against tenant budgets."""
+
+        config = await self._repo.get_config()
+        await self._budget.check_reservation(config, reserved_tokens)
 
     # ------------------------------------------------------------------
     # Repository access (for rollup jobs and usage APIs)

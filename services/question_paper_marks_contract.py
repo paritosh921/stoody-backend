@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import math
 import re
+import hashlib
+import json
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -299,4 +301,134 @@ def summarize_question_marks(
         "calculated_total": calculated,
         "expected_total": expected,
         "reconciled": reconciled,
+    }
+
+
+def expected_paper_total(
+    document: Dict[str, Any],
+    questions: Iterable[Dict[str, Any]],
+) -> Optional[float]:
+    """Return the paper-level total that question marks must reconcile with.
+
+    A teacher-confirmed document total is the authority. Until a teacher makes
+    that decision, retain the total extracted from the paper instead of
+    silently replacing it with the sum of the questions.
+    """
+
+    source = str(document.get("total_points_source") or "").strip().lower()
+    if source == "teacher":
+        teacher_total = positive_marks(document.get("total_points"))
+        if teacher_total is not None:
+            return teacher_total
+
+    document_summary = document.get("marks_extraction_summary")
+    if isinstance(document_summary, dict):
+        extracted_total = positive_marks(document_summary.get("expected_total"))
+        if extracted_total is not None:
+            return extracted_total
+
+    for question in questions:
+        metadata = question.get("metadata")
+        paper_summary = metadata.get("paper_marks_summary") if isinstance(metadata, dict) else None
+        if not isinstance(paper_summary, dict):
+            continue
+        extracted_total = positive_marks(paper_summary.get("expected_total"))
+        if extracted_total is not None:
+            return extracted_total
+
+    return None
+
+
+def paper_marks_issue_fingerprint(
+    document_id: Any,
+    questions: Iterable[Dict[str, Any]],
+    *,
+    expected_total: Any,
+) -> str:
+    """Fingerprint the exact marks state shown to the resolving teacher."""
+
+    rows = []
+    for index, question in enumerate(questions, start=1):
+        metadata = question.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        rows.append(
+            {
+                "id": str(question.get("id") or question.get("question_id") or index),
+                "number": question.get("question_number") or question.get("extraction_order") or index,
+                "marks": effective_question_marks(question),
+                "status": question_marks_status(question),
+                "source": str(metadata.get("marks_source") or ""),
+            }
+        )
+    rows.sort(key=lambda row: (str(row["number"]), row["id"]))
+    payload = {
+        "document_id": str(document_id or ""),
+        "expected_total": positive_marks(expected_total),
+        "questions": rows,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_paper_total_mismatch_issue(
+    document: Dict[str, Any],
+    questions: Iterable[Dict[str, Any]],
+    marks_summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build the actionable paper-level issue for an authoritative mismatch."""
+
+    expected = positive_marks(marks_summary.get("expected_total"))
+    calculated = positive_marks(marks_summary.get("calculated_total"))
+    if (
+        marks_summary.get("reconciled") is not False
+        or expected is None
+        or calculated is None
+        or int(marks_summary.get("unresolved_count") or 0) > 0
+        or int(marks_summary.get("provisional_count") or 0) > 0
+    ):
+        return None
+
+    question_list = list(questions)
+    source = str(document.get("total_points_source") or "").strip().lower()
+    paper_total_label = "Teacher-confirmed paper total" if source == "teacher" else "Printed paper total"
+    fingerprint = paper_marks_issue_fingerprint(
+        document.get("document_id"),
+        question_list,
+        expected_total=expected,
+    )
+    return {
+        "id": f"paper-total-mismatch:{fingerprint[:16]}",
+        "code": "PAPER_TOTAL_MISMATCH",
+        "severity": "blocking",
+        "scope": "paper",
+        "title": "Marks total mismatch",
+        "message": (
+            f"{paper_total_label} is {expected:g}, but the question marks add to {calculated:g}. "
+            "Confirm the intended paper total or review the individual question marks."
+        ),
+        "fingerprint": fingerprint,
+        "evidence": {
+            "paper_total": expected,
+            "paper_total_label": paper_total_label,
+            "question_total": calculated,
+            "difference": calculated - expected,
+            "question_count": int(marks_summary.get("question_count") or len(question_list)),
+        },
+        "allowed_actions": [
+            {
+                "id": "save_question_marks",
+                "label": "Correct question marks",
+                "kind": "resolution",
+            },
+            {
+                "id": "confirm_question_total",
+                "label": f"Confirm {calculated:g} as paper total",
+                "kind": "resolution",
+            },
+            {
+                "id": "review_question_marks",
+                "label": "Review question marks",
+                "kind": "navigation",
+            },
+        ],
     }

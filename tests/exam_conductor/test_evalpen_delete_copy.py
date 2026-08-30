@@ -87,6 +87,10 @@ async def test_delete_copy_clears_complete_active_lifecycle_and_keeps_exam_paper
             "exam_id": submission["exam_id"],
             "student_id": submission["student_id"],
             "status": "submitted",
+            "original_asset": {
+                "storage_path": "s3://test/private/exampen/student-answer-copies/original.pdf",
+                "content_type": "application/pdf",
+            },
         }
     )
     await db["exampen_camera_uploads"].insert_one(
@@ -107,7 +111,7 @@ async def test_delete_copy_clears_complete_active_lifecycle_and_keeps_exam_paper
     with patch(
         "services.exampen_submission_deletion._cleanup_storage_paths",
         new=AsyncMock(return_value={"deleted": ["page-1"], "failed": [], "skipped": []}),
-    ):
+    ) as cleanup_storage:
         result = await delete_submission_copy(
             db,
             submission,
@@ -118,6 +122,9 @@ async def test_delete_copy_clears_complete_active_lifecycle_and_keeps_exam_paper
         )
 
     assert result["status"] == "deleted"
+    cleanup_paths = set(cleanup_storage.await_args.args[0])
+    assert "s3://test/private/exampen/student-answer-copies/page-1.png" in cleanup_paths
+    assert "s3://test/private/exampen/student-answer-copies/original.pdf" in cleanup_paths
     for collection_name in (
         "evalpen_submissions",
         "evalpen_answer_pages",

@@ -11,7 +11,7 @@ import os
 import json
 import re
 import io
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -30,6 +30,7 @@ from slowapi.util import get_remote_address
 import aiofiles
 from bson import ObjectId as BsonObjectId
 from pymongo import ReturnDocument
+from pymongo.errors import PyMongoError
 
 from core.database import DatabaseManager
 from core.cache import CacheManager
@@ -77,8 +78,11 @@ from services.question_marking_contract import (
     supports_negative_marking,
 )
 from services.question_paper_marks_contract import (
+    build_paper_total_mismatch_issue,
     effective_question_marks,
+    expected_paper_total,
     extracted_marks_metadata,
+    paper_marks_issue_fingerprint,
     positive_marks,
     project_question_marks_for_authoring,
     summarize_question_marks,
@@ -195,6 +199,25 @@ class PCRMarkingPlanDraftRequest(BaseModel):
     """
 
     mappingId: Optional[str] = Field(default=None, max_length=512)
+
+
+class PaperMarksQuestionCorrection(BaseModel):
+    """One teacher-reviewed question-mark correction."""
+
+    question_id: str = Field(min_length=1, max_length=512)
+    points: float = Field(gt=0, le=10000)
+
+
+class PaperMarksResolutionRequest(BaseModel):
+    """Resolve one exact paper-total mismatch reviewed by a teacher."""
+
+    action: Literal["confirm_question_total", "save_question_marks"]
+    issue_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    question_marks: List[PaperMarksQuestionCorrection] = Field(
+        default_factory=list,
+        max_length=10000,
+    )
+    note: Optional[str] = Field(default=None, max_length=500)
 
 class QuestionImage(BaseModel):
     id: str
@@ -377,18 +400,7 @@ async def _prepare_pcr_finalization(
         document_id=str(document.get("document_id") or ""),
         questions=questions,
     )
-    expected_total = (
-        document.get("total_points")
-        if str(document.get("total_points_source") or "").lower() == "teacher"
-        else None
-    )
-    if expected_total is None:
-        for question in finalized_questions:
-            metadata = question.get("metadata")
-            paper_summary = metadata.get("paper_marks_summary") if isinstance(metadata, dict) else None
-            if isinstance(paper_summary, dict) and paper_summary.get("expected_total") is not None:
-                expected_total = paper_summary.get("expected_total")
-                break
+    expected_total = expected_paper_total(document, finalized_questions)
     marks_summary = summarize_question_marks(
         finalized_questions,
         expected_total=expected_total,
@@ -406,6 +418,7 @@ async def _prepare_pcr_finalization(
     marking_errors = validate_pcr_questions(
         finalized_questions,
         marking_policy=marking_policy,
+        expected_total=expected_total,
     )
     regions_document = await tenant_db["document_regions"].find_one(
         _document_regions_filter(str(document.get("document_id") or ""), "question")
@@ -448,6 +461,71 @@ def _public_pcr_finalization_readiness(
         "verified_question_regions",
         "full_document_visual",
     }
+    mismatch_issue = build_paper_total_mismatch_issue(document, questions, marks_summary)
+    issues: List[Dict[str, Any]] = []
+    if mismatch_issue:
+        issues.append(mismatch_issue)
+
+    def append_message_issue(message: str, *, severity: str) -> None:
+        lower = message.lower()
+        if mismatch_issue and "question marks total" in lower and "paper total" in lower:
+            return
+        code = "FINALIZATION_BLOCKER" if severity == "blocking" else "READINESS_WARNING"
+        title = "Paper setup needs review" if severity == "blocking" else "Review recommended"
+        allowed_actions: List[Dict[str, str]] = []
+        if "marking plan" in lower or "marking criteria" in lower or "criterion" in lower:
+            code = "MARKING_PLAN_INCOMPLETE"
+            title = "Marking plan incomplete"
+            allowed_actions.append({"id": "review_marking_plan", "label": "Review marking plan", "kind": "navigation"})
+        elif "answer mapping" in lower or "approved solution" in lower:
+            code = "ANSWER_MAPPING_INCOMPLETE"
+            title = "Answer mapping needs review"
+            allowed_actions.append({"id": "review_answer_mapping", "label": "Review answers", "kind": "navigation"})
+        elif "ocr" in lower or "layout" in lower or "region" in lower or "paper evidence" in lower:
+            code = "PAPER_EVIDENCE_INCOMPLETE"
+            title = "Paper evidence needs review"
+            allowed_actions.append({"id": "review_paper_regions", "label": "Review paper regions", "kind": "navigation"})
+        elif lower.startswith("q ") or "question" in lower:
+            code = "QUESTION_REVIEW_REQUIRED"
+            title = "Question needs review"
+            allowed_actions.append({"id": "review_questions", "label": "Review questions", "kind": "navigation"})
+        issue_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{document.get('document_id')}:{severity}:{code}:{message}",
+        ).hex
+        issues.append(
+            {
+                "id": f"{code.lower()}:{issue_id[:16]}",
+                "code": code,
+                "severity": severity,
+                "scope": "question" if lower.startswith("q ") else "paper",
+                "title": title,
+                "message": message,
+                "allowed_actions": allowed_actions,
+            }
+        )
+
+    for error in errors:
+        append_message_issue(str(error), severity="blocking")
+    for warning in warnings:
+        append_message_issue(str(warning), severity="warning")
+
+    unresolved_marks = int(marks_summary.get("unresolved_count") or 0)
+    provisional_marks = int(marks_summary.get("provisional_count") or 0)
+    marks_ready = unresolved_marks == 0 and mismatch_issue is None
+    marks_review_required = bool(
+        marks_summary.get("review_required_count")
+        or mismatch_issue
+    )
+    if mismatch_issue:
+        marks_detail = mismatch_issue["message"]
+    elif unresolved_marks:
+        marks_detail = f"{unresolved_marks} question(s) need marks before finalization"
+    elif provisional_marks:
+        marks_detail = f"{provisional_marks} question(s) provisionally use 1 mark — review recommended"
+    else:
+        marks_detail = "Printed or teacher-confirmed question marks are ready"
+
     return {
         "document_id": document.get("document_id"),
         "exam_mode": document.get("exam_mode"),
@@ -457,6 +535,11 @@ def _public_pcr_finalization_readiness(
         "question_count": len(questions),
         "errors": errors,
         "warnings": warnings,
+        "issues": issues,
+        "issue_counts": {
+            "blocking": sum(1 for issue in issues if issue.get("severity") == "blocking"),
+            "warning": sum(1 for issue in issues if issue.get("severity") == "warning"),
+        },
         "marking_plan": marking_plan,
         "marks_summary": marks_summary,
         "paper_context": preflight.get("paper_context") or {},
@@ -480,13 +563,9 @@ def _public_pcr_finalization_readiness(
             {
                 "id": "marks",
                 "label": "Question marks",
-                "ready": True,
-                "review_required": bool(marks_summary.get("review_required_count")),
-                "detail": (
-                    f"{int(marks_summary.get('provisional_count') or 0)} question(s) provisionally use 1 mark — review recommended"
-                    if marks_summary.get("review_required_count")
-                    else "Printed or teacher-confirmed question marks are ready"
-                ),
+                "ready": marks_ready,
+                "review_required": marks_review_required,
+                "detail": marks_detail,
             },
             {
                 "id": "marking-plan",
@@ -6215,6 +6294,380 @@ async def draft_pcr_marking_plan(
     }
 
 
+async def _resolve_paper_total_in_session(
+    tenant_db: Any,
+    *,
+    document_id: str,
+    body: PaperMarksResolutionRequest,
+    actor_id: Any,
+    session: Any = None,
+) -> Dict[str, Any]:
+    """Apply one reviewed marks resolution inside the caller's transaction."""
+
+    session_kwargs = {"session": session} if session is not None else {}
+    document = await tenant_db["documents"].find_one(
+        {"document_id": document_id},
+        **session_kwargs,
+    )
+    if not document:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+    if document.get("exam_mode") != "pcr":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Paper-total review is available only for PCR exam documents",
+        )
+    _require_document_authoring_unlocked(document)
+    if document.get("exam_finalization_status") == "processing":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "PAPER_FINALIZATION_IN_PROGRESS",
+                "message": "This paper is currently being finalized. Refresh before resolving its marks.",
+            },
+        )
+
+    questions = await tenant_db["questions"].find(
+        {"document_id": document_id},
+        **session_kwargs,
+    ).to_list(length=10000)
+    if not questions:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "NO_QUESTIONS",
+                "message": "No questions are available to reconcile.",
+            },
+        )
+
+    expected_total = expected_paper_total(document, questions)
+    marks_summary = summarize_question_marks(questions, expected_total=expected_total)
+    issue = build_paper_total_mismatch_issue(document, questions, marks_summary)
+    current_fingerprint = paper_marks_issue_fingerprint(
+        document_id,
+        questions,
+        expected_total=expected_total,
+    )
+    if body.issue_fingerprint != current_fingerprint:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "STALE_READINESS_ISSUE",
+                "message": "The paper marks changed after this issue was opened. Refresh and review the latest totals.",
+            },
+        )
+    if issue is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "ISSUE_ALREADY_RESOLVED",
+                "message": "This marks-total mismatch is no longer present. Refresh the paper review.",
+            },
+        )
+
+    resolved_at = datetime.utcnow()
+    question_mark_changes: List[Dict[str, Any]] = []
+    proposed_questions = list(questions)
+
+    if body.action == "save_question_marks":
+        if not body.question_marks:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "QUESTION_MARKS_REQUIRED",
+                    "message": "Change at least one question mark before saving.",
+                },
+            )
+
+        correction_ids = [item.question_id for item in body.question_marks]
+        if len(set(correction_ids)) != len(correction_ids):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "DUPLICATE_QUESTION_MARKS",
+                    "message": "Each question can appear only once in a marks correction.",
+                },
+            )
+
+        questions_by_id = {
+            str(question.get("id") or question.get("question_id") or ""): question
+            for question in questions
+        }
+        unknown_ids = sorted(set(correction_ids) - set(questions_by_id))
+        if unknown_ids:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "QUESTION_NOT_IN_PAPER",
+                    "message": "One or more corrected questions are no longer part of this paper. Refresh and try again.",
+                    "question_ids": unknown_ids[:20],
+                },
+            )
+
+        corrections = {item.question_id: float(item.points) for item in body.question_marks}
+        proposed_questions = []
+        for question in questions:
+            question_key = str(question.get("id") or question.get("question_id") or "")
+            proposed = dict(question)
+            if question_key in corrections:
+                previous_points = positive_marks(effective_question_marks(question))
+                corrected_points = corrections[question_key]
+                if previous_points is None or abs(previous_points - corrected_points) > 1e-9:
+                    proposed_metadata = teacher_confirmed_marks_metadata(
+                        question.get("metadata"),
+                        actor_id=actor_id,
+                        confirmed_at=resolved_at,
+                    )
+                    proposed["points"] = corrected_points
+                    proposed["metadata"] = proposed_metadata
+                    question_mark_changes.append(
+                        {
+                            "question_id": question_key,
+                            "question_number": question.get("question_number")
+                            or question.get("extraction_order"),
+                            "previous_points": previous_points,
+                            "corrected_points": corrected_points,
+                        }
+                    )
+            proposed_questions.append(proposed)
+
+        if not question_mark_changes:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "QUESTION_MARKS_UNCHANGED",
+                    "message": "The entered marks are the same as the saved marks.",
+                },
+            )
+
+        resolved_summary = summarize_question_marks(
+            proposed_questions,
+            expected_total=expected_total,
+        )
+        if resolved_summary.get("reconciled") is not True:
+            proposed_total = positive_marks(resolved_summary.get("calculated_total"))
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "QUESTION_MARKS_STILL_MISMATCH",
+                    "message": (
+                        f"The corrected question marks add to {float(proposed_total or 0):g}, "
+                        f"but the paper total is {float(expected_total or 0):g}."
+                    ),
+                    "evidence": {
+                        "paper_total": expected_total,
+                        "question_total": proposed_total,
+                    },
+                },
+            )
+        confirmed_total = positive_marks(expected_total)
+        if confirmed_total is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "PAPER_TOTAL_MISSING",
+                    "message": "The paper total is missing. Review the paper before correcting question marks.",
+                },
+            )
+        response_message = (
+            f"Question marks saved. They now match the paper total of {confirmed_total:g}."
+        )
+    else:
+        calculated_total = positive_marks(marks_summary.get("calculated_total"))
+        if calculated_total is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "QUESTION_MARKS_INCOMPLETE",
+                    "message": "Every question must have valid marks before the question total can be confirmed.",
+                },
+            )
+        confirmed_total = calculated_total
+        resolved_summary = summarize_question_marks(
+            questions,
+            expected_total=confirmed_total,
+        )
+        if resolved_summary.get("reconciled") is not True:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "code": "QUESTION_MARKS_INCOMPLETE",
+                    "message": "The current question marks cannot be confirmed as a complete paper total.",
+                },
+            )
+        response_message = (
+            f"Paper total confirmed as {confirmed_total:g}. Readiness checks were recalculated."
+        )
+
+    resolution = {
+        "resolution_id": uuid.uuid4().hex,
+        "issue_code": "PAPER_TOTAL_MISMATCH",
+        "action": body.action,
+        "previous_paper_total": positive_marks(marks_summary.get("expected_total")),
+        "confirmed_paper_total": confirmed_total,
+        "question_total": positive_marks(resolved_summary.get("calculated_total")),
+        "question_mark_changes": question_mark_changes,
+        "issue_fingerprint": current_fingerprint,
+        "resolved_by": actor_id,
+        "resolved_at": resolved_at,
+        "note": str(body.note or "").strip() or None,
+    }
+
+    changes_by_id = {
+        str(item["question_id"]): item
+        for item in question_mark_changes
+    }
+    if changes_by_id:
+        for question, proposed in zip(questions, proposed_questions):
+            question_key = str(question.get("id") or question.get("question_id") or "")
+            proposed_metadata = dict(proposed.get("metadata") or {})
+            proposed_metadata.update(
+                {
+                    "paper_marks_summary": resolved_summary,
+                    "paper_marks_reconciled": True,
+                    "paper_total_resolution": resolution,
+                }
+            )
+            question_update: Dict[str, Any] = {
+                "metadata": proposed_metadata,
+                "updated_at": resolved_at,
+                "updated_by": actor_id,
+            }
+            if question_key in changes_by_id:
+                question_update["points"] = changes_by_id[question_key]["corrected_points"]
+                if question.get("assessment_units"):
+                    question_update.update(
+                        {
+                            "assessment_units": [],
+                            "response_selection": None,
+                            "marking_criteria": [],
+                            "reference_solution": None,
+                            "marking_plan_generation_status": "not_generated",
+                            "marking_plan_generation_error": (
+                                "Question marks changed; regenerate and review the assessment units"
+                            ),
+                        }
+                    )
+            question_identity = (
+                {"id": question_key}
+                if question.get("id") is not None
+                else {"question_id": question_key}
+            )
+            question_result = await tenant_db["questions"].update_one(
+                {"document_id": document_id, **question_identity},
+                {"$set": question_update},
+                **session_kwargs,
+            )
+            if question_result.matched_count != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "code": "PAPER_CHANGED_DURING_RESOLUTION",
+                        "message": "The question catalog changed during marks resolution. Refresh and try again.",
+                    },
+                )
+    else:
+        question_result = await tenant_db["questions"].update_many(
+            {"document_id": document_id},
+            {
+                "$set": {
+                    "metadata.paper_marks_summary": resolved_summary,
+                    "metadata.paper_marks_reconciled": True,
+                    "metadata.paper_total_resolution": resolution,
+                    "updated_at": resolved_at,
+                }
+            },
+            **session_kwargs,
+        )
+        if question_result.matched_count != len(questions):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "PAPER_CHANGED_DURING_RESOLUTION",
+                    "message": "The question catalog changed during marks resolution. Refresh and try again.",
+                },
+            )
+
+    document_result = await tenant_db["documents"].update_one(
+        {
+            "document_id": document_id,
+            "exam_finalized": {"$ne": True},
+            "exam_finalization_status": {"$ne": "processing"},
+        },
+        {
+            "$set": {
+                "total_points": confirmed_total,
+                "total_points_source": "teacher",
+                "marks_extraction_summary": resolved_summary,
+                "marks_review_required": False,
+                "paper_marks_resolution": resolution,
+                "updated_at": resolved_at,
+            },
+            "$push": {"paper_marks_resolution_history": resolution},
+            "$inc": {"authoring_revision": 1},
+        },
+        **session_kwargs,
+    )
+    if document_result.matched_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "PAPER_CHANGED_DURING_RESOLUTION",
+                "message": "The paper was locked or changed during marks resolution. Refresh and try again.",
+            },
+        )
+
+    return {
+        "document_id": document_id,
+        "resolved_issue": "PAPER_TOTAL_MISMATCH",
+        "resolution": resolution,
+        "marks_summary": resolved_summary,
+        "message": response_message,
+    }
+
+
+@router.post("/documents/{document_id}/readiness-issues/paper-total/resolve")
+@limiter.limit("10/minute")
+async def resolve_paper_total_issue(
+    request: Request,
+    document_id: str,
+    body: PaperMarksResolutionRequest,
+    current_user: Dict[str, Any] = Depends(require_admin_or_tutor),
+    db: DatabaseManager = Depends(get_database),
+) -> Dict[str, Any]:
+    """Record a teacher's explicit resolution of a paper-total contradiction."""
+
+    is_b2c = is_b2c_admin(current_user)
+    tenant_db = db.b2c_db if is_b2c else await db.get_tenant_db(current_user.get("db_name"))
+    try:
+        async with await tenant_db.client.start_session() as session:
+            async with session.start_transaction():
+                return await _resolve_paper_total_in_session(
+                    tenant_db,
+                    document_id=document_id,
+                    body=body,
+                    actor_id=current_user.get("user_id"),
+                    session=session,
+                )
+    except HTTPException:
+        raise
+    except PyMongoError as exc:
+        logger.exception("Transactional paper-total resolution failed for %s", document_id)
+        is_transient = bool(
+            getattr(exc, "has_error_label", lambda _label: False)("TransientTransactionError")
+        )
+        raise HTTPException(
+            status_code=(status.HTTP_409_CONFLICT if is_transient else status.HTTP_500_INTERNAL_SERVER_ERROR),
+            detail={
+                "code": "PAPER_RESOLUTION_RETRY_REQUIRED" if is_transient else "PAPER_RESOLUTION_FAILED",
+                "message": (
+                    "The paper changed while resolving marks. Refresh and try again."
+                    if is_transient
+                    else "The marks resolution could not be saved safely. Nothing was finalized."
+                ),
+            },
+        ) from exc
+
+
 @router.get("/documents/{document_id}/finalize-readiness")
 async def get_exam_finalize_readiness(
     document_id: str,
@@ -6247,6 +6700,15 @@ async def get_exam_finalize_readiness(
 
     if exam_mode == "pcr":
         if document.get("ocr_status") != "completed":
+            issue = {
+                "id": "document-processing-incomplete",
+                "code": "DOCUMENT_PROCESSING_INCOMPLETE",
+                "severity": "blocking",
+                "scope": "paper",
+                "title": "Question paper is still processing",
+                "message": "Question extraction must complete before the paper can be finalized.",
+                "allowed_actions": [],
+            }
             return {
                 "document_id": document_id,
                 "exam_mode": exam_mode,
@@ -6256,6 +6718,8 @@ async def get_exam_finalize_readiness(
                 "question_count": len(questions),
                 "errors": ["OCR must be completed before finalizing."],
                 "warnings": [],
+                "issues": [issue],
+                "issue_counts": {"blocking": 1, "warning": 0},
                 "checks": [],
                 "paper_context": {},
                 "marking_plan": {},
@@ -6282,6 +6746,18 @@ async def get_exam_finalize_readiness(
         if not question.get("correct_answer"):
             answer_key_errors.append(f"Q {question_id}: missing correct answer")
     errors = [*template_errors, *answer_key_errors]
+    issues = [
+        {
+            "id": f"dcr-finalization-blocker:{index}",
+            "code": "DCR_FINALIZATION_BLOCKER",
+            "severity": "blocking",
+            "scope": "paper",
+            "title": "DCR setup needs review",
+            "message": error,
+            "allowed_actions": [],
+        }
+        for index, error in enumerate(errors, start=1)
+    ]
     return {
         "document_id": document_id,
         "exam_mode": exam_mode,
@@ -6291,6 +6767,8 @@ async def get_exam_finalize_readiness(
         "question_count": len(questions),
         "errors": errors,
         "warnings": [],
+        "issues": issues,
+        "issue_counts": {"blocking": len(issues), "warning": 0},
         "paper_context": {},
         "marking_plan": {},
         "checks": [
@@ -6472,11 +6950,14 @@ async def finalize_exam(
             )
             readiness_errors = list(preflight.get("errors") or [])
             if readiness_errors:
+                public_readiness = _public_pcr_finalization_readiness(doc, preflight)
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail={
                         "message": "PCR finalization requires a complete paper context",
                         "errors": readiness_errors[:50],
+                        "issues": public_readiness.get("issues") or [],
+                        "issue_counts": public_readiness.get("issue_counts") or {},
                     },
                 )
             finalized_questions = list(preflight.get("questions") or [])
@@ -9213,11 +9694,7 @@ async def recalculate_document_points(
             )
         marks_summary = summarize_question_marks(
             questions,
-            expected_total=(
-                document.get("total_points")
-                if document.get("total_points_source") == "teacher"
-                else None
-            ),
+            expected_total=expected_paper_total(document, questions),
         )
         if int(marks_summary.get("unresolved_count") or 0) > 0:
             raise HTTPException(
@@ -9237,7 +9714,8 @@ async def recalculate_document_points(
                 "total_points": total_points,
                 "total_points_source": "teacher_question_marks",
                 "marks_extraction_summary": marks_summary,
-                "marks_review_required": False,
+                "marks_review_required": bool(marks_summary.get("review_required_count"))
+                or marks_summary.get("reconciled") is False,
             }}
         )
 
@@ -10113,11 +10591,7 @@ async def get_document_questions(
 
         marks_summary = summarize_question_marks(
             serialized_questions,
-            expected_total=(
-                document.get("total_points")
-                if document.get("total_points_source") == "teacher"
-                else None
-            ),
+            expected_total=expected_paper_total(document, serialized_questions),
         )
 
         return {
@@ -10943,13 +11417,10 @@ async def update_question(
                         else:
                             all_questions = await db.mongo_find("questions", {"pdf_source": document_id})
 
+                    paper_total = expected_paper_total(document, all_questions)
                     marks_summary = summarize_question_marks(
                         all_questions,
-                        expected_total=(
-                            document.get("total_points")
-                            if document.get("total_points_source") == "teacher"
-                            else None
-                        ),
+                        expected_total=paper_total,
                     )
                     document_marks_update: Dict[str, Any] = {
                         "marks_extraction_summary": marks_summary,
@@ -10959,16 +11430,18 @@ async def update_question(
                     if (
                         int(marks_summary.get("unresolved_count") or 0) == 0
                     ):
-                        document_marks_update["total_points"] = marks_summary["calculated_total"]
-                        document_marks_update["total_points_source"] = (
-                            "teacher"
-                            if document.get("total_points_source") == "teacher"
-                            else (
+                        if paper_total is None:
+                            document_marks_update["total_points"] = marks_summary["calculated_total"]
+                            document_marks_update["total_points_source"] = (
                                 "provisional_question_marks"
                                 if int(marks_summary.get("provisional_count") or 0) > 0
                                 else "teacher_question_marks"
                             )
-                        )
+                        elif marks_summary.get("reconciled") is True:
+                            # Preserve the printed or teacher-confirmed paper total.
+                            # A question edit may resolve a mismatch, but it must not
+                            # silently redefine the paper's authority.
+                            document_marks_update["total_points"] = paper_total
 
                     if is_b2c:
                         await db.b2c_update_one(
@@ -11111,22 +11584,34 @@ async def bulk_update_questions(
                 all_qs = await db.b2c_find("questions", query)
             else:
                 all_qs = await db.mongo_find("questions", query)
-            marks_summary = summarize_question_marks(all_qs)
+            paper_total = expected_paper_total(_parent_doc or {}, all_qs)
+            marks_summary = summarize_question_marks(
+                all_qs,
+                expected_total=paper_total,
+            )
             document_marks_update: Dict[str, Any] = {
                 "marks_extraction_summary": marks_summary,
-                "marks_review_required": bool(marks_summary.get("review_required_count")),
+                "marks_review_required": bool(marks_summary.get("review_required_count"))
+                or marks_summary.get("reconciled") is False,
             }
             if int(marks_summary.get("unresolved_count") or 0) == 0:
-                document_marks_update.update(
-                    {
-                        "total_points": marks_summary["calculated_total"],
-                        "total_points_source": (
-                            "provisional_question_marks"
-                            if int(marks_summary.get("provisional_count") or 0) > 0
-                            else "teacher_question_marks"
-                        ),
-                    }
-                )
+                if paper_total is None:
+                    document_marks_update.update(
+                        {
+                            "total_points": marks_summary["calculated_total"],
+                            "total_points_source": (
+                                "provisional_question_marks"
+                                if int(marks_summary.get("provisional_count") or 0) > 0
+                                else "teacher_question_marks"
+                            ),
+                        }
+                    )
+                elif marks_summary.get("reconciled") is True:
+                    document_marks_update.update(
+                        {
+                            "total_points": paper_total,
+                        },
+                    )
             if is_b2c:
                 await db.b2c_update_one(
                     "documents",

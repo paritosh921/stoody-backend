@@ -91,6 +91,17 @@ def _normalise_page_refs(refs: Mapping[str, Any]) -> List[Dict[str, Any]]:
             page_number = int(physical)
         if not book_type or page_number < 0:
             continue
+        raw_intervals = page.get("timeIntervals") or page.get("visitIntervals") or []
+        time_intervals = [
+            {
+                "start_ts": _as_mapping(interval).get("startTs"),
+                "end_ts": _as_mapping(interval).get("endTs"),
+            }
+            for interval in raw_intervals
+            if _as_mapping(interval)
+        ]
+        if not time_intervals:
+            time_intervals = [{"start_ts": page.get("startTs"), "end_ts": page.get("endTs")}]
         pages.append(
             {
                 "book_type": book_type,
@@ -98,22 +109,31 @@ def _normalise_page_refs(refs: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "ordinal": ordinal or None,
                 "start_ts": page.get("startTs"),
                 "end_ts": page.get("endTs"),
+                "time_intervals": time_intervals,
             }
         )
 
     if pages:
         return pages
 
-    intervals = refs.get("timeIntervals") or []
-    for index, page_number in enumerate(refs.get("activePages") or []):
-        interval = _as_mapping(intervals[index]) if index < len(intervals) else {}
+    intervals = [
+        {
+            "start_ts": _as_mapping(interval).get("startTs"),
+            "end_ts": _as_mapping(interval).get("endTs"),
+        }
+        for interval in (refs.get("timeIntervals") or [])
+        if _as_mapping(interval)
+    ]
+    for page_number in refs.get("activePages") or []:
+        first_interval = intervals[0] if intervals else {}
         pages.append(
             {
                 "book_type": default_book,
                 "page_number": int(page_number),
                 "ordinal": None,
-                "start_ts": interval.get("startTs"),
-                "end_ts": interval.get("endTs"),
+                "start_ts": first_interval.get("start_ts"),
+                "end_ts": first_interval.get("end_ts"),
+                "time_intervals": intervals,
             }
         )
     return pages
@@ -127,6 +147,7 @@ def _stroke_matches_scope(
     ordinal: Optional[int],
     start_ts: Any,
     end_ts: Any,
+    time_intervals: Optional[List[Mapping[str, Any]]] = None,
 ) -> bool:
     stroke_session = stroke.get("practiceSessionId")
     stroke_question = stroke.get("questionId")
@@ -144,10 +165,20 @@ def _stroke_matches_scope(
     # Legacy scoped pages may predate the ownership fields. Accept only a
     # stroke whose wall-clock activity falls inside the submitted page window.
     timestamp = stroke.get("startedAt", stroke.get("timestamp"))
-    if not isinstance(timestamp, (int, float)) or not isinstance(start_ts, (int, float)):
+    if not isinstance(timestamp, (int, float)):
         return False
-    upper = end_ts if isinstance(end_ts, (int, float)) else float("inf")
-    return float(start_ts) <= float(timestamp) <= float(upper)
+    intervals = list(time_intervals or [])
+    if not intervals:
+        intervals = [{"start_ts": start_ts, "end_ts": end_ts}]
+    for interval in intervals:
+        interval_start = interval.get("start_ts")
+        if not isinstance(interval_start, (int, float)):
+            continue
+        interval_end = interval.get("end_ts")
+        upper = interval_end if isinstance(interval_end, (int, float)) else float("inf")
+        if float(interval_start) <= float(timestamp) <= float(upper):
+            return True
+    return False
 
 
 async def resolve_practice_stroke_evidence(
@@ -209,6 +240,7 @@ async def resolve_practice_stroke_evidence(
                     ordinal=page_ref["ordinal"],
                     start_ts=page_ref["start_ts"],
                     end_ts=page_ref["end_ts"],
+                    time_intervals=page_ref.get("time_intervals"),
                 ):
                     continue
                 stroke_id = str(raw_stroke.get("id") or "").strip()

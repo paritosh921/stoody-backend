@@ -256,6 +256,11 @@ async def delete_submission_copy(
         [page.get("raw_image_ref") for page in page_docs]
         + [page.get("storage_path") for page in camera_docs]
         + [
+            (attempt.get("original_asset") or {}).get("storage_path")
+            for attempt in upload_attempts
+            if isinstance(attempt.get("original_asset"), dict)
+        ]
+        + [
             page.get("storage_path")
             for attempt in upload_attempts
             for page in (attempt.get("pages") or [])

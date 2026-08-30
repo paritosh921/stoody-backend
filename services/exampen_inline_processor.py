@@ -47,10 +47,13 @@ class InlinePCRProcessor:
         poll_seconds: float = 3.0,
         concurrency: int = 1,
         retry_delay_seconds: float = 60.0,
+        batch_reconcile_seconds: float = 60.0,
     ) -> None:
         self._db_manager = db_manager
         self._poll_seconds = max(1.0, float(poll_seconds))
         self._retry_delay_seconds = max(1.0, float(retry_delay_seconds))
+        self._batch_reconcile_seconds = max(15.0, float(batch_reconcile_seconds))
+        self._next_batch_reconcile_at = 0.0
         self._concurrency = max(1, int(concurrency))
         self._semaphore = asyncio.Semaphore(self._concurrency)
         self._active_jobs: dict[str, asyncio.Task[None]] = {}
@@ -108,12 +111,11 @@ class InlinePCRProcessor:
         # state.  A task may be scheduled before it has acquired the semaphore,
         # so ``_value`` is neither public API nor a reliable job count here.
         available_slots = max(0, self._concurrency - len(self._active_jobs))
-        if available_slots == 0:
+        reconcile_batches = monotonic() >= self._next_batch_reconcile_at
+        if available_slots == 0 and not reconcile_batches:
             return 0
 
         for tenant in tenants:
-            if available_slots <= 0:
-                break
             db_name = str(tenant.get("db_name") or "").strip()
             if not db_name:
                 continue
@@ -123,6 +125,22 @@ class InlinePCRProcessor:
                 logger.exception("Inline PCR processor could not resolve tenant %s", db_name)
                 continue
             if tenant_db is None:
+                continue
+
+            if reconcile_batches:
+                try:
+                    from services.exampen_openai_batch import (
+                        reconcile_economy_batch_groups,
+                    )
+
+                    await reconcile_economy_batch_groups(tenant_db)
+                except Exception:
+                    logger.exception(
+                        "Inline PCR processor could not reconcile economy batches for tenant %s",
+                        db_name,
+                    )
+
+            if available_slots <= 0:
                 continue
 
             recovered = await recover_stale_processing_jobs(tenant_db)
@@ -162,6 +180,9 @@ class InlinePCRProcessor:
                 available_slots -= 1
                 if available_slots <= 0:
                     break
+
+        if reconcile_batches:
+            self._next_batch_reconcile_at = monotonic() + self._batch_reconcile_seconds
 
         return scheduled
 

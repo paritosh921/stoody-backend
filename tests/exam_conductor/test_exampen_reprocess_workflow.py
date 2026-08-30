@@ -622,6 +622,59 @@ async def test_new_job_reconciles_if_exam_contract_changes_during_insert(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_new_economy_job_waits_for_explicit_batch_start():
+    from services.exampen_workflow import (
+        ECONOMY_WAITING_JOB_STATUS,
+        PROCESSING_JOBS_COLLECTION,
+        ensure_processing_job,
+    )
+
+    db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-ECONOMY")
+    job, created = await ensure_processing_job(
+        db,
+        exam_id="EXAM-ECONOMY",
+        submission_id="SUB-ECONOMY",
+        processing_mode="economy",
+    )
+
+    assert created is True
+    assert job["status"] == ECONOMY_WAITING_JOB_STATUS
+    assert job["processing_mode"] == "economy"
+    stored = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"submission_id": "SUB-ECONOMY"}
+    )
+    assert stored["status"] == ECONOMY_WAITING_JOB_STATUS
+
+
+@pytest.mark.asyncio
+async def test_economy_schedule_does_not_dispatch_an_immediate_worker():
+    from services.exampen_workflow import (
+        ECONOMY_WAITING_JOB_STATUS,
+        schedule_submission_processing,
+    )
+
+    db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-ECONOMY-SCHEDULE")
+    await db["exampen_exams"].update_one(
+        {"exam_id": "EXAM-ECONOMY-SCHEDULE"},
+        {"$set": {"checking_mode": "economy"}},
+    )
+    with patch(
+        "services.exampen_workflow.dispatch_processing_job",
+        new=AsyncMock(side_effect=AssertionError("economy jobs must not dispatch immediately")),
+    ):
+        job = await schedule_submission_processing(
+            db,
+            db_name="skb_test",
+            exam_id="EXAM-ECONOMY-SCHEDULE",
+            submission_id="SUB-ECONOMY-SCHEDULE",
+        )
+
+    assert job["status"] == ECONOMY_WAITING_JOB_STATUS
+
+
+@pytest.mark.asyncio
 async def test_new_job_is_not_dispatched_while_whole_exam_migration_is_applying(
     monkeypatch,
 ):

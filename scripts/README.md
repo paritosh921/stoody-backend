@@ -118,6 +118,19 @@ python scripts/migrations/fix_question_document_types.py
 
 ## Common Workflows
 
+### Verify Economy Batch credentials
+
+Run this after creating or rotating the OpenAI project key and before allowing
+teachers to start Economy checking:
+
+```bash
+python scripts/verify_openai_batch_transport.py
+```
+
+The probe uses one no-cost moderation request to verify the complete OpenAI
+Files-to-Batch handoff. It deletes the input and result files it creates. Do not
+retry failed student-copy batches until this command prints `PASS`.
+
 ### Initial Setup
 ```bash
 # 1. Initialize default admin

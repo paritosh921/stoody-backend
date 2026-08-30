@@ -298,6 +298,56 @@ async def test_draft_setup_can_be_repaired_without_replacing_immutable_paper():
 
 
 @pytest.mark.asyncio
+async def test_draft_setup_persists_economy_checking_mode():
+    from api.v1.exam_orch_async import _build_exam_doc
+
+    db = _fresh_db()
+    exam = _build_exam_doc(
+        exam_id="exam-economy-setup",
+        exam_type="pcr",
+        current_user=_admin_user(),
+        roster=["student-1"],
+        checking_mode="immediate",
+    )
+    await db["exampen_exams"].insert_one(exam)
+
+    updated = await _update_exam_setup(
+        db,
+        "exam-economy-setup",
+        _admin_user(),
+        checking_mode="economy",
+    )
+
+    assert updated.checking_mode == "economy"
+    stored = await db["exampen_exams"].find_one({"exam_id": "exam-economy-setup"})
+    assert stored["checking_mode"] == "economy"
+
+
+@pytest.mark.asyncio
+async def test_legacy_draft_setup_remains_immediate_when_speed_is_not_changed():
+    from api.v1.exam_orch_async import _build_exam_doc
+
+    db = _fresh_db()
+    exam = _build_exam_doc(
+        exam_id="exam-legacy-setup",
+        exam_type="pcr",
+        current_user=_admin_user(),
+        roster=["student-1"],
+    )
+    exam.pop("checking_mode", None)
+    await db["exampen_exams"].insert_one(exam)
+
+    updated = await _update_exam_setup(
+        db,
+        "exam-legacy-setup",
+        _admin_user(),
+        roster=["student-1", "student-2"],
+    )
+
+    assert updated.checking_mode == "immediate"
+
+
+@pytest.mark.asyncio
 async def test_dcr_uploading_session_does_not_require_pcr_processing_job():
     from api.v1.exam_orch_async import _ready_for_eval_issues
     from services.exampen_workflow import _maybe_mark_exam_ready_for_review

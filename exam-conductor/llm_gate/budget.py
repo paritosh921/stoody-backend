@@ -217,6 +217,59 @@ class BudgetChecker:
                     resets_at=_next_month(now),
                 )
 
+    async def check_reservation(
+        self,
+        config: GateConfig,
+        reserved_tokens: int,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Reject delayed work whose conservative upper bound exceeds headroom."""
+
+        reservation = max(0, int(reserved_tokens or 0))
+        if reservation == 0 or not any(
+            (
+                config.daily_token_limit,
+                config.weekly_token_limit,
+                config.monthly_token_limit,
+            )
+        ):
+            return
+        now = now or datetime.utcnow()
+        checks = (
+            (
+                "daily",
+                config.daily_token_limit,
+                await self._repo.sum_tokens_since(_day_start(now))
+                if config.daily_token_limit is not None
+                else 0,
+                _next_day(now),
+            ),
+            (
+                "weekly",
+                config.weekly_token_limit,
+                await self._sum_tokens_for_period(_week_start(now), now)
+                if config.weekly_token_limit is not None
+                else 0,
+                _next_week(now),
+            ),
+            (
+                "monthly",
+                config.monthly_token_limit,
+                await self._sum_tokens_for_period(_month_start(now), now)
+                if config.monthly_token_limit is not None
+                else 0,
+                _next_month(now),
+            ),
+        )
+        for period, limit, used, resets_at in checks:
+            if limit is not None and used + reservation > limit:
+                raise BudgetExhaustedError(
+                    period=period,
+                    used_tokens=used + reservation,
+                    limit_tokens=limit,
+                    resets_at=resets_at,
+                )
+
     # ------------------------------------------------------------------
     # Current usage query (used by usage API — I-GATE-03)
     # ------------------------------------------------------------------

@@ -119,3 +119,44 @@ async def test_finalized_pcr_question_catalog_cannot_be_mutated_in_place():
     assert exc.value.status_code == 409
     stored = await tenant_db["questions"].find_one({"id": "pcr-question-1"})
     assert stored["text"] == "Original question"
+
+
+@pytest.mark.asyncio
+async def test_question_mark_edit_preserves_authoritative_paper_total_and_records_mismatch():
+    from api.v1.pdf_async import update_question
+
+    tenant_db = AsyncMongoMockClient()["skb_test"]
+    await _seed_pcr_question(tenant_db, finalized=False)
+    await tenant_db["documents"].update_one(
+        {"document_id": "pcr-paper"},
+        {
+            "$set": {
+                "total_points": 4,
+                "total_points_source": "visual_question_marks",
+                "marks_extraction_summary": {
+                    "expected_total": 4,
+                    "calculated_total": 4,
+                    "reconciled": True,
+                },
+            }
+        },
+    )
+    db = _ScopedDatabase(tenant_db)
+
+    await update_question.__wrapped__(
+        request=None,
+        question_id="pcr-question-1",
+        question_data={"points": 3},
+        current_user=_admin_user(),
+        db=db,
+    )
+
+    stored_question = await tenant_db["questions"].find_one({"id": "pcr-question-1"})
+    stored_document = await tenant_db["documents"].find_one({"document_id": "pcr-paper"})
+    assert stored_question["points"] == 3
+    assert stored_document["total_points"] == 4
+    assert stored_document["total_points_source"] == "visual_question_marks"
+    assert stored_document["marks_extraction_summary"]["calculated_total"] == 3
+    assert stored_document["marks_extraction_summary"]["expected_total"] == 4
+    assert stored_document["marks_extraction_summary"]["reconciled"] is False
+    assert stored_document["marks_review_required"] is True

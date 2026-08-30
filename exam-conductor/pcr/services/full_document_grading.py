@@ -256,6 +256,14 @@ class FullDocumentGradingResult:
     document_review_required: bool = False
     review_state: str = "not_applicable"
     review_reasons: List[str] = field(default_factory=list)
+    # In-memory only. The coordinator writes this body directly to JSONL; it is
+    # intentionally never persisted in MongoDB because visual requests can be
+    # larger than Mongo's single-document limit.
+    deferred_provider_request: Optional[Dict[str, Any]] = field(
+        default=None,
+        repr=False,
+    )
+    deferred_call_index: Optional[int] = None
 
 
 @dataclass
@@ -611,6 +619,9 @@ class FullDocumentGradingService:
                 contract_scope=contract_scope,
                 contract_override_id=contract_override_id or None,
                 source_prompt_version=source_prompt_version or None,
+                resume_deferred=bool(
+                    getattr(self._gate, "resume_deferred_run", False)
+                ),
             )
 
         if existing_run and existing_run.get("status") in {
@@ -686,6 +697,48 @@ class FullDocumentGradingService:
                         **common_generation_args,
                     )
             except Exception as exc:
+                if bool(getattr(exc, "deferred_batch_call", False)):
+                    call_index = max(0, int(getattr(exc, "call_index", 0) or 0))
+                    deferred_status = (
+                        "awaiting_batch_primary"
+                        if call_index == 0
+                        else "awaiting_batch_recovery"
+                    )
+                    deferred_update = await self._db[_RUNS_COLLECTION].update_one(
+                        {
+                            "run_id": run_id,
+                            "generation_lease_token": generation_lease_token,
+                        },
+                        {
+                            "$set": {
+                                "status": deferred_status,
+                                "deferred_call_index": call_index,
+                                "provider_transport": "openai_batch",
+                                "updated_at": datetime.now(timezone.utc),
+                            },
+                            "$unset": {
+                                "generation_lease_token": "",
+                                "generation_lease_expires_at": "",
+                                "generation_error": "",
+                            },
+                        },
+                    )
+                    if deferred_update.matched_count != 1:
+                        raise FullDocumentGradingError(
+                            "Submission grading ownership expired before Batch preparation"
+                        ) from exc
+                    return FullDocumentGradingResult(
+                        handled=True,
+                        submission_id=submission_id,
+                        status="waiting_for_batch",
+                        page_count=len(answer_pages),
+                        run_id=run_id,
+                        review_state="waiting_for_batch",
+                        deferred_provider_request=dict(
+                            getattr(exc, "request_body", {}) or {}
+                        ),
+                        deferred_call_index=call_index,
+                    )
                 failure_update: Dict[str, Any] = {
                     "status": "failed",
                     "generation_error": str(exc)[:500],
@@ -1232,6 +1285,7 @@ async def _claim_or_wait_for_run(
     contract_scope: str = "exam",
     contract_override_id: Optional[str] = None,
     source_prompt_version: Optional[str] = None,
+    resume_deferred: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Single-flight technical retries for one submission grading generation.
 
@@ -1294,11 +1348,16 @@ async def _claim_or_wait_for_run(
             # read. Join its single-flight wait instead of failing the copy.
             pass
     else:
+        reclaimable_statuses = ["failed"]
+        if resume_deferred:
+            reclaimable_statuses.extend(
+                ["awaiting_batch_primary", "awaiting_batch_recovery"]
+            )
         reclaimed = await collection.update_one(
             {
                 "run_id": run_id,
                 "$or": [
-                    {"status": "failed"},
+                    {"status": {"$in": reclaimable_statuses}},
                     {
                         "status": "generating",
                         "generation_lease_expires_at": {"$lte": now},
@@ -1776,7 +1835,9 @@ async def _run_whole_copy_grading(
                 "recursive_splitting": False,
             },
         )
-    except Exception:
+    except Exception as exc:
+        if bool(getattr(exc, "deferred_batch_call", False)):
+            raise
         logger.exception("Bounded whole-copy recovery failed for run %s", run_id)
         return normalized_primary, primary_raw, primary_usage
 

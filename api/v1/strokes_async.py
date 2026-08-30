@@ -266,6 +266,12 @@ class CanvasPageStroke(BaseModel):
     screenCanvasW: Optional[float] = None
     screenCanvasH: Optional[float] = None
 
+    @field_validator("qualityFlags", mode="before")
+    @classmethod
+    def _normalise_quality_flags(cls, value: Any) -> list:
+        """Accept pre-contract web cache records that serialized missing flags as null."""
+        return [] if value is None else value
+
     @field_validator("points", mode="before")
     @classmethod
     def _normalise_points(cls, v: Any) -> list:

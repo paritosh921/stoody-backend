@@ -12,6 +12,7 @@ from api.v1.copy_sets_async import ensure_practice_copy_set_for_user
 from api.v1.practice_async import QuestionPageRefsModel
 from api.v1.strokes_async import _raise_sanitized_canvas_write_error
 from api.v1.tutor_async import _question_page_identity_clauses
+from services.practice_stroke_evidence import _normalise_page_refs, _stroke_matches_scope
 
 
 def _matches(document: dict, query: dict) -> bool:
@@ -148,6 +149,50 @@ def test_question_page_identity_clauses_support_legacy_attempts():
 def test_question_page_references_are_bounded_at_the_api_contract():
     with pytest.raises(ValidationError):
         QuestionPageRefsModel(activePages=list(range(51)))
+
+
+def test_web_practice_page_refs_preserve_disjoint_question_intervals():
+    pages = _normalise_page_refs(
+        {
+            "bookType": "LS",
+            "virtualPages": [
+                {
+                    "physicalPageNo": 46,
+                    "bookType": "LS",
+                    "startTs": 100,
+                    "endTs": 400,
+                    "timeIntervals": [
+                        {"startTs": 100, "endTs": 200},
+                        {"startTs": 300, "endTs": 400},
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert len(pages) == 1
+    assert pages[0]["time_intervals"] == [
+        {"start_ts": 100, "end_ts": 200},
+        {"start_ts": 300, "end_ts": 400},
+    ]
+    assert not _stroke_matches_scope(
+        {"startedAt": 250},
+        practice_session_id="attempt-1",
+        question_id="question-1",
+        ordinal=None,
+        start_ts=100,
+        end_ts=400,
+        time_intervals=pages[0]["time_intervals"],
+    )
+    assert _stroke_matches_scope(
+        {"startedAt": 350},
+        practice_session_id="attempt-1",
+        question_id="question-1",
+        ordinal=None,
+        start_ts=100,
+        end_ts=400,
+        time_intervals=pages[0]["time_intervals"],
+    )
 
 
 def test_question_page_identity_clauses_cap_legacy_fanout():

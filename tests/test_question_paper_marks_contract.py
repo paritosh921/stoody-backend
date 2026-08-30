@@ -5,8 +5,11 @@ import pytest
 
 from services.exampen_paper_service import validate_pcr_questions
 from services.question_paper_marks_contract import (
+    build_paper_total_mismatch_issue,
     effective_question_marks,
+    expected_paper_total,
     extracted_marks_metadata,
+    paper_marks_issue_fingerprint,
     project_question_marks_for_authoring,
     summarize_question_marks,
     teacher_confirmed_marks_metadata,
@@ -174,6 +177,126 @@ def test_pcr_finalization_allows_provisional_one_but_rejects_authoritative_total
         marking_policy={"mode": "legacy"},
     )
     assert not any("paper total" in error for error in corrected_errors)
+
+
+def test_authoritative_total_mismatch_is_one_paper_issue_with_teacher_actions():
+    questions = [
+        {
+            "id": "internal-q-1",
+            "question_number": 1,
+            "points": 2,
+            "metadata": {
+                "marks_status": "verified",
+                "marks_source": "visual_printed_evidence",
+                "paper_marks_summary": {"expected_total": 3},
+                "paper_marks_reconciled": False,
+            },
+        },
+        {
+            "id": "internal-q-2",
+            "question_number": 2,
+            "points": 2,
+            "metadata": {
+                "marks_status": "verified",
+                "marks_source": "visual_printed_evidence",
+                "paper_marks_summary": {"expected_total": 3},
+                "paper_marks_reconciled": False,
+            },
+        },
+    ]
+    document = {
+        "document_id": "paper-1",
+        "total_points": 4,
+        "total_points_source": "visual_question_marks",
+        "marks_extraction_summary": {"expected_total": 3},
+    }
+    expected = expected_paper_total(document, questions)
+    summary = summarize_question_marks(questions, expected_total=expected)
+
+    issue = build_paper_total_mismatch_issue(document, questions, summary)
+
+    assert expected == 3
+    assert issue["code"] == "PAPER_TOTAL_MISMATCH"
+    assert issue["scope"] == "paper"
+    assert issue["evidence"] == {
+        "paper_total": 3.0,
+        "paper_total_label": "Printed paper total",
+        "question_total": 4.0,
+        "difference": 1.0,
+        "question_count": 2,
+    }
+    assert [action["id"] for action in issue["allowed_actions"]] == [
+        "save_question_marks",
+        "confirm_question_total",
+        "review_question_marks",
+    ]
+    assert issue["fingerprint"] == paper_marks_issue_fingerprint(
+        "paper-1",
+        questions,
+        expected_total=3,
+    )
+
+
+def test_teacher_confirmed_document_total_supersedes_stale_extracted_total():
+    questions = [
+        {
+            "id": "q1",
+            "points": 4,
+            "metadata": {
+                "marks_status": "verified",
+                "paper_marks_summary": {"expected_total": 3},
+                "paper_marks_reconciled": False,
+            },
+        }
+    ]
+    document = {
+        "document_id": "paper-1",
+        "total_points": 4,
+        "total_points_source": "teacher",
+        "marks_extraction_summary": {"expected_total": 3},
+    }
+
+    expected = expected_paper_total(document, questions)
+    errors = validate_pcr_questions(
+        [
+            {
+                **questions[0],
+                "text": "Question",
+                "question_type": "subjective",
+                "reference_solution": "Answer",
+            }
+        ],
+        marking_policy={"mode": "legacy"},
+        expected_total=expected,
+    )
+
+    assert expected == 4
+    assert not any("paper total" in error for error in errors)
+
+
+def test_paper_total_mismatch_is_reported_once_without_internal_question_ids():
+    questions = [
+        {
+            "id": f"internal-uuid-{index}",
+            "question_number": index,
+            "text": f"Question {index}",
+            "points": 2,
+            "question_type": "subjective",
+            "reference_solution": "Answer",
+            "metadata": {"marks_status": "verified"},
+        }
+        for index in (1, 2)
+    ]
+
+    errors = validate_pcr_questions(
+        questions,
+        marking_policy={"mode": "legacy"},
+        expected_total=3,
+    )
+
+    mismatch_errors = [error for error in errors if "paper total" in error]
+    assert mismatch_errors == ["Question marks total 4 does not match the paper total 3"]
+    assert "internal-uuid" not in mismatch_errors[0]
 
 
 @pytest.mark.asyncio
