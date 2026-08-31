@@ -17,6 +17,7 @@ on:
       - "mentorAI/**"
       - "stoody-book/**"
       - "scripts/cleanup_upload_storage.py"
+      - "scripts/verify_openai_batch_transport.py"
       - "scripts/validate_upload_security_deploy.py"
       - "scripts/validate_jitsi_runtime.py"
       - "scripts/run_tui.sh"
@@ -149,3 +150,13 @@ jobs:
             "cd '${DEV_MAIN_BACKEND_PATH}' && \
             '${DEV_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/validate_jitsi_runtime.py \
             --env-file .env --require-jwt --check-public-assets --timeout-seconds 10"
+
+      - name: Validate OpenAI Economy Batch transport
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -i ~/.ssh/dev_deploy_key -o StrictHostKeyChecking=yes \
+            "${DEV_MAIN_BACKEND_USER}@${DEV_MAIN_BACKEND_HOST}" \
+            "cd '${DEV_MAIN_BACKEND_PATH}' && \
+            '${DEV_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/verify_openai_batch_transport.py"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -23,15 +24,40 @@ from services.exampen_openai_batch import (
     BATCH_PARTS_COLLECTION,
     OpenAIBatchClient,
     PROCESSING_JOBS_COLLECTION,
+    StaleBatchGenerationError,
+    _batch_max_requests_per_part,
     _create_provider_parts,
+    _import_item,
     _recover_interrupted_part_creation,
     cancel_economy_batch_group,
     classify_economy_batch_failure,
+    describe_provider_batch_progress,
     parse_batch_jsonl,
     partition_batch_requests,
     prepare_economy_batch_group,
     reconcile_economy_batches,
 )
+
+
+def test_provider_progress_exposes_delayed_finalizing_without_inventing_completion():
+    observed_at = datetime(2026, 8, 31, 14, 0, tzinfo=timezone.utc)
+
+    progress = describe_provider_batch_progress(
+        {
+            "status": "finalizing",
+            "expires_at": int(observed_at.timestamp()) - 90,
+            "finalizing_at": int(observed_at.timestamp()) - 120,
+            "request_counts": {"total": 2, "completed": 1, "failed": 0},
+        },
+        now=observed_at,
+    )
+
+    assert progress["job_status"] == "provider_finalizing"
+    assert progress["stage"] == "provider_finalizing"
+    assert progress["delayed"] is True
+    assert progress["delay_seconds"] == 90
+    assert progress["completed"] == 1
+    assert "1/2 requests complete" in progress["message"]
 
 
 def test_batch_file_access_failure_requires_provider_configuration_change():
@@ -44,11 +70,87 @@ def test_batch_file_access_failure_requires_provider_configuration_change():
     assert "Batch-enabled OpenAI project" in result["operator_action"]
 
 
-def test_unknown_batch_failure_remains_retryable():
+def test_provider_timeout_has_specific_retryable_failure_contract():
     result = classify_economy_batch_failure("Temporary provider timeout")
 
-    assert result["failure_code"] == "provider_batch_failed"
+    assert result["failure_code"] == "provider_batch_expired"
     assert result["retryable"] is True
+    assert "Retry only this copy" in result["operator_action"]
+
+
+def test_economy_batch_defaults_to_one_copy_per_provider_failure_domain(monkeypatch):
+    monkeypatch.delenv("EXAMPEN_BATCH_MAX_REQUESTS_PER_PART", raising=False)
+    assert _batch_max_requests_per_part() == 1
+
+    monkeypatch.setenv("EXAMPEN_BATCH_MAX_REQUESTS_PER_PART", "7")
+    assert _batch_max_requests_per_part() == 7
+
+
+@pytest.mark.asyncio
+async def test_superseded_batch_generation_never_replays_or_overwrites_marks():
+    from mongomock_motor import AsyncMongoMockClient
+
+    db = AsyncMongoMockClient()["skb_test"]
+    await db[PROCESSING_JOBS_COLLECTION].insert_one({
+        "job_id": "job-new-run",
+        "status": "provider_processing",
+        "grading_generation": 3,
+    })
+    item = {
+        "custom_id": "copy-old-run",
+        "job_id": "job-new-run",
+        "submission_id": "submission-1",
+        "job_generation": 2,
+    }
+
+    with patch("services.exampen_openai_batch._run_grader", new=AsyncMock()) as grader:
+        with pytest.raises(StaleBatchGenerationError):
+            await _import_item(
+                db,
+                item=item,
+                provider_line={
+                    "response": {"status_code": 200, "body": {"id": "response-old"}}
+                },
+            )
+
+    grader.assert_not_awaited()
+    job = await db[PROCESSING_JOBS_COLLECTION].find_one({"job_id": "job-new-run"})
+    assert job["status"] == "provider_processing"
+    assert job["grading_generation"] == 3
+
+
+@pytest.mark.asyncio
+async def test_legacy_batch_item_is_generation_zero_not_a_wildcard():
+    from mongomock_motor import AsyncMongoMockClient
+
+    db = AsyncMongoMockClient()["skb_test"]
+    await db[PROCESSING_JOBS_COLLECTION].insert_one({
+        "job_id": "job-retried-after-deploy",
+        "status": "provider_processing",
+        "grading_generation": 1,
+    })
+    legacy_item = {
+        "custom_id": "copy-from-generation-zero",
+        "job_id": "job-retried-after-deploy",
+        "submission_id": "submission-1",
+    }
+
+    with patch("services.exampen_openai_batch._run_grader", new=AsyncMock()) as grader:
+        with pytest.raises(StaleBatchGenerationError):
+            await _import_item(
+                db,
+                item=legacy_item,
+                provider_line={
+                    "response": {"status_code": 200, "body": {"id": "legacy-response"}}
+                },
+            )
+
+    grader.assert_not_awaited()
+    job = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "job-retried-after-deploy"}
+    )
+    assert job["status"] == "provider_processing"
+    assert job["grading_generation"] == 1
 
 
 @pytest.mark.asyncio
@@ -451,6 +553,62 @@ async def test_terminal_provider_failure_is_preserved_on_job_part_and_group():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_exposes_finalizing_progress_and_clears_stale_job_error():
+    from mongomock_motor import AsyncMongoMockClient
+
+    db = AsyncMongoMockClient()["skb_test"]
+    await db["exampen_provider_batches"].insert_one({
+        "batch_group_id": "econ-finalizing",
+        "status": "provider_processing",
+        "job_ids": ["job-finalizing"],
+    })
+    await db[BATCH_PARTS_COLLECTION].insert_one({
+        "local_part_id": "part-finalizing",
+        "batch_group_id": "econ-finalizing",
+        "provider_batch_id": "batch-finalizing",
+        "status": "in_progress",
+    })
+    await db[BATCH_ITEMS_COLLECTION].insert_one({
+        "custom_id": "copy-finalizing",
+        "local_part_id": "part-finalizing",
+        "batch_group_id": "econ-finalizing",
+        "job_id": "job-finalizing",
+        "import_status": "pending",
+    })
+    await db[PROCESSING_JOBS_COLLECTION].insert_one({
+        "job_id": "job-finalizing",
+        "status": "provider_processing",
+        "last_error": "obsolete error from an earlier attempt",
+    })
+    client = AsyncMock()
+    client.scope = {"project": "proj-exampen"}
+    client.retrieve_batch.return_value = {
+        "id": "batch-finalizing",
+        "status": "finalizing",
+        "expires_at": 1,
+        "finalizing_at": 2,
+        "request_counts": {"total": 2, "completed": 1, "failed": 0},
+    }
+
+    with patch("services.exampen_openai_batch.OpenAIBatchClient", return_value=client):
+        summary = await reconcile_economy_batches(db)
+
+    part = await db[BATCH_PARTS_COLLECTION].find_one({"local_part_id": "part-finalizing"})
+    job = await db[PROCESSING_JOBS_COLLECTION].find_one({"job_id": "job-finalizing"})
+    group = await db["exampen_provider_batches"].find_one({"batch_group_id": "econ-finalizing"})
+
+    assert summary["parts_polled"] == 1
+    assert part["status"] == "finalizing"
+    assert job["status"] == "provider_finalizing"
+    assert job["provider_batch_status"] == "finalizing"
+    assert job["provider_request_counts"] == {"total": 2, "completed": 1, "failed": 0}
+    assert job["provider_delayed"] is True
+    assert job["progress"]["stage"] == "provider_finalizing"
+    assert "last_error" not in job
+    assert group["status"] == "provider_processing"
+
+
+@pytest.mark.asyncio
 async def test_economy_batch_response_recovers_legacy_provider_failure_safely():
     from mongomock_motor import AsyncMongoMockClient
     from api.v1.exam_orch_async import _economy_batch_to_response
@@ -483,6 +641,45 @@ async def test_economy_batch_response_recovers_legacy_provider_failure_safely():
     assert response.retryable is False
     assert "Batch-enabled OpenAI project" in response.operator_action
     assert "provider_state" not in response.parts[0]
+
+
+@pytest.mark.asyncio
+async def test_economy_batch_response_reports_real_provider_finalizing_phase():
+    from mongomock_motor import AsyncMongoMockClient
+    from api.v1.exam_orch_async import _economy_batch_to_response
+
+    db = AsyncMongoMockClient()["skb_test"]
+    await db[BATCH_PARTS_COLLECTION].insert_one({
+        "local_part_id": "part-finalizing-response",
+        "batch_group_id": "econ-finalizing-response",
+        "provider_batch_id": "batch-finalizing-response",
+        "status": "finalizing",
+        "updated_at": datetime(2026, 8, 31, 13, 0, tzinfo=timezone.utc),
+        "provider_state": {
+            "status": "finalizing",
+            "expires_at": 1,
+            "finalizing_at": 2,
+            "request_counts": {"total": 2, "completed": 1, "failed": 0},
+        },
+    })
+
+    response = await _economy_batch_to_response(db, {
+        "batch_group_id": "econ-finalizing-response",
+        "exam_id": "exam-finalizing-response",
+        "status": "provider_processing",
+        "requested_count": 2,
+    })
+
+    assert response.status == "provider_processing"
+    assert response.provider_status == "finalizing"
+    assert response.provider_total_count == 2
+    assert response.provider_completed_count == 1
+    assert response.provider_failed_count == 0
+    assert response.provider_delayed is True
+    assert response.provider_delay_seconds > 0
+    assert response.provider_expires_at is not None
+    assert response.provider_finalizing_at is not None
+    assert response.provider_last_polled_at is not None
 
 
 @pytest.mark.asyncio
@@ -588,6 +785,100 @@ async def test_terminal_provider_part_is_claimed_imported_and_cleaned_once():
     assert item["import_status"] == "completed"
     assert group["status"] == "completed"
     assert client.delete_file.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_expired_batch_preserves_completed_copy_and_fails_only_unfinished_copy():
+    from mongomock_motor import AsyncMongoMockClient
+
+    db = AsyncMongoMockClient()["skb_test"]
+    await db["exampen_provider_batches"].insert_one({
+        "batch_group_id": "econ-partial-expiry",
+        "status": "provider_processing",
+        "job_ids": ["job-completed-copy", "job-expired-copy"],
+    })
+    await db[BATCH_PARTS_COLLECTION].insert_one({
+        "local_part_id": "part-partial-expiry",
+        "batch_group_id": "econ-partial-expiry",
+        "provider_batch_id": "batch-partial-expiry",
+        "status": "in_progress",
+        "input_file_id": "file-input",
+    })
+    await db[BATCH_ITEMS_COLLECTION].insert_many([
+        {
+            "custom_id": "copy-completed",
+            "local_part_id": "part-partial-expiry",
+            "batch_group_id": "econ-partial-expiry",
+            "job_id": "job-completed-copy",
+            "import_status": "pending",
+        },
+        {
+            "custom_id": "copy-expired",
+            "local_part_id": "part-partial-expiry",
+            "batch_group_id": "econ-partial-expiry",
+            "job_id": "job-expired-copy",
+            "import_status": "pending",
+        },
+    ])
+    await db[PROCESSING_JOBS_COLLECTION].insert_many([
+        {"job_id": "job-completed-copy", "status": "provider_processing"},
+        {"job_id": "job-expired-copy", "status": "provider_processing"},
+    ])
+
+    client = AsyncMock()
+    client.scope = {}
+    client.retrieve_batch.return_value = {
+        "id": "batch-partial-expiry",
+        "status": "expired",
+        "input_file_id": "file-input",
+        "output_file_id": "file-output",
+        "request_counts": {"total": 2, "completed": 1, "failed": 0},
+    }
+    client.file_content.return_value = (
+        b'{"custom_id":"copy-completed","response":{"status_code":200,'
+        b'"body":{"id":"response-completed"}}}\n'
+    )
+
+    async def import_completed_only(tenant_db, *, item, provider_line, missing_result_error):
+        if provider_line is None:
+            raise RuntimeError(missing_result_error)
+        await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+            {"job_id": item["job_id"]},
+            {"$set": {"status": "completed"}},
+        )
+        return None
+
+    with (
+        patch("services.exampen_openai_batch.OpenAIBatchClient", return_value=client),
+        patch("services.exampen_openai_batch._import_item", side_effect=import_completed_only),
+    ):
+        summary = await reconcile_economy_batches(db)
+
+    completed_item = await db[BATCH_ITEMS_COLLECTION].find_one(
+        {"custom_id": "copy-completed"}
+    )
+    expired_item = await db[BATCH_ITEMS_COLLECTION].find_one(
+        {"custom_id": "copy-expired"}
+    )
+    completed_job = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "job-completed-copy"}
+    )
+    expired_job = await db[PROCESSING_JOBS_COLLECTION].find_one(
+        {"job_id": "job-expired-copy"}
+    )
+    group = await db["exampen_provider_batches"].find_one(
+        {"batch_group_id": "econ-partial-expiry"}
+    )
+
+    assert summary["items_imported"] == 1
+    assert summary["items_failed"] == 1
+    assert completed_item["import_status"] == "completed"
+    assert completed_job["status"] == "completed"
+    assert expired_item["import_status"] == "failed"
+    assert expired_job["status"] == "batch_failed"
+    assert expired_job["failure_code"] == "provider_batch_expired"
+    assert expired_job["retryable"] is True
+    assert group["status"] == "completed_with_errors"
 
 
 @pytest.mark.asyncio

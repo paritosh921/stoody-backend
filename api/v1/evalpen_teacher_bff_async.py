@@ -49,6 +49,10 @@ from services.exampen_submission_readiness import (
 )
 from services.evalpen_flag_utils import is_flag_resolved
 from services.exampen_workflow import public_processing_status
+from services.exampen_copy_state import (
+    processing_job_projection,
+    submission_queue_bucket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +171,18 @@ class QueueItem(BaseModel):
     # creates individual responses. Exposing that state prevents a teacher
     # from seeing a misleading generic "Pending" message.
     processing_status: Optional[str] = None
+    state_version: int = 1
+    copy_state: Optional[str] = None
+    checking_mode: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_phase: Optional[str] = None
+    stage_number: int = 0
+    stage_count: int = 0
+    deadline_at: Optional[str] = None
+    failure_code: Optional[str] = None
+    retryable: bool = True
+    can_retry: bool = False
+    operator_action: Optional[str] = None
     processing_error: Optional[str] = None
 
 
@@ -186,8 +202,9 @@ def _submission_queue_bucket(
     publication_status: str,
     needs_teacher_review: bool,
     has_unresolved_blocking: bool,
-    job_needs_attention: bool,
-    processing_status: Optional[str],
+    job_needs_attention: bool = False,
+    processing_status: Optional[str] = None,
+    processing_job: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Return the authoritative teacher-queue bucket for one submission.
 
@@ -197,20 +214,19 @@ def _submission_queue_bucket(
     the publish queue.
     """
 
-    normalized_processing = str(processing_status or "").lower()
-    all_evaluated = pcr_ready and dcr_complete
-
-    if has_unresolved_blocking or job_needs_attention:
+    if job_needs_attention:
         return "blocked"
-    if all_evaluated and publication_status == "ready":
-        return "ready_to_publish"
-    if needs_teacher_review:
-        return "needs_review"
-    if not pcr_ready and normalized_processing not in {"", "queued", "processing"}:
-        return "blocked"
-    if not all_evaluated:
-        return "pending"
-    return "ready_to_publish"
+    effective_job = processing_job
+    if effective_job is None and processing_status is not None:
+        effective_job = {"status": processing_status}
+    return submission_queue_bucket(
+        pcr_ready=pcr_ready,
+        dcr_complete=dcr_complete,
+        publication_status=publication_status,
+        needs_teacher_review=needs_teacher_review,
+        has_unresolved_blocking=has_unresolved_blocking,
+        processing_job=effective_job,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1015,14 +1031,10 @@ async def list_exams(
                 needs_teacher_review = bool(action_codes) and action_codes.issubset(
                     reviewable_codes
                 )
+                processing_job = jobs_by_sub.get(sub_id)
                 processing_status = public_processing_status(
-                    (jobs_by_sub.get(sub_id) or {}).get("status") or ""
+                    (processing_job or {}).get("status") or ""
                 )
-                job_needs_attention = processing_status in {
-                    "failed",
-                    "retryable_error",
-                    "enqueue_failed",
-                }
 
                 queue_bucket = _submission_queue_bucket(
                     pcr_ready=pcr_ready,
@@ -1032,8 +1044,8 @@ async def list_exams(
                     ).lower(),
                     needs_teacher_review=needs_teacher_review,
                     has_unresolved_blocking=has_unresolved_blocking,
-                    job_needs_attention=job_needs_attention,
                     processing_status=processing_status,
+                    processing_job=processing_job,
                 )
                 if queue_bucket == "needs_review":
                     needs_review += 1
@@ -1332,6 +1344,7 @@ async def get_exam_queue(
                 if processing_job
                 else None
             )
+            processing_contract = processing_job_projection(processing_job)
 
             # DCR completeness for this student
             student_has_dcr = student_id in dcr_student_ids
@@ -1410,19 +1423,14 @@ async def get_exam_queue(
                 if r.get("eval_status", "pending") == "pending"
             )
 
-            job_needs_attention = processing_status in {
-                "failed",
-                "retryable_error",
-                "enqueue_failed",
-            }
             queue_bucket = _submission_queue_bucket(
                 pcr_ready=pcr_ready,
                 dcr_complete=dcr_complete,
                 publication_status=pub_status,
                 needs_teacher_review=needs_teacher_review,
                 has_unresolved_blocking=has_unresolved_blocking,
-                job_needs_attention=job_needs_attention,
                 processing_status=processing_status,
+                processing_job=processing_job,
             )
 
             # Bucket logic
@@ -1442,6 +1450,7 @@ async def get_exam_queue(
                         review_kind=review_kind,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
+                        **processing_contract,
                         processing_error=processing_error,
                     )
                 )
@@ -1450,8 +1459,11 @@ async def get_exam_queue(
                     blocked_summary = f"{unresolved_count} unresolved blocking flag(s)"
                 elif processing_status == "blocked_for_review":
                     blocked_summary = "AI checking needs teacher review"
-                elif processing_status == "failed":
-                    blocked_summary = "AI checking failed"
+                elif processing_contract["copy_state"] == "failed":
+                    blocked_summary = (
+                        str(processing_contract.get("operator_action") or "").strip()
+                        or "AI checking failed"
+                    )
                 elif not pcr_ready:
                     blocked_summary = readiness_message(readiness)
                 else:
@@ -1466,6 +1478,7 @@ async def get_exam_queue(
                         status_summary=blocked_summary,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
+                        **processing_contract,
                         processing_error=processing_error,
                     )
                 )
@@ -1477,9 +1490,9 @@ async def get_exam_queue(
                         f"{pending_responses}/{response_count} PCR pending"
                     )
                 if response_count == 0:
-                    if processing_status == "queued":
+                    if processing_contract["copy_state"] == "queued":
                         parts.append("AI checking queued")
-                    elif processing_status == "processing":
+                    elif processing_contract["copy_state"] in {"checking", "importing"}:
                         parts.append("AI checking in progress")
                     elif processing_status == "completed":
                         parts.append("AI completed without detected responses")
@@ -1497,6 +1510,7 @@ async def get_exam_queue(
                         status_summary=status_msg,
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
+                        **processing_contract,
                         processing_error=processing_error,
                     )
                 )
@@ -1511,6 +1525,7 @@ async def get_exam_queue(
                         status_summary="Fully evaluated, ready to publish",
                         has_dcr_results=student_has_dcr,
                         processing_status=processing_status,
+                        **processing_contract,
                         processing_error=processing_error,
                     )
                 )

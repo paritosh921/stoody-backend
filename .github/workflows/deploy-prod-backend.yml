@@ -17,6 +17,7 @@ on:
       - "mentorAI/**"
       - "stoody-book/**"
       - "scripts/cleanup_upload_storage.py"
+      - "scripts/verify_openai_batch_transport.py"
       - "scripts/validate_upload_security_deploy.py"
       - "scripts/validate_jitsi_runtime.py"
       - "scripts/run_tui.sh"
@@ -189,6 +190,20 @@ jobs:
             systemctl is-active --quiet stoody-exampen-worker.service; \
             systemctl is-enabled --quiet stoody-exampen-beat.service; \
             systemctl is-active --quiet stoody-exampen-beat.service"
+
+      - name: Validate OpenAI Economy Batch transport
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Exercise the deployed key's complete Files -> Batch handoff before
+          # teachers can depend on it. The probe uses Moderations, deletes the
+          # provider files it creates, and fails the deployment on any project-
+          # scope or asynchronous-validator error.
+          ssh -i ~/.ssh/prod_deploy_key -o StrictHostKeyChecking=yes \
+            "${PROD_MAIN_BACKEND_USER}@${PROD_MAIN_BACKEND_HOST}" \
+            "cd '${PROD_MAIN_BACKEND_PATH}' && \
+            '${PROD_MAIN_BACKEND_VENV_PATH}/bin/python' scripts/verify_openai_batch_transport.py"
 
       - name: Invalidate existing sessions after prod deploy
         shell: bash

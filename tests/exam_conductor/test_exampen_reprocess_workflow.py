@@ -773,6 +773,46 @@ async def test_teacher_reprocess_rejects_an_active_processing_lease(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_teacher_reprocess_rejects_an_active_economy_batch():
+    """Standard checking cannot overlap a delayed Economy generation."""
+    from services.exampen_workflow import (
+        PROCESSING_JOBS_COLLECTION,
+        ProcessingJobBusyError,
+        reprocess_processing_job,
+    )
+
+    db = _fresh_db()
+    await _seed_supported_subjective_exam(db, "EXAM-economy-active")
+    await _seed_submission(db, "SUB-economy-active", "EXAM-economy-active")
+    jobs = db[PROCESSING_JOBS_COLLECTION]
+    await jobs.insert_one(
+        {
+            "job_id": "pcr-job-SUB-economy-active",
+            "submission_id": "SUB-economy-active",
+            "exam_id": "EXAM-economy-active",
+            "status": "provider_finalizing",
+            "processing_mode": "economy",
+            "grading_generation": 1,
+            "attempts": 0,
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+
+    with pytest.raises(ProcessingJobBusyError, match="already queued"):
+        await reprocess_processing_job(
+            db,
+            db_name="skb_test",
+            job_id="pcr-job-SUB-economy-active",
+            requested_by="TUT-1",
+            reason="Do not overlap the live Economy run",
+        )
+
+    stored = await jobs.find_one({"job_id": "pcr-job-SUB-economy-active"})
+    assert stored["status"] == "provider_finalizing"
+    assert stored["grading_generation"] == 1
+
+
+@pytest.mark.asyncio
 async def test_teacher_reprocess_reclaims_only_an_expired_processing_lease(monkeypatch):
     from services.exampen_workflow import (
         PROCESSING_JOBS_COLLECTION,

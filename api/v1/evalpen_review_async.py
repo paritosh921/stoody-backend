@@ -58,6 +58,7 @@ from services.exampen_workflow import (
     is_supported_pcr_grading_contract,
     public_processing_status,
 )
+from services.exampen_copy_state import ACTIVE_COPY_STATES, processing_job_projection
 from services.objective_scoring_service import is_integer_question
 from utils.tutor_scoping import get_tutor_scoped_students
 from utils.s3_storage import PrivateObjectStorageError, create_private_download_url
@@ -1807,6 +1808,20 @@ class CollectionRosterItemAPI(BaseModel):
     source: Optional[str] = None
     last_activity: Optional[str] = None
     open_recheck_count: int = 0
+    processing_status: Optional[str] = None
+    state_version: int = 1
+    copy_state: Optional[str] = None
+    checking_mode: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_phase: Optional[str] = None
+    stage_number: int = 0
+    stage_count: int = 0
+    deadline_at: Optional[str] = None
+    failure_code: Optional[str] = None
+    retryable: bool = True
+    can_retry: bool = False
+    operator_action: Optional[str] = None
+    processing_error: Optional[str] = None
 
 
 class ExamRosterAPI(BaseModel):
@@ -2059,6 +2074,8 @@ async def get_exam_roster(
         job = job_by_submission.get(submission_id or "")
         publication = str((submission or {}).get("publication_status") or "").lower()
         job_status = str((job or {}).get("status") or "").lower()
+        processing_contract = processing_job_projection(job) if job else None
+        copy_state = str((processing_contract or {}).get("copy_state") or "")
         review_state = str((submission or {}).get("review_state") or "").lower()
         open_recheck_count = open_rechecks_by_student.get(student_id, 0)
         readiness_ready = bool(
@@ -2104,12 +2121,7 @@ async def get_exam_roster(
         elif (
             submission_id in blocked_submissions
             or review_state == "blocked"
-            or job_status
-            in {
-                "failed",
-                "retryable_error",
-                "enqueue_failed",
-            }
+            or copy_state == "failed"
         ):
             status_value = "blocked"
             total_blocked += 1
@@ -2122,7 +2134,7 @@ async def get_exam_roster(
             review_state == "needs_review"
             or submission_id in review_submissions
             or (
-                job_status == "blocked_for_review"
+                copy_state == "needs_review"
                 and submission_id not in blocked_submissions
             )
         ):
@@ -2131,19 +2143,13 @@ async def get_exam_roster(
             total_submitted += 1
         elif (
             submission_id in ready_submissions
-            or job_status == "completed"
+            or copy_state == "ready"
             or publication in {"ready", "unpublished"}
         ):
             status_value = "ready"
             total_ready += 1
             total_submitted += 1
-        elif job_status in {
-            "queued",
-            "processing",
-            "retryable_error",
-            "enqueue_failed",
-            "not_enqueued",
-        } or str((submission or {}).get("segmentation_status") or "") in {
+        elif copy_state in ACTIVE_COPY_STATES or str((submission or {}).get("segmentation_status") or "") in {
             "pending",
             "processing",
         }:
@@ -2167,6 +2173,11 @@ async def get_exam_roster(
                 source=source if source in {"pen", "camera", "mixed"} else None,
                 last_activity=last_activity,
                 open_recheck_count=open_recheck_count,
+                processing_status=(
+                    public_processing_status(job_status) if job else None
+                ),
+                **(processing_contract or {}),
+                processing_error=(str((job or {}).get("last_error") or "") or None),
             )
         )
 

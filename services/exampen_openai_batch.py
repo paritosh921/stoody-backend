@@ -31,9 +31,20 @@ ECONOMY_WAITING_JOB_STATUS = "waiting_for_batch"
 ACTIVE_GROUP_STATUSES = {"queued", "preparing", "provider_processing", "importing", "cancelling"}
 ACTIVE_PROVIDER_STATUSES = {"validating", "in_progress", "finalizing", "cancelling"}
 TERMINAL_PROVIDER_STATUSES = {"completed", "failed", "expired", "cancelled"}
+ACTIVE_BATCH_JOB_STATUSES = {
+    "batch_queued",
+    "preparing_batch",
+    "provider_processing",
+    "provider_finalizing",
+    "importing_batch",
+}
 PART_IMPORTING_STATUS = "importing_results"
 DEFAULT_JSONL_LIMIT = 180 * 1024 * 1024
 MAX_BATCH_REQUESTS = 50_000
+
+
+class StaleBatchGenerationError(RuntimeError):
+    """Raised when delayed provider output belongs to a superseded grading run."""
 
 
 def _now() -> datetime:
@@ -41,7 +52,52 @@ def _now() -> datetime:
 
 
 def _short_error(value: Any, limit: int = 600) -> str:
+    if isinstance(value, Mapping):
+        try:
+            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            pass
     return str(value or "Unknown error").replace("\n", " ").strip()[:limit]
+
+
+def _batch_max_requests_per_part() -> int:
+    """Bound the failure domain of one provider Batch.
+
+    One copy per Batch is the safe default: a slow or expired copy cannot hold
+    every other student's completed output.  Operators may deliberately widen
+    the shard after validating their provider limits and latency objectives.
+    """
+
+    try:
+        configured = int(os.getenv("EXAMPEN_BATCH_MAX_REQUESTS_PER_PART", "1"))
+    except (TypeError, ValueError):
+        configured = 1
+    return max(1, min(MAX_BATCH_REQUESTS, configured))
+
+
+def _entry_stage(entry: Mapping[str, Any]) -> Dict[str, Any]:
+    call_index = max(1, int(entry.get("call_index") or 1))
+    grader_kind = str(entry.get("grader_kind") or "")
+    stage_count = 2 if grader_kind == "full_document" else 1
+    stage_number = min(call_index, stage_count)
+    phase = (
+        "mapping"
+        if grader_kind == "full_document" and stage_number == 1
+        else "grading"
+    )
+    return {
+        "provider_phase": phase,
+        "stage_number": stage_number,
+        "stage_count": stage_count,
+    }
+
+
+def _entry_generation(entry: Mapping[str, Any]) -> int:
+    # Items created before grading generations were introduced belong to
+    # generation zero. Never interpret a missing legacy field as "match any
+    # generation", because delayed legacy output could otherwise claim a newer
+    # retry after deployment.
+    return int(entry.get("job_generation") or 0)
 
 
 def _provider_request_metadata(payload: Mapping[str, Any]) -> Dict[str, str]:
@@ -102,6 +158,80 @@ def provider_batch_failure(provider_state: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def describe_provider_batch_progress(
+    provider_state: Mapping[str, Any],
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Build the stable active-provider progress contract used by jobs and APIs.
+
+    OpenAI can remain in ``finalizing`` after the nominal completion window.
+    That is not a completed result and must not be converted into marks or a
+    failure locally. It is materially different from model work still running,
+    so expose it explicitly while reconciliation continues.
+    """
+
+    observed_at = now or _now()
+    status_value = str(provider_state.get("status") or "").strip().lower()
+    counts = provider_state.get("request_counts")
+    counts = counts if isinstance(counts, Mapping) else {}
+    total = max(0, int(counts.get("total") or 0))
+    completed = max(0, int(counts.get("completed") or 0))
+    failed = max(0, int(counts.get("failed") or 0))
+
+    expires_at = provider_state.get("expires_at")
+    try:
+        expires_epoch = float(expires_at) if expires_at is not None else None
+    except (TypeError, ValueError):
+        expires_epoch = None
+    delay_seconds = (
+        max(0, int(observed_at.timestamp() - expires_epoch))
+        if expires_epoch is not None and observed_at.timestamp() >= expires_epoch
+        else 0
+    )
+    delayed = bool(
+        delay_seconds
+        and status_value in {"validating", "in_progress", "finalizing"}
+    )
+
+    if status_value == "validating":
+        stage = "provider_validating"
+        message = "OpenAI is validating the economy Batch"
+    elif status_value == "finalizing":
+        stage = "provider_finalizing"
+        message = (
+            "OpenAI is delayed while finalizing the economy Batch; Stoody is still polling"
+            if delayed
+            else "OpenAI is finalizing the economy Batch results"
+        )
+    elif status_value == "cancelling":
+        stage = "provider_cancelling"
+        message = "OpenAI is cancelling the economy Batch"
+    else:
+        stage = "provider_processing"
+        message = "OpenAI economy checking is running"
+    if total:
+        message = f"{message} ({completed}/{total} requests complete)"
+
+    return {
+        "status": status_value or "in_progress",
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "expires_at": expires_at,
+        "finalizing_at": provider_state.get("finalizing_at"),
+        "delayed": delayed,
+        "delay_seconds": delay_seconds,
+        "job_status": (
+            "provider_finalizing"
+            if status_value == "finalizing"
+            else "provider_processing"
+        ),
+        "stage": stage,
+        "message": message,
+    }
+
+
 def classify_economy_batch_failure(error: Any) -> Dict[str, Any]:
     """Turn provider text into a stable retry/operations contract.
 
@@ -144,6 +274,45 @@ def classify_economy_batch_failure(error: Any) -> Dict[str, Any]:
                 "Correct the OpenAI project credentials and restart the backend "
                 "before starting Economy checking again."
             ),
+        }
+    if any(marker in normalized for marker in ("server_is_overloaded", "server overloaded", "overloaded")):
+        return {
+            "failure_code": "provider_overloaded",
+            "retryable": True,
+            "operator_action": "Retry this copy in Economy, or use Standard checking if it is urgent.",
+        }
+    if any(marker in normalized for marker in ("rate_limit", "rate limit", "http 429")):
+        return {
+            "failure_code": "provider_rate_limited",
+            "retryable": True,
+            "operator_action": "Wait for provider capacity, then retry only this copy.",
+        }
+    if any(marker in normalized for marker in ("expired", "timed out", "timeout")):
+        return {
+            "failure_code": "provider_batch_expired",
+            "retryable": True,
+            "operator_action": "Retry only this copy; completed copies remain unchanged.",
+        }
+    if "cancelled" in normalized or "canceled" in normalized:
+        return {
+            "failure_code": "provider_batch_cancelled",
+            "retryable": True,
+            "operator_action": "Start Economy checking again for the unfinished copy.",
+        }
+    if any(
+        marker in normalized
+        for marker in (
+            "invalid_request_error",
+            "invalid request",
+            "unsupported parameter",
+            "model_not_found",
+            "content_policy_violation",
+        )
+    ):
+        return {
+            "failure_code": "provider_invalid_request",
+            "retryable": False,
+            "operator_action": "Correct the grading request or model configuration before retrying.",
         }
     return {
         "failure_code": "provider_batch_failed",
@@ -498,6 +667,12 @@ class OpenAIBatchClient:
 
 
 async def ensure_batch_indexes(tenant_db: Any) -> None:
+    # Legacy jobs predate the run-generation fence.  Backfill once so delayed
+    # provider output can be compared atomically during rolling deployment.
+    await tenant_db[PROCESSING_JOBS_COLLECTION].update_many(
+        {"grading_generation": {"$exists": False}},
+        {"$set": {"grading_generation": 0}},
+    )
     await tenant_db[BATCH_GROUPS_COLLECTION].create_index(
         "batch_group_id", unique=True, name="uniq_exampen_batch_group"
     )
@@ -522,6 +697,10 @@ async def ensure_batch_indexes(tenant_db: Any) -> None:
     await tenant_db[BATCH_ITEMS_COLLECTION].create_index(
         [("batch_group_id", 1), ("import_status", 1)],
         name="idx_exampen_batch_item_import",
+    )
+    await tenant_db[BATCH_ITEMS_COLLECTION].create_index(
+        [("job_id", 1), ("job_generation", 1), ("import_status", 1)],
+        name="idx_exampen_batch_item_generation",
     )
 
 
@@ -582,13 +761,30 @@ async def create_economy_batch_group(
         {
             "$set": {
                 "status": "batch_queued",
+                "processing_mode": "economy",
                 "provider_batch_group_id": group_id,
                 "progress": {
                     "stage": "batch_queued",
                     "message": "Queued for economy checking",
                 },
                 "updated_at": now,
-            }
+            },
+            "$inc": {"grading_generation": 1},
+            "$unset": {
+                "last_error": "",
+                "failure_code": "",
+                "retryable": "",
+                "operator_action": "",
+                "finished_at": "",
+                "provider_batch_id": "",
+                "provider_batch_status": "",
+                "provider_phase": "",
+                "provider_expires_at": "",
+                "provider_request_counts": "",
+                "provider_delayed": "",
+                "stage_number": "",
+                "stage_count": "",
+            },
         },
     )
     return group
@@ -646,6 +842,7 @@ async def _commit_grading_result(
     *,
     job: Mapping[str, Any],
     result: Any,
+    expected_generation: Optional[int] = None,
 ) -> None:
     """Commit the same public job projection used by the immediate worker."""
 
@@ -654,11 +851,14 @@ async def _commit_grading_result(
         getattr(result, "processing_path", "") or "full_document_visual"
     )
     final_status = str(getattr(result, "status", "") or "blocked_for_review")
-    await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-        {
-            "job_id": job.get("job_id"),
-            "status": {"$in": ["batch_queued", "preparing_batch", "provider_processing", "importing_batch"]},
-        },
+    job_filter: Dict[str, Any] = {
+        "job_id": job.get("job_id"),
+        "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+    }
+    if expected_generation is not None:
+        job_filter["grading_generation"] = expected_generation
+    committed = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+        job_filter,
         {
             "$set": {
                 "status": final_status,
@@ -691,9 +891,19 @@ async def _commit_grading_result(
                 "finished_at": now,
                 "updated_at": now,
             },
-            "$unset": {"lease_token": "", "lease_expires_at": ""},
+            "$unset": {
+                "lease_token": "",
+                "lease_expires_at": "",
+                "failure_code": "",
+                "retryable": "",
+                "operator_action": "",
+            },
         },
     )
+    if committed.matched_count != 1:
+        raise StaleBatchGenerationError(
+            "Provider output belongs to a superseded grading run"
+        )
     try:
         from services.exampen_workflow import _maybe_mark_exam_ready_for_review
 
@@ -704,17 +914,32 @@ async def _commit_grading_result(
         logger.warning("Could not refresh exam readiness after Batch import", exc_info=True)
 
 
-async def _mark_job_failed(tenant_db: Any, job_id: str, error: Any) -> None:
+async def _mark_job_failed(
+    tenant_db: Any,
+    job_id: str,
+    error: Any,
+    *,
+    expected_generation: Optional[int] = None,
+) -> None:
+    failure = classify_economy_batch_failure(error)
+    job_filter: Dict[str, Any] = {
+        "job_id": job_id,
+        "status": {"$nin": ["completed", "blocked_for_review"]},
+    }
+    if expected_generation is not None:
+        job_filter["grading_generation"] = expected_generation
     await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-        {"job_id": job_id, "status": {"$nin": ["completed", "blocked_for_review"]}},
+        job_filter,
         {
             "$set": {
                 "status": "batch_failed",
                 "last_error": _short_error(error),
+                **failure,
                 "progress": {
                     "stage": "batch_failed",
-                    "message": "Economy checking failed; retry only this copy",
+                    "message": "Economy checking stopped for this copy; no marks were changed",
                 },
+                "finished_at": _now(),
                 "updated_at": _now(),
             }
         },
@@ -813,12 +1038,17 @@ async def _create_provider_parts(
     except (TypeError, ValueError):
         max_bytes = DEFAULT_JSONL_LIMIT
     max_bytes = max(1, min(199 * 1024 * 1024, max_bytes))
-    partitions, oversized = partition_batch_requests(pending_entries, max_bytes=max_bytes)
+    partitions, oversized = partition_batch_requests(
+        pending_entries,
+        max_bytes=max_bytes,
+        max_requests=_batch_max_requests_per_part(),
+    )
     for entry in oversized:
         await _mark_job_failed(
             tenant_db,
             str(entry.get("job_id") or ""),
             "One copy is too large for the 200 MB OpenAI Batch input limit",
+            expected_generation=_entry_generation(entry),
         )
     created = 0
     for partition_index, partition in enumerate(partitions):
@@ -842,6 +1072,7 @@ async def _create_provider_parts(
         await tenant_db[BATCH_PARTS_COLLECTION].insert_one(part_doc)
         item_docs = []
         for entry in partition:
+            stage_projection = _entry_stage(entry)
             item_doc = {
                     "custom_id": entry["custom_id"],
                     "batch_group_id": group["batch_group_id"],
@@ -851,6 +1082,8 @@ async def _create_provider_parts(
                     "submission_id": entry["submission_id"],
                     "grader_kind": entry["grader_kind"],
                     "call_index": int(entry.get("call_index") or 0),
+                    "job_generation": _entry_generation(entry),
+                    **stage_projection,
                     "stage": stage,
                     "model": entry["model"],
                     "prior_response_bodies": list(entry.get("prior_response_bodies") or []),
@@ -954,21 +1187,48 @@ async def _create_provider_parts(
                     }
                 },
             )
-            await tenant_db[PROCESSING_JOBS_COLLECTION].update_many(
-                {"job_id": {"$in": [entry["job_id"] for entry in partition]}},
-                {
-                    "$set": {
-                        "status": "provider_processing",
-                        "progress": {
-                            "stage": "provider_processing",
-                            "message": "Economy checking is running (up to 24 hours)",
+            for entry in partition:
+                stage_projection = _entry_stage(entry)
+                stage_number = int(stage_projection["stage_number"])
+                stage_count = int(stage_projection["stage_count"])
+                entry_job_filter: Dict[str, Any] = {
+                    "job_id": entry["job_id"],
+                    "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+                }
+                entry_generation = _entry_generation(entry)
+                if entry_generation is not None:
+                    entry_job_filter["grading_generation"] = entry_generation
+                await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+                    entry_job_filter,
+                    {
+                        "$set": {
+                            "status": "provider_processing",
+                            "provider_batch_id": provider_batch_id,
+                            "provider_batch_status": str(
+                                provider_batch.get("status") or "validating"
+                            ),
+                            "provider_expires_at": provider_batch.get("expires_at"),
+                            **stage_projection,
+                            "progress": {
+                                "stage": "provider_processing",
+                                "message": (
+                                    f"Economy checking stage {stage_number} of {stage_count}: "
+                                    f"{stage_projection['provider_phase']}"
+                                ),
+                            },
+                            "updated_at": _now(),
                         },
-                        "updated_at": _now(),
-                    }
-                },
-            )
+                        "$unset": {
+                            "last_error": "",
+                            "failure_code": "",
+                            "retryable": "",
+                            "operator_action": "",
+                        },
+                    },
+                )
             created += 1
         except Exception as exc:
+            failure_contract = classify_economy_batch_failure(exc)
             await tenant_db[BATCH_PARTS_COLLECTION].update_one(
                 {"local_part_id": local_part_id},
                 {
@@ -976,6 +1236,7 @@ async def _create_provider_parts(
                         "status": "imported",
                         "provider_creation_failed": True,
                         "last_error": _short_error(exc),
+                        **failure_contract,
                         "updated_at": _now(),
                     }
                 },
@@ -987,12 +1248,18 @@ async def _create_provider_parts(
                         "import_status": "failed",
                         "reserved_tokens": 0,
                         "last_error": _short_error(exc),
+                        **failure_contract,
                         "updated_at": _now(),
                     }
                 },
             )
             for entry in partition:
-                await _mark_job_failed(tenant_db, entry["job_id"], exc)
+                await _mark_job_failed(
+                    tenant_db,
+                    entry["job_id"],
+                    exc,
+                    expected_generation=_entry_generation(entry),
+                )
             if input_file_id:
                 await client.delete_file(input_file_id)
     return created
@@ -1065,10 +1332,11 @@ async def _recover_interrupted_part_creation(
                             "status": "provider_processing",
                             "progress": {
                                 "stage": "provider_processing",
-                                "message": "Economy checking is running (up to 24 hours)",
+                                "message": "Economy checking is running; each provider stage has its own window",
                             },
                             "updated_at": _now(),
-                        }
+                        },
+                        "$unset": {"last_error": ""},
                     },
                 )
             continue
@@ -1221,6 +1489,7 @@ async def prepare_economy_batch_group(
                     tenant_db,
                     str(pending_entry.get("job_id") or ""),
                     exc,
+                    expected_generation=_entry_generation(pending_entry),
                 )
             return exc
 
@@ -1266,7 +1535,12 @@ async def prepare_economy_batch_group(
                         getattr(result, "skipped_reason", None)
                         or "The grading contract declined this copy"
                     )
-                await _commit_grading_result(tenant_db, job=job, result=result)
+                await _commit_grading_result(
+                    tenant_db,
+                    job=job,
+                    result=result,
+                    expected_generation=int(job.get("grading_generation") or 0),
+                )
                 local_completed += 1
                 continue
             if not deferred or not deferred.get("request_body"):
@@ -1276,6 +1550,7 @@ async def prepare_economy_batch_group(
                 "custom_id": custom_id,
                 "job_id": job_id,
                 "submission_id": submission_id,
+                "job_generation": int(job.get("grading_generation") or 0),
                 **deferred,
             }
             entry["jsonl_line"] = _jsonl_line(custom_id, entry["request_body"])
@@ -1288,34 +1563,29 @@ async def prepare_economy_batch_group(
         except Exception as exc:
             failures += 1
             logger.exception("Could not prepare economy checking for job %s", job_id)
-            await _mark_job_failed(tenant_db, job_id, exc)
+            await _mark_job_failed(
+                tenant_db,
+                job_id,
+                exc,
+                expected_generation=int(job.get("grading_generation") or 0),
+            )
 
     try:
         if not preparation_error:
             preparation_error = await flush_entries()
         if preparation_error:
-            pending_job_ids = [
-                str(job.get("job_id") or "")
-                for job in jobs
-                if str(job.get("job_id") or "") not in assigned_job_ids
-            ]
-            await tenant_db[PROCESSING_JOBS_COLLECTION].update_many(
-                {
-                    "job_id": {"$in": pending_job_ids},
-                    "status": {"$in": ["batch_queued", "preparing_batch"]},
-                },
-                {
-                    "$set": {
-                        "status": "batch_failed",
-                        "last_error": _short_error(preparation_error),
-                        "progress": {
-                            "stage": "batch_failed",
-                            "message": "Economy checking failed; retry only this copy",
-                        },
-                        "updated_at": _now(),
-                    }
-                },
-            )
+            for pending_job in jobs:
+                pending_job_id = str(pending_job.get("job_id") or "")
+                if not pending_job_id or pending_job_id in assigned_job_ids:
+                    continue
+                await _mark_job_failed(
+                    tenant_db,
+                    pending_job_id,
+                    preparation_error,
+                    expected_generation=int(
+                        pending_job.get("grading_generation") or 0
+                    ),
+                )
         provider_request_count = await tenant_db[BATCH_ITEMS_COLLECTION].count_documents(
             {
                 "batch_group_id": batch_group_id,
@@ -1406,6 +1676,31 @@ async def _import_item(
     provider_line: Optional[Mapping[str, Any]],
     missing_result_error: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    expected_generation = _entry_generation(item)
+    job_filter: Dict[str, Any] = {
+        "job_id": item.get("job_id"),
+        "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+    }
+    if expected_generation is not None:
+        job_filter["grading_generation"] = expected_generation
+    claimed = await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+        job_filter,
+        {
+            "$set": {
+                "status": "importing_batch",
+                "provider_phase": "importing",
+                "progress": {
+                    "stage": "importing_batch",
+                    "message": "Validating and importing the returned marks",
+                },
+                "updated_at": _now(),
+            }
+        },
+    )
+    if claimed.matched_count != 1:
+        raise StaleBatchGenerationError(
+            "Provider output belongs to a superseded grading run"
+        )
     job = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one(
         {"job_id": item.get("job_id")}
     )
@@ -1447,6 +1742,7 @@ async def _import_item(
             "custom_id": custom_id,
             "job_id": str(item.get("job_id") or ""),
             "submission_id": str(item.get("submission_id") or ""),
+            "job_generation": expected_generation,
             "prior_response_bodies": response_bodies,
             "recorded_call_indexes": sorted(set(recorded + [current_call_index])),
             "parent_custom_id": str(item.get("custom_id") or ""),
@@ -1456,7 +1752,12 @@ async def _import_item(
         return recovery
     if result is None or not getattr(result, "handled", False):
         raise RuntimeError("Imported provider output did not complete grading")
-    await _commit_grading_result(tenant_db, job=job, result=result)
+    await _commit_grading_result(
+        tenant_db,
+        job=job,
+        result=result,
+        expected_generation=expected_generation,
+    )
     return None
 
 
@@ -1542,6 +1843,47 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                 },
                 {"$set": part_set},
             )
+            if observed.matched_count and provider_status in ACTIVE_PROVIDER_STATUSES:
+                progress = describe_provider_batch_progress(provider_state)
+                item_jobs = await tenant_db[BATCH_ITEMS_COLLECTION].find(
+                    {"local_part_id": part.get("local_part_id")},
+                    {"job_id": 1, "job_generation": 1},
+                ).to_list(length=MAX_BATCH_REQUESTS)
+                for item_job in item_jobs:
+                    item_job_id = str(item_job.get("job_id") or "")
+                    if not item_job_id:
+                        continue
+                    progress_filter: Dict[str, Any] = {
+                        "job_id": item_job_id,
+                        "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+                    }
+                    item_generation = _entry_generation(item_job)
+                    if item_generation is not None:
+                        progress_filter["grading_generation"] = item_generation
+                    await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
+                        progress_filter,
+                        {
+                            "$set": {
+                                "status": progress["job_status"],
+                                "provider_batch_status": progress["status"],
+                                "provider_batch_id": provider_batch_id,
+                                "provider_last_polled_at": _now(),
+                                "provider_request_counts": {
+                                    "total": progress["total"],
+                                    "completed": progress["completed"],
+                                    "failed": progress["failed"],
+                                },
+                                "provider_expires_at": progress["expires_at"],
+                                "provider_delayed": progress["delayed"],
+                                "progress": {
+                                    "stage": progress["stage"],
+                                    "message": progress["message"],
+                                },
+                                "updated_at": _now(),
+                            },
+                            "$unset": {"last_error": ""},
+                        },
+                    )
             if not observed.matched_count or provider_status not in TERMINAL_PROVIDER_STATUSES:
                 continue
             claimed_part = await tenant_db[BATCH_PARTS_COLLECTION].find_one_and_update(
@@ -1614,11 +1956,15 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                         "$unset": {"import_lease_expires_at": ""},
                     },
                 )
+                cancel_job_filter: Dict[str, Any] = {
+                    "job_id": str(item.get("job_id") or ""),
+                    "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+                }
+                item_generation = _entry_generation(item)
+                if item_generation is not None:
+                    cancel_job_filter["grading_generation"] = item_generation
                 await tenant_db[PROCESSING_JOBS_COLLECTION].update_one(
-                    {
-                        "job_id": str(item.get("job_id") or ""),
-                        "status": {"$in": ["batch_queued", "preparing_batch", "provider_processing", "importing_batch"]},
-                    },
+                    cancel_job_filter,
                     {
                         "$set": {
                             "status": ECONOMY_WAITING_JOB_STATUS,
@@ -1656,14 +2002,17 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                     recovery_entries.append(recovery)
                 else:
                     summary["items_imported"] += 1
-            except Exception as exc:
-                summary["items_failed"] += 1
-                logger.exception("Could not import OpenAI Batch item %s", item.get("custom_id"))
+            except StaleBatchGenerationError as exc:
+                logger.info(
+                    "Ignoring superseded OpenAI Batch item %s: %s",
+                    item.get("custom_id"),
+                    exc,
+                )
                 await tenant_db[BATCH_ITEMS_COLLECTION].update_one(
                     {"custom_id": item["custom_id"], "import_status": "importing"},
                     {
                         "$set": {
-                            "import_status": "failed",
+                            "import_status": "superseded",
                             "reserved_tokens": 0,
                             "last_error": _short_error(exc),
                             "updated_at": _now(),
@@ -1671,7 +2020,29 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                         "$unset": {"import_lease_expires_at": ""},
                     },
                 )
-                await _mark_job_failed(tenant_db, str(item.get("job_id") or ""), exc)
+            except Exception as exc:
+                summary["items_failed"] += 1
+                logger.exception("Could not import OpenAI Batch item %s", item.get("custom_id"))
+                failure_contract = classify_economy_batch_failure(exc)
+                await tenant_db[BATCH_ITEMS_COLLECTION].update_one(
+                    {"custom_id": item["custom_id"], "import_status": "importing"},
+                    {
+                        "$set": {
+                            "import_status": "failed",
+                            "reserved_tokens": 0,
+                            "last_error": _short_error(exc),
+                            **failure_contract,
+                            "updated_at": _now(),
+                        },
+                        "$unset": {"import_lease_expires_at": ""},
+                    },
+                )
+                await _mark_job_failed(
+                    tenant_db,
+                    str(item.get("job_id") or ""),
+                    exc,
+                    expected_generation=_entry_generation(item),
+                )
         if recovery_entries and group:
             summary["recovery_parts"] += await _create_provider_parts(
                 tenant_db,

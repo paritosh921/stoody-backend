@@ -46,8 +46,10 @@ from services.exampen_workflow import (
     is_supported_pcr_grading_contract,
     public_processing_status,
 )
+from services.exampen_copy_state import processing_job_projection
 from services.exampen_openai_batch import (
     classify_economy_batch_failure,
+    describe_provider_batch_progress,
     provider_batch_failure,
 )
 from utils.tutor_scoping import get_tutor_scoped_students, tutor_can_access_document
@@ -325,6 +327,19 @@ class ProcessingJobResponse(BaseModel):
     submission_id: str
     student_id: Optional[str] = None
     status: str
+    state_version: int = 1
+    copy_state: str
+    checking_mode: str
+    provider_status: Optional[str] = None
+    provider_phase: Optional[str] = None
+    stage_number: int = 0
+    stage_count: int = 0
+    deadline_at: Optional[str] = None
+    failure_code: Optional[str] = None
+    retryable: bool = True
+    can_retry: bool = False
+    operator_action: Optional[str] = None
+    grading_generation: int = 0
     attempts: int = 0
     last_error: Optional[str] = None
     created_at: Optional[str] = None
@@ -367,6 +382,15 @@ class EconomyBatchResponse(BaseModel):
     failure_code: Optional[str] = None
     retryable: bool = True
     operator_action: Optional[str] = None
+    provider_status: Optional[str] = None
+    provider_total_count: int = 0
+    provider_completed_count: int = 0
+    provider_failed_count: int = 0
+    provider_expires_at: Optional[str] = None
+    provider_finalizing_at: Optional[str] = None
+    provider_last_polled_at: Optional[str] = None
+    provider_delayed: bool = False
+    provider_delay_seconds: int = 0
     parts: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -526,11 +550,28 @@ def _processing_job_to_response(doc: Dict[str, Any]) -> ProcessingJobResponse:
             return value.isoformat()
         return str(value) if value is not None else None
 
+    projection = processing_job_projection(doc)
+    deadline = projection.get("deadline_at")
+    if isinstance(deadline, (int, float)):
+        deadline = datetime.fromtimestamp(float(deadline), tz=timezone.utc)
     return ProcessingJobResponse(
         job_id=str(doc.get("job_id") or ""),
         submission_id=str(doc.get("submission_id") or ""),
         student_id=_fmt(doc.get("student_id")),
         status=public_processing_status(doc.get("status") or "queued"),
+        state_version=int(projection["state_version"]),
+        copy_state=str(projection["copy_state"]),
+        checking_mode=str(projection["checking_mode"]),
+        provider_status=_fmt(projection.get("provider_status")),
+        provider_phase=_fmt(projection.get("provider_phase")),
+        stage_number=int(projection.get("stage_number") or 0),
+        stage_count=int(projection.get("stage_count") or 0),
+        deadline_at=_fmt(deadline),
+        failure_code=_fmt(projection.get("failure_code")),
+        retryable=bool(projection.get("retryable", True)),
+        can_retry=bool(projection.get("can_retry", False)),
+        operator_action=_fmt(projection.get("operator_action")),
+        grading_generation=int(doc.get("grading_generation") or 0),
         attempts=int(doc.get("attempts") or 0),
         last_error=_fmt(doc.get("last_error")),
         created_at=_fmt(doc.get("created_at")),
@@ -1694,6 +1735,7 @@ async def _economy_batch_to_response(
             "input_bytes": 1,
             "last_error": 1,
             "provider_state": 1,
+            "updated_at": 1,
         },
     ).sort("created_at", 1).to_list(length=1000)
 
@@ -1724,6 +1766,53 @@ async def _economy_batch_to_response(
             "operator_action": None,
         }
     )
+    provider_progress = [
+        describe_provider_batch_progress(part.get("provider_state") or {})
+        for part in raw_parts
+        if isinstance(part.get("provider_state"), dict)
+    ]
+    provider_statuses = {
+        str(progress.get("status") or "")
+        for progress in provider_progress
+        if str(progress.get("status") or "")
+    }
+    provider_status: Optional[str] = None
+    if str(doc.get("status") or "") == "cancelling":
+        provider_status = "cancelling"
+    else:
+        # Report the least-advanced active phase across provider parts. A
+        # group is not finalizing while another part is still validating or
+        # executing requests.
+        for candidate in ("validating", "in_progress", "finalizing", "cancelling"):
+            if candidate in provider_statuses:
+                provider_status = candidate
+                break
+        if provider_status is None and len(provider_statuses) == 1:
+            provider_status = next(iter(provider_statuses))
+        elif provider_status is None and provider_statuses:
+            provider_status = "mixed_terminal"
+
+    def _provider_epoch(values: List[Any], *, latest: bool) -> Optional[str]:
+        epochs: List[float] = []
+        for value in values:
+            try:
+                if value is not None:
+                    epochs.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        if not epochs:
+            return None
+        epoch = max(epochs) if latest else min(epochs)
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+    part_poll_times = [
+        part.get("updated_at")
+        for part in raw_parts
+        if hasattr(part.get("updated_at"), "isoformat")
+    ]
+    provider_last_polled_at = (
+        max(part_poll_times).isoformat() if part_poll_times else None
+    )
     return EconomyBatchResponse(
         batch_group_id=str(doc.get("batch_group_id") or ""),
         exam_id=str(doc.get("exam_id") or ""),
@@ -1740,6 +1829,25 @@ async def _economy_batch_to_response(
         retryable=bool(doc.get("retryable", failure_contract.get("retryable", True))),
         operator_action=_fmt(
             doc.get("operator_action") or failure_contract.get("operator_action")
+        ),
+        provider_status=provider_status,
+        provider_total_count=sum(int(item.get("total") or 0) for item in provider_progress),
+        provider_completed_count=sum(
+            int(item.get("completed") or 0) for item in provider_progress
+        ),
+        provider_failed_count=sum(int(item.get("failed") or 0) for item in provider_progress),
+        provider_expires_at=_provider_epoch(
+            [item.get("expires_at") for item in provider_progress],
+            latest=True,
+        ),
+        provider_finalizing_at=_provider_epoch(
+            [item.get("finalizing_at") for item in provider_progress],
+            latest=False,
+        ),
+        provider_last_polled_at=provider_last_polled_at,
+        provider_delayed=any(bool(item.get("delayed")) for item in provider_progress),
+        provider_delay_seconds=max(
+            [int(item.get("delay_seconds") or 0) for item in provider_progress] or [0]
         ),
         parts=parts,
     )
