@@ -40,6 +40,35 @@ def _regions():
     }
 
 
+def test_paper_content_hash_includes_question_and_option_visuals():
+    from services.exampen_paper_service import _content_hash
+
+    document = {"document_id": "DOC-VISUAL-HASH", "exam_mode": "pcr"}
+    base_question = {
+        "id": "q-1",
+        "text": "Use the diagram.",
+        "marks": 1,
+        "question_figures": [{"id": "figure-a", "path": "uploads/figure-a.png"}],
+        "images": [{"id": "legacy-option-a", "path": "uploads/option-a.png"}],
+        "enhanced_options": [
+            {"label": "A", "type": "image", "image_id": "legacy-option-a"}
+        ],
+    }
+
+    initial_hash = _content_hash(document, [base_question])
+    changed_figure_hash = _content_hash(
+        document,
+        [{**base_question, "question_figures": [{"id": "figure-b", "path": "uploads/figure-b.png"}]}],
+    )
+    changed_legacy_option_hash = _content_hash(
+        document,
+        [{**base_question, "images": [{"id": "legacy-option-b", "path": "uploads/option-b.png"}]}],
+    )
+
+    assert changed_figure_hash != initial_hash
+    assert changed_legacy_option_hash != initial_hash
+
+
 def test_question_layout_is_complete_and_uses_printed_order():
     from services.exampen_paper_service import build_question_layout
 

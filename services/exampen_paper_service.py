@@ -633,6 +633,10 @@ def _content_hash(
                 "enhanced_options": copy.deepcopy(
                     question.get("enhanced_options") or []
                 ),
+                "images": copy.deepcopy(question.get("images") or []),
+                "question_figures": copy.deepcopy(
+                    question.get("question_figures") or []
+                ),
                 "correct_answer": normalize_answer_label(
                     question.get("correct_answer")
                     or question.get("correctAnswer")

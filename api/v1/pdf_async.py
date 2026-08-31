@@ -41,6 +41,7 @@ from api.v1.auth_async import get_current_user, get_database, get_cache
 from api.v1.student_async import require_student, require_student_or_admin
 from config_async import OCR_TIMEOUT_SECONDS, settings
 from utils.path_utils import get_relative_path, get_absolute_path
+from utils.enhanced_option_images import enrich_enhanced_option_images
 from utils.s3_storage import upload_file as s3_upload_file, is_s3_enabled, get_public_url, download_file
 from utils.tutor_scoping import (
     build_tutor_document_candidate_filter,
@@ -3871,10 +3872,15 @@ async def _resolve_authoring_image_ref(
                 ref.get(key),
                 content_type,
             )
-    if str(ref.get("type") or "").strip().lower() == "image" and ref.get("content"):
+    inline_content = str(ref.get("content") or "").strip()
+    if (
+        str(ref.get("type") or "").strip().lower() == "image"
+        and inline_content
+        and not inline_content.startswith(("/", "http://", "https://", "s3://"))
+    ):
         return await asyncio.to_thread(
             _authoring_image_data_uri,
-            ref.get("content"),
+            inline_content,
             content_type,
         )
 
@@ -10581,6 +10587,11 @@ async def get_document_questions(
                     logger.error(f"Error processing image: {img_err}")
 
             question_dict["images"] = enriched_images
+            question_dict["enhanced_options"] = await enrich_enhanced_option_images(
+                question_dict.get("enhanced_options") or [],
+                db=db,
+                is_b2c=is_b2c,
+            )
 
             question_id = str(question_dict.get("id") or "")
             if include_worked_answers:
@@ -11049,8 +11060,6 @@ async def update_question(
             update_data["question_text"] = question_data["text"]
         if "options" in question_data:
             update_data["options"] = question_data["options"]
-        if "correct_answer" in question_data:
-            update_data["correct_answer"] = question_data["correct_answer"]
         if "reference_solution" in question_data:
             update_data["reference_solution"] = str(
                 question_data["reference_solution"] or ""
@@ -11171,10 +11180,30 @@ async def update_question(
             update_data["evaluation_mode"] = normalized_evaluation_mode
         # Helper to process and save new images
         async def process_new_images(images_list, id_prefix):
+            if not isinstance(images_list, list):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Question images must be a list",
+                )
             processed_images = []
             for i, img in enumerate(images_list):
-                # Check if this is a new image upload (has base64Data)
-                if img.get("base64Data"):
+                if not isinstance(img, dict):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Question image {i + 1} is malformed",
+                    )
+                # Retrieval responses may enrich an already-stored reference
+                # with base64 for preview. Do not rewrite that image on every
+                # text edit; only pathless inline records are new uploads.
+                has_stored_reference = bool(
+                    img.get("path")
+                    or img.get("storage_path")
+                    or (
+                        str(img.get("url") or "").startswith("/api/v1/images/")
+                        and img.get("id")
+                    )
+                )
+                if img.get("base64Data") and not has_stored_reference:
                     try:
                         logger.info(f"Processing new image upload for question {question_id}")
                         # Generate a unique ID if the current one is temporary or missing
@@ -11192,6 +11221,11 @@ async def update_question(
                             split_composite=False, # Don't split manual uploads
                             is_b2c=is_b2c
                         )
+                        if not saved_results:
+                            raise HTTPException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                detail=f"Question image {i + 1} could not be stored",
+                            )
                         
                         # Add saved images to the list
                         for saved_img in saved_results:
@@ -11202,14 +11236,173 @@ async def update_question(
                             saved_img["base64Data"] = img["base64Data"]
                             processed_images.append(saved_img)
                             
+                    except HTTPException:
+                        raise
                     except Exception as e:
                         logger.error(f"Failed to save new image: {str(e)}")
-                        # If save fails, we might want to skip it or let validation fail
-                        # For now, we'll skip adding it to processed_images
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Question image {i + 1} could not be stored",
+                        ) from e
                 else:
                     # Existing image (no base64Data), keep as is
                     processed_images.append(img)
             return processed_images
+
+        async def process_enhanced_options(options_list: Any) -> List[Dict[str, Any]]:
+            """Persist option visuals using the same image authority as figures.
+
+            The browser works with data URLs while editing, but Mongo should
+            keep a durable image reference. Existing stored references are
+            revalidated so a broken option can never be accepted and later
+            disappear from marking-plan generation.
+            """
+
+            if not isinstance(options_list, list):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="enhanced_options must be a list",
+                )
+
+            from utils.image_validator import validate_image_exists
+
+            processed_options: List[Dict[str, Any]] = []
+            max_image_bytes = 5 * 1024 * 1024
+            for index, raw_option in enumerate(options_list):
+                option = dict(raw_option) if isinstance(raw_option, dict) else {
+                    "type": "text",
+                    "content": str(raw_option or ""),
+                }
+                option["label"] = chr(65 + index)
+                option_type = str(option.get("type") or "text").strip().lower()
+                if option_type != "image":
+                    option["type"] = "text"
+                    option["content"] = str(option.get("content") or "")
+                    processed_options.append(option)
+                    continue
+
+                option["type"] = "image"
+                content = str(option.get("content") or "").strip()
+                inline_payload = str(
+                    option.get("base64Data")
+                    or option.get("base64_data")
+                    or (
+                        content
+                        if content.startswith("data:image/")
+                        or (
+                            len(content) > 512
+                            and not content.startswith(("/", "http://", "https://", "s3://"))
+                        )
+                        else ""
+                    )
+                ).strip()
+
+                stored_reference_id = str(option.get("image_id") or "").strip()
+                has_stored_reference = bool(
+                    stored_reference_id
+                    and (
+                        option.get("path")
+                        or option.get("storage_path")
+                        or str(option.get("url") or "").startswith("/api/v1/images/")
+                    )
+                )
+                if inline_payload and has_stored_reference:
+                    if not await validate_image_exists(stored_reference_id, db, is_b2c):
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Option {option['label']} image is missing from storage",
+                        )
+                    option["content"] = f"/api/v1/images/{stored_reference_id}"
+                    option["url"] = f"/api/v1/images/{stored_reference_id}"
+                    option.pop("base64Data", None)
+                    option.pop("base64_data", None)
+                    processed_options.append(option)
+                    continue
+
+                if inline_payload:
+                    encoded_payload = inline_payload.split(",", 1)[1] if inline_payload.startswith("data:") and "," in inline_payload else inline_payload
+                    try:
+                        decoded_payload = base64.b64decode(encoded_payload, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Option {option['label']} is not a valid base64 image",
+                        ) from exc
+                    if not decoded_payload or len(decoded_payload) > max_image_bytes:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Option {option['label']} image must be 5 MB or smaller",
+                        )
+                    if not (
+                        decoded_payload.startswith(b"\xFF\xD8\xFF")
+                        or decoded_payload.startswith(b"\x89PNG\r\n\x1a\n")
+                        or decoded_payload.startswith((b"GIF87a", b"GIF89a"))
+                        or (decoded_payload.startswith(b"RIFF") and b"WEBP" in decoded_payload[:12])
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Option {option['label']} is not a supported image",
+                        )
+
+                    requested_image_id = str(
+                        option.get("image_id") or option.get("id") or ""
+                    ).strip()
+                    if not requested_image_id or requested_image_id.startswith(("img_", "opt_")) or "temp" in requested_image_id:
+                        requested_image_id = (
+                            f"{question_id}_option_{index}_{int(datetime.utcnow().timestamp() * 1000)}"
+                        )
+                    saved_results = await save_image_to_disk(
+                        image_base64=inline_payload,
+                        image_id=requested_image_id,
+                        pdf_filename=(
+                            existing_question.get("document_id")
+                            or existing_question.get("pdf_source")
+                            or question_id
+                        ),
+                        db=db,
+                        user_id=current_user.get("user_id"),
+                        split_composite=False,
+                        is_b2c=is_b2c,
+                    )
+                    if not saved_results:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"Option {option['label']} image could not be stored",
+                        )
+                    saved_image = saved_results[0]
+                    image_id = str(saved_image.get("id") or "").strip()
+                    option.update(
+                        {
+                            "id": image_id,
+                            "image_id": image_id,
+                            "content": saved_image.get("url") or f"/api/v1/images/{image_id}",
+                            "url": saved_image.get("url") or f"/api/v1/images/{image_id}",
+                            "path": saved_image.get("path"),
+                            "filename": saved_image.get("filename"),
+                            "size": saved_image.get("size"),
+                        }
+                    )
+                    option.pop("base64Data", None)
+                    option.pop("base64_data", None)
+                    processed_options.append(option)
+                    continue
+
+                image_id = str(option.get("image_id") or "").strip()
+                if not image_id and content.startswith("/api/v1/images/"):
+                    image_id = content.rsplit("/", 1)[-1].strip()
+                if not image_id:
+                    image_id = str(option.get("id") or "").strip()
+                if not image_id or not await validate_image_exists(image_id, db, is_b2c):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=f"Option {option['label']} image is missing from storage",
+                    )
+                option["image_id"] = image_id
+                option["content"] = f"/api/v1/images/{image_id}"
+                option["url"] = f"/api/v1/images/{image_id}"
+                processed_options.append(option)
+
+            return processed_options
 
         if "images" in question_data:
             # Process any new images first
@@ -11221,6 +11414,10 @@ async def update_question(
 
             if invalid_image_ids:
                 logger.warning(f"Question {question_id} update attempted with {len(invalid_image_ids)} invalid images. These will be filtered out: {invalid_image_ids}")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="One or more option images are missing from storage; reload the question and retry",
+                )
 
             update_data["images"] = valid_images
 
@@ -11235,11 +11432,18 @@ async def update_question(
 
             if invalid_figure_ids:
                 logger.warning(f"Question {question_id} update attempted with {len(invalid_figure_ids)} invalid question figures. These will be filtered out: {invalid_figure_ids}")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="One or more question images are missing from storage; reload the question and retry",
+                )
 
             update_data["question_figures"] = valid_figures
 
         # Support enhanced_options (options with images/metadata)
         if "enhanced_options" in question_data:
+            question_data["enhanced_options"] = await process_enhanced_options(
+                question_data["enhanced_options"]
+            )
             update_data["enhanced_options"] = question_data["enhanced_options"]
 
         if "points" in question_data:
@@ -11277,11 +11481,31 @@ async def update_question(
                 document_question_type=(_parent_doc or {}).get("question_type"),
             )
         
-        # Support question_type (mcq or integer) - accept both snake_case and camelCase
+        # Treat question type as a grading-contract transition, not just a label.
+        # Incompatible fields must never survive a switch and silently influence
+        # the other grading lane.
         question_type = question_data.get("question_type") or question_data.get("questionType")
+        question_type_aliases = {
+            "objective": "mcq",
+            "multiple_choice": "mcq",
+            "multiplechoice": "mcq",
+            "numeric": "integer",
+            "numerical": "integer",
+            "descriptive": "subjective",
+        }
         if question_type:
+            raw_question_type = (
+                str(question_type).strip().lower().replace("-", "_").replace(" ", "_")
+            )
+            question_type = question_type_aliases.get(
+                raw_question_type,
+                raw_question_type,
+            )
             if question_type not in ["mcq", "integer", "subjective", "unclassified"]:
-                question_type = "mcq"  # Default to MCQ
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid question type. Allowed: mcq, integer, subjective, unclassified",
+                )
             if _parent_doc and _parent_doc.get("exam_mode") == "dcr" and question_type == "subjective":
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -11293,6 +11517,130 @@ async def update_question(
                 document_question_type=(_parent_doc or {}).get("question_type"),
             ):
                 update_data["penalty"] = 0.0
+
+        raw_existing_question_type = (
+            str(existing_question.get("question_type") or "mcq")
+            .strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
+        existing_question_type = question_type_aliases.get(
+            raw_existing_question_type,
+            raw_existing_question_type,
+        )
+        effective_question_type = question_type or existing_question_type
+        question_type_changed = bool(
+            question_type and question_type != existing_question_type
+        )
+
+        if effective_question_type == "subjective":
+            # Direct callers may omit correct_answer when changing only the
+            # type. Clear the objective key and penalty server-side regardless.
+            update_data["correct_answer"] = ""
+            update_data["penalty"] = 0.0
+        elif "correct_answer" in question_data:
+            raw_correct_answer = str(question_data.get("correct_answer") or "").strip()
+            if effective_question_type == "integer":
+                update_data["correct_answer"] = raw_correct_answer
+            else:
+                normalized_correct_answer = _normalise_correct_answer_label(
+                    raw_correct_answer
+                )
+                if raw_correct_answer and normalized_correct_answer not in {
+                    "A", "B", "C", "D", "E", "F"
+                }:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Objective correct_answer must be an option label from A to F",
+                    )
+                option_labels: List[str] = []
+                effective_enhanced_options = question_data.get(
+                    "enhanced_options",
+                    existing_question.get("enhanced_options") or [],
+                )
+                if isinstance(effective_enhanced_options, list):
+                    for index, option in enumerate(effective_enhanced_options):
+                        if isinstance(option, dict):
+                            content = str(
+                                option.get("content")
+                                or option.get("image_id")
+                                or option.get("url")
+                                or ""
+                            ).strip()
+                            if not content:
+                                continue
+                            label = _normalise_correct_answer_label(
+                                option.get("label") or chr(65 + index)
+                            )
+                        else:
+                            if not str(option or "").strip():
+                                continue
+                            label = chr(65 + index)
+                        if label:
+                            option_labels.append(label)
+
+                if not option_labels:
+                    effective_options = question_data.get(
+                        "options",
+                        existing_question.get("options") or [],
+                    )
+                    if isinstance(effective_options, list):
+                        option_labels = [
+                            chr(65 + index)
+                            for index, option in enumerate(effective_options)
+                            if str(option or "").strip()
+                        ]
+
+                if (
+                    normalized_correct_answer
+                    and option_labels
+                    and normalized_correct_answer not in option_labels
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail=(
+                            f"Correct answer {normalized_correct_answer} is not one of "
+                            f"the saved options: {', '.join(option_labels)}"
+                        ),
+                    )
+                update_data["correct_answer"] = normalized_correct_answer
+        elif question_type_changed:
+            # Never carry an answer from a different grading mode or from MCQ
+            # into a numerical-answer contract without explicit confirmation.
+            update_data["correct_answer"] = ""
+
+        if question_type_changed and effective_question_type in {"mcq", "integer"}:
+            # Objective grading is controlled solely by the saved answer key.
+            # Retaining an old Subjective plan makes review UI and immutable
+            # snapshots disagree about the grading authority.
+            update_data.update(
+                {
+                    "reference_solution": None,
+                    "rubric": None,
+                    "marking_criteria": [],
+                    "assessment_units": [],
+                    "response_selection": None,
+                    "method_policy": _pcr_marking_policy_module().default_method_policy(),
+                    "marking_plan_generation_status": "not_generated",
+                    "marking_plan_generation_error": None,
+                    "marking_plan_generation_contract": None,
+                }
+            )
+        elif question_type_changed and effective_question_type == "subjective":
+            update_data.update(
+                {
+                    "marking_criteria": [],
+                    "assessment_units": [],
+                    "response_selection": None,
+                    "method_policy": _pcr_marking_policy_module().default_method_policy(),
+                    "marking_plan_generation_status": "not_generated",
+                    "marking_plan_generation_error": (
+                        "Question type changed to Subjective; prepare and review a marking plan"
+                    ),
+                    "marking_plan_generation_contract": None,
+                }
+            )
 
         structural_changed = False
         if "text" in question_data:
@@ -11337,6 +11685,42 @@ async def update_question(
                 _figure_identity(question_data.get("question_figures"))
                 != _figure_identity(existing_question.get("question_figures"))
             )
+        if "options" in question_data:
+            structural_changed = structural_changed or (
+                [str(item or "").strip() for item in question_data.get("options") or []]
+                != [str(item or "").strip() for item in existing_question.get("options") or []]
+            )
+        if "enhanced_options" in question_data:
+            def _enhanced_option_identity(items: Any) -> List[Dict[str, str]]:
+                if not isinstance(items, list):
+                    return []
+                identities: List[Dict[str, str]] = []
+                for index, item in enumerate(items):
+                    if not isinstance(item, dict):
+                        identities.append(
+                            {"label": chr(65 + index), "type": "text", "content": str(item or "").strip()}
+                        )
+                        continue
+                    item_type = str(item.get("type") or "text").strip().lower()
+                    identities.append(
+                        {
+                            "label": chr(65 + index),
+                            "type": "image" if item_type == "image" else "text",
+                            "content": str(
+                                item.get("image_id")
+                                or item.get("content")
+                                or item.get("url")
+                                or item.get("path")
+                                or ""
+                            ).strip(),
+                        }
+                    )
+                return identities
+
+            structural_changed = structural_changed or (
+                _enhanced_option_identity(question_data.get("enhanced_options"))
+                != _enhanced_option_identity(existing_question.get("enhanced_options"))
+            )
         assessment_units_unchanged = submitted_assessment_units is None
         if submitted_assessment_units is not None:
             try:
@@ -11354,6 +11738,10 @@ async def update_question(
             existing_question.get("assessment_units")
             and structural_changed
             and assessment_units_unchanged
+            and not (
+                question_type_changed
+                and effective_question_type in {"mcq", "integer"}
+            )
         ):
             # Never leave a previously approved child marks ledger attached to
             # question text, marks, or visuals that have since changed.
@@ -12790,7 +13178,14 @@ async def update_document_answer_mapping_review(
             else:
                 question_doc = await db.mongo_find_one("questions", question_query)
             existing_correct = _normalise_correct_answer_label((question_doc or {}).get("correct_answer"))
-            if question_doc and (not existing_correct or existing_correct == candidate_correct_answer):
+            question_is_objective = bool(
+                question_doc
+                and _is_objective_question_type(
+                    question_doc.get("question_type")
+                    or document.get("question_type")
+                )
+            )
+            if question_is_objective and (not existing_correct or existing_correct == candidate_correct_answer):
                 question_update = {
                     "correct_answer": candidate_correct_answer,
                     "correct_answer_source": "answer_sheet_mapping_review",
@@ -12803,7 +13198,7 @@ async def update_document_answer_mapping_review(
                 else:
                     await db.mongo_update_one("questions", question_query, {"$set": question_update})
                 applied_correct_answer = candidate_correct_answer
-            elif question_doc and existing_correct != candidate_correct_answer:
+            elif question_is_objective and existing_correct != candidate_correct_answer:
                 correct_answer_conflict = {
                     "existing_correct_answer": existing_correct,
                     "candidate_correct_answer": candidate_correct_answer,

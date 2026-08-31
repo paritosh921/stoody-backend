@@ -23,6 +23,7 @@ from services.objective_scoring_service import (
     objective_points,
     score_objective_response,
 )
+from utils.enhanced_option_images import enrich_enhanced_option_images
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +459,11 @@ async def _get_mcq_questions_with_images(db: DatabaseManager, where_filter: dict
                     })
 
             # Get enhanced options
-            enhanced_options = question_doc.get("enhanced_options", [])
+            enhanced_options = await enrich_enhanced_option_images(
+                question_doc.get("enhanced_options", []),
+                db=db,
+                is_b2c=False,
+            )
 
             # Debug log for image options
             for opt in enhanced_options:
@@ -974,6 +979,14 @@ async def get_test_series_questions(
                     if _can_expose_test_answer_key(current_user):
                         payload["correct_answer"] = q.get("correct_answer")
 
+                    enriched_options = await enrich_enhanced_option_images(
+                        q.get("enhanced_options", []),
+                        db=db,
+                        is_b2c=True,
+                    )
+                    payload["enhanced_options"] = enriched_options
+                    payload["enhancedOptions"] = enriched_options
+
                     # Enrich figures with base64 from B2C database
                     try:
                         figures: List[Dict[str, Any]] = []
@@ -1008,31 +1021,6 @@ async def get_test_series_questions(
                         payload["questionFigures"] = figures
                     except Exception:
                         payload["questionFigures"] = []
-                    
-                    # Inline base64 for image-type enhanced options
-                    try:
-                        eos = payload.get("enhanced_options") or []
-                        for i, opt in enumerate(list(eos)):
-                            if isinstance(opt, dict) and opt.get("type") == "image":
-                                content = opt.get("content")
-                                if isinstance(content, str) and content and not content.startswith("data:image"):
-                                    img_doc = await db.b2c_find_one("images", {"_id": content})
-                                    if img_doc:
-                                        b64 = img_doc.get("base64Data")
-                                        if not b64 and img_doc.get("file_path"):
-                                            import os, base64
-                                            fp = img_doc["file_path"]
-                                            if os.path.exists(fp):
-                                                with open(fp, "rb") as f:
-                                                    enc = base64.b64encode(f.read()).decode("utf-8")
-                                                    ct = img_doc.get("content_type", "image/jpeg")
-                                                    if not ct.startswith("image/"):
-                                                        ct = "image/jpeg"
-                                                    b64 = f"data:{ct};base64,{enc}"
-                                        if b64:
-                                            payload["enhanced_options"][i]["content"] = b64
-                    except Exception:
-                        pass
                     
                     questions_with_images.append(to_jsonable(payload))
             
@@ -1131,6 +1119,14 @@ async def get_test_series_questions(
                     if _can_expose_test_answer_key(current_user):
                         payload["correct_answer"] = q.get("correct_answer")
 
+                    enriched_options = await enrich_enhanced_option_images(
+                        q.get("enhanced_options", []),
+                        db=db,
+                        is_b2c=False,
+                    )
+                    payload["enhanced_options"] = enriched_options
+                    payload["enhancedOptions"] = enriched_options
+
                     # Enrich figures with base64 (for UI that displays diagrams)
                     try:
                         figures: List[Dict[str, Any]] = []
@@ -1166,30 +1162,6 @@ async def get_test_series_questions(
                     except Exception:
                         payload["questionFigures"] = []
 
-                    # Inline base64 for image-type enhanced options when content is an image id
-                    try:
-                        eos = payload.get("enhanced_options") or []
-                        for i, opt in enumerate(list(eos)):
-                            if isinstance(opt, dict) and opt.get("type") == "image":
-                                content = opt.get("content")
-                                if isinstance(content, str) and content and not content.startswith("data:image"):
-                                    img_doc = await db.mongo_find_one("images", {"_id": content})
-                                    if img_doc:
-                                        b64 = img_doc.get("base64Data")
-                                        if not b64 and img_doc.get("file_path"):
-                                            import os, base64
-                                            fp = img_doc["file_path"]
-                                            if os.path.exists(fp):
-                                                with open(fp, "rb") as f:
-                                                    enc = base64.b64encode(f.read()).decode("utf-8")
-                                                    ct = img_doc.get("content_type", "image/jpeg")
-                                                    if not ct.startswith("image/"):
-                                                        ct = "image/jpeg"
-                                                    b64 = f"data:{ct};base64,{enc}"
-                                        if b64:
-                                            payload["enhanced_options"][i]["content"] = b64
-                    except Exception:
-                        pass
                     questions_with_images.append(to_jsonable(payload))
             return {
                 "success": True,

@@ -25,6 +25,7 @@ class _MappingReviewDb:
         self.mappings = deepcopy(mappings)
         self.document_updates = []
         self.mapping_updates = []
+        self.question_updates = []
 
     async def mongo_find_one(self, collection_name, query):
         if collection_name == "documents":
@@ -66,6 +67,11 @@ class _MappingReviewDb:
             mapping = next(item for item in self.mappings if item["mapping_id"] == query["mapping_id"])
             mapping.update(deepcopy(update["$set"]))
             self.mapping_updates.append(deepcopy(update["$set"]))
+            return True
+        if collection_name == "questions":
+            question = next(item for item in self.questions if item["id"] == query["id"])
+            question.update(deepcopy(update["$set"]))
+            self.question_updates.append(deepcopy(update["$set"]))
             return True
         return False
 
@@ -192,3 +198,68 @@ async def test_editing_a_mapping_updates_the_marking_source_and_keeps_the_origin
     assert mapping["original_final_answer_text"] == "Old final"
     assert mapping["review_status"] == "accepted"
     assert mapping["manual_review_required"] is False
+
+
+@pytest.mark.asyncio
+async def test_subjective_mapping_candidate_is_not_applied_as_an_objective_key():
+    db = _MappingReviewDb(
+        [
+            {
+                "document_id": "paper-1",
+                "mapping_id": "m1",
+                "question_id": "q1",
+                "answer_text": "A complete worked solution",
+                "correct_answer_candidate": "B",
+                "review_status": "needs_review",
+                "manual_review_required": True,
+            }
+        ]
+    )
+
+    result = await pdf_async.update_document_answer_mapping_review(
+        document_id="paper-1",
+        mapping_id="m1",
+        review_request=pdf_async.AnswerMappingReviewRequest(
+            reviewStatus="accepted",
+            correctAnswer="B",
+        ),
+        current_user=_admin(),
+        db=db,
+    )
+
+    assert result["appliedCorrectAnswer"] is None
+    assert "correct_answer" not in db.questions[0]
+    assert db.question_updates == []
+
+
+@pytest.mark.asyncio
+async def test_objective_mapping_candidate_is_applied_to_the_saved_answer_key():
+    db = _MappingReviewDb(
+        [
+            {
+                "document_id": "paper-1",
+                "mapping_id": "m1",
+                "question_id": "q1",
+                "answer_text": "B",
+                "correct_answer_candidate": "B",
+                "review_status": "needs_review",
+                "manual_review_required": True,
+            }
+        ]
+    )
+    db.questions[0]["question_type"] = "mcq"
+
+    result = await pdf_async.update_document_answer_mapping_review(
+        document_id="paper-1",
+        mapping_id="m1",
+        review_request=pdf_async.AnswerMappingReviewRequest(
+            reviewStatus="accepted",
+            correctAnswer="B",
+        ),
+        current_user=_admin(),
+        db=db,
+    )
+
+    assert result["appliedCorrectAnswer"] == "B"
+    assert db.questions[0]["correct_answer"] == "B"
+    assert db.question_updates[0]["correct_answer_source"] == "answer_sheet_mapping_review"

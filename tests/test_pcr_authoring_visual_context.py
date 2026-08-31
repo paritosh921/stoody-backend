@@ -357,6 +357,72 @@ def test_visual_context_uses_inline_question_figure():
     assert visuals[0]["data_uri"].startswith("data:image/png;base64,")
 
 
+def test_visual_context_uses_inline_image_option():
+    from api.v1.pdf_async import _build_pcr_authoring_visual_context
+
+    visuals = asyncio.run(
+        _build_pcr_authoring_visual_context(
+            document={},
+            question={
+                "text": "Choose the matching graph.",
+                "enhanced_options": [
+                    {
+                        "label": "A",
+                        "type": "image",
+                        "content": f"data:image/png;base64,{TINY_PNG}",
+                    }
+                ],
+            },
+            solution_images=[],
+            gateway_context={"db": None, "is_b2c": False},
+        )
+    )
+
+    assert visuals[0]["label"] == "Question option A"
+    assert visuals[0]["data_uri"].startswith("data:image/png;base64,")
+
+
+def test_visual_context_resolves_durable_image_option(monkeypatch):
+    import api.v1.pdf_async as pdf_async
+
+    class ImageDb:
+        async def mongo_find_one(self, collection_name, query):
+            assert collection_name == "images"
+            assert query == {"_id": "stored-option-image"}
+            return {
+                "_id": "stored-option-image",
+                "file_path": "uploads/options/stored-option-image.png",
+                "content_type": "image/png",
+            }
+
+    async def read_stored(_path):
+        return base64.b64decode(TINY_PNG)
+
+    monkeypatch.setattr(pdf_async, "_read_authoring_storage_bytes", read_stored)
+    visuals = asyncio.run(
+        pdf_async._build_pcr_authoring_visual_context(
+            document={},
+            question={
+                "text": "Choose the matching graph.",
+                "enhanced_options": [
+                    {
+                        "id": "stored-option-image",
+                        "image_id": "stored-option-image",
+                        "label": "A",
+                        "type": "image",
+                        "content": "/api/v1/images/stored-option-image",
+                    }
+                ],
+            },
+            solution_images=[],
+            gateway_context={"db": ImageDb(), "is_b2c": False},
+        )
+    )
+
+    assert visuals[0]["label"] == "Question option A"
+    assert visuals[0]["data_uri"].startswith("data:image/png;base64,")
+
+
 def test_visual_context_fails_closed_when_required_image_is_unavailable(monkeypatch):
     import api.v1.pdf_async as pdf_async
 
