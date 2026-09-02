@@ -111,7 +111,8 @@ _FAMILY_PATTERNS = (
     (
         "functional_writing",
         re.compile(
-            r"\b(?:letter|application|notice|report|email|e-mail|article|advertisement|message)\b"
+            r"\b(?:letter|application|notice|report|email|e-mail|article|advertisement|message|"
+            r"write a note|friendly letter|informal letter|formal letter)\b"
             r"|पत्र|आवेदन|सूचना|रिपोर्ट|प्रतिवेदन|विज्ञापन|संदेश|ईमेल",
             re.IGNORECASE,
         ),
@@ -159,6 +160,73 @@ _STEM_TASK_PATTERN = re.compile(
     r"गणना|समीकरण|सूत्र|वेग|त्वरण|बल|ऊर्जा|अभिक्रिया|प्रमेय|प्रायिकता",
     re.IGNORECASE,
 )
+
+LANGUAGE_PRACTICE_PASS_THRESHOLD = 0.60
+
+LEVEL_SCORES = {
+    "excellent": 1.0,
+    "secure": 0.80,
+    "developing": 0.55,
+    "needs_improvement": 0.30,
+}
+
+FAMILY_WEIGHTS = {
+    "creative_writing": {
+        "understanding": 0.15,
+        "content": 0.20,
+        "structure_organization": 0.15,
+        "language_grammar": 0.20,
+        "clarity_expression": 0.15,
+        "tone_style": 0.10,
+        "conciseness_precision": 0.05,
+    },
+    "functional_writing": {
+        "understanding": 0.15,
+        "content": 0.20,
+        "structure_organization": 0.15,
+        "language_grammar": 0.20,
+        "clarity_expression": 0.15,
+        "tone_style": 0.10,
+        "conciseness_precision": 0.05,
+    },
+    "comprehension": {
+        "understanding": 0.30,
+        "content": 0.25,
+        "language_grammar": 0.15,
+        "clarity_expression": 0.15,
+        "conciseness_precision": 0.15,
+    },
+    "grammar_vocabulary": {
+        "understanding": 0.20,
+        "language_grammar": 0.50,
+        "clarity_expression": 0.15,
+        "conciseness_precision": 0.15,
+    },
+    "translation": {
+        "understanding": 0.20,
+        "content": 0.20,
+        "language_grammar": 0.25,
+        "clarity_expression": 0.15,
+        "tone_style": 0.10,
+        "conciseness_precision": 0.10,
+    },
+    "literature_response": {
+        "understanding": 0.20,
+        "content": 0.20,
+        "structure_organization": 0.10,
+        "language_grammar": 0.20,
+        "clarity_expression": 0.15,
+        "tone_style": 0.10,
+        "conciseness_precision": 0.05,
+    },
+    "short_language_response": {
+        "understanding": 0.25,
+        "content": 0.20,
+        "language_grammar": 0.25,
+        "clarity_expression": 0.15,
+        "conciseness_precision": 0.15,
+    },
+}
 
 _APPLICABLE_BY_FAMILY = {
     "creative_writing": {item[0] for item in DIMENSIONS},
@@ -339,6 +407,39 @@ def infer_language_paper(questions: Sequence[Mapping[str, Any]]) -> Dict[str, An
     }
 
 
+def is_non_language_academic_subject(subject: Any) -> bool:
+    """True when the subject is a non-language academic course (Physics, Maths, …)."""
+
+    return bool(_NON_LANGUAGE_SUBJECT_PATTERN.search(_normal_text(subject)))
+
+
+_WRITING_TASK_FAMILIES = {
+    "creative_writing",
+    "functional_writing",
+    "comprehension",
+    "translation",
+    "literature_response",
+}
+
+
+def is_strong_language_writing_task(task_text: str) -> bool:
+    """True for unmistakable language tasks: letter, essay, grammar, comprehension."""
+
+    text = str(task_text or "")
+    if _STEM_TASK_PATTERN.search(text):
+        return False
+    return _response_family(text) != "short_language_response"
+
+
+def is_language_writing_task(task_text: str) -> bool:
+    """True for letter/essay/comprehension-style writing, not grammar MCQs."""
+
+    text = str(task_text or "")
+    if _STEM_TASK_PATTERN.search(text):
+        return False
+    return _response_family(text) in _WRITING_TASK_FAMILIES
+
+
 def language_feedback_profile(question: Mapping[str, Any]) -> Dict[str, Any]:
     """Return a migration-free language-feedback profile for one question."""
 
@@ -359,6 +460,86 @@ def language_feedback_profile(question: Mapping[str, Any]) -> Dict[str, Any]:
     task_text = _task_text(question)
     family = _response_family(task_text)
     return _profile(family)
+
+
+def practice_language_feedback_profile(question: Mapping[str, Any]) -> Dict[str, Any]:
+    """Practice routing: language subject, or a clear writing task in a mixed set.
+
+    STEM subjects stay STEM even if the student writes in English or Hindi.
+    Mixed-subject practice sets still get language marking when the stem is a
+    letter, essay, paragraph, or comprehension task — even if the question was
+    tagged MCQ by OCR. Grammar MCQs stay objective.
+    Exam PCR marks are unchanged — this helper is practice-only.
+    """
+
+    if is_non_language_academic_subject(question.get("subject")):
+        return language_feedback_profile(question)
+    task_text = _task_text(question)
+    if is_language_writing_task(task_text):
+        return _profile(_response_family(task_text))
+    profile = language_feedback_profile(question)
+    if profile.get("enabled"):
+        return profile
+    grading_mode = _normal_text(
+        question.get("grading_mode") or question.get("question_type")
+    ).replace(" ", "_")
+    if grading_mode in {"objective", "mcq", "integer"}:
+        return {"enabled": False, "version": LANGUAGE_FEEDBACK_VERSION}
+    if not is_strong_language_writing_task(task_text):
+        return {"enabled": False, "version": LANGUAGE_FEEDBACK_VERSION}
+    return _profile(_response_family(task_text))
+
+
+def score_language_practice_feedback(feedback: Any) -> Optional[Dict[str, Any]]:
+    """Turn the seven writing parameters into the practice score.
+
+    Exam PCR must not call this — locked marking criteria still own exam marks.
+    """
+
+    if not isinstance(feedback, Mapping):
+        return None
+    family = _normal_text(feedback.get("response_family")).replace(" ", "_")
+    weights = FAMILY_WEIGHTS.get(family) or FAMILY_WEIGHTS["short_language_response"]
+    raw_dimensions = feedback.get("dimensions")
+    by_id: Dict[str, Mapping[str, Any]] = {}
+    if isinstance(raw_dimensions, Mapping):
+        by_id = {
+            str(dimension_id): item
+            for dimension_id, item in raw_dimensions.items()
+            if isinstance(item, Mapping)
+        }
+    elif isinstance(raw_dimensions, Sequence) and not isinstance(raw_dimensions, (str, bytes)):
+        for item in raw_dimensions:
+            if not isinstance(item, Mapping):
+                continue
+            dimension_id = str(item.get("dimension_id") or "").strip()
+            if dimension_id:
+                by_id[dimension_id] = item
+    else:
+        return None
+
+    weighted = 0.0
+    total_weight = 0.0
+    for dimension_id, weight in weights.items():
+        item = by_id.get(dimension_id)
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("applicability") or "") != "applicable":
+            continue
+        level = str(item.get("level") or "").strip().lower()
+        if level not in LEVEL_SCORES:
+            continue
+        weighted += LEVEL_SCORES[level] * weight
+        total_weight += weight
+    if total_weight <= 0:
+        return None
+    score = max(0.0, min(1.0, weighted / total_weight))
+    return {
+        "score": round(score, 4),
+        "correct": score >= LANGUAGE_PRACTICE_PASS_THRESHOLD,
+        "pass_threshold": LANGUAGE_PRACTICE_PASS_THRESHOLD,
+        "source": "language_dimensions",
+    }
 
 
 def format_language_feedback(value: Any) -> str:

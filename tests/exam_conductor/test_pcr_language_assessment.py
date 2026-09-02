@@ -243,6 +243,64 @@ def test_unclear_language_dimension_can_be_preserved_as_not_assessed():
     assert normalized["dimensions"][0]["level"] == "not_assessed"
 
 
+def test_practice_profile_enables_mixed_set_letter_even_when_tagged_mcq():
+    profile = language.practice_language_feedback_profile(
+        {
+            "question_text": "Write an informal letter to your friend describing your school.",
+            "subject": "All Subjects_Class 6",
+            "question_type": "mcq",
+            "grading_mode": "objective",
+        }
+    )
+
+    assert profile["enabled"] is True
+    assert profile["response_family"] == "functional_writing"
+
+
+def test_practice_profile_enables_from_writing_stem_when_subject_is_missing():
+    profile = language.practice_language_feedback_profile(
+        {
+            "question_text": "Write a letter to the editor about cleanliness.",
+            "subject": "",
+            "question_type": "subjective",
+            "grading_mode": "subjective",
+        }
+    )
+
+    assert profile["enabled"] is True
+    assert profile["response_family"] == "functional_writing"
+
+
+def test_practice_profile_keeps_stem_subject_off_language_marking():
+    profile = language.practice_language_feedback_profile(
+        _question(subject="Mathematics", text="Write a paragraph explaining how to solve x + 1 = 2.")
+    )
+
+    assert profile["enabled"] is False
+
+
+def test_practice_language_score_follows_seven_parameters():
+    profile = language.language_feedback_profile(_question())
+    feedback = language.normalize_language_feedback(
+        _feedback(profile), profile=profile, attempted=True
+    )
+    scored = language.score_language_practice_feedback(feedback)
+
+    assert scored is not None
+    assert scored["score"] == 0.8
+    assert scored["correct"] is True
+    assert scored["source"] == "language_dimensions"
+
+    weak = language.normalize_language_feedback(
+        _feedback(profile), profile=profile, attempted=True
+    )
+    for item in weak["dimensions"]:
+        if item["dimension_id"] == "language_grammar":
+            item["level"] = "needs_improvement"
+    weak_score = language.score_language_practice_feedback(weak)
+    assert weak_score["score"] < scored["score"]
+
+
 def test_validated_dimensions_are_curated_into_existing_feedback_text():
     profile = language.language_feedback_profile(_question())
     normalized = language.normalize_language_feedback(

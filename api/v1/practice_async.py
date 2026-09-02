@@ -122,10 +122,24 @@ def _practice_language_feedback_profile(
         or metadata.get("subject_name")
         or ""
     )
+    question_text = "\n".join(
+        str(part).strip()
+        for part in (
+            question.get("text"),
+            question.get("question_text"),
+            question.get("course_plan"),
+            metadata.get("chapter"),
+            metadata.get("topic"),
+            metadata.get("document_title"),
+            metadata.get("title"),
+        )
+        if str(part or "").strip()
+    )
     adapted = {
         **dict(question),
         "subject": subject,
-        "question_text": question.get("text") or question.get("question_text") or "",
+        "question_text": question_text,
+        "rubric": question.get("rubric") or metadata.get("rubric") or "",
         "reference_solution": reference_solution
         or question.get("reference_solution")
         or question.get("correctAnswer")
@@ -134,6 +148,9 @@ def _practice_language_feedback_profile(
         "grading_mode": "objective" if is_mcq else "subjective",
         "question_type": "mcq" if is_mcq else "subjective",
     }
+    practice_profile = getattr(module, "practice_language_feedback_profile", None)
+    if callable(practice_profile):
+        return practice_profile(adapted)
     return module.language_feedback_profile(adapted)
 
 
@@ -2354,17 +2371,73 @@ def _build_evaluation_prompt(
         "what_went_wrong": "if wrong: the specific mistake; empty if correct",
     }
     if language_example is not None:
+        output_contract["extracted_answer"] = (
+            "EXACT words the student wrote, including every misspelling and grammar error."
+        )
+        output_contract["work_shown"] = (
+            "Full line-by-line exact transcription. Keep every spelling and grammar mistake."
+        )
+        output_contract["verbatim_transcript"] = (
+            "exact student wording with misspellings preserved, e.g. recieve, definately"
+        )
+        output_contract["spelling_grammar_errors"] = [
+            "student_form → conventional_form",
+        ]
         output_contract["language_feedback"] = language_example
         parts.append(
-            "\nLANGUAGE-WRITING DIAGNOSTIC (does not change the score):\n"
-            "This is a recognized language-subject writing task. Alongside semantic "
-            "correctness, give evidence-based feedback for the seven supplied dimensions. "
-            "For applicable dimensions, level must be one of excellent, secure, developing, "
-            "needs_improvement, or not_assessed. Use only evidence visible in this answer. "
-            "For non-applicable dimensions return not_applicable with empty evidence and "
-            "feedback. This diagnostic must never alter is_correct or score; those remain "
-            "the task-correctness verdict."
+            "\nLANGUAGE-WRITING ASSESSMENT (the seven parameters OWN the score):\n"
+            "This is a language-subject writing task. Grade the student's actual words "
+            "the way a language teacher marks a copy. The same contract applies to every "
+            "language paper, class, and medium — not to one assignment type.\n"
+            "NEVER auto-correct. NEVER silently fix spelling, grammar, punctuation, tense, "
+            "or word choice. The model/reference answer is only for expected CONTENT and "
+            "task completeness. Do not rewrite the student's wording to match that reference.\n"
+            "BAD: student wrote a misspelling → you output the dictionary spelling.\n"
+            "GOOD: keep the student's exact spelling and list each error as "
+            "student_form → conventional_form in spelling_grammar_errors.\n"
+            "Score using ONLY these seven parameters. For applicable dimensions, level must "
+            "be one of excellent, secure, developing, needs_improvement, or not_assessed. "
+            "Use only evidence visible in this answer. For non-applicable dimensions return "
+            "not_applicable with empty evidence and feedback.\n"
+            "1. Understanding — Did they understand the question/topic? Is the response relevant?\n"
+            "2. Content — Quality and completeness of ideas, key points, examples, depth.\n"
+            "3. Structure & Organization — Logical flow, sequencing, paragraphing, intro/body/conclusion.\n"
+            "4. Language & Grammar — Grammar, sentence construction, vocabulary, spelling, punctuation.\n"
+            "5. Clarity & Expression — How clearly they communicate; sentences easy to understand.\n"
+            "6. Tone & Style — Tone and style fit the question, audience, and type of writing.\n"
+            "7. Conciseness & Precision — Avoid filler/repetition; stay to the required length.\n"
+            "is_correct and score MUST follow these seven parameters. Visible spelling or "
+            "grammar errors must lower Language & Grammar. Missing required task parts must "
+            "lower Content and Structure. A response that only 'gets the idea' is not full marks."
         )
+        evaluation_rules = '''
+HOW TO EVALUATE THIS LANGUAGE ANSWER — read the copy like a language teacher.
+
+The student page is their written answer. READ the words. Do not narrate
+pen strokes, curves, loops, or how a letter is shaped.
+
+  STEP 1 — TRANSCRIBE EXACTLY. THIS IS THE MOST IMPORTANT STEP.
+    Copy the student's words as written, including mistakes.
+    Do not clean spelling, grammar, or word choice.
+    If a word is misspelled, keep that misspelling in verbatim_transcript,
+    extracted_answer, and work_shown.
+    Then list each error in spelling_grammar_errors as "student_form → correct_form".
+    If there are no language errors, return an empty list.
+
+  STEP 2 — MARK THE WRITING, NOT JUST THE IDEA.
+    Fill language_feedback for every applicable parameter with evidence from
+    THIS answer. Grammar and spelling errors must lower language_grammar.
+    Weak structure must lower structure_organization. Do not mark full marks
+    only because the meaning is roughly right.
+
+  STEP 3 — SET THE VERDICT FROM THE WRITING.
+    is_correct and score must match the seven parameters, not a separate
+    "did they understand the topic" shortcut.
+
+WHAT_WENT_WRONG — the main writing gaps, or empty if the writing is strong.
+
+OUTPUT — strict JSON only (no markdown fences, no commentary):
+__OUTPUT_CONTRACT__'''
     else:
         parts.append(
             "\nNON-LANGUAGE SUBJECT BOUNDARY:\n"
@@ -2374,8 +2447,7 @@ def _build_evaluation_prompt(
             "that skill. A Physics, Chemistry, Mathematics, Biology, or other subject answer "
             "written in Hindi remains that subject. Do not return language_feedback."
         )
-
-    evaluation_rules = '''
+        evaluation_rules = '''
 HOW TO EVALUATE — read the canvas like a teacher, not like a graphics reporter.
 
 The student page is a photo of their copy. READ the content. Do not narrate
@@ -2582,9 +2654,10 @@ def _build_evaluation_system_prompt(
             "(work_shown and what_went_wrong fields must be in Hindi). "
         )
     subject_boundary = (
-        "This is a recognized language-subject writing task. Return the requested "
-        "seven-dimension language_feedback as a diagnostic alongside the verdict, but "
-        "never change is_correct or score because of that diagnostic. "
+        "This is a language-subject writing task. Grade the student's actual wording. "
+        "The seven-dimension language_feedback determines is_correct and score. "
+        "Do not auto-correct or forgive spelling, grammar, punctuation, or word choice. "
+        "Transcribe exactly. Do not treat 'same meaning, different words' as full marks. "
         if language_feedback_enabled
         else
         "This is not a recognized language-writing task. Grade only the requested subject "
@@ -2700,17 +2773,29 @@ def _parse_evaluation_response(
             evaluation_data["score"] = 1.0 if evaluation_data["correct"] else 0.0
     evaluation_data["score"] = max(0.0, min(1.0, evaluation_data["score"]))
 
-    evaluation_data["extractedAnswer"] = _normalize_latex_for_render(
-        str(parsed.get("extracted_answer", "")).strip() or (answer_text or "")
-    )
-    evaluation_data["workShown"] = _normalize_latex_for_render(
-        str(parsed.get("work_shown", "")).strip()
-    )
-    evaluation_data["whatWentWrong"] = _normalize_latex_for_render(
-        str(parsed.get("what_went_wrong", "")).strip()
-    )
+    raw_extracted = str(parsed.get("extracted_answer", "")).strip() or (answer_text or "")
+    raw_work = str(parsed.get("work_shown", "")).strip()
+    raw_feedback = str(parsed.get("what_went_wrong", "")).strip()
+    verbatim = str(parsed.get("verbatim_transcript") or "").strip()
+    spelling_errors = [
+        str(item).strip()
+        for item in (parsed.get("spelling_grammar_errors") or [])
+        if str(item).strip()
+    ][:20]
 
     profile = language_feedback_profile or {}
+    keep_student_wording = bool(profile.get("enabled"))
+    if keep_student_wording:
+        evaluation_data["extractedAnswer"] = verbatim or raw_extracted
+        evaluation_data["workShown"] = raw_work or verbatim
+        evaluation_data["whatWentWrong"] = raw_feedback
+        if spelling_errors:
+            evaluation_data["spellingGrammarErrors"] = spelling_errors
+    else:
+        evaluation_data["extractedAnswer"] = _normalize_latex_for_render(raw_extracted)
+        evaluation_data["workShown"] = _normalize_latex_for_render(raw_work)
+        evaluation_data["whatWentWrong"] = _normalize_latex_for_render(raw_feedback)
+
     if profile.get("enabled"):
         module = _try_load_language_assessment_module()
         if module is not None:
@@ -2720,8 +2805,15 @@ def _parse_evaluation_response(
                 attempted=True,
             )
             if language_feedback is not None:
-                # Curate the validated seven-dimension output into the existing
-                # feedback field. The UI and API shape stay unchanged.
+                if spelling_errors:
+                    language_feedback["spelling_grammar_errors"] = spelling_errors
+                evaluation_data["languageFeedback"] = language_feedback
+                score_fn = getattr(module, "score_language_practice_feedback", None)
+                scored = score_fn(language_feedback) if callable(score_fn) else None
+                if isinstance(scored, dict) and scored.get("score") is not None:
+                    evaluation_data["score"] = float(scored["score"])
+                    evaluation_data["correct"] = bool(scored.get("correct"))
+                    evaluation_data["scoreSource"] = str(scored.get("source") or "language_dimensions")
                 curated_feedback = module.format_language_feedback(language_feedback)
                 if curated_feedback:
                     evaluation_data["whatWentWrong"] = curated_feedback
@@ -3087,6 +3179,11 @@ async def evaluate_submission(
                 reference_solution=cached_solution_text,
             )
         language_feedback_enabled = bool(language_profile.get("enabled"))
+        logger.info(
+            f"Language profile Q:{qid} enabled={language_feedback_enabled} "
+            f"family={language_profile.get('response_family') or '-'} is_mcq={is_mcq} "
+            f"subject={question_doc.get('subject') or '-'}"
+        )
 
         # 6. Build the single, unified prompt + system prompt
         if evaluation_mode == EVALUATION_MODE_CASE_STUDY:
@@ -3124,13 +3221,13 @@ async def evaluate_submission(
 
         # 7. ONE LLM call. Non-language answers retain the compact five-field
         # budget; recognized language-writing answers receive room for the
-        # seven diagnostic dimensions without making a second provider call.
+        # seven scoring dimensions without making a second provider call.
         # Image order MUST match the per-image labelling produced by the prompt builder:
         #   question figures first, then option images, then student pages (one per page).
         all_images = all_question_images + student_images
         # The higher value is a ceiling, not a forced spend. It prevents a
         # seven-dimension JSON object from being truncated and invalidating the
-        # verdict; normal concise responses stop well before this limit.
+        # language mark; normal concise responses stop well before this limit.
         evaluation_max_tokens = 2400 if language_feedback_enabled else 1000
         if all_images:
             response = await _gate_vision_call(
@@ -3216,6 +3313,8 @@ async def evaluate_submission(
                 "hints_used": payload.hintsUsed or 0,
                 "work_shown": evaluation_data.get("workShown", ""),
                 "what_went_wrong": evaluation_data.get("whatWentWrong", ""),
+                "language_feedback": evaluation_data.get("languageFeedback"),
+                "score_source": evaluation_data.get("scoreSource"),
                 "correct_solution": evaluation_data.get("correctSolution", ""),
                 "question_page_refs": question_page_refs,
                 "canonical_evidence_receipt": canonical_evidence_receipt,
