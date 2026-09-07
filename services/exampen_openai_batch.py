@@ -1005,7 +1005,7 @@ async def _create_provider_parts(
             return bool(
                 current
                 and str(current.get("status") or "")
-                in {"provider_processing", "importing"}
+                in {"preparing", "provider_processing", "importing"}
             )
         return bool(
             current
@@ -1761,10 +1761,61 @@ async def _import_item(
     return None
 
 
+async def _recover_orphaned_handoffs(tenant_db: Any) -> None:
+    """Reopen retired parents whose required continuation was never persisted.
+
+    Only retired parts are inspected: an active importer retains exclusive
+    ownership of its handoff. Historical completed groups can contain orphans.
+    """
+    parents = await tenant_db[BATCH_ITEMS_COLLECTION].aggregate([
+        {"$match": {"import_status": "waiting_recovery"}},
+        {"$lookup": {"from": BATCH_ITEMS_COLLECTION, "localField": "custom_id",
+                     "foreignField": "parent_custom_id", "as": "handoff_children"}},
+        {"$match": {"handoff_children": {"$size": 0}}},
+        {"$limit": 1000},
+        {"$project": {"handoff_children": 0}},
+    ]).to_list(length=1000)
+    for parent in parents:
+        if await tenant_db[BATCH_ITEMS_COLLECTION].find_one(
+            {"parent_custom_id": parent["custom_id"]}, {"_id": 1}
+        ):
+            continue
+        part = await tenant_db[BATCH_PARTS_COLLECTION].find_one({
+            "local_part_id": parent.get("local_part_id"), "status": "imported",
+        })
+        if not part:
+            continue
+        job = await tenant_db[PROCESSING_JOBS_COLLECTION].find_one({
+            "job_id": parent.get("job_id"),
+            "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+        })
+        if not job or (_entry_generation(parent) is not None
+                       and _entry_generation(parent) != int(job.get("grading_generation") or 0)):
+            continue
+        group = await tenant_db[BATCH_GROUPS_COLLECTION].find_one({
+            "batch_group_id": parent.get("batch_group_id"),
+            "status": {"$in": ["preparing", "provider_processing", "importing", "completed", "completed_with_errors"]},
+        })
+        if not group:
+            continue
+        await tenant_db[BATCH_GROUPS_COLLECTION].update_one(
+            {"batch_group_id": group["batch_group_id"], "status": group["status"]},
+            {"$set": {"status": ("preparing" if group["status"] == "preparing" else "importing"), "updated_at": _now()},
+             "$unset": {"completed_at": ""}},
+        )
+        await tenant_db[BATCH_PARTS_COLLECTION].update_one(
+            {"local_part_id": part["local_part_id"], "status": "imported"},
+            {"$set": {"status": PART_IMPORTING_STATUS,
+                      "import_lease_expires_at": _now(), "updated_at": _now()},
+             "$unset": {"imported_at": ""}},
+        )
+
+
 async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
     """Poll provider parts, import outputs idempotently, and submit recovery parts."""
 
     await ensure_batch_indexes(tenant_db)
+    await _recover_orphaned_handoffs(tenant_db)
     summary = {"parts_polled": 0, "items_imported": 0, "items_failed": 0, "recovery_parts": 0}
     client: Optional[OpenAIBatchClient] = None
     parts = await tenant_db[BATCH_PARTS_COLLECTION].find(
@@ -1905,7 +1956,24 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                 continue
             part = claimed_part
 
-        results = await _read_part_results(client, provider_state)
+        # Save responses before invoking the grader. A worker may stop between
+        # producing a continuation and creating its provider part.
+        saved_items = await tenant_db[BATCH_ITEMS_COLLECTION].find(
+            {"local_part_id": part.get("local_part_id")}
+        ).to_list(length=MAX_BATCH_REQUESTS)
+        results = {
+            entry["custom_id"]: entry["provider_result"]
+            for entry in saved_items if isinstance(entry.get("provider_result"), dict)
+        }
+        download_error = None
+        if any(entry.get("import_status") in {"pending", "retry", "importing", "waiting_recovery"}
+               and entry["custom_id"] not in results for entry in saved_items):
+            try:
+                results.update(await _read_part_results(client, provider_state))
+            except RuntimeError as exc:
+                if "HTTP 404" not in str(exc):
+                    raise
+                download_error = "Saved provider output is unavailable; this copy requires a fresh economy check"
         provider_failure = provider_batch_failure(provider_state)
         group = await tenant_db[BATCH_GROUPS_COLLECTION].find_one(
             {"batch_group_id": part.get("batch_group_id")}
@@ -1918,7 +1986,7 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
         recovery_entries: List[Dict[str, Any]] = []
         claimable_item_filter: Dict[str, Any] = {
             "$or": [
-                {"import_status": {"$in": ["pending", "retry"]}},
+                {"import_status": {"$in": ["pending", "retry", "waiting_recovery"]}},
                 {
                     "import_status": "importing",
                     "import_lease_expires_at": {"$lte": _now()},
@@ -1929,6 +1997,10 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
             {"local_part_id": part.get("local_part_id"), **claimable_item_filter}
         ).to_list(length=MAX_BATCH_REQUESTS)
         for raw_item in items:
+            if raw_item.get("import_status") == "waiting_recovery" and await tenant_db[BATCH_ITEMS_COLLECTION].find_one(
+                {"parent_custom_id": raw_item["custom_id"]}, {"_id": 1}
+            ):
+                continue
             item = await tenant_db[BATCH_ITEMS_COLLECTION].find_one_and_update(
                 {"custom_id": raw_item.get("custom_id"), **claimable_item_filter},
                 {
@@ -1943,6 +2015,11 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
             if not item:
                 continue
             provider_line = results.get(str(item.get("custom_id") or ""))
+            if provider_line is not None:
+                await tenant_db[BATCH_ITEMS_COLLECTION].update_one(
+                    {"custom_id": item["custom_id"], "import_status": "importing"},
+                    {"$set": {"provider_result": provider_line}},
+                )
             if cancellation_requested and provider_line is None:
                 await tenant_db[BATCH_ITEMS_COLLECTION].update_one(
                     {"custom_id": item["custom_id"], "import_status": "importing"},
@@ -1983,7 +2060,7 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                     tenant_db,
                     item=item,
                     provider_line=provider_line,
-                    missing_result_error=provider_failure,
+                    missing_result_error=download_error or provider_failure,
                 )
                 next_status = "waiting_recovery" if recovery else "completed"
                 await tenant_db[BATCH_ITEMS_COLLECTION].update_one(
@@ -1994,6 +2071,10 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                             "reserved_tokens": 0,
                             "imported_at": _now(),
                             "updated_at": _now(),
+                            "recorded_call_indexes": (
+                                recovery.get("recorded_call_indexes", []) if recovery
+                                else item.get("recorded_call_indexes", [])
+                            ),
                         },
                         "$unset": {"import_lease_expires_at": ""},
                     },
@@ -2051,6 +2132,20 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
                 stage="recovery",
                 client=client,
             )
+        # Do not retire the parent or delete its output until every continuation
+        # has a durable child. A refused/interrupted handoff must remain resumable.
+        stranded = False
+        for entry in recovery_entries:
+            if not await tenant_db[BATCH_ITEMS_COLLECTION].find_one(
+                {"parent_custom_id": entry["parent_custom_id"]}, {"_id": 1}
+            ):
+                stranded = True
+        if stranded:
+            await tenant_db[BATCH_PARTS_COLLECTION].update_one(
+                {"local_part_id": part.get("local_part_id"), "import_lease_token": import_lease_token},
+                {"$set": {"import_lease_expires_at": _now()}},
+            )
+            continue
         finalized_part = await tenant_db[BATCH_PARTS_COLLECTION].update_one(
             {
                 "local_part_id": part.get("local_part_id"),
@@ -2079,6 +2174,20 @@ async def reconcile_economy_batches(tenant_db: Any) -> Dict[str, int]:
             }
         )
         if active_parts:
+            continue
+        unfinished_jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].count_documents({
+            "job_id": {"$in": list(group.get("job_ids") or [])},
+            "status": {"$in": sorted(ACTIVE_BATCH_JOB_STATUSES)},
+        })
+        if unfinished_jobs:
+            continue
+        job_ids = list(group.get("job_ids") or [])
+        terminal_jobs = await tenant_db[PROCESSING_JOBS_COLLECTION].count_documents({
+            "job_id": {"$in": job_ids},
+            "status": {"$in": ["completed", "blocked_for_review", "batch_failed", "cancelled"]
+                       + ([ECONOMY_WAITING_JOB_STATUS] if group_was_cancelling else [])},
+        })
+        if terminal_jobs != len(set(job_ids)):
             continue
         failed_items = await tenant_db[BATCH_ITEMS_COLLECTION].count_documents(
             {"batch_group_id": group.get("batch_group_id"), "import_status": "failed"}

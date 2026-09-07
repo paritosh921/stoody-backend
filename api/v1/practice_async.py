@@ -6,7 +6,7 @@ Practice session management endpoints with analytics
 import json
 import logging
 import aiofiles
-from typing import Optional, Dict, Any, List, Mapping
+from typing import Optional, Dict, Any, List, Mapping, Sequence
 from datetime import datetime, timedelta
 from bson import ObjectId
 
@@ -103,55 +103,102 @@ def _practice_language_feedback_profile(
     *,
     is_mcq: bool,
     reference_solution: str = "",
+    sibling_questions: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Derive feedback eligibility from question metadata, never answer script.
+    """Derive language copy-check eligibility from exam contract + paper inference.
 
-    A Hindi-medium Physics answer remains Physics.  Conversely, a subjective
-    Hindi/English language-writing task gets the shared seven-dimension profile.
-    The derivation is read-time only, so historical practice sets need no migration.
+    A Hindi-medium Physics answer remains Physics. A language-writing task in a
+    mixed practice set uses the same paper-level inference as ExamPen.
     """
 
     module = _try_load_language_assessment_module()
     if module is None:
         return {"enabled": False, "version": "language-feedback-v1"}
-    metadata = question.get("metadata")
-    metadata = metadata if isinstance(metadata, Mapping) else {}
-    subject = (
-        question.get("subject")
-        or metadata.get("subject")
-        or metadata.get("subject_name")
-        or ""
-    )
-    question_text = "\n".join(
-        str(part).strip()
-        for part in (
-            question.get("text"),
-            question.get("question_text"),
-            question.get("course_plan"),
-            metadata.get("chapter"),
-            metadata.get("topic"),
-            metadata.get("document_title"),
-            metadata.get("title"),
+    resolve = getattr(module, "resolve_practice_language_profile", None)
+    if callable(resolve):
+        return resolve(
+            question,
+            is_mcq=is_mcq,
+            reference_solution=reference_solution,
+            sibling_questions=sibling_questions,
         )
-        if str(part or "").strip()
-    )
-    adapted = {
-        **dict(question),
-        "subject": subject,
-        "question_text": question_text,
-        "rubric": question.get("rubric") or metadata.get("rubric") or "",
-        "reference_solution": reference_solution
-        or question.get("reference_solution")
-        or question.get("correctAnswer")
-        or question.get("correct_answer")
-        or "",
-        "grading_mode": "objective" if is_mcq else "subjective",
-        "question_type": "mcq" if is_mcq else "subjective",
-    }
     practice_profile = getattr(module, "practice_language_feedback_profile", None)
     if callable(practice_profile):
-        return practice_profile(adapted)
-    return module.language_feedback_profile(adapted)
+        adapted = getattr(module, "adapt_question_for_practice_language", None)
+        payload = (
+            adapted(question, is_mcq=is_mcq, reference_solution=reference_solution)
+            if callable(adapted)
+            else question
+        )
+        return practice_profile(payload)
+    return module.language_feedback_profile(question)
+
+
+def _practice_language_marking_criteria(
+    profile: Mapping[str, Any],
+    question: Optional[Mapping[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    module = _try_load_language_assessment_module()
+    if module is None or not profile.get("enabled"):
+        return []
+    builder = getattr(module, "practice_language_marking_criteria", None)
+    if not callable(builder):
+        return []
+    existing = None
+    if isinstance(question, Mapping):
+        existing = question.get("marking_criteria") or question.get("criteria")
+    return builder(profile, existing)
+
+
+async def _load_practice_sibling_questions(
+    db: DatabaseManager,
+    question_doc: Mapping[str, Any],
+    *,
+    document_id: Optional[str],
+    is_b2c: bool,
+) -> List[Dict[str, Any]]:
+    """Load other questions from the same practice set for paper-level inference."""
+
+    meta = question_doc.get("metadata") if isinstance(question_doc.get("metadata"), Mapping) else {}
+    doc_id = (
+        document_id
+        or question_doc.get("document_id")
+        or meta.get("document_id")
+        or meta.get("documentId")
+    )
+    if not doc_id:
+        return []
+    filt = {
+        "$or": [
+            {"document_id": doc_id},
+            {"metadata.document_id": doc_id},
+            {"metadata.documentId": doc_id},
+        ]
+    }
+    projection = {
+        "id": 1,
+        "question_id": 1,
+        "text": 1,
+        "question_text": 1,
+        "subject": 1,
+        "question_type": 1,
+        "grading_mode": 1,
+        "correct_answer": 1,
+        "correctAnswer": 1,
+        "reference_solution": 1,
+        "rubric": 1,
+        "metadata": 1,
+        "document_id": 1,
+    }
+    try:
+        if is_b2c:
+            rows = await db.b2c_find("questions", filt, projection=projection, limit=80)
+        else:
+            rows = await db.mongo_find("questions", filt, projection=projection, limit=80)
+    except Exception as exc:
+        logger.warning(f"Could not load sibling practice questions for language inference: {exc}")
+        return []
+    return [row for row in (rows or []) if isinstance(row, Mapping)]
 
 
 def _practice_language_feedback_example(
@@ -577,10 +624,44 @@ def _decode_text_transport_escapes(text: str) -> str:
     import re as _re
 
     out = text.replace('\\"', '"').replace("\\/", "/")
-    out = _re.sub(r"\\n(?![A-Za-z])", "\n", out)
-    out = _re.sub(r"\\t(?![A-Za-z])", "\t", out)
-    out = _re.sub(r"\\r(?![A-Za-z])", "", out)
+    for _ in range(3):
+        nxt = out
+        nxt = _re.sub(r"\\\\n(?![a-z])", "\n", nxt)
+        nxt = _re.sub(r"\\n(?![a-z])", "\n", nxt)
+        nxt = _re.sub(r"\\\\t(?![a-z])", "\t", nxt)
+        nxt = _re.sub(r"\\t(?![a-z])", "\t", nxt)
+        nxt = _re.sub(r"\\\\r(?![a-z])", "", nxt)
+        nxt = _re.sub(r"\\r(?![a-z])", "", nxt)
+        if nxt == out:
+            break
+        out = nxt
     return _repair_latex_escape_damage(out)
+
+
+_ATTEMPT_DISPLAY_FIELDS = (
+    "question_text",
+    "student_answer",
+    "correct_answer",
+    "work_shown",
+    "what_went_wrong",
+    "correct_solution",
+    "evaluation_feedback",
+    "evaluation_reasoning",
+)
+
+
+def _prepare_attempt_display_fields(attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """Make stored history rows renderable: real line breaks, no JSON `\nStep`."""
+    out = dict(attempt)
+    for field in _ATTEMPT_DISPLAY_FIELDS:
+        value = out.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if field == "correct_solution":
+            out[field] = _clean_model_solution_text(value)
+        else:
+            out[field] = _decode_text_transport_escapes(value)
+    return out
 
 
 def _normalize_latex_for_render(text: str) -> str:
@@ -2694,6 +2775,130 @@ def _build_evaluation_system_prompt(
     )
 
 
+def _build_language_copy_system_prompt(detected_language: str) -> str:
+    module = _try_load_language_assessment_module()
+    exam_doctrine = ""
+    if module is not None:
+        doctrine_fn = getattr(module, "practice_language_copy_system_instructions", None)
+        if callable(doctrine_fn):
+            exam_doctrine = str(doctrine_fn() or "").strip()
+    lang_rule = ""
+    if detected_language == "hindi":
+        lang_rule = (
+            "CRITICAL: The question is in Hindi (Devanagari script). Respond ENTIRELY in Hindi "
+            "except for JSON keys. "
+        )
+    return (
+        f"{lang_rule}"
+        f"{exam_doctrine} "
+        "OUTPUT: only valid JSON. No markdown fences, no commentary."
+    )
+
+
+def _build_language_copy_evaluation_prompt(
+    *,
+    question_text: str,
+    options_text: str,
+    reference_answer: str,
+    answer_text: str,
+    uploaded_doc_text: str,
+    num_student_images: int,
+    num_question_figures: int,
+    num_option_images: int,
+    language_feedback_profile: Mapping[str, Any],
+    marking_criteria: Sequence[Mapping[str, Any]],
+) -> str:
+    """Exam-style single-question language copy check. Never uses STEM equivalence rules."""
+
+    parts: List[str] = []
+    num_q_images = num_question_figures + num_option_images
+    total_images = num_q_images + num_student_images
+    if total_images > 0:
+        guide: List[str] = ["IMAGES IN THIS REQUEST (read in order):"]
+        idx = 1
+        for fi in range(num_question_figures):
+            guide.append(f"  Image {idx} — QUESTION FIGURE {fi + 1} (part of the question itself)")
+            idx += 1
+        for oi in range(num_option_images):
+            guide.append(f"  Image {idx} — OPTION {chr(ord('A') + oi)}")
+            idx += 1
+        for sp in range(num_student_images):
+            guide.append(
+                f"  Image {idx} — STUDENT'S ANSWER, page {sp + 1} of {num_student_images}"
+            )
+            idx += 1
+        guide.append("")
+        guide.append(
+            "Read the student pages as a language teacher reads a copy. "
+            "Question figures are not the student's writing."
+        )
+        parts.append("\n".join(guide))
+
+    parts.append("\nQUESTION:")
+    parts.append((question_text or "").strip() or "(Read the question from the QUESTION FIGURE image(s).)")
+    if options_text:
+        parts.append("\nOPTIONS:")
+        parts.append(options_text)
+
+    submission_lines: List[str] = []
+    if answer_text:
+        submission_lines.append(f"Typed answer: {answer_text}")
+    if uploaded_doc_text:
+        submission_lines.append(
+            f"Uploaded document content:\n{_truncate_for_prompt(uploaded_doc_text, 8000)}"
+        )
+    if num_student_images:
+        submission_lines.append(
+            f"Handwritten copy: {num_student_images} page(s). Transcribe exactly."
+        )
+    if not submission_lines:
+        submission_lines.append("(No answer submitted)")
+    parts.append("\nSTUDENT'S SUBMISSION:")
+    parts.append("\n".join(submission_lines))
+
+    if reference_answer:
+        parts.append("\nTEACHER REFERENCE / MODEL CONTENT (content only, never rewrite student spelling to match this):")
+        parts.append(reference_answer)
+
+    parts.append("\nLOCKED MARKING CRITERIA (criterion_marks must use these IDs and maxima):")
+    parts.append(json.dumps(list(marking_criteria), ensure_ascii=False, indent=2))
+
+    language_example = _practice_language_feedback_example(language_feedback_profile)
+    output_contract: Dict[str, Any] = {
+        "student_answer": "faithful transcription of the student's exact words, including misspellings",
+        "verbatim_transcript": "line-by-line exact copy of the visible writing",
+        "extracted_answer": "same exact wording; never a dictionary-corrected rewrite",
+        "work_shown": "short teacher readout that still keeps the student's misspellings",
+        "what_went_wrong": "main copy-checking gaps, or empty if the writing is strong",
+        "spelling_grammar_errors": ["student_form → conventional_form"],
+        "criterion_marks": [
+            {
+                "criterion_id": str(item.get("criterion_id") or ""),
+                "marks_awarded": 0,
+                "rationale": "what is visible and why this mark was awarded or lost",
+                "evidence": "quoted student words or a visible missing part",
+            }
+            for item in marking_criteria
+            if isinstance(item, Mapping)
+        ],
+    }
+    if language_example is not None:
+        output_contract["language_feedback"] = language_example
+
+    parts.append(
+        "\nHOW TO MARK THIS LANGUAGE COPY — same standard as ExamPen:\n"
+        "1. Transcribe the visible words exactly. Never auto-correct.\n"
+        "2. Award each locked criterion from visible evidence only.\n"
+        "3. Fill language_feedback for every supplied dimension.\n"
+        "4. List clear spelling/grammar errors. Do not invent errors from unclear handwriting.\n"
+        "5. Missing required task parts lose Content/Structure marks. Wrong spelling/grammar "
+        "loses Language & Grammar. A response that only 'gets the idea' is not full marks.\n"
+        "OUTPUT — strict JSON only (no markdown fences, no commentary):\n"
+        + json.dumps(output_contract, ensure_ascii=False, indent=2)
+    )
+    return "\n".join(parts)
+
+
 def _build_case_study_evaluation_system_prompt(detected_language: str) -> str:
     lang_rule = ""
     if detected_language == "hindi":
@@ -2722,6 +2927,7 @@ def _parse_evaluation_response(
     answer_text: str,
     evaluation_mode: str = EVALUATION_MODE_STANDARD,
     language_feedback_profile: Optional[Mapping[str, Any]] = None,
+    language_marking_criteria: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Parse the LLM evaluator JSON output.
 
@@ -2776,7 +2982,9 @@ def _parse_evaluation_response(
     raw_extracted = str(parsed.get("extracted_answer", "")).strip() or (answer_text or "")
     raw_work = str(parsed.get("work_shown", "")).strip()
     raw_feedback = str(parsed.get("what_went_wrong", "")).strip()
-    verbatim = str(parsed.get("verbatim_transcript") or "").strip()
+    verbatim = str(
+        parsed.get("verbatim_transcript") or parsed.get("student_answer") or ""
+    ).strip()
     spelling_errors = [
         str(item).strip()
         for item in (parsed.get("spelling_grammar_errors") or [])
@@ -2798,7 +3006,14 @@ def _parse_evaluation_response(
 
     if profile.get("enabled"):
         module = _try_load_language_assessment_module()
+        scored = None
         if module is not None:
+            criteria_fn = getattr(module, "score_practice_language_criteria", None)
+            if callable(criteria_fn):
+                scored = criteria_fn(
+                    parsed.get("criterion_marks"),
+                    language_marking_criteria or [],
+                )
             language_feedback = module.normalize_language_feedback(
                 parsed.get("language_feedback"),
                 profile=profile,
@@ -2808,15 +3023,29 @@ def _parse_evaluation_response(
                 if spelling_errors:
                     language_feedback["spelling_grammar_errors"] = spelling_errors
                 evaluation_data["languageFeedback"] = language_feedback
-                score_fn = getattr(module, "score_language_practice_feedback", None)
-                scored = score_fn(language_feedback) if callable(score_fn) else None
-                if isinstance(scored, dict) and scored.get("score") is not None:
-                    evaluation_data["score"] = float(scored["score"])
-                    evaluation_data["correct"] = bool(scored.get("correct"))
-                    evaluation_data["scoreSource"] = str(scored.get("source") or "language_dimensions")
+                if not (isinstance(scored, dict) and scored.get("score") is not None):
+                    score_fn = getattr(module, "score_language_practice_feedback", None)
+                    scored = score_fn(language_feedback) if callable(score_fn) else None
                 curated_feedback = module.format_language_feedback(language_feedback)
                 if curated_feedback:
                     evaluation_data["whatWentWrong"] = curated_feedback
+        if isinstance(scored, dict) and scored.get("score") is not None:
+            evaluation_data["score"] = float(scored["score"])
+            evaluation_data["correct"] = bool(scored.get("correct"))
+            evaluation_data["scoreSource"] = str(scored.get("source") or "language_criteria")
+            if scored.get("marks_awarded") is not None:
+                evaluation_data["marksAwarded"] = scored.get("marks_awarded")
+                evaluation_data["maxMarks"] = scored.get("max_marks")
+        else:
+            # Do not keep an unvalidated STEM-style score on a language copy.
+            evaluation_data["correct"] = False
+            evaluation_data["score"] = 0.0
+            evaluation_data["scoreSource"] = "language_unvalidated"
+            if not evaluation_data["whatWentWrong"]:
+                evaluation_data["whatWentWrong"] = (
+                    "The language copy could not be marked completely. "
+                    "Please submit again with clearer writing."
+                )
 
     return evaluation_data
 
@@ -3168,6 +3397,14 @@ async def evaluate_submission(
             correct_answer_display = _normalize_latex_for_render(cached_final_answer)
             has_correct_answer = True
 
+        sibling_questions: List[Dict[str, Any]] = []
+        if evaluation_mode == EVALUATION_MODE_STANDARD:
+            sibling_questions = await _load_practice_sibling_questions(
+                db,
+                question_doc,
+                document_id=payload.documentId,
+                is_b2c=is_b2c,
+            )
         language_profile: Dict[str, Any] = {
             "enabled": False,
             "version": "language-feedback-v1",
@@ -3177,15 +3414,19 @@ async def evaluate_submission(
                 question_doc,
                 is_mcq=is_mcq,
                 reference_solution=cached_solution_text,
+                sibling_questions=sibling_questions,
             )
         language_feedback_enabled = bool(language_profile.get("enabled"))
+        language_criteria = _practice_language_marking_criteria(language_profile, question_doc)
         logger.info(
             f"Language profile Q:{qid} enabled={language_feedback_enabled} "
             f"family={language_profile.get('response_family') or '-'} is_mcq={is_mcq} "
-            f"subject={question_doc.get('subject') or '-'}"
+            f"subject={question_doc.get('subject') or '-'} "
+            f"siblings={len(sibling_questions)} criteria={len(language_criteria)}"
         )
 
-        # 6. Build the single, unified prompt + system prompt
+        # 6. Build the prompt. Language writing uses the exam copy-check contract;
+        # STEM and case-study keep their existing evaluators.
         if evaluation_mode == EVALUATION_MODE_CASE_STUDY:
             prompt = _build_case_study_evaluation_prompt(
                 question_text=question_text,
@@ -3199,6 +3440,20 @@ async def evaluate_submission(
                 teacher_reference_answer=correct_answer_display or correct_answer_value or correct_answer,
             )
             system_prompt = _build_case_study_evaluation_system_prompt(detected_language)
+        elif language_feedback_enabled:
+            prompt = _build_language_copy_evaluation_prompt(
+                question_text=question_text,
+                options_text=options_text,
+                reference_answer=correct_answer_display or correct_answer_value or correct_answer or cached_solution_text,
+                answer_text=answer_text,
+                uploaded_doc_text=uploaded_doc_text,
+                num_student_images=num_student_images,
+                num_question_figures=num_question_figures,
+                num_option_images=num_option_images,
+                language_feedback_profile=language_profile,
+                marking_criteria=language_criteria,
+            )
+            system_prompt = _build_language_copy_system_prompt(detected_language)
         else:
             prompt = _build_evaluation_prompt(
                 question_text=question_text,
@@ -3216,7 +3471,7 @@ async def evaluate_submission(
             )
             system_prompt = _build_evaluation_system_prompt(
                 detected_language,
-                language_feedback_enabled=language_feedback_enabled,
+                language_feedback_enabled=False,
             )
 
         # 7. ONE LLM call. Non-language answers retain the compact five-field
@@ -3228,7 +3483,7 @@ async def evaluate_submission(
         # The higher value is a ceiling, not a forced spend. It prevents a
         # seven-dimension JSON object from being truncated and invalidating the
         # language mark; normal concise responses stop well before this limit.
-        evaluation_max_tokens = 2400 if language_feedback_enabled else 1000
+        evaluation_max_tokens = 4000 if language_feedback_enabled else 1000
         if all_images:
             response = await _gate_vision_call(
                 db, current_user, all_images,
@@ -3256,6 +3511,7 @@ async def evaluate_submission(
             answer_text=answer_text,
             evaluation_mode=evaluation_mode,
             language_feedback_profile=language_profile,
+            language_marking_criteria=language_criteria,
         )
         evaluation_data["correctSolution"] = cached_solution_text
         if cached.get("source") and not has_correct_answer:
@@ -3305,17 +3561,17 @@ async def evaluate_submission(
                 "question_type": q_type,
                 "evaluation_mode": evaluation_mode,
                 "options": question_doc.get("options"),
-                "student_answer": evaluation_data.get("extractedAnswer", ""),
+                "student_answer": _decode_text_transport_escapes(str(evaluation_data.get("extractedAnswer", "") or "")),
                 "correct_answer": correct_answer,
                 "is_correct": evaluation_data.get("correct", False),
                 "score": evaluation_data.get("score", 0.0),
                 "time_spent": payload.timeSpent,
                 "hints_used": payload.hintsUsed or 0,
-                "work_shown": evaluation_data.get("workShown", ""),
-                "what_went_wrong": evaluation_data.get("whatWentWrong", ""),
+                "work_shown": _decode_text_transport_escapes(str(evaluation_data.get("workShown", "") or "")),
+                "what_went_wrong": _decode_text_transport_escapes(str(evaluation_data.get("whatWentWrong", "") or "")),
                 "language_feedback": evaluation_data.get("languageFeedback"),
                 "score_source": evaluation_data.get("scoreSource"),
-                "correct_solution": evaluation_data.get("correctSolution", ""),
+                "correct_solution": _clean_model_solution_text(str(evaluation_data.get("correctSolution", "") or "")),
                 "question_page_refs": question_page_refs,
                 "canonical_evidence_receipt": canonical_evidence_receipt,
                 "created_at": datetime.utcnow(),
@@ -3951,7 +4207,7 @@ async def get_practice_attempts(
                 attempt_dict["id"] = str(attempt_dict.pop("_id"))
             if "created_at" in attempt_dict and attempt_dict["created_at"]:
                 attempt_dict["created_at"] = attempt_dict["created_at"].isoformat()
-            attempt_list.append(attempt_dict)
+            attempt_list.append(_prepare_attempt_display_fields(attempt_dict))
         
         # Calculate stats
         total_correct = sum(1 for a in attempt_list if a.get("is_correct"))
@@ -4132,7 +4388,7 @@ async def get_practice_attempt_detail(
         
         return {
             "success": True,
-            "attempt": attempt_dict
+            "attempt": _prepare_attempt_display_fields(attempt_dict)
         }
         
     except HTTPException:

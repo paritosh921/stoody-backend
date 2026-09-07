@@ -9,7 +9,7 @@ derived at read time so existing exams need no data migration.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 
 LANGUAGE_FEEDBACK_VERSION = "language-feedback-v1"
@@ -488,6 +488,266 @@ def practice_language_feedback_profile(question: Mapping[str, Any]) -> Dict[str,
     if not is_strong_language_writing_task(task_text):
         return {"enabled": False, "version": LANGUAGE_FEEDBACK_VERSION}
     return _profile(_response_family(task_text))
+
+
+DIMENSION_CRITERION_TEXT = {
+    "understanding": {
+        "description": "Has the student understood the question/topic correctly? Is the response relevant and does it address what was asked?",
+        "acceptable_evidence": "Visible writing answers the asked task, not a different topic.",
+    },
+    "content": {
+        "description": "Quality and completeness of ideas, key points covered, supporting examples or facts, and depth where required.",
+        "acceptable_evidence": "Required points, examples, or facts are present in the student's own words.",
+    },
+    "structure_organization": {
+        "description": "Logical flow of ideas, sequencing, paragraphing, and introduction/body/conclusion where the task requires them.",
+        "acceptable_evidence": "The answer is sequenced as the task requires (for example letter parts or paragraphs).",
+    },
+    "language_grammar": {
+        "description": "Grammar, sentence construction, vocabulary, spelling, punctuation, and overall language accuracy.",
+        "acceptable_evidence": "Spelling, grammar, tense, and punctuation are judged from the exact words written.",
+    },
+    "clarity_expression": {
+        "description": "How clearly the student communicates their thoughts; whether ideas are easy to understand and sentences are appropriately constructed.",
+        "acceptable_evidence": "A teacher can follow the intended meaning from the visible wording.",
+    },
+    "tone_style": {
+        "description": "Whether the tone and writing style are appropriate for the question, audience, and type of writing.",
+        "acceptable_evidence": "Register matches the task (formal letter, informal note, literary response, etc.).",
+    },
+    "conciseness_precision": {
+        "description": "Avoiding unnecessary repetition or filler, staying within the required length, and expressing ideas efficiently.",
+        "acceptable_evidence": "The writing stays on task without empty repetition.",
+    },
+}
+
+
+def adapt_question_for_practice_language(
+    question: Mapping[str, Any],
+    *,
+    is_mcq: bool = False,
+    reference_solution: str = "",
+) -> Dict[str, Any]:
+    """Normalise a practice question onto the exam language-contract fields."""
+
+    metadata = question.get("metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    subject = (
+        question.get("subject")
+        or metadata.get("subject")
+        or metadata.get("subject_name")
+        or ""
+    )
+    question_text = "\n".join(
+        str(part).strip()
+        for part in (
+            question.get("text"),
+            question.get("question_text"),
+            question.get("course_plan"),
+            metadata.get("chapter"),
+            metadata.get("topic"),
+            metadata.get("document_title"),
+            metadata.get("title"),
+        )
+        if str(part or "").strip()
+    )
+    return {
+        **dict(question),
+        "subject": subject,
+        "question_text": question_text,
+        "rubric": question.get("rubric") or metadata.get("rubric") or "",
+        "reference_solution": reference_solution
+        or question.get("reference_solution")
+        or question.get("correctAnswer")
+        or question.get("correct_answer")
+        or "",
+        "grading_mode": "objective" if is_mcq else (
+            question.get("grading_mode") or question.get("question_type") or "subjective"
+        ),
+        "question_type": "mcq" if is_mcq else (question.get("question_type") or "subjective"),
+    }
+
+
+def resolve_practice_language_profile(
+    question: Mapping[str, Any],
+    *,
+    is_mcq: bool = False,
+    reference_solution: str = "",
+    sibling_questions: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Exam-aligned practice routing: writing task, language subject, or paper inference.
+
+    STEM subjects stay STEM. A mixed practice set uses the same paper-level
+    inference as ExamPen so one weakly worded language question still gets
+    copy-checking when the rest of the paper is clearly language writing.
+    """
+
+    adapted = adapt_question_for_practice_language(
+        question, is_mcq=is_mcq, reference_solution=reference_solution
+    )
+    if is_non_language_academic_subject(adapted.get("subject")):
+        return language_feedback_profile(adapted)
+
+    if sibling_questions:
+        prepared = [
+            adapt_question_for_practice_language(sibling)
+            for sibling in sibling_questions
+            if isinstance(sibling, Mapping)
+        ]
+        if not any(
+            str(item.get("question_id") or item.get("id") or "")
+            == str(adapted.get("question_id") or adapted.get("id") or "")
+            for item in prepared
+        ):
+            prepared.append(adapted)
+        inference = infer_language_paper(prepared)
+        if inference.get("enabled"):
+            adapted["language_subject_inferred"] = True
+            paper_profile = language_feedback_profile(adapted)
+            if paper_profile.get("enabled"):
+                return paper_profile
+
+    return practice_language_feedback_profile(adapted)
+
+
+def practice_language_marking_criteria(
+    profile: Mapping[str, Any],
+    existing: Any = None,
+) -> List[Dict[str, Any]]:
+    """Return exam-style criteria: teacher/PDF criteria if present, else the 7 parameters."""
+
+    criteria: List[Dict[str, Any]] = []
+    if isinstance(existing, Sequence) and not isinstance(existing, (str, bytes)):
+        for item in existing:
+            if not isinstance(item, Mapping):
+                continue
+            criterion_id = str(item.get("criterion_id") or item.get("id") or "").strip()
+            description = str(item.get("description") or item.get("label") or "").strip()
+            if not criterion_id or not description:
+                continue
+            max_marks = item.get("max_marks")
+            try:
+                max_marks_value = float(max_marks) if max_marks is not None else None
+            except (TypeError, ValueError):
+                max_marks_value = None
+            weight = item.get("relative_weight")
+            try:
+                weight_value = float(weight) if weight is not None else None
+            except (TypeError, ValueError):
+                weight_value = None
+            if max_marks_value is None:
+                max_marks_value = weight_value if weight_value and weight_value > 0 else 1.0
+            criteria.append(
+                {
+                    "criterion_id": criterion_id,
+                    "description": description,
+                    "max_marks": max_marks_value,
+                    "relative_weight": weight_value if weight_value and weight_value > 0 else max_marks_value,
+                    "acceptable_evidence": str(item.get("acceptable_evidence") or "").strip(),
+                    "source": "teacher",
+                }
+            )
+    if criteria:
+        return criteria
+
+    family = _normal_text(profile.get("response_family")).replace(" ", "_")
+    weights = FAMILY_WEIGHTS.get(family) or FAMILY_WEIGHTS["short_language_response"]
+    for dimension_id, label in DIMENSIONS:
+        applicable = True
+        for item in profile.get("dimensions") or []:
+            if isinstance(item, Mapping) and item.get("dimension_id") == dimension_id:
+                applicable = bool(item.get("applicable"))
+                break
+        if not applicable:
+            continue
+        weight = float(weights.get(dimension_id) or 0)
+        if weight <= 0:
+            continue
+        text = DIMENSION_CRITERION_TEXT[dimension_id]
+        criteria.append(
+            {
+                "criterion_id": dimension_id,
+                "description": f"{label}: {text['description']}",
+                "max_marks": round(weight * 10.0, 2),
+                "relative_weight": weight,
+                "acceptable_evidence": text["acceptable_evidence"],
+                "source": "language_dimensions",
+            }
+        )
+    return criteria
+
+
+def score_practice_language_criteria(
+    criterion_marks: Any,
+    criteria: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Server-owned score from criterion marks, same ownership as ExamPen."""
+
+    if not criteria:
+        return None
+    by_id: Dict[str, Mapping[str, Any]] = {}
+    if isinstance(criterion_marks, Sequence) and not isinstance(criterion_marks, (str, bytes)):
+        for item in criterion_marks:
+            if not isinstance(item, Mapping):
+                continue
+            criterion_id = str(item.get("criterion_id") or "").strip()
+            if criterion_id:
+                by_id[criterion_id] = item
+    if not by_id:
+        return None
+
+    awarded = 0.0
+    maximum = 0.0
+    for criterion in criteria:
+        if not isinstance(criterion, Mapping):
+            continue
+        criterion_id = str(criterion.get("criterion_id") or "").strip()
+        try:
+            max_marks = float(criterion.get("max_marks") or criterion.get("relative_weight") or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if max_marks <= 0 or not criterion_id:
+            continue
+        mark = by_id.get(criterion_id) or {}
+        try:
+            got = float(mark.get("marks_awarded") or 0)
+        except (TypeError, ValueError):
+            got = 0.0
+        awarded += max(0.0, min(max_marks, got))
+        maximum += max_marks
+    if maximum <= 0:
+        return None
+    score = max(0.0, min(1.0, awarded / maximum))
+    return {
+        "score": round(score, 4),
+        "correct": score >= LANGUAGE_PRACTICE_PASS_THRESHOLD,
+        "pass_threshold": LANGUAGE_PRACTICE_PASS_THRESHOLD,
+        "source": "language_criteria",
+        "marks_awarded": round(awarded, 2),
+        "max_marks": round(maximum, 2),
+    }
+
+
+def practice_language_copy_system_instructions() -> str:
+    """Exam copy-checking doctrine, scoped to one practice language answer."""
+
+    return (
+        "You are a language teacher marking one handwritten student answer the "
+        "same way ExamPen marks a language copy. Read the question, the locked "
+        "marking criteria, the teacher reference for expected CONTENT only, and "
+        "every labelled student page.\n"
+        "Transcribe faithfully. Do not auto-correct, silently fix, or fabricate "
+        "a cleaner spelling or grammar. If a word is clearly misspelled, keep "
+        "that misspelling in student_answer and verbatim_transcript and list it "
+        "in spelling_grammar_errors. Do not call uncertain handwriting a "
+        "spelling or grammar error.\n"
+        "criterion_marks are the only score source. Award each criterion from "
+        "visible evidence only. The seven language_feedback dimensions explain "
+        "the writing; they must not invent extra marks.\n"
+        "Do not penalize one defect twice across dimensions. Do not treat a "
+        "roughly similar meaning as full marks when spelling, grammar, format, "
+        "or required task parts are missing."
+    )
 
 
 def score_language_practice_feedback(feedback: Any) -> Optional[Dict[str, Any]]:

@@ -122,32 +122,35 @@ def test_non_language_prompt_has_hard_grammar_boundary_and_no_feedback_field():
     assert "Do not lower the score or criticize spelling" in prompt
 
 
-def test_language_prompt_requests_all_dimensions_in_the_same_model_call():
+def test_language_copy_prompt_uses_exam_contract_not_stem_rules():
     profile = practice._practice_language_feedback_profile(
         _question(subject="English", text="Write a letter to the editor."),
         is_mcq=False,
     )
-    prompt = practice._build_evaluation_prompt(
+    criteria = practice._practice_language_marking_criteria(
+        profile, _question(subject="English", text="Write a letter to the editor.")
+    )
+    prompt = practice._build_language_copy_evaluation_prompt(
         question_text="Write a letter to the editor.",
         options_text="",
-        correct_answer="A relevant formal letter",
-        correct_answer_value="A relevant formal letter",
-        is_option_letter=False,
-        is_mcq=False,
+        reference_answer="A relevant formal letter",
         answer_text="Dear Editor, ...",
         uploaded_doc_text="",
-        num_student_images=0,
+        num_student_images=1,
         num_question_figures=0,
         num_option_images=0,
         language_feedback_profile=profile,
+        marking_criteria=criteria,
     )
+    system_prompt = practice._build_language_copy_system_prompt("english")
 
-    assert "LANGUAGE-WRITING ASSESSMENT" in prompt
-    assert "seven parameters OWN the score" in prompt
-    assert "NEVER auto-correct" in prompt
+    assert "LOCKED MARKING CRITERIA" in prompt
+    assert "Never auto-correct" in prompt
+    assert "criterion_marks" in prompt
     assert "verbatim_transcript" in prompt
-    assert "student_form → conventional_form" in prompt
-    assert "must never alter" not in prompt
+    assert "matches the reference in ANY form" not in prompt
+    assert "Do not lower the score or criticize spelling" not in system_prompt
+    assert "faithful" in system_prompt.lower() or "Transcribe faithfully" in system_prompt
     for dimension in (
         "understanding",
         "content",
@@ -256,7 +259,7 @@ def test_language_parse_keeps_verbatim_misspellings():
     ]
 
 
-def test_malformed_language_diagnostic_is_dropped_without_losing_verdict():
+def test_malformed_language_copy_does_not_keep_stem_score():
     profile = practice._practice_language_feedback_profile(
         _question(subject="English", text="Write a paragraph."),
         is_mcq=False,
@@ -278,6 +281,73 @@ def test_malformed_language_diagnostic_is_dropped_without_losing_verdict():
         language_feedback_profile=profile,
     )
 
-    assert parsed["correct"] is True
-    assert parsed["score"] == 0.85
+    assert parsed["correct"] is False
+    assert parsed["score"] == 0.0
+    assert parsed["scoreSource"] == "language_unvalidated"
     assert "languageFeedback" not in parsed
+
+
+def test_language_criteria_own_practice_score_like_exam():
+    profile = practice._practice_language_feedback_profile(
+        _question(subject="English", text="Write a letter to the editor."),
+        is_mcq=False,
+    )
+    criteria = practice._practice_language_marking_criteria(profile)
+    raw = {
+        "is_correct": True,
+        "score": 1.0,
+        "student_answer": "Dear Editor, I recieve your letter.",
+        "verbatim_transcript": "Dear Editor, I recieve your letter.",
+        "extracted_answer": "Dear Editor, I receive your letter.",
+        "work_shown": "Dear Editor, I recieve your letter.",
+        "what_went_wrong": "",
+        "spelling_grammar_errors": ["recieve → receive"],
+        "criterion_marks": [
+            {
+                "criterion_id": item["criterion_id"],
+                "marks_awarded": 0.3 * float(item["max_marks"])
+                if item["criterion_id"] == "language_grammar"
+                else 0.8 * float(item["max_marks"]),
+                "rationale": "visible evidence",
+                "evidence": "recieve",
+            }
+            for item in criteria
+        ],
+        "language_feedback": _raw_feedback(profile),
+    }
+    raw["language_feedback"]["dimensions"]["language_grammar"] = {
+        "applicability": "applicable",
+        "level": "needs_improvement",
+        "evidence": "recieve",
+        "feedback": "Correct the spelling.",
+    }
+
+    parsed = practice._parse_evaluation_response(
+        raw_response=json.dumps(raw),
+        correct_answer_display="A relevant formal letter",
+        has_correct_answer=True,
+        answer_text="",
+        language_feedback_profile=profile,
+        language_marking_criteria=criteria,
+    )
+
+    assert parsed["extractedAnswer"] == "Dear Editor, I recieve your letter."
+    assert parsed["scoreSource"] == "language_criteria"
+    assert parsed["score"] < 0.8
+    assert parsed["languageFeedback"]["spelling_grammar_errors"] == ["recieve → receive"]
+
+
+def test_paper_level_inference_enables_weakly_worded_language_question():
+    siblings = [
+        _question(subject="", text="Write a letter to the principal asking for leave."),
+        _question(subject="", text="Write a paragraph on honesty."),
+        _question(subject="", text="Read the passage and answer the questions."),
+    ]
+    weak = _question(subject="", text="Answer in your own words.")
+    profile = practice._practice_language_feedback_profile(
+        weak,
+        is_mcq=False,
+        sibling_questions=siblings + [weak],
+    )
+
+    assert profile["enabled"] is True

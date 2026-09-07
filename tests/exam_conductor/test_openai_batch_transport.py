@@ -439,14 +439,15 @@ async def test_cancelling_before_provider_creation_returns_jobs_to_waiting():
 
 
 @pytest.mark.asyncio
-async def test_recovery_request_can_create_a_followup_provider_part():
+@pytest.mark.parametrize("group_status", ["preparing", "provider_processing", "importing"])
+async def test_recovery_request_can_create_a_followup_provider_part(group_status):
     from mongomock_motor import AsyncMongoMockClient
 
     db = AsyncMongoMockClient()["skb_test"]
     group = {
         "batch_group_id": "econ-recovery",
         "exam_id": "exam-1",
-        "status": "provider_processing",
+        "status": group_status,
     }
     await db["exampen_provider_batches"].insert_one(group)
     await db[PROCESSING_JOBS_COLLECTION].insert_one({
@@ -468,6 +469,7 @@ async def test_recovery_request_can_create_a_followup_provider_part():
     request_body = {"model": "gpt-5.1", "input": [], "store": False}
     entry = {
         "custom_id": "recovery-1",
+        "parent_custom_id": "primary-1",
         "job_id": "job-recovery",
         "submission_id": "submission-1",
         "grader_kind": "full_document",
@@ -492,6 +494,11 @@ async def test_recovery_request_can_create_a_followup_provider_part():
     assert created == 1
     part = await db[BATCH_PARTS_COLLECTION].find_one({"provider_batch_id": "batch-recovery"})
     assert part["stage"] == "recovery"
+    repeated = await _create_provider_parts(
+        db, group=group, entries=[entry], stage="recovery", client=client,
+    )
+    assert repeated == 0
+    assert client.create_batch.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -771,9 +778,14 @@ async def test_terminal_provider_part_is_claimed_imported_and_cleaned_once():
         b'{"custom_id":"copy-import","response":{"status_code":200,"body":{"id":"response-1"}}}\n'
     )
 
+    async def complete_job(*args, **kwargs):
+        await db[PROCESSING_JOBS_COLLECTION].update_one(
+            {"job_id": "job-import"}, {"$set": {"status": "completed"}}
+        )
+
     with (
         patch("services.exampen_openai_batch.OpenAIBatchClient", return_value=client),
-        patch("services.exampen_openai_batch._import_item", new=AsyncMock(return_value=None)),
+        patch("services.exampen_openai_batch._import_item", new=AsyncMock(side_effect=complete_job)),
     ):
         summary = await reconcile_economy_batches(db)
 

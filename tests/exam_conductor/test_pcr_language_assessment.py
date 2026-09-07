@@ -243,6 +243,56 @@ def test_unclear_language_dimension_can_be_preserved_as_not_assessed():
     assert normalized["dimensions"][0]["level"] == "not_assessed"
 
 
+def test_practice_paper_inference_enables_weak_language_question():
+    siblings = [
+        _question(text="Write a letter to the editor."),
+        _question(text="Write a paragraph on kindness."),
+        _question(text="Read the passage and answer the questions."),
+        _question(subject="", text="Answer in your own words."),
+    ]
+    siblings[-1]["subject"] = ""
+    siblings[-1]["question_text"] = "Answer in your own words."
+
+    profile = language.resolve_practice_language_profile(
+        siblings[-1],
+        is_mcq=False,
+        sibling_questions=siblings,
+    )
+
+    assert profile["enabled"] is True
+
+
+def test_practice_language_criteria_prefer_teacher_rubric():
+    profile = language.practice_language_feedback_profile(_question())
+    criteria = language.practice_language_marking_criteria(
+        profile,
+        [
+            {
+                "criterion_id": "format",
+                "description": "Letter format with date and sign-off",
+                "max_marks": 2,
+            },
+            {
+                "criterion_id": "grammar",
+                "description": "Accurate spelling and grammar",
+                "max_marks": 3,
+            },
+        ],
+    )
+
+    assert [item["criterion_id"] for item in criteria] == ["format", "grammar"]
+    scored = language.score_practice_language_criteria(
+        [
+            {"criterion_id": "format", "marks_awarded": 1},
+            {"criterion_id": "grammar", "marks_awarded": 1.5},
+        ],
+        criteria,
+    )
+    assert scored["source"] == "language_criteria"
+    assert scored["score"] == 0.5
+    assert scored["correct"] is False
+
+
 def test_practice_profile_enables_mixed_set_letter_even_when_tagged_mcq():
     profile = language.practice_language_feedback_profile(
         {
