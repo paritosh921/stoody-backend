@@ -28,5 +28,6 @@ mentorAI/.mentor-ai.pid
 *.swp
 .idea/
 .vscode/
+.serena/
 *.pem
 
