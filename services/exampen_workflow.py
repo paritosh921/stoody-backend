@@ -1470,11 +1470,17 @@ async def _maybe_mark_exam_ready_for_review(tenant_db: Any, exam_id: str) -> Non
 
     absent = {str(student_id) for student_id in (exam.get("absent_student_ids") or [])}
     expected = {str(student_id) for student_id in (exam.get("roster") or []) if str(student_id)} - absent
-    if not expected:
-        return
-
     submissions = await tenant_db["evalpen_submissions"].find({"exam_id": exam_id}).to_list(length=5000)
     by_student = {str(item.get("student_id")): item for item in submissions if item.get("student_id")}
+    from services.exampen_eligibility import uses_live_students
+    live_students = uses_live_students(exam)
+    if live_students:
+        from services.exampen_upload_window import answer_copy_upload_is_open
+        if answer_copy_upload_is_open(exam):
+            return
+        expected = set(by_student)
+    if not expected:
+        return
     if not expected.issubset(by_student):
         return
 
@@ -1493,8 +1499,11 @@ async def _maybe_mark_exam_ready_for_review(tenant_db: Any, exam_id: str) -> Non
             return
 
     now = _now()
+    completion_filter = {"exam_id": exam_id, "lifecycle_state": "uploading"}
+    if live_students:
+        completion_filter["answer_copy_upload_state"] = "closed"
     result = await exam_col.update_one(
-        {"exam_id": exam_id, "lifecycle_state": "uploading"},
+        completion_filter,
         {
             "$set": {
                 "lifecycle_state": "ready_for_eval",

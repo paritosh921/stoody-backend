@@ -34,8 +34,18 @@ async def _seed_self_submission_exam(db, **overrides: Any) -> None:
         "roster": ["student-1"],
         "absent_student_ids": [],
         "admin_id": "admin-1",
+        "prepared_document_id": "self-paper",
     }
     exam.update(overrides)
+    await db["documents"].update_one(
+        {"document_id": exam["prepared_document_id"]},
+        {"$set": {"admin_id": "admin-1", "standard": "11"}}, upsert=True,
+    )
+    for student_id in exam["roster"]:
+        await db["students"].update_one(
+            {"student_id": student_id},
+            {"$set": {"admin_id": "admin-1", "grade": "11", "is_active": True}}, upsert=True,
+        )
     await db["exampen_exams"].insert_one(exam)
 
 
@@ -48,7 +58,7 @@ def _upload_file() -> UploadFile:
 
 
 @pytest.mark.asyncio
-async def test_student_submission_options_only_show_enabled_rostered_pcr_sessions():
+async def test_student_submission_options_use_live_class_not_saved_roster():
     from api.v1.evalpen_student_submission_async import list_answer_copy_options
 
     db = _fresh_db()
@@ -70,7 +80,7 @@ async def test_student_submission_options_only_show_enabled_rostered_pcr_session
     ):
         result = await list_answer_copy_options(current_user=_student_user(), db=None)
 
-    assert [item.exam_id for item in result.items] == ["PCR-SELF-1"]
+    assert {item.exam_id for item in result.items} == {"PCR-SELF-1", "PCR-OTHER-STUDENT"}
     assert result.items[0].can_submit is True
     assert result.items[0].max_pages == 5
     assert result.items[0].submission.status == "not_submitted"

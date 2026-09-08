@@ -802,6 +802,8 @@ async def _build_preflight(
     exam_doc: Dict[str, Any],
 ) -> ExamPreflightResponse:
     """Return the server-authoritative arm/readiness checks for a session."""
+    from services.exampen_eligibility import resolve_exam_students
+    exam_doc = await resolve_exam_students(tenant_db, exam_doc)
     exam_id = str(exam_doc.get("exam_id") or "")
     exam_type = str(exam_doc.get("exam_type") or "")
     capture_mode = str(exam_doc.get("capture_mode") or "pen")
@@ -843,9 +845,9 @@ async def _build_preflight(
     checks.append(
         PreflightCheck(
             id="roster",
-            label="Student roster",
+            label="Eligible students",
             ready=bool(roster),
-            detail=(f"{len(roster)} student(s)" if roster else "Add at least one student before arming"),
+            detail=(f"{len(roster)} student(s)" if roster else "No eligible students found for this paper"),
         )
     )
 
@@ -932,9 +934,9 @@ async def _build_preflight(
                     and bool(roster)
                 ),
                 detail=(
-                    f"Rostered students can upload up to {max_pages} photographed/scanned pages"
+                    f"Eligible students can upload up to {max_pages} photographed/scanned pages"
                     if exam_type == "pcr" and capture_mode in {"camera", "hybrid"} and roster
-                    else "Requires a PCR camera/hybrid session with a roster"
+                    else "Requires a PCR camera/hybrid session with eligible students"
                 ),
             )
         )
@@ -952,11 +954,16 @@ async def _ready_for_eval_issues(tenant_db: Any, exam_doc: Dict[str, Any]) -> Li
     exam_id = str(exam_doc.get("exam_id") or "")
     absent = {str(student_id) for student_id in (exam_doc.get("absent_student_ids") or [])}
     expected_students = set(_normalize_roster(exam_doc.get("roster"))) - absent
-    if not expected_students:
-        return ["No expected students remain; add a roster or record attendance correctly"]
-
     submissions = await tenant_db["evalpen_submissions"].find({"exam_id": exam_id}).to_list(length=5000)
     by_student = {str(item.get("student_id")): item for item in submissions if item.get("student_id")}
+    from services.exampen_eligibility import uses_live_students
+    if uses_live_students(exam_doc):
+        from services.exampen_upload_window import answer_copy_upload_is_open
+        if answer_copy_upload_is_open(exam_doc):
+            return ["Close answer-copy uploads before completing collection"]
+        expected_students = set(by_student)
+    if not expected_students:
+        return ["No submitted copies are available for review"]
     missing = sorted(expected_students - set(by_student))
     issues: List[str] = []
     if missing:
@@ -1055,6 +1062,9 @@ async def _require_tutor_visibility(
         for student in scoped_students
         if student.get("student_id")
     }
+    from services.exampen_eligibility import resolve_exam_students
+    tenant_db = await _get_tenant_db(db, current_user)
+    exam_doc = await resolve_exam_students(tenant_db, exam_doc)
     exam_roster = {
         str(student_id)
         for student_id in (exam_doc.get("roster") or [])
@@ -1331,23 +1341,13 @@ async def _camera_roster_for_document(
             detail="Set the paper class before activating camera answer-copy uploads",
         )
 
-    query: Dict[str, Any] = {
-        "grade": standard,
-        "is_active": True,
-    }
-    if document.get("admin_id") is not None:
-        query["admin_id"] = document["admin_id"]
-
-    students = await tenant_db["students"].find(
-        query,
-        projection={"_id": 1, "student_id": 1},
-    ).to_list(length=5000)
-    roster = _normalize_roster(
-        [
-            str(student.get("student_id") or student.get("_id") or "")
-            for student in students
-        ]
-    )
+    from services.exampen_eligibility import resolve_exam_students
+    eligible = await resolve_exam_students(tenant_db, {
+        "exam_type": "pcr", "capture_mode": "camera",
+        "prepared_document_id": document.get("document_id"),
+        "admin_id": document.get("admin_id"),
+    })
+    roster = eligible["roster"]
     if not roster:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1388,7 +1388,7 @@ async def ensure_default_pcr_camera_collection(
             detail="Automatic camera collection is available for finalized PCR papers only",
         )
 
-    roster = await _camera_roster_for_document(tenant_db, document)
+    await _camera_roster_for_document(tenant_db, document)
     collection = tenant_db["exampen_exams"]
     await _ensure_indexes(collection)
 
@@ -1418,7 +1418,7 @@ async def ensure_default_pcr_camera_collection(
             body=ExamCreateRequest(
                 prepared_document_id=prepared_document_id,
                 request_id=_automatic_camera_request_id(document),
-                roster=roster,
+                roster=[],
                 pen_bindings={},
                 capture_mode="camera",
                 student_self_submission_enabled=True,
@@ -1444,19 +1444,12 @@ async def ensure_default_pcr_camera_collection(
             )
 
         if lifecycle == "draft" or automatic:
-            # For an automatic camera collection, refreshing activation safely
-            # adds newly enrolled class students and upgrades the page limit.
-            existing_roster = _normalize_roster(session.get("roster"))
-            desired_roster = (
-                roster
-                if lifecycle in {"draft", "armed"}
-                else _normalize_roster([*existing_roster, *roster])
-            )
+            # Student eligibility is read live; activation only updates capture
+            # configuration and never backfills a saved admission list.
             await collection.update_one(
                 {"exam_id": session["exam_id"]},
                 {
                     "$set": {
-                        "roster": desired_roster,
                         "pen_bindings": {},
                         "capture_mode": "camera",
                         "student_self_submission_enabled": True,
@@ -1522,7 +1515,8 @@ async def ensure_default_pcr_camera_collection(
             status_code=status.HTTP_409_CONFLICT,
             detail="Camera answer-copy collection is not open",
         )
-    return _doc_to_response(session)
+    from services.exampen_eligibility import resolve_exam_students
+    return _doc_to_response(await resolve_exam_students(tenant_db, session))
 
 
 @router.get(
@@ -1565,7 +1559,8 @@ async def list_exams(
 
     cursor = collection.find(query).sort("created_at", -1)
     docs = await cursor.to_list(length=200)
-
+    from services.exampen_eligibility import ExamEligibility
+    docs = await ExamEligibility(tenant_db).resolve_many(docs)
     items = [_doc_to_response(d) for d in docs]
     total = len(items)
 
@@ -1605,7 +1600,8 @@ async def get_exam(
 
     await _require_tutor_visibility(doc, current_user, db)
 
-    return _doc_to_response(doc)
+    from services.exampen_eligibility import resolve_exam_students
+    return _doc_to_response(await resolve_exam_students(tenant_db, doc))
 
 
 @router.patch(
@@ -1905,8 +1901,10 @@ async def mark_student_absent(
             detail="Students can be marked absent only after collection closes",
         )
     student_id = body.student_id.strip()
+    from services.exampen_eligibility import resolve_exam_students
+    doc = await resolve_exam_students(tenant_db, doc)
     if student_id not in _normalize_roster(doc.get("roster")):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student is not in this exam roster")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student is not eligible for this paper")
     await collection.update_one(
         {"exam_id": exam_id},
         {
@@ -2320,6 +2318,8 @@ async def get_upload_progress(
     cursor = tenant_db["evalpen_submissions"].aggregate(pipeline)
     agg_results = await cursor.to_list(length=1000)
 
+    from services.exampen_eligibility import resolve_exam_students
+    doc = await resolve_exam_students(tenant_db, doc)
     absent_student_ids = {str(student_id) for student_id in (doc.get("absent_student_ids") or [])}
     roster = set(_normalize_roster(doc.get("roster"))) - absent_student_ids
     hub_ids = {ha.get("hub_id") for ha in doc.get("hub_assignments", [])}

@@ -1867,6 +1867,9 @@ async def get_exam_roster(
         )
     has_full_exam_access = _has_full_exam_access(current_user, exam)
 
+    from services.exampen_eligibility import resolve_exam_students
+    exam = await resolve_exam_students(tenant_db, exam)
+
     roster_ids = [
         str(student_id).strip()
         for student_id in (exam.get("roster") or [])

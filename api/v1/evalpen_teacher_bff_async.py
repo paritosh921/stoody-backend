@@ -314,6 +314,7 @@ def _visible_exam_query_for_user(
     current_user: Dict[str, Any],
     scoped_student_ids: Optional[List[str]] = None,
     visible_prepared_document_ids: Optional[List[str]] = None,
+    live_eligible_exam_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Return the ExamPen exam visibility query for the current actor."""
     if _is_tutor_admin_role(current_user):
@@ -328,7 +329,9 @@ def _visible_exam_query_for_user(
         {"teacher_ids": tutor_id},
     ]
     if scoped_student_ids:
-        visibility.append({"roster": {"$in": scoped_student_ids}})
+        visibility.append({"capture_mode": {"$ne": "camera"}, "roster": {"$in": scoped_student_ids}})
+    if live_eligible_exam_ids:
+        visibility.append({"exam_id": {"$in": live_eligible_exam_ids}})
     if visible_prepared_document_ids:
         visibility.append({
             "prepared_document_id": {"$in": visible_prepared_document_ids}
@@ -381,10 +384,15 @@ async def _require_exam_visible_or_legacy_student_scope(
             "teacher_ids": 1,
             "roster": 1,
             "prepared_document_id": 1,
+            "admin_id": 1,
+            "exam_type": 1,
+            "capture_mode": 1,
         },
     )
     if exam_doc is None:
         return False
+    from services.exampen_eligibility import resolve_exam_students
+    exam_doc = await resolve_exam_students(tenant_db, exam_doc)
     roster = {
         str(student_id)
         for student_id in (exam_doc.get("roster") or [])
@@ -584,10 +592,13 @@ async def list_exams(
                 )
 
         # ----- Fetch orchestration exams even before submissions exist -----
+        from services.exampen_eligibility import eligible_exam_ids_for_students
+        live_eligible_ids = await eligible_exam_ids_for_students(tenant_db, scoped_ids) if scoped_ids else []
         active_exam_query = _visible_exam_query_for_user(
             current_user,
             scoped_ids,
             finalized_doc_ids,
+            live_eligible_ids,
         )
 
         active_exam_docs = await tenant_db["exampen_exams"].find(

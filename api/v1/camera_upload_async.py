@@ -196,11 +196,19 @@ async def _require_camera_upload_context(
                 "before adding a late copy."
             ),
         )
+    from services.exampen_eligibility import resolve_exam_students, uses_live_students
+
+    exam_doc = await resolve_exam_students(tenant_db, exam_doc)
+    from api.v1.evalpen_review_async import _get_tutor_scoped_student_ids, _has_full_exam_access
+    if not _has_full_exam_access(current_user, exam_doc):
+        scoped_ids = await _get_tutor_scoped_student_ids(current_user, db)
+        if scoped_ids is not None and student_id not in {str(s) for s in scoped_ids}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Student is outside your teaching scope")
     roster = [str(item) for item in (exam_doc.get("roster") or [])]
-    if roster and student_id not in roster:
+    if (uses_live_students(exam_doc) or roster) and student_id not in roster:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Student {student_id} not found in exam roster",
+            detail="Student is not eligible for this paper",
         )
     return exam_doc
 

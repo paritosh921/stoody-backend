@@ -650,7 +650,7 @@ def _student_upload_availability(exam: Dict[str, Any], student_id: str) -> tuple
 
     roster = {str(item) for item in (exam.get("roster") or []) if str(item)}
     if not roster or student_id not in roster:
-        return False, "You are not on this exam's submission roster"
+        return False, "You are not eligible to submit a copy for this paper"
     absent = {str(item) for item in (exam.get("absent_student_ids") or []) if str(item)}
     if student_id in absent:
         return False, "You are marked absent for this exam"
@@ -750,10 +750,15 @@ async def _get_student_exam_or_404(
     if exam is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
 
-    # Keep the feature undiscoverable to students outside the roster.  The
-    # endpoint never accepts a client-supplied student id.
+    from services.exampen_eligibility import resolve_exam_students
+    exam = await resolve_exam_students(tenant_db, exam)
+    # Historical copies remain accessible after a class change. Admission is
+    # checked separately by _student_upload_availability on every upload.
     roster = {str(item) for item in (exam.get("roster") or []) if str(item)}
-    if student_id not in roster:
+    historical_copy = await tenant_db["evalpen_submissions"].find_one(
+        {"exam_id": exam_id, "student_id": student_id}, {"_id": 1}
+    )
+    if student_id not in roster and not historical_copy:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
     return exam
 
@@ -1213,14 +1218,17 @@ async def list_answer_copy_options(
     tenant_db = await _get_tenant_db(db, current_user)
     student_ids = await _get_student_identity_ids(tenant_db, current_user)
     student_id = student_ids[0]
+    from services.exampen_eligibility import ExamEligibility, student_exam_visibility
+    visibility = await student_exam_visibility(tenant_db, student_id)
     cursor = tenant_db["exampen_exams"].find(
         {
             "exam_type": "pcr",
             "student_self_submission_enabled": True,
-            "roster": student_id,
+            **visibility,
         },
         projection={
             "exam_id": 1,
+            "admin_id": 1,
             "title": 1,
             "paper_title": 1,
             "lifecycle_state": 1,
@@ -1242,6 +1250,7 @@ async def list_answer_copy_options(
         },
     ).sort("created_at", -1)
     exams = await cursor.to_list(length=100)
+    exams = await ExamEligibility(tenant_db).resolve_many(exams)
 
     prepared_ids = [
         str(exam.get("prepared_document_id") or "")
