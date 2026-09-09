@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+async def _find_learning_document(db, document_id: str, *, admin_id=None, is_b2c=False):
+    """Resolve the public chapter ID or a legacy Mongo ID within its owner scope.
+
+    Chapter lists expose document_id (for example BM001), falling back to _id.
+    Both metadata and PDF delivery must accept that same identity contract.
+    """
+    find_one = db.b2c_find_one if is_b2c else db.mongo_find_one
+    if not is_b2c and admin_id is None:
+        raise HTTPException(status_code=403, detail="Document owner scope is required")
+    scope = {} if is_b2c else {"admin_id": admin_id}
+    if ObjectId.is_valid(document_id):
+        document = await find_one("documents", {**scope, "_id": ObjectId(document_id)})
+        if document is not None:
+            return document
+    return await find_one("documents", {**scope, "document_id": document_id})
+
 # IMPORTANT: Grade/Standard matching is EXACT
 # Both student.grade and document.standard should come from the same admin settings
 # so they will match exactly (e.g., "12th Pass" == "12th Pass")
@@ -566,8 +583,8 @@ async def get_document_metadata(
         except Exception:
             pass
 
-        # Get document from database (document_id is MongoDB's _id as string, filtered by admin_id)
-        document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
+        # Resolve the same public or legacy ID returned by the chapter list.
+        document = await _find_learning_document(db, document_id, admin_id=admin_id)
 
         if not document:
             raise HTTPException(
@@ -684,15 +701,8 @@ async def get_chapter_pdf(
 
         # B2C users - query from B2C database
         if is_b2c:
-            # Try to find document by _id first, then by document_id
-            try:
-                document = await db.b2c_find_one("documents", {"_id": ObjectId(document_id)})
-            except:
-                document = None
-            
-            if not document:
-                document = await db.b2c_find_one("documents", {"document_id": document_id})
-            
+            document = await _find_learning_document(db, document_id, is_b2c=True)
+
             if not document:
                 logger.error(f"B2C document not found: {document_id}")
                 raise HTTPException(
@@ -706,7 +716,7 @@ async def get_chapter_pdf(
             # No additional access control needed - documents are already filtered by admin
         else:
             # Regular B2B flow - query main database
-            document = await db.mongo_find_one("documents", {"_id": ObjectId(document_id), "admin_id": admin_id})
+            document = await _find_learning_document(db, document_id, admin_id=admin_id)
 
             if not document:
                 raise HTTPException(
@@ -786,7 +796,7 @@ async def get_chapter_pdf(
             # Production-ready headers for caching and performance
             headers = {
                 "Accept-Ranges": "bytes",
-                "Cache-Control": "public, max-age=31536000, immutable",
+                "Cache-Control": "private, no-store",
                 "Content-Type": "application/pdf",
                 "Content-Disposition": f'inline; filename="{document.get("title", "chapter")}.pdf"',
                 "X-Content-Type-Options": "nosniff",
@@ -869,7 +879,7 @@ async def get_chapter_pdf(
         # Production-ready headers for caching and performance
         headers = {
             "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=31536000, immutable",  # 1 year cache
+            "Cache-Control": "private, no-store",
             "Content-Type": "application/pdf",
             "Content-Disposition": f'inline; filename="{document.get("title", "chapter")}.pdf"',
             "X-Content-Type-Options": "nosniff",
