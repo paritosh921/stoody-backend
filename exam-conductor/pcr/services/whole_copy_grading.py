@@ -13,6 +13,7 @@ one targeted recovery request.
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from typing import Any, Dict, Mapping, Optional, Sequence
 
 from ..language_assessment import language_feedback_schema
@@ -45,6 +46,11 @@ def system_instructions() -> str:
         "incomplete work is still an attempt. Use not_attempted only after checking every "
         "physical page and finding no relevant work. Use unresolved only when meaning or "
         "ownership genuinely prevents a reliable award after using the readable views.\n\n"
+        "For not_attempted, return student_answer as an empty string, source_pages "
+        "and criterion_marks as empty arrays, total_score=0 and needs_review=false. "
+        "If attempted_unit_ids is present, return an empty array. Put the explanation "
+        "of the full-copy absence check only in overall_feedback, never in student_answer "
+        "or criterion_marks. If absence cannot be verified, return unresolved instead.\n\n"
         "Grade the student's visible work, not teacher ticks, crosses, circles, written "
         "marks, or corrections. Apply the locked criteria and maximums exactly. Award "
         "credit for each correct visible step or diagram component and deduct only for "
@@ -336,12 +342,26 @@ def _question_schema(
     if feedback_schema is not None:
         properties["language_feedback"] = feedback_schema
         required.append("language_feedback")
-    return {
+    base = {
         "type": "object",
         "additionalProperties": False,
         "properties": properties,
         "required": required,
     }
+    # Make incompatible answer states impossible in structured provider output.
+    # The server validator still rejects contradictory historical/nonconforming
+    # output; it never erases possible student evidence to manufacture a blank.
+    blank = deepcopy(base)
+    blank_properties = blank["properties"]
+    blank_properties["attempt_status"] = {"type": "string", "enum": ["not_attempted"]}
+    blank_properties["student_answer"] = {"type": "string", "enum": [""]}
+    for key in ("source_pages", "criterion_marks", "attempted_unit_ids"):
+        if key in blank_properties:
+            blank_properties[key]["maxItems"] = 0
+    blank_properties["total_score"] = {"type": "number", "enum": [0]}
+    blank_properties["needs_review"] = {"type": "boolean", "enum": [False]}
+    properties["attempt_status"] = {"type": "string", "enum": ["attempted", "unresolved"]}
+    return {"anyOf": [base, blank]}
 
 
 def _criterion_schema(criterion: Optional[Mapping[str, Any]]) -> Dict[str, Any]:

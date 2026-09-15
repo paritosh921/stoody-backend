@@ -498,7 +498,8 @@ async def test_incomplete_output_is_recorded_without_identical_whole_copy_retry(
             paper_hash="paper-hash",
             solution_hash="solution-hash",
         )
-    assert len(gate.calls) == 1
+    assert len(gate.calls) == 2
+    assert gate.calls[1]["max_output_tokens"] == 20_000
     assert gate.calls[0]["metadata"]["pcr_stage"] == "student_evidence_mapping"
     assert gate.calls[0]["max_output_tokens"] == 10_000
 

@@ -123,7 +123,7 @@ def test_native_script_language_subject_is_detected_without_database_changes():
 def test_whole_copy_schema_adds_feedback_only_to_language_questions():
     language_catalog = grading._catalog_question(_question())
     language_schema = whole_copy.whole_copy_schema([language_catalog])
-    item_schema = language_schema["properties"]["questions"]["items"]
+    item_schema = language_schema["properties"]["questions"]["items"]["anyOf"][0]
 
     assert "language_feedback" in item_schema["properties"]
     assert "language_feedback" in item_schema["required"]
@@ -137,7 +137,7 @@ def test_whole_copy_schema_adds_feedback_only_to_language_questions():
         _question(subject="Mathematics", text="Solve x + 1 = 2.")
     )
     maths_schema = whole_copy.whole_copy_schema([maths_catalog])
-    maths_item = maths_schema["properties"]["questions"]["items"]
+    maths_item = maths_schema["properties"]["questions"]["items"]["anyOf"][0]
     assert "language_feedback" not in maths_item["properties"]
 
 

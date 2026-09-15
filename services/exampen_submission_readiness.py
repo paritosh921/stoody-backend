@@ -27,6 +27,14 @@ TERMINAL_RESPONSE_STATUSES = {
     "not_attempted",
 }
 
+DOCUMENT_COVERAGE_PROJECTION = {
+    "run_id": 1,
+    "validated_payload.unassigned_student_regions": 1,
+    "evidence_mapping_payload.unassigned_student_regions": 1,
+    "evidence_mapping_units.payload.unassigned_student_regions": 1,
+    "evidence_mapping_recovery_units.payload.unassigned_student_regions": 1,
+}
+
 
 def _blocker(code: str, message: str, **details: Any) -> Dict[str, Any]:
     return {"code": code, "message": message, **details}
@@ -107,6 +115,36 @@ def extract_unassigned_document_regions(
             if len(findings) >= 100:
                 return findings
     return findings
+
+
+def build_unmatched_copy_blocker(
+    grading_run: Mapping[str, Any] | None,
+    responses: List[Mapping[str, Any]],
+) -> Dict[str, Any] | None:
+    """Unassigned work with no mapped attempt is not a verified blank copy.
+
+    Derive this from the current evidence, even after a legacy coverage
+    acknowledgement. A corrected mapping or fresh upload can resolve it.
+    """
+    findings = extract_unassigned_document_regions(grading_run)
+    if not findings:
+        return None
+    if any(
+        response.get("question_id")
+        and response.get("source_pages")
+        and not response.get("is_missing_response")
+        and response.get("answer_state") != "not_attempted"
+        for response in responses
+    ):
+        return None
+    return _blocker(
+        "answer_copy_not_matched",
+        "No student work was matched to this exam. Check that the correct copy "
+        "was uploaded. Replace the wrong copy, or correct its question evidence "
+        "before publishing; excluding all work cannot confirm an unattempted exam.",
+        action_type="check_answer_copy",
+        findings=findings,
+    )
 
 
 def build_document_coverage_action(
@@ -288,22 +326,23 @@ async def assess_submission_readiness(
         )
 
     document_review = submission.get("document_review")
-    if isinstance(document_review, dict) and document_review.get("required"):
+    document_run = None
+    if document_grading_run_id(submission):
         grading_run_id = document_grading_run_id(submission)
         document_run = (
             _preloaded.get("document_run")
             if _preloaded is not None
             else (
                 await tenant_db["evalpen_document_grading_runs"].find_one(
-                    {"run_id": grading_run_id}
+                    {"run_id": grading_run_id}, DOCUMENT_COVERAGE_PROJECTION,
                 )
                 if grading_run_id
                 else None
             )
         )
-        action = build_document_coverage_action(document_review, document_run)
-        if action is not None:
-            required_actions.append(action)
+    action = build_document_coverage_action(document_review, document_run)
+    if action is not None:
+        required_actions.append(action)
 
     segmentation_status = str(submission.get("segmentation_status") or "")
     if segmentation_status != "complete":
@@ -360,6 +399,13 @@ async def assess_submission_readiness(
         ).to_list(length=5000)
     )
     response_ids = [str(response.get("response_id") or "") for response in responses]
+    unmatched_copy = build_unmatched_copy_blocker(document_run, responses)
+    if unmatched_copy is not None:
+        blockers.append(unmatched_copy)
+        required_actions = [
+            action for action in required_actions
+            if action.get("code") != "document_coverage_requires_review"
+        ]
     evaluations = (
         list(_preloaded.get("evaluations") or [])
         if _preloaded is not None
@@ -640,16 +686,12 @@ async def assess_submissions_readiness(
         {
             document_grading_run_id(item)
             for item in submissions
-            if (
-                isinstance(item.get("document_review"), dict)
-                and (item.get("document_review") or {}).get("required")
-            )
         }
         - {""}
     )
     document_runs = (
         await tenant_db["evalpen_document_grading_runs"].find(
-            {"run_id": {"$in": grading_run_ids}}
+            {"run_id": {"$in": grading_run_ids}}, DOCUMENT_COVERAGE_PROJECTION,
         ).to_list(length=len(grading_run_ids))
         if grading_run_ids
         else []

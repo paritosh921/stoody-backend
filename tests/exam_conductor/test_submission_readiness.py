@@ -262,6 +262,121 @@ async def test_readiness_allows_shared_page_atoms_from_whole_copy_visual_grading
     }
 
 
+async def _seed_unmatched_copy(db, *, accepted=False):
+    await _seed_ready_submission(db)
+    blank = await db["evalpen_detected_responses"].find_one({"response_id": "RESP-READY-2"})
+    await db["evalpen_detected_responses"].update_one(
+        {"response_id": "RESP-READY-1"},
+        {"$set": {key: blank[key] for key in (
+            "detected_text", "source_pages", "is_missing_response", "absence_proven",
+            "answer_state", "eval_status", "question_assignment",
+        )}},
+    )
+    await db["evalpen_evaluations"].update_one(
+        {"response_id": "RESP-READY-1"}, {"$set": {"total_score": 0.0}},
+    )
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-READY"},
+        {"$set": {"document_review": {
+            "status": "accepted" if accepted else "pending_review",
+            "required": not accepted, "grading_run_id": "RUN-WRONG-COPY",
+            "all_student_work_accounted": False,
+        }}},
+    )
+    await db["evalpen_document_grading_runs"].insert_one({
+        "run_id": "RUN-WRONG-COPY", "submission_id": "SUB-READY",
+        "validated_payload": {"unassigned_student_regions": [
+            {"region_id": "physics-1", "page_number": 1, "evidence": "Physics work"},
+        ]},
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_unmatched_copy_cannot_publish_even_after_legacy_exclusion(accepted):
+    from services.exampen_submission_readiness import assess_submission_readiness, assess_submissions_readiness
+    from api.v1.evalpen_review_async import PublishRequest, publish_submission, get_submission_summary
+
+    db = _fresh_db()
+    await _seed_unmatched_copy(db, accepted=accepted)
+    report = await assess_submission_readiness(db, "SUB-READY")
+    batched = await assess_submissions_readiness(db, ["SUB-READY"])
+    assert not report["ready"]
+    assert any(b["code"] == "answer_copy_not_matched" for b in report["blockers"])
+    assert batched["SUB-READY"]["blockers"] == report["blockers"]
+    assert not report["required_actions"]  # No bypass through generic page acceptance.
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch("api.v1.evalpen_review_async._get_tutor_scoped_student_ids", return_value=None),
+    ):
+        with pytest.raises(HTTPException) as error:
+            await publish_submission("SUB-READY", PublishRequest(), current_user=_admin_user(), db=None)
+        assert error.value.status_code == 409
+        summary = await get_submission_summary("SUB-READY", current_user=_admin_user(), db=None)
+    assert summary.document_review["can_exclude_unassigned_work"] is False
+    assert summary.score_state == "unavailable"
+    assert summary.review_state == "blocked"
+    saved = await db["evalpen_submissions"].find_one({"submission_id": "SUB-READY"})
+    assert saved.get("publication_status") != "published"
+
+
+@pytest.mark.asyncio
+async def test_excluding_all_student_work_is_rejected_without_mutating_review():
+    from api.v1.evalpen_review_async import DocumentCoverageReviewRequest, confirm_document_coverage_review
+    db = _fresh_db()
+    await _seed_unmatched_copy(db)
+    before = await db["evalpen_submissions"].find_one({"submission_id": "SUB-READY"})
+    with (
+        patch("api.v1.evalpen_review_async._get_tenant_db", return_value=db),
+        patch("api.v1.evalpen_review_async._get_tutor_scoped_student_ids", return_value=None),
+        pytest.raises(HTTPException) as error,
+    ):
+        await confirm_document_coverage_review("SUB-READY", DocumentCoverageReviewRequest(
+            grading_run_id="RUN-WRONG-COPY", note="Exclude all unrelated pages", region_ids=["physics-1"],
+        ), current_user=_admin_user(), db=None)
+    assert error.value.status_code == 409
+    assert "No student work was matched" in error.value.detail
+    assert await db["evalpen_submissions"].find_one({"submission_id": "SUB-READY"}) == before
+
+
+@pytest.mark.asyncio
+async def test_verified_blank_copy_without_unassigned_work_remains_publishable():
+    from services.exampen_submission_readiness import assess_submission_readiness
+    db = _fresh_db()
+    await _seed_unmatched_copy(db, accepted=True)
+    await db["evalpen_document_grading_runs"].update_one(
+        {"run_id": "RUN-WRONG-COPY"}, {"$set": {"validated_payload.unassigned_student_regions": []}},
+    )
+    assert (await assess_submission_readiness(db, "SUB-READY"))["ready"]
+
+
+@pytest.mark.asyncio
+async def test_current_corrected_mapping_resolves_unmatched_copy_without_score_override():
+    from services.exampen_submission_readiness import assess_submission_readiness
+    db = _fresh_db()
+    await _seed_unmatched_copy(db, accepted=True)
+    await db["evalpen_detected_responses"].update_one(
+        {"response_id": "RESP-READY-1"}, {"$set": {
+            "source_pages": [{"page_number": 1}], "detected_text": "Verified chemistry answer",
+            "is_missing_response": False, "answer_state": "detected", "eval_status": "evaluated",
+        }},
+    )
+    assert (await assess_submission_readiness(db, "SUB-READY"))["ready"]
+
+
+@pytest.mark.asyncio
+async def test_missing_review_run_id_does_not_drop_the_coverage_gate():
+    from services.exampen_submission_readiness import assess_submission_readiness
+    db = _fresh_db()
+    await _seed_ready_submission(db)
+    await db["evalpen_submissions"].update_one(
+        {"submission_id": "SUB-READY"}, {"$set": {"document_review": {"required": True}}},
+    )
+    report = await assess_submission_readiness(db, "SUB-READY")
+    assert not report["ready"]
+    assert report["required_actions"][0]["code"] == "document_coverage_requires_review"
+
+
 @pytest.mark.asyncio
 async def test_readiness_keeps_scored_review_notes_nonblocking():
     from services.exampen_submission_readiness import assess_submission_readiness

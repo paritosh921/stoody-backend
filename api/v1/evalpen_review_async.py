@@ -1279,8 +1279,9 @@ async def get_submission_summary(
             and isinstance(sub_dict.get("document_review"), dict)
             else None
         )
-        if document_review and document_review.get("required"):
+        if document_review:
             from services.exampen_submission_readiness import (
+                build_unmatched_copy_blocker,
                 document_grading_run_id,
                 extract_unassigned_document_regions,
             )
@@ -1297,12 +1298,23 @@ async def get_submission_summary(
                 **document_review,
                 "findings": extract_unassigned_document_regions(grading_run),
             }
+            copy_blocker = build_unmatched_copy_blocker(grading_run, response_docs)
+            if copy_blocker and not processing_active:
+                score_state = "unavailable"
+                document_review = {
+                    **document_review,
+                    "required": True,
+                    "can_exclude_unassigned_work": False,
+                    "blocking_code": copy_blocker["code"],
+                    "message": copy_blocker["message"],
+                }
         # Derive the displayed state from canonical rows on every read. The
         # stored field is an index hint and can briefly lag behind a review or
         # reprocess write; it must never hide a current blocker.
         review_state = (
             "blocked"
             if processing_failed or (blocked_count and score_state != "processing")
+            or bool(document_review and document_review.get("blocking_code") == "answer_copy_not_matched")
             else "processing"
             if score_state == "processing"
             else "needs_review"
@@ -1585,6 +1597,7 @@ async def confirm_document_coverage_review(
             detail="The answer copy was reprocessed. Refresh before confirming it.",
         )
     from services.exampen_submission_readiness import (
+        build_unmatched_copy_blocker,
         document_grading_run_id,
         extract_unassigned_document_regions,
     )
@@ -1599,6 +1612,20 @@ async def confirm_document_coverage_review(
     grading_run = await tenant_db["evalpen_document_grading_runs"].find_one(
         {"run_id": body.grading_run_id}
     )
+    if grading_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The evidence ledger is unavailable. Refresh or reprocess before reviewing this copy.",
+        )
+    active_responses = await tenant_db["evalpen_detected_responses"].find(
+        {"submission_id": submission_id, "superseded_at": {"$exists": False}}
+    ).to_list(length=5000)
+    copy_blocker = build_unmatched_copy_blocker(grading_run, active_responses)
+    if copy_blocker is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=copy_blocker["message"],
+        )
     findings = extract_unassigned_document_regions(grading_run)
     expected_region_ids = {
         str(item.get("region_id") or "") for item in findings if item.get("region_id")

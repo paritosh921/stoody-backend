@@ -1974,7 +1974,8 @@ async def _run_evidence_first_grading(
 
     The mapping checkpoint is deliberately persisted before grading. A provider
     failure during grading can therefore resume without purchasing completed
-    visual association work again. V13 remains the two-call legacy contract;
+    visual association work again. V13 uses mapping and grading, with at most
+    one larger-budget mapping recovery after output truncation;
     bounded contracts checkpoint page units, and v15 adds one absence/ownership
     recovery pass only when the first map leaves any question without attempted
     evidence.
@@ -2008,6 +2009,13 @@ async def _run_evidence_first_grading(
     mapping_payload = current_run.get("evidence_mapping_payload")
     mapping_raw = str(current_run.get("evidence_mapping_raw") or "")
     mapping_usage = dict(current_run.get("evidence_mapping_usage") or {})
+    if isinstance(mapping_payload, dict) and getattr(gate, "resume_deferred_run", False):
+        # Existing Economy runs predate the explicit span; their v13 mapping
+        # checkpoint always represents one recorded primary provider response.
+        checkpoint_calls = current_run.get("evidence_mapping_batch_call_count")
+        if checkpoint_calls is None:
+            checkpoint_calls = 1 if current_run.get("provider_transport") == "openai_batch" else 0
+        gate.skip_checkpointed_calls(int(checkpoint_calls))
     resolved_model = str(current_run.get("model_used") or model_id)
     mapping_catalog = [_mapping_catalog_question(question) for question in questions]
     mapping_cache_key = _stage_cache_key(
@@ -2017,7 +2025,8 @@ async def _run_evidence_first_grading(
     )
 
     if not isinstance(mapping_payload, dict):
-        mapping_response = await gate.call(
+        mapping_response, mapping_usage = await _call_mapping_with_recovery(
+            gate=gate,
             model_id=resolved_model,
             prompt="",
             caller_id=_CALLER_ID,
@@ -2031,7 +2040,9 @@ async def _run_evidence_first_grading(
             prompt_cache_key=mapping_cache_key,
             reasoning_effort=reasoning_effort,
             temperature=temperature,
-            max_output_tokens=_evidence_mapping_output_limit(len(questions)),
+            max_output_tokens=_evidence_mapping_output_limit(
+                len(questions), page_count=page_count, reasoning_effort=reasoning_effort,
+            ),
             metadata={
                 "pcr_stage": "student_evidence_mapping",
                 "prompt_version": _PROMPT_VERSION,
@@ -2050,9 +2061,10 @@ async def _run_evidence_first_grading(
             mapping_response,
             raw=mapping_raw,
             stage="Student evidence mapping",
-            output_limit=_evidence_mapping_output_limit(len(questions)),
+            output_limit=_evidence_mapping_output_limit(
+                len(questions), page_count=page_count, reasoning_effort=reasoning_effort,
+            ),
         )
-        mapping_usage = _usage_dict(mapping_response, fallback_model=resolved_model)
         resolved_model = str(mapping_usage.get("model") or resolved_model)
         checkpoint = await db[_RUNS_COLLECTION].update_one(
             {
@@ -2064,6 +2076,10 @@ async def _run_evidence_first_grading(
                     "evidence_mapping_payload": mapping_payload,
                     "evidence_mapping_raw": mapping_raw,
                     "evidence_mapping_usage": mapping_usage,
+                    "evidence_mapping_batch_call_count": (
+                        int(mapping_usage.get("mapping_request_count", 1))
+                        if getattr(gate, "resume_deferred_run", False) else 0
+                    ),
                     "model_used": resolved_model,
                     "updated_at": datetime.now(timezone.utc),
                 }
@@ -2145,8 +2161,8 @@ async def _run_evidence_first_grading(
                 "question_count": len(attempted_questions),
                 "page_count": page_count,
                 "run_id": run_id,
-                "provider_call_number": 2,
-                "provider_call_limit": 2,
+                "provider_call_number": 1 + int(mapping_usage.get("mapping_request_count", 1)),
+                "provider_call_limit": 3,
             },
         )
         grading_raw = str(getattr(grading_response, "content", "") or "")
@@ -3634,6 +3650,45 @@ def _build_verification_responses_input(
     ]
 
 
+async def _call_mapping_with_recovery(
+    *, gate: Any, **request: Any,
+) -> tuple[Any, Dict[str, Any]]:
+    """At most two mapping requests, with unchanged evidence and a larger ceiling.
+
+    Both calls go through the shared gate, so Economy replay reuses recorded
+    responses after a deferred handoff. Only a completed, parsed map is eligible
+    for the existing durable mapping checkpoint. No truncated JSON is salvaged.
+    """
+    primary_limit = int(request["max_output_tokens"])
+    usages: List[Dict[str, Any]] = []
+    for attempt, limit in enumerate((primary_limit, min(48_000, primary_limit * 2))):
+        metadata = {
+            **request.get("metadata", {}),
+            "provider_call_number": attempt + 1,
+            "provider_call_limit": 3,
+            "mapping_attempt": attempt + 1,
+        }
+        response = await gate.call(**{
+            **request, "max_output_tokens": limit, "metadata": metadata,
+        })
+        usages.append(_usage_dict(response, fallback_model=request["model_id"]))
+        usage = _aggregate_usages(usages, fallback_model=request["model_id"])
+        usage["mapping_request_count"] = attempt + 1
+        failure = _response_completion_failure(response)
+        if attempt == 0 and failure and failure["incomplete_reason"] == "max_output_tokens":
+            continue
+        try:
+            _require_complete_structured_payload(
+                response, raw=str(getattr(response, "content", "") or ""),
+                stage="Student evidence mapping", output_limit=limit,
+            )
+        except StructuredGradingOutputError as exc:
+            exc.token_usage = usage
+            raise
+        return response, usage
+    raise AssertionError("Mapping recovery must return or fail within two calls")
+
+
 def _require_complete_structured_payload(
     response: Any,
     *,
@@ -3691,8 +3746,16 @@ def _stage_cache_key(
     return prefix + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
-def _evidence_mapping_output_limit(question_count: int) -> int:
-    return min(24_000, max(10_000, 1_100 * max(1, int(question_count or 0))))
+def _evidence_mapping_output_limit(
+    question_count: int, *, page_count: int = 0, reasoning_effort: str = "medium",
+) -> int:
+    # Ownership output grows with physical pages/regions, not only the paper's
+    # question count. Reserve room for reasoning as well as visible JSON.
+    reserve = {"none": 0, "minimal": 1_000, "low": 2_000, "medium": 4_000, "high": 7_000}.get(reasoning_effort, 4_000)
+    return min(24_000, max(
+        10_000, 1_100 * max(1, int(question_count or 0)),
+        1_400 * max(0, int(page_count or 0)) + reserve,
+    ))
 
 
 def _evidence_grading_output_limit(question_count: int) -> int:
@@ -3881,7 +3944,7 @@ def _aggregate_usages(
             sum(float(item.get("estimated_cost_usd") or 0.0) for item in items),
             8,
         ),
-        "stage_count": len(items),
+        "stage_count": sum(int(item.get("stage_count", 1)) for item in items),
     }
 
 

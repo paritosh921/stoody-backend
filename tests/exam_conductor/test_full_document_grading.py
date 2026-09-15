@@ -561,7 +561,7 @@ async def test_normal_service_path_uses_one_mapping_and_one_grading_call(monkeyp
         "mapped_evidence_grading",
     ]
     assert [call["metadata"]["provider_call_number"] for call in gate.calls] == [1, 2]
-    assert all(call["metadata"]["provider_call_limit"] == 2 for call in gate.calls)
+    assert all(call["metadata"]["provider_call_limit"] == 3 for call in gate.calls)
     mapping_files = [
         item
         for message in gate.calls[0]["responses_input"]
@@ -752,7 +752,7 @@ async def test_no_attempts_need_mapping_only_and_receive_zero(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_incomplete_mapping_fails_terminally_without_grading_call(monkeypatch):
+async def test_incomplete_mapping_stops_after_one_larger_recovery_without_grading(monkeypatch):
     module = _module()
     db = _db()
     await _seed(db)
@@ -764,7 +764,7 @@ async def test_incomplete_mapping_fails_terminally_without_grading_call(monkeypa
                 completion_status="incomplete",
                 incomplete_reason="max_output_tokens",
             )
-        ]
+        ] * 2
     )
     monkeypatch.setattr(
         module,
@@ -782,7 +782,8 @@ async def test_incomplete_mapping_fails_terminally_without_grading_call(monkeypa
             db, gate, model_id="gpt-5.1-2025-11-13"
         ).grade_submission("SUB-1")
 
-    assert len(gate.calls) == 1
+    assert len(gate.calls) == 2
+    assert gate.calls[1]["max_output_tokens"] == 20_000
     assert gate.calls[0]["max_output_tokens"] == 10_000
     run = await db["evalpen_document_grading_runs"].find_one(
         {"prompt_version": "pcr-full-document-visual-v13"}
@@ -792,7 +793,8 @@ async def test_incomplete_mapping_fails_terminally_without_grading_call(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_mapping_checkpoint_resumes_without_purchasing_mapping_again():
+@pytest.mark.parametrize("batch_checkpoint", [None, "current", "legacy"])
+async def test_mapping_checkpoint_resumes_without_purchasing_mapping_again(batch_checkpoint):
     module = _module()
     db = _db()
     mapping_payload = _mapping_payload(_mapped_question(1))
@@ -809,6 +811,16 @@ async def test_mapping_checkpoint_resumes_without_purchasing_mapping_again():
         }
     )
     gate = _Gate([_grading_payload(_graded_question(1, "c1"))])
+    skipped = []
+    if batch_checkpoint:
+        checkpoint_fields = {"provider_transport": "openai_batch"}
+        if batch_checkpoint == "current":
+            checkpoint_fields["evidence_mapping_batch_call_count"] = 1
+        await db["evalpen_document_grading_runs"].update_one(
+            {"run_id": "RUN-1"}, {"$set": checkpoint_fields},
+        )
+        gate.resume_deferred_run = True
+        gate.skip_checkpointed_calls = skipped.append
 
     merged, _, usage = await module._run_evidence_first_grading(
         db=db,
@@ -838,6 +850,30 @@ async def test_mapping_checkpoint_resumes_without_purchasing_mapping_again():
     assert gate.calls[0]["metadata"]["provider_call_number"] == 2
     assert merged["questions"][0]["student_answer"] == "दिखा हुआ उत्तर 1"
     assert usage["stage_count"] == 2
+    assert skipped == ([1] if batch_checkpoint else [])
+
+
+@pytest.mark.asyncio
+async def test_mapping_truncation_recovers_and_materializes_only_complete_results(monkeypatch):
+    module = _module()
+    db = _db()
+    await _seed(db)
+    gate = _Gate([
+        SimpleNamespace(content='{"partial":', usage=_usage(), completion_status="incomplete", incomplete_reason="max_output_tokens"),
+        _mapping_payload(_mapped_question(1), _mapped_question(2)),
+        _grading_payload(_graded_question(1, "c1"), _graded_question(2, "c2")),
+    ])
+    monkeypatch.setattr(module, "_read_canonical_file", lambda *a, **kw: _value(b"%PDF canonical"))
+    monkeypatch.setattr(module, "_student_copy_content", lambda pages: _value(([{"type": "input_text", "text": "complete copy"}], 20)))
+    result = await module.FullDocumentGradingService(db, gate, model_id="gpt-5.1-2025-11-13").grade_submission("SUB-1")
+    assert result.evaluated_count == 2
+    assert result.blocked_count == 0
+    assert result.review_state == "ready"
+    assert [c["metadata"]["provider_call_number"] for c in gate.calls] == [1, 2, 3]
+    saved = await db["evalpen_document_grading_runs"].find_one({"run_id": result.run_id})
+    assert saved["evidence_mapping_usage"]["mapping_request_count"] == 2
+    assert saved["token_usage"]["stage_count"] == 3
+    assert "partial" not in saved["evidence_mapping_payload"]
 
 
 @pytest.mark.asyncio

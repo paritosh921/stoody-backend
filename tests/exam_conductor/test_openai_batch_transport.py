@@ -78,6 +78,13 @@ def test_provider_timeout_has_specific_retryable_failure_contract():
     assert "Retry only this copy" in result["operator_action"]
 
 
+def test_exhausted_mapping_does_not_offer_identical_discounted_retry():
+    result = classify_economy_batch_failure("Student evidence mapping exhausted its output budget before completing")
+    assert result["failure_code"] == "provider_output_limit"
+    assert result["retryable"] is False
+    assert "Review the uploaded copy" in result["operator_action"]
+
+
 def test_economy_batch_defaults_to_one_copy_per_provider_failure_domain(monkeypatch):
     monkeypatch.delenv("EXAMPEN_BATCH_MAX_REQUESTS_PER_PART", raising=False)
     assert _batch_max_requests_per_part() == 1

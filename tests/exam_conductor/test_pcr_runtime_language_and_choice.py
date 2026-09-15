@@ -147,7 +147,7 @@ def test_choice_schema_and_validator_score_only_visible_selected_units():
     prepared = grading._prepare_runtime_question_catalog([_optional_question()])[0]
     catalog = grading._catalog_question(prepared)
     schema = whole_copy.whole_copy_schema([catalog])
-    item = schema["properties"]["questions"]["items"]
+    item = schema["properties"]["questions"]["items"]["anyOf"][0]
     assert item["properties"]["attempted_unit_ids"]["items"]["enum"] == [
         f"part_{index}" for index in range(1, 6)
     ]

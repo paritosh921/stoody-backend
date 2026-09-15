@@ -53,6 +53,13 @@ class BatchReplayGate:
         }
         self._call_index = 0
 
+    def skip_checkpointed_calls(self, count: int) -> None:
+        """Advance replay over calls whose validated result is already persisted."""
+        count = int(count)
+        if count < 0 or self._call_index + count > len(self._response_bodies):
+            raise ValueError("Recorded Batch responses do not cover the saved checkpoint")
+        self._call_index += count
+
     async def initialize(self) -> None:
         if hasattr(self._gate, "initialize"):
             await self._gate.initialize()

@@ -243,6 +243,16 @@ def classify_economy_batch_failure(error: Any) -> Dict[str, Any]:
 
     message = _short_error(error)
     normalized = message.casefold()
+    if "exhausted its output budget" in normalized:
+        return {
+            "failure_code": "provider_output_limit",
+            "retryable": False,
+            "operator_action": (
+                "The evidence check could not finish within its output allowance. "
+                "Review the uploaded copy or change the grading configuration before retrying; "
+                "repeating the same Economy request may fail again."
+            ),
+        }
     file_access_failure = (
         "cannot find file" in normalized
         and "does not have access to it" in normalized
