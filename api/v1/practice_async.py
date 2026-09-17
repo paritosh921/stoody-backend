@@ -24,6 +24,10 @@ from services.practice_stroke_evidence import (
     resolve_practice_stroke_evidence,
 )
 
+from services.practice_answer_lifecycle import (
+    resolve_attempt, prepare_answer, load_snapshot, begin_evaluation, finish_evaluation,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1919,6 +1923,7 @@ class UploadedDocumentFile(BaseModel):
 
 class QuestionPageRefsModel(BaseModel):
     """Per-question page mapping from the Stoody Pen QuestionSession."""
+    allowEmptyAnswer: bool = False
     activePages: Optional[List[int]] = Field(default=None, max_length=50)  # Physical pages
     bookType: Optional[str] = None                 # e.g. "LS", "MS"
     copyId: Optional[str] = None                   # Copy set ID
@@ -1926,6 +1931,7 @@ class QuestionPageRefsModel(BaseModel):
     questionId: Optional[str] = None               # Question ownership key
     virtualPages: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=50)
     timeIntervals: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=50)
+    legacyPageNumbers: Optional[List[int]] = Field(default=None, max_length=50)
 
 
 class EvaluateRequest(BaseModel):
@@ -1943,6 +1949,7 @@ class EvaluateRequest(BaseModel):
     hintsUsed: Optional[int] = 0      # Number of hints used
     # Per-question page mapping from Stoody Pen (which pages + time intervals)
     questionPageRefs: Optional[QuestionPageRefsModel] = None
+    snapshotId: Optional[str] = Field(default=None, max_length=64)
 
     # Be flexible: accept pages as strings or objects with common keys; normalize to data URLs
     @validator('canvasData', pre=True)
@@ -3197,6 +3204,36 @@ async def practice_mentor_chat(
         )
 
 
+class ResolveDraftRequest(BaseModel):
+    hasPendingWriting: bool = False
+    documentId: str = Field(min_length=1, max_length=200)
+    preferredSessionId: Optional[str] = Field(default=None, max_length=200)
+
+
+@router.post("/drafts/resolve")
+async def resolve_practice_draft(payload: ResolveDraftRequest,
+                                 current_user: Dict[str, Any] = Depends(get_current_user),
+                                 db: DatabaseManager = Depends(get_database)):
+    session_id = await resolve_attempt(current_user, db, payload.documentId, payload.preferredSessionId, payload.hasPendingWriting)
+    return {"sessionId": session_id}
+
+
+@router.post("/answers/prepare")
+async def prepare_practice_answer(payload: QuestionPageRefsModel,
+                                   current_user: Dict[str, Any] = Depends(get_current_user),
+                                   db: DatabaseManager = Depends(get_database)):
+    if not payload.copyId or not payload.practiceSessionId or not payload.questionId:
+        raise HTTPException(422, "Complete Practice ownership is required.")
+    for page in payload.virtualPages or []:
+        ids = page.get("expectedStrokeIds") or []
+        if not isinstance(ids, list) or len(ids) > 20000 or any(not isinstance(i, str) for i in ids):
+            raise HTTPException(422, "Invalid expected stroke identifiers.")
+    try:
+        return await prepare_answer(current_user, db, payload)
+    except PracticeStrokeEvidenceError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @router.post("/evaluate", response_model=EvaluateResponse)
 @limiter.limit("120/minute")
 async def evaluate_submission(
@@ -3218,6 +3255,7 @@ async def evaluate_submission(
     Returns: { success, evaluation: { correct, score, extractedAnswer, workShown,
               whatWentWrong, correctSolution, feedback, reasoning, correctAnswer, ... } }
     """
+    evaluation_claim = None
     try:
         qid = payload.questionId
         answer_text = (payload.answerText or "").strip()
@@ -3302,7 +3340,15 @@ async def evaluate_submission(
                 or payload.questionPageRefs.virtualPages
             )
         )
-        if has_question_page_refs:
+        if payload.snapshotId:
+            snapshot = await load_snapshot(current_user, db, payload.snapshotId, qid, payload.sessionId)
+            evaluation_claim = await begin_evaluation(current_user, db, payload)
+            if evaluation_claim[3] is not None:
+                return EvaluateResponse(**evaluation_claim[3])
+            canvas_pages_raw = snapshot["images"]
+            canonical_evidence_receipt = snapshot["receipt"]
+            payload.questionPageRefs = QuestionPageRefsModel(**snapshot["page_refs"])
+        elif has_question_page_refs:
             try:
                 resolved_evidence = await resolve_practice_stroke_evidence(
                     current_user=current_user,
@@ -3524,6 +3570,7 @@ async def evaluate_submission(
         )
 
         # === SAVE PRACTICE ATTEMPT TO DATABASE FOR HISTORY ===
+        practice_attempt = None
         try:
             user_id = current_user.get("user_id") or current_user.get("student_id") or current_user.get("id")
             
@@ -3581,10 +3628,11 @@ async def evaluate_submission(
             }
             
             # Save to appropriate database (B2C or main)
-            if is_b2c:
-                await db.b2c_insert_one("practice_attempts", practice_attempt)
-            else:
-                await db.mongo_insert_one("practice_attempts", practice_attempt)
+            if not evaluation_claim:
+                if is_b2c:
+                    await db.b2c_insert_one("practice_attempts", practice_attempt)
+                else:
+                    await db.mongo_insert_one("practice_attempts", practice_attempt)
             
             logger.info(f"💾 Saved practice attempt for student {user_id}, question {qid}")
             
@@ -3592,11 +3640,15 @@ async def evaluate_submission(
             # Log but don't fail the request if saving fails
             logger.error(f"❌ Failed to save practice attempt: {save_err}", exc_info=True)
 
-        return EvaluateResponse(success=True, evaluation=evaluation_data)
+        result = EvaluateResponse(success=True, evaluation=evaluation_data)
+        await finish_evaluation(evaluation_claim, result.model_dump(), practice_attempt)
+        return result
 
     except HTTPException:
+        await finish_evaluation(evaluation_claim)
         raise
     except Exception as e:
+        await finish_evaluation(evaluation_claim)
         logger.error(f"Failed to evaluate submission: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

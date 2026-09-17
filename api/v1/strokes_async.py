@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pymongo import ReplaceOne, UpdateOne
 from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from api.v1.auth_async import get_current_user, get_database
@@ -621,40 +620,28 @@ def _merge_stroke_docs(
     existing_strokes: List[Dict[str, Any]],
     incoming_strokes: List[Dict[str, Any]],
 ) -> tuple[List[Dict[str, Any]], int]:
-    seen_ids = {
-        str(stroke.get("id") or "")
-        for stroke in existing_strokes
-        if stroke.get("id")
-    }
-    merged = list(existing_strokes)
-    added = 0
-    for stroke in incoming_strokes:
-        stroke_id = str(stroke.get("id") or "")
-        if stroke_id and stroke_id in seen_ids:
+    # Stroke geometry is immutable by ID. Ownership may be enriched once, but
+    # a replay must never erase it or reassign another question's writing.
+    merged = [dict(stroke) for stroke in existing_strokes]
+    by_id = {str(stroke["id"]): i for i, stroke in enumerate(merged) if stroke.get("id")}
+    changed = 0
+    for incoming in incoming_strokes:
+        stroke_id = str(incoming.get("id") or "")
+        if stroke_id and stroke_id in by_id:
+            old = merged[by_id[stroke_id]]
+            keys = ("practiceSessionId", "questionId")
+            if any(old.get(k) and incoming.get(k) and old[k] != incoming[k] for k in keys):
+                raise HTTPException(status_code=409, detail="Stroke ownership conflict; writing was retained under its original question.")
+            if all(incoming.get(k) for k in keys):
+                if any(not old.get(k) for k in keys):
+                    old.update({k: incoming[k] for k in keys})
+                    changed += 1
             continue
         if stroke_id:
-            seen_ids.add(stroke_id)
-        merged.append(stroke)
-        added += 1
-    return merged, added
-
-
-def _is_stale_canvas_page_update(existing_doc: Dict[str, Any], page: CanvasPageUpsert) -> bool:
-    existing_version = int(existing_doc.get("version", 0) or 0)
-    if page.version is not None:
-        # Canvas page writes are additive. Equal-version writes are still
-        # conflict-prone because the client may have loaded only a subset of
-        # strokes for that page. Merge on >= so same-version saves do not
-        # replace older strokes that were already present on the server.
-        return existing_version >= page.version
-
-    existing_last_modified = existing_doc.get("client_last_modified")
-    incoming_last_modified = page.client_last_modified
-    if existing_last_modified is not None and incoming_last_modified is not None:
-        return float(existing_last_modified) > float(incoming_last_modified)
-
-    # Versionless writes are treated as stale/merge-only by default when a page already exists.
-    return True
+            by_id[stroke_id] = len(merged)
+        merged.append(dict(incoming))
+        changed += 1
+    return merged, changed
 
 
 def _build_merged_page_doc(
@@ -721,36 +708,6 @@ def _build_merged_page_doc(
         merged_doc["device_id"] = device_id
     return merged_doc, added_count
 
-
-def _build_metadata_refresh(
-    existing_doc: Dict[str, Any],
-    page: CanvasPageUpsert,
-    now: datetime,
-) -> Dict[str, Any]:
-    """Build a $set dict for audit/activity fields when no new strokes were added.
-
-    Returns an empty dict if nothing needs updating.
-    """
-    updates: Dict[str, Any] = {"last_modified": now}
-
-    if page.device_id and page.device_id != existing_doc.get("device_id"):
-        updates["device_id"] = page.device_id
-    if page.session_id and page.session_id != existing_doc.get("session_id"):
-        updates["session_id"] = page.session_id
-    if page.first_activity is not None:
-        existing_first = existing_doc.get("first_activity")
-        if existing_first is None or page.first_activity < existing_first:
-            updates["first_activity"] = page.first_activity
-    if page.last_activity is not None:
-        existing_last = existing_doc.get("last_activity")
-        if existing_last is None or page.last_activity > existing_last:
-            updates["last_activity"] = page.last_activity
-    if page.client_last_modified is not None:
-        existing_clm = existing_doc.get("client_last_modified")
-        if existing_clm is None or page.client_last_modified > existing_clm:
-            updates["client_last_modified"] = page.client_last_modified
-
-    return updates
 
 
 async def _upsert_notes_canvas_classification(
@@ -853,6 +810,34 @@ async def _upsert_notes_canvas_classification(
         logging.getLogger(__name__).warning("note_classifications upsert failed: %s", exc)
 
 
+async def _persist_canvas_page(collection, page_filter, user_id, admin_id, page, now, copy_id):
+    """Retry concurrent additive writes without losing ink or ownership."""
+    for _ in range(8):
+        existing = await collection.find_one(page_filter)
+        if existing is None:
+            doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
+            try:
+                await collection.insert_one(doc)
+                return doc, True, True
+            except DuplicateKeyError as exc:
+                # Another writer may have created this exact page. A conflict
+                # on an obsolete index is a schema error, not an endless retry.
+                if await collection.find_one(page_filter) is None:
+                    _raise_sanitized_canvas_write_error(exc)
+                continue
+        doc, changed = _build_merged_page_doc(
+            existing_doc=existing, user_id=user_id, admin_id=admin_id,
+            page=page, now=now, copy_id=copy_id,
+        )
+        version_filter = {"_id": existing["_id"], "version": existing.get("version")}
+        # All updates, including duplicate uploads, advance the revision. Every
+        # writer compares against the same revision before replacing a page.
+        result = await collection.replace_one(version_filter, doc)
+        if result.matched_count:
+            return doc, bool(changed), False
+    raise HTTPException(status_code=409, detail="Notebook changed during synchronization. Your writing is retained; retry submission.")
+
+
 @router.put("/pages")
 async def upsert_canvas_page(
     page: CanvasPageUpsert,
@@ -877,54 +862,9 @@ async def upsert_canvas_page(
         "book_type": page.book_type.upper(),
         "page_number": page.page_number,
     }
-    existing = await collection.find_one(page_filter)
-    should_enqueue_credit = False
-
-    if existing is None:
-        doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
-        upsert_filt: Dict[str, Any] = {
-            "user_id": user_id,
-            "copy_id": copy_id,
-            "book_type": page.book_type.upper(),
-            "page_number": page.page_number,
-        }
-        try:
-            result = await collection.replace_one(upsert_filt, doc, upsert=True)
-        except DuplicateKeyError as exc:
-            _raise_sanitized_canvas_write_error(exc)
-        should_enqueue_credit = True
-    else:
-        doc, added_count = _build_merged_page_doc(
-            existing_doc=existing,
-            user_id=user_id,
-            admin_id=admin_id,
-            page=page,
-            now=now,
-            copy_id=copy_id,
-        )
-        if added_count == 0:
-            # No new strokes, but still refresh audit/activity metadata
-            metadata_update = _build_metadata_refresh(existing, page, now)
-            if metadata_update:
-                await collection.update_one({"_id": existing["_id"]}, {"$set": metadata_update})
-            await _upsert_notes_canvas_classification(
-                classification_collection,
-                user_id=user_id,
-                user_ids=user_ids,
-                page=page,
-                now=now,
-                copy_id=copy_id,
-            )
-            return {
-                "success": True,
-                "version": int(existing.get("version", 1) or 1),
-                "last_modified": now.isoformat(),
-            }
-        try:
-            result = await collection.replace_one({"_id": existing["_id"]}, doc)
-        except DuplicateKeyError as exc:
-            _raise_sanitized_canvas_write_error(exc)
-        should_enqueue_credit = True
+    doc, should_enqueue_credit, created = await _persist_canvas_page(
+        collection, page_filter, user_id, admin_id, page, now, copy_id,
+    )
 
     await _upsert_notes_canvas_classification(
         classification_collection,
@@ -943,6 +883,7 @@ async def upsert_canvas_page(
 
     return {
         "success": True,
+        "created": created,
         "version": doc["version"],
         "last_modified": now.isoformat(),
         "copy_id": copy_id,
@@ -956,120 +897,13 @@ async def batch_upsert_canvas_pages(
     db: DatabaseManager = Depends(get_database),
 ):
     """Upsert up to 20 canvas pages in one request."""
-    user_id = _canonical_canvas_user_id(current_user)
-    admin_id = current_user.get("admin_id")
-    collection = await _get_canvas_collection(current_user, db)
-    tenant_db = collection.database
-    classification_collection = collection.database["note_classifications"]
-    user_ids = _resolve_canvas_user_ids(current_user)
-
-    # Resolve copy_id once for the entire batch.  Individual pages may
-    # carry their own copy_id but when absent the batch defaults to the
-    # user's active copy.
-    batch_copy_id = await _resolve_copy_id(
-        body.pages[0].copy_id if body.pages else None,
-        current_user,
-        db,
-    )
-
-    now = datetime.now(timezone.utc)
-
-    # Pre-fetch existing docs to handle legacy user_id variants.
-    page_keys = [
-        (p.copy_id or batch_copy_id, p.book_type.upper(), p.page_number) for p in body.pages
-    ]
-    existing_map: Dict[tuple, Any] = {}
-    if page_keys:
-        or_clauses = [
-            {"copy_id": cid, "book_type": bt, "page_number": pn} for cid, bt, pn in page_keys
-        ]
-        existing_cursor = collection.find(
-            {"user_id": {"$in": user_ids}, "$or": or_clauses},
-            {
-                "_id": 1,
-                "copy_id": 1,
-                "book_type": 1,
-                "page_number": 1,
-                "strokes": 1,
-                "version": 1,
-                "client_last_modified": 1,
-                "page_style": 1,
-                "canvas_background": 1,
-                "pen_mac": 1,
-                "source": 1,
-                "session_id": 1,
-                "first_activity": 1,
-                "last_activity": 1,
-                "device_id": 1,
-            },
-        )
-        async for edoc in existing_cursor:
-            existing_map[(edoc.get("copy_id"), edoc["book_type"], edoc["page_number"])] = edoc
-
-    ops = []
-    changed_pages: List[tuple[CanvasPageUpsert, str]] = []  # (page, resolved_copy_id)
-    credit_pages: List[Dict[str, Any]] = []
+    # Both web and agent uploads use the same ownership and compare-and-swap
+    # contract. A stale bulk replacement used to overwrite concurrent writing.
+    created = 0
     for page in body.pages:
-        copy_id = page.copy_id or batch_copy_id
-        key = (copy_id, page.book_type.upper(), page.page_number)
-        existing = existing_map.get(key)
-        if existing is None:
-            doc = _page_doc(user_id, admin_id, page, now, copy_id=copy_id)
-            filt = {
-                "user_id": user_id,
-                "copy_id": copy_id,
-                "book_type": page.book_type.upper(),
-                "page_number": page.page_number,
-            }
-            ops.append(ReplaceOne(filt, doc, upsert=True))
-            changed_pages.append((page, copy_id))
-            credit_pages.append(doc)
-        else:
-            doc, added_count = _build_merged_page_doc(
-                existing_doc=existing,
-                user_id=user_id,
-                admin_id=admin_id,
-                page=page,
-                now=now,
-                copy_id=copy_id,
-            )
-            if added_count == 0:
-                # No new strokes — still refresh audit/activity metadata
-                metadata_update = _build_metadata_refresh(existing, page, now)
-                if metadata_update:
-                    ops.append(UpdateOne({"_id": existing["_id"]}, {"$set": metadata_update}))
-                changed_pages.append((page, copy_id))
-                continue
-            ops.append(ReplaceOne({"_id": existing["_id"]}, doc))
-            changed_pages.append((page, copy_id))
-            credit_pages.append(doc)
-
-    if ops:
-        try:
-            result = await collection.bulk_write(ops, ordered=False)
-        except BulkWriteError as exc:
-            _raise_sanitized_canvas_write_error(exc)
-        for page, page_copy_id in changed_pages:
-            await _upsert_notes_canvas_classification(
-                classification_collection,
-                user_id=user_id,
-                user_ids=user_ids,
-                page=page,
-                now=now,
-                copy_id=page_copy_id,
-            )
-        for page_doc in credit_pages:
-            await _try_enqueue_canvas_credit(
-                tenant_db,
-                current_user=current_user,
-                page_doc=page_doc,
-            )
-        return {
-            "success": True,
-            "upserted": result.upserted_count,
-            "modified": result.modified_count,
-        }
-    return {"success": True, "upserted": 0, "modified": 0}
+        result = await upsert_canvas_page(page, current_user, db)
+        created += int(result["created"])
+    return {"success": True, "upserted": created, "modified": len(body.pages) - created}
 
 
 @router.get("/pages")

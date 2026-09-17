@@ -23,6 +23,7 @@ class PracticeStrokeEvidenceError(RuntimeError):
 class ResolvedPracticeEvidence:
     data_urls: List[str]
     receipt: Dict[str, Any]
+    page_refs: Optional[Dict[str, Any]] = None
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -110,6 +111,7 @@ def _normalise_page_refs(refs: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "start_ts": page.get("startTs"),
                 "end_ts": page.get("endTs"),
                 "time_intervals": time_intervals,
+                "expected_ids": page.get("expectedStrokeIds") or [],
             }
         )
 
@@ -164,7 +166,9 @@ def _stroke_matches_scope(
 
     # Legacy scoped pages may predate the ownership fields. Accept only a
     # stroke whose wall-clock activity falls inside the submitted page window.
-    timestamp = stroke.get("startedAt", stroke.get("timestamp"))
+    timestamp = stroke.get("startedAt")
+    if timestamp is None:
+        timestamp = stroke.get("timestamp")
     if not isinstance(timestamp, (int, float)):
         return False
     intervals = list(time_intervals or [])
@@ -187,6 +191,8 @@ async def resolve_practice_stroke_evidence(
     db: DatabaseManager,
     refs: Any,
     payload_question_id: str,
+    discover_owned: bool = False,
+    allow_empty: bool = False,
 ) -> ResolvedPracticeEvidence:
     ref_map = _as_mapping(refs)
     copy_id = str(ref_map.get("copyId") or "").strip()
@@ -198,7 +204,7 @@ async def resolve_practice_stroke_evidence(
         raise PracticeStrokeEvidenceError("Practice page references belong to a different question.")
 
     page_refs = _normalise_page_refs(ref_map)
-    if not page_refs:
+    if not page_refs and not discover_owned:
         raise PracticeStrokeEvidenceError("No synchronized Practice pages were referenced.")
 
     collection = await _canvas_collection(current_user, db)
@@ -206,15 +212,72 @@ async def resolve_practice_stroke_evidence(
         (page["book_type"], page["page_number"])
         for page in page_refs
     }
+    alternatives = [
+        {"book_type": book_type, "page_number": page_number}
+        for book_type, page_number in identities
+    ]
+    if discover_owned:
+        alternatives.append({"strokes": {"$elemMatch": {
+            "practiceSessionId": practice_session_id, "questionId": question_id,
+        }}})
+        # Legacy ledgers recorded only a page number. Search all book types;
+        # only exact stroke ownership can recover these ambiguous identities.
+        legacy_numbers = ref_map.get("legacyPageNumbers") or []
+        if legacy_numbers:
+            alternatives.append({"page_number": {"$in": legacy_numbers}})
     query = {
         "user_id": {"$in": _user_id_variants(current_user)},
         "copy_id": copy_id,
-        "$or": [
-            {"book_type": book_type, "page_number": page_number}
-            for book_type, page_number in identities
-        ],
+        "$or": alternatives,
     }
-    docs = await collection.find(query).sort("last_modified", 1).to_list(length=100)
+    docs = await collection.find(query).sort("last_modified", 1).to_list(length=101)
+    if len(docs) > 100:
+        raise PracticeStrokeEvidenceError("Too many candidate pages; reconcile this answer before submitting.")
+    if discover_owned:
+        for doc in docs:
+            identity = (str(doc.get("book_type") or "").upper(), int(doc.get("page_number") or 0))
+            if identity not in identities and any(
+                s.get("practiceSessionId") == practice_session_id and s.get("questionId") == question_id
+                for s in doc.get("strokes", [])
+            ):
+                page_refs.append({"book_type": identity[0], "page_number": identity[1],
+                                  "ordinal": None, "start_ts": None, "end_ts": None,
+                                  "time_intervals": [], "expected_ids": []})
+                identities.add(identity)
+    if discover_owned:
+        intervals = [{"start_ts": i.get("startTs"), "end_ts": i.get("endTs")}
+                     for i in ref_map.get("timeIntervals") or []]
+        for number in ref_map.get("legacyPageNumbers") or []:
+            candidates = [d for d in docs if d.get("page_number") == number]
+            if not candidates:
+                raise PracticeStrokeEvidenceError(f"Legacy page {number} is unavailable locally and on the server. Reconcile its ownership before submitting.")
+            matching = []
+            for doc in candidates:
+                if any(_stroke_matches_scope(s, practice_session_id=practice_session_id,
+                        question_id=question_id, ordinal=None, start_ts=None, end_ts=None,
+                        time_intervals=intervals) for s in doc.get("strokes") or []):
+                    matching.append(doc)
+            # A numeric legacy reference cannot identify a book. Never silently
+            # bind it to the currently visible book or submit multiple guesses.
+            books = {str(d.get("book_type") or "").upper() for d in matching}
+            if len(books) > 1:
+                raise PracticeStrokeEvidenceError(f"Legacy page {number} matches multiple books; select its original book before submitting.")
+            for doc in matching:
+                identity = (str(doc.get("book_type") or "").upper(), number)
+                if identity not in identities:
+                    page_refs.append({"book_type": identity[0], "page_number": number,
+                                      "ordinal": None, "start_ts": None, "end_ts": None,
+                                      "time_intervals": intervals, "expected_ids": []})
+                    identities.add(identity)
+                else:
+                    # Discovery may already have added this page from one tagged
+                    # stroke. Preserve the legacy visit evidence as well; a page
+                    # can contain both tagged and older untagged answer writing.
+                    for page_ref in page_refs:
+                        if (page_ref["book_type"], page_ref["page_number"]) == identity:
+                            for interval in intervals:
+                                if interval not in page_ref["time_intervals"]:
+                                    page_ref["time_intervals"].append(interval)
     docs_by_identity: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
     for doc in docs:
         key = (str(doc.get("book_type") or "").upper(), int(doc.get("page_number") or 0))
@@ -222,7 +285,8 @@ async def resolve_practice_stroke_evidence(
 
     data_urls: List[str] = []
     page_receipts: List[Dict[str, Any]] = []
-    for page_ref in page_refs:
+    verified_refs: List[Dict[str, Any]] = []
+    for page_ref in sorted(page_refs, key=lambda p: (p["book_type"], p["page_number"], p["ordinal"] or 0)):
         key = (page_ref["book_type"], page_ref["page_number"])
         scoped: Dict[str, Mapping[str, Any]] = {}
         for doc in docs_by_identity.get(key, []):
@@ -247,12 +311,24 @@ async def resolve_practice_stroke_evidence(
                 if stroke_id:
                     scoped[stroke_id] = raw_stroke
 
-        strokes = list(scoped.values())
+        expected_ids = set(page_ref.get("expected_ids") or [])
+        if expected_ids - set(scoped):
+            raise PracticeStrokeEvidenceError(f"{key[0]} page {key[1]} has unacknowledged answer strokes; retry synchronization.")
+        strokes = [scoped[k] for k in sorted(scoped)]
+        if not strokes and discover_owned and not expected_ids and docs_by_identity.get(key):
+            # Candidate membership is not ownership. A restored page containing
+            # only other answers is excluded after examining server evidence.
+            continue
         if not strokes:
             raise PracticeStrokeEvidenceError(
                 f"Synchronized writing for {key[0]} page {key[1]} is missing or belongs to another question."
             )
 
+        verified_refs.append({"physicalPageNo": key[1], "bookType": key[0],
+                              "expectedStrokeIds": sorted(scoped),
+                              "startTs": page_ref["start_ts"], "endTs": page_ref["end_ts"],
+                              "timeIntervals": [{"startTs": i["start_ts"], "endTs": i["end_ts"]}
+                                                for i in page_ref.get("time_intervals", [])]})
         canonical_json = json.dumps(strokes, sort_keys=True, separators=(",", ":"), default=str)
         content_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
         png = render_stroke_page({"strokes": strokes})
@@ -268,6 +344,10 @@ async def resolve_practice_stroke_evidence(
             }
         )
 
+    if not data_urls and not (allow_empty and not page_refs and not ref_map.get("legacyPageNumbers")):
+        raise PracticeStrokeEvidenceError("No verified writing belongs to this question. Older unassigned writing needs reconciliation.")
+    if len(data_urls) > 50:
+        raise PracticeStrokeEvidenceError("An answer may contain at most 50 pages.")
     receipt_payload = {
         "version": "practice-canonical-evidence-v1",
         "copy_id": copy_id,
@@ -278,4 +358,8 @@ async def resolve_practice_stroke_evidence(
     receipt_payload["receipt_sha256"] = hashlib.sha256(
         json.dumps(receipt_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return ResolvedPracticeEvidence(data_urls=data_urls, receipt=receipt_payload)
+    return ResolvedPracticeEvidence(data_urls=data_urls, receipt=receipt_payload, page_refs={
+        "copyId": copy_id, "practiceSessionId": practice_session_id, "questionId": question_id,
+        "activePages": sorted({p["physicalPageNo"] for p in verified_refs}),
+        "bookType": verified_refs[0]["bookType"] if verified_refs else "", "virtualPages": verified_refs, "timeIntervals": [],
+    })
